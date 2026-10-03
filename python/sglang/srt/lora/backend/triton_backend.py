@@ -159,7 +159,7 @@ class TritonLoRABackend(BaseLoRABackend):
         )
         return lora_output
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,

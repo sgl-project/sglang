@@ -193,7 +193,7 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             device=torch.device("cuda"),
             server_args=server_args,
         )
-        backend.init_cuda_graph_batch_info(
+        backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=BS, num_tokens_per_req=1
         )
         lora_ranks = [MAX_RANK] * NUM_LORAS

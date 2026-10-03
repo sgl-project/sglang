@@ -64,6 +64,8 @@ class TestTiedLMHeadLoRA(CustomTestCase):
         manager.base_model = model
         manager.base_hf_config = SimpleNamespace(num_hidden_layers=0)
         manager.target_modules = {"lm_head"}
+        manager.dense_target_modules = {"lm_head"}
+        manager.moe_target_modules = set()
         wrapped_lm_head = object()
 
         inkling_module = types.ModuleType("sglang.srt.models.inkling_common.dense_mlp")
