@@ -1,6 +1,8 @@
 use super::*;
 use crate::components::FULL;
-use crate::node::{NodeArena, NodeIdx_, ValueSlotIdx};
+use crate::node::{NodeIdx_, ValueSlotIdx};
+use crate::test_utils::NodeArena;
+use tch::Tensor;
 
 fn order(list: &UnifiedLRUList) -> Vec<NodeIdx_> {
     list.iter().collect()
@@ -877,7 +879,7 @@ fn tlru_integer_history_overflow_panics_before_float_conversion() {
 #[test]
 fn tlru_factory_forwards_float_config_instead_of_the_integer_budget() {
     let (arena, a) = arena_with_node();
-    let strategy = get_eviction_strategy::<Vec<i64>>(
+    let strategy = get_eviction_strategy::<Vec<i64>, Tensor>(
         "TLrU",
         999,
         0,
@@ -906,7 +908,7 @@ fn get_eviction_strategy_resolves_each_policy_name() {
     ];
     for (policy, expected) in cases {
         assert_eq!(
-            get_eviction_strategy::<Vec<i64>>(policy, 2, 0, None).get_priority(node),
+            get_eviction_strategy::<Vec<i64>, Tensor>(policy, 2, 0, None).get_priority(node),
             expected,
             "policy {policy}"
         );
@@ -919,11 +921,11 @@ fn eviction_policy_names_are_case_insensitive() {
     let node = arena.node(NodeIdx_(a.0));
     // Mixed-case names resolve to the same strategies as their lowercase forms.
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("LRU", 2, 0, None).get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("LRU", 2, 0, None).get_priority(node),
         PriorityKey(5, 0)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("Priority", 2, 0, None).get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("Priority", 2, 0, None).get_priority(node),
         PriorityKey(9, 5)
     );
 }
@@ -931,7 +933,7 @@ fn eviction_policy_names_are_case_insensitive() {
 #[test]
 fn get_eviction_strategy_slru_default_threshold_is_two() {
     let (mut arena, a) = arena_with_node();
-    let slru = get_eviction_strategy::<Vec<i64>>("slru", 2, 0, None);
+    let slru = get_eviction_strategy::<Vec<i64>, Tensor>("slru", 2, 0, None);
     // Exactly 2 hits is protected under the factory default; 1 is not.
     arena.node_mut(NodeIdx_(a.0)).hit_count = 2;
     assert_eq!(
@@ -950,11 +952,11 @@ fn tlru_factory_uses_the_tail_budget_and_accepts_mixed_case_names() {
     let (arena, a) = arena_with_node();
     let node = arena.node(a);
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 0, None).get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("TLrU", 999, 0, None).get_priority(node),
         PriorityKey(0, 5)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 1, None).get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("TLrU", 999, 1, None).get_priority(node),
         PriorityKey(-1, 5)
     );
 }
@@ -962,7 +964,7 @@ fn tlru_factory_uses_the_tail_budget_and_accepts_mixed_case_names() {
 #[test]
 #[should_panic(expected = "Unknown eviction policy: random. Supported policies:")]
 fn get_eviction_strategy_panics_on_an_unknown_policy() {
-    get_eviction_strategy::<Vec<i64>>("Random", 2, 0, None);
+    get_eviction_strategy::<Vec<i64>, Tensor>("Random", 2, 0, None);
 }
 
 #[test]
