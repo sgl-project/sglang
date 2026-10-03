@@ -110,6 +110,7 @@ class TestGlm5NextPDMux(unittest.TestCase):
         ):
             for mode, expected in (
                 (ForwardMode.DECODE, helper),
+                (ForwardMode.TARGET_VERIFY, helper),
                 (ForwardMode.SPLIT_PREFILL, None),
                 (ForwardMode.IDLE, helper),
                 (ForwardMode.EXTEND, None),

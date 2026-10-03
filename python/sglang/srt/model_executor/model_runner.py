@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1683,6 +1684,13 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def get_decode_attn_backend(self):
+        # Target verification and its mask/state updates belong to the decode
+        # lane. Draft workers install their own specialized attention backend.
+        if get_disagg().enable_pdmux and not self.is_draft_worker:
+            return self.decode_attn_backend
+        return self.attn_backend
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -1868,13 +1876,19 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            # Draft graphs are captured on ordinary streams, rather than the
+            # scheduler's green-context partitions. Keep PDMux drafts eager.
+            pdmux_draft = self.is_draft_worker and get_disagg().enable_pdmux
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                split_forward_count is None
+                and not forward_batch.forward_mode.is_split_prefill()
+                and not pdmux_draft
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1924,7 +1938,8 @@ class ModelRunner:
                     ),
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not pdmux_draft
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
