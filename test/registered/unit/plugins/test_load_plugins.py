@@ -3,7 +3,8 @@ Unit tests for the plugin loading flow.
 
 Covers: idempotency, apply_hooks invocation, exception resilience,
 SGLANG_PLUGINS whitelist, SGLANG_PLATFORM exclusion logic,
-and _current_plugin_source context var reset.
+_current_plugin_source context var reset, and the
+FOUNDRY_GRAPH_EXTENSION_CONFIG requires-plugin check.
 
 Run:  python -m pytest test/registered/unit/plugins/test_load_plugins.py -v
 """
@@ -61,6 +62,7 @@ class TestLoadPlugins(CustomTestCase):
         """Second call is a no-op; first call invokes apply_hooks."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get.return_value = None
 
         load_plugins()
         self.assertEqual(mock_registry.apply_hooks.call_count, 1)
@@ -75,6 +77,7 @@ class TestLoadPlugins(CustomTestCase):
         """A failing plugin should not prevent others from loading."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get.return_value = None
 
         def bad_plugin():
             raise RuntimeError("boom")
@@ -153,6 +156,7 @@ class TestLoadPlugins(CustomTestCase):
         mock_eps.return_value = [_make_ep("spy", load_fn=spy_plugin)]
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get.return_value = None
 
         load_plugins()
         # During execution: source was set (not None)
@@ -171,6 +175,7 @@ class TestLoadPlugins(CustomTestCase):
         """_current_plugin_source is reset to None even when a plugin raises."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get.return_value = None
 
         def bad_plugin():
             raise RuntimeError("boom")
@@ -179,6 +184,31 @@ class TestLoadPlugins(CustomTestCase):
 
         load_plugins()
         self.assertIsNone(_current_plugin_source.get())
+
+    @patch("sglang.srt.plugins.HookRegistry")
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_foundry_config_requires_foundry_plugin(
+        self, mock_eps, mock_envs, mock_registry
+    ):
+        """FOUNDRY_GRAPH_EXTENSION_CONFIG without a loaded 'foundry' plugin
+        raises before any plugin runs; with it, loading proceeds."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get.return_value = "/tmp/f.toml"
+        other_fn, foundry_fn = MagicMock(), MagicMock()
+
+        mock_eps.return_value = [_make_ep("other", load_fn=other_fn)]
+        with self.assertRaisesRegex(ValueError, "FOUNDRY_GRAPH_EXTENSION_CONFIG"):
+            load_plugins()
+        other_fn.assert_not_called()
+        mock_registry.apply_hooks.assert_not_called()
+
+        _reset_plugins_loaded()
+        mock_eps.return_value.append(_make_ep("foundry", load_fn=foundry_fn))
+        load_plugins()
+        foundry_fn.assert_called_once()
+        mock_registry.apply_hooks.assert_called_once()
 
 
 if __name__ == "__main__":
