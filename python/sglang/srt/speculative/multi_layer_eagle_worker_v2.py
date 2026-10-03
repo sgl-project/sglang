@@ -84,6 +84,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
     get_plan_stream,
+    lm_head_is_packed,
     sample_draft_proposal,
     select_top_k_tokens,
 )
@@ -359,6 +360,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def init_lm_head(self):
         target_runner = self.target_worker.model_runner
+        if lm_head_is_packed(getattr(target_runner.model, "lm_head", None)):
+            raise ValueError(
+                "The target lm_head stores its weight packed; multi-layer EAGLE "
+                "shares the head tensor only."
+            )
         # Share the embedding and lm_head
         for i in range(self.speculative_num_steps):
             embed, head = resolve_draft_embed_and_head(
