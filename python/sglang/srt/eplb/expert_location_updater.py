@@ -32,6 +32,22 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
+_NCCL_DTYPE_ALIAS = {
+    torch.uint16: torch.bfloat16,
+}
+
+
+def _comm_view(t: torch.Tensor) -> torch.Tensor:
+    """Return a NCCL-friendly view of `t` for P2P send/recv. If the dtype is
+    in `_NCCL_DTYPE_ALIAS`, reinterpret as the aliased signed integer type;
+    otherwise return `t` unchanged. The underlying storage is shared, so
+    after irecv the original-dtype tensor reads the correct bytes."""
+    alias = _NCCL_DTYPE_ALIAS.get(t.dtype)
+    if alias is None:
+        return t
+    return t.view(alias)
+
+
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 
 
@@ -354,7 +370,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=_comm_view(
+                            _get_tensor(temp_buffers, i, dst_expert_location)
+                        ),
                         peer=src_rank,
                     )
                     for i in range(num_tensors)
@@ -402,8 +420,8 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
+                        tensor=_comm_view(
+                            _get_tensor(routed_experts_weights, i, src_expert_location)
                         ),
                         peer=dst_rank,
                     )
