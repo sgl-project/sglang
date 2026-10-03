@@ -128,67 +128,6 @@ class TestKeepCheckpointMapped(unittest.TestCase):
             )
 
 
-class TestComponentOffloadKeepsCheckpointMapping(unittest.TestCase):
-    """A checkpoint-mapped weight must still be file-backed after a
-    component-offload GPU round trip; a swap-out that copies it into fresh
-    anonymous host memory destroys the mapping for good (H3's video VAE)."""
-
-    @unittest.skipUnless(
-        torch.cuda.is_available(), "component offload swaps to a CUDA device"
-    )
-    def test_round_trip_stays_host_mapped(self):
-        import os
-
-        from safetensors.torch import load_file, save_file
-
-        from sglang.multimodal_gen.runtime.loader.utils import (
-            MappedRegions,
-            component_residency_bytes,
-        )
-        from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-            ComponentUse,
-            ResidencyState,
-        )
-        from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
-            ComponentOffloadStrategy,
-        )
-        from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
-            HostPinBudget,
-        )
-
-        module = nn.Linear(16, 16, bias=True)
-        with TemporaryDirectory() as root:
-            checkpoint = os.path.join(root, "vae.safetensors")
-            save_file(
-                {"weight": torch.randn(16, 16), "bias": torch.randn(16)}, checkpoint
-            )
-            module.load_state_dict(load_file(checkpoint), assign=True)
-            self.assertTrue(
-                MappedRegions().holds(module.weight),
-                "precondition: assign=True must leave the weight file-backed",
-            )
-
-            strategy = ComponentOffloadStrategy(
-                component_name="vae", pin_budget=HostPinBudget()
-            )
-            use = ComponentUse(stage_name="DecodingStage", component_name="vae")
-            state = ResidencyState()
-
-            strategy.prepare_for_use(module, use, state)
-            strategy.wait_for_use(module, use, state)
-            self.assertEqual(module.weight.device.type, "cuda")
-            strategy.finish_use(module, use, state)
-            torch.cuda.synchronize()
-
-            totals = component_residency_bytes(module)
-            self.assertGreater(
-                totals["host_mapped"],
-                0,
-                "swap-out replaced the checkpoint mapping with host copies",
-            )
-            self.assertEqual(totals["host"] + totals["host_pinned"], 0)
-
-
 class TestMatchCheckpointDtypes(CustomTestCase):
     """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
 
@@ -708,59 +647,26 @@ class TestVAELoader(unittest.TestCase):
         self.assertNotIn("latents_mean", loaded)
         self.assertNotIn("latents_std", loaded)
 
-    def test_channels_last_3d_defaults_true_for_qwen_image_on_cuda(self):
+    def test_channels_last_3d_cuda_model_defaults(self):
+        cases = [
+            (QwenImagePipelineConfig, 1, "vae", True),
+            (WanT2V480PConfig, 1, "video_vae", True),
+            (FastWan2_2_TI2V_5B_Config, 1, "video_vae", True),
+            (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
+            (LTX2PipelineConfig, 1, "video_vae", True),
+            (LTX2PipelineConfig, 2, "video_vae", False),
+        ]
         with (
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(QwenImagePipelineConfig())
-            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(WanT2V480PConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_fast_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(FastWan2_2_TI2V_5B_Config(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
+            for config_cls, num_gpus, component, expected in cases:
+                with self.subTest(config=config_cls.__name__, num_gpus=num_gpus):
+                    server_args = _FakeServerArgs(config_cls(), num_gpus=num_gpus)
+                    self.assertEqual(
+                        _should_use_channels_last_3d(server_args, component), expected
+                    )
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (
@@ -808,9 +714,20 @@ class TestVAELoader(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=False),
         ):
             server_args = _FakeServerArgs(QwenImagePipelineConfig())
             self.assertFalse(_should_use_channels_last_3d(server_args, "vae"))
+
+    def test_channels_last_3d_selected_on_xpu(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=True),
+        ):
+            server_args = _FakeServerArgs(QwenImagePipelineConfig())
+            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
@@ -824,10 +741,29 @@ class TestVAELoader(unittest.TestCase):
         with (
             patch.object(wanvae.current_platform, "is_cuda", return_value=False),
             patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_uses_channels_last_3d_on_xpu(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=True),
+        ):
+            out = wanvae.match_conv3d_input_format(x, weight)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"

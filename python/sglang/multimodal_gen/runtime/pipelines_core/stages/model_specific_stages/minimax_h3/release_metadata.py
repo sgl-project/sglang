@@ -131,7 +131,10 @@ class MiniMaxH3ReleaseMetadata:
                 f"task {task!r} is not served by MiniMax H3 partition {self.partition!r}; "
                 f"supported tasks: {list(self.tasks)!r}"
             )
-        if partition_for_task(canonical) != self.partition:
+        if (
+            self.partition != "hybrid"
+            and partition_for_task(canonical) != self.partition
+        ):
             raise ValueError(
                 f"task {task!r} resolves outside partition {self.partition!r}"
             )

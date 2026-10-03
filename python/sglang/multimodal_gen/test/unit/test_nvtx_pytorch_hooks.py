@@ -20,9 +20,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
     ResidentStrategy,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
-    HostPinBudget,
-)
 from sglang.multimodal_gen.runtime.utils import nvtx_pytorch_hooks
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
     DiffusionNvtxHooks,
@@ -229,9 +226,7 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
         self.assertTrue(manager._should_keep_single_dit("transformer", module))
 
         manager.strategy_for = lambda _component_name, _module: (
-            ComponentOffloadStrategy(
-                component_name="transformer", pin_budget=HostPinBudget()
-            )
+            ComponentOffloadStrategy()
         )
         self.assertFalse(manager._should_keep_single_dit("transformer", module))
 

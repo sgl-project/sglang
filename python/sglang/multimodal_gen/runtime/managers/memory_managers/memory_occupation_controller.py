@@ -4,11 +4,11 @@ import gc
 
 import torch
 
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
-    component_offload_host_store,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
@@ -81,17 +81,7 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
             attrs[attr_name] = moved_value
 
 
-def _release_if_offload_managed(module: torch.nn.Module) -> bool:
-    """True when an offload store owns this module's weights.
-
-    Their weights already rest on the host; a store still loaded at sleep
-    time (a warmup-kept component) just drops its device copies.
-    """
-    store = component_offload_host_store(module)
-    if store is not None:
-        if store.loaded:
-            store.release()
-        return True
+def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
     return is_layerwise_offloaded_module(module)
 
 
@@ -145,7 +135,8 @@ class MemoryOccupationController:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
                 if device.startswith("cpu"):
-                    _module_to_pinned_cpu(module)
+                    if not restore_weight_snapshot(module):
+                        _module_to_pinned_cpu(module)
                 else:
                     module.to(device, non_blocking=True)
                 moved.append(name)
@@ -167,7 +158,7 @@ class MemoryOccupationController:
     def _offload_active_modules_to_cpu(self) -> dict[str, str]:
         restore_map: dict[str, str] = {}
         for name, module in get_updatable_modules(self.pipeline).items():
-            if _release_if_offload_managed(module):
+            if _is_layerwise_offload_managed(module):
                 continue
             device = _get_module_device(module)
             if not device.startswith("cpu"):

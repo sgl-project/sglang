@@ -46,6 +46,9 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -54,11 +57,11 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
-    component_offload_host_store,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
@@ -188,6 +191,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     and returns an HTTP error.
     """
     with torch.inference_mode():
+        restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
@@ -197,20 +201,17 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
                 m for m in module.layerwise_offload_managers if m.enabled
             ]
 
-        host_store = component_offload_host_store(module)
-        if offload_managers or host_store is not None:
+        if offload_managers:
             entries = list(weights_iter)
             if any(shard_id is not None for _, _, shard_id in entries):
                 raise NotImplementedError(
                     "Fused-parameter weight updates are not supported for "
-                    "offloaded modules."
+                    "layerwise-offloaded modules."
                 )
             weight_dict = {n: w for n, w, _ in entries}
             offloaded_names: set[str] = set()
             for manager in offload_managers:
                 offloaded_names.update(manager.update_cpu_weights(weight_dict))
-            if host_store is not None:
-                offloaded_names.update(host_store.update_host_weights(weight_dict))
             remaining = (
                 (n, w) for n, w in weight_dict.items() if n not in offloaded_names
             )
@@ -371,6 +372,7 @@ class WeightsUpdater:
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Update model weights from disk without restarting the server."""
+        invalidate_conditioning_caches()
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -533,6 +535,7 @@ class WeightsUpdater:
         lora_alpha: int | None = None,
         lora_rank: int | None = None,
     ) -> tuple[bool, str]:
+        invalidate_conditioning_caches()
         if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
             return self._update_lora_from_tensor(
                 named_tensors=named_tensors,

@@ -248,17 +248,6 @@ class TestHostPinBudget:
         budget = HostPinBudget(available_bytes=800 * GIB_BYTES, node_local_ranks=8)
         assert budget.reserve_bytes == 5 * GIB_BYTES
 
-    def test_shared_pool_does_not_pin_on_any_rank(self, monkeypatch):
-        monkeypatch.setattr(
-            host_memory_budget.current_platform,
-            "device_shares_host_memory",
-            lambda: True,
-        )
-        for ranks in (1, 4):
-            budget = HostPinBudget(node_local_ranks=ranks)
-            assert budget.available_bytes == 0
-            assert not budget.request(component_name="dit", weight_bytes=GIB_BYTES)
-
 
 class TestModuleWeightBytes:
     def test_parameters_and_buffers_are_counted(self):
@@ -331,4 +320,31 @@ def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
     larger = host_memory_budget.host_memory_available_bytes()
     assert abs((larger - available) - 32 * 1024**3) < 512 * 1024**2, (
         "the same process on a machine twice the size has one machine more room"
+    )
+
+
+def test_the_physical_reading_ignores_the_forced_host_view(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        host_memory_budget.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=200 * host_memory_budget.GIB_BYTES),
+    )
+    monkeypatch.setattr(
+        host_memory_budget, "cgroup_memory_limit_bytes", lambda *a, **k: None
+    )
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+    # the pretend host sizes our own copies ...
+    assert (
+        host_memory_budget.host_memory_available_bytes()
+        <= 32 * host_memory_budget.GIB_BYTES
+    )
+    # ... but not what the kernel's page cache can hold
+    assert (
+        host_memory_budget.physical_host_memory_available_bytes()
+        == 200 * host_memory_budget.GIB_BYTES
+    )
+    assert not host_memory_budget.page_cache_cannot_hold(
+        45 * host_memory_budget.GIB_BYTES
     )
