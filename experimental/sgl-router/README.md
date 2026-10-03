@@ -108,7 +108,9 @@ is common with parallel sampling, RL rollouts and agent fan-out.
 `--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
 long after routing it there, so the burst stays together. It is off by default
 and needs `--policy cache_aware` with the Router-local radix tree.
-`sgl_router_cache_pending_prefix_hits_total` counts the lookups it decided.
+`sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
+prefix matched deeper than any confirmed one; the policy's candidate and
+admission filters still decide whether that worker is picked.
 
 ### Peer bootstrap (Kubernetes)
 

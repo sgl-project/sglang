@@ -58,7 +58,7 @@ impl RadixTreePrefixProvider {
         Some(ExternalPrefixSignal {
             outcome,
             query_blocks: hashes.len(),
-            block_hashes: Some(hashes.into()),
+            block_hashes: self.tree.pending().is_enabled().then(|| hashes.into()),
         })
     }
 
