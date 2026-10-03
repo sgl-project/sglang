@@ -196,7 +196,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         )
 
 
-def _run_mla(element_dim: int, page_count: int) -> None:
+def _run_mla(element_dim: int, page_count: int, num_layers: int = NUM_LAYERS) -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MLATokenToKVPool(
         size=pool_size,
@@ -204,7 +204,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         kv_lora_rank=element_dim - 64,
         qk_rope_head_dim=64,
         dtype=torch.bfloat16,
-        layer_num=NUM_LAYERS,
+        layer_num=num_layers,
         device=DEVICE,
         enable_memory_saver=False,
     )
@@ -216,7 +216,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
     )
     assert host_pool.can_use_write_back_jit
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
@@ -230,7 +230,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
     )
     torch.cuda.synchronize()
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _assert_pages_equal(
             host_pool.data_refs[layer_id],
             device_pool.kv_buffer[layer_id],
@@ -240,19 +240,19 @@ def _run_mla(element_dim: int, page_count: int) -> None:
 
     if not host_pool.can_use_jit:
         return
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         device_pool.kv_buffer[layer_id].zero_()
 
     load_pages = torch.arange(1, 1 + page_count, device=DEVICE, dtype=torch.int64)
     load_indices = _token_indices_for_pages(load_pages)
     host_indices_device = host_indices.to(DEVICE)
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         host_pool.load_to_device_per_layer(
             device_pool, host_indices_device, load_indices, layer_id, "kernel"
         )
     torch.cuda.synchronize()
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _assert_pages_equal(
             host_pool.data_refs[layer_id],
             device_pool.kv_buffer[layer_id],
@@ -271,6 +271,23 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+@pytest.mark.skipif(is_hip(), reason="cudaMemcpyBatchAsync write-back is CUDA-only.")
+@pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
+@pytest.mark.parametrize("page_count", PAGE_COUNTS)
+def test_page_first_staged_write_back_mla_batch_copy(
+    element_dim: int, page_count: int
+) -> None:
+    layer_page_bytes = PAGE_SIZE * element_dim * torch.bfloat16.itemsize
+    # Enough layers for a page to reach kLargeCopyThresholdBytes (128 KiB) in
+    # staged_write_back.cuh, where write-back switches to cudaMemcpyBatchAsync.
+    num_layers = -(-128 * 1024 // layer_page_bytes)
+    # cudaMemcpyBatchAsync rejects the legacy default stream, which would send
+    # the copy to the per-page fallback; L2TransferEngine writes back on its own
+    # device-to-host stream.
+    with torch.cuda.stream(torch.cuda.Stream()):
+        _run_mla(element_dim, page_count, num_layers)
 
 
 @pytest.mark.skipif(
