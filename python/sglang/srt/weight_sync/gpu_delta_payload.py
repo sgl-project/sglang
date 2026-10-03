@@ -13,41 +13,30 @@
 
 """Immutable delta transport validation; never reads or mutates weights."""
 
-import re
+import os
 import time
 
 
-def outer_zstd_profile(manifest):
-    """Select the authenticated envelope contract, independent of local env vars."""
-    version, profile = (
-        manifest.get("protocol_version"),
-        manifest.get("codec_profile", ""),
-    )
+def configured_codec():
+    """Freeze the launch constraint when the scheduler admits a delta backend."""
+    codec = os.environ.get("WEIGHT_DELTA_CODEC", "snappy-zstd")
+    if codec != "snappy-zstd":
+        raise ValueError("WEIGHT_DELTA_CODEC must be snappy-zstd")
+    return codec
+
+
+def validate_codec(manifest, expected):
+    """Authenticate the one wire format before examining any tensor payload."""
     if (
-        type(version) is int
-        and version == 2
-        and isinstance(profile, str)
-        and re.fullmatch(r"zstd-independent-(64kib|1mib|2mib)-v1", profile)
+        type(manifest.get("protocol_version")) is not int
+        or manifest["protocol_version"] != 4
+        or manifest.get("codec") != expected
+        or expected != "snappy-zstd"
+        or "codec_profile" in manifest
+        or type(manifest.get("frame_bytes")) is not int
+        or manifest["frame_bytes"] not in {1 << 16, 1 << 20}
     ):
-        return None
-    if (
-        type(version) is int
-        and version == 3
-        and isinstance(profile, str)
-        and re.fullmatch(r"snappy-independent-(64kib|1mib|2mib)-zstd-v1", profile)
-    ):
-        return "cpu"
-    if (
-        type(version) is int
-        and version == 4
-        and isinstance(profile, str)
-        and re.fullmatch(r"snappy-independent-(64kib|1mib|2mib)-gpu-zstd-v1", profile)
-    ):
-        return "gpu"
-    raise ValueError(
-        "unsupported direct-delta protocol/profile: Snappy requires protocol 3 "
-        "CPU or protocol 4 GPU Zstd envelopes; plain Zstd uses protocol 2"
-    )
+        raise ValueError("GPU delta requires protocol 4 with codec snappy-zstd")
 
 
 def raw_payload_range(entry, files):
@@ -94,35 +83,7 @@ def _reject_overlapping_ranges(ranges):
             end = stop
 
 
-def validate_plain_entries(entries, files):
-    """Check raw ranges against the absolute frame ranges of plain Zstd."""
-    ranges = {name: [] for name in files}
-    for entry in entries:
-        if entry["encoding"] == "raw_bytes":
-            payload_range = raw_payload_range(entry, files)
-            if payload_range is not None:
-                name, start, stop = payload_range
-                ranges[name].append((start, stop))
-            continue
-        if entry["encoding"] != "xor_bytes" or "raw" in entry or "outer" in entry:
-            raise ValueError("compressed tensor has an unexpected payload descriptor")
-        for frame in entry["frames"]:
-            name, start, size = (
-                frame[k] for k in ("file", "encoded_offset", "encoded_bytes")
-            )
-            if (
-                name not in files
-                or any(type(v) is not int for v in (start, size))
-                or start < 0
-                or size <= 0
-                or start + size > files[name]
-            ):
-                raise ValueError("encoded frame exceeds immutable payload")
-            ranges[name].append((start, start + size))
-    _reject_overlapping_ranges(ranges)
-
-
-def validate_outer_entries(entries, files, *, gpu=False):
+def validate_outer_entries(entries, files, frame_bytes):
     """Bound reconstructed spans before allocation, including foreign EP tensors."""
     ranges = {name: [] for name in files}
     for entry in entries:
@@ -139,9 +100,7 @@ def validate_outer_entries(entries, files, *, gpu=False):
             if "outer" in entry:
                 raise ValueError("empty tensor must omit the outer envelope")
             continue
-        fields = {"codec", "file", "encoded_offset", "encoded_bytes", "decoded_bytes"}
-        if gpu:
-            fields.add("frames")
+        fields = {"file", "encoded_offset", "encoded_bytes", "decoded_bytes", "frames"}
         if not isinstance(outer, dict) or set(outer) != fields:
             raise ValueError("invalid outer Zstd descriptor")
         name = outer["file"]
@@ -149,8 +108,7 @@ def validate_outer_entries(entries, files, *, gpu=False):
             outer[k] for k in ("encoded_offset", "encoded_bytes", "decoded_bytes")
         )
         if (
-            outer["codec"] != "zstd"
-            or name not in files
+            name not in files
             or any(type(v) is not int for v in (start, count, size))
             or start < 0
             or count <= 0
@@ -158,10 +116,16 @@ def validate_outer_entries(entries, files, *, gpu=False):
             or start + count > files[name]
         ):
             raise ValueError("outer Zstd descriptor exceeds immutable payload")
-        if gpu:
-            _validate_gpu_outer_frames(outer)
+        _validate_outer_frames(outer)
         end = decoded_end = 0
         for frame in frames:
+            if not isinstance(frame, dict) or set(frame) != {
+                "encoded_offset",
+                "encoded_bytes",
+                "decoded_offset",
+                "decoded_bytes",
+            }:
+                raise ValueError("invalid relative inner Snappy frame")
             offset, encoded, decoded_offset, decoded = (
                 frame[k]
                 for k in (
@@ -172,17 +136,17 @@ def validate_outer_entries(entries, files, *, gpu=False):
                 )
             )
             if (
-                frame["file"] != name
-                or any(
+                any(
                     type(v) is not int
                     for v in (offset, encoded, decoded_offset, decoded)
                 )
                 or offset != (end + 15) // 16 * 16
-                or not 0 < encoded <= decoded <= 1 << 20
+                or not 0 < decoded <= 1 << 20
+                or not 0 < encoded <= 32 + decoded + decoded // 6
+                or decoded_offset % frame_bytes
+                or decoded != min(frame_bytes, entry["nbytes"] - decoded_offset)
                 or decoded_offset < decoded_end
                 or decoded_offset + decoded > entry["nbytes"]
-                or frame["codec"] not in {"snappy", "none"}
-                or (frame["codec"] == "none" and encoded != decoded)
             ):
                 raise ValueError("invalid relative inner Snappy frame")
             end, decoded_end = offset + encoded, decoded_offset + decoded
@@ -192,7 +156,7 @@ def validate_outer_entries(entries, files, *, gpu=False):
     _reject_overlapping_ranges(ranges)
 
 
-def _validate_gpu_outer_frames(outer):
+def _validate_outer_frames(outer):
     """GPU Zstd chunks exactly cover one natural tensor's inner Snappy arena."""
     chunks = outer["frames"]
     if not isinstance(chunks, list) or not chunks:
@@ -230,7 +194,7 @@ def _validate_gpu_outer_frames(outer):
         raise ValueError("GPU outer Zstd chunks do not exactly cover their tensor")
 
 
-def validate_zstd_frame(payload, expected_size, *, gpu_chunk=False):
+def validate_zstd_frame(payload, expected_size):
     """Require one complete, bounded frame before streaming into pinned memory.
 
     Stream readers may return EOF on a truncated frame. The standard Zstd block
@@ -244,12 +208,9 @@ def validate_zstd_frame(payload, expected_size, *, gpu_chunk=False):
         raise ValueError("outer payload must contain one standard Zstd frame")
     parameters = zstd.get_frame_parameters(payload)
     if (
-        parameters.content_size
-        not in (
-            {expected_size, zstd.CONTENTSIZE_UNKNOWN} if gpu_chunk else {expected_size}
-        )
+        parameters.content_size not in {expected_size, zstd.CONTENTSIZE_UNKNOWN}
         or parameters.dict_id != 0
-        or parameters.window_size > ((1 << 20) if gpu_chunk else expected_size)
+        or parameters.window_size > (1 << 20)
     ):
         raise ValueError("outer Zstd content size/window/dictionary mismatch")
     position = zstd.frame_header_size(payload)
@@ -300,23 +261,13 @@ class OuterZstdReader:
             outer[k] for k in ("encoded_offset", "encoded_bytes", "decoded_bytes")
         )
         payload = memoryview(self.files[outer["file"]])[start : start + count]
-        chunks = outer.get("frames")
-        if chunks is None:
-            chunks = [
-                dict(
-                    encoded_offset=0,
-                    encoded_bytes=count,
-                    decoded_offset=0,
-                    decoded_bytes=size,
-                )
-            ]
+        chunks = outer["frames"]
         started = time.perf_counter()
         for chunk in chunks:
             offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
             validate_zstd_frame(
                 payload[offset : offset + length],
                 chunk["decoded_bytes"],
-                gpu_chunk="frames" in outer,
             )
         self.timings["host_outer_zstd_validate_s"] += time.perf_counter() - started
         started = time.perf_counter()

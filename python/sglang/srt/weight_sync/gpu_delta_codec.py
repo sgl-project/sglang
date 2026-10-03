@@ -15,10 +15,6 @@ from typing import Sequence
 import torch
 
 
-class _ZstdOptions(ctypes.Structure):
-    _fields_ = [("backend", ctypes.c_int), ("reserved", ctypes.c_char * 60)]
-
-
 class _SnappyOptions(ctypes.Structure):
     _fields_ = [
         ("backend", ctypes.c_int),
@@ -74,16 +70,13 @@ def _require_hardware_allocator(device: torch.device) -> None:
 
 
 class NvcompDecoder:
-    """One device's qualified Zstd/SM or Snappy/hardware decoder.
+    """One device's qualified Snappy hardware decoder.
 
     Missing libraries and unsupported hardware fail admission. There is no CPU
     decoder, algorithm substitution or software Snappy fallback.
     """
 
-    def __init__(self, codec: str, device: torch.device):
-        if codec not in ("zstd", "snappy"):
-            raise ValueError(f"Unsupported nvCOMP delta codec: {codec}")
-        self.codec = codec
+    def __init__(self, device: torch.device):
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("Delta decoder requires an explicit CUDA device")
@@ -97,26 +90,22 @@ class NvcompDecoder:
         if not (5, 3) <= version < (6, 0) or ctypes.sizeof(ctypes.c_size_t) != 8:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 5.3+ ABI")
         self.version = distribution.version
-        self.backend = "hardware" if codec == "snappy" else "cuda"
-        options = _SnappyOptions if codec == "snappy" else _ZstdOptions
-        self._options = options()
+        self.backend = "hardware"
+        self._options = _SnappyOptions()
         # Explicit backend selection: DEFAULT can silently select software.
-        self._options.backend = 1 if codec == "snappy" else 2
-        if codec == "snappy":
-            if torch.cuda.get_device_capability(self.device)[0] < 10:
-                raise RuntimeError(
-                    "Snappy deltas require Blackwell hardware decompression"
-                )
-            _require_hardware_allocator(self.device)
+        self._options.backend = 1
+        if torch.cuda.get_device_capability(self.device)[0] < 10:
+            raise RuntimeError("Snappy deltas require Blackwell hardware decompression")
+        _require_hardware_allocator(self.device)
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
         )
         pointer, size = ctypes.c_void_p, ctypes.c_size_t
         self._temporary = self._bind(
-            "GetTempSizeAsync", [size, size, options, ctypes.POINTER(size), size]
+            "GetTempSizeAsync", [size, size, _SnappyOptions, ctypes.POINTER(size), size]
         )
         self._align = self._bind(
-            "GetRequiredAlignments", [options, ctypes.POINTER(_Alignments)]
+            "GetRequiredAlignments", [_SnappyOptions, ctypes.POINTER(_Alignments)]
         )
         self._decode = self._bind(
             "Async",
@@ -129,7 +118,7 @@ class NvcompDecoder:
                 pointer,
                 size,
                 pointer,
-                options,
+                _SnappyOptions,
                 pointer,
                 pointer,
             ],
@@ -140,16 +129,14 @@ class NvcompDecoder:
     def _bind(self, suffix, arguments):
         function = getattr(
             self._library,
-            "nvcompBatched" + self.codec.capitalize() + "Decompress" + suffix,
+            "nvcompBatchedSnappyDecompress" + suffix,
         )
         function.argtypes, function.restype = arguments, ctypes.c_int
         return function
 
     def _check(self, status):
         if status != 0:
-            raise RuntimeError(
-                f"nvCOMP {self.codec}/{self.backend} failed: status={status}"
-            )
+            raise RuntimeError(f"nvCOMP snappy/{self.backend} failed: status={status}")
 
     def temporary_bytes(self, frames: Sequence[DecodeFrame]) -> int:
         if not frames:
@@ -239,7 +226,9 @@ class NvcompDecoder:
                 raise ValueError("Misaligned decoded frame")
             prior_output_end = frame.output_offset + frame.decoded_bytes
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
-            host = torch.empty((4, len(frames)), dtype=torch.int64, pin_memory=True)
+            host = torch.empty(
+                (4, len(frames)), dtype=torch.int64, device="cpu", pin_memory=True
+            )
             host.numpy()[:] = [
                 [encoded.data_ptr() + f.input_offset for f in frames],
                 [f.encoded_bytes for f in frames],

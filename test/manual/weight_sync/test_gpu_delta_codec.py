@@ -2,7 +2,7 @@
 
 Manual-only: requires Blackwell, the paired Miles image, nvCOMP 5.3,
 zstandard, and python-snappy. Missing hardware or dependencies fail this suite.
-Both codecs decode the same bytes. Tests intentionally never feed malformed
+The hardware decoder preserves known bytes. Tests intentionally never feed malformed
 compressed streams to the GPU decoder.
 """
 
@@ -14,15 +14,10 @@ import torch
 from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
 
 
-def _encode(codec, values):
-    if codec == "zstd":
-        import zstandard
+def _encode(values):
+    import snappy
 
-        compress = zstandard.ZstdCompressor(level=1).compress
-    else:
-        import snappy
-
-        compress = snappy.compress
+    compress = snappy.compress
     payload = bytearray()
     frames = []
     offset = 0
@@ -35,14 +30,13 @@ def _encode(codec, values):
     return payload, frames
 
 
-@pytest.mark.parametrize("codec", ["zstd", "snappy"])
-def test_same_delta_decode_and_reuse(codec):
+def test_same_delta_decode_and_reuse():
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(codec, device)
+    decoder = NvcompDecoder(device)
     # Partial final frame, many zero bytes, and valid nonzero XOR values.
     values = [bytes(1 << 20), bytes(range(256)) * 4096, bytes(range(253)) * 3]
-    payload, frames = _encode(codec, values)
-    host = torch.empty(len(payload), dtype=torch.uint8, pin_memory=True)
+    payload, frames = _encode(values)
+    host = torch.empty(len(payload), dtype=torch.uint8, device="cpu", pin_memory=True)
     host.numpy()[:] = memoryview(payload)
     stream = torch.cuda.Stream(device=device)
     encoded = torch.empty_like(host, device=device)
@@ -62,12 +56,12 @@ def test_same_delta_decode_and_reuse(codec):
             assert plan.statuses.tolist() == [0] * len(frames)
             assert plan.actual_sizes.tolist() == list(map(len, values))
             assert bytes(decoded.cpu().numpy()) == b"".join(values)
-    assert decoder.backend == ("hardware" if codec == "snappy" else "cuda")
+    assert decoder.backend == "hardware"
 
 
 def test_rejects_frame_range_before_decode():
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder("zstd", device)
+    decoder = NvcompDecoder(device)
     encoded = torch.empty(256, dtype=torch.uint8, device=device)
     decoded = torch.empty(256, dtype=torch.uint8, device=device)
     stream = torch.cuda.Stream(device=device)

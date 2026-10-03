@@ -21,7 +21,7 @@ it does not require nvCOMP.
 
 The codec suite is manual-only because registered CI does not provision its
 prebuilt nvCOMP dependency. It requires Blackwell, `nvidia-libnvcomp-cu13==5.3.0.16`,
-`zstandard` and `python-snappy`. It compares both GPU decoders with identical
+`zstandard` and `python-snappy`. It checks hardware Snappy decoding against
 known input bytes, reusing a bounded encoded tensor buffer. No malformed compressed
 streams are sent to nvCOMP. Missing hardware or dependencies fail the manual
 suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and derived
@@ -32,32 +32,33 @@ buffers and constructs descriptors without reading weights or stopping serving.
 Preparation reserves the largest required encoded/decoded tensor arenas. During
 apply, each required matrix tensor is uploaded from pinned host memory, decoded and
 applied before reusing those arenas. There is no staging selector or full-publication
-HBM copy. Snappy and Zstd profiles may contain raw frames when compression expands
-individual inputs. After every original rank is prepared, the coordinator retracts generation and waits for actual
+HBM copy. Every retained changed matrix frame is Snappy, including inputs whose
+compressed representation expands; there is no raw-frame fallback. After every original rank is prepared, the coordinator retracts generation and waits for actual
 `QUIESCED` receipts. Only then does `update_weights_from_delta` mutate weights.
 All original engines must commit before any resumes. A failure after possible
 mutation poisons the session and requires a fresh engine; no rollback is promised.
 
-Snappy matrix deltas use protocol 3 with a CPU Zstd envelope around each tensor's
-Snappy bytes (`snappy-independent-*-zstd-v1`). CPU and GPU producers emit the same
-format; plain Snappy publications are rejected. Protocol 2 retains the ordinary
-Zstd transport (`zstd-independent-*-v1`). The immutable manifest selects the
-decoder, with no envelope setting or automatic fallback. Snappy owner files are
-SHA-256 checked once into pageable memory. The background preparation worker
-unwraps only local tensors directly into their final pinned buffers, using one
-reused Zstd context and caching a tensor shared by multiple local bindings.
-It validates exact frame extent, content size, inner offsets and output length
-before reporting `PREPARED`; malformed envelopes fail before any model mutation.
-Protocol 4 additionally admits GPU-produced outer Zstd chunks
-(`snappy-independent-*-gpu-zstd-v1`). Each natural tensor remains one descriptor;
-its independent chunks have at most 1 MiB output and exactly cover its aligned
-inner Snappy arena. The receiver always unwraps these on CPU directly into that
-same final pinned tensor buffer, with one reused Zstd context and no intermediate
-Snappy copy. It then uses the unchanged per-tensor H2D/hardware-Snappy apply path.
-There is no GPU outer decoder or full-Snappy HBM residency option on the receiver.
-Only the sender chooses the opt-in `WEIGHT_DELTA_SNAPPY_OUTER=gpu` path.
-GPU chunks may omit content size, but bounded window/output, exact encoded frame
-extent, and exact reconstructed size are checked before accepting the result.
+`WEIGHT_DELTA_CODEC=snappy-zstd` is the sole contract and the default. The
+receiver freezes it at backend admission, advertises it in its participant plan,
+and rejects any unsupported value. The sender and receiver must agree before a
+publication; manifest fields cannot override the launch constraint. Legacy codec
+values and removed encoder/outer selectors have no migration layer.
+
+Protocol 4 carries `codec="snappy-zstd"` and explicit `frame_bytes` (64 KiB or
+1 MiB). Matrix frames contain only input/output offsets and lengths, without
+redundant codec/file fields. Each natural tensor's outer descriptor names one
+immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
+covering its aligned Snappy arena. The sender computes both Snappy and outer Zstd
+on GPU; the receiver always unwraps Zstd on CPU directly into final pinned tensor
+buffers, then streams tensor Snappy bytes for hardware decoding and in-place apply.
+There is no GPU outer decoder, legacy protocol or automatic fallback.
+
+Owner files are SHA-256 checked once into pageable memory. The preparation worker
+unwraps only local tensors using one reused Zstd context and caches tensors shared
+by multiple local bindings. It validates chunk/frame extents, alignment, bounded
+window/output and exact decoded length before reporting `PREPARED`. GPU Zstd may
+omit content size; the bounded decoder output remains mandatory. Invalid envelopes
+fail before any model mutation. Full Snappy HBM residency is not supported.
 
 Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
@@ -75,7 +76,7 @@ the same poisoned-session behavior. The matrix streaming path is unchanged.
 `host_outer_zstd_decode_s` separate envelope validation, pinned allocation and CPU
 decode. Encoded/decoded byte and tensor counts use the same `host_outer_zstd_`
 prefix and count each reconstructed local tensor once. `host_outer_zstd_frames`
-counts outer chunks (one per natural tensor for protocol 3). These preparation costs
+counts outer chunks. These preparation costs
 are outside the explicit scheduler pause. Background work and pre-pause status
 handlers can still contend with serving; the pause metric does not measure that
 interference. Each rank still reads the small outer files;
@@ -93,7 +94,7 @@ Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
 The paired Miles feature contains `tests/manual/bench_gpu_delta.py`, which launches
-one EP8 engine and measures streaming Zstd and wrapped Snappy with the same persistent
+one EP8 engine and measures the snappy-zstd contract using persistent
 altered checkpoint and publications. `WEIGHT_DELTA_TIMING=1` enables
 phase events without synchronizing every tensor; correctness comparisons stay
 outside timed updates.

@@ -343,13 +343,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             stream_id="test", base_version=0, target_version=1, plan_digest="plan"
         )
         manifest = dict(
-            protocol_version=2,
-            codec_profile="zstd-independent-1mib-v1",
+            protocol_version=4,
+            codec="snappy-zstd",
+            frame_bytes=1 << 20,
             tensors=[{"name": name}],
             **metadata,
         )
         content = json.dumps(manifest).encode()
         backend = SimpleNamespace(
+            codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
                 inventory={name: {"dtype": "F32", "shape": []}},
@@ -370,76 +372,139 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     metadata,
                 )
 
-    def test_zstd_streaming_reuses_largest_tensor_buffer_and_accepts_raw_frames(self):
-        # Mock only CUDA allocation/stream boundaries. Raw-frame copies and
-        # in-place XOR still exercise real Torch tensors and publication parsing.
-        targets = [torch.zeros(shape, dtype=torch.uint8) for shape in ((2, 4), (3, 4))]
-        bindings = [
+    def test_snappy_streaming_unwraps_only_local_tensors_and_reuses_scratch(self):
+        import zstandard as zstd
+
+        targets = [torch.zeros(2, size, dtype=torch.uint8) for size in (4, 6)]
+        local = [
             layout._direct_binding(str(i), {"dtype": "U8", "shape": list(t.shape)}, t)
             for i, t in enumerate(targets)
         ]
-        definitions = [b.describe() for b in bindings]
-        payload = bytes(range(8)) + bytes(24) + bytes(range(12))
+        foreign = layout._direct_binding(
+            "foreign",
+            {"dtype": "U8", "shape": [3, 4]},
+            torch.zeros(3, 4, dtype=torch.uint8),
+        )
+        definitions = [b.describe() for b in (*local, foreign)]
+        blobs, entries, records = {}, [], []
+        for binding in (*local, foreign):
+            name, size = binding.name, binding.storage[0].numel()
+            # A valid Snappy literal block expands these tiny matrix frames.
+            # Only the CUDA decoder is mocked below; CPU Zstd and file checks run.
+            inner = bytes([size, (size - 1) << 2]) + bytes(range(size))
+            blob = zstd.ZstdCompressor().compress(inner)
+            if name == "foreign":
+                blob = b"not-a-zstd-frame"  # Foreign EP data is never unwrapped.
+            blobs[name] = blob
+            file = name + ".bin"
+            entries.append(
+                binding.describe()
+                | {
+                    "byte_order": "little",
+                    "nbytes": size,
+                    "outer": dict(
+                        file=file,
+                        encoded_offset=0,
+                        encoded_bytes=len(blob),
+                        decoded_bytes=len(inner),
+                        frames=[
+                            dict(
+                                encoded_offset=0,
+                                encoded_bytes=len(blob),
+                                decoded_offset=0,
+                                decoded_bytes=len(inner),
+                            )
+                        ],
+                    ),
+                    "frames": [
+                        dict(
+                            encoded_offset=0,
+                            encoded_bytes=len(inner),
+                            decoded_offset=0,
+                            decoded_bytes=size,
+                        )
+                    ],
+                }
+            )
+            records.append(
+                dict(
+                    name=file,
+                    nbytes=len(blob),
+                    sha256=layout.hashlib.sha256(blob).hexdigest(),
+                )
+            )
         metadata = dict(
             stream_id="test",
             base_version=0,
             target_version=1,
             plan_digest=layout._digest(definitions),
         )
-        entries = []
-        for definition, offset, target in zip(definitions, (0, 32), targets):
-            entries.append(
-                definition
-                | {
-                    "byte_order": "little",
-                    "nbytes": target.numel(),
-                    "frames": [
-                        {
-                            "file": "owner.bin",
-                            "encoded_offset": offset,
-                            "encoded_bytes": target.numel(),
-                            "decoded_offset": 0,
-                            "decoded_bytes": target.numel(),
-                            "codec": "none",
-                        }
-                    ],
-                }
-            )
         manifest = dict(
-            protocol_version=2,
-            codec_profile="zstd-independent-1mib-v1",
+            protocol_version=4,
+            codec="snappy-zstd",
+            frame_bytes=1 << 20,
             tensors=entries,
-            files=[
-                {
-                    "name": "owner.bin",
-                    "nbytes": len(payload),
-                    "sha256": layout.hashlib.sha256(payload).hexdigest(),
-                }
-            ],
+            files=records,
             **metadata,
         )
         backend = SimpleNamespace(
+            codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
-                bindings=bindings,
-                excluded={},
-                derived=[],
+                bindings=[local[0], local[0], local[1]],
                 inventory={
-                    b.name: {"dtype": b.dtype, "shape": list(b.shape)} for b in bindings
+                    b.name: {"dtype": b.dtype, "shape": list(b.shape)}
+                    for b in (*local, foreign)
                 },
+                excluded={"foreign": "expert owned by another EP rank"},
+                derived=[],
             ),
         )
+
+        class CpuLiteralDecoder:
+            # Explicit CPU test substitute; this does not qualify nvCOMP/CUDA.
+            def __init__(self, device):
+                self.device = device
+
+            def allocate_workspace(self, batches):
+                return object()
+
+            def prepare(self, frames, encoded, decoded, workspace, stream):
+                def enqueue(_):
+                    for frame in frames:
+                        data = encoded[
+                            frame.input_offset : frame.input_offset
+                            + frame.encoded_bytes
+                        ]
+                        assert data[0] == frame.decoded_bytes
+                        assert data[1] == (frame.decoded_bytes - 1) << 2
+                        decoded[
+                            frame.output_offset : frame.output_offset
+                            + frame.decoded_bytes
+                        ].copy_(data[2:])
+
+                sizes = torch.tensor([f.decoded_bytes for f in frames])
+                return SimpleNamespace(
+                    enqueue=enqueue,
+                    statuses=torch.zeros(len(frames)),
+                    actual_sizes=sizes,
+                    metadata={2: sizes},
+                )
+
         empty = torch.empty
 
-        def unpinned_empty(*args, **kwargs):
+        def unpinned(*args, **kwargs):
             kwargs.pop("pin_memory", None)
             return empty(*args, **kwargs)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"
-            path.with_name("owner.bin").write_bytes(payload)
+            for name, blob in blobs.items():
+                path.with_name(name + ".bin").write_bytes(blob)
+            content = json.dumps(manifest).encode()
+            path.write_bytes(content)
             with (
-                patch.object(torch, "empty", side_effect=unpinned_empty),
+                patch.object(torch, "empty", side_effect=unpinned),
                 patch.object(torch.cuda, "Stream", return_value=object()),
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
                 patch.object(
@@ -449,22 +514,30 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         record=lambda _: None, synchronize=lambda: None
                     ),
                 ),
+                patch(
+                    "sglang.srt.weight_sync.gpu_delta_codec.NvcompDecoder",
+                    CpuLiteralDecoder,
+                ),
             ):
-                content = json.dumps(manifest).encode()
-                path.write_bytes(content)
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
-                self.assertEqual(prepared.encoded.numel(), 12)
+                self.assertFalse(prepared.host_files)
+                self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 2)
+                self.assertEqual(prepared.timings["host_outer_zstd_frames"], 2)
+                self.assertEqual(
+                    prepared.units[0].pinned.data_ptr(),
+                    prepared.units[1].pinned.data_ptr(),
+                )
+                self.assertEqual(prepared.encoded.numel(), 14)
                 self.assertEqual(prepared.decoded.numel(), 12)
-                self.assertEqual(prepared.h2d_bytes, 20)
+                self.assertEqual(prepared.h2d_bytes, 34)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
                 pointer = prepared.encoded.data_ptr()
-                for unit, target in zip(prepared.units, targets):
-                    self.assertEqual(
-                        unit.pinned.untyped_storage().data_ptr(),
-                        prepared.host_files["owner.bin"].untyped_storage().data_ptr(),
-                    )
+                for unit, target in [
+                    (prepared.units[0], targets[0]),
+                    (prepared.units[2], targets[1]),
+                ]:
                     prepared._apply_tensor(unit)
                     torch.testing.assert_close(
                         target,
@@ -473,184 +546,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         ),
                     )
                     self.assertEqual(prepared.encoded.data_ptr(), pointer)
-                # Raw frames are an incompressible-frame representation, not a
-                # separate user-selected uncompressed publication profile.
-                for profile in (
-                    "none-independent-1mib-v1",
-                    "snappy-independent-1mib-v1",
-                ):
-                    manifest["codec_profile"] = profile
-                    content = json.dumps(manifest).encode()
-                    path.write_bytes(content)
-                    with (
-                        self.subTest(profile=profile),
-                        patch.object(
-                            torch,
-                            "empty",
-                            side_effect=AssertionError(
-                                "rejected profile reached payload allocation"
-                            ),
-                        ),
-                        self.assertRaisesRegex(ValueError, "protocol/profile"),
-                    ):
-                        layout.PreparedDelta(
-                            backend,
-                            path,
-                            layout.hashlib.sha256(content).hexdigest(),
-                            metadata,
-                        )
-
-    def test_outer_zstd_prepares_only_local_tensors_and_reuses_reconstruction(self):
-        import zstandard as zstd
-
-        target = torch.zeros(2, 4, dtype=torch.uint8)
-        local = layout._direct_binding(
-            "local", {"dtype": "U8", "shape": [2, 4]}, target
-        )
-        foreign = layout._direct_binding(
-            "foreign",
-            {"dtype": "U8", "shape": [3, 4]},
-            torch.zeros(3, 4, dtype=torch.uint8),
-        )
-        definitions = [b.describe() for b in (foreign, local)]
-        compressed = zstd.ZstdCompressor(level=1).compress(bytes(range(8)))
-        # A foreign expert is metadata-validated and its owner file is hashed,
-        # but its envelope is never unwrapped by this rank.
-        blobs = {"local": compressed, "foreign": b"not-a-zstd-frame"}
-        entries, records = [], []
-        for binding in (foreign, local):
-            name, size = binding.name, binding.storage[0].numel()
-            file = name + ".bin"
-            entries.append(
-                binding.describe()
-                | {
-                    "byte_order": "little",
-                    "nbytes": size,
-                    "outer": {
-                        "codec": "zstd",
-                        "file": file,
-                        "encoded_offset": 0,
-                        "encoded_bytes": len(blobs[name]),
-                        "decoded_bytes": size,
-                    },
-                    "frames": [
-                        {
-                            "file": file,
-                            "encoded_offset": 0,
-                            "encoded_bytes": size,
-                            "decoded_offset": 0,
-                            "decoded_bytes": size,
-                            "codec": "none",
-                        }
-                    ],
-                }
-            )
-            records.append(
-                {
-                    "name": file,
-                    "nbytes": len(blobs[name]),
-                    "sha256": layout.hashlib.sha256(blobs[name]).hexdigest(),
-                }
-            )
-        metadata = dict(
-            stream_id="test",
-            base_version=0,
-            target_version=1,
-            plan_digest=layout._digest(definitions),
-        )
-        manifest = dict(
-            protocol_version=3,
-            codec_profile="snappy-independent-1mib-zstd-v1",
-            tensors=entries,
-            files=records,
-            **metadata,
-        )
-        backend = SimpleNamespace(
-            device=torch.device("cpu"),
-            layout=SimpleNamespace(
-                bindings=[local, local],  # Two consumers share the same reconstruction.
-                inventory={
-                    b.name: {"dtype": b.dtype, "shape": list(b.shape)}
-                    for b in (local, foreign)
-                },
-                excluded={"foreign": "expert owned by another EP rank"},
-                derived=[],
-            ),
-        )
-        empty = torch.empty
-
-        def unpinned_empty(*args, **kwargs):
-            kwargs.pop("pin_memory", None)
-            return empty(*args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "manifest.json"
-            for name, blob in blobs.items():
-                path.with_name(name + ".bin").write_bytes(blob)
-            with (
-                patch.object(torch, "empty", side_effect=unpinned_empty),
-                patch.object(torch.cuda, "Stream", return_value=object()),
-                patch.object(torch.cuda, "stream", return_value=nullcontext()),
-                patch.object(
-                    torch.cuda,
-                    "Event",
-                    return_value=SimpleNamespace(
-                        record=lambda _: None, synchronize=lambda: None
-                    ),
-                ),
-            ):
-                content = json.dumps(manifest).encode()
-                path.write_bytes(content)
-                prepared = layout.PreparedDelta(
-                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
-                )
-                self.assertFalse(prepared.host_files)  # Small outer files released.
-                self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 1)
-                self.assertEqual(prepared.timings["host_outer_zstd_decoded_bytes"], 8)
-                self.assertEqual(
-                    prepared.units[0].pinned.data_ptr(),
-                    prepared.units[1].pinned.data_ptr(),
-                )
-                self.assertEqual(prepared.encoded.numel(), 8)
-                self.assertTrue(torch.all(target == 0))
-                prepared._apply_tensor(prepared.units[0])
-                torch.testing.assert_close(
-                    target, torch.arange(8, dtype=torch.uint8).reshape(2, 4)
-                )
-                # A GPU producer's protocol-4 chunks use this same CPU unwrap
-                # and per-tensor pinned staging path. Receiver GPU code is unchanged.
-                manifest["protocol_version"] = 4
-                manifest["codec_profile"] = "snappy-independent-1mib-gpu-zstd-v1"
-                for entry in entries:
-                    outer = entry["outer"]
-                    outer["frames"] = [
-                        dict(
-                            encoded_offset=0,
-                            encoded_bytes=outer["encoded_bytes"],
-                            decoded_offset=0,
-                            decoded_bytes=outer["decoded_bytes"],
-                        )
-                    ]
-                content = json.dumps(manifest).encode()
-                path.write_bytes(content)
-                target.zero_()
-                gpu_produced = layout.PreparedDelta(
-                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
-                )
-                self.assertTrue(gpu_produced.units[0].pinned.device.type == "cpu")
-                self.assertEqual(gpu_produced.timings["host_outer_zstd_frames"], 1)
-                self.assertEqual(
-                    gpu_produced.timings["host_outer_zstd_decoded_bytes"], 8
-                )
-                self.assertTrue(torch.all(target == 0))
-                gpu_produced._apply_tensor(gpu_produced.units[0])
-                torch.testing.assert_close(
-                    target, torch.arange(8, dtype=torch.uint8).reshape(2, 4)
-                )
-                # A corrupt immutable file fails before any model write.
-                target.zero_()
-                path.with_name("local.bin").write_bytes(
-                    compressed[:-1] + bytes([compressed[-1] ^ 1])
+                # Immutable-file corruption cannot reach any model write.
+                targets[0].zero_()
+                path.with_name("0.bin").write_bytes(
+                    blobs["0"][:-1] + bytes([blobs["0"][-1] ^ 1])
                 )
                 with self.assertRaisesRegex(ValueError, "SHA256"):
                     layout.PreparedDelta(
@@ -659,7 +558,30 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         layout.hashlib.sha256(content).hexdigest(),
                         metadata,
                     )
-                self.assertTrue(torch.all(target == 0))
+                self.assertTrue(torch.all(targets[0] == 0))
+
+    def test_backend_freezes_configured_codec_in_advertised_plan(self):
+        fake_plan = SimpleNamespace(
+            check_identity=lambda: None,
+            rank_plan_digest="digest",
+            bindings=[],
+            excluded={},
+        )
+        fake_model = SimpleNamespace(
+            parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda", 0))])
+        )
+        runtime = SimpleNamespace(get_exec=lambda: SimpleNamespace(moe=object()))
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": runtime}),
+            patch.object(layout, "_require_fixed_moe_topology"),
+            patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
+            patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "snappy-zstd"}),
+        ):
+            backend = layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
+            with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
+                self.assertEqual(backend.describe()["codec"], "snappy-zstd")
+                with self.assertRaisesRegex(ValueError, "WEIGHT_DELTA_CODEC"):
+                    layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
 
     def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
         root = torch.nn.Module()
@@ -752,8 +674,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             plan_digest=layout._digest([b.describe() for b in bindings]),
         )
         manifest = dict(
-            protocol_version=3,
-            codec_profile="snappy-independent-1mib-zstd-v1",
+            protocol_version=4,
+            codec="snappy-zstd",
+            frame_bytes=1 << 20,
             tensors=entries,
             files=[
                 {
@@ -765,6 +688,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             **metadata,
         )
         backend = SimpleNamespace(
+            codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
                 bindings=bindings,
@@ -803,7 +727,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
             self.assertFalse(prepared.units)
-            self.assertFalse(prepared.decoders)
+            self.assertIsNone(prepared.decoder)
             self.assertEqual(prepared.timings["raw_tensors"], 4)
             self.assertEqual(prepared.timings["raw_bytes"], len(blob))
             self.assertEqual(prepared.h2d_bytes, 36)  # Includes dtype alignment gaps.
