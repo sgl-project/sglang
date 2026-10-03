@@ -76,8 +76,8 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sgl-deep-ep==0.1.3rc1",
-  "sgl-deep-gemm==0.2.1rc0",
+  "sgl-deep-ep==0.1.3rc2",
+  "sgl-deep-gemm==0.2.1rc1",
   "sglang-kernel==0.4.8",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",

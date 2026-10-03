@@ -153,7 +153,7 @@ jobs:
           # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
           python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
           # sgl-deep-ep's own torch pin overrides the line above; it must pin TORCH_VER.
-          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.3rc1"
+          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.3rc2"
           # --force-reinstall: a base image may already carry this exact version,
           # in which case pip skips the wheel and the job tests a stale _C.so.
           python3 -m pip install dist/*.whl --force-reinstall --no-deps
