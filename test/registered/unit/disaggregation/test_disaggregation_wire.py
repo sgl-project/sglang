@@ -21,9 +21,11 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    chunk_register_regions,
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
+    register_chunks_compatible,
     unpack_int_lists,
     unpack_list_of_buffers,
 )
@@ -38,6 +40,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -182,6 +185,7 @@ class TestDisaggregationWire(unittest.TestCase):
                         manager.decode_kv_args_table[req.mooncake_session_id] = (
                             SimpleNamespace(
                                 requires_dcp_relayout=False,
+                                dst_register_chunk_pages=0,
                                 dst_state_data_ptrs=[[0x2000], [0x4000]],
                                 dst_state_item_lens=[
                                     [
@@ -382,6 +386,9 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.dst_register_chunk_pages, 0)
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128), b"2048"])
+        self.assertEqual(info.dst_register_chunk_pages, 2048)
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -904,6 +911,78 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+    def test_register_chunk_pages_breaks_runs_at_destination_chunks(self):
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "4"}):
+            src, dst = group_concurrent_contiguous(
+                self._arr(list(range(10, 20))), self._arr(list(range(2, 12)))
+            )
+        self.assertEqual(dst, [[2, 3], [4, 5, 6, 7], [8, 9, 10, 11]])
+        self.assertEqual(src, [[10, 11], [12, 13, 14, 15], [16, 17, 18, 19]])
+
+    def test_register_chunk_pages_unset_keeps_whole_runs(self):
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "0"}):
+            self.assertEqual(
+                group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([7, 8, 9])),
+                ([[1, 2, 3]], [[7, 8, 9]]),
+            )
+
+
+class TestChunkRegisterRegions(unittest.TestCase):
+    def test_chunks_start_at_page_boundaries_and_cover_the_buffer(self):
+        # Two buffers: 10 pages of 16 bytes and 3 pages of 8 bytes, 4 pages a chunk.
+        regions = chunk_register_regions([1000, 5000], [160, 24], [16, 8], 4)
+        self.assertEqual(regions, [(1000, 64), (1064, 64), (1128, 32), (5000, 24)])
+
+    def test_empty_chunk_is_rejected(self):
+        with self.assertRaises(ValueError):
+            chunk_register_regions([1000], [160], [0], 4)
+
+    def test_negative_chunk_pages_are_refused(self):
+        manager = self._decode_manager([7000], [64])
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "-4"}):
+            with self.assertRaisesRegex(ValueError, "must be 0"):
+                manager._registerable_regions()
+
+    def test_prefill_splits_must_cover_decode_chunks(self):
+        self.assertTrue(register_chunks_compatible(0, 0))
+        self.assertTrue(register_chunks_compatible(4, 0))
+        self.assertTrue(register_chunks_compatible(4, 4))
+        self.assertTrue(register_chunks_compatible(2, 4))
+        self.assertFalse(register_chunks_compatible(0, 4))
+        self.assertFalse(register_chunks_compatible(8, 4))
+        self.assertFalse(register_chunks_compatible(3, 4))
+
+    def _decode_manager(self, state_ptrs, state_lens):
+        manager = object.__new__(MooncakeKVManager)
+        manager.disaggregation_mode = DisaggregationMode.DECODE
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1000],
+            kv_data_lens=[160],
+            kv_item_lens=[16],
+            aux_data_ptrs=[9000],
+            aux_data_lens=[32],
+            state_data_ptrs=[state_ptrs],
+            state_data_lens=[state_lens],
+        )
+        return manager
+
+    def test_decode_registers_kv_in_chunks(self):
+        manager = self._decode_manager([7000], [64])
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "4"}):
+            regions = manager._registerable_regions()
+        self.assertEqual(
+            regions, [(1000, 64), (1064, 64), (1128, 32), (9000, 32), (7000, 64)]
+        )
+
+    def test_chunking_refuses_a_state_buffer_aliasing_kv(self):
+        # The unified pool reports its raw buffer as both KV and state.
+        manager = self._decode_manager([1000], [160])
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "4"}):
+            with self.assertRaises(ValueError):
+                manager._registerable_regions()
+        with patch.dict("os.environ", {"SGLANG_DISAGG_REGISTER_CHUNK_PAGES": "0"}):
+            self.assertEqual(manager._registerable_regions(), [(1000, 160), (9000, 32)])
 
 
 class TestStagingWatermark(unittest.TestCase):
