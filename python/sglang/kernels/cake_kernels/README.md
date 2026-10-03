@@ -33,12 +33,13 @@ with `ops/kvcache/cake.py` is the canonical example.
 
 ## Inventory
 
-162 op ids at the FlashInfer baseline (main commit `46340689a5ab`, 2026-10-02). Columns:
+167 op ids: 162 at the FlashInfer baseline (main commit `46340689a5ab`, 2026-10-02) plus
+5 post-baseline entries read at main `e4f94f948` (noted `post-baseline` in the row). Columns:
 op id without the group prefix, FlashInfer entry (module path after `flashinfer.`, then
 `:name`), admitted compute capabilities (inclusive `KernelSpec` range; `any CUDA` marks
 pure-torch or FlashInfer-quantizer weight preparation) and graph/prepare notes.
 
-### `attention` (48)
+### `attention` (52)
 
 Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 `ops/attention/cake_linear.py`.
@@ -50,9 +51,12 @@ Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 | `concat_mla_k` | `concat_ops:concat_mla_k` | 10.0-10.3 | in-place K assembly; `backend="cake"` |
 | `create_block_sparse_attention_wrapper` | `sparse:BlockSparseAttentionWrapper` | 10.0-10.3 | wrapper; `plan()` before capture |
 | `create_sparse_mla_sm120_wrapper` | `mla:SparseMLASm120Wrapper` | 12.0-12.1 | wrapper; `plan()` before capture; SM120 registry-only in CI |
+| `create_sparse_mla_sm120_dsv41_mixed_wrapper` | `mla:SparseMLASm120Wrapper` (`kv_cache_format='fp8'`, `kv_scale_format='ue8m0_g32'`, `extra_kv_fp4=True`) | 12.0-12.1 | post-baseline (#5983); wrapper, decode-only; warm every shape before capture; SM120 registry-only in CI |
 | `create_variable_block_sparse_attention_wrapper_sm90` | `sparse:VariableBlockSparseAttentionWrapper` | 9.0 | wrapper, engine cuda/cute; plan before capture |
 | `dcp_spec_decode` | `decode:trtllm_batch_decode_with_kv_cache` | 10.0-10.7 | `backend="cake"`; workspace sized by host helpers |
 | `dsa_indexer_topk` | `dsa_indexer:dsa_indexer_topk` | 10.0-10.7 | one-shot; workspace via host helper |
+| `dsv41_fp8_quantize_append_sparse_mla_cache` | `mla:dsv41_fp8_quantize_append_sparse_mla_cache` | 12.0-12.1 | post-baseline (#5983); in-place slot append into the 528 B/token main cache; capturable |
+| `dsv41_fp8_quantize_pack_sparse_mla_cache` | `mla:dsv41_fp8_quantize_pack_sparse_mla_cache` | 12.0-12.1 | post-baseline (#5983); allocating full-page pack (HND/NHD) |
 | `fmha_batch_context_with_kv_cache` | `prefill:trtllm_batch_context_with_kv_cache` | 10.0-10.3 | `backend="cake"`; one-shot |
 | `fmha_batch_decode_with_kv_cache` | `decode:trtllm_batch_decode_with_kv_cache` | 10.0-10.3 | `backend="cake"`; one-shot |
 | `gdn_chunk_gated_delta_rule` | `gdn_prefill:chunk_gated_delta_rule` | 10.0-10.3 | `backend="cake_gdn"`; manifest rows only (skip otherwise) |
@@ -91,6 +95,7 @@ Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 | `sm110_xqa_prepare` | `sm110_xqa:prepare` | 11.0 | Thor; registry-only (no runner) |
 | `sparse_mla_sm120_dsv4_nvfp4_decode` | `mla:cake_sparse_mla_sm120_dsv4_nvfp4_decode` | 12.0-12.1 | SM120 registry-only in CI |
 | `sparse_mla_sm120_dsv4_nvfp4_prefill` | `mla:cake_sparse_mla_sm120_dsv4_nvfp4_prefill` | 12.0-12.1 | SM120 registry-only in CI |
+| `sparse_mla_sm120_dsv41_mixed_decode` | `mla:cake_sparse_mla_sm120_dsv41_mixed_decode` | 12.0-12.1 | post-baseline (#5983); allocation-free, caller-owned `mid_out`/`mid_lse` when the plan splits; `compute_precision` bf16/fp8; SM120 registry-only in CI |
 | `trtllm_batch_decode_sparse_mla_dsv4` | `mla:trtllm_batch_decode_sparse_mla_dsv4` | 10.0-10.3, 12.0-12.1 | `backend="cake"`; `cake_dsv4_workspace_reset` before capture |
 | `trtllm_batch_decode_with_kv_cache_mla` | `mla:trtllm_batch_decode_with_kv_cache_mla` | 10.0-10.3 | `backend="cake"`; 148/152-SM builds only |
 
@@ -190,11 +195,12 @@ DeepGEMM-family plans and the dense/sparse MQA plans pin the physical SM count
 | `prepare_mm_fp4_per_token` | `experimental.cake_nvfp4_per_token.cake_backend:prepare_mm_fp4_per_token` | 10.0-10.3 | prepare once, launch many |
 | `prepare_nvfp4_per_token_chain` | `experimental.cake_nvfp4_per_token.cake_backend:prepare_nvfp4_per_token_chain` | 10.0-10.3 | prepare once; quantizer + GEMM chain |
 
-### `kvcache` (1)
+### `kvcache` (2)
 
 | op id | FlashInfer entry | SM | notes (graph/prepare) |
 |---|---|---|---|
 | `fused_qk_rmsnorm_rope_append_paged_kv_cache` | `cake_fused_qk_rope_append:cake_fused_qk_rmsnorm_rope_append_paged_kv_cache` | 9.0-10.3 | in-place NHD append; capturable |
+| `fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache` | `cake_fused_qk_rope_fp8_append:cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache` | 9.0-10.3 | post-baseline (#5956); FP8 E4M3 Q + `q_scale` + `split_k_flag`, in-place NHD `float8_e4m3fn` append; capturable |
 
 ### `mamba` (3)
 
@@ -290,9 +296,14 @@ FlashInfer entries that reference Cake but have no op id here, by category:
   reached through an arch dispatcher, plan and return-type objects, stable wrapper classes
   duplicating a `prepare_*` entry, drop-level shims under `moe_ep.kernel_src`, pure-torch
   test references.
-- **Post-baseline modules**: added to FlashInfer after `46340689a5ab`, e.g. the FP8 fused
-  QK RoPE + paged append, the DSv4.1 mixed SM120 sparse MLA and the DeepGEMM FP8 JIT
-  helper. They become candidates when the baseline moves (see Versioning).
+- **Post-baseline modules**: added to FlashInfer after `46340689a5ab`. The FP8 fused QK
+  RoPE + paged append (#5956) and the DSv4.1 mixed-cache SM120 sparse MLA with its FP8
+  main-cache writers (#5983) are forwarded as of the `e4f94f948` re-pin (rows marked
+  `post-baseline`). Still not forwarded: the DeepGEMM FP8 JIT helper
+  (`experimental/deepgemm_fp8_gemm/cake_jit.py`, a loader) and the DSA training launch
+  helper (`experimental/cake_dsa_train/cake_launch.py`, training-only). The pre-baseline
+  `dsv41_fp4_quantize_{pack,append}_sparse_mla_cache` extra-cache writers are hand-written
+  (`is_cake=no`) and stay unforwarded; the mixed-cache test reaches them directly.
 - **Dispatch-only rows**: `allreduce_fusion(moe_finalize_backend="cake")` (SGLang's
   unified all-reduce workspace path passes the kwarg itself), the deprecated
   `MoeAlltoAll(backend="cake")` (use `communication.moe_ep_alltoall`) and package
@@ -307,6 +318,11 @@ project, not in this tree.
 
 - **Baseline**: every docstring contract, `supports_*` check and test was read from
   FlashInfer main commit `46340689a5ab` (2026-10-02).
+- **Re-pin to `e4f94f948`**: the five post-baseline op ids (`kvcache.fused_qk_rmsnorm_rope_
+  quantize_fp8_append_paged_kv_cache`; `attention.sparse_mla_sm120_dsv41_mixed_decode`,
+  `attention.create_sparse_mla_sm120_dsv41_mixed_wrapper`,
+  `attention.dsv41_fp8_quantize_{pack,append}_sparse_mla_cache`) were read from FlashInfer
+  main `e4f94f948` (PRs #5956 and #5983); their docstrings cite that commit.
 - **Pinned release**: SGLang pins `flashinfer_python 0.7.0.post1`, which ships 11 of the
   117 Cake Python modules present at the baseline. For the other 106, `find_spec` returns
   `None`, `supports_*` returns `False` and callers keep their existing backend: no import

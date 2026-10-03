@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 _PKG = "sglang.kernels.cake_kernels."
 _FMHA = _PKG + "attention_fmha:"
 _MLA = _PKG + "attention_mla:"
+_MLA_DSV41 = _PKG + "attention_mla_sm120_dsv41:"
 _SPARSE = _PKG + "attention_sparse:"
 _MISC = _PKG + "attention_misc:"
 
@@ -341,6 +342,73 @@ _reg(
     description=(
         "Cake in-place MLA K assembly distributed by FlashInfer "
         "(concat_mla_k backend='cake')."
+    ),
+)
+
+# SM120/121 DeepSeek-V4.1 mixed cache (attention_mla_sm120_dsv41; post-baseline,
+# FlashInfer PR #5983 at main e4f94f948)
+_reg(
+    "sparse_mla_sm120_dsv41_mixed_decode",
+    _MLA_DSV41 + "sparse_mla_sm120_dsv41_mixed_decode",
+    _SM120_121,
+    dtypes=("bfloat16", "uint8", "float32", "int32"),
+    in_place=True,
+    contract=(
+        "BF16 q [T,H,512]; 528 B/token FP8+UE8M0 main cache and optional 288 "
+        "B/token V41_FP4 extra cache (uint8 pages, 2-D/3-D/HND/NHD views); "
+        "int32 indices/lengths; BF16 output [T,H,512], f32 out_lse [T,H] "
+        "(base 2 x lse_scale); mid_out/mid_lse required when num_splits > 1; "
+        "compute_precision bf16 (default) or fp8 -> plan dict"
+    ),
+    description=(
+        "Cake SM120/121 DeepSeek-V4.1 mixed-cache sparse-MLA decode kernel "
+        "distributed by FlashInfer (kv_cache_format='fp8_dsv41_fp4_ca')."
+    ),
+)
+_reg(
+    "create_sparse_mla_sm120_dsv41_mixed_wrapper",
+    _MLA_DSV41 + "create_sparse_mla_sm120_dsv41_mixed_wrapper",
+    _SM120_121,
+    dtypes=("bfloat16", "uint8"),
+    contract=(
+        "SparseMLASm120Wrapper(backend='cake', kv_cache_format='fp8', "
+        "kv_scale_format='ue8m0_g32', extra_kv_fp4=True); decode-only "
+        "run(q, kv_cache, indices, output, sm_scale, ...) per FlashInfer"
+    ),
+    description=(
+        "Cake SM120/121 DeepSeek-V4.1 mixed-cache sparse-MLA wrapper "
+        "distributed by FlashInfer."
+    ),
+)
+_reg(
+    "dsv41_fp8_quantize_pack_sparse_mla_cache",
+    _MLA_DSV41 + "dsv41_fp8_quantize_pack_sparse_mla_cache",
+    _SM120_121,
+    dtypes=("bfloat16", "float16", "uint8"),
+    contract=(
+        "BF16/FP16 latent [pages,page_size,512] (optional singleton head axis) "
+        "-> uint8 [pages,1,page_size,528] (HND) or [pages,page_size,1,528] "
+        "(NHD); E4M3 values + per-page UE8M0 group-32 scale footer"
+    ),
+    description=(
+        "DeepSeek-V4.1 FP8 main-cache full-page writer for the Cake SM120/121 "
+        "mixed-cache sparse MLA (FlashInfer PR #5983)."
+    ),
+)
+_reg(
+    "dsv41_fp8_quantize_append_sparse_mla_cache",
+    _MLA_DSV41 + "dsv41_fp8_quantize_append_sparse_mla_cache",
+    _SM120_121,
+    dtypes=("bfloat16", "float16", "uint8", "int32", "int64"),
+    in_place=True,
+    contract=(
+        "BF16/FP16 rows [N,512], int32/int64 slot_mapping[N] "
+        "(page*page_size+entry; negative = padding), uint8 528 B/token cache "
+        "(2-D/3-D/HND/NHD view) written in place"
+    ),
+    description=(
+        "DeepSeek-V4.1 FP8 main-cache slot append for the Cake SM120/121 "
+        "mixed-cache sparse MLA (FlashInfer PR #5983)."
     ),
 )
 
@@ -767,6 +835,53 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     return _k("sparse_mla_sm120_dsv4_nvfp4_prefill")(
         q, kv_cache, indices, output, out_lse, sm_scale, **kwargs
     )
+
+
+def cake_sparse_mla_sm120_dsv41_mixed_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_scale: float,
+    **kwargs,
+) -> Dict[str, int]:
+    """Explicit Cake SM120/121 DSv4.1 mixed-cache decode kernel entry point."""
+    return _k("sparse_mla_sm120_dsv41_mixed_decode")(
+        q, kv_cache, indices, output, out_lse, sm_scale, **kwargs
+    )
+
+
+def cake_create_sparse_mla_sm120_dsv41_mixed_wrapper(
+    max_num_tokens: Optional[int] = None,
+    max_num_heads: Optional[int] = None,
+    *,
+    compute_precision: str = "default",
+    device=None,
+):
+    """Explicit Cake SM120/121 DSv4.1 mixed-cache sparse-MLA wrapper factory."""
+    return _k("create_sparse_mla_sm120_dsv41_mixed_wrapper")(
+        max_num_tokens,
+        max_num_heads,
+        compute_precision=compute_precision,
+        device=device,
+    )
+
+
+def cake_dsv41_fp8_quantize_pack_sparse_mla_cache(
+    latent_kv: torch.Tensor, *, kv_layout: str = "HND"
+) -> torch.Tensor:
+    """Explicit DSv4.1 FP8 main-cache full-page pack (SM120/121)."""
+    return _k("dsv41_fp8_quantize_pack_sparse_mla_cache")(
+        latent_kv, kv_layout=kv_layout
+    )
+
+
+def cake_dsv41_fp8_quantize_append_sparse_mla_cache(
+    latent_kv: torch.Tensor, slot_mapping: torch.Tensor, cache: torch.Tensor
+) -> None:
+    """Explicit DSv4.1 FP8 main-cache slot append (SM120/121); writes in place."""
+    _k("dsv41_fp8_quantize_append_sparse_mla_cache")(latent_kv, slot_mapping, cache)
 
 
 def cake_trtllm_batch_decode_with_kv_cache_mla(
@@ -1331,6 +1446,10 @@ __all__ = [
     "cake_create_sparse_mla_sm120_wrapper",
     "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
     "cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+    "cake_sparse_mla_sm120_dsv41_mixed_decode",
+    "cake_create_sparse_mla_sm120_dsv41_mixed_wrapper",
+    "cake_dsv41_fp8_quantize_pack_sparse_mla_cache",
+    "cake_dsv41_fp8_quantize_append_sparse_mla_cache",
     "cake_trtllm_batch_decode_with_kv_cache_mla",
     "cake_kimi_k3_mla_fp8_paged_attention",
     "cake_prepare_kimi_k3_mla_fp8_paged_attention",
