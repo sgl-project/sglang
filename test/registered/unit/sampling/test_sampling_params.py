@@ -16,14 +16,19 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
     MAX_STOP_REGEX_LEN,
+    REQUEST_NGRAM_CORPUS_SEEDS_KEY,
+    REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR,
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
+    get_request_ngram_corpus_seeds,
+    set_request_ngram_corpus_seeds,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -130,6 +135,33 @@ class TestSamplingParamsVerify(CustomTestCase):
             ):
                 self._make(
                     custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
+                ).verify(self.VOCAB_SIZE)
+
+    def test_request_ngram_corpus_seeds_are_vocab_bounded_integers(self):
+        """verify() is the scheduler's only check on this client-writable key.
+        The renderer's own payload, separator included, must pass it."""
+        sampling_params = {}
+        set_request_ngram_corpus_seeds(sampling_params, [[17, 18], [19]])
+        self._make(custom_params=sampling_params["custom_params"]).verify(
+            self.VOCAB_SIZE
+        )
+
+        invalid_values = [
+            [1, "2"],
+            [1, -2],
+            [True],
+            [self.VOCAB_SIZE],
+            "17",
+            [[1, 2]],
+            [0] * (MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS + 1),
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request ngram corpus seeds"),
+            ):
+                self._make(
+                    custom_params={REQUEST_NGRAM_CORPUS_SEEDS_KEY: value}
                 ).verify(self.VOCAB_SIZE)
 
     def test_negative_temperature_raises(self):
@@ -639,6 +671,87 @@ class TestRegexMaxLength(CustomTestCase):
         """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
+
+
+class TestRequestNgramCorpusSeeds(CustomTestCase):
+    def test_round_trip_keeps_sequence_boundaries(self):
+        """The wire type is a flat list of scalars; the separator is what keeps
+        two seeds from being read back as one sequence after msgpack."""
+        sampling_params = {}
+        set_request_ngram_corpus_seeds(sampling_params, [[1, 2, 3], [4, 5]])
+        self.assertEqual(
+            sampling_params["custom_params"][REQUEST_NGRAM_CORPUS_SEEDS_KEY],
+            [1, 2, 3, REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR, 4, 5],
+        )
+
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(
+            encoder.encode(
+                SamplingParams(custom_params=sampling_params["custom_params"])
+            )
+        )
+        self.assertEqual(
+            get_request_ngram_corpus_seeds(rebuilt.custom_params), [[1, 2, 3], [4, 5]]
+        )
+
+    def test_set_writes_only_its_key(self):
+        """set_request_reasoning_end_token_ids fills the same dict one line
+        earlier in _convert_to_internal_request; replacing it would drop the
+        reasoning terminator. Without seeds nothing is written at all."""
+        sampling_params = {"custom_params": {"other": 1}}
+        set_request_ngram_corpus_seeds(sampling_params, [[7]])
+        self.assertEqual(
+            sampling_params["custom_params"],
+            {"other": 1, REQUEST_NGRAM_CORPUS_SEEDS_KEY: [7]},
+        )
+
+        sampling_params = {}
+        set_request_ngram_corpus_seeds(sampling_params, None)
+        set_request_ngram_corpus_seeds(sampling_params, [])
+        self.assertEqual(sampling_params, {})
+
+    def test_malformed_payload_reads_as_no_seeds(self):
+        """custom_params is client-writable; the worker must get [] for
+        anything but a well-formed payload rather than feed it to the corpus."""
+        self.assertEqual(get_request_ngram_corpus_seeds(None), [])
+        self.assertEqual(get_request_ngram_corpus_seeds({}), [])
+        payloads = [
+            "1,2,3",
+            [1, "2"],
+            [1, -2],
+            [1.0],
+            [True],
+            [[1, 2]],
+            [REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR],
+            [0] * (MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS + 1),
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    get_request_ngram_corpus_seeds(
+                        {REQUEST_NGRAM_CORPUS_SEEDS_KEY: payload}
+                    ),
+                    [],
+                )
+
+    def test_cap_is_the_same_on_both_sides(self):
+        """A request the renderer accepts must be read back by the worker:
+        exactly MAX tokens pass both sides, MAX + 1 fails both."""
+        at_cap = [0] * MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS
+        sampling_params = {}
+        set_request_ngram_corpus_seeds(sampling_params, [at_cap])
+        self.assertEqual(
+            get_request_ngram_corpus_seeds(sampling_params["custom_params"]),
+            [at_cap],
+        )
+        over = at_cap + [0]
+        with self.assertRaises(ValueError):
+            set_request_ngram_corpus_seeds({}, [over])
+        self.assertEqual(
+            get_request_ngram_corpus_seeds({REQUEST_NGRAM_CORPUS_SEEDS_KEY: over}),
+            [],
+        )
 
 
 if __name__ == "__main__":

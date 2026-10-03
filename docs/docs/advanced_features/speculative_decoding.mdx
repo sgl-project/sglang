@@ -761,6 +761,8 @@ print(response.choices[0].message.content)
 
 SGLang also supports **ngram-based speculative decoding** (no separate draft model). It retrieves draft tokens from an ngram cache built from previously generated tokens, and then verifies them with the target model.
 
+For a chat request with `tools`, the cache is also seeded with the chat template's rendering of each tool call before the request's first draft, so the first call to a tool is drafted as well, not only repeats of it. This costs one template render per tool per request and only happens on an NGRAM server.
+
 Enable it with:
 - `--speculative-algorithm NGRAM`
 

@@ -12,7 +12,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_model, get_serving, get_spec
 
 
 class ThinkingMode(str, Enum):
@@ -45,6 +45,9 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv4,
     encoding_dsv32,
     encoding_dsv41,
+)
+from sglang.srt.entrypoints.openai.ngram_corpus_seeding import (
+    render_tool_call_seeds,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -112,6 +115,7 @@ from sglang.srt.parser.reasoning_parser import (
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
+    set_request_ngram_corpus_seeds,
     set_request_reasoning_end_token_ids,
 )
 from sglang.srt.utils import ImageData
@@ -330,6 +334,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
+        # Only the NGRAM worker reads request corpus seeds; render them only
+        # when the server drafts with NGRAM.
+        speculative_algorithm = get_spec().speculative_algorithm
+        self._uses_ngram_spec = (
+            speculative_algorithm is not None
+            and speculative_algorithm.upper() == "NGRAM"
+        )
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
@@ -1255,6 +1266,10 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
+        set_request_ngram_corpus_seeds(
+            sampling_params=sampling_params,
+            seeds=processed_messages.ngram_corpus_seeds,
+        )
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
@@ -1511,6 +1526,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
+        ngram_corpus_seeds = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -1751,6 +1767,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
+            if self._uses_ngram_spec and tools and not assistant_prefix:
+                ngram_corpus_seeds = render_tool_call_seeds(
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                    messages=openai_compatible_messages,
+                    tools=tools,
+                    template_kwargs=extra_template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                )
+
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
@@ -1779,6 +1804,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            ngram_corpus_seeds=ngram_corpus_seeds,
         )
 
     def _render_and_encode_chat_template(

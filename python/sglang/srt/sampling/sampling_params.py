@@ -111,6 +111,85 @@ def set_request_reasoning_end_token_ids(
     sampling_params["custom_params"] = custom_params
 
 
+# Read by the NGRAM worker and put into the corpus before the request's first
+# draft.  custom_params values are flat, so sequences are joined with a separator.
+REQUEST_NGRAM_CORPUS_SEEDS_KEY = "__sglang_ngram_corpus_seeds"
+REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR = -1  # Any negative id; token ids are >= 0.
+MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS = 4096  # Arbitrary bound on one request's insert.
+
+
+def get_request_ngram_corpus_seeds(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> List[List[int]]:
+    """Return the request's ngram corpus seeds, split back into sequences."""
+    if not isinstance(custom_params, dict):
+        return []
+    if REQUEST_NGRAM_CORPUS_SEEDS_KEY not in custom_params:
+        return []
+    flat = custom_params.get(REQUEST_NGRAM_CORPUS_SEEDS_KEY)
+    invalid = (
+        not isinstance(flat, list)
+        or len(flat) > MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS
+        or any(
+            type(token) is not int
+            or (token < 0 and token != REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR)
+            for token in flat
+        )
+        or (
+            vocab_size is not None
+            and isinstance(flat, list)
+            and any(type(token) is int and token >= vocab_size for token in flat)
+        )
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "request ngram corpus seeds must be a vocabulary-bounded list of "
+                f"at most {MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS} integers"
+            )
+        return []
+    seeds: List[List[int]] = []
+    seed: List[int] = []
+    for token in flat:
+        if token == REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR:
+            if seed:
+                seeds.append(seed)
+            seed = []
+        else:
+            seed.append(token)
+    if seed:
+        seeds.append(seed)
+    return seeds
+
+
+def set_request_ngram_corpus_seeds(
+    sampling_params: Dict,
+    seeds: Optional[List[List[int]]],
+) -> None:
+    """Attach the renderer-produced ngram corpus seeds to a request."""
+    if not seeds:
+        return
+    flat: List[int] = []
+    for seed in seeds:
+        if not seed or any(type(token) is not int or token < 0 for token in seed):
+            raise ValueError(
+                "ngram corpus seeds must be non-empty lists of non-negative integers"
+            )
+        if flat:
+            flat.append(REQUEST_NGRAM_CORPUS_SEEDS_SEPARATOR)
+        flat.extend(seed)
+    if len(flat) > MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS:
+        raise ValueError(
+            f"ngram corpus seeds exceed {MAX_REQUEST_NGRAM_CORPUS_SEEDS_TOKENS} tokens"
+        )
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_NGRAM_CORPUS_SEEDS_KEY] = flat
+    sampling_params["custom_params"] = custom_params
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
@@ -284,6 +363,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 )
 
         get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
+        get_request_ngram_corpus_seeds(
             self.custom_params,
             vocab_size=vocab_size,
             strict=True,
