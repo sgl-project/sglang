@@ -1269,7 +1269,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When <code>tool_choice</code> names a function, render every request tool into the chat template instead of only the named one, so the prompt keeps the prefix of earlier turns. The output is still constrained to the named tool. The variable has no effect for parsers that build no output constraint for a named tool (<code>hunyuan</code>, <code>muse</code>, <code>spark25</code>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When <code>tool_choice</code> names a function, render every request tool into the chat template instead of only the named one, so the prompt keeps the prefix of earlier turns. The output constraint still forces a call to the named tool. The variable has no effect for parsers that build no output constraint for a named tool (<code>hunyuan</code>, <code>muse</code>, <code>spark25</code>).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
