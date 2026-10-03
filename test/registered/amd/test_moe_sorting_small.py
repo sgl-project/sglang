@@ -45,17 +45,28 @@ class TestMoeSortingSmall(CustomTestCase):
         cls.orig_quant = staticmethod(orig_quant)
         cls.dev = torch.device("cuda", 0)
 
-    def _routing(self, m, seed):
+    def _routing(self, m, seed, E=E, topk=TOPK):
         g = torch.Generator(device="cpu").manual_seed(seed)
         ids = torch.stack(
-            [torch.randperm(self.E - 1, generator=g)[: self.TOPK - 1] for _ in range(m)]
+            [torch.randperm(E - 1, generator=g)[: topk - 1] for _ in range(m)]
         )
-        ids = torch.cat([ids, torch.full((m, 1), self.E - 1)], 1)
+        ids = torch.cat([ids, torch.full((m, 1), E - 1)], 1)
         ids = ids.to(torch.int32).to(self.dev).contiguous()
-        return ids, torch.rand(m, self.TOPK, generator=g).to(self.dev)
+        return ids, torch.rand(m, topk, generator=g).to(self.dev)
 
-    def _sort(self, fn, ids, w, bs):
-        return fn(ids, w, self.E, self.DIM, torch.bfloat16, bs, None, None, 0, True)
+    def _sort(self, fn, ids, w, bs, E=E):
+        return fn(ids, w, E, self.DIM, torch.bfloat16, bs, None, None, 0, True)
+
+    def _emitted_quant(self, ids, w, x, bs, E):
+        S = self.S
+        tok = S._pending_quant_input.set(x)
+        etok = S._emitted_quant.set(None)
+        try:
+            self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
+            return S._emitted_quant.get()
+        finally:
+            S._emitted_quant.reset(etok)
+            S._pending_quant_input.reset(tok)
 
     def _assert_same_sort(self, a, b, bs, msg):
         na, nb = int(a[3][0]), int(b[3][0])
@@ -73,56 +84,51 @@ class TestMoeSortingSmall(CustomTestCase):
                 f"{msg} block {i // bs}",
             )
 
-    def test_dispatch_limit(self):
-        for bs in (16, 32, 64):
-            for m in range(1, 25):
-                ids, _ = self._routing(m, m)
-                self.assertEqual(
-                    self.S._small_sort_supported(ids, bs, None, None),
-                    m * self.TOPK <= min(64, 2 * bs),
-                    f"m={m} bs={bs}",
-                )
-
     def test_sort_matches_aiter(self):
+        # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared
+        cases = [(513, 11, m) for m in (1, 2, 4, 5)] + [
+            (129, 5, m) for m in (13, 25, 51)
+        ]
         for bs in (32, 64):
-            for m in (1, 2, 4, 5, 6, 12, 23, 40):
-                ids, w = self._routing(m, m)
+            for E, topk, m in cases:
+                ids, w = self._routing(m, m, E, topk)
                 self._assert_same_sort(
-                    self._sort(self.orig_sort, ids, w, bs),
-                    self._sort(self.fm._moe_sorting_impl, ids, w, bs),
+                    self._sort(self.orig_sort, ids, w, bs, E),
+                    self._sort(self.fm._moe_sorting_impl, ids, w, bs, E),
                     bs,
-                    f"m={m} bs={bs}",
+                    f"E={E} m={m} bs={bs}",
                 )
 
     def test_fused_mxfp8_quant_matches_aiter(self):
-        S, bs = self.S, 32
-        for m in (1, 4, 5):
-            ids, w = self._routing(m, m)
+        bs = 32
+        # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared
+        for E, topk, m in ((513, 11, 1), (513, 11, 5), (129, 5, 16), (129, 5, 51)):
+            ids, w = self._routing(m, m, E, topk)
             x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
-            sid, sw, _, nv, _ = self._sort(self.orig_sort, ids, w, bs)
+            sid, sw, _, nv, _ = self._sort(self.orig_sort, ids, w, bs, E)
             ref_q, _ = self.orig_quant(
                 x,
                 sorted_ids=sid,
                 num_valid_ids=nv,
                 token_num=m,
-                topk=self.TOPK,
+                topk=topk,
                 block_size=bs,
                 sorted_weights=sw,
-                num_experts_upper_bound=self.E,
+                num_experts_upper_bound=E,
             )
-            tok = S._pending_quant_input.set(x)
-            etok = S._emitted_quant.set(None)
-            try:
-                self._sort(self.fm._moe_sorting_impl, ids, w, bs)
-                emitted = S._emitted_quant.get()
-            finally:
-                S._emitted_quant.reset(etok)
-                S._pending_quant_input.reset(tok)
-            self.assertIsNotNone(emitted, f"m={m}")
+            emitted = self._emitted_quant(ids, w, x, bs, E)
+            self.assertIsNotNone(emitted, f"E={E} m={m}")
             self.assertTrue(
                 torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
-                f"m={m}",
+                f"E={E} m={m}",
             )
+
+    def test_falls_back_to_aiter_past_compact_at_513_experts(self):
+        m = 6
+        ids, w = self._routing(m, m)
+        self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
+        x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
+        self.assertIsNone(self._emitted_quant(ids, w, x, 32, self.E))
 
 
 if __name__ == "__main__":
