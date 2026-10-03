@@ -3,7 +3,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
@@ -357,14 +357,17 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
     """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
 
     num_inference_steps: int = 5
+    _distilled_grid_points: ClassVar[int] = 5
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 5:
+        grid_points = self._distilled_grid_points
+        if self.num_inference_steps != grid_points:
             raise ValueError(
-                "FastH3 is distilled for exactly five sigma grid points (four DiT "
-                f"forwards); got num_inference_steps={self.num_inference_steps}. "
-                "Use MiniMaxAI/MiniMax-H3 for other schedules."
+                f"FastH3 is distilled for exactly {grid_points} sigma grid points "
+                f"({grid_points - 1} DiT forwards); got num_inference_steps="
+                f"{self.num_inference_steps}. Use MiniMaxAI/MiniMax-H3 for other "
+                "schedules."
             )
         if self.task is not None and self.task.strip().lower() != "t2va":
             raise ValueError(
@@ -374,4 +377,16 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
             )
 
 
-__all__ = ["FastH3SamplingParams", "MiniMaxH3SamplingParams"]
+@dataclass
+class FastH3V2SamplingParams(FastH3SamplingParams):
+    """FastH3 8-Step V2: nine sigma grid points, i.e. the eight DiT forwards."""
+
+    num_inference_steps: int = 9
+    _distilled_grid_points: ClassVar[int] = 9
+
+
+__all__ = [
+    "FastH3SamplingParams",
+    "FastH3V2SamplingParams",
+    "MiniMaxH3SamplingParams",
+]

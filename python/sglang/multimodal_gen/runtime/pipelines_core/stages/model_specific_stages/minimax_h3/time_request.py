@@ -57,3 +57,27 @@ def minimax_h3_time_shift_sigmas(
     if num_steps > 1 and shifted[-1].item() > 0.0:
         shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]
+
+
+def minimax_h3_rung_sigmas(
+    *,
+    rungs: tuple[int, ...],
+    shift_scale: float,
+) -> list[float]:
+    """Shift a distilled checkpoint's rungs and append the terminal zero.
+
+    Rungs are unshifted noise levels on the 1000-step training clock, so the
+    base grid is ``rung / 1000`` rather than a uniform linspace.
+    """
+    if shift_scale <= 0:
+        raise ValueError("MiniMax H3 shift_scale must be > 0")
+
+    import torch
+
+    base = torch.tensor(
+        [rung / 1000.0 for rung in rungs] + [0.0],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
+    return [float(value) for value in shifted.tolist()]

@@ -51,6 +51,10 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
+    # A distilled checkpoint's trained noise ladder; None keeps the uniform grid.
+    sigma_rungs: tuple[int, ...] | None = None
+    # A VSA-distilled checkpoint's trained sparsity; None keeps the backend default.
+    vsa_sparsity: float | None = None
 
     @classmethod
     def from_model_index(

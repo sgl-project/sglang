@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_world_group,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_RESERVE_FRACTION,
     MIN_HOST_RESERVE_BYTES,
@@ -39,9 +40,8 @@ logger = init_logger(__name__)
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
-# The native adaln_proj tensor names the online rebuild streams; a checkpoint
-# without them (Diffusers layout, quantized export) cannot serve as a rebuild
-# source.
+# A weight update can retarget the online rebuild only onto shards that carry
+# the native adaln_proj tensor names (not a Diffusers-layout or quantized export).
 _NATIVE_ADALN_PROBE_KEY = "blocks.0.adaln_proj.linear.weight"
 
 
@@ -59,6 +59,40 @@ def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
         struct.unpack("<I", struct.pack("<f", float(value)))[0]
         for value in timesteps.tolist()
     )
+
+
+def _diffusers_adaln_checkpoint_names(
+    weight_files: list[str], arch: MiniMaxH3DiTArchConfig
+) -> dict[str, str]:
+    """Native adaln_proj name -> tensor name in a Diffusers-layout checkpoint,
+    resolved through the DiT's own checkpoint mapping."""
+    mapping = get_param_names_mapping(arch.param_names_mapping)
+    prefixes = [f"blocks.{layer}.adaln_proj.linear" for layer in range(arch.num_layers)]
+    prefixes.append("final_layer.adaln_proj.linear")
+    wanted = {f"{prefix}.{kind}" for prefix in prefixes for kind in ("weight", "bias")}
+    names: dict[str, str] = {}
+    for file in weight_files:
+        with safe_open(file, framework="pt", device="cpu") as handle:
+            for checkpoint_name in handle.keys():
+                native_name, merge_index, _ = mapping(checkpoint_name)
+                if native_name not in wanted:
+                    continue
+                # The rebuild streams whole tensors; a fused or twice-mapped
+                # source has no single tensor to read.
+                if merge_index is not None or native_name in names:
+                    raise ValueError(
+                        "MiniMax H3 online AdaLN cannot resolve "
+                        f"{native_name!r} to a single checkpoint tensor "
+                        f"({checkpoint_name!r}, {names.get(native_name)!r})"
+                    )
+                names[native_name] = checkpoint_name
+    missing = sorted(wanted - names.keys())
+    if missing:
+        raise ValueError(
+            "MiniMax H3 online AdaLN found no checkpoint tensor for "
+            f"{len(missing)} adaln_proj parameter(s), e.g. {missing[0]!r}"
+        )
+    return names
 
 
 def native_adaln_weight_files(weights_path: str) -> list[str]:
@@ -422,6 +456,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.path = path
         self.model_variant = model_variant
         self.weight_files = weight_files
+        # None reads the native tensor names straight from the shards.
+        self._checkpoint_names = (
+            _diffusers_adaln_checkpoint_names(weight_files, arch)
+            if weight_files is not None and arch.checkpoint_uses_diffusers_layout
+            else None
+        )
         self.max_plans = max_plans
         self.max_plan_width = max_plan_width
         self.num_layers = arch.num_layers
@@ -734,6 +774,11 @@ class MiniMaxH3AdalnCache(nn.Module):
             self.max_plans,
         )
 
+    def retarget_native(self, weight_files: list[str]) -> None:
+        """Rebuild from a native-layout checkpoint after a weight update."""
+        self.weight_files = weight_files
+        self._checkpoint_names = None
+
     def invalidate(self) -> None:
         """Drop every cached plan; call between requests after a weight swap."""
         if self._host_tier is not None:
@@ -757,8 +802,11 @@ class MiniMaxH3AdalnCache(nn.Module):
                 for f in self.weight_files
             ]
             index = {name: h for h in handles for name in h.keys()}
+            checkpoint_names = self._checkpoint_names
 
             def read_shard(name: str, out_features: int) -> torch.Tensor:
+                if checkpoint_names is not None:
+                    name = checkpoint_names[name]
                 if tp_size == 1:
                     tensor = index[name].get_tensor(name)
                 else:

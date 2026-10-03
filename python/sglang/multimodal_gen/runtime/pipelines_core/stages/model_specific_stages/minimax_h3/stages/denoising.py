@@ -449,7 +449,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # one denoise per sigma interval: steps - 1
         return max(1, num_inference_steps - 1)
 
-    def __init__(self, transformer, pipeline=None) -> None:
+    def __init__(
+        self, transformer, pipeline=None, *, vsa_sparsity: float | None = None
+    ) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
@@ -457,6 +459,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
+        # The checkpoint's trained VSA-H3 sparsity, used unless the server
+        # configures VSA_sparsity explicitly.
+        self._vsa_sparsity = vsa_sparsity
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -751,6 +756,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 ctx=ctx,
                 server_args=server_args,
                 device=device,
+                checkpoint_sparsity=self._vsa_sparsity,
             )
             if build_vsa_h3_step_metadata is None:
                 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
@@ -1053,6 +1059,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     ctx: _FullLoopContext,
     server_args: ServerArgs,
     device: torch.device,
+    checkpoint_sparsity: float | None = None,
 ) -> Callable[[int], Any] | None:
     """Per-step VSA-H3 metadata builder over the request-static packed layout,
     or None off the VSA path."""
@@ -1076,7 +1083,10 @@ def _maybe_prepare_vsa_h3_step_metadata(
             "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
             f"geometry; got vsa_tile_size={tile_size}."
         )
-    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    default_sparsity = 0.9 if checkpoint_sparsity is None else checkpoint_sparsity
+    sparsity = float(
+        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
+    )
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
     mode = str(config.get("vsa_mode", "exempt"))

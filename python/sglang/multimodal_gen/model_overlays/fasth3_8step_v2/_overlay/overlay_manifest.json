@@ -1,0 +1,26 @@
+{
+  "source_model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
+  "materializer_version": "v1",
+  "custom_materializer": "_overlay/materialize.py",
+  "required_source_files": [
+    "fastvideo_inference.json",
+    "scheduler/scheduler_config.json",
+    "audio_scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors.index.json",
+    "audio_vae/config.json",
+    "text_encoder/config.json"
+  ],
+  "file_mappings": [
+    { "type": "tree", "src": "transformer", "dst_dir": "transformer" },
+    { "type": "tree", "src": "audio_vae", "dst_dir": "audio_vae" },
+    { "type": "tree", "src": "text_encoder", "dst_dir": "text_encoder" },
+    { "type": "tree", "src": "tokenizer", "dst_dir": "tokenizer" },
+    { "type": "tree", "src": "processor", "dst_dir": "processor" },
+    { "type": "tree", "src": "scheduler", "dst_dir": "scheduler" },
+    { "type": "tree", "src": "audio_scheduler", "dst_dir": "audio_scheduler" },
+    { "type": "file", "src": "fastvideo_inference.json" }
+  ]
+}

@@ -46,6 +46,9 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
         "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
     },
+    "FastVideo/FastVideo-FastH3-8-Step-V2": {
+        "bundled_overlay_subdir": "fasth3_8step_v2",
+    },
     "OpenVDN/vdn-minimax-h3": {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
         "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
@@ -153,13 +156,21 @@ def _normalize_model_overlay_registry(
             raise ValueError(
                 "Overlay registry values must be either strings or JSON objects"
             )
-        overlay_repo_id = spec.get("overlay_repo_id")
-        if not overlay_repo_id:
+        if not spec.get("overlay_repo_id") and not spec.get("bundled_overlay_subdir"):
             raise ValueError(
-                f"Overlay registry entry for {source_model_id!r} is missing overlay_repo_id"
+                f"Overlay registry entry for {source_model_id!r} needs overlay_repo_id "
+                "or bundled_overlay_subdir"
             )
         normalized[source_model_id] = dict(spec)
     return normalized
+
+
+def _overlay_repo_label(overlay_spec: dict[str, Any]) -> str:
+    """The overlay's HF repo id, or a stable label for an in-tree bundled one."""
+    overlay_repo_id = overlay_spec.get("overlay_repo_id")
+    if overlay_repo_id:
+        return str(overlay_repo_id)
+    return f"bundled:{overlay_spec['bundled_overlay_subdir']}"
 
 
 def resolve_model_overlay(model_name_or_path: str) -> dict[str, Any] | None:
@@ -441,6 +452,11 @@ def download_overlay_metadata(
         )
         return bundled_overlay_dir
 
+    if not overlay_spec.get("overlay_repo_id"):
+        raise ValueError(
+            f"Bundled overlay {overlay_spec['bundled_overlay_subdir']!r} for "
+            f"{source_model_id} is missing from this SGLang installation"
+        )
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     if os.path.exists(overlay_repo_id):
         logger.info(
@@ -558,7 +574,7 @@ def materialize_overlay_model(
         manifest = cast(dict[str, Any], json.load(f))
 
     materializer_version = str(manifest.get("materializer_version", "v1"))
-    overlay_repo_id = str(overlay_spec["overlay_repo_id"])
+    overlay_repo_id = _overlay_repo_label(overlay_spec)
     overlay_revision = str(overlay_spec.get("overlay_revision", "main"))
     overlay_fingerprint = _compute_overlay_fingerprint(overlay_dir)
     cache_key = hashlib.sha256(
