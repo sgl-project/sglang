@@ -10,8 +10,10 @@ import hashlib
 import json
 import math
 import sys
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime
+from itertools import groupby
 from typing import Annotated, Literal, Mapping
 
 import msgspec
@@ -258,20 +260,30 @@ def _coverage(objects: list[TensorDescriptor], n: int, heads: int) -> int:
     end = max(o.token_range[1] for o in objects)
     if end not in (n - 1, n):
         raise ContractError("only the final token may lack KV")
-    boundaries = sorted({0, end} | {x for o in objects for x in o.token_range})
-    for lo, hi in zip(boundaries, boundaries[1:]):
-        intervals = sorted(
-            o.head_range
-            for o in objects
-            if o.token_range[0] <= lo and o.token_range[1] >= hi
-        )
-        cursor = 0
-        for start, stop in intervals:
-            if start != cursor:
-                raise ContractError("overlapping or missing KV heads/tokens")
-            cursor = stop
-        if cursor != heads:
+    events = []
+    for obj in objects:
+        start, stop = obj.token_range
+        interval = tuple(obj.head_range)
+        events.extend(((start, 1, interval), (stop, -1, interval)))
+    active = []
+    covered = previous = 0
+    # End events sort before starts at the same token. Disjoint in-bounds
+    # head intervals cover a slab exactly when their total width equals heads.
+    for position, changes in groupby(sorted(events), key=lambda event: event[0]):
+        if position > previous and covered != heads:
             raise ContractError("incomplete KV head coverage")
+        for _, direction, interval in changes:
+            index = bisect_left(active, interval)
+            if direction < 0:
+                active.pop(index)
+            else:
+                if (index and active[index - 1][1] > interval[0]) or (
+                    index < len(active) and interval[1] > active[index][0]
+                ):
+                    raise ContractError("overlapping or missing KV heads/tokens")
+                active.insert(index, interval)
+            covered += direction * (interval[1] - interval[0])
+        previous = position
     return end
 
 

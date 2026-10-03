@@ -27,6 +27,7 @@ it does not redefine the goal as the modules already implemented.
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
+| KV coverage validation | Token-endpoint sweep with disjoint active head intervals | Independent grid-oracle comparisons and 123 shared/Store tests pass; 32K metadata validation falls 69.4%, with 16 complete long-context post-exit snapshots and no established serving speedup |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
@@ -4798,6 +4799,48 @@ source/cleanup hashes are recorded in the [runbook](experiments/CAPTURE_SOAK.md)
 and [evidence](experiments/capture-soak.json). No extra GPU was allocated; live
 process inspection confirms the resident idle load has resumed.
 
+## KV Coverage Sweep
+
+Manifest coverage now sweeps token endpoints and maintains disjoint active
+head intervals. End events precede starts at shared boundaries; their total
+width must equal the layer's head count across every token slab. Head bounds,
+all-layer consistency and the final-token-only exception remain enforced.
+This removes repeated scans of every token chunk for the usual fixed TP shard
+count. Sorted-list update costs still depend on active head partitions; the
+change does not claim logarithmic updates for arbitrary head counts.
+
+An independent per-cell oracle checks 2,145 exhaustive small multisets, 3,500
+random tiling/corruption cases and all 120 orders of a changing head partition.
+Shuffled JSON roundtrips and missing-chunk rejection pass. All **123 methods**
+pass across shared protocol/topology/context/writer/coordinator suites and the
+actual TCP Store's independent-reader, cohort and recovery suite.
+
+Metadata-only median validation falls from **45.627 to 13.984 ms (69.4%)** for
+a 32K-prompt/two-layer fixture with 2,064 objects. The real Qwen3 32K comparison
+uses three layers and two identical off/on/off brackets. Each enabled phase
+admits and publishes all eight requests. Together, post-exit readback validates
+**16 snapshots / 49,376 tensor objects / 6,456,617,984 payload bytes**.
+
+Real snapshot construction falls from **539.833 to 455.239 ms/sample**, and
+complete content validation from **615.298 to 559.288 ms/sample**. Request
+throughput is **0.10545 versus 0.10641 requests/s**; that small one-pair difference
+does not establish an end-to-end serving improvement or a production SLO.
+Hashes, payload semantic checks, wire layout and GPU collection are unchanged.
+
+The benchmark now exposes `--manifest-mib`, defaulting to the existing 1 MiB.
+Actual long-context manifests are approximately 1.45 MB, so both completed
+comparisons reserve 4 MiB within the 1 GiB Host budget. Two initial runs with
+insufficient metadata reservations were intentionally interrupted and retained.
+The final source audit covers 5,047 Python files and binds the only production
+difference to `protocol.py`. Test/driver files pass full Ruff; protocol findings
+decrease from two baseline diagnostics to one, with no new findings.
+
+All eight worker jobs are terminal. The [runbook](experiments/KV_COVERAGE_SWEEP.md)
+and [evidence](experiments/kv-coverage-sweep.json) record the 76-artifact archive,
+initial runs, corrected lint audit and live-process/GPU cleanup. The resident
+idle load has resumed and no extra GPU was allocated. Production Catalog,
+broader topology/workload acceptance and training integration remain open.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4840,7 +4883,7 @@ process inspection confirms the resident idle load has resumed.
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing
-   teacher LSE, contiguous row-selection and Host finite-scan overhead, profile the remaining capture
+   teacher LSE, contiguous row-selection, Host finite-scan and KV coverage overhead, profile the remaining capture
    and control/durability costs. The new token-based timing and publication join
    reproduce off-phase TTFT/TPOT stalls and mixed-publication slow batches; locate
    their server operations without dropping publication checks. The deferred

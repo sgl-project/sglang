@@ -292,6 +292,7 @@ def capture_config(args, directory, address, catalog, ratio):
         "max_sample_tokens": args.input_len + args.output_len,
         "max_inflight_samples": args.capture_slots,
         "max_host_bytes": args.host_mib << 20,
+        "manifest_buffer_bytes": getattr(args, "manifest_mib", 1) << 20,
         "kv_d2h_batch_tokens": args.kv_d2h_batch_tokens,
         "kv_export_backend": getattr(args, "kv_export_backend", "torch"),
         "teacher_d2h_batch_tokens": args.teacher_d2h_batch_tokens,
@@ -683,6 +684,7 @@ def main():
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 14, 27])
     parser.add_argument("--capture-slots", type=int, default=16)
     parser.add_argument("--host-mib", type=int, default=256)
+    parser.add_argument("--manifest-mib", type=int, default=1)
     parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
     parser.add_argument(
         "--kv-export-backend", choices=("torch", "hicache"), default="torch"
@@ -719,6 +721,7 @@ def main():
             args.repeats,
             args.capture_slots,
             args.host_mib,
+            args.manifest_mib,
             args.kv_d2h_batch_tokens,
             args.teacher_d2h_batch_tokens,
             args.segment_mib,

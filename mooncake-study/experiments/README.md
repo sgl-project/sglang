@@ -48,6 +48,10 @@ and checks request lifetime with exact publication/readback validation.
 multiple measured batches, checks process memory and pool ownership without
 forced collection between batches, and validates all READY samples after exit.
 
+[KV Coverage Sweep](KV_COVERAGE_SWEEP.md) removes repeated full-object scans
+from long-context metadata validation, with independent rectangle-grid checks
+and actual 32K serving/readback comparisons using an explicit manifest budget.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.
