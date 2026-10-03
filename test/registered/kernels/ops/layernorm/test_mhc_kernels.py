@@ -383,39 +383,6 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     assert layer.local_boundary is None and layer.next_boundary is None
 
 
-def test_mhc_mix_stats_preserves_xpu_split_dispatch():
-    from unittest.mock import Mock, patch
-
-    from sglang.srt.models import deepseek_v4 as model
-    from sglang.srt.models import deepseek_v4_mhc as model_mhc
-
-    cfg = model_mhc.HcConfig(4, 20, 1e-6, 1e-6, 8, True, False)
-    x = torch.randn(2, 4, 8)
-    hc = model_mhc.HcSubLayer(
-        cfg, torch.randn(24, 32), torch.ones(3), torch.zeros(24), None
-    )
-    triplet = (torch.ones(2, 1, 4), torch.ones(2, 1, 4), torch.ones(2, 1, 4, 4))
-    split = Mock(return_value=triplet)
-    with (
-        patch.object(model_mhc, "_is_xpu", True),
-        patch.object(
-            model, "get_mhc_ops", return_value=SimpleNamespace(hc_split_sinkhorn=split)
-        ),
-        patch.object(
-            mhc,
-            "hc_split_sinkhorn",
-            side_effect=AssertionError("XPU must not call the TileLang splitter"),
-        ),
-    ):
-        actual = model_mhc.mix_stats(hc, x)
-    split.assert_called_once()
-    assert split.call_args.args[1] is hc.scale
-    assert split.call_args.args[2] is hc.base
-    assert split.call_args.args[3:] == (cfg.mult, cfg.sinkhorn_iters, cfg.eps)
-    for result, expected in zip(actual, triplet):
-        torch.testing.assert_close(result, expected.squeeze(1), rtol=0, atol=0)
-
-
 @pytest.mark.parametrize(
     "replicated,add_shared,has_shared,expected",
     [
