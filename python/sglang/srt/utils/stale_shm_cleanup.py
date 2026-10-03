@@ -1,13 +1,17 @@
-"""Self-heal for leaked POSIX shared-memory segments in CI.
+"""Self-heal for leaked POSIX shared-memory segments.
 
 SGLang processes are torn down with SIGKILL (kill_process_tree, PDEATHSIG),
 which skips every Python-level unlink path, so /dev/shm segments accumulate
 until the tmpfs is full and the next scheduler init dies with SIGBUS.
 
-Pid-stamped names (see _creator_pid) are unlinked once their creator is dead;
-pid-less families (_ORPHAN_PREFIXES) are unlinked unconditionally, safe only
-because the sweep runs at CI job start right after killall.py. CI-only
-(SGLANG_IS_IN_CI): both rules assume a single-tenant runner container.
+Pid-stamped names (see _creator_pid) are unlinked once their creator is dead.
+The sweep runs at every scheduler startup: on a private /dev/shm (the normal
+container/pod deployment) the pid check is against the current pid namespace,
+and a recycled pid only degrades to under-collection, never to deleting a
+live segment. On a host-shared /dev/shm the check can misattribute a foreign
+live segment, which is why the additional pid-less families
+(_ORPHAN_PREFIXES) are unlinked unconditionally only in CI
+(SGLANG_IS_IN_CI): single-tenant runner containers.
 """
 
 import logging
@@ -65,14 +69,20 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_shm() -> None:
+def cleanup_stale_shm(include_orphans: bool | None = None) -> None:
     """Unlink leaked shared-memory segments (rules in module docstring).
 
     Best-effort: never raises, since a failed sweep must not block server
     startup.
+
+    Args:
+        include_orphans: also unlink pid-less orphan families (``nccl-*``,
+            ``cuda.shm.*``, ...). Unconditionally unsafe on a shared /dev/shm,
+            so it defaults to CI-only; explicit True/False overrides it
+            (used by tests).
     """
     try:
-        _cleanup_stale_shm_impl()
+        _cleanup_stale_shm_impl(include_orphans)
     except Exception:
         logger.warning(
             "cleanup_stale_shm: sweep failed, continuing startup", exc_info=True
@@ -85,9 +95,9 @@ def _is_in_ci() -> bool:
     return os.environ.get("SGLANG_IS_IN_CI", "false").lower() in ("true", "1")
 
 
-def _cleanup_stale_shm_impl() -> None:
-    if not _is_in_ci():
-        return
+def _cleanup_stale_shm_impl(include_orphans: bool | None = None) -> None:
+    if include_orphans is None:
+        include_orphans = _is_in_ci()
     if not _SHM_DIR.is_dir():
         return
 
@@ -106,7 +116,7 @@ def _cleanup_stale_shm_impl() -> None:
             # segment. Keep that bias when changing this check.
             if pid == os.getpid() or _pid_alive(pid):
                 continue
-        elif not entry.name.startswith(_ORPHAN_PREFIXES):
+        elif not include_orphans or not entry.name.startswith(_ORPHAN_PREFIXES):
             continue
         try:
             size = entry.stat().st_size
