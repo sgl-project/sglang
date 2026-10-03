@@ -57,16 +57,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
     MHATokenToKVPool,
     MLATokenToKVPool,
     RadixAttention,
     unwrap_write_loc,
-)
-from sglang.srt.mem_cache.page_interleave import (
-    PageInterleavePlacement,
-    PageShardSpec,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -76,6 +73,7 @@ from sglang.srt.utils import ceil_div, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.mem_cache.page_interleave import PageShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +118,8 @@ class PageInterleaveKVPoolMixin:
         assert spec.chunk_tokens % spec.page_size == 0
 
         self.shard_spec = spec
-        self.placement = PageInterleavePlacement(spec)
+        self.shard_group = shard_group
+        self.placement = page_interleave.PageInterleavePlacement(spec)
         self.shard_rank = spec.shard_rank
         self.shard_size = spec.shard_size
         self.device_module = torch.get_device_module(self.device)
