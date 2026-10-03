@@ -177,6 +177,7 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 | Phase | Backend | Mechanism | Default |
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
+| Prefill | `full` | One `torch.xpu.XPUGraph` per token-length bucket, capturing the whole prefill forward | **Off** (opt-in) |
 | Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
 | Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
 
@@ -192,7 +193,28 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 ### Enable Prefill Graph
 
 Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
-Two backends are available: `tc_piecewise` and `breakable`.
+Three backends are available: `full`, `tc_piecewise` and `breakable`.
+
+#### full
+
+Captures the full prefill forward as one `torch.xpu.XPUGraph` per
+token-length bucket. For `full` prefill, the graph also fixes the
+number of request slots baked into each capture. If you do not set that
+explicitly, SGLang derives it from `chunked_prefill_size // 512` and
+clamps it by the phase-level `max_bs`.
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill full
+```
+
+To override the request-slot cap for `full` prefill, pass it through
+`--cuda-graph-config`, for example:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-config '{"prefill":{"backend":"full","bs":[64,128,256],"full_prefill_max_req":8}}'
+```
 
 #### tc_piecewise
 
@@ -290,12 +312,12 @@ python -m sglang.launch_server \
 
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
-| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
-| `--cuda-graph-backend-prefill` | `tc_piecewise`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `tc_piecewise` or `breakable` explicitly to enable. |
+| `--cuda-graph-backend-decode` | `full`, `breakable`, `disabled` | `disabled` | Backend for the decode phase. `full` and `breakable` are supported on XPU. |
+| `--cuda-graph-backend-prefill` | `full`, `tc_piecewise`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `full`, `tc_piecewise`, or `breakable` explicitly to enable. |
 | `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
-| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'`. Overrides all per-phase flags. |
+| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"full"}}'` or `'{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'`. Overrides all per-phase flags. |
 | `--disable-decode-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-decode=disabled`. |
 | `--disable-prefill-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-prefill=disabled`. |
 | `--enable-torch-compile` | — | `False` | Apply `torch.compile` on top of the decode XPU graph for further kernel optimization. |
@@ -308,8 +330,8 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 
 | Feature | Status |
 |---|---|
-| Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Not yet implemented |
+| Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported (requires concurrent multi-stream graph capture) |
+| Memory saver with XPU Graph (`--enable-memory-saver`) | Weights and KV cache can be released/resumed via Level Zero virtual memory; XPU graph allocations themselves are not pauseable (Level Zero in-process hook mode does not hook XPUGraph memory) |
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
