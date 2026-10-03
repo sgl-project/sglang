@@ -741,6 +741,23 @@ def load_token_map(token_map_path: str) -> List[int]:
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
 
+def validate_hot_token_ids_fit(hot_token_id: torch.Tensor, num_head_rows: int) -> None:
+    """Hot ids index the shared target lm_head, so they must address real rows.
+
+    Whether that head is vocab-sharded by ``tp_size`` or replicated per
+    attention-DP rank is per-model (only models passing ``use_attn_tp_group``
+    follow the attention-TP width), so the row count is the only exact test.
+    """
+    max_hot_id = int(hot_token_id.max())
+    if max_hot_id >= num_head_rows:
+        raise ValueError(
+            f"--speculative-token-map holds global vocab id {max_hot_id}, but "
+            f"the shared target lm_head has {num_head_rows} rows on this rank. "
+            "The head is vocab-sharded, so global hot ids cannot index it; run "
+            "with tp_size 1, or a parallelism that keeps the lm_head replicated."
+        )
+
+
 @contextmanager
 def draft_pp_context():
     # The draft model is one layer and never spans pipeline stages; give it a

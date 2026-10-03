@@ -970,15 +970,29 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Currently standalone speculative decoding does not support dp attention."
         )
 
-    # The map holds global vocab ids, but the shared target lm_head is
-    # vocab-sharded at tp_size > 1, so gathering its rows by those ids reads out
-    # of bounds. EAGLE3 ignores the flag and uses the checkpoint's own reduced
-    # head, which is sharded consistently.
-    # TODO(xin-osaka-u): support tp_size > 1, sgl-project/sglang#42397.
+    # STANDALONE keeps the draft's own full-vocab head -- its init_lm_head is a
+    # no-op -- so the loaded map never reduces a head and only corrupts the
+    # proposal, which indexes it by full-vocab ids. Broken at every tp_size.
+    if (
+        cfg.speculative_token_map is not None
+        and cfg.speculative_algorithm == "STANDALONE"
+    ):
+        raise ValueError(
+            "--speculative-token-map is not supported with "
+            "--speculative-algorithm STANDALONE: the standalone draft keeps its "
+            "own full-vocabulary lm_head, so a reduced token map cannot apply."
+        )
+
+    # Global hot ids cannot index a vocab-sharded target lm_head. The shard
+    # width is per-model (only models passing use_attn_tp_group follow the
+    # attention-TP width), so reject just the unambiguous case here; the exact
+    # row check lives in eagle_worker_v2.init_lm_head.
+    # TODO(xin-osaka-u): support a sharded head, sgl-project/sglang#42397.
     if (
         cfg.speculative_token_map is not None
         and cfg.speculative_algorithm != "EAGLE3"
         and cfg.tp_size > 1
+        and not attn_dp_enabled_of(resolved_view(server_args))
     ):
         raise ValueError(
             "--speculative-token-map is not supported with tp_size > 1: the hot "

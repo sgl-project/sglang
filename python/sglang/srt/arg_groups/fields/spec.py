@@ -118,7 +118,9 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_token_map: A[
         Optional[str],
-        "The path of the draft model's small vocab table.",
+        "The path of the draft model's small vocab table (requires a replicated "
+        "lm_head, so tp_size=1 unless the model keeps the head replicated under "
+        "attention DP; ignored for EAGLE3, unsupported for STANDALONE).",
     ] = None
     speculative_attention_mode: A[
         str,
