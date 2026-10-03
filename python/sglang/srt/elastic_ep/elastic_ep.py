@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
+_RECOVER_COHORT_KEY_PREFIX = "elastic_ep/recover_cohort"
 
 # Last inactive-rank set reported by is_scaling(), which polls: re-log only on change.
 _fault_reported_ranks: tuple = ()
@@ -70,6 +71,44 @@ def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     if not store.check([key]):
         return None
     return msgspec.json.decode(store.get(key), type=ScaleCohort)
+
+
+def register_recover_cohort(rank_offset: int, effective_ep_size: int) -> None:
+    """Announce the cohort width a recover joiner sized its expert map for.
+
+    Its own key space, not the scale cohort's: survivors ask ``get_scale_cohort``
+    whether an append grow has a cohort waiting, and a recover joiner parked at an
+    offset equal to the current width would answer that for an unrelated grow.
+    """
+    store = get_global_tcp_store()
+    if store is None:
+        raise RuntimeError("Elastic EP recover-mode join requires the global TCPStore.")
+    store.set(f"{_RECOVER_COHORT_KEY_PREFIX}/{rank_offset}", str(effective_ep_size))
+
+
+def clear_recover_cohort(rank_offset: int) -> None:
+    """Drop a stale announce so a later grow cannot be planned off a dead joiner."""
+    store = get_global_tcp_store()
+    key = f"{_RECOVER_COHORT_KEY_PREFIX}/{rank_offset}"
+    if store is not None and store.check([key]):
+        store.delete_key(key)
+
+
+def required_recover_width(recover_slots: List[int]) -> Optional[int]:
+    """The narrowest cohort width that fits every joiner waiting on these slots.
+
+    None until all of them have announced, and deliberately no guess in the meantime:
+    going direct kills a joiner wider than the target at the cohort barrier, while
+    assuming the launch width asks a narrower one to fill slots it has no ranks for.
+    Reads the store once and never sleeps, because the caller is the scheduler loop.
+    """
+    store = get_global_tcp_store()
+    if store is None:
+        return None
+    keys = [f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}" for slot in recover_slots]
+    if not all(store.check([key]) for key in keys):
+        return None
+    return max(int(store.get(key)) for key in keys)
 
 
 @dataclass
