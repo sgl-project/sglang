@@ -626,9 +626,12 @@ class PDCaptureRuntimeBase(CustomTestCase):
             if prefill_backend == "disabled":
                 self.assertFalse(prefill_replays)
             else:
+                prefill_ranks = {
+                    (tp, pp) for tp in range(prefill_tp) for pp in range(prefill_pp)
+                }
                 self.assertEqual(
                     {(r["tp_rank"], r["pp_rank"]) for r in prefill_replays},
-                    {(tp, pp) for tp in range(prefill_tp) for pp in range(prefill_pp)},
+                    prefill_ranks,
                 )
                 for frame in prefill_replays:
                     self.assertIsNotNone(frame["prefill_graph"])
@@ -646,12 +649,14 @@ class PDCaptureRuntimeBase(CustomTestCase):
                             set(rows.values()),
                             {frame["prefill_graph"]["raw_tokens"]},
                         )
-                self.assertTrue(
-                    any(
-                        r["prefill_graph"]["raw_tokens"]
-                        < r["prefill_graph"]["padded_tokens"]
+                self.assertEqual(
+                    {
+                        (r["tp_rank"], r["pp_rank"])
                         for r in prefill_replays
-                    )
+                        if r["prefill_graph"]["raw_tokens"]
+                        < r["prefill_graph"]["padded_tokens"]
+                    },
+                    prefill_ranks,
                 )
                 self.assertTrue(
                     any(
@@ -676,7 +681,10 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     buffers.setdefault(key, set()).add(
                         frame["prefill_graph"]["replay_id"]
                     )
-                self.assertTrue(any(len(ids) > 1 for ids in buffers.values()))
+                self.assertEqual(
+                    {key[:2] for key, ids in buffers.items() if len(ids) > 1},
+                    prefill_ranks,
+                )
             self.assertTrue(any(not r["predictions"] for r in prefill_frames))
             decode_frames = [
                 r

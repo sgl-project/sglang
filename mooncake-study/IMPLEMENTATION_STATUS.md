@@ -37,7 +37,7 @@ it does not redefine the goal as the modules already implemented.
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture and real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2 binding pass; additional deployed models remain open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Four-process Gloo failure/finite-wait tests and real distributed identity, resource readiness and activation pass; broader deployment combinations remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
-| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | AR and static target-KV DSpark pass Full, Breakable and default torch.compile piecewise in colocated and P/D single-rank, TP2 overlap and PP2 synchronous serving, with eager output comparison and post-exit Store parity; mixed TP/PP, asymmetric P/D and other speculative prefill graphs remain open |
+| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | AR and static target-KV DSpark pass Full, Breakable and torch.compile piecewise in colocated and P/D single-rank, TP2 overlap, PP2 synchronous and combined TP2/PP2 serving, with eager output comparison and post-exit Store parity; combined piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -45,7 +45,7 @@ it does not redefine the goal as the modules already implemented.
 | Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
-| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial HTTP/CPU and single-rank P/D suites pass; matching TP2/PP1 and TP1/PP2 AR/static target-KV DSpark add eight live-control cells with 64 complete post-exit snapshots; mixed/asymmetric and cross-node live control remain open |
+| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial HTTP/CPU and single-rank P/D suites pass; matching TP2/PP1, TP1/PP2 and TP2/PP2 AR/static target-KV DSpark add twelve live-control cells with 96 complete post-exit snapshots; asymmetric and cross-node live control remain open |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
@@ -4167,10 +4167,44 @@ uses a read-only pod-exec metrics relay. The Store uses real TCP with the test
 Catalog; production Catalog, alerting, broader topology and rollout gates remain
 open. The H100 experiment worker resumes its existing idle workload afterward.
 
+## Combined TP/PP Graph And Control Acceptance
+
+Four actual H100s run matching TP2/PP2 with Qwen3-0.6B and the real Mooncake
+TCP Store. Colocated and P/D prefill graph suites each pass six methods across
+Full, Breakable and torch.compile piecewise, for AR and static target-KV
+DSpark. Including each suite's eager baseline, these validate 140 complete
+snapshots after producer exit and observe 456 prefill replay rank-frames.
+Exact selected KV and raw top-128 values/IDs, teacher LSE, eager response
+parity, prefix reuse, chunking and speculative commit paths pass. Missing/stale
+P/D handoffs and cancelled requests fail capture without partial publication.
+
+Shared test oracles now require graph padding and buffer reuse on every TP/PP
+rank. Colocated buffer identities include the process's rank coordinates;
+equal virtual addresses in different processes cannot establish buffer reuse.
+
+Four additional P/D control methods pass AR/DSpark eager/graph execution in
+610.333 seconds, checking both endpoints' four rank-local states after every
+control. Each cell validates eight post-exit snapshots, five intended failed
+request captures and nine unbound tickets retired without payload writes.
+Together the three suites pass 16 methods and validate 172 snapshots. The
+production code is unchanged; these tests close the combined topology gaps
+for this model and fixture. All 3,355/3,356 Python source and storage test files
+match the corresponding frozen experimental checkouts.
+
+The [runbook](experiments/COMBINED_CAPTURE_RUNTIME.md) and
+[evidence](experiments/combined-capture-runtime.json) retain commands, results,
+source/log hashes and cleanup. Both P/D groups share the same four GPUs; PP
+scheduling is synchronous, piecewise uses eager compile debug mode, and Full
+prefill remains experimental. Synthetic draft weights and the test Catalog
+do not establish trained quality, production retention or SLO acceptance.
+Asymmetric P/D graphs/control and cross-node distributed RDMA remain open.
+The temporary four-GPU job is deleted; the resident H100 remains available.
+
 ## Next Implementation
 
-1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
-   coverage to mixed TP/PP, asymmetric P/D, other speculative and mixed-batch execution. Extend distributed
+1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
+   DSpark prefill graph coverage to asymmetric P/D, other speculative and
+   mixed-batch execution. Extend distributed
    pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache
@@ -4198,8 +4232,8 @@ open. The H100 experiment worker resumes its existing idle workload afterward.
    representative workloads and SLO thresholds, and extend the passing local
    dashboard runtime acceptance to deployment discovery/authentication/alerting.
    Complete rollout/rollback checks beyond the new single-GPU live capture
-   controls and passing TP1/PP1, TP2/PP1 and TP1/PP2 separate-endpoint P/D matrices,
-   including mixed/asymmetric and cross-node P/D control.
+   controls and passing TP1/PP1, TP2/PP1, TP1/PP2 and TP2/PP2 separate-endpoint
+   P/D matrices, including asymmetric and cross-node P/D control.
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing

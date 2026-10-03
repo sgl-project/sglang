@@ -48,6 +48,13 @@ remain limited to PP=1. Qwen3-0.6B with a synthetic target-KV draft is verified
 at TP2/PP1, TP1/PP2 and TP2/PP2, including eager/graph execution, prefix reuse,
 full acceptance, rejection and mixed acceptance lengths in a batch. Overlap
 is verified at PP=1; pipeline serving remains synchronous.
+Full, Breakable and torch.compile piecewise prefill graphs are also verified
+for AR and static target-KV DSpark at matching TP2/PP2, both colocated and P/D.
+Each rank exercises padding and graph-buffer reuse; complete snapshots are
+checked after producer exit. The piecewise fixture uses eager compile debug
+mode, and Full prefill remains experimental. See the
+[combined graph matrix](../../../../mooncake-study/experiments/COMBINED_CAPTURE_RUNTIME.md)
+for the exact model, backend and transport scope.
 Each rank writes its own captured KV heads to the Store. An independent reader
 reconstructs the global tensors after producer exit; the snapshot path does not
 gather KV payloads through its control group.
@@ -176,8 +183,11 @@ generation completes. The
 adds matching TP2/PP1 and TP1/PP2 on two H100s, with every rank's control state
 checked and complete post-exit Store readback. PP2 graph execution is synchronous;
 TP2 graph execution includes overlap. Resume can precede background ticket
-readiness, and abort also retires unbound tickets. These tests do not certify
-mixed/asymmetric topologies, cross-node control or a global drain barrier.
+readiness, and abort also retires unbound tickets. The
+[combined matrix](../../../../mooncake-study/experiments/COMBINED_CAPTURE_RUNTIME.md)
+adds matching TP2/PP2 on four H100s, with four AR/DSpark eager/graph control
+cells and 32 post-exit snapshots. These tests do not certify asymmetric
+topologies, cross-node control or a global drain barrier.
 
 ### Reservation Refill
 

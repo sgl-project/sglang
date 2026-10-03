@@ -1,0 +1,967 @@
+{
+  "status": "completed",
+  "date": "2026-10-03",
+  "cleanup": {
+    "temporary_job_deleted": true,
+    "pod_and_job_resources_absent": true,
+    "supervisor_exit_code": 0,
+    "resident_worker_and_idle_load_verified_live": true,
+    "evidence": "cleanup.json"
+  },
+  "base_commit": "d4940b11565dc583c7d9ccd3c64f7d477693cb5d",
+  "feature": "Combined TP2/PP2 prefill graph capture and live P/D controls",
+  "production_code_changed": false,
+  "environment": {
+    "temporary_job": "job-8e90d73789c0-20261003091401",
+    "node": "node073",
+    "gpus": [
+      "GPU-6a8f76c5-3e29-47ec-c0a4-589a8ccff080",
+      "GPU-d0d9f5d5-6ada-7791-1714-c4258193188b",
+      "GPU-7b0af4f8-cdaa-04f0-03cd-c7eaa180e1c1",
+      "GPU-5c70adea-4f33-d6cd-d82d-b3a810bdb389"
+    ],
+    "image_id": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "flashinfer": "0.6.17",
+      "kernel": "0.4.6.post1",
+      "mooncake": "0.3.11.post1",
+      "transformers": "5.12.1"
+    },
+    "runtime_lock_sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "removed_temporary_image_packages": [
+      "flashinfer-cubin==0.6.12",
+      "flashinfer-jit-cache==0.6.12+cu130"
+    ],
+    "transport": "TCP",
+    "catalog": "HTTP TestCaptureCatalog"
+  },
+  "source_sha256": {
+    "python/sglang/test/pd_capture_runtime.py": "c593571220a05b86ed16f427eb1cdf097fcfcc898f70b0b72eebe6d6d1e9daf6",
+    "python/sglang/test/training_capture_prefill_runtime.py": "bfdbcfec9cbf21c41c537edbe8427478603280822cdb6c2eb926c40dfa3a3a7e",
+    "test/registered/storage/test_training_capture_tp_pp_prefill_graph.py": "f5916cd693c03b8a39be18f8d4c65c9764ede710eba1a7f6fd0a1dbace5a63b0",
+    "test/registered/storage/test_training_capture_pd_tp_pp_prefill_graph.py": "13694a13c084dbf7ac7a954c3a6a26c8e141266a3d2184dff629d590bc2fc0d3",
+    "test/registered/storage/test_training_capture_pd_tp_pp_control.py": "15dbb398e28884048644103ca3a0f50254913bf967aee7095ce07da8b9b60a07"
+  },
+  "frozen_sources_verified": true,
+  "source_audit": {
+    "status": "passed",
+    "checked_at": "2026-10-03T01:58:25.820Z",
+    "scope": "All tracked Python source and storage tests, plus new combined test files",
+    "reports": [
+      {
+        "version": 1,
+        "files": 3355,
+        "manifest_sha256": "b9daad58d2890739e5217d5a85d957e9c627b3813ef8c9973fb48bd687de1f46"
+      },
+      {
+        "version": 2,
+        "files": 3356,
+        "manifest_sha256": "3c2407bd202749b3210131f8a9df3d6ae7d5ebb17771c4773c3b2b2a9ffbd549"
+      }
+    ]
+  },
+  "jobs": [
+    {
+      "role": "colocated",
+      "file": "test_training_capture_tp_pp_prefill_graph.py",
+      "job_id": "01790990365885280304-ca8942df36c0",
+      "command": "kubectl exec -n qiji job-8e90d73789c0-20261003091401-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v1 --timeout-seconds 2400 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_tp_pp_prefill_graph.py -v -f",
+      "result": {
+        "job_id": "01790990365885280304-ca8942df36c0",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790991024.3770945,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003/logs/01790990365885280304-ca8942df36c0.log"
+      },
+      "methods": 6,
+      "seconds": 635.511,
+      "log_sha256": "4460ae2b9558fdcc6fc867f706fe0d4ef2df41add10d9f9420c4ed9f03ca1f06"
+    },
+    {
+      "role": "pd",
+      "file": "test_training_capture_pd_tp_pp_prefill_graph.py",
+      "job_id": "01790990366381131592-10942fdce273",
+      "command": "kubectl exec -n qiji job-8e90d73789c0-20261003091401-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v1 --timeout-seconds 3000 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_tp_pp_prefill_graph.py -v -f",
+      "result": {
+        "job_id": "01790990366381131592-10942fdce273",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790992035.4657748,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003/logs/01790990366381131592-10942fdce273.log"
+      },
+      "methods": 6,
+      "seconds": 990.107,
+      "log_sha256": "4b35a30a012907ff82759e3c7030abf0ad75e9cc63668f571e1ebcddeed45033"
+    },
+    {
+      "role": "control",
+      "file": "test_training_capture_pd_tp_pp_control.py",
+      "job_id": "01790990490438752277-74bc504a7da8",
+      "command": "kubectl exec -n qiji job-8e90d73789c0-20261003091401-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v2 --timeout-seconds 1800 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-prefill-tp-pp-v2/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_tp_pp_control.py -v -f",
+      "result": {
+        "job_id": "01790990490438752277-74bc504a7da8",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790992666.3320396,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-tp-pp-20261003/logs/01790990490438752277-74bc504a7da8.log"
+      },
+      "methods": 4,
+      "seconds": 610.333,
+      "log_sha256": "6f1e05de006437ad788ab7784b3a01deac0ac80b9c33739695b5f259463af70d"
+    }
+  ],
+  "totals": {
+    "methods": 16,
+    "colocated_post_exit_snapshots": 70,
+    "colocated_tensor_objects": 2408,
+    "colocated_tensor_bytes": 95762660,
+    "pd_post_exit_snapshots": 70,
+    "control_post_exit_snapshots": 32,
+    "prefill_replay_frames": 456
+  },
+  "cases": {
+    "colocated": [
+      {
+        "prefill_capture": "disabled",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": false,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13785932,
+        "source_frames": 228,
+        "prefill_replay_frames": 0,
+        "verify_replay_frames": 0,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [],
+        "graph_shapes": [],
+        "graph_prefix_lengths": [],
+        "reused_graph_buffers": 0,
+        "reused_graph_buffer_ranks": [],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "breakable",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": false,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13465916,
+        "source_frames": 132,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 0,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "full",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": false,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13465916,
+        "source_frames": 132,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 0,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "tc_piecewise",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": false,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13465916,
+        "source_frames": 132,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 0,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "breakable",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": true,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13859660,
+        "source_frames": 116,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 68,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [
+          -1
+        ],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "full",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": true,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13859660,
+        "source_frames": 116,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 68,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [
+          -1
+        ],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      },
+      {
+        "prefill_capture": "tc_piecewise",
+        "tp_size": 2,
+        "pp_size": 2,
+        "target_kv": true,
+        "overlap": false,
+        "samples": 10,
+        "tensor_objects": 344,
+        "tensor_bytes": 13859660,
+        "source_frames": 116,
+        "prefill_replay_frames": 44,
+        "verify_replay_frames": 68,
+        "prefill_hidden_states": false,
+        "verify_result_lags": [
+          -1
+        ],
+        "graph_shapes": [
+          [
+            1,
+            13,
+            16
+          ],
+          [
+            1,
+            15,
+            16
+          ],
+          [
+            1,
+            19,
+            32
+          ],
+          [
+            1,
+            128,
+            128
+          ],
+          [
+            3,
+            113,
+            128
+          ]
+        ],
+        "graph_prefix_lengths": [
+          0,
+          128,
+          256,
+          271
+        ],
+        "reused_graph_buffers": 4,
+        "reused_graph_buffer_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "producer_exited": true
+      }
+    ],
+    "pd": [
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": null,
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "disabled",
+        "prefill_draft": false,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 0,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": false,
+        "counters": {
+          "admitted": 13,
+          "eager_forwards": 31,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": null,
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "breakable",
+        "prefill_draft": false,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 31,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": null,
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "full",
+        "prefill_draft": false,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 31,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": null,
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "tc_piecewise",
+        "prefill_draft": false,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 31,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": "target_kv",
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "breakable",
+        "prefill_draft": true,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 18,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10,
+          "speculative_commits_copied": 20,
+          "speculative_verify_forwards": 18
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": "target_kv",
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "full",
+        "prefill_draft": true,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 18,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10,
+          "speculative_commits_copied": 20,
+          "speculative_verify_forwards": 18
+        }
+      },
+      {
+        "decode_pp": 2,
+        "decode_tp": 2,
+        "draft_kind": "target_kv",
+        "enable_overlap": false,
+        "post_exit_snapshots": 10,
+        "prefill_backend": "tc_piecewise",
+        "prefill_draft": true,
+        "prefill_pp": 2,
+        "prefill_replay_frames": 32,
+        "prefill_tp": 2,
+        "ragged_mode": "static",
+        "replay": true,
+        "counters": {
+          "admitted": 13,
+          "cuda_graph_forwards": 18,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 11,
+          "ready": 0,
+          "sealed": 10,
+          "speculative_commits_copied": 20,
+          "speculative_verify_forwards": 18
+        }
+      }
+    ],
+    "control": [
+      {
+        "replay": false,
+        "draft_kind": null,
+        "post_exit_snapshots": 8,
+        "failed_request_captures": {
+          "control-gated-abort-decode": "db12e79829dc47c1bb400e93c9dea6a7",
+          "control-gated-abort-prefill": "2e57bb49fe0d4eeea8b453868775d687",
+          "control-gated-abort-prefill-decode": "8d79586e41f246478a54af72007ad59b",
+          "control-only-p-paused": "b7214bf42c744f95b51866582c57e7bf",
+          "control-running-decode": "3b464b9451e6438f99c22800b41d97d3"
+        },
+        "failed_unbound_captures": [
+          "007842adb3a748748b071ff8c9b77433",
+          "05c669fda6004e6fb34c0cc18b9d6bd7",
+          "2e8cc7f3fdd34b1fb7e70f2710240186",
+          "3d4429fc765e442bb1fda31ef3e5cc9e",
+          "5483e4ad20fc4831a5377c388d0963f5",
+          "9a5ee80bde034285947ddd343cb47bb9",
+          "b633c2690536409d8b6df2c01d9375ed",
+          "d10693466ec043c3b5efe1488c7af4e8",
+          "f048f2e310a4403cb6211ec9d9a12967"
+        ],
+        "rank_names": {
+          "decode": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ],
+          "prefill": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ]
+        }
+      },
+      {
+        "replay": true,
+        "draft_kind": null,
+        "post_exit_snapshots": 8,
+        "failed_request_captures": {
+          "control-gated-abort-decode": "9341de2a5fb14cb1af68a417db581e1a",
+          "control-gated-abort-prefill": "83ca5577bf4b4ba8a6fc9822783ba7b7",
+          "control-gated-abort-prefill-decode": "5c3731c8cded4eca9f82cb129543c904",
+          "control-only-p-paused": "86c9d669da6c43f69deb64504ee7680d",
+          "control-running-decode": "38c66edffa974a1ebc0a57c8b6712260"
+        },
+        "failed_unbound_captures": [
+          "059c1ff6f7da4c899601f2dcd95392f0",
+          "35b0a73c092d48fab7c3dc4a9baebc13",
+          "5870d6e8a191438391f269a7e13d249a",
+          "674a540678084bb3a03ee99a11e2c8ca",
+          "b2adc2d2cbeb4b93ae716ed66c9242f0",
+          "beb8d6c0c57a401d9fb492c12e94d971",
+          "c321169912394cc9966f126f956e3aeb",
+          "c8d732cb5758481c898f7b2de30d8c96",
+          "ee77f000dbe84350a1def621f6333d24"
+        ],
+        "rank_names": {
+          "decode": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ],
+          "prefill": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ]
+        }
+      },
+      {
+        "replay": false,
+        "draft_kind": "target_kv",
+        "post_exit_snapshots": 8,
+        "failed_request_captures": {
+          "control-gated-abort-decode": "5763130085874a90ab82252aa23a2c20",
+          "control-gated-abort-prefill": "3463eb05f2ef444a890bd239d693090e",
+          "control-gated-abort-prefill-decode": "b97e34be983147a3a063840a718a13c2",
+          "control-only-p-paused": "d0663a7c947b4df2b2863d8a3b17eea8",
+          "control-running-decode": "fdf4b1d127504d72a6e5be22e61c6abc"
+        },
+        "failed_unbound_captures": [
+          "0f05fdc2d28942b1bf8be9a0fc9e4c53",
+          "2c734b22e78147a18fb88396757a67f3",
+          "3eab093a03a84fe88bb3d87a0dde2003",
+          "3ee8c10d36664ac6b9332b142e1b4616",
+          "6cad67d58768410f8eac4b70fa1fa543",
+          "8930e941248c4437835340fac7e941e5",
+          "b89e7a1df4b4438bb5d4b1b972727f7e",
+          "d810f94f265647c49dbbf4fde1b1c426",
+          "e937c7e661e340fa845dce8e0cc984c8"
+        ],
+        "rank_names": {
+          "decode": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ],
+          "prefill": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ]
+        }
+      },
+      {
+        "replay": true,
+        "draft_kind": "target_kv",
+        "post_exit_snapshots": 8,
+        "failed_request_captures": {
+          "control-gated-abort-decode": "fa4d5751583545c48e40861a2482c542",
+          "control-gated-abort-prefill": "8776e0f7bb784caea818a98dfb6dc296",
+          "control-gated-abort-prefill-decode": "9886bc9e2e454645ad90b2b88d527a6d",
+          "control-only-p-paused": "4e3178ffe6764fb0877187fe67f2637a",
+          "control-running-decode": "8b2f26e58ad04dd9b83d73aae5a81cc6"
+        },
+        "failed_unbound_captures": [
+          "114f36cddfc44330aacb1a065b02a782",
+          "4f096e31fcc74feba947042267fc593f",
+          "58294a70063747088a4ab3f4a3d3f615",
+          "5e52570c55a44147a2dcbefb3ff2a7ba",
+          "6690b4f23fb84d1a9901e924bb955f5b",
+          "9a9c43b0db7d494f95b3f3762ac76e48",
+          "b7d63f7579b94a1b9f737679a779da51",
+          "e2a4d19c85fa461eb42e08c829079002",
+          "f97838159635412081582f694181dd9c"
+        ],
+        "rank_names": {
+          "decode": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ],
+          "prefill": [
+            "pp0-tp0",
+            "pp0-tp1",
+            "pp1-tp0",
+            "pp1-tp1"
+          ]
+        }
+      }
+    ]
+  },
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/combined-capture-20261003",
+  "artifacts": [
+    {
+      "path": "cleanup.json",
+      "bytes": 2035,
+      "sha256": "dd85773ad1b7f614c2d1c861e7e4fb27d933e2208a0c8d19586110e327460ade"
+    },
+    {
+      "path": "jobs/01790990365885280304-ca8942df36c0.log",
+      "bytes": 418771,
+      "sha256": "4460ae2b9558fdcc6fc867f706fe0d4ef2df41add10d9f9420c4ed9f03ca1f06"
+    },
+    {
+      "path": "jobs/01790990365885280304-ca8942df36c0.json",
+      "bytes": 264,
+      "sha256": "8543202b5d63e48e283e20add43dda91b0ff7d41e23bd3904a55524765867a0e"
+    },
+    {
+      "path": "jobs/01790990366381131592-10942fdce273.log",
+      "bytes": 893055,
+      "sha256": "4b35a30a012907ff82759e3c7030abf0ad75e9cc63668f571e1ebcddeed45033"
+    },
+    {
+      "path": "jobs/01790990366381131592-10942fdce273.json",
+      "bytes": 264,
+      "sha256": "da8c62b28c6d1eb1630238a666e0545fcd7198e1a5cc75bdae9c24e59821a888"
+    },
+    {
+      "path": "jobs/01790990490438752277-74bc504a7da8.log",
+      "bytes": 726466,
+      "sha256": "6f1e05de006437ad788ab7784b3a01deac0ac80b9c33739695b5f259463af70d"
+    },
+    {
+      "path": "jobs/01790990490438752277-74bc504a7da8.json",
+      "bytes": 264,
+      "sha256": "8ddaed9afdd5729f3c374c6697bbc950bbb2736352745238941755821c6180b0"
+    },
+    {
+      "path": "submissions.json",
+      "bytes": 2937,
+      "sha256": "1703baa2170fee490a5bd75fb721e0aa31b76559f68064439a2495622eaa75f0"
+    },
+    {
+      "path": "audit.cjs",
+      "bytes": 9515,
+      "sha256": "4ba562e76e9fbe6ab9d50114919c282b48c271055f38c1cfa5ac8c083514f601"
+    },
+    {
+      "path": "source-audit.cjs",
+      "bytes": 1551,
+      "sha256": "c2c9b44e61a1915a868c4b1e780f41bdd5d7f41eac23d1788bbcfcd9d5d50713"
+    },
+    {
+      "path": "source/python/sglang/test/pd_capture_runtime.py",
+      "bytes": 35215,
+      "sha256": "c593571220a05b86ed16f427eb1cdf097fcfcc898f70b0b72eebe6d6d1e9daf6"
+    },
+    {
+      "path": "source/python/sglang/test/training_capture_prefill_runtime.py",
+      "bytes": 17687,
+      "sha256": "bfdbcfec9cbf21c41c537edbe8427478603280822cdb6c2eb926c40dfa3a3a7e"
+    },
+    {
+      "path": "source/test/registered/storage/test_training_capture_tp_pp_prefill_graph.py",
+      "bytes": 1158,
+      "sha256": "f5916cd693c03b8a39be18f8d4c65c9764ede710eba1a7f6fd0a1dbace5a63b0"
+    },
+    {
+      "path": "source/test/registered/storage/test_training_capture_pd_tp_pp_prefill_graph.py",
+      "bytes": 1497,
+      "sha256": "13694a13c084dbf7ac7a954c3a6a26c8e141266a3d2184dff629d590bc2fc0d3"
+    },
+    {
+      "path": "source/test/registered/storage/test_training_capture_pd_tp_pp_control.py",
+      "bytes": 625,
+      "sha256": "15dbb398e28884048644103ca3a0f50254913bf967aee7095ce07da8b9b60a07"
+    }
+  ],
+  "limitations": [
+    "One Qwen3-0.6B model, synthetic draft, synchronous pipeline and same-node P/D groups; no trained quality or SLO claim.",
+    "Piecewise uses eager compile debug mode. Full prefill remains experimental.",
+    "Test Catalog and TCP do not certify production retention or distributed cross-node RDMA.",
+    "Asymmetric P/D graphs/control, asynchronous PP and additional models remain open."
+  ]
+}

@@ -263,13 +263,15 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                     {item["prefill_graph"]["raw_tokens"]},
                 )
         if backend != "disabled":
-            self.assertTrue(
-                any(
-                    r["prefill_graph"]["raw_tokens"]
-                    < r["prefill_graph"]["padded_tokens"]
+            self.assertEqual(
+                {
+                    (r["tp_rank"], r["pp_rank"])
                     for r in replay
-                ),
-                "no token-padded prefill graph replay",
+                    if r["prefill_graph"]["raw_tokens"]
+                    < r["prefill_graph"]["padded_tokens"]
+                },
+                ranks,
+                "every rank must exercise token-padded prefill replay",
             )
             self.assertTrue(any(r["batch_size"] == 3 for r in replay))
             self.assertTrue(any(r["extend_prefix_length"] >= 271 for r in replay))
@@ -324,11 +326,16 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                 self.assertTrue(any(r["result_lag"] == 1 for r in references))
         buffers = {}
         for r in replay:
-            buffers.setdefault(r["prefill_graph"]["input_buffer"], set()).add(
-                r["prefill_graph"]["replay_id"]
+            key = (
+                r["tp_rank"],
+                r["pp_rank"],
+                r["prefill_graph"]["input_buffer"],
             )
+            buffers.setdefault(key, set()).add(r["prefill_graph"]["replay_id"])
         if backend != "disabled":
-            self.assertTrue(any(len(replays) > 1 for replays in buffers.values()))
+            self.assertEqual(
+                {key[:2] for key, ids in buffers.items() if len(ids) > 1}, ranks
+            )
 
         # Open a new client after the producer has exited and all graph buffers
         # have been destroyed. No target model runs to reconstruct the sample.
@@ -401,6 +408,9 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                         {r["extend_prefix_length"] for r in replay}
                     ),
                     "reused_graph_buffers": sum(len(v) > 1 for v in buffers.values()),
+                    "reused_graph_buffer_ranks": sorted(
+                        {key[:2] for key, ids in buffers.items() if len(ids) > 1}
+                    ),
                     "producer_exited": process.poll() is not None,
                     "capture_state": final_state,
                 }
