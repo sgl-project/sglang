@@ -479,6 +479,14 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    # Lossless GDN tuple verify: target-verify keeps each draft step's
+    # (u, k, g) tuple instead of a full [HV, V, K] state snapshot and replays the
+    # accepted prefix at commit with the verify kernel's exact rounding, so the
+    # committed state and every output stay bit-identical to the snapshot verify.
+    enable_linear_lossless_verify: A[
+        bool,
+        "Keep per-draft (u, k, g) tuples instead of full SSM-state snapshots during GDN speculative target-verify and replay the accepted state at commit. Bit-identical to the default verify with ~64x less verify scratch; the freed memory goes to the KV cache. GDN hybrid models with a linear draft chain (--speculative-eagle-topk 1: EAGLE/MTP, DFLASH, DSPARK) and the Triton verify kernel.",
+    ] = False
 
 
 class ExecGraph(msgspec.Struct):

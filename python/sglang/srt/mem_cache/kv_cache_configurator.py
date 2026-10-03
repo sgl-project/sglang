@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.memory_pool import (
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
     get_minimax_sparse_index_dtype,
+    spec_intermediate_bytes_per_req,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -1092,6 +1093,7 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_linear_lossless_verify=self._linear_lossless_verify_enabled(),
         )
         return req_to_token_pool
 
@@ -1173,6 +1175,7 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_linear_lossless_verify=self._linear_lossless_verify_enabled(),
         )
         return req_to_token_pool
 
@@ -2424,6 +2427,42 @@ class KVCacheConfigurator:
             )
         return config
 
+    def _linear_lossless_verify_enabled(self) -> bool:
+        """--enable-linear-lossless-verify, checked against the model."""
+        if not get_exec().mamba.enable_linear_lossless_verify:
+            return False
+        if self.hybrid_gdn_config is None:
+            raise ValueError(
+                "--enable-linear-lossless-verify supports GDN hybrid "
+                "linear-attention models only."
+            )
+        return True
+
+    def _spec_intermediate_bytes(self, n_slots: int, pp_layer_scale: float) -> int:
+        """Target-verify scratch to reserve for ``n_slots`` request slots.
+
+        The default verify keeps a full (conv + SSM) snapshot per draft token,
+        charged as ``mamba_cache_per_req * D``. The lossless tuple verify keeps
+        only (u, k, g) per draft token, ~K x less; charging it the snapshot cost
+        would park the difference as idle memory instead of KV cache, so ask
+        memory_pool, which owns the allocation, for the real size.
+        """
+        if not self._linear_lossless_verify_enabled():
+            per_req = int(
+                self.mambaish_config.mamba2_cache_params.mamba_cache_per_req
+                * pp_layer_scale
+            )
+            return per_req * n_slots * get_spec().speculative_num_draft_tokens
+        per_req = spec_intermediate_bytes_per_req(
+            self.mambaish_config.mamba2_cache_params,
+            # Same draft count the pool is built with (adaptive-aware maximum).
+            max_speculative_num_draft_tokens()
+            or get_spec().speculative_num_draft_tokens,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            enable_linear_lossless_verify=True,
+        )
+        return int(per_req * pp_layer_scale) * n_slots
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -2503,10 +2542,8 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
+                intermediate_size = self._spec_intermediate_bytes(
+                    capped_reqs + 1, pp_layer_scale
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -2522,10 +2559,8 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
-                intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                intermediate_size = self._spec_intermediate_bytes(
+                    get_schedule().max_mamba_cache_size + 1, pp_layer_scale
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2544,13 +2579,16 @@ class KVCacheConfigurator:
 
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
-                D = get_spec().speculative_num_draft_tokens
-                # Joint solve: main_state + intermediate = mamba_budget
+                # Joint solve: main_state + intermediate = mamba_budget, i.e.
+                #   (K + 1) * per_req + (K / ratio + 1) * inter = budget,
+                # where `inter` is the real scratch of one request's D draft
+                # steps (not per_req * D, see _spec_intermediate_bytes).
+                inter_per_req = self._spec_intermediate_bytes(1, pp_layer_scale)
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D) - extra_per_slot)
-                        // (per_req * (1 + D / ratio) + extra_per_slot)
+                        (mamba_budget_bytes - per_req - inter_per_req - extra_per_slot)
+                        // (per_req + inter_per_req / ratio + extra_per_slot)
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -2559,7 +2597,7 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = inter_per_req * (capped_reqs + 1)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot

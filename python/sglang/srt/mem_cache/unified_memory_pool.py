@@ -1094,11 +1094,17 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_lossless_verify: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape=None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
+        if enable_linear_lossless_verify:
+            raise ValueError(
+                "--enable-linear-lossless-verify is not supported with "
+                "--enable-unified-memory"
+            )
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal

@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
@@ -49,6 +51,11 @@ logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
+# The replay pins its rounding with inline PTX on NVIDIA. PTX does not exist
+# on ROCm (the AMDGPU backend rejects the "f" register constraint), so HIP builds
+# use the portable form: a separate rounded multiply feeding an explicit fma.
+# Both are bit-exact against the verify kernel (H100 and MI325X).
+_REPLAY_USE_PTX = torch.version.hip is None
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -1153,6 +1160,197 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+@triton.jit
+def _mul_rn_f32(left, right):
+    # Target verify rounds the decay multiply before the rank-1 update because
+    # the decayed state is also consumed by the delta reduction. Spell that
+    # instruction boundary explicitly so LLVM cannot contract across it.
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [left, right],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fma_rn_f32(left, right, addend):
+    # Match ``b_h += b_k * b_v`` in target verify (one RN f32 FMA).
+    return tl.inline_asm_elementwise(
+        "fma.rn.f32 $0, $1, $2, $3;",
+        "=f,f,f,f",
+        [left, right, addend],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _decay_rank1_update(h, e, k, u, USE_PTX: tl.constexpr):
+    """h * e (rounded) + k * u (one fma), exactly like target verify's
+    ``b_h *= exp(g); ...; b_h += b_k * b_v``."""
+    if USE_PTX:
+        decayed = _mul_rn_f32(h, e)
+        return _fma_rn_f32(k, u, decayed)
+    else:
+        # The decayed state feeds an fma, not an fadd, so nothing can contract
+        # it: it stays a rounded multiply, and tl.fma is a single rounding.
+        decayed = h * e
+        return tl.fma(k, u, decayed)
+
+
+@triton.jit
+def _recon_kernel(
+    ssm_ptr,
+    u_ptr,
+    k_ptr,
+    g_ptr,
+    pool_ptr,
+    dest_ptr,
+    cache_ptr,
+    step_ptr,
+    V,
+    K,
+    num_slots,
+    num_cache_slots,
+    BLOCK: tl.constexpr,
+    BV: tl.constexpr,
+    BK: tl.constexpr,
+    NVB: tl.constexpr,
+    USE_PTX: tl.constexpr,
+    s_l,
+    s_slot,
+    s_hv,
+    s_v,
+    s_k,
+    cu_l,
+    cu_slot,
+    cu_t,
+    cu_hv,
+    cu_v,
+    ck_l,
+    ck_slot,
+    ck_t,
+    ck_hv,
+    ck_k,
+    cg_l,
+    cg_slot,
+    cg_t,
+    cg_hv,
+):
+    pid_l = tl.program_id(0).to(tl.int64)
+    pid_r = tl.program_id(1)
+    pid2 = tl.program_id(2)
+    hv = pid2 // NVB
+    vb = pid2 % NVB
+    step = tl.load(step_ptr + pid_r)
+    pool = tl.load(pool_ptr + pid_r).to(tl.int64)
+    dest = tl.load(dest_ptr + pid_r).to(tl.int64)
+    cache = tl.load(cache_ptr + pid_r).to(tl.int64)
+    # Same validity rule as the upstream fused_mamba_state_scatter_with_mask:
+    # nothing is read or written for a row whose step is negative or whose
+    # pool / dest / cache index is out of range (e.g. a -1 pad slot).
+    valid = (
+        (step >= 0)
+        & (pool >= 0)
+        & (pool < num_slots)
+        & (dest >= 0)
+        & (dest < num_slots)
+        & (cache >= 0)
+        & (cache < num_cache_slots)
+    )
+    if not valid:
+        return
+    o_v = vb * BV + tl.arange(0, BV)
+    o_k = tl.arange(0, BK)
+    mv = o_v < V
+    mk = o_k < K
+    m = mv[:, None] & mk[None, :]
+    hv_v_k = hv * s_hv + o_v[:, None] * s_v + o_k[None, :] * s_k
+    s_off = pid_l * s_l + pool * s_slot + hv_v_k
+    d_off = pid_l * s_l + dest * s_slot + hv_v_k
+    h = tl.load(ssm_ptr + s_off, mask=m, other=0.0).to(tl.float32)
+    for t in range(BLOCK):
+        active = t <= step
+        g = tl.load(g_ptr + pid_l * cg_l + cache * cg_slot + t * cg_t + hv * cg_hv).to(
+            tl.float32
+        )
+        u = tl.load(
+            u_ptr + pid_l * cu_l + cache * cu_slot + t * cu_t + hv * cu_hv + o_v * cu_v,
+            mask=mv,
+            other=0.0,
+        ).to(tl.float32)
+        k = tl.load(
+            k_ptr + pid_l * ck_l + cache * ck_slot + t * ck_t + hv * ck_hv + o_k * ck_k,
+            mask=mk,
+            other=0.0,
+        ).to(tl.float32)
+        # A single algebraic expression contracts a different multiply into
+        # FMA on CUDA and creates 1-2 ULP drift. Mirror target verify exactly.
+        updated = _decay_rank1_update(h, tl.exp(g), k[None, :], u[:, None], USE_PTX)
+        h = tl.where(active, updated, h)
+    tl.store(ssm_ptr + d_off, h.to(ssm_ptr.dtype.element_ty), mask=m)
+
+
+def _reconstruct_ssm_from_tuples(
+    ssm_states,
+    u_cache,
+    k_cache,
+    g_cache,
+    pool_indices,
+    cache_indices,
+    step_indices,
+    dest_indices=None,
+    use_ptx: Optional[bool] = None,
+):
+    """Replay h = exp(g) * h + k outer u from ``ssm_states[pool]`` through the
+    accepted step and store it to ``ssm_states[dest]`` (``dest`` defaults to
+    ``pool``, i.e. in place). Rows with step < 0, or with an out-of-range
+    pool / dest / cache index, are not touched. ``use_ptx`` overrides the
+    platform default of the rounding helpers (tests check both forms)."""
+    L, _, HV, V, K = ssm_states.shape
+    R = pool_indices.shape[0]
+    if R == 0:
+        return
+    block = u_cache.shape[2]
+    BV = 32
+    BK = triton.next_power_of_2(K)
+    NVB = triton.cdiv(V, BV)
+    grid = (L, R, HV * NVB)
+    if dest_indices is None:
+        dest_indices = pool_indices
+    # num_warps only changes how the [BV, BK] tile is spread over lanes; every
+    # output element runs its own independent scalar recurrence, so the result
+    # is bit-identical for any warp count.
+    _recon_kernel[grid](
+        ssm_states,
+        u_cache,
+        k_cache,
+        g_cache,
+        pool_indices.to(torch.int64),
+        dest_indices.to(torch.int64),
+        cache_indices.to(torch.int64),
+        step_indices.to(torch.int32),
+        V,
+        K,
+        ssm_states.shape[1],
+        u_cache.shape[1],
+        block,
+        BV,
+        BK,
+        NVB,
+        _REPLAY_USE_PTX if use_ptx is None else use_ptx,
+        *ssm_states.stride(),
+        *u_cache.stride(),
+        *k_cache.stride(),
+        *g_cache.stride(),
+        num_warps=4,
+    )
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
@@ -1505,6 +1703,55 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        # Lossless GDN tuple verify (--enable-linear-lossless-verify): the pool
+        # keeps per-step (u, k, g) tuples instead of a full SSM snapshot per
+        # draft token, so the accepted SSM state is replayed here instead of
+        # gather-scattered. Conv windows keep the upstream scatter below.
+        u_tuple_cache = mamba_caches.intermediate_ssm_u
+        if u_tuple_cache is not None:
+            # Verify wrote the tuples to the rows it was handed: stable request
+            # rows under PP spec, batch positions otherwise.
+            cache_indices_tensor = (
+                src_indices_raw
+                if src_indices_raw is not None
+                else self.linear_attn_backend.verify_intermediate_state_indices[
+                    :request_number
+                ]
+            )
+            ssm_states = mamba_caches.temporal
+            if mamba_track_indices is not None:
+                assert mamba_steps_to_track is not None
+                # ORDER MATTERS. Both replays start from ssm_states[slot], the
+                # pre-verify state (verify runs with disable_state_update). The
+                # main replay below overwrites that slot in place, so the track
+                # replay must run first; otherwise it replays the drafts again
+                # on top of the accepted state and stores a wrong prefix-cache
+                # state. The full-state scatter has no such hazard because its
+                # source is the separate intermediate_ssm buffer.
+                #
+                # Launched unconditionally: guarding it with
+                # `bool((mamba_steps_to_track >= 0).any())` is a D2H sync, and
+                # the kernel already skips rows whose step is negative.
+                _reconstruct_ssm_from_tuples(
+                    ssm_states,
+                    u_tuple_cache,
+                    mamba_caches.intermediate_ssm_k,
+                    mamba_caches.intermediate_ssm_g,
+                    state_indices_tensor,
+                    cache_indices_tensor,
+                    mamba_steps_to_track,
+                    dest_indices=mamba_track_indices,
+                )
+            _reconstruct_ssm_from_tuples(
+                ssm_states,
+                u_tuple_cache,
+                mamba_caches.intermediate_ssm_k,
+                mamba_caches.intermediate_ssm_g,
+                state_indices_tensor,
+                cache_indices_tensor,
+                last_correct_step_indices,
+            )
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1512,6 +1759,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
+            skip_ssm=u_tuple_cache is not None,
         )
 
         self._update_ple_state_after_mtp_verify(
