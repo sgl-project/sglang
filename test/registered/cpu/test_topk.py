@@ -383,6 +383,35 @@ class TestCustomTopK(CustomTestCase):
                 topk_weights, expected_weights, atol=1e-4, rtol=1e-4
             )
 
+    def test_topk_sigmoid_with_correction_bias_small_expert_counts(self):
+        """Small expert buffers must not be accessed beyond their logical size."""
+        for dtype, num_experts in itertools.product(
+            [torch.float32, torch.bfloat16], [1, 2, 4, 8]
+        ):
+            hidden_states = torch.zeros((1, 1), dtype=dtype)
+            gating_output = torch.zeros((1, num_experts), dtype=dtype)
+            correction_bias = torch.linspace(-0.5, 0.5, num_experts)
+            topk = min(2, num_experts)
+
+            topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=False,
+                correction_bias=correction_bias,
+            )
+
+            scores = torch.sigmoid(gating_output.float())
+            expected_ids = torch.topk(
+                scores + correction_bias.unsqueeze(0), k=topk, dim=-1
+            ).indices
+            expected_weights = scores.gather(1, expected_ids)
+
+            torch.testing.assert_close(topk_ids.to(torch.int64), expected_ids)
+            torch.testing.assert_close(
+                topk_weights, expected_weights, atol=1e-4, rtol=1e-4
+            )
+
     def test_topk_sigmoid_mixed_input_dtypes(self):
         torch.manual_seed(0)
         hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
