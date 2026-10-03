@@ -4,6 +4,7 @@ import re
 from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -58,6 +59,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
+        # Set when a <function=NAME> inside a genuine <tool_call> wrapper
+        # names a tool that was not declared -- the rest of that call region
+        # is then dropped instead of streamed as a phantom delta.tool_calls.
+        self._suppress_current_call: bool = False
+
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
@@ -90,6 +96,25 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     return {}
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
         return {}
+
+    def _is_declared_tool(self, func_name: str, tools: Optional[list[Tool]]) -> bool:
+        """Whether ``func_name`` should be emitted as a tool call.
+
+        True when it matches a declared function tool, when unknown tool
+        calls are being forwarded (``SGLANG_FORWARD_UNKNOWN_TOOLS``), or when
+        there is nothing to validate against. Mirrors
+        ``base_format_detector.parse_base_json``, which drops names outside
+        the declared set unless that env var is set.
+        """
+        if not tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+            return True
+        for config in tools:
+            try:
+                if config.type == "function" and config.function.name == func_name:
+                    return True
+            except AttributeError:
+                continue
+        return False
 
     def _get_param_type(self, param_schema: Any) -> str:
         """Infer the parser conversion type from a JSON schema parameter."""
@@ -201,6 +226,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                     name_end = func_body.index(">")
                     func_name = func_body[:name_end]
+                    if not self._is_declared_tool(func_name, tools):
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
+                        continue
                     params_str = func_body[name_end + 1 :]
 
                     param_config = self._get_arguments_config(func_name, tools)
@@ -270,6 +300,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
+                self._suppress_current_call = False
                 self.parsed_pos += len(self.tool_call_start_token)
                 self.is_inside_tool_call = True
                 continue
@@ -277,10 +308,35 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 2. Function Name: <function=name>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_prefix):
+            # Recognize the tool-call structure tags (this branch and 3-5
+            # below) only while inside a <tool_call>...</tool_call> wrapper:
+            # the same <function=/<parameter= markup quoted in ordinary
+            # assistant prose (a fenced example, an echoed payload, reasoning
+            # about tool syntax) is not an invocation. has_tool_call() and
+            # the non-streaming detect_and_parse() both require the wrapper
+            # token; the streaming path must agree, or a bare "<function=X>"
+            # in prose is streamed as a phantom delta.tool_calls named X.
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.tool_call_prefix
+            ):
                 end_angle = current_slice.find(">")
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
+
+                    if not self._is_declared_tool(func_name, tools):
+                        # A genuine <tool_call> wrapper, but the name is not a
+                        # declared tool: an example the model quoted (fenced
+                        # or in its reasoning) or a near-miss truncation.
+                        # Emit the literal tag as text and swallow the rest
+                        # of this call region instead of a phantom call.
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
+                        self._suppress_current_call = True
+                        self.current_func_name = None
+                        normal_text_chunks.append(current_slice[: end_angle + 1])
+                        self.parsed_pos += end_angle + 1
+                        continue
 
                     self.current_tool_id += 1
                     self.current_tool_name_sent = True
@@ -305,7 +361,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 3. Parameter: <parameter=name>value...
             # -------------------------------------------------------
-            if current_slice.startswith(self.parameter_prefix):
+            if (
+                self.is_inside_tool_call
+                and not self._suppress_current_call
+                and current_slice.startswith(self.parameter_prefix)
+            ):
                 name_end = current_slice.find(">")
                 if name_end != -1:
                     value_start_idx = name_end + 1
@@ -389,7 +449,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 4. Function End: </function>
             # -------------------------------------------------------
-            if current_slice.startswith(self.function_end_token):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.function_end_token
+            ):
+                if self._suppress_current_call:
+                    self._suppress_current_call = False
+                    self.current_func_name = None
+                    self.parsed_pos += len(self.function_end_token)
+                    continue
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -406,9 +473,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 5. Tool Call End: </tool_call>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_end_token):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.tool_call_end_token
+            ):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
+                self._suppress_current_call = False
                 continue
 
             # -------------------------------------------------------
