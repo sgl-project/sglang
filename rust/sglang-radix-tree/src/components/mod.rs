@@ -361,6 +361,15 @@ pub trait TreeComponent<K: ChildKeyType> {
         unimplemented!("release_window_lock is SWA-only")
     }
 
+    /// Reshape the load path (e.g. split a node) before load-back transfers are
+    /// built; runs inside the tree core, with no cache access.
+    fn prepare_load_back_in_tree_core(
+        &self,
+        _tree_core: &mut UnifiedTreeCore<K>,
+        _node_id: NodeIdx_,
+    ) {
+    }
+
     /// Build transfer descriptors for this component in the given phase; None when
     /// the component has nothing to transfer.
     fn build_hicache_transfers(
