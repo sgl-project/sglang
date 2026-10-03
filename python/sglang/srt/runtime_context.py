@@ -191,12 +191,14 @@ def attn_tp_size_of(cfg: Any):
 def attn_dp_enabled_of(cfg: Any) -> bool:
     """`attn_dp_enabled`, computed at publish.
 
-    A scale joiner's own group can be one rank wide, but it joins an
-    attention-DP deployment and runs its DP-attention paths.
+    A joiner's own group can be one rank wide, but it joins an attention-DP
+    deployment and runs its DP-attention paths. Any joiner, not just a scale one:
+    a recover joiner regrowing into a retired slot is in the same position, and
+    reading the scale-only arm here makes it fail the dp_lm_head validation.
     """
-    from sglang.srt.arg_groups.model_override_base import ep_scale_joiner_of
+    from sglang.srt.arg_groups.model_override_base import ep_joiner_of
 
-    return cfg.attn_dp_size > 1 or ep_scale_joiner_of(cfg)
+    return cfg.attn_dp_size > 1 or ep_joiner_of(cfg)
 
 
 def num_dp_ranks_of(cfg: Any) -> int:
