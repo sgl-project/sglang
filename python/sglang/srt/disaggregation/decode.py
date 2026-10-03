@@ -80,6 +80,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -971,6 +972,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            if not ensure_mamba_capacity(
+                self.req_to_token_pool, [req], self.tree_cache
+            ):
+                break
+
             full_required, swa_required = self._prealloc_required_tokens(req)
             if not self._prealloc_reservation_fits(
                 full_required,
@@ -1388,18 +1394,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
-            # draining the mamba pool before the KV pool (would assert "Not
-            # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (only if it manages mamba states;
-            # ChunkCache.evict is a no-op), else stop.
-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                supports_mamba = self.tree_cache.supports_mamba()
-                if supports_mamba and hasattr(self.tree_cache, "evict"):
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                if mamba_allocator.available_size() <= 0:
-                    break
+            # Reserve enough Mamba capacity for radix COW and tracking buffers
+            # before prefix matching can bind state or lock cached entries.
+            if not ensure_mamba_capacity(
+                self.req_to_token_pool, [decode_req.req], self.tree_cache
+            ):
+                break
 
             if hisparse_req_budget <= 0:
                 break
