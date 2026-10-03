@@ -278,14 +278,20 @@ struct ErrorBody<'a> {
     message: String,
 }
 
+/// OpenAI error `type` for an HTTP status.
+pub(crate) fn openai_error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.class().status();
         let code = self.error_code();
-        let typ = match status.as_u16() {
-            400..=499 => "invalid_request_error",
-            _ => "server_error",
-        };
+        let typ = openai_error_type(status.as_u16());
         // Pick a client-facing message that NEVER leaks worker URLs or raw
         // source chains; full structured details are logged server-side.
         let message = match &self {
