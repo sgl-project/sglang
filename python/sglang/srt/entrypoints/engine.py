@@ -100,6 +100,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     get_main_process_id,
     get_tokenizer_worker_class,
+    multi_tokenizer_args_shm_name,
     read_from_shared_memory,
     run_multi_detokenizer_router_process,
     write_data_for_multi_tokenizer,
@@ -1347,7 +1348,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         parent_pid = get_main_process_id() if parent_pid is None else parent_pid
         port_args, server_args, scheduler_info = read_from_shared_memory(
-            f"multi_tokenizer_args_{parent_pid}"
+            multi_tokenizer_args_shm_name(parent_pid)
         )
         publish(server_args, role="tokenizer")
         self = cls.__new__(cls)
