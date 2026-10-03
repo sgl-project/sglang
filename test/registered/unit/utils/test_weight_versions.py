@@ -9,7 +9,7 @@ from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
     add_weight_versions_to_meta_info,
-    build_endpoint_weight_version_metadata,
+    build_endpoint_weight_version_sglext_fields,
     compute_weight_version_spans,
     record_weight_version_events,
     truncate_weight_version_events,
@@ -518,14 +518,14 @@ class TestMakeAbortReq(CustomTestCase):
         )
 
 
-class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
-    def test_metadata_projects_only_the_weight_fields(self):
-        """Endpoint metadata exposes the version fields and nothing else from meta_info."""
+class TestBuildEndpointWeightVersionSglextFields(CustomTestCase):
+    def test_sglext_fields_project_only_the_weight_fields(self):
+        """Endpoint sglext fields expose the version fields and nothing else from meta_info."""
         spans = [
             {"version": "v1", "start": 0, "end": 3},
             {"version": "v2", "start": 3, "end": 7},
         ]
-        metadata = build_endpoint_weight_version_metadata(
+        fields = build_endpoint_weight_version_sglext_fields(
             {
                 "weight_version": "v2",
                 "weight_versions": spans,
@@ -533,12 +533,19 @@ class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
                 "completion_tokens": 7,
             }
         )
-        self.assertEqual(metadata, {"weight_version": "v2", "weight_versions": spans})
+        self.assertEqual(fields, {"weight_version": "v2", "weight_versions": spans})
 
-    def test_metadata_omits_spans_when_absent(self):
+    def test_sglext_fields_omit_spans_when_absent(self):
         """Responses without spans still report the legacy version alone."""
-        metadata = build_endpoint_weight_version_metadata({"weight_version": "v2"})
-        self.assertEqual(metadata, {"weight_version": "v2"})
+        fields = build_endpoint_weight_version_sglext_fields({"weight_version": "v2"})
+        self.assertEqual(fields, {"weight_version": "v2"})
+
+    def test_sglext_fields_omit_unset_versions(self):
+        """Servers without a configured weight version report no weight fields."""
+        fields = build_endpoint_weight_version_sglext_fields(
+            {"weight_version": None, "id": "r0"}
+        )
+        self.assertEqual(fields, {})
 
 
 class TestAddWeightVersionsToMetaInfo(CustomTestCase):
