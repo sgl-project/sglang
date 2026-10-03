@@ -1898,6 +1898,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
                 layer.w13_weight.is_shuffled = is_shuffled
                 layer.w2_weight.is_shuffled = is_shuffled
+                if is_shuffled:
+                    layer._aiter_gate_up_interleaved = (
+                        bool(gu_intv)
+                        if _is_gfx1250_supported
+                        else bool(shuffle_gu_intv)
+                    )
                 return
 
             # DSV4 dequant requested: convert to block-FP8 and use the standard
@@ -3316,10 +3322,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-        if (
-            gate_up_interleaved is not None
-            and (self.moe_runner_config.swiglu_limit or 0.0) > 0
-        ):
+        if gate_up_interleaved is not None:
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
