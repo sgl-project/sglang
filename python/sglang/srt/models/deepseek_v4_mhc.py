@@ -316,7 +316,13 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         x_flat = x_flat.float()
         rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + cfg.rms_eps)
         mixes = (F.linear(x_flat, hc.fn) * rsqrt).unsqueeze(1)
-    pre, post, comb = hc_split_sinkhorn(
+    if _is_xpu:
+        from sglang.srt.models.deepseek_v4 import get_mhc_ops
+
+        split_sinkhorn = get_mhc_ops().hc_split_sinkhorn
+    else:
+        split_sinkhorn = hc_split_sinkhorn
+    pre, post, comb = split_sinkhorn(
         mixes,
         hc.scale,
         hc.base,
