@@ -274,6 +274,7 @@ class PrefillBootstrapQueue:
             else None
         )
         num_draft_entries = 0
+        kv_args.draft_total_kv_head_num = 0
         if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
@@ -284,6 +285,14 @@ class PrefillBootstrapQueue:
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
+            # An MLA draft keeps one replicated latent per rank, so its pages are
+            # copied whole; only a head-sharded draft publishes a head count.
+            if not is_mla_backend(draft_kv_pool):
+                kv_args.draft_total_kv_head_num = (
+                    self.scheduler.draft_worker._draft_model_runners()[
+                        0
+                    ].model_config.get_total_num_kv_heads()
+                )
 
         dcp_remote_decode_layout = []
         if self.transfer_backend == TransferBackend.ASCEND:

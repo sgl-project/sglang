@@ -81,7 +81,7 @@ class KVArgs:
     ib_device: str
     gpu_id: int
     kv_head_num: int
-    total_kv_head_num: int
+    total_kv_head_num: int = 0
     page_size: int
     # for system dp
     system_dp_rank: int
@@ -107,6 +107,7 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    draft_total_kv_head_num: int = 0
 
 
 class KVPoll:

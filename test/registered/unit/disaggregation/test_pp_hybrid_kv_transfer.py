@@ -1,6 +1,7 @@
 """Unit tests for full-attention KV transfer with prefill pp_size > 1 on
 hybrid-linear models (HybridLinearKVPool)."""
 
+import concurrent.futures
 import unittest
 from types import SimpleNamespace
 
@@ -88,6 +89,17 @@ class _RecordingKVManager:
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         self.blocks.extend(transfer_blocks)
         return 0
+
+    def bind_slice_engine(self):
+        def batch_transfer_sync(_, src_addrs, dst_addrs, lengths):
+            self.blocks.extend(zip(src_addrs, dst_addrs, lengths))
+            return 0
+
+        self.engine = SimpleNamespace(batch_transfer_sync=batch_transfer_sync)
+        self._await_transfer_futures = (
+            MooncakeKVManager._await_transfer_futures.__get__(self)
+        )
+        self.send_kvcache_slice = MooncakeKVManager.send_kvcache_slice.__get__(self)
 
 
 class TestHybridSendUsesLayerIdPairing(CustomTestCase):
@@ -189,6 +201,91 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(manager.blocks, [(1000 + 3 * 64, 2000 + 7 * 64, 2 * 64)])
+
+
+# TP2 prefill sender: two replicated MLA target entries (64 B/token) followed by
+# a TP-sharded MHA draft K/V pair (256 B/token on TP2, 8 KV heads in total).
+_HYBRID_LAYER_IDS = [72, 76, 93, 93]
+_DECODE_TP8_PTRS = [5000, 6000, 7000, 8000]
+_TARGET_BLOCKS = [(1064, 5192, 64), (2064, 6192, 64)]
+# Decode TP8 rank 2 receives its 32-byte head slice of each draft K/V page.
+_DRAFT_BLOCKS = [(3320, 7192, 32), (3448, 7224, 32), (4320, 8192, 32), (4448, 8224, 32)]
+# A replicated MLA draft (256 B/token on both sides) is copied as whole pages.
+_MLA_DRAFT_BLOCKS = [(3256, 7768, 256), (4256, 8768, 256)]
+
+
+def _tp2_hybrid_sender(*, hybrid: bool) -> _RecordingKVManager:
+    manager = _RecordingKVManager(prefill_start_layer=0, pp_size=4)
+    manager.attn_tp_size = 2
+    manager.is_hybrid_mla_backend = hybrid
+    manager.kv_args = SimpleNamespace(
+        engine_rank=0,
+        prefill_start_layer=0,
+        page_size=2,
+        num_draft_entries=2,
+        draft_total_kv_head_num=8,
+        kv_data_ptrs=[1000, 2000, 3000, 4000],
+        kv_item_lens=[64, 64, 256, 256],
+        kv_layer_ids=_HYBRID_LAYER_IDS,
+    )
+    manager.bind_slice_engine()
+    return manager
+
+
+def _decode_tp8_rank2_kwargs(executor) -> dict:
+    return dict(
+        mooncake_session_id="session",
+        prefill_kv_indices=np.array([1], dtype=np.int32),
+        dst_kv_ptrs=_DECODE_TP8_PTRS,
+        dst_kv_indices=np.array([3], dtype=np.int32),
+        dst_tp_rank=2,
+        dst_attn_tp_size=8,
+        dst_kv_item_len=64,
+        dst_layer_ids=_HYBRID_LAYER_IDS,
+        executor=executor,
+    )
+
+
+class TestHybridDraftHeterogeneousTp(CustomTestCase):
+    def test_mla_draft_keeps_full_page_copy_under_tp_mismatch(self):
+        """Bug regression: a hybrid-MLA sender whose speculative draft is itself
+        MLA (one replicated latent per rank, same item length on both sides) must
+        copy the draft pages whole under a TP mismatch; head-slicing a replicated
+        draft raised on the head width and killed the transfer worker."""
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = _tp2_hybrid_sender(hybrid=True)
+        manager.kv_args.draft_total_kv_head_num = 0
+        manager._validate_envelope_kv_layout = lambda *args: None
+        manager._send_kvcache_generic = MooncakeKVManager._send_kvcache_generic.__get__(
+            manager
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            rc = MooncakeKVManager.send_kvcache(
+                manager,
+                **_decode_tp8_rank2_kwargs(executor),
+                dst_kv_item_lens=[64, 64, 256, 256],
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(manager.blocks, _TARGET_BLOCKS + _MLA_DRAFT_BLOCKS)
+
+    def test_mha_draft_is_head_sliced_while_target_stays_replicated(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = _tp2_hybrid_sender(hybrid=True)
+        manager._validate_envelope_kv_layout = lambda *args: None
+        manager._send_kvcache_generic = MooncakeKVManager._send_kvcache_generic.__get__(
+            manager
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            rc = MooncakeKVManager.send_kvcache(
+                manager,
+                **_decode_tp8_rank2_kwargs(executor),
+                dst_kv_item_lens=[64] * 4,
+            )
+        self.assertEqual(rc, 0)
+        # Replicated target pages keep the page transfer; the draft tail is head-sliced.
+        self.assertEqual(manager.blocks, _TARGET_BLOCKS + _DRAFT_BLOCKS)
 
 
 class _RecordingAscendManager:
