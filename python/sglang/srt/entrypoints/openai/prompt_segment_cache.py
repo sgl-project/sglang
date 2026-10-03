@@ -118,6 +118,9 @@ def _split_markers(tokenizer) -> List[str]:
     # Other backends and slow tokenizers keep the full encode.
     if not isinstance(backend, Tokenizer) or backend.normalizer is not None:
         return []
+    # With this setting the backend encodes special tokens as plain text.
+    if getattr(tokenizer, "split_special_tokens", False):
+        return []
     template = getattr(tokenizer, "chat_template", None)
     if not isinstance(template, str):
         return []

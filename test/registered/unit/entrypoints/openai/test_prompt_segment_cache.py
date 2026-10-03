@@ -211,6 +211,11 @@ class TestUnsupportedTokenizers(CustomTestCase):
                 tokenizer = _tokenizer(**{flag: True})
                 self.assertIsNone(PromptSegmentCache.create(tokenizer))
 
+    def test_a_tokenizer_that_splits_special_tokens_gets_no_cache(self):
+        tokenizer = _tokenizer()
+        tokenizer.split_special_tokens = True
+        self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
     def test_a_template_without_special_tokens_gets_no_cache(self):
         tokenizer = _tokenizer(template="{{ messages[0]['content'] }}")
         self.assertIsNone(PromptSegmentCache.create(tokenizer))
