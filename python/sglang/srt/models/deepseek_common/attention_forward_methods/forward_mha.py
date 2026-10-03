@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -452,6 +453,7 @@ class DeepseekMHAForwardMixin:
             kv[..., : self.qk_nope_head_dim],
             k_pe,
             kv[..., self.qk_nope_head_dim :],
+            layer=self.attn_mha,
         )
         del kv_a_normed, k_pe, kv
 
@@ -478,6 +480,8 @@ class DeepseekMHAForwardMixin:
 
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        if pack_fn is not None:
+            pack_fn = partial(pack_fn, layer=self.attn_mha)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
         get_mla_kv_buffer = (
             self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer

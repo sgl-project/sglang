@@ -14,6 +14,9 @@ import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -130,7 +133,10 @@ def _quantize_fp8_qkv(q, k, v, layer):
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
         k_scale = 1.0
-    if k_scale != 1.0:
+    # A packed prefix chunk arrives already quantized with this layer's scale.
+    if k.dtype == torch.float8_e4m3fn:
+        pass
+    elif k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
             k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
@@ -142,7 +148,9 @@ def _quantize_fp8_qkv(q, k, v, layer):
     v_scale = getattr(layer, "v_scale_float", None)
     if v_scale is None:
         v_scale = 1.0
-    if v_scale != 1.0:
+    if v.dtype == torch.float8_e4m3fn:
+        pass
+    elif v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(
             v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
@@ -289,6 +297,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
+        uses_trt_packer = (
+            type(self).pack_prefix_chunk_kv is TRTLLMMLABackend.pack_prefix_chunk_kv
+        )
+        if uses_trt_packer and not (
+            envs.SGLANG_ENABLE_TRTLLM_MLA_FUSED_PREFIX_KV_PACK.get()
+            and self.data_type == torch.float8_e4m3fn
+        ):
+            self.pack_prefix_chunk_kv = None
+
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.dense_q_indptr_verify = (
             self.q_indptr_decode * self.num_draft_tokens
@@ -329,6 +346,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
+        )
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        layer: RadixAttention,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack cached-prefix K/V directly into checkpoint-scaled FP8."""
+        k_scale = layer.k_scale_float
+        v_scale = layer.v_scale_float
+        return mla_kv_pack_quantize_fp8(
+            k_nope,
+            k_pe,
+            v,
+            k_scale_inv=1.0 / (1.0 if k_scale is None else k_scale),
+            v_scale_inv=1.0 / (1.0 if v_scale is None else v_scale),
+            enable_pdl=_ENABLE_PDL,
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:

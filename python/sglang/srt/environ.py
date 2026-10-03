@@ -1110,6 +1110,8 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Pack and FP8-quantize cached-prefix K/V in one kernel for TRT-LLM MLA prefill.
+    SGLANG_ENABLE_TRTLLM_MLA_FUSED_PREFIX_KV_PACK = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
