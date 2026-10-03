@@ -120,8 +120,9 @@ class TestAttnTpReduceRejection(CustomTestCase):
 
     def test_the_other_gated_attentions_refuse_the_same_layout(self):
         """These models have no checkpoint in CI, so state the gate on the
-        layer classes themselves. Only PhiMoE builds from a stub config, so it
-        carries the accepted-layout half."""
+        layer classes themselves. Only the refused layout is stated here: both
+        constructors reach a rotary embedding that needs a GPU build, and the
+        accepted layouts are covered by the checks above."""
         from sglang.srt.models.exaone_moe import ExaoneMoEAttention
         from sglang.srt.models.phimoe import PhiMoEAttention
 
@@ -146,9 +147,6 @@ class TestAttnTpReduceRejection(CustomTestCase):
                 self.publish(tp_size=4, attn_dp_size=2)
                 with self.assertRaisesRegex(ValueError, f"{name} shards over"):
                     build()
-
-        self.publish(tp_size=4)
-        phimoe()
 
     def test_a_replicated_branch_is_not_gated(self):
         """MoonViT's tensor-parallel MLP is refused, while its ModelSlim branch
