@@ -1045,6 +1045,43 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
+        try:
+            from sglang.srt.runtime_context import get_model
+            model_bag = get_model()
+            runtime_kv_dtype = getattr(model_bag, "kv_cache_dtype", None)
+
+            kv_scheme = None
+            if quant_config is not None and hasattr(quant_config, "kv_cache_scheme"):
+                kv_scheme = quant_config.kv_cache_scheme
+            elif hasattr(model, "config") and hasattr(model.config, "hf_config"):
+                quant_cfg = getattr(model.config.hf_config, "quantization_config", None)
+                if isinstance(quant_cfg, dict):
+                    kv_scheme = quant_cfg.get("kv_cache_scheme")
+                elif hasattr(quant_cfg, "kv_cache_scheme"):
+                    kv_scheme = getattr(quant_cfg, "kv_cache_scheme", None)
+
+            if (
+                isinstance(kv_scheme, dict)
+                and kv_scheme.get("num_bits") == 8
+                and runtime_kv_dtype == "nvfp4"
+            ):
+                logger.warning(
+                    f"Ignoring FP8 KV cache scales from checkpoint (kv_cache_scheme: {kv_scheme}) "
+                    "because runtime kv_cache_dtype is NVFP4. The FP8 scales (e.g. amax/448) "
+                    "would systematically mis-scale NVFP4 KVs (amax/6). Falling back to dynamic scales."
+                )
+
+                def _filter_kv_scales(ws):
+                    for n, w in ws:
+                        if n.endswith("k_scale") or n.endswith("v_scale") or n.endswith("kv_scale"):
+                            continue
+                        yield n, w
+
+                weights = _filter_kv_scales(weights)
+        except Exception as e:
+            logger.debug("Failed to check KV cache scales: %s", e)
+
+
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
