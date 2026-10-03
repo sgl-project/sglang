@@ -181,5 +181,32 @@ class TestWrapperBackendsForwardTranslator(CustomTestCase):
                 self.assertIs(wrapper.kv_index_translator, translator)
 
 
+class TestDSABackendBindsTranslator(CustomTestCase):
+    """DSA draft backends are created after the runner's generic bind pass."""
+
+    def test_constructor_binds_owning_runner_translator(self):
+        source = dict(_iter_sources())["dsa_backend.py"]
+        module = ast.parse(source)
+        backend = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DeepseekSparseAttnBackend"
+        )
+        init = next(
+            node
+            for node in backend.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+
+        assignments = {
+            ast.unparse(node) for node in ast.walk(init) if isinstance(node, ast.Assign)
+        }
+        self.assertIn(
+            "self.kv_index_translator = model_runner.kv_index_translator",
+            assignments,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
