@@ -299,8 +299,8 @@ class DedupedCudaGraphMixin:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-    def build_deduped_cuda_graph(self):
-        if not envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get():
+    def build_deduped_cuda_graph(self, *, enabled: bool = False):
+        if not (enabled or envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get()):
             return None
         if cuda_drv is None or cuda_rt is None:
             return None
@@ -319,7 +319,7 @@ class DedupedCudaGraphMixin:
             )
             return None
 
-    def begin_cuda_graph_capture(self) -> None:
+    def begin_cuda_graph_capture(self, *, enable_dedup: bool = False) -> None:
         if self.deduped_cuda_graph is not None:
             self.end_cuda_graph_capture()
 
@@ -327,7 +327,7 @@ class DedupedCudaGraphMixin:
             self.deduped_cuda_graph = None
             return
 
-        self.deduped_cuda_graph = self.build_deduped_cuda_graph()
+        self.deduped_cuda_graph = self.build_deduped_cuda_graph(enabled=enable_dedup)
         if self.deduped_cuda_graph is not None:
             self._dedup_registries().append(self.deduped_cuda_graph)
 

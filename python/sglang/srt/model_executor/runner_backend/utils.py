@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_sm120
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -108,14 +109,24 @@ def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
+    model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
     if backend_name == Backend.BREAKABLE:
+        # Nemotron's hybrid prefill breaks at every Mamba/attention layer.
+        # Reuse compatible executables so their MoE side streams are reused
+        # across layers too, while preserving the shared/routed expert overlap.
+        enable_dedup = (
+            is_sm120()
+            and type(getattr(model_runner.model, "model", None)).__name__
+            == "NemotronHModel"
+        )
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
+            enable_dedup=enable_dedup,
         )
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(
