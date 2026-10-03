@@ -10,6 +10,14 @@ from sglang.kernels.ops.diffusion.common.platform import (
     lazy_fallback,
     select_impl,
 )
+from sglang.srt.utils import is_gfx1250_supported
+
+# gfx1250 only: the ROCm SDK's Triton emits packed v_pk_*_bf16 for
+# bf16 elementwise math, and that op reads an inline float immediate
+# (+-0.5/1/2/4) from the wrong half of the 32-bit word -- as zero -- silently
+# dropping the identity term in ``scale_constant + scale``. tl.full does not
+# help; the splat folds back into the immediate.
+_FP32_MODULATE = is_gfx1250_supported()
 
 
 @triton.jit
@@ -285,6 +293,7 @@ def _fused_scale_shift_4d_kernel(
     num_frames,
     frame_seqlen,
     BLOCK_N: tl.constexpr,
+    FP32_MODULATE: tl.constexpr = _FP32_MODULATE,
 ):
     pid_row = tl.program_id(0)
     pid_col = tl.program_id(1)
@@ -315,6 +324,11 @@ def _fused_scale_shift_4d_kernel(
         # CuTe's residual path has no extra +0 on the gate. In particular,
         # adding +0 would change a negative-zero gate before multiplication.
         output = normalized * scale + shift
+    elif FP32_MODULATE:
+        output = normalized.to(tl.float32) * (
+            scale_constant + scale.to(tl.float32)
+        ) + shift.to(tl.float32)
+        output = output.to(out_ptrs.dtype.element_ty)
     else:
         scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
         output = normalized * (scale_const_tensor + scale) + shift
@@ -345,6 +359,7 @@ def fuse_scale_shift_kernel_blc_opt(
     SHIFT_IS_SCALAR: tl.constexpr,
     BLOCK_L: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    FP32_MODULATE: tl.constexpr = _FP32_MODULATE,
 ):
     pid_l = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -386,7 +401,14 @@ def fuse_scale_shift_kernel_blc_opt(
         )
         scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
 
-    y = x * (scale_constant + scale) + shift
+    if FP32_MODULATE:
+        y = x.to(tl.float32) * (scale_constant + scale.to(tl.float32)) + shift.to(
+            tl.float32
+        )
+        y = y.to(y_ptr.dtype.element_ty)
+    else:
+        y = x * (scale_constant + scale) + shift
+
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
