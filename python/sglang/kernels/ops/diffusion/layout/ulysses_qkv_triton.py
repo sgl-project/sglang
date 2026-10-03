@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+# The extra grid dimension only pays off for production-scale payloads.
+_CONTIGUOUS_FAST_PATH_MIN_ELEMENTS = 1 << 23
+
 
 @triton.jit
 def _pack_qkv_destination_major_kernel(
@@ -52,6 +55,40 @@ def _pack_qkv_destination_major_kernel(
     tl.store(output_ptr + output_base + 2 * head_size, v, mask=mask)
 
 
+@triton.jit
+def _pack_qkv_destination_major_contiguous_kernel(
+    output_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    rows,
+    HEAD_SIZE: tl.constexpr,
+    FEATURES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Keep destination in the grid so each program only divides by the
+    # compile-time local feature count, rather than recovering destination,
+    # row, head, and dim from one global element index.
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    destination = tl.program_id(1)
+    mask = offsets < rows * FEATURES
+    row = offsets // FEATURES
+    feature = offsets - row * FEATURES
+    local_head = feature // HEAD_SIZE
+    dim = feature - local_head * HEAD_SIZE
+    source_offset = (row * tl.num_programs(1) + destination) * FEATURES + feature
+    output_offset = (
+        (destination * rows + row) * (3 * FEATURES) + local_head * (3 * HEAD_SIZE) + dim
+    )
+
+    q = tl.load(q_ptr + source_offset, mask=mask)
+    k = tl.load(k_ptr + source_offset, mask=mask)
+    v = tl.load(v_ptr + source_offset, mask=mask)
+    tl.store(output_ptr + output_offset, q, mask=mask)
+    tl.store(output_ptr + output_offset + HEAD_SIZE, k, mask=mask)
+    tl.store(output_ptr + output_offset + 2 * HEAD_SIZE, v, mask=mask)
+
+
 def pack_qkv_destination_major(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -94,6 +131,34 @@ def pack_qkv_destination_major(
         )
     total_elements = rows * global_heads * head_size
     if total_elements == 0:
+        return output
+
+    features = local_heads * head_size
+    if (
+        total_elements >= _CONTIGUOUS_FAST_PATH_MIN_ELEMENTS
+        and torch.version.hip is None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and world_size in (2, 4, 8)
+    ):
+        with torch.get_device_module().device(q.device):
+            block_size = 1024
+            _pack_qkv_destination_major_contiguous_kernel[
+                (triton.cdiv(rows * features, block_size), world_size)
+            ](
+                output,
+                q,
+                k,
+                v,
+                rows,
+                HEAD_SIZE=head_size,
+                FEATURES=features,
+                BLOCK_SIZE=block_size,
+                num_warps=8,
+                num_stages=1,
+            )
         return output
 
     block_size = 1024
