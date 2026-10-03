@@ -147,8 +147,7 @@ pub struct CacheAwarePolicy {
     engine_load: Arc<EngineReportedLoadTable>,
     config: AffinityConfig,
     pub admission: Arc<dyn EngineAdmission>,
-    /// This policy checks admission on the fallback's pick.
-    pub fallback: Arc<dyn Policy>,
+    fallback: PowerOfTwoPolicy,
 }
 
 impl CacheAwarePolicy {
@@ -173,7 +172,7 @@ impl CacheAwarePolicy {
         }
         Ok(Self {
             source,
-            fallback: Arc::new(PowerOfTwoPolicy::new(Arc::clone(&engine_load))),
+            fallback: PowerOfTwoPolicy::new(Arc::clone(&engine_load)),
             engine_load,
             config,
             admission: Arc::new(AdmissionLimits::default()),
@@ -326,22 +325,17 @@ impl Policy for CacheAwarePolicy {
             if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
                 return Err(PickError::NoAdmissibleEngine(rejections));
             }
-            let fallback = async {
-                let mut pick = self.pick_fallback(&pool, request).await?;
-                if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
-                    return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
-                }
-                if let Some(rejection) = self.check(&pick.engine, &load)? {
-                    return Err(PickError::AdmissionRejected(rejection));
-                }
-                pick.reason = if affinity.is_some() {
-                    "affinity_load"
-                } else {
-                    "no_cache_candidate"
-                };
-                Ok(pick)
-            }
-            .await;
+            let fallback = self
+                .fallback
+                .pick_admitted(&pool, request, self.admission.as_ref())
+                .map(|pick| Pick {
+                    reason: if affinity.is_some() {
+                        "affinity_load"
+                    } else {
+                        "no_cache_candidate"
+                    },
+                    ..pick
+                });
             let uncached_tokens = |engine: &Worker| {
                 (candidates.iter())
                     .find(|c| c.engine.id == engine.id)
@@ -349,9 +343,5 @@ impl Policy for CacheAwarePolicy {
             };
             affinity::choose(&self.config, affinity, fallback, &load, uncached_tokens)
         })
-    }
-
-    fn fallback(&self) -> Option<&dyn Policy> {
-        Some(self.fallback.as_ref())
     }
 }

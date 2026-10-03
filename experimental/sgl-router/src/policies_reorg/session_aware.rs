@@ -105,12 +105,9 @@ impl Policy for SessionAwarePolicy {
                 if alternatives.is_empty() {
                     return rejection.map_or(Ok(primary), Err);
                 }
-                let fallback = async {
-                    let pick = self.pick_fallback(&alternatives, request).await?;
-                    self.check(&pick.engine, &load)?;
-                    Ok::<_, PickError>(pick)
-                }
-                .await;
+                let fallback =
+                    self.fallback
+                        .pick_admitted(&alternatives, request, self.admission.as_ref());
                 let mut pick = affinity::choose(
                     &self.config,
                     rejection.is_none().then_some(primary),
@@ -132,12 +129,10 @@ impl Policy for SessionAwarePolicy {
                 return Ok(pick);
             }
 
-            // The nested power-of-two policy uses AdmissionLimits::default().
-            // The session owner checks its chosen engine before creating or
-            // replacing a binding.
-            let mut pick = self.pick_fallback(engines, request).await?;
+            let mut pick =
+                self.fallback
+                    .pick_admitted(engines, request, self.admission.as_ref())?;
             let load = self.engine_load.capture_snapshot(Instant::now());
-            self.check(&pick.engine, &load)?;
             let Some(key) = key else {
                 pick.reason = "no_session";
                 return Ok(pick);
@@ -155,9 +150,5 @@ impl Policy for SessionAwarePolicy {
             pick.engine = Arc::clone(effective);
             Ok(pick)
         })
-    }
-
-    fn fallback(&self) -> Option<&dyn Policy> {
-        Some(&self.fallback)
     }
 }
