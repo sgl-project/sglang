@@ -385,9 +385,9 @@ def decode_scores(
     req, pos = inputs.req_rows, inputs.positions
     paged = get_platform().is_sm90
     bs = req.shape[0]
-    assert (
-        pos.shape[0] == bs
-    ), f"decode expects one token per request, {pos.shape=} {bs=}"
+    assert pos.shape[0] == bs, (
+        f"decode expects one token per request, {pos.shape=} {bs=}"
+    )
     if bs == 0:
         inputs.reset_outputs()
         return None
