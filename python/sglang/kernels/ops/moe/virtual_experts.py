@@ -306,18 +306,16 @@ def _align_block_size_jit(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    scratch=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
 
-    Uses the v2 kernel from moe_align_kernel.cu which supports large expert
-    counts via per-thread multi-expert processing and a two-level warp scan,
-    replacing the previous pure-PyTorch fallback that had excessive CPU overhead
-    from 15+ individual kernel launches and torch.argsort.
+    The v2 kernel in moe_align_kernel.cu uses per-thread multi-expert processing
+    and a two-level warp scan. IDs are shifted by +1 so the EP sentinel (-1)
+    maps to bucket 0.
 
-    The JIT kernel uses a +1 offset convention: topk_ids are shifted by +1 so
-    that the EP sentinel value (-1) maps to bucket 0. The kernel internally
-    handles histogram, padded prefix-sum, expert_ids assignment, and token
-    scattering in just 2–3 CUDA kernel launches.
+    ``scratch(numel)`` returns the int32 scratch buffer (default: a fresh
+    allocation); a caller under CUDA graphs passes a persistent buffer.
     """
     assert num_experts <= 8191, (
         f"_align_block_size_jit supports at most 8191 experts "
@@ -362,7 +360,11 @@ def _align_block_size_jit(
         + num_post_pad_size
         + cumsum_size
     )
-    buf = torch.empty(total_buf, dtype=torch.int32, device=device)
+    buf = (
+        torch.empty(total_buf, dtype=torch.int32, device=device)
+        if scratch is None
+        else scratch(total_buf)
+    )
     off = 0
     sorted_token_ids = buf[off : off + max_num_tokens_padded]
     off += max_num_tokens_padded
