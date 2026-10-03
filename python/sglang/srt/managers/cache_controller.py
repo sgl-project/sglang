@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -51,7 +52,7 @@ device_module = get_device_module()
 
 
 def storage_model_name(
-    model_name: Optional[str], host_pool: HostKVCache
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
 ) -> Optional[str]:
     """The model name storage backends key pages on, tagged with the host
     pool's page format when it has one of its own."""

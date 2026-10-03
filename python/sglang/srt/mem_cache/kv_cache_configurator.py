@@ -927,6 +927,7 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens=swa_max_total_num_tokens,
             total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            post_capture_active=self.post_capture_kv_active,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
             # `_init_unified_mamba_pools`.

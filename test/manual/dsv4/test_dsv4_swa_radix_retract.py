@@ -1,6 +1,6 @@
 """DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
-Regression test for the former SWA `insert_req` assertion:
+Regression test for the former SWA `checkpoint` assertion:
     assert old_prefix_len <= len(new_indices)
 The unified cache reads `req.kv.cache_protected_len` and tolerates page_size - 1
 of alignment slack, so this reproduces the historical trip conditions rather

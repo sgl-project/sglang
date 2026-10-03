@@ -1729,7 +1729,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
 
-    def test_insert_req(self):
+    def test_checkpoint(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1785,7 +1785,7 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(len(prompt_only.device_indices), prompt_aligned_len)
         cache.sanity_check()
 
-    def test_insert_req_strips_thinking(self):
+    def test_checkpoint_strips_thinking(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1883,7 +1883,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_insert_req_mid_flight(self):
+    def test_checkpoint_mid_flight(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         req = self._make_req(req_to_token_pool)
@@ -1905,7 +1905,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.insert_req(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         self.assertGreater(len(req.prefix_indices), 0)
         self.assertEqual(req.kv.cache_protected_len, len(req.prefix_indices))
@@ -1943,7 +1943,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
-        cache.insert_req(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         (first,) = _node_children(cache, cache.root_node_handle())
         self.assertEqual(_node_key_length(cache, first), evicted_len)
@@ -2022,7 +2022,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_paged_insert_req_unaligned_tail_freed(self):
+    def test_paged_checkpoint_unaligned_tail_freed(self):
         if self.cfg.page_size == 1:
             self.skipTest("page_size > 1 only")
         if self.cfg.has_swa:
@@ -2170,7 +2170,7 @@ class UnifiedRadixCacheSuite:
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
-        cache.insert_req(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -2859,7 +2859,7 @@ class UnifiedRadixCacheSuite:
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.insert_req(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_range.end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
@@ -2946,7 +2946,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.insert_req(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_range.end)
 
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -8522,6 +8522,68 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone(
+        self,
+    ):
+        """Write-back builds the insert backup as [target] only, so a second SWA
+        window publish never re-marks an ancestor another ack still holds."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        ps = self.cfg.page_size
+        if self.cfg.sliding_window_size <= 2 * ps:
+            self.skipTest("window must span past the leaf and its parent to reach c")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        # c(Full unbacked) -> b(Full backed) -> t1(Full backed)
+        #                  -> d(Full unbacked) -> t2(Full backed)
+        # Every node holds a device-only SWA value inside the window.
+        c_seq = self._make_seq(1, 2)
+        t1_seq = c_seq + self._make_seq(1000, 1) + self._make_seq(2000, 1)
+        t2_seq = c_seq + self._make_seq(3000, 1) + self._make_seq(4000, 1)
+        for seq in (t1_seq, t2_seq, t1_seq[:-ps], t2_seq[:-ps]):
+            self._insert(cache, allocator, req_to_token_pool, seq)
+
+        def leaf(seq):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+
+        c, b, t1 = self._path_chain(cache, leaf(t1_seq))
+        _, d, t2 = self._path_chain(cache, leaf(t2_seq))
+        for node in (b, t1, t2):
+            cache.tree_core.set_component_host_value_raw(
+                node,
+                ComponentType.FULL,
+                _device_value(cache, node, ComponentType.FULL).clone(),
+            )
+        for node in (c, b, t1, d, t2):
+            self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+            self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+        # Two requests in one batch finish at t1 and t2; neither ack drains.
+        with mock.patch.object(
+            cache,
+            "_execute_and_commit_kv_backup",
+            wraps=cache._execute_and_commit_kv_backup,
+        ) as backups:
+            for seq, target in ((t1_seq, t1), (t2_seq, t2)):
+                backups.reset_mock()
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                self.assertEqual(
+                    [call.args[0].node_ids for call in backups.call_args_list],
+                    [[target]],
+                )
+
+        for node, ack in ((c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)):
+            self.assertEqual(cache.tree_core.get_write_through_pending_id(node), ack)
+        # Write-back defers the unbacked Full prefix to eviction.
+        self.assertFalse(cache.tree_core.is_backuped(c))
+        self.assertFalse(cache.tree_core.is_backuped(d))
+
 
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
     components = (ComponentType.FULL, ComponentType.SWA)
@@ -10289,7 +10351,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
 
 
 class TestSWAWindowUnderBigramKey(CustomTestCase):
-    """`insert_req` has to leave the leaf it inserts holding a full
+    """`checkpoint` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
     refuses that leaf, `cache_protected_len` never advances, and the next insert
     frees KV the tree already owns as if it were the request's duplicate.
@@ -10345,7 +10407,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.insert_req(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_range.end)
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(

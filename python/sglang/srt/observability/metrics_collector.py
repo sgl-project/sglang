@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
+    FORWARD_OVERLAP_CATEGORIES,
+    FORWARD_OVERLAP_NONE,
     SCHEDULER_STAGE_CATEGORIES,
 )
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
@@ -959,13 +961,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:scheduler_stage_seconds_total",
             documentation=(
                 "Total scheduler-loop wall time exclusively attributed to each stage."
+                f" forward_overlap ({', '.join(FORWARD_OVERLAP_CATEGORIES)}):"
+                " full=both endpoints active, partial=one, none=no observed overlap"
+                " (including unavailable timing). Not exact overlapped/exposed seconds."
             ),
-            labelnames=list(labels.keys()) + ["category"],
+            labelnames=list(labels.keys()) + ["category", "forward_overlap"],
         )
         self.scheduler_idle_seconds_total.labels(**labels)
         self.scheduler_process_cpu_seconds_total.labels(**labels)
         for category in SCHEDULER_STAGE_CATEGORIES:
-            self.scheduler_stage_seconds_total.labels(**labels, category=category)
+            self.scheduler_stage_seconds_total.labels(
+                **labels, category=category, forward_overlap=FORWARD_OVERLAP_NONE
+            )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -1361,10 +1368,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_scheduler_process_cpu_seconds(self, t: float) -> None:
         self.scheduler_process_cpu_seconds_total.labels(**self.labels).inc(t)
 
-    def increment_scheduler_stage_seconds(self, stage: str, seconds: float) -> None:
-        self.scheduler_stage_seconds_total.labels(**self.labels, category=stage).inc(
-            seconds
-        )
+    def increment_scheduler_stage_seconds(
+        self, stage: str, seconds: float, forward_overlap: str = FORWARD_OVERLAP_NONE
+    ) -> None:
+        self.scheduler_stage_seconds_total.labels(
+            **self.labels, category=stage, forward_overlap=forward_overlap
+        ).inc(seconds)
 
     def increment_estimated_perf(
         self,

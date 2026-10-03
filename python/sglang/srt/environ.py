@@ -663,6 +663,8 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in: keep receiving prefill requests while forward results are pending.
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -763,6 +765,10 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Host memory in bytes available to HiCache pools on this host. When set,
+    # it replaces cgroup and psutil discovery; the 10 GiB reserve and the
+    # per-local-rank split still apply.
+    SGLANG_HICACHE_HOST_MEMORY_BYTES = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1024,6 +1030,9 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
+    # Disable to save the additional weight memory or allow online updates.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1592,6 +1601,12 @@ class Envs:
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
+    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
+    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
@@ -1752,6 +1767,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
