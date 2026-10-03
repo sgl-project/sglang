@@ -306,10 +306,8 @@ def _decode(fn, q, main, indices, **kwargs):
 @pytest.mark.parametrize("page_size", [64, 61])
 def test_fp8_pack_and_append_match_flashinfer_and_reference(page_size):
     _skip_unless_sm12x(cake.FI_API_MODULE, cake.FI_API_JIT_MODULE)
-    from flashinfer.mla import (
-        dsv41_fp8_quantize_append_sparse_mla_cache as fi_append,
-        dsv41_fp8_quantize_pack_sparse_mla_cache as fi_pack,
-    )
+    from flashinfer.mla import dsv41_fp8_quantize_append_sparse_mla_cache as fi_append
+    from flashinfer.mla import dsv41_fp8_quantize_pack_sparse_mla_cache as fi_pack
 
     device = torch.device("cuda")
     torch.manual_seed(20261003 + page_size)
@@ -360,8 +358,8 @@ def test_fp8_pack_and_append_match_flashinfer_and_reference(page_size):
 @pytest.mark.parametrize("with_extra", [False, True])
 def test_mixed_decode_matches_flashinfer_and_reference(num_heads, with_extra):
     _skip_unless_family()
+    from flashinfer.mla import cake_sparse_mla_sm120_dsv41_mixed_decode as fi_decode
     from flashinfer.mla import (
-        cake_sparse_mla_sm120_dsv41_mixed_decode as fi_decode,
         dsv41_fp4_quantize_pack_sparse_mla_cache,
     )
 

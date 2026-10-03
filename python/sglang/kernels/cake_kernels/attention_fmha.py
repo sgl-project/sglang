@@ -85,8 +85,17 @@ or non-HND caches for balanced decode; anything but FP16 on Thor.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
-from typing import Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from sglang.kernels.cake_kernels.attention_common import (
     SM100,
