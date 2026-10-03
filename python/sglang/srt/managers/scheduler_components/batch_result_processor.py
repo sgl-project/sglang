@@ -478,6 +478,17 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        # Mixed decode/prefill requests and cache-skipped requests can leave a
+        # checkpoint reservation unused. A middle chunk retains its slot until
+        # the scheduler stashes that completed chunk after result processing.
+        release_reservation = getattr(
+            self.req_to_token_pool, "release_mamba_cache_reservation", None
+        )
+        if release_reservation is not None:
+            for req in batch.reqs:
+                if req is not batch.chunked_req:
+                    release_reservation(req)
+
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req

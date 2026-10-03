@@ -12,12 +12,15 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
+    EvictParams,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
@@ -25,7 +28,10 @@ from sglang.srt.mem_cache.prefill_budget import (
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedMambaSlotAllocator,
+    init_unified_swa_pools,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
@@ -145,6 +151,104 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
+
+    def test_mamba_admission_counts_ping_pong_and_pending_batch_slots(self):
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.enable_mamba_extra_buffer = True
+        pool.mamba_ckpt_pool = None
+        pool.enable_mamba_extra_buffer_lazy = False
+        pool.mamba_ping_pong_track_buffer_size = 1
+        pool.mamba_allocator = MagicMock()
+        pool.mamba_allocator.admission_available_size.return_value = 3
+        cache = SimpleNamespace(
+            req_to_token_pool=pool,
+            supports_mamba=lambda: True,
+            evict_for_alloc=MagicMock(),
+        )
+        adder = object.__new__(PrefillAdder)
+        adder.tree_cache = cache
+        adder.can_run_list = []
+        adder._mamba_slot_cost = 4
+        fresh = SimpleNamespace(
+            skip_radix_cache_insert=False,
+            kv=SimpleNamespace(
+                holds_mamba=False,
+                mamba_ping_pong_track_buffer=None,
+                mamba_prefill_live_slot=None,
+                mamba_prefill_ping_pong_slots=None,
+                mamba_cache_reserve_slot=None,
+            ),
+        )
+        matched = SimpleNamespace(
+            skip_radix_cache_insert=False,
+            kv=SimpleNamespace(
+                holds_mamba=True,
+                mamba_ping_pong_track_buffer=None,
+                mamba_prefill_live_slot=None,
+                mamba_prefill_ping_pong_slots=None,
+                mamba_cache_reserve_slot=None,
+            ),
+        )
+
+        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 3)
+        self.assertEqual(adder._mamba_slots_needed_for_req(matched), 2)
+        self.assertEqual(adder._mamba_gap_budget_for_req(fresh), 12)
+        self.assertTrue(adder._has_mamba_slots_for_req(fresh))
+
+        adder.can_run_list.append(fresh)
+        self.assertFalse(adder._has_mamba_slots_for_req(matched))
+        cache.evict_for_alloc.assert_called_once_with(
+            EvictParams(num_tokens=0, mamba_num=2)
+        )
+
+        # Prefix COW or HiCache load-back may already own the live state;
+        # the tracking buffer and checkpoint slot are charged at admission.
+        pool.mamba_allocator.admission_available_size.return_value = 2
+        adder.can_run_list.clear()
+        self.assertTrue(adder._has_mamba_slots_for_req(matched))
+
+        pool.mamba_ping_pong_track_buffer_size = 2
+        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 4)
+
+        adder.page_size = 1
+        adder.per_req_token_overhead = 1
+        adder.memory_budget = MagicMock()
+        adder.rem_mamba_slots = 4
+        adder.rem_input_tokens = 10
+        adder.rem_chunk_tokens = None
+        adder.dllm_config = None
+        adder.log_hit_tokens = 0
+        adder.log_input_tokens = 0
+        adder._update_prefill_budget(
+            prefix_len=0,
+            extend_input_len=1,
+            max_new_tokens=0,
+            retracted_stain=False,
+            mamba_gap_reserve=8,
+        )
+        self.assertEqual(adder.rem_mamba_slots, 2)
+
+    def test_mamba_admission_sees_unused_grouped_prefix_slots(self):
+        allocator = MambaSlotAllocator(size=4, device="cpu")
+        allocator.alloc_group_begin(3)
+        self.assertEqual(allocator.available_size(), 1)
+        self.assertEqual(allocator.admission_available_size(), 4)
+        allocator.alloc(1)
+        self.assertEqual(allocator.admission_available_size(), 3)
+        allocator.alloc_group_end()
+        self.assertEqual(allocator.available_size(), 3)
+        self.assertEqual(allocator.admission_available_size(), 3)
+
+        shared = MagicMock()
+        shared.alloc.return_value = torch.tensor([1, 2, 3])
+        shared.schedulable_available_size.return_value = 1
+        unified_allocator = UnifiedMambaSlotAllocator(shared, 4, "cpu")
+        unified_allocator.alloc_group_begin(3)
+        self.assertEqual(unified_allocator.admission_available_size(), 4)
+        unified_allocator.alloc(1)
+        self.assertEqual(unified_allocator.admission_available_size(), 3)
+        unified_allocator.alloc_group_end()
+        shared.free.assert_called_once()
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False

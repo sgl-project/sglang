@@ -1001,6 +1001,10 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
+            if release := getattr(
+                self.req_to_token_pool, "release_mamba_cache_reservation", None
+            ):
+                release(req)
             return
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
@@ -1008,6 +1012,10 @@ class UnifiedRadixCache(BasePrefixCache):
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
+            if release := getattr(
+                self.req_to_token_pool, "release_mamba_cache_reservation", None
+            ):
+                release(req)
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : len(token_ids)
             ]
@@ -1667,10 +1675,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component pre-allocate per-request state for the load-back;
         # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
-        }
+        preps: dict[ComponentType, PrepareLoadBackResult] = {}
+        try:
+            for comp in self._components_tuple:
+                preps[comp.component_type] = comp.prepare_load_back(node_id, req=req)
+        except Exception:
+            # Preparation can fail under state-slot pressure. Nothing has been
+            # submitted to the controller yet, so undo every prepared component
+            # and both path locks before the scheduler retries this request.
+            try:
+                for comp in self._components_tuple:
+                    prep = preps.get(comp.component_type)
+                    if prep is not None:
+                        comp.finalize_load_back(req, prep, False)
+            finally:
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+            raise
         success = False
         try:
             success = self._load_back_transfers(
@@ -3378,8 +3399,8 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
-    def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+    def check_hicache_events(self) -> bool:
+        """Poll async HiCache events and report possible device-side work."""
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -3399,13 +3420,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
-            return
+            return False
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
+
+        write_back_policy = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
 
         (
             write_finish_count,
@@ -3439,6 +3465,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        return (write_back_policy and write_finish_count > 0) or (
+            self.enable_storage and any(storage_queue_sizes)
+        )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

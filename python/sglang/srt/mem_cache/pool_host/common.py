@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import mmap
 import os
 from collections import defaultdict
 from functools import lru_cache
@@ -138,14 +140,19 @@ def get_allocator_type() -> str:
 
 
 def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+    buffer: torch.Tensor,
+    registration_granularity_bytes: int | None = None,
+    *,
+    _retry_chunk_limit_bytes: int | None = None,
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
     chunk_limit_bytes = (
-        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+        _retry_chunk_limit_bytes
+        if _retry_chunk_limit_bytes is not None
+        else max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
     # Preserve the legacy single-call behavior unless the caller provides a
     # copy granularity. Splitting an unknown page-first layout at an arbitrary
@@ -157,28 +164,37 @@ def _cuda_host_register(
                 "registration_granularity_bytes must be positive, got "
                 f"{registration_granularity_bytes}"
             )
-        if registration_granularity_bytes > chunk_limit_bytes:
-            raise ValueError(
-                "Host registration granularity exceeds the configured chunk limit: "
-                f"granularity={registration_granularity_bytes}, "
-                f"chunk_limit={chunk_limit_bytes}"
-            )
-        chunk_bytes = (
-            chunk_limit_bytes // registration_granularity_bytes
-        ) * registration_granularity_bytes
+        # Both copy pages and OS pages must stay whole. Otherwise the next
+        # cudaHostRegister call can start at a non-page-aligned address.
+        registration_alignment_bytes = math.lcm(
+            registration_granularity_bytes, mmap.PAGESIZE
+        )
+        # If one aligned span exceeds the preferred limit, keep it whole.
+        chunk_bytes = max(
+            registration_alignment_bytes,
+            (chunk_limit_bytes // registration_alignment_bytes)
+            * registration_alignment_bytes,
+        )
     registered_ranges: list[tuple[int, int]] = []
+    failed_rc = None
+    failed_size = 0
     try:
         offset = 0
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
-            if rc != 0:
+            rc = cudart.cudaHostRegister(ptr, size, 0)
+            if int(rc) != 0:
+                failed_rc = int(rc)
+                failed_size = size
                 raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
-                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
-                    f"pinned and device transfers may silently return stale data."
+                    f"cudaHostRegister failed (rc={int(rc)}, "
+                    f"{cudart.cudaGetErrorString(rc)}) at ptr={ptr:#x} "
+                    f"(page_offset={ptr % mmap.PAGESIZE}) offset={offset} size={size} "
+                    f"(total={total}, chunk_limit={chunk_bytes}, "
+                    f"registration_granularity={registration_granularity_bytes}); "
+                    "host buffer is not pinned and device transfers may silently "
+                    "return stale data."
                 )
             registered_ranges.append((ptr, size))
             offset += size
@@ -193,6 +209,37 @@ def _cuda_host_register(
         )
         if remaining_ranges:
             setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+        # Preserve the successful one-call path. Only a rejected oversized
+        # range is retried, after all earlier registrations are undone.
+        fallback_limit_bytes = 1024**3
+        fallback_chunk_bytes = (
+            max(
+                registration_alignment_bytes,
+                (fallback_limit_bytes // registration_alignment_bytes)
+                * registration_alignment_bytes,
+            )
+            if registration_granularity_bytes is not None
+            else chunk_bytes
+        )
+        if (
+            not remaining_ranges
+            and _retry_chunk_limit_bytes is None
+            and registration_granularity_bytes is not None
+            and failed_rc == 1  # cudaErrorInvalidValue
+            and failed_size > fallback_limit_bytes
+            and ptr % mmap.PAGESIZE == 0
+            and fallback_chunk_bytes < chunk_bytes
+        ):
+            logger.warning(
+                "cudaHostRegister rejected a %d-byte range; retrying with "
+                "at most 1 GiB per registration before page alignment",
+                failed_size,
+            )
+            return _cuda_host_register(
+                buffer,
+                registration_granularity_bytes,
+                _retry_chunk_limit_bytes=fallback_limit_bytes,
+            )
         raise
 
 
@@ -201,13 +248,13 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
-        if rc != 0:
+        rc = cudart.cudaHostUnregister(ptr)
+        if int(rc) != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
-                rc,
+                int(rc),
                 cudart.cudaGetErrorString(rc),
                 ptr,
                 size,

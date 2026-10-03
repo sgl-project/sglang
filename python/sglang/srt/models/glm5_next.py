@@ -109,7 +109,9 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multiplex.pdmux_context import get_pdmux_decode_alt_stream
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_lora,
     get_mm,
     get_parallel,
@@ -684,6 +686,11 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
+        self.enable_pdmux = get_disagg().enable_pdmux
+        self.pdmux_alt_stream = alt_stream
+        if self.enable_pdmux:
+            # Select the helper for each lane at forward time, including capture.
+            alt_stream = None
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -917,6 +924,19 @@ class Glm5NextDecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _set_pdmux_alt_stream(self, forward_batch: ForwardBatch) -> None:
+        alt_stream = (
+            get_pdmux_decode_alt_stream(self.pdmux_alt_stream)
+            if forward_batch.forward_mode.is_decode_or_idle()
+            else None
+        )
+        if not self.is_linear_attn:
+            self.self_attn.alt_stream = alt_stream
+            if self.self_attn.indexer is not None:
+                self.self_attn.indexer.alt_stream = alt_stream
+        if self.is_layer_sparse:
+            self.mlp.alt_stream = alt_stream
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -927,6 +947,8 @@ class Glm5NextDecoderLayer(nn.Module):
         prev_topk_indices: Optional[torch.Tensor] = None,
         capture_output=None,
     ):
+        if self.enable_pdmux:
+            self._set_pdmux_alt_stream(forward_batch)
         hidden_states_orig = residual_access.buffer(hidden_states)
 
         hidden_states = self.attn_boundary.prepare(
@@ -1000,6 +1022,7 @@ class Glm5NextModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Decoder layers enable this helper only for full-device decode lanes.
         self.alt_stream = (
             torch.cuda.Stream()
             if (
@@ -1093,7 +1116,13 @@ class Glm5NextModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        split_interval: Optional[Tuple[int, int]] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if split_interval is not None:
+            return self.forward_split_prefill(
+                input_ids, positions, forward_batch, split_interval, input_embeds
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1193,6 +1222,97 @@ class Glm5NextModel(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def forward_split_prefill(
+        self,
+        input_ids: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]]:
+        """Resume a PDMux prefill with one batch-owned residual stream."""
+        start, end = split_interval
+        if not self.start_layer <= start < end <= self.end_layer:
+            raise ValueError(f"Invalid GLM-5.3-Flash prefill layers: {split_interval}")
+
+        if start == self.start_layer:
+            hidden_states = input_embeds
+            if hidden_states is None:
+                hidden_states = self.embed_tokens(input_ids)
+            residual_batch.start(forward_batch)
+            forward_batch.hidden_states = hidden_states
+            forward_batch.model_specific_states = {
+                "zero_allocator": BumpAllocator(
+                    buffer_size=(self.end_layer - self.start_layer) * 2,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                "gemm_output_zero_allocator": (
+                    BumpAllocator(
+                        buffer_size=self.gemm_output_zero_allocator_size,
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                    if self.gemm_output_zero_allocator_size > 0
+                    else None
+                ),
+                "topk_indices": None,
+                "aux_hidden_states": AuxHiddenStateList(),
+            }
+
+        states = forward_batch.model_specific_states
+        hidden_states = forward_batch.hidden_states
+        zero_allocator = states["zero_allocator"]
+        gemm_output_zero_allocator = states["gemm_output_zero_allocator"]
+        topk_indices = states["topk_indices"]
+        aux_hidden_states = states["aux_hidden_states"]
+
+        for i in range(start, end):
+            # NOTE: torch dynamo does not support graph break in context manager
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+
+                def capture_output(aux_hidden_state, *, owned=False):
+                    aux_hidden_state = self._prepare_aux_hidden_state(aux_hidden_state)
+                    owned = owned or (self.dflash_capture and self.config.mhc)
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        group = get_parallel().attn_tp_group
+                        aux_hidden_state = group.all_gather(aux_hidden_state, dim=0)
+                        owned = owned or group.world_size > 1
+                    aux_hidden_states.capture(aux_hidden_state, owned=owned)
+
+                layer = self.layers[i]
+                (hidden_states, topk_indices) = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    prev_topk_indices=topk_indices,
+                    capture_output=capture_output
+                    if i in self.layers_to_capture
+                    else None,
+                )
+
+        forward_batch.hidden_states = hidden_states
+        states["topk_indices"] = topk_indices
+        if end != self.end_layer:
+            return None
+
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
+        forward_batch.hidden_states = hidden_states
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
@@ -1584,6 +1704,41 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+    ):
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            if split_interval[0] == self.model.start_layer:
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    split_interval=split_interval,
+                )
+            else:
+                hidden_states = self.model.forward_split_prefill(
+                    input_ids, positions, forward_batch, split_interval
+                )
+
+        if hidden_states is None:
+            return None
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
