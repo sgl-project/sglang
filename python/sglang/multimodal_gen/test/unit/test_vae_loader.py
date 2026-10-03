@@ -65,6 +65,9 @@ class _FakeServerArgs:
     def resolve_component_attention_backend(self, _component_name):
         return None, None
 
+    def resolve_component_backend_by_role(self, *_component_names):
+        return {}
+
     def requested_component_attention_backend(self, _component_name):
         return None
 

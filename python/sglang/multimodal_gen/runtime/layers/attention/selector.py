@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionBackend,
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import (
+    AttentionRole,
+    make_component_role_key,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -33,6 +37,11 @@ class ComponentAttnBackendContext(NamedTuple):
     backend: AttentionBackendEnum | None
     component_name: str | None
     selected_backends: dict[str, str | None]
+    backend_by_role: dict[AttentionRole, AttentionBackendEnum]
+    # Same records as ``selected_backends``, but attributed to the role of the
+    # layer that made them. ``None`` collects selections made outside a layer,
+    # which belong to no single role.
+    selected_backends_by_role: dict[AttentionRole | None, dict[str, str | None]]
     allow_global_backend_fallback: bool = False
     require_backend_selection: bool = False
 
@@ -89,6 +98,17 @@ def claim_deferred_component_attn_backend() -> AttentionBackendEnum | None:
     return context.backend
 
 
+def get_component_forced_attn_backend_for_role(
+    role: AttentionRole,
+) -> AttentionBackendEnum | None:
+    """Role-specific component override (e.g. ``transformer.cross``).
+
+    Takes precedence over the component-wide backend when both are configured.
+    """
+    context = get_component_attn_backend_context()
+    return context.backend_by_role.get(role) if context is not None else None
+
+
 def get_component_attn_backend_name() -> str | None:
     context = get_component_attn_backend_context()
     return context.component_name if context is not None else None
@@ -99,17 +119,35 @@ def _component_allows_global_backend_fallback() -> bool:
     return context is not None and context.allow_global_backend_fallback
 
 
-def _record_component_attn_backend(backend_name: str, reason: str | None) -> bool:
+def _merge_selection(
+    selections: dict[str, str | None], backend_name: str, reason: str | None
+) -> None:
+    if backend_name not in selections:
+        selections[backend_name] = reason
+    elif reason is None:
+        # unrestricted selection must not be hidden by a later valid fallback
+        selections[backend_name] = None
+
+
+def _record_component_attn_backend(
+    backend_name: str, reason: str | None, role: AttentionRole | None = None
+) -> bool:
     context = get_component_attn_backend_context()
     if context is None or context.component_name is None:
         return False
 
-    if backend_name not in context.selected_backends:
-        context.selected_backends[backend_name] = reason
-    elif reason is None:
-        # unrestricted selection must not be hidden by a later valid fallback
-        context.selected_backends[backend_name] = None
+    _merge_selection(context.selected_backends, backend_name, reason)
+    _merge_selection(
+        context.selected_backends_by_role.setdefault(role, {}), backend_name, reason
+    )
     return True
+
+
+def _format_component_attn_selections(selections: dict[str, str | None]) -> str:
+    return ", ".join(
+        f"{backend_name} ({reason})" if reason else backend_name
+        for backend_name, reason in selections.items()
+    )
 
 
 def _log_component_attn_backend_summary(
@@ -122,50 +160,101 @@ def _log_component_attn_backend_summary(
     ):
         return
 
-    backend_parts = []
-    for backend_name, reason in context.selected_backends.items():
-        if reason:
-            backend_parts.append(f"{backend_name} ({reason})")
-        else:
-            backend_parts.append(backend_name)
+    by_role = context.selected_backends_by_role
+    summary = ""
+    # Break the summary out per role only when a role override is configured, so
+    # it can be confirmed from the log without re-deriving which layers it
+    # reached. Components with no override keep the flat single-line format.
+    if context.backend_by_role:
+        parts = [
+            f"{role.value}={_format_component_attn_selections(by_role[role])}"
+            for role in AttentionRole
+            if by_role.get(role)
+        ]
+        if by_role.get(None):
+            parts.append(_format_component_attn_selections(by_role[None]))
+        summary = "; ".join(parts)
+    if not summary:
+        summary = _format_component_attn_selections(context.selected_backends)
 
-    logger.info_once(
-        f"Attention backends for {context.component_name}: {', '.join(backend_parts)}"
+    logger.info_once(f"Attention backends for {context.component_name}: {summary}")
+
+
+def _validate_selection_against_request(
+    selections: dict[str, str | None], requested_name: str, target: str
+) -> None:
+    """Check that ``target``'s layers honored ``requested_name``.
+
+    A divergence is tolerated only when every diverging selection carries a
+    reason, i.e. it went through an allowed fallback such as the dense
+    replacement for a sparse backend in cross-attention.
+    """
+    unexplained = sorted(
+        backend_name
+        for backend_name, reason in selections.items()
+        if backend_name != requested_name and reason is None
     )
+    if unexplained:
+        detail = (
+            f"also selected {', '.join(unexplained)} without an allowed fallback"
+            if requested_name in selections
+            else f"selected {', '.join(unexplained)} without an allowed fallback"
+        )
+        raise ComponentAttentionBackendNotAppliedError(
+            f"Attention backend '{requested_name}' was requested for {target}, "
+            f"but it {detail}"
+        )
 
 
 def _validate_component_attn_backend_selection(
     context: ComponentAttnBackendContext,
 ) -> None:
-    if not context.require_backend_selection:
+    component_name = context.component_name or "component"
+
+    # A role override is honored when the layers of that role selected it, or
+    # fell back for a recorded reason. Having no layers of that role at all
+    # means the override silently did nothing, which is the same failure the
+    # component-wide check below reports.
+    for role, backend in context.backend_by_role.items():
+        target = f"component '{make_component_role_key(component_name, role)}'"
+        selections = context.selected_backends_by_role.get(role)
+        requested_name = backend.name.lower()
+        if not selections:
+            raise ComponentAttentionBackendNotAppliedError(
+                f"Attention backend '{requested_name}' was requested for {target}, "
+                f"but the component constructed no {role.value}-attention layers"
+            )
+        _validate_selection_against_request(selections, requested_name, target)
+
+    if not context.require_backend_selection or context.backend is None:
         return
 
-    requested_backend = context.backend
-    assert requested_backend is not None
-    requested_name = requested_backend.name.lower()
-    component_name = context.component_name or "component"
-    if requested_name not in context.selected_backends:
-        detail = (
-            "did not construct any SGLang-selectable attention layers"
-            if not context.selected_backends
-            else f"selected {', '.join(sorted(context.selected_backends))} instead"
-        )
-        raise ComponentAttentionBackendNotAppliedError(
-            f"Attention backend '{requested_name}' was requested for component "
-            f"'{component_name}', but it {detail}"
-        )
+    # Roles carrying their own override are out of the component-wide backend's
+    # scope, so judge it only on what is left.
+    residual: dict[str, str | None] = {}
+    for role, selections in context.selected_backends_by_role.items():
+        if role is not None and role in context.backend_by_role:
+            continue
+        for backend_name, reason in selections.items():
+            _merge_selection(residual, backend_name, reason)
 
-    unexplained = sorted(
-        backend_name
-        for backend_name, reason in context.selected_backends.items()
-        if backend_name != requested_name and reason is None
-    )
-    if unexplained:
+    requested_name = context.backend.name.lower()
+    target = f"component '{component_name}'"
+    if not residual:
+        if context.selected_backends_by_role:
+            # Every layer this component built was diverted by a role override,
+            # so the component-wide backend had nothing left to apply to.
+            return
         raise ComponentAttentionBackendNotAppliedError(
-            f"Attention backend '{requested_name}' was requested for component "
-            f"'{component_name}', but it also selected "
-            f"{', '.join(unexplained)} without an allowed fallback"
+            f"Attention backend '{requested_name}' was requested for {target}, "
+            "but it did not construct any SGLang-selectable attention layers"
         )
+    if requested_name not in residual:
+        raise ComponentAttentionBackendNotAppliedError(
+            f"Attention backend '{requested_name}' was requested for {target}, "
+            f"but it selected {', '.join(sorted(residual))} instead"
+        )
+    _validate_selection_against_request(residual, requested_name, target)
 
 
 def get_attn_backend(
@@ -184,6 +273,7 @@ def get_attn_backend(
     it is admitted when the platform resolves it and the backend satisfies the
     layer's semantic requirements.
     """
+    attention_role = AttentionRole.CROSS if is_cross_attention else AttentionRole.SELF
     requirements = attention_requirements or AttentionRequirements()
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -199,6 +289,11 @@ def get_attn_backend(
     if selected_backend is None:
         selected_backend = get_global_forced_attn_backend()
         selection_is_explicit = selected_backend is not None
+    selected_from_role_override = False
+    if selected_backend is None:
+        selected_backend = get_component_forced_attn_backend_for_role(attention_role)
+        selection_is_explicit = selected_backend is not None
+        selected_from_role_override = selection_is_explicit
     if selected_backend is None:
         selected_backend = get_component_forced_attn_backend()
         selection_is_explicit = selected_backend is not None
@@ -322,9 +417,22 @@ def get_attn_backend(
 
     backend_name = attention_backend_cls.get_enum().name.lower()
     reason = fallback_reason
+    if selected_from_role_override and fallback_reason is not None:
+        # An explicit role request that could not be used is allowed to fall
+        # back, but silently doing so would look like the override took effect.
+        component_name = get_component_attn_backend_name() or "component"
+        logger.warning_once(
+            f"Attention backend '{selected_backend.name.lower()}' was requested "
+            f"for '{make_component_role_key(component_name, attention_role)}' but "
+            f"could not be used ({fallback_reason}); using {backend_name} instead"
+        )
+    if reason is None and selected_from_role_override:
+        # Diverging from the component-wide backend is the point of a role
+        # override, so record it as an explained selection.
+        reason = f"{attention_role.value}-attention override"
     if reason is None and backend_name == constraint_backend:
         reason = "component constraint"
-    if not _record_component_attn_backend(backend_name, reason):
+    if not _record_component_attn_backend(backend_name, reason, attention_role):
         reason_suffix = f" ({reason})" if reason else ""
         logger.info_once(f"Using {backend_name} attention backend{reason_suffix}")
     return attention_backend_cls
@@ -378,11 +486,12 @@ def _is_backend_supported(
 def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
+    backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     allow_global_backend_fallback: bool = False,
     require_backend_selection: bool | None = None,
     require_component_backend_selection: bool | None = None,
 ) -> Generator[None, None, None]:
-    if attn_backend is None and component_name is None:
+    if attn_backend is None and component_name is None and not backend_by_role:
         yield
         return
 
@@ -395,10 +504,26 @@ def component_attn_backend_context_manager(
     elif require_component_backend_selection is not None:
         raise ValueError("Specify only one component backend selection requirement")
 
+    if backend_by_role:
+        # Announce the configured overrides up front; the summary logged on exit
+        # reports which layers each one actually reached.
+        role_parts = ", ".join(
+            f"{role.value}={backend.name.lower()}"
+            for role, backend in sorted(
+                backend_by_role.items(), key=lambda item: item[0].value
+            )
+        )
+        logger.info(
+            f"Per-role attention backend overrides for "
+            f"{component_name or 'component'}: {role_parts}"
+        )
+
     token = component_attn_backend_context.set(
         ComponentAttnBackendContext(
             attn_backend,
             component_name,
+            {},
+            dict(backend_by_role or {}),
             {},
             allow_global_backend_fallback,
             require_backend_selection,
