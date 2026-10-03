@@ -136,6 +136,16 @@ def handle_multimodal(server_args: Any):
                     f"but got {type(cfg.mm_process_config[key])}"
                 )
 
+    if cfg.enable_mm_global_cache and get_platform().is_npu:
+        if cfg.mm_global_cache_backend != "npu_memcache":
+            logger.warning(
+                "--enable-mm-global-cache is enabled with "
+                "--mm-global-cache-backend=%s on NPU. The mooncake backend relies "
+                "on RDMA/mooncake master and is not supported on Ascend; use "
+                "--mm-global-cache-backend npu_memcache instead.",
+                cfg.mm_global_cache_backend,
+            )
+
 
 def handle_crash_dump_env(server_args: Any):
     cfg = resolving_view(server_args)
