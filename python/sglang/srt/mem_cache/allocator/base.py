@@ -139,13 +139,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         Return whether capacity was realized, or None if it still needs checking.
         """
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-        from sglang.srt.mem_cache.common import _evict_until_allocatable
+        from sglang.srt.mem_cache.common import (
+            _evict_until_allocatable,
+            _eviction_target_with_headroom,
+        )
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         shortfall = num_tokens - self.available_size()
         if shortfall > 0:
-            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            tree_cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=_eviction_target_with_headroom(
+                        shortfall, tree_cache.evictable_size()
+                    )
+                )
+            )
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(

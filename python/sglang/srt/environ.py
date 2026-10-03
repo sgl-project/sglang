@@ -670,6 +670,9 @@ class Envs:
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
+    # Extra L1 KV tokens to evict once allocation pressure starts. A bounded
+    # reserve amortizes repeated radix-tree scans while the device pool is full.
+    SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS = EnvInt(0)
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)

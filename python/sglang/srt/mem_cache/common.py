@@ -10,6 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -38,6 +39,24 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+
+
+def _eviction_target_with_headroom(
+    shortfall: int, evictable_tokens: int | None = None
+) -> int:
+    """Add bounded L1 eviction headroom to a mandatory allocation shortfall."""
+    shortfall = max(0, shortfall)
+    headroom = max(0, envs.SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS.get())
+    if shortfall == 0 or headroom == 0:
+        return shortfall
+
+    extra_tokens = headroom
+    if evictable_tokens is not None:
+        # The reserve must not turn an otherwise satisfiable allocation into a
+        # failure. The mandatory shortfall remains unchanged when reclaimable
+        # cache is insufficient for the optional reserve.
+        extra_tokens = min(extra_tokens, max(0, int(evictable_tokens) - shortfall))
+    return shortfall + extra_tokens
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
