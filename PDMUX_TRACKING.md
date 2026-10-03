@@ -8,7 +8,7 @@ DeepSeek-V4.1-Flash. This document does not change runtime behavior.
 
 | Order | PR | Branch | Scope | Status |
 | --- | --- | --- | --- | --- |
-| 1 | [#42411](https://github.com/sgl-project/sglang/pull/42411) | `feat/glm53-pdmux` | GLM model forward, split-prefill scheduling, bounded layer submission, and capped-prefill/full-device-decode overlap. | Draft |
+| 1 | [#42411](https://github.com/sgl-project/sglang/pull/42411) | `feat/glm53-pdmux` | GLM model forward, split-prefill scheduling, bounded layer submission, and capped-prefill/full-device-decode overlap. | Ready for review |
 | 2 | [#42412](https://github.com/sgl-project/sglang/pull/42412) | `fix/glm53-mamba-hicache` | Mamba admission/checkpoint reservations, HiCache load-back rollback and aligned host registration. | Draft |
 | 3 | [#42413](https://github.com/sgl-project/sglang/pull/42413) | `feat/glm53-pdmux-dp` | Rank-consistent DP/EP communication, raw versus padded token metadata and idle-rank handling. | Draft |
 | 4 | [#42414](https://github.com/sgl-project/sglang/pull/42414) | `feat/glm53-pdmux-mtp` | Checkpoint single-layer MTP through EAGLE/NEXTN, final-slice draft handoff and decode-lane verification. | Draft |
@@ -76,7 +76,7 @@ are retained; this GLM reorganization does not split or rewrite that work.
 
 ## Merge progress
 
-- [x] Open and link the four GLM draft PRs.
+- [x] Open and link the four GLM PRs.
 - [ ] Merge #42411 and narrow the remaining diffs.
 - [ ] Merge #42412 and narrow the remaining diffs.
 - [ ] Merge #42413 and narrow the MTP diff.
