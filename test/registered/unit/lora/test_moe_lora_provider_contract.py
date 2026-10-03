@@ -93,6 +93,117 @@ class TestProviderGeometry(CustomTestCase):
         self.assertIs(actual_mapping, pair_to_row)
         self.assertEqual(rows.data_ptr(), activation_rows.data_ptr())
 
+    def test_cutedsl_schedule_uses_the_resident_slice_count(self):
+        """Resident weight width, not activation, determines one- versus two-slice GEMM1."""
+
+        class StubWorkspace(msgspec.Struct, kw_only=True):
+            hidden_permuted: torch.Tensor
+            masked_m: torch.Tensor
+            expected_m: int
+            pair_to_row: torch.Tensor
+            m_max: int
+            input_buffer_reuse: bool
+
+        class StubProvider:
+            @property
+            def gate_up_slices(self):
+                return self._gate_up_slices
+
+            def prepare(self, *_args):
+                return self._base_workspace
+
+        base_module = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.base")
+        base_module.MoeBaseProviderContract = lambda **kwargs: SimpleNamespace(**kwargs)
+        base_module.expected_rows_per_expert = lambda num_pairs, num_experts: 1
+        row_module = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.masked_row_domain"
+        )
+        row_module.MaskedRowDomainProvider = StubProvider
+        row_module.MaskedRowState = StubWorkspace
+        row_module.masked_m_max = lambda num_tokens, alignment=8: max(
+            alignment, (num_tokens + alignment - 1) // alignment * alignment
+        )
+        row_module.prepare_buffer = None
+        quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
+        quant_module.MoeLoraBf16QuantInfo = object
+        quant_module.StandardLayoutQuantInfo = object
+        contiguous_module = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain"
+        )
+        contiguous_module.ContiguousRowDomainProvider = object
+        contiguous_module.ContiguousRowState = _ContiguousRowStateStub
+        small_module = types.ModuleType(
+            "sglang.srt.lora.moe.kernels.dispatch_masked_small"
+        )
+        small_module.small_masked_prepare = None
+        small_module.small_masked_prepare_applies = lambda *args, **kwargs: False
+
+        # cutedsl_bf16 builds on the shared tile mixin. Load the real module:
+        # it imports only msgspec and torch.
+        common_spec = importlib.util.spec_from_file_location(
+            "sglang.srt.lora.moe.base_gemm_provider.cutedsl_common",
+            PROVIDER / "cutedsl_common.py",
+        )
+        common = importlib.util.module_from_spec(common_spec)
+        common_spec.loader.exec_module(common)
+        packages = {}
+        for name in (
+            "sglang",
+            "sglang.srt",
+            "sglang.srt.lora",
+            "sglang.srt.lora.moe",
+            "sglang.srt.lora.moe.base_gemm_provider",
+            "sglang.srt.lora.moe.kernels",
+        ):
+            package = types.ModuleType(name)
+            package.__path__ = []
+            packages[name] = package
+        spec = importlib.util.spec_from_file_location(
+            "_cpu_cutedsl_bf16", PROVIDER / "cutedsl_bf16.py"
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                **packages,
+                base_module.__name__: base_module,
+                row_module.__name__: row_module,
+                quant_module.__name__: quant_module,
+                contiguous_module.__name__: contiguous_module,
+                small_module.__name__: small_module,
+                common.__name__: common,
+            },
+        ):
+            spec.loader.exec_module(module)
+
+        base = StubWorkspace(
+            hidden_permuted=torch.empty((2, 4, 8)),
+            masked_m=torch.tensor([2, 2], dtype=torch.int32),
+            expected_m=2,
+            pair_to_row=torch.arange(4, dtype=torch.int32),
+            m_max=4,
+            input_buffer_reuse=False,
+        )
+        provider = object.__new__(module.CuteDslBf16MaskedProvider)
+        provider._base_workspace = base
+        provider.quant_info = SimpleNamespace(intermediate_size=16, hidden_size=8)
+        provider._gate_up_slices = 1
+        provider._max_token_clusters = 1024
+        provider._compiled = {8: object()}
+        provider._config_table = None
+        observed = {}
+
+        def build(masked_m, **kwargs):
+            observed.update(kwargs)
+            return (masked_m, masked_m, masked_m, masked_m)
+
+        provider._build_schedules = build
+        provider.prepare(torch.empty((4, 8)), torch.zeros((4, 1)), 1)
+        self.assertEqual(observed["n_gemm1"], 16)
+        self.assertEqual(observed["n_gemm2"], 8)
+
 
 class TestSharedOuterFinalize(CustomTestCase):
     """Execute the host dispatch with real CPU buffers and mocked GPU launches."""

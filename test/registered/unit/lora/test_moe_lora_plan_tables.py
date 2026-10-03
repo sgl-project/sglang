@@ -347,7 +347,10 @@ class TestLoraMoeRunnerBackend:
         # LoRA vendors must not enter the plain vendor dispatch paths.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
-        for backend in (MoeRunnerBackend.LORA_TRITON,):
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
             assert backend.is_lora()
         assert not MoeRunnerBackend.LORA_TRITON.is_triton()
         assert not MoeRunnerBackend.DEEP_GEMM.is_lora()
@@ -357,7 +360,10 @@ class TestLoraMoeRunnerBackend:
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.server_args import MOE_RUNNER_BACKEND_CHOICES
 
-        for backend in (MoeRunnerBackend.LORA_TRITON,):
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
             assert backend.value in MOE_RUNNER_BACKEND_CHOICES
 
 

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 class _FakeMoeLayer:
     def __init__(self, device: torch.device) -> None:
-        self._lora_runner_backend = MoeRunnerBackend.LORA_TRITON
+        self._lora_runner_backend = MoeRunnerBackend.LORA_CUTEDSL
         self.base_layer = SimpleNamespace(
             w13_weight=torch.empty(1, device=device, dtype=torch.bfloat16),
         )
