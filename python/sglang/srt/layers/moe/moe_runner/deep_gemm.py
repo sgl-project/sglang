@@ -173,7 +173,6 @@ def _cake_activation_scale_ok(src: torch.Tensor, m: int, k_groups: int) -> bool:
     return src.dtype == torch.int32 and 4 * int(src.shape[1]) >= k_groups
 
 
-
 def _cake_debug_sync(stage: str) -> None:
     """``SGLANG_CAKE_DEBUG``: synchronize after ``stage`` (outside graph capture) and log the outcome."""
     if torch.cuda.is_current_stream_capturing():
