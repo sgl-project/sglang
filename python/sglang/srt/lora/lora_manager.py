@@ -1089,10 +1089,22 @@ class LoRAManager:
                 if isinstance(module, InklingBatchDenseMLP):
                     from sglang.srt.models.inkling_common.lora import (
                         InklingBatchDenseMLPWithLoRA,
+                        InklingBatchDenseMLPWithLoRAV2,
                     )
 
-                    module.__class__ = InklingBatchDenseMLPWithLoRA
+                    # The dense engine's sink runs on the pool buffers directly;
+                    # other backends take the experimental path.
+                    module.__class__ = (
+                        InklingBatchDenseMLPWithLoRAV2
+                        if self.lora_backend.name == "triton_v2"
+                        else InklingBatchDenseMLPWithLoRA
+                    )
                     module.initialize_lora(self.lora_backend)
+                    logger.info_once(
+                        "Inkling shared-sink LoRA: %s on the %s backend",
+                        type(module).__name__,
+                        self.lora_backend.name,
+                    )
                     lora_module = module
                 else:
                     lora_module = self.set_lora_module(module_name, module)
