@@ -65,10 +65,36 @@ if _is_hip and _is_gfx95_supported:
             err,
         )
 
+# Fused inverse-RoPE + per-token-group mxfp8 quant in a single aiter kernel.
+# Optional enhancement over the two-kernel path (fused_rope_inplace + the Triton
+# quantizer above): it removes one launch and one HBM round-trip of the [T,H,Dh]
+# attention output. Resolved once at import; None leaves the two-kernel path in
+# place, so this is purely additive.
+_inverse_rope_group_quant = None
+if _batched_gemm_a8w8_mxscale is not None:
+    try:
+        from aiter.ops.inverse_rope_group_quant import (
+            inverse_rope_group_quant as _inverse_rope_group_quant,
+        )
+    except Exception as err:  # pragma: no cover - env-dependent
+        logger.warning(
+            "aiter inverse_rope_group_quant import failed; the DSV4 wo_a fp8 "
+            "fused inverse-RoPE path is unavailable, using the two-kernel "
+            "path: %s",
+            err,
+        )
+
 
 def is_wo_a_fp8_mxscale_supported() -> bool:
     """True when the ROCm fp8 ``wo_a`` path can run on this build/arch."""
     return _batched_gemm_a8w8_mxscale is not None
+
+
+def is_wo_a_fp8_fused_invrope_supported() -> bool:
+    """True when the fused inverse-RoPE + quant ``wo_a`` path can run."""
+    return (
+        _batched_gemm_a8w8_mxscale is not None and _inverse_rope_group_quant is not None
+    )
 
 
 @triton.jit
@@ -155,6 +181,50 @@ def apply_wo_a_fp8_mxscale(
     time by ``wo_a_weight_scale_to_e8m0``. Returns bf16 [T, G, R].
     """
     o_fp8, o_scale = quant_wo_a_act_mxfp8(o)
+    return _batched_gemm_a8w8_mxscale(
+        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
+    )
+
+
+def apply_wo_a_fp8_mxscale_fused_invrope(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """fp8 ``wo_a`` with a fused inverse-RoPE + group-quant front end.
+
+    Identical result to ``apply_wo_a_fp8_mxscale`` preceded by the standalone
+    inverse RoPE, but ``inverse_rope_group_quant`` does the inverse rotation and
+    the [T,G,D] mxfp8 quant in one kernel, so the caller must NOT run the
+    separate ``fused_rope_inplace`` first.
+
+    Args:
+        o: ``[T, H, head_dim]`` bf16 attention output, still RoPE'd (the kernel
+            applies the inverse rotation to the trailing rope dims internally).
+        positions: ``[T]`` absolute positions into the cos/sin tables.
+        cos_cache/sin_cache: ``[max_pos, rope_dim // 2]`` bf16 tables.
+        num_groups: local o-groups ``G``.
+        weight: ``[G, R, D]`` fp8 ``wo_a`` weight.
+        weight_scale: ``[G, R/128, D/128]`` uint8 e8m0 (from load-time convert).
+
+    Returns bf16 ``[T, G, R]``.
+    """
+    # Default scale layout is the unshuffled row layout on both the current
+    # (``scale_shuffle=False``) and older (``scale_layout="row"``) aiter
+    # signatures, which is exactly what ``batched_gemm_a8w8_mxscale`` consumes,
+    # so we omit the layout kwarg to stay compatible across aiter versions.
+    o_fp8, o_scale = _inverse_rope_group_quant(
+        o,
+        positions,
+        cos_cache,
+        sin_cache,
+        num_groups=num_groups,
+        quant_group_size=WO_A_MXFP8_GROUP_SIZE,
+    )
     return _batched_gemm_a8w8_mxscale(
         o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
     )

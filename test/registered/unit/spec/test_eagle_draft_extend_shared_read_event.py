@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as runner_module
@@ -37,6 +38,9 @@ class _RecordingDevice:
 class _RecordingAttentionBackend:
     def __init__(self, trace):
         self.trace = trace
+
+    def shared_read_ends(self, forward_mode):
+        return SharedReadEnds.IN_REPLAY
 
     def init_forward_metadata_out_graph(self, forward_batch):
         self.trace.append("metadata")
@@ -74,6 +78,7 @@ class TestEagleDraftExtendSharedReadEvent(CustomTestCase):
         runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         runner.draft_extend_attn_backend = _RecordingAttentionBackend(trace)
         runner.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(model_is_mrope=False),
             device_timer=None,
             shared_read_done_event=None,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
