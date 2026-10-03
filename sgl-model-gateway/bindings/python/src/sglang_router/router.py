@@ -208,9 +208,9 @@ class Router:
             Default: 'sglang.ai/bootstrap-port'
         request_timeout_secs: Request timeout in seconds. Default: 600
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
-        queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
+        queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue; 503 for concurrency-only admission, otherwise 429). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60
-        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests. Default: None
+        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second; 0 holds slots until requests finish). If not set, defaults to max_concurrent_requests. Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
