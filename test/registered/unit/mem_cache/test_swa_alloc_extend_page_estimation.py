@@ -7,10 +7,11 @@ last partial page. Fix replaces with get_num_new_pages-based gating.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -150,6 +151,67 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
                 stub, prefix_lens_cpu=prefix, seq_lens_cpu=seq, extend_num_tokens=4
             )
             self.assertIsNotNone(result, f"page_size={page_size}")
+
+
+class TestSWAAllocDecodeCapacity(CustomTestCase):
+    """A rejected decode must not strand pages in the other attention pool."""
+
+    def test_oom_preserves_both_pools(self):
+        for exhausted_pool in ("full", "swa"):
+            with self.subTest(exhausted_pool=exhausted_pool):
+                allocator = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+                allocator.page_size = 8
+                allocator.full_attn_allocator = PagedTokenToKVPoolAllocator(
+                    size=24,
+                    page_size=8,
+                    dtype=torch.float16,
+                    device="cpu",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                allocator.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+                    size=24,
+                    page_size=8,
+                    dtype=torch.float16,
+                    device="cpu",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                full_prefix = allocator.full_attn_allocator.alloc(8)
+                swa_prefix = allocator.swa_attn_allocator.alloc(8)
+                allocator.full_to_swa_index_mapping = torch.zeros(33, dtype=torch.int64)
+                allocator.full_to_swa_index_mapping[-1] = -1
+                allocator._kvcache = SimpleNamespace(
+                    full_to_swa_index_mapping=allocator.full_to_swa_index_mapping,
+                    translate_loc_from_full_to_swa=lambda indices: (
+                        allocator.full_to_swa_index_mapping[indices]
+                    ),
+                )
+                allocator.set_full_to_swa_mapping(full_prefix, swa_prefix)
+                exhausted = getattr(allocator, f"{exhausted_pool}_attn_allocator")
+                exhausted.alloc(16)
+                pools = (
+                    allocator.full_attn_allocator,
+                    allocator.swa_attn_allocator,
+                )
+                free_pages_before = [pool.free_pages.clone() for pool in pools]
+                mapping_before = allocator.full_to_swa_index_mapping.clone()
+                seq_lens = torch.tensor([9], dtype=torch.int64)
+
+                # Only the GPU kernel is suppressed. The real paged allocators
+                # still perform admission and update their free-page lists.
+                with patch("sglang.srt.mem_cache.allocator.paged.alloc_decode_kernel"):
+                    for _ in range(3):
+                        self.assertIsNone(
+                            allocator.alloc_decode(seq_lens, seq_lens, full_prefix[-1:])
+                        )
+                        for pool, before in zip(pools, free_pages_before):
+                            self.assertTrue(torch.equal(pool.free_pages, before))
+                        self.assertTrue(
+                            torch.equal(
+                                allocator.full_to_swa_index_mapping, mapping_before
+                            )
+                        )
 
 
 if __name__ == "__main__":
