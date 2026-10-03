@@ -28,6 +28,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         # happening, spy on clear() here and test its contents where clear()
         # is tested, or build a real manager instance.
         sender.kv_mgr = SimpleNamespace(
+            deferred_bootstrap=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},
