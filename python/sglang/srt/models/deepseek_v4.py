@@ -792,7 +792,6 @@ class MqaAttentionBase(nn.Module):
     ) -> None:
         super().__init__()
         self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.attn_tp_rank: int = get_parallel().attn_tp_rank
         self.attn_tp_size: int = get_parallel().attn_tp_size
 
@@ -1972,10 +1971,6 @@ class MQALayer(MqaAttentionBase):
                 # which has no second return slot here. Prefill's write lands
                 # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
-            elif unified and fuse_verify:
-                # The bf16 verify path transforms kv in place and lets the
-                # backend perform the causally indexed ring write.
-                pass
             elif not unified and use_cp:
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
@@ -1987,7 +1982,7 @@ class MQALayer(MqaAttentionBase):
                     swa_k=kv,
                     forward_batch=forward_batch,
                 )
-            else:
+            elif not (unified and fuse_verify):
                 kv = None
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
@@ -2039,17 +2034,14 @@ class MQALayer(MqaAttentionBase):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                if use_cp and _is_hip:
-                    # The unified 2-source path consumes the complete logical
-                    # chunk while each CP rank computes only its local queries.
+                if use_cp:
+                    # 2-source attention reads the whole logical chunk.
                     kv = cp_materialize_global_token_order(
                         kv.contiguous(),
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
             elif use_cp and not self.is_dsv41:
-                # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),

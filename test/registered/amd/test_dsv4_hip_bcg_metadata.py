@@ -27,6 +27,7 @@ MAX_CONTEXT = 512
 # Block slots (out_cache_loc) live past every req_to_token slot.
 OUT_LOC_BASE = NUM_REQ_SLOTS * MAX_CONTEXT + 1
 NUM_FULL_SLOTS = OUT_LOC_BASE + 4096
+_HIP_RADIX = "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix"
 
 
 def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
@@ -244,18 +245,25 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             backend._attach_unified_kv_prefill_meta.call_args.kwargs["exact_num_tokens"]
         )
 
-    def test_cp_draft_prefill_attaches_before_reindex_without_flashmla(self):
+    def test_cp_prefill_attaches_before_reindex(self):
+        for need_compress in (False, True):
+            with self.subTest(need_compress=need_compress):
+                self._check_cp_prefill_order(need_compress)
+
+    def _check_cp_prefill_order(self, need_compress):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
-        backend.token_to_kv_pool = object()
         backend.has_c4 = False
         backend.has_c128 = False
+        backend._init_low_ratio_indexer_metadata = mock.Mock(return_value={})
         core = self._make_core_metadata(0)
         events = []
         core.apply_cp_reindex = mock.Mock(
             side_effect=lambda **_: events.append("reindex")
         )
-        core.init_flashmla_related = mock.Mock()
+        core.init_flashmla_related = mock.Mock(
+            side_effect=lambda: events.append("flashmla")
+        )
         backend.make_core_attn_metadata = mock.Mock(return_value=core)
         backend._attach_unified_kv_prefill_meta = mock.Mock(
             side_effect=lambda *_args, **_kwargs: events.append("attach")
@@ -275,11 +283,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                     ),
                 ),
             ) as expand_prefill,
-            mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
-                "is_cp_active",
-                return_value=True,
-            ),
+            mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
         ):
             backend.init_forward_metadata_prefill(
                 max_seq_len=4096,
@@ -290,7 +294,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 num_tokens=3,
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 extend_seq_lens_cpu=[1, 2],
-                need_compress=False,
+                need_compress=need_compress,
                 forward_batch=forward_batch,
             )
 
@@ -298,9 +302,11 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(
             backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
         )
-        self.assertEqual(events, ["attach", "reindex"])
         core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
-        core.init_flashmla_related.assert_not_called()
+        # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
+        self.assertEqual(
+            events, ["attach", "reindex"] + (["flashmla"] if need_compress else [])
+        )
 
     def test_cp_reindex_skips_absent_compression_fields(self):
         core = self._make_core_metadata(0)
@@ -313,21 +319,25 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         core.swa_out_cache_loc = torch.arange(3, dtype=torch.int64)
         for field_name in ("c4_out_loc", "c128_out_loc", "c1_out_loc", "c2_out_loc"):
             setattr(core, field_name, None)
-        core.unified = None
-        for field_name in core._CP_OPTIONAL_REINDEX_FIELDS:
+        for field_name in core._CP_REINDEX_OPTIONAL_FIELDS:
             setattr(core, field_name, None)
 
+        # HIP reuses the CUDA reindex, which reads get_parallel there.
         with mock.patch(
-            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.get_parallel",
+            "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
             return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
         ):
             core.apply_cp_reindex(num_tokens=3)
 
+        self.assertIn("c128_topk_lengths_raw", core._CP_REINDEX_OPTIONAL_FIELDS)
         self.assertEqual(core.positions_casual.tolist(), [1, 0])
-        for field_name in core._CP_REQUIRED_REINDEX_FIELDS:
+        for field_name in core._CP_REINDEX_FIELDS:
             self.assertEqual(getattr(core, field_name).shape[0], 2)
-        for field_name in core._CP_OPTIONAL_REINDEX_FIELDS:
+        for field_name in core._CP_REINDEX_OPTIONAL_FIELDS:
             self.assertIsNone(getattr(core, field_name))
+        # Cache-write locations stay global.
+        self.assertEqual(core.raw_out_loc.tolist(), [0, 1, 2])
+        self.assertEqual(core.swa_out_cache_loc.tolist(), [0, 1, 2])
 
     def test_cp_unified_uses_inert_query_padding_and_logical_ring_rows(self):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
@@ -363,14 +373,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         output = torch.zeros(2, 1, 4)
 
         with (
+            mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
             mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
-                "is_cp_active",
-                return_value=True,
-            ),
-            mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
-                "get_parallel",
+                f"{_HIP_RADIX}.get_parallel",
                 return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
             ),
             mock.patch.object(

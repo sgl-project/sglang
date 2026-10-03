@@ -134,17 +134,28 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
-        if cfg.enable_decoder_swa_bounded_replay:
-            raise ValueError(
-                "DeepSeekV4 prefill CP on HIP cannot be combined with "
-                "--enable-decoder-swa-bounded-replay yet; the late-layer tail "
-                "metadata is built for the unsplit layout."
-            )
-        if model_config_of(server_args).hf_config.model_type == "deepseek_v41":
-            raise ValueError(
-                "DeepSeek-V4.1 prefill CP on HIP is not supported yet; the HIP "
-                "ratio-1/2 indexer is not CP-aware."
-            )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+        )
+
+        unsupported = (
+            ("multiple nodes", cfg.nnodes > 1),
+            (
+                "DeepSeek-V4.1",
+                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
+            ),
+            (
+                "--enable-decoder-swa-bounded-replay",
+                cfg.enable_decoder_swa_bounded_replay,
+            ),
+            ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
+            ("the fp8 unified_kv pool", is_unified_kv_fp8()),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
+                )
 
     # DeepSeek-V4 CP runs data-parallel groups as attention DP.
     assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
@@ -173,7 +184,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.nnodes == 1, "DeepSeekV4 context parallel only supports one node."
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )

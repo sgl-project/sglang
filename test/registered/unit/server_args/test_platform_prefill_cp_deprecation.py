@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
 from sglang.srt.arg_groups.parallel_hook import (
@@ -15,6 +16,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+
+
+def _cp_args(arch="DeepseekV4ForCausalLM", model_type="deepseek_v4", **overrides):
+    args = ServerArgs(
+        **{
+            "model_path": "local-deepseek-v4",
+            "enable_prefill_cp": True,
+            "cp_strategy": "interleave",
+            "tp_size": 2,
+            "attention_backend": "dsv4",
+            **overrides,
+        }
+    )
+    args._model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[arch], model_type=model_type),
+        hf_text_config=SimpleNamespace(model_type=model_type),
+        is_multimodal=False,
+    )
+    return args
 
 
 class TestPlatformPrefillCPPolicy(CustomTestCase):
@@ -65,107 +87,36 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                             args.resolve_once()
 
     @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_gate_allows_migrated_path(self):
-        args = ServerArgs(
-            model_path="missing-model-is-not-loaded-by-this-gate",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-        )
-        validate_prefill_cp_platform(args)
-
-    @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_context_parallel_rejects_other_models(self):
-        args = ServerArgs(
-            model_path="local-unsupported-model",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-        )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
-            hf_text_config=SimpleNamespace(model_type="deepseek_v3"),
-            is_multimodal=False,
-        )
-
+    def test_hip_context_parallel_is_deepseek_v4_only(self):
+        handle_context_parallelism(_cp_args(attn_cp_size=2))
+        args = _cp_args("DeepseekV3ForCausalLM", "deepseek_v3")
         with self.assertRaisesRegex(ValueError, "only supported.*DeepseekV4"):
             handle_context_parallelism(args)
 
     @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_context_parallel_allows_deepseek_v4(self):
-        args = ServerArgs(
-            model_path="local-deepseek-v4",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            tp_size=2,
-            attn_cp_size=2,
+    def test_hip_deepseek_v4_cp_rejections(self):
+        cases = (
+            ("dsv4.*both phases", dict(prefill_attention_backend="flashinfer")),
+            ("support multiple nodes", dict(nnodes=2)),
+            ("support DeepSeek-V4.1", dict(model_type="deepseek_v41")),
+            ("bounded-replay", dict(enable_decoder_swa_bounded_replay=True)),
+            ("two-batch-overlap", dict(enable_two_batch_overlap=True)),
+            ("fp8 unified_kv", dict(fp8=True)),
         )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
-            hf_text_config=SimpleNamespace(model_type="deepseek_v4"),
-            is_multimodal=False,
-        )
+        for regex, overrides in cases:
+            overrides = dict(overrides)
+            fp8 = overrides.pop("fp8", False)
+            args = _cp_args(**overrides)
+            with (
+                self.subTest(regex=regex),
+                mock.patch(f"{_ENV_GATE}.is_unified_kv_fp8", return_value=fp8),
+                self.assertRaisesRegex(ValueError, regex),
+            ):
+                validate_deepseek_v4_cp(args)
 
-        handle_context_parallelism(args)
-
-    @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_deepseek_v4_requires_dsv4_for_both_phases(self):
-        args = ServerArgs(
-            model_path="local-deepseek-v4",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            tp_size=2,
-            attention_backend="dsv4",
-            prefill_attention_backend="flashinfer",
-        )
-
-        with self.assertRaisesRegex(ValueError, "dsv4.*both phases"):
-            validate_deepseek_v4_cp(args)
-
-    @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_deepseek_v4_rejects_multinode_cp(self):
-        args = ServerArgs(
-            model_path="local-deepseek-v4",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            tp_size=2,
-            nnodes=2,
-            attention_backend="dsv4",
-        )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="deepseek_v4")
-        )
-
-        with self.assertRaisesRegex(AssertionError, "only supports one node"):
-            validate_deepseek_v4_cp(args)
-
-    @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_deepseek_v4_cp_rejects_decoder_swa_bounded_replay(self):
-        args = ServerArgs(
-            model_path="local-deepseek-v4",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            tp_size=2,
-            attention_backend="dsv4",
-            enable_decoder_swa_bounded_replay=True,
-        )
-
-        with self.assertRaisesRegex(ValueError, "decoder-swa-bounded-replay"):
-            validate_deepseek_v4_cp(args)
-
-    @override_platform(is_hip=True, is_npu=False, is_musa=False)
-    def test_hip_deepseek_v41_cp_is_rejected(self):
-        args = ServerArgs(
-            model_path="local-deepseek-v41",
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            tp_size=2,
-            attention_backend="dsv4",
-        )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="deepseek_v41")
-        )
-
-        with self.assertRaisesRegex(ValueError, "V4.1 prefill CP on HIP"):
-            validate_deepseek_v4_cp(args)
+    @override_platform(is_hip=False, is_npu=False, is_musa=False)
+    def test_cuda_deepseek_v4_cp_allows_multiple_nodes(self):
+        validate_deepseek_v4_cp(_cp_args(nnodes=2))
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
@@ -177,16 +128,19 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                         args = ServerArgs(model_path="dummy", dcp_size=dcp_size)
                         validate_prefill_cp_platform(args)
 
-    @override_platform(is_hip=False, is_npu=False, is_musa=False)
     def test_generic_cp_is_not_rejected_or_modified(self):
-        for strategy in ("zigzag", "interleave"):
-            with self.subTest(strategy=strategy):
-                args = ServerArgs(
-                    model_path="dummy", enable_prefill_cp=True, cp_strategy=strategy
-                )
-                validate_prefill_cp_platform(args)
-                self.assertTrue(args.enable_prefill_cp)
-                self.assertEqual(args.cp_strategy, strategy)
+        for is_hip in (False, True):
+            for strategy in ("zigzag", "interleave"):
+                with (
+                    self.subTest(is_hip=is_hip, strategy=strategy),
+                    override_platform(is_hip=is_hip, is_npu=False, is_musa=False),
+                ):
+                    args = ServerArgs(
+                        model_path="dummy", enable_prefill_cp=True, cp_strategy=strategy
+                    )
+                    validate_prefill_cp_platform(args)
+                    self.assertTrue(args.enable_prefill_cp)
+                    self.assertEqual(args.cp_strategy, strategy)
 
 
 if __name__ == "__main__":

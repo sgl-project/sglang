@@ -60,6 +60,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
@@ -592,81 +593,14 @@ class DSV4AttnMetadata:
         ).items():
             setattr(self, name, value)
 
-    _CP_REQUIRED_REINDEX_FIELDS = [
-        "seq_lens_casual",
-        "positions_casual",
-        "swa_page_indices",
-        "swa_topk_lengths",
-        "page_table",
-    ]
-    _CP_OPTIONAL_REINDEX_FIELDS = [
-        "c4_topk_lengths_raw",
-        "c4_topk_lengths_clamp1",
-        "c128_page_indices",
-        "c128_topk_lengths_clamp1",
-        "c128_topk_lengths_raw",
-        "c1_topk_lengths_clamp1",
-        "c2_topk_lengths_clamp1",
-    ]
-    _CP_REINDEX_FIELDS = _CP_REQUIRED_REINDEX_FIELDS + _CP_OPTIONAL_REINDEX_FIELDS
-    _CP_GLOBAL_FIELDS = [
-        "raw_out_loc",
-        "swa_out_cache_loc",
-        "c4_out_loc",
-        "c128_out_loc",
-        "c1_out_loc",
-        "c2_out_loc",
-    ]
-
-    def apply_cp_reindex(self, num_tokens: Optional[int] = None) -> None:
-        cp_rank = get_parallel().attn_cp_rank
-        cp_size = get_parallel().attn_cp_size
-        idx = slice(cp_rank, None, cp_size)
-        pre_global_len = self.seq_lens_casual.shape[0]
-        assert pre_global_len % cp_size == 0, (
-            f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "
-            "CP round-robin requires padding to ensure divisibility."
-        )
-        expected_local_len = pre_global_len // cp_size
-        if num_tokens is None:
-            num_tokens = pre_global_len
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name, None)
-            if val is None:
-                assert field_name in self._CP_OPTIONAL_REINDEX_FIELDS, (
-                    f"CP reindex: required field {field_name} is None"
-                )
-                continue
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
-            setattr(self, field_name, val[idx].contiguous())
-
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name, None)
-            if val is None:
-                continue
-            assert val.shape[0] == expected_local_len, (
-                f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
-                f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
-            )
-        for field_name in self._CP_GLOBAL_FIELDS:
-            val = getattr(self, field_name, None)
-            if val is None:
-                continue
-            assert val.shape[0] == num_tokens, (
-                f"apply_cp_reindex post-condition: global field {field_name}.shape[0]={val.shape[0]} "
-                f"!= num_tokens={num_tokens} (must remain global for compressor write path)"
-            )
-        if self.unified is not None:
-            for field_name in ("c4_out_loc", "c128_out_loc"):
-                val = getattr(self.unified, field_name, None)
-                if val is None:
-                    continue
-                assert val.shape[0] == num_tokens, (
-                    f"apply_cp_reindex post-condition: unified.{field_name}.shape[0]="
-                    f"{val.shape[0]} != num_tokens={num_tokens} (must remain global)"
-                )
+    # Same CP contract as the CUDA metadata; HIP also keeps the raw c128 lengths.
+    _CP_REINDEX_FIELDS = _cuda_backend.DSV4AttnMetadata._CP_REINDEX_FIELDS
+    _CP_REINDEX_OPTIONAL_FIELDS = (
+        _cuda_backend.DSV4AttnMetadata._CP_REINDEX_OPTIONAL_FIELDS
+        + ["c128_topk_lengths_raw"]
+    )
+    _CP_GLOBAL_FIELDS = _cuda_backend.DSV4AttnMetadata._CP_GLOBAL_FIELDS
+    apply_cp_reindex = _cuda_backend.DSV4AttnMetadata.apply_cp_reindex
 
     def init_flashmla_related(self, is_prefill: bool = False):
         assert self.index_topk in (512, 1024), (
@@ -1215,7 +1149,7 @@ class DeepseekV4HipRadixBackend(
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
             if need_compress:
-                core_attn_metadata.init_flashmla_related(is_prefill=True)
+                core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
             # Verify runs the unified_kv DECODE kernel; req_pool_indices_repeated
             # is the per-token (num_draft*bs -> bs) req-slot map.
@@ -2754,34 +2688,22 @@ class DeepseekV4HipRadixBackend(
         final_pos = core_attn_metadata.unified.pf_final_pos
 
         # Slice CP query metadata while keeping cache-write metadata global.
-        _cp_size = get_parallel().attn_cp_size
-        _cp_active = _cp_size > 1 and is_cp_active(forward_batch)
+        _cp_active = is_cp_active(forward_batch)
         state_slot_full = state_slot
         final_pos_full = final_pos
         positions_full = positions
         if _cp_active:
+            _cp_size = get_parallel().attn_cp_size
+            # pf_* were built on the padded global layout before the reindex.
+            assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
             _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
-            _padded_rows = _cp_size * T
-
-            def _cp_round_robin(v: torch.Tensor) -> torch.Tensor:
-                # CP may have fewer logical rows than its padded layout.
-                if v.shape[0] < _padded_rows:
-                    v = torch.cat(
-                        [v, v[-1:].expand(_padded_rows - v.shape[0], *v.shape[1:])]
-                    )
-                return v[_sl].contiguous()
-
-            state_slot = _cp_round_robin(state_slot)
-            chunk_start = _cp_round_robin(chunk_start)
-            cu_q = _cp_round_robin(cu_q)
-            final_pos = _cp_round_robin(final_pos)
-            # This field has already been CP-reindexed and gives physical
-            # padding rows the inert position produced by metadata expansion.
+            state_slot, chunk_start, cu_q, final_pos = (
+                v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q, final_pos)
+            )
+            # Already CP-reindexed; padding rows carry the inert expansion position.
             positions = core_attn_metadata.positions_casual.to(torch.int64)
             assert positions.shape[0] == T
-            positions_full = forward_batch.positions.to(torch.int64)[
-                : state_slot_full.shape[0]
-            ].contiguous()
+            positions_full = forward_batch.positions.to(torch.int64)
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -2838,28 +2760,18 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            _ring_state_slot = state_slot_full if _cp_active else state_slot
-            _ring_final_pos = final_pos_full if _cp_active else final_pos
-            _ring_positions = positions_full if _cp_active else positions
-            # CP gathers only logical rows; the metadata may additionally carry
-            # physical padding used to make every rank's query shard equal.
-            n_real = kv.shape[0] if _cp_active else _ring_state_slot.shape[0]
-            assert (
-                min(
-                    _ring_state_slot.shape[0],
-                    _ring_final_pos.shape[0],
-                    _ring_positions.shape[0],
-                )
-                >= n_real
-            )
+            # CP gathers only the logical rows; drop the physical padding rows.
+            n_real = kv.shape[0] if _cp_active else state_slot_full.shape[0]
+            # the store launches one program per kv row and never checks these lengths
+            assert min(state_slot_full.shape[0], positions_full.shape[0]) >= n_real
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
-                state_slot=_ring_state_slot[:n_real],
-                positions=_ring_positions[:n_real],
+                state_slot=state_slot_full[:n_real],
+                positions=positions_full[:n_real],
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=_ring_final_pos[:n_real],
+                final_pos=final_pos_full[:n_real],
                 kv_rope=None if k_rope is None else k_rope[:n_real],
                 unified_kv_rope=(
                     None if k_rope is None else pool.get_unified_kv_rope(layer_id)
@@ -3325,8 +3237,8 @@ class DeepseekV4HipRadixBackend(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"
                 )
-            # HIP rejects prefill CP, the only caller passing rows_per_request
-            assert rows_per_request is None, "prefill CP is not supported on HIP"
+            # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
+            assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
