@@ -203,15 +203,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
                 local_can_run_tbo=False,
                 local_forward_mode=ForwardMode.EXTEND.value,
             )
-            for mm in (
-                [
-                    SimpleNamespace(
-                        contains_mm_input=lambda: True,
-                        contains_image_inputs=lambda: True,
-                    )
-                ],
-                None,
-            )
+            for mm in ([SimpleNamespace(contains_mm_input=lambda: True)], None)
         ]
         values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
         gather.side_effect = lambda output, *a, **kw: output.copy_(values)
