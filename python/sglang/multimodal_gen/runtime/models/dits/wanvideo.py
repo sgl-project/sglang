@@ -733,8 +733,13 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
+        # fp32 like the other modulation tensors (shift_msa is asserted fp32
+        # above): the fused residual-norm kernels want one dtype across gate,
+        # shift, scale, weight and bias, and self_attn_residual_norm's affine
+        # parameters are fp32. bf16 zeros here silently disqualified the AOT
+        # SYCL kernel on XPU and sent this site to the triton fallback.
         null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            (1,), device=hidden_states.device, dtype=shift_msa.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
