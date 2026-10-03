@@ -645,9 +645,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
-    def supports_streaming_session(self) -> bool:
-        return False
-
     def release_session(self, session_id: str) -> None:
         pass
 
