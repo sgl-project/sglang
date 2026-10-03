@@ -1,6 +1,4 @@
-"""CPU-only regression tests for Inkling's linearized shared-sink LoRA path:
-in-place refresh of the derived decode operands on an adapter swap, and the
-shared-sink factor layout from checkpoint to one moe-TP shard's operands."""
+"""Inkling legacy/V2 sink operand layouts, in-place adapter refresh, and TP sharding."""
 
 from __future__ import annotations
 
@@ -39,8 +37,8 @@ _DOWN_B = f"{_PREFIX}.down_proj.lora_B.weight"
 
 
 class _FakeSharedSink(nn.Module):
-    """Stand-in for ``InklingBatchDenseMLP``: only the attributes
-    ``InklingBatchDenseMLPWithLoRA`` reads."""
+    """Stand-in for ``InklingBatchDenseMLP``: only the attributes the LoRA
+    wrappers read."""
 
     def __init__(
         self,
@@ -48,6 +46,7 @@ class _FakeSharedSink(nn.Module):
         num_shared: int = _NUM_SHARED,
         intermediate: int = _SHARD,
         moe_tp_size: int = 1,
+        contiguous_gate_up: bool = False,
     ):
         super().__init__()
         self.n_shared_experts = num_shared
@@ -55,10 +54,11 @@ class _FakeSharedSink(nn.Module):
         self.moe_tp_size = moe_tp_size
         self.moe_tp_rank = 0
         self._linearized_bf16_enabled = True
+        self._w13_gate_up_contiguous = contiguous_gate_up
 
 
-def _load_sink_lora_class():
-    """Import the real Inkling LoRA layer against the fake dense-sink base."""
+def _load_sink_lora_module():
+    """Import the real Inkling LoRA layers against the fake dense-sink base."""
     stub = types.ModuleType("sglang.srt.models.inkling_common.dense_mlp")
     stub.InklingBatchDenseMLP = _FakeSharedSink
     patched = dict(sys.modules)
@@ -68,23 +68,36 @@ def _load_sink_lora_class():
     patched.pop("sglang.srt.models.inkling_common.lora", None)
     with mock.patch.dict(sys.modules, patched, clear=True):
         module = importlib.import_module("sglang.srt.models.inkling_common.lora")
-    return module.InklingBatchDenseMLPWithLoRA
+    return module
 
 
-InklingSharedSinkWithLoRA = _load_sink_lora_class()
+_lora_module = _load_sink_lora_module()
+InklingSharedSinkWithLoRA = _lora_module.InklingBatchDenseMLPWithLoRA
+InklingSharedSinkWithLoRAV2 = _lora_module.InklingBatchDenseMLPWithLoRAV2
+WRAPPERS = [InklingSharedSinkWithLoRA, InklingSharedSinkWithLoRAV2]
+WRAPPER_IDS = ["legacy", "v2"]
 
 
-def _new_sink(*, slots: int = 1, moe_tp_size: int = 1, intermediate: int = _SHARD):
-    layer = InklingSharedSinkWithLoRA(
-        moe_tp_size=moe_tp_size, intermediate=intermediate
+def _new_sink(
+    cls=InklingSharedSinkWithLoRA,
+    *,
+    slots: int = 1,
+    moe_tp_size: int = 1,
+    intermediate: int = _SHARD,
+):
+    layer = cls(
+        moe_tp_size=moe_tp_size,
+        intermediate=intermediate,
+        contiguous_gate_up=cls is InklingSharedSinkWithLoRAV2,
     )
-    # initialize_lora() reads only these two backend fields (and flips
-    # is_moe_lora on the backend it is handed).
+    # initialize_lora() reads only these backend fields (and flips is_moe_lora
+    # on the backend it is handed); V2 needs the dense engine present.
     layer.initialize_lora(
         SimpleNamespace(
             name="triton" if slots > 1 else "torch-test",
             max_loras_per_batch=slots,
             is_moe_lora=False,
+            runner=object(),
         )
     )
     return layer
@@ -188,8 +201,8 @@ def _pool_from_shards(shards, *, max_rank: int, slots: int = 1):
     return buffers
 
 
-def _sink_with_shard(shards, *, max_rank: int):
-    layer = _new_sink(moe_tp_size=_MOE_TP_SIZE)
+def _sink_with_shard(cls, shards, *, max_rank: int):
+    layer = _new_sink(cls, moe_tp_size=_MOE_TP_SIZE)
     layer.set_lora_info(*_pool_from_shards(shards, max_rank=max_rank))
     return layer
 
@@ -205,19 +218,59 @@ def _consumer_delta(layer, x, act):
     )
 
 
-def _reference_delta(shards, x, act):
-    """The same delta straight from the sharded adapter factors; the sink's w13 is
-    gate/up *interleaved*, so gate lands at ``[..., 0::2]`` and up at
-    ``[..., 1::2]`` of each expert's block."""
+def _site_delta(layer, x, act):
+    """The V2 wrapper's two deltas by the dense engine's contract on its bound
+    sites: shrink over ``a``, expand slice s from bridge block
+    s % bridge_slices (s when 0) into its output columns."""
+
+    def run(site, x):
+        a, b = site["a"][0], site["b"][0]
+        rank = b.shape[-1]
+        assert int(site["lora_ranks"][0]) == rank
+        if site.get("a_windowed"):
+            k, r = a.shape[-1], a.shape[0] // site["a_blocks"]
+            bridge = torch.cat(
+                [
+                    x[:, e * k : (e + 1) * k] @ a[e * r : (e + 1) * r].T
+                    for e in range(site["a_blocks"])
+                ],
+                dim=1,
+            )
+        else:
+            bridge = x @ a.T
+        blocks = site.get("bridge_slices", 0)
+        offsets = site["offsets"]
+        starts = site.get("out_offsets", offsets[:-1])
+        out = x.new_zeros(x.shape[0], offsets[-1])
+        for s, (lo, hi) in enumerate(zip(offsets, offsets[1:])):
+            block = s % blocks if blocks else s
+            columns = starts[s] + torch.arange(hi - lo)
+            out[:, columns] += bridge[:, block * rank : (block + 1) * rank] @ b[lo:hi].T
+        return out
+
+    return run(layer._gate_up, x), run(layer._down, act)
+
+
+def _reference_delta(shards, x, act, contiguous: bool = False):
+    """The same delta straight from the sharded adapter factors. With the
+    sink's w13 gate/up *interleaved* (the legacy wrapper) gate lands at
+    ``[..., 0::2]`` and up at ``[..., 1::2]`` of each expert's block; on the
+    dense-engine wrapper's contiguous layout gate is the block's first half and
+    up its second."""
     a_gate_up, b_gate_up, a_down, b_down = shards
     rank = b_gate_up.shape[-1]
     experts, f = b_gate_up.shape[0], b_gate_up.shape[1] // 2
     gate_shrink = x @ a_gate_up[0, :rank].T
     up_shrink = x @ a_gate_up[0, rank:].T
     y = x.new_zeros(x.shape[0], experts, 2 * f)
+    gate_cols, up_cols = (
+        (slice(0, f), slice(f, 2 * f))
+        if contiguous
+        else (slice(0, None, 2), slice(1, None, 2))
+    )
     for expert in range(experts):
-        y[:, expert, 0::2] = gate_shrink @ b_gate_up[expert, :f].T
-        y[:, expert, 1::2] = up_shrink @ b_gate_up[expert, f:].T
+        y[:, expert, gate_cols] = gate_shrink @ b_gate_up[expert, :f].T
+        y[:, expert, up_cols] = up_shrink @ b_gate_up[expert, f:].T
     down_shrink = torch.einsum("tef,ekf->tk", act.view(-1, experts, f), a_down)
     return y.reshape(x.shape[0], -1), down_shrink @ b_down[0].T
 
@@ -399,9 +452,10 @@ def test_derived_operands_refresh_in_place_after_slot_copy(monkeypatch):
     assert (layer._w1_delta.data_ptr(), layer._a_cat.data_ptr()) == pointers
 
 
-def test_shared_sink_factor_layout_roundtrip():
+@pytest.mark.parametrize("cls", WRAPPERS, ids=WRAPPER_IDS)
+def test_shared_sink_factor_layout_roundtrip(cls):
     """Guards the shared-sink factor layout from checkpoint to one moe-TP shard's
-    decode operands; reds on a lost ``down_proj`` transpose, gate-major gate/up
+    operands; reds on a lost ``down_proj`` transpose, gate-major gate/up
     LoRA-B, a collapsed gate/up shard, or a rank offset from the wrong rank."""
     rank, hidden = _ADAPTER_RANK, _HIDDEN
     experts, full = _NUM_SHARED, _INTERMEDIATE
@@ -450,7 +504,7 @@ def test_shared_sink_factor_layout_roundtrip():
 
     # -- layer side: this moe-TP rank's shard -----------------------------
     normalized = _normalize(_inkling_config(), dict(flat))
-    layer = _new_sink(moe_tp_size=_MOE_TP_SIZE)
+    layer = _new_sink(cls, moe_tp_size=_MOE_TP_SIZE)
     shards = _shard_factors(layer, normalized)
     start = _MOE_TP_RANK * _SHARD
     # The gate half and the up half are sharded independently and re-paired, so
@@ -492,17 +546,183 @@ def test_shared_sink_factor_layout_roundtrip():
     x = torch.tensor([[0.5, -1.0, 0.25], [1.25, 0.75, -0.5]])
     act = torch.tensor([[0.5, -0.25, 1.0, 0.75], [-1.0, 0.25, 0.5, -0.75]])
     assert x.shape[-1] == hidden and act.shape[-1] == experts * _SHARD
-    expected_gate_up_delta, expected_down_delta = _reference_delta(shards, x, act)
+    expected_gate_up_delta, expected_down_delta = _reference_delta(
+        shards, x, act, contiguous=cls is InklingSharedSinkWithLoRAV2
+    )
 
     # A pool padded past the adapter's rank must produce the same delta as an
     # exactly-sized one: the up half's column offset comes from the padded
     # max_rank, matching where the pool stacks the up half of LoRA-A.
     for max_rank in (rank, rank + 1):
-        sink = _sink_with_shard(shards, max_rank=max_rank)
-        assert sink.experts_shared_outer_loras is True
-        gate_up_delta, down_delta = _consumer_delta(sink, x, act)
+        sink = _sink_with_shard(cls, shards, max_rank=max_rank)
+        if cls is InklingSharedSinkWithLoRA:
+            assert sink.experts_shared_outer_loras is True
+        else:
+            assert sink._down["kind"] == "linear"
+        delta = _consumer_delta if cls is InklingSharedSinkWithLoRA else _site_delta
+        gate_up_delta, down_delta = delta(sink, x, act)
         torch.testing.assert_close(gate_up_delta, expected_gate_up_delta)
         torch.testing.assert_close(down_delta, expected_down_delta)
+
+
+def _per_expert_pool(*, slots: int, max_rank: int):
+    return tuple(
+        torch.zeros(shape)
+        for shape in (
+            (slots, _NUM_SHARED, 2 * max_rank, _HIDDEN),
+            (slots, _NUM_SHARED, 2 * _SHARD, max_rank),
+            (slots, _NUM_SHARED, max_rank, _SHARD),
+            (slots, _NUM_SHARED, _HIDDEN, max_rank),
+        )
+    )
+
+
+def test_v2_binds_the_pool_and_refreshes_only_its_down_operand():
+    """The V2 gate/up site reads the pool buffers as they are (per-expert
+    gate and up row slices, written as contiguous output slices on the
+    sink's [gate | up] layout it asked for at initialization); only the down
+    shrink operand is derived, in place, and the legacy-only operands are
+    never allocated."""
+    max_rank = _ADAPTER_RANK + 1
+    buffers = _empty_pool(slots=2, max_rank=max_rank)
+    layer = _new_sink(InklingSharedSinkWithLoRAV2, slots=2)
+    assert layer._w13_gate_up_contiguous is True
+    layer.set_lora_info(*buffers)
+    assert layer._down["kind"] == "linear"
+    assert set(dict(layer.named_buffers())) == {"_down_cat"}
+    site = layer._gate_up
+    assert site["a"].data_ptr() == buffers[0].data_ptr()
+    assert site["b"].data_ptr() == buffers[1].data_ptr()
+    assert site["offsets"] == (0, _SHARD, 2 * _SHARD, 3 * _SHARD, 4 * _SHARD)
+    assert site["bridge_slices"] == 2 and "interleave_pairs" not in site
+    assert site["lora_ranks"].tolist() == [max_rank, max_rank]
+    pointer = layer._down_cat.data_ptr()
+
+    a_down, b_down = buffers[2], buffers[3]
+    source, target = layer._down_refresh
+    assert source.data_ptr() == a_down.data_ptr()
+    assert target.data_ptr() == pointer
+    assert source.shape == target.shape == (2, max_rank, _NUM_SHARED, _SHARD)
+    a_down[1, :, :_ADAPTER_RANK] = torch.arange(
+        _NUM_SHARED * _ADAPTER_RANK * _SHARD, dtype=torch.float32
+    ).view(_NUM_SHARED, _ADAPTER_RANK, _SHARD)
+    layer.on_lora_slots_updated({1})
+    assert layer._down_cat.data_ptr() == pointer
+    torch.testing.assert_close(
+        layer._down_cat[1].view(max_rank, _NUM_SHARED, _SHARD),
+        a_down[1].permute(1, 0, 2),
+    )
+    assert layer._down_cat[0].abs().sum() == 0
+    del b_down
+
+    # Per-expert adapters: the down shrink reads the pool's A expert by expert
+    # over its own activation window; only the concatenated down expand is
+    # derived, in place.
+    buffers = _per_expert_pool(slots=1, max_rank=max_rank)
+    layer = _new_sink(InklingSharedSinkWithLoRAV2)
+    layer.set_lora_info(*buffers)
+    assert layer._down["kind"] == "sink_down"
+    assert set(dict(layer.named_buffers())) == {"_down_cat"}
+    gate_up = layer._gate_up
+    assert gate_up["bridge_slices"] == 0
+    assert gate_up["a"].shape == (1, _NUM_SHARED * 2 * max_rank, _HIDDEN)
+    a_down, b_down = buffers[2], buffers[3]
+    site = layer._down
+    assert site["a"].data_ptr() == a_down.data_ptr()
+    assert site["a"].shape == (1, _NUM_SHARED * max_rank, _SHARD)
+    assert (site["a_blocks"], site["a_windowed"]) == (_NUM_SHARED, True)
+    assert site["lora_ranks"].tolist() == [_NUM_SHARED * max_rank]
+    b_down[0, 0, :, :_ADAPTER_RANK] = 3.0
+    b_down[0, 1, :, :_ADAPTER_RANK] = 4.0
+    layer.on_lora_slots_updated({0})
+    torch.testing.assert_close(
+        layer._down_cat[0].view(_HIDDEN, _NUM_SHARED, max_rank),
+        b_down[0].permute(1, 0, 2),
+    )
+    # The engine's contract on the bound site against the per-expert math.
+    x = torch.tensor([[0.5, -1.0, 0.25], [1.25, 0.75, -0.5]])
+    act = torch.tensor([[0.5, -0.25, 1.0, 0.75], [-1.0, 0.25, 0.5, -0.75]])
+    a_down[0, :, :_ADAPTER_RANK] = torch.arange(
+        _NUM_SHARED * _ADAPTER_RANK * _SHARD, dtype=torch.float32
+    ).view(_NUM_SHARED, _ADAPTER_RANK, _SHARD)
+    _, down_delta = _site_delta(layer, x, act)
+    expected = sum(
+        (act[:, e * _SHARD : (e + 1) * _SHARD] @ a_down[0, e].T) @ b_down[0, e].T
+        for e in range(_NUM_SHARED)
+    )
+    torch.testing.assert_close(down_delta, expected)
+
+
+@pytest.mark.parametrize("pool", [_empty_pool, _per_expert_pool])
+def test_v2_failed_shape_rebind_preserves_bound_operands(pool):
+    buffers = pool(slots=1, max_rank=_ADAPTER_RANK)
+    layer = _new_sink(InklingSharedSinkWithLoRAV2)
+    layer.set_lora_info(*buffers)
+    gate_up, down = layer._gate_up, layer._down
+    refresh, down_cat = layer._down_refresh, layer._down_cat
+    previous = down_cat.clone()
+
+    with pytest.raises(RuntimeError, match="pool shape changed"):
+        layer.set_lora_info(*pool(slots=1, max_rank=_ADAPTER_RANK + 1))
+
+    assert layer.set_lora
+    assert layer._gate_up is gate_up and layer._down is down
+    assert layer._down_refresh is refresh and layer._down_cat is down_cat
+    torch.testing.assert_close(down_cat, previous)
+    source, target = refresh
+    source.fill_(3.0)
+    layer.on_lora_slots_updated({0})
+    torch.testing.assert_close(target, source)
+
+
+def test_v2_looks_up_the_plan_on_each_forward():
+    layer = _new_sink(InklingSharedSinkWithLoRAV2)
+    layer.set_lora_info(*_empty_pool(slots=1, max_rank=_ADAPTER_RANK))
+    plans = [object(), object()]
+    runner = mock.Mock()
+    runner.plan_for.side_effect = plans
+    runner.apply.side_effect = lambda x, base_fn, plan, **site: base_fn()
+    layer.lora_backend.runner = runner
+
+    for tokens in (1, 4):
+        x = torch.zeros(tokens, _HIDDEN)
+        assert layer._lora_gemm(x, lambda: x, **layer._gate_up) is x
+
+    assert runner.plan_for.call_args_list == [
+        mock.call(
+            "sink_gate_up",
+            _ADAPTER_RANK,
+            _HIDDEN,
+            2 * _NUM_SHARED * _SHARD,
+            num_tokens=tokens,
+        )
+        for tokens in (1, 4)
+    ]
+    assert [call.args[2] for call in runner.apply.call_args_list] == plans
+
+
+def test_v2_rejects_interleaved_layout_before_initializing_lora():
+    layer = InklingSharedSinkWithLoRAV2()
+    backend = SimpleNamespace(runner=object(), is_moe_lora=False)
+    attributes = set(vars(layer))
+
+    with pytest.raises(ValueError, match="contiguous"):
+        layer.initialize_lora(backend)
+
+    assert set(vars(layer)) == attributes
+    assert not layer._buffers
+    assert not layer._w13_gate_up_contiguous
+    assert not backend.is_moe_lora
+
+
+def test_legacy_wrapper_keeps_only_its_experimental_path_operands():
+    layer = _new_sink()
+    assert not layer._w13_gate_up_contiguous
+    layer.set_lora_info(*_empty_pool(slots=1, max_rank=_ADAPTER_RANK))
+    assert set(dict(layer.named_buffers())) == {"_w1_delta", "_a_cat"}
+    assert not any(
+        name.startswith(("_sink", "_sites", "_down")) for name in vars(layer)
+    )
 
 
 if __name__ == "__main__":
