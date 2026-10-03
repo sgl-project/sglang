@@ -175,7 +175,7 @@ class StagePlan:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
-        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
+        self._publish_lora_layout = get_parallel().attn_dp_enabled and bool(
             get_lora().enable_lora
         )
         self._next_input_rows = None
@@ -214,7 +214,6 @@ class StagePlan:
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
-                complete_output_move=out.complete_output_move,
             )
 
     @property

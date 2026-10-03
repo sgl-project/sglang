@@ -44,9 +44,6 @@ from sglang.kernels.ops.gemm.bf16_fp32 import (
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
@@ -72,7 +69,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
-    should_skip_mlp_all_reduce,
 )
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -325,18 +321,6 @@ class LongcatFlashMoE(nn.Module):
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        # LONGCAT_MOE_A2A_SKIP_ALLREDUCE: skip the post-experts TP all-reduce when a
-        # real EP a2a backend is active -- self.experts (DeepEPMoE) already combined
-        # expert outputs across EP ranks, so an extra all-reduce double-counts.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _lc_gab
-
-        if (
-            self.tp_size > 1
-            and _lc_gab().is_none()
-            and not should_skip_mlp_all_reduce()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def get_moe_weights(self):
@@ -414,7 +398,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                         if "mlps" in getattr(config, "disable_quant_module", [])
                         else quant_config
                     ),
-                    reduce_results=True,
+                    reduce_results=False,
                     prefix=add_prefix(f"mlps.{i}", prefix),
                 )
                 for i in range(2)
@@ -427,9 +411,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.attn_boundary, self.moe_boundary = make_stages(
             (
@@ -523,9 +504,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = self.first_ffn_boundary.branch_input(
             self.moe_boundary, hidden_states, forward_batch
         )
-        with self.first_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[0](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[0](hidden_states)
+        hidden_states = self.first_ffn_boundary.finish(hidden_states, forward_batch)
 
         # second_attn_boundary
         hidden_states = self.second_attn_boundary.prepare(hidden_states, forward_batch)
@@ -545,9 +525,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         # second_mlp
         hidden_states = self.second_attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.second_ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.second_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[1](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[1](hidden_states)
+        hidden_states = self.second_ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states, prev_topk_indices
 
@@ -676,7 +655,6 @@ class LongcatFlashForCausalLM(nn.Module):
             ]
 
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.model = LongcatFlashModel(
             config, quant_config, prefix=add_prefix("model", prefix)
