@@ -503,34 +503,79 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
 
+    def supports_dynamic_batching(self):
+        # EditPlus/2511/Layered have different multi-image conditioning semantics.
+        return type(self) is QwenImageEditPipelineConfig
+
+    def supports_dynamic_batching_with_image_conditioning(self) -> bool:
+        return type(self) is QwenImageEditPipelineConfig
+
+    def supports_dynamic_batching_for_request(self, batch) -> bool:
+        return (
+            isinstance(batch.image_path, str)
+            and max(1, int(batch.num_outputs_per_prompt or 1)) == 1
+        )
+
+    def prepare_image_processor_kwargs(self, batch, neg=False):
+        kwargs = super().prepare_image_processor_kwargs(batch, neg=neg)
+        if not batch.extra.get("dynamic_batch_image_conditioning"):
+            return kwargs
+
+        images = _normalize_image_list(batch.condition_image)
+        prompts = _normalize_prompt_list(
+            batch.prompt if not neg else batch.negative_prompt
+        )
+        if neg and len(prompts) == 1 and len(images) > 1:
+            prompts = prompts * len(images)
+            if len(kwargs.get("text", [])) == 1:
+                kwargs["text"] = kwargs["text"] * len(images)
+        if len(images) != len(prompts):
+            raise ValueError(
+                "Dynamic Qwen Image Edit batching requires exactly one "
+                "conditioning image per prompt."
+            )
+        kwargs["per_prompt_images"] = [[image] for image in images]
+        return kwargs
+
+    def merge_condition_image_latents(self, image_latents, batch):
+        if batch.extra.get("dynamic_batch_image_conditioning"):
+            return torch.cat(image_latents, dim=0)
+        return super().merge_condition_image_latents(image_latents, batch)
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
         batch_size = batch.latents.shape[0]
-        assert batch_size == 1
         text_seq_len = prompt_embeds[0].shape[1]
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
-        edit_width, edit_height, _ = _calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
+        image_sizes = batch.extra.get(
+            "dynamic_batch_condition_image_sizes",
+            [batch.original_condition_image_size] * batch_size,
         )
+        if len(image_sizes) != batch_size:
+            raise ValueError("Conditioning image sizes must match the edit batch size.")
         vae_scale_factor = self.get_vae_scale_factor()
 
-        img_shapes = [
-            [
-                (
-                    1,
-                    height // vae_scale_factor // 2,
-                    width // vae_scale_factor // 2,
-                ),
-                (
-                    1,
-                    edit_height // vae_scale_factor // 2,
-                    edit_width // vae_scale_factor // 2,
-                ),
-            ],
-        ] * batch_size
+        img_shapes = []
+        for image_size in image_sizes:
+            edit_width, edit_height, _ = _calculate_dimensions(
+                1024 * 1024, image_size[0] / image_size[1]
+            )
+            img_shapes.append(
+                [
+                    (
+                        1,
+                        height // vae_scale_factor // 2,
+                        width // vae_scale_factor // 2,
+                    ),
+                    (
+                        1,
+                        edit_height // vae_scale_factor // 2,
+                        edit_width // vae_scale_factor // 2,
+                    ),
+                ]
+            )
         txt_seq_lens, encoder_hidden_states_mask = self._prepare_text_conditioning(
             batch, 0, text_seq_len, batch_size, negative=negative
         )
@@ -578,7 +623,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
 
     def postprocess_image_latent(self, latent_condition, batch):
-        batch_size = batch.batch_size
+        batch_size = (
+            latent_condition.shape[0]
+            if batch.extra.get("dynamic_batch_image_conditioning")
+            else batch.batch_size
+        )
         if batch_size > latent_condition.shape[0]:
             if batch_size % latent_condition.shape[0] == 0:
                 # expand init_latents for batch_size
