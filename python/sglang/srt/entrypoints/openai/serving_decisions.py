@@ -127,7 +127,10 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     async def handle_request(self, request: Any, raw_request: Request) -> Any:
         """Dispatch joint checkpoints before generic per-question scoring."""
-        if getattr(self.tokenizer_manager.model_config, "clef_config", None) is not None:
+        if (
+            getattr(self.tokenizer_manager.model_config, "clef_config", None)
+            is not None
+        ):
             from sglang.srt.entrypoints.openai.serving_clef import handle_clef_request
 
             try:
