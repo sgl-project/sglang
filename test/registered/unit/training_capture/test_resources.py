@@ -447,6 +447,149 @@ class TestCaptureResources(CustomTestCase):
         self.assertIsNone(reference())
         self.assertNotIn(store, MooncakeSnapshotStore._retained)
 
+    def test_cuda_stop_failure_retains_resources_until_successful_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            kv = make_kv_spec()
+            client = FaultStore()
+            store = MooncakeSnapshotStore(client, FakeReplicateConfig())
+            resources = CaptureResources.from_connected(
+                config=resource_config(root),
+                kv=kv,
+                exporter=cpu_exporter(kv),
+                store=store,
+                catalog=None,
+                pin_memory=False,
+            )
+            resources.device = torch.device("cuda:3")
+            resource_ref = weakref.ref(resources)
+            storage_ref = weakref.ref(resources.pool.slots[0].storage)
+            try:
+                with (
+                    patch(
+                        "torch.cuda.synchronize",
+                        side_effect=RuntimeError("CUDA stop failed"),
+                    ) as sync,
+                    self.assertRaisesRegex(RuntimeError, "CUDA stop failed"),
+                ):
+                    resources.close()
+                sync.assert_called_once_with(torch.device("cuda:3"))
+                self.assertFalse(resources.closed)
+                self.assertFalse(store.closed)
+                self.assertFalse(resources.journal.lock.closed)
+                self.assertIn(resources, CaptureResources._retained)
+                self.assertEqual(client.close_observations, [])
+                del resources
+                gc.collect()
+                self.assertIsNotNone(resource_ref())
+                self.assertIsNotNone(storage_ref())
+                self.assertTrue(store.registered)
+            finally:
+                resources = resource_ref()
+                if resources is not None:
+                    with patch("torch.cuda.synchronize") as sync:
+                        resources.close()
+                    sync.assert_called_once_with(torch.device("cuda:3"))
+            self.assertTrue(resources.closed)
+            self.assertTrue(store.closed)
+            self.assertTrue(resources.journal.lock.closed)
+            self.assertNotIn(resources, CaptureResources._retained)
+            del resources
+            gc.collect()
+            self.assertIsNone(resource_ref())
+            self.assertIsNone(storage_ref())
+
+    def test_cuda_and_store_stop_order_and_transport_failure_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            kv, calls = make_kv_spec(), []
+            client = FaultStore(close_failure=True)
+            store = MooncakeSnapshotStore(client, FakeReplicateConfig())
+            resources = CaptureResources.from_connected(
+                config=resource_config(root),
+                kv=kv,
+                exporter=cpu_exporter(kv),
+                store=store,
+                catalog=None,
+                pin_memory=False,
+            )
+            resources.device = torch.device("cuda:2")
+            original_close = client.close
+
+            def close():
+                calls.append("store")
+                return original_close()
+
+            try:
+                with (
+                    patch(
+                        "torch.cuda.synchronize",
+                        side_effect=lambda device: calls.append(("cuda", device)),
+                    ),
+                    patch.object(client, "close", side_effect=close),
+                ):
+                    with self.assertRaises(TransportError):
+                        resources.close()
+                    self.assertEqual(calls, [("cuda", torch.device("cuda:2")), "store"])
+                    self.assertIn(resources, CaptureResources._retained)
+                    self.assertTrue(store.registered)
+                    self.assertFalse(resources.closed)
+                    self.assertFalse(resources.journal.lock.closed)
+                    client.close_failure = False
+                    resources.close()
+                    self.assertEqual(
+                        calls, [("cuda", torch.device("cuda:2")), "store"] * 2
+                    )
+                    resources.close()
+                    self.assertEqual(len(calls), 4)
+                self.assertTrue(resources.closed)
+                self.assertNotIn(resources, CaptureResources._retained)
+            finally:
+                client.close_failure = False
+                with patch("torch.cuda.synchronize"):
+                    resources.close()
+
+    def test_aux_only_resource_uses_source_pool_cuda_device(self):
+        with tempfile.TemporaryDirectory() as root:
+            kv = make_kv_spec()
+            partition = plan_capture_layout(
+                kv, tp_size=1, pp_layer_ranges=[(0, 4), (4, 6)]
+            ).partition("dp0-pp1-tp0")
+            self.assertFalse(partition.heads)
+            self.assertTrue(partition.include_aux)
+            store = MooncakeSnapshotStore(FaultStore(), FakeReplicateConfig())
+            with (
+                patch.object(MooncakeSnapshotStore, "connect", return_value=store),
+                patch.object(SelectedLayerKVExporter, "from_pool") as exporter,
+            ):
+                resources = CaptureResources.prepare(
+                    config=resource_config(root),
+                    kv=kv,
+                    partition=partition,
+                    source_pool=SimpleNamespace(device=torch.device("cuda:3")),
+                    pin_memory=False,
+                )
+            exporter.assert_not_called()
+            self.assertEqual(resources.device, torch.device("cuda:3"))
+            with patch("torch.cuda.synchronize") as sync:
+                resources.close()
+            sync.assert_called_once_with(torch.device("cuda:3"))
+
+    def test_cpu_and_inactive_resources_do_not_initialize_cuda_on_close(self):
+        with tempfile.TemporaryDirectory() as root:
+            kv = make_kv_spec()
+            store = MooncakeSnapshotStore(FaultStore(), FakeReplicateConfig())
+            resources = CaptureResources.from_connected(
+                config=resource_config(root),
+                kv=kv,
+                exporter=cpu_exporter(kv),
+                store=store,
+                catalog=None,
+                pin_memory=False,
+            )
+            with patch("torch.cuda.synchronize") as sync:
+                resources.close()
+                CaptureResources().close()
+            sync.assert_not_called()
+
     def test_thread_start_failure_never_activates_catalog_and_releases_journal(self):
         with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
             catalog = TestCaptureCatalog()

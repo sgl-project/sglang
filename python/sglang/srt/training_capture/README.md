@@ -592,10 +592,14 @@ The extra acknowledgement matters because a timed-out Gloo `all_gather` can
 still complete for a late participant. On failure, successfully prepared ranks
 close their resources. Cooperative cleanup errors are voted as `cleanup`; after
 transport failure there is no further collective. Callbacks must clean their
-own partial failures. Store shutdown is the barrier before registered storage
-can lose its references. A failed Store close retains the adapter and buffers
-until a successful explicit close or process teardown. Failed resource close
-also retains the owning resource bundle and journal lock.
+own partial failures. After workers stop, resource close first synchronizes the
+capture device and then stops the Store transport. A missing or failed request
+event cannot be replaced by Store shutdown: D2H or GPU staging may still be
+pending on another stream. The device is bound during preparation, including
+aux-only ranks; CPU/inactive bundles do not initialize CUDA on close. Either
+barrier failing retains the resource bundle, buffers and journal lock until a
+successful explicit close or process teardown. See the
+[CUDA shutdown regression](../../../../mooncake-study/experiments/CUDA_STOP_BARRIER.md).
 
 The serving coordinator prepares its writer, lease and metrics threads behind
 an activation event. Only after readiness confirmation does `activate()` release

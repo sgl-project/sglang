@@ -1174,6 +1174,6 @@ class CaptureCoordinator:
         if self.writer_thread.is_alive():
             logger.error("Capture writer did not stop; retaining registered buffers")
             return
-        # Client close is the transport stop barrier, including quarantined slots.
+        # Stop CUDA and transport work before releasing quarantined storage.
         self.resources.close()
         self.closed = True

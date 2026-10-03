@@ -615,6 +615,15 @@ TP2、PP2 和 TP2/PP2 的真实 Store 可控 manifest 阻塞验证已通过：33
 
 网络错误或 CUDA 错误后，只有确认传输停止才可回收注册 buffer。不能仅因 Future 抛错就假设 DMA/RDMA 不再访问内存；需要 transport completion 或 quarantine 队列。
 
+关闭采集资源时，调用方先停止所有采集线程，再由 `CaptureResources.close()`
+等待绑定设备上的 CUDA 工作完成，随后关闭 Store transport 和 journal。
+逐请求 event 创建或等待失败时，不能仅凭 Store close 就认为 D2H/设备 staging
+已经结束。KV owner 从 exporter 绑定设备，aux-only owner 从 source pool
+绑定设备，准备阶段固定 CUDA index；CPU/inactive 资源不初始化 CUDA。
+CUDA 或 Store 屏障失败时保留完整资源引用及 journal lock，允许显式重试，
+最终以进程退出兜底。该设备同步只用于关闭，不加入逐 token 采集路径；复现见
+[CUDA 关闭屏障](experiments/CUDA_STOP_BARRIER.md)。
+
 紧凑 teacher 回传可通过 `teacher_d2h_batch_tokens` 单独启用批量 D2H，
 默认值 1 保持逐次回传。aux owner 为每个 inflight slot 分配有界 GPU 缓冲，
 与 KV staging 共用 `max_device_bytes` 预算，并在注册 Host buffer 前校验总量。

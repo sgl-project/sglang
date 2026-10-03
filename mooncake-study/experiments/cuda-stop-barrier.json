@@ -1,0 +1,424 @@
+{
+  "status": "completed",
+  "scope": "Capture resource CUDA completion before Store shutdown, error retention and retry",
+  "base_commit": "1e73d8816",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/cuda-stop-20261003",
+  "jobs": {
+    "before": {
+      "spec": {
+        "role": "before",
+        "job": "01791025853464922586-aa7d903dde95",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submitted": "2026-10-03T11:10:53.479Z"
+      },
+      "result": {
+        "job_id": "01791025853464922586-aa7d903dde95",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791025873.1252162,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791025853464922586-aa7d903dde95.log"
+      },
+      "methods": 1,
+      "seconds": 6.325,
+      "log_sha256": "15361642c81cc87c986932be1a0dbe7b55585ced4d1c83ca20c58e1c4ce29a14"
+    },
+    "before_v2": {
+      "spec": {
+        "role": "before_v2",
+        "job": "01791026009957057499-df30a7700689",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before-v2",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before-v2",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-before-v2/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submitted": "2026-10-03T11:13:29.977Z"
+      },
+      "result": {
+        "job_id": "01791026009957057499-df30a7700689",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791026029.4805372,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026009957057499-df30a7700689.log"
+      },
+      "methods": 1,
+      "seconds": 6.356,
+      "log_sha256": "ea0deeb726c8bcd08f5cc9090e816cf5e3e246777f82e56430b4adc73a2d6d87"
+    },
+    "cuda": {
+      "spec": {
+        "role": "cuda",
+        "job": "01791026300263599154-8241e56abaf4",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_shutdown.py",
+          "-v"
+        ],
+        "submitted": "2026-10-03T11:18:20.284Z"
+      },
+      "result": {
+        "job_id": "01791026300263599154-8241e56abaf4",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791026319.9042094,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026300263599154-8241e56abaf4.log"
+      },
+      "methods": 1,
+      "seconds": 6.364,
+      "log_sha256": "3327dd2e69610a91f57f78fa5820a5f174a1bd50d1c4584063f79c67f19080c7"
+    },
+    "units": {
+      "spec": {
+        "role": "units",
+        "job": "01791026300467118254-710879b71f09",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_stop_units.py"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_stop_units.py"
+        ],
+        "submitted": "2026-10-03T11:18:20.478Z"
+      },
+      "result": {
+        "job_id": "01791026300467118254-710879b71f09",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791026346.2636178,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026300467118254-710879b71f09.log"
+      },
+      "methods": 7,
+      "seconds": 14.578,
+      "log_sha256": "d3963249f895e24d8ef6b3d73d340a8b5a4171b0ceb62a0ff364e747ea3ecbc9"
+    },
+    "cuda_snapshot": {
+      "spec": {
+        "role": "cuda_snapshot",
+        "job": "01791026385348684366-a1c4ed059841",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_snapshot.py",
+          "-v",
+          "-f"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_cuda_snapshot.py",
+          "-v",
+          "-f"
+        ],
+        "submitted": "2026-10-03T11:19:45.377Z"
+      },
+      "result": {
+        "job_id": "01791026385348684366-a1c4ed059841",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791026398.6619012,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026385348684366-a1c4ed059841.log"
+      },
+      "methods": 7,
+      "seconds": 0.893,
+      "log_sha256": "57fc98e01ee0c97609b0d0f35f15291a4e548b5534f8814ab22613a78fe51515"
+    },
+    "store": {
+      "spec": {
+        "role": "store",
+        "job": "01791026385593061578-cb892da7d291",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_snapshot_mooncake.py",
+          "-v",
+          "-f"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_snapshot_mooncake.py",
+          "-v",
+          "-f"
+        ],
+        "submitted": "2026-10-03T11:19:45.605Z"
+      },
+      "result": {
+        "job_id": "01791026385593061578-cb892da7d291",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791026610.2123024,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026385593061578-cb892da7d291.log"
+      },
+      "methods": 7,
+      "seconds": 197.017,
+      "log_sha256": "01990897e5b617c75a66f392b0662233c8e994b242ccc0bd21e3322efc5e0944"
+    },
+    "units_v2": {
+      "spec": {
+        "role": "units_v2",
+        "job": "01791026460699104707-0ed7185548ac",
+        "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+        "argv": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_stop_units_v2.py"
+        ],
+        "submit_args": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+          "--state-dir",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+          "submit",
+          "--cwd",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1",
+          "--timeout-seconds",
+          "600",
+          "--env",
+          "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cuda-stop-v1/python",
+          "--env",
+          "OMP_NUM_THREADS=1",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_stop_units_v2.py"
+        ],
+        "submitted": "2026-10-03T11:21:00.714Z"
+      },
+      "result": {
+        "job_id": "01791026460699104707-0ed7185548ac",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791026693.7640193,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791026460699104707-0ed7185548ac.log"
+      },
+      "methods": 129,
+      "seconds": 71.772,
+      "log_sha256": "08d2c0fd693b8a1847650a836d3e245cd8d4be92afedd23dabcbb823ee441251"
+    }
+  },
+  "cuda_cases": [
+    {
+      "staged": false,
+      "store_closed_after_cuda": [
+        true
+      ],
+      "capture_quarantined_slots": 1
+    },
+    {
+      "staged": true,
+      "store_closed_after_cuda": [
+        true
+      ],
+      "capture_quarantined_slots": 1
+    }
+  ],
+  "cuda_test_comparison": "identical CUDA test after normalizing three closure bindings",
+  "passing_methods": 144,
+  "source_audit": {
+    "python_files": 5032,
+    "sha256": "54807e31a742046fb7b32916343206551ed7e405c796c91afc185602814667e9"
+  },
+  "diagnostics": {
+    "python/sglang/srt/training_capture/resources.py": [],
+    "python/sglang/srt/training_capture/coordinator.py": [
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "code": "BLE001",
+        "message": "Do not catch blind exception: `Exception`"
+      }
+    ],
+    "test/registered/unit/training_capture/test_resources.py": [],
+    "test/registered/unit/training_capture/test_cuda_shutdown.py": []
+  },
+  "cleanup": {
+    "time": "2026-10-03T11:27:55.593Z",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791026874.1323838,
+      "idle_pid": 33696,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.9230861663818359
+    },
+    "processes": [
+      "PID  PPID STAT COMMAND",
+      "    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60",
+      "33696     1 Rsl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6",
+      "33778     0 Rs   ps -eo pid,ppid,stat,args"
+    ],
+    "additional_allocations": 0,
+    "gpu": "NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB",
+    "compute_processes": "56984, [Not Found], 1092 MiB"
+  },
+  "artifact_count": 41,
+  "artifact_manifest_sha256": "11e5f6f3e456b2a152dba6d012bcdd42f43eae61c822d97dc99134be53e5a68f",
+  "failed_attempts": [
+    "Initial direct-D2H case failed its pending-event precondition; warm allocation fixed that fixture. The staging case reproduced early Store close.",
+    "Corrected baseline failed Store-close ordering in both direct and staged cases.",
+    "Initial aggregate unit runner lacked the multiprocessing main guard; the guarded runner passed the same source."
+  ],
+  "limitations": [
+    "The real CUDA test uses a fake byte-addressed Store and deliberately retains buffers on failing assertions; no memory-corruption claim.",
+    "Separate actual Store coverage is local TCP. Long-duration memory, physical CUDA damage, RDMA outage, production retention and trained draft quality remain unproven."
+  ]
+}

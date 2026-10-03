@@ -6,6 +6,7 @@ import os
 from typing import ClassVar
 
 import msgspec
+import torch
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
@@ -14,12 +15,13 @@ from sglang.srt.training_capture.snapshot_writer import PublicationJournal
 
 
 class CaptureResources:
-    # An unsuccessful transport stop must retain registered storage even if the
-    # startup exception is discarded. Process teardown is the final backstop.
+    # An unsuccessful CUDA or transport stop must retain storage even if its
+    # exception is discarded. Process teardown is the final backstop.
     _retained: ClassVar[set[CaptureResources]] = set()
 
     def __init__(self):
         self.store = self.pool = self.catalog = self.journal = self.exporter = None
+        self.device = None
         self.closed = False
 
     @classmethod
@@ -78,6 +80,11 @@ class CaptureResources:
         return resources
 
     def _allocate(self, config, kv, partition, pin_memory, *, device=None):
+        device = self.exporter.device if self.exporter is not None else device
+        if device is not None:
+            self.device = torch.device(device)
+            if self.device.type == "cuda" and self.device.index is None:
+                self.device = torch.device("cuda", torch.cuda.current_device())
         self.pool = HostBufferPool(
             kv=kv,
             max_tokens=config.max_sample_tokens,
@@ -86,7 +93,7 @@ class CaptureResources:
             registrar=self.store,
             manifest_bytes=config.manifest_buffer_bytes,
             pin_memory=pin_memory,
-            device=self.exporter.device if self.exporter is not None else device,
+            device=self.device,
             kv_d2h_batch_tokens=config.kv_d2h_batch_tokens,
             kv_export_backend=config.kv_export_backend,
             teacher_d2h_batch_tokens=config.teacher_d2h_batch_tokens,
@@ -96,17 +103,19 @@ class CaptureResources:
         if config.kv_export_backend == "hicache" and self.exporter is not None:
             for slot in self.pool.slots:
                 slot.kv_exporter = self.exporter.bind(slot)
-            import torch
-
             torch.cuda.current_stream(self.exporter.device).synchronize()
         if partition is None or partition.include_aux:
             self.journal = PublicationJournal(config.journal_directory)
 
     def close(self):
-        """Caller must first stop workers and synchronize outstanding CUDA copies."""
+        """Caller stops workers; both CUDA and Store must stop before release."""
         if self.closed:
             return
         try:
+            # A failed request fence can leave copies pending on another stream.
+            # Closing the Store client only stops its own transport operations.
+            if self.device is not None and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             if self.store is not None:
                 self.store.close()
             if self.journal is not None:

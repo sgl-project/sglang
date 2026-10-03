@@ -29,7 +29,7 @@ it does not redefine the goal as the modules already implemented.
 | Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
-| Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
+| Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including native batches and complete reads after producer exit; TCP fault/recovery and RDMA partial-read ownership checks pass, without a measured serving speedup; production retention remains open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
@@ -4713,6 +4713,51 @@ has manifest SHA-256
 The benchmark is one sequential pair with fixed-length traffic, local TCP Store
 and a test Catalog. Broader workloads, production retention, trained draft
 quality, long-duration memory and serving SLOs remain open.
+
+## CUDA Completion At Resource Shutdown
+
+A request whose CUDA completion event fails can still have D2H or device
+staging pending when the writer quarantines its slot. Previously, resource
+close stopped Store and marked itself closed without an independent device
+barrier. The corrected baseline H100 test demonstrates early Store close for
+both direct D2H and GPU staging. It intentionally keeps buffers alive, so this
+is evidence of an invalid completion boundary, not reproduced memory corruption.
+
+Resource preparation now binds the capture device, including aux-only ranks,
+and resolves implicit CUDA indices. After callers stop workers, close waits for
+all work on that device, then closes Store and the journal. Failure of either
+barrier retains the complete resource bundle and lock for explicit retry.
+CPU/inactive resources do not initialize CUDA. The change does not insert a
+device synchronization into normal token capture or reopen quarantined slots.
+
+- The final H100 regression passes both pending-work cases in 6.364 seconds.
+  Its independent event is complete at the actual test Store-close call;
+  completed tensor values match and neither failed request publishes.
+- All 129 resource/buffer/coordinator/writer methods pass in 71.772 seconds,
+  including failure retention after dropping exception/resource references,
+  successful retry, aux-only device binding and four-process startup rollback.
+- The seven existing CUDA snapshot cases pass in 0.893 seconds; all seven
+  real TCP Store methods pass in 197.017 seconds. Total candidate coverage is
+  144 passing methods, with their existing source and publication assertions.
+- The initial direct-D2H probe did not preserve its pending-copy precondition
+  because first-use allocation synchronized. Allocator warmup fixes that
+  fixture and both baseline cases then fail the intended ordering assertion.
+  An initial aggregate unit runner also lacked the multiprocessing main guard;
+  its corrected runner passes without changing production/test source.
+- All 5,032 Python files match the frozen source. The final CUDA test differs
+  from the corrected baseline only in three lint-required closure bindings,
+  confirmed by AST comparison. New/edited resource tests and implementation
+  pass Ruff; the coordinator's comment edit retains its nine baseline findings.
+
+The [runbook](experiments/CUDA_STOP_BARRIER.md) and
+[evidence JSON](experiments/cuda-stop-barrier.json) retain all seven terminal jobs.
+The 41-artifact archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/cuda-stop-20261003` has manifest SHA-256
+`11e5f6f3e456b2a152dba6d012bcdd42f43eae61c822d97dc99134be53e5a68f`.
+No additional GPU was used; serving/Store/test processes have exited and the
+resident idle load is live with an empty queue. Long-duration memory stability,
+actual device-fault recovery, RDMA outage behavior, production retention and
+trained draft quality remain separate requirements.
 
 ## Next Implementation
 
