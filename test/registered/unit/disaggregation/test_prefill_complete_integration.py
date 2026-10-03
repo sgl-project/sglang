@@ -124,6 +124,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.req_to_decode_prefix_len = {}
         mgr.transfer_infos = {}
         mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
         mgr.required_prefill_response_num_table = {}
         mgr.prefill_response_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker = defaultdict(set)
