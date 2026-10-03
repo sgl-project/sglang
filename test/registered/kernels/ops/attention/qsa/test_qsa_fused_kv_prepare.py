@@ -412,6 +412,9 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         spec_info=SimpleNamespace(draft_token_num=width, topk=1),
         input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
         extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        # ForwardBatch leaves this None off the extend path; the backend's
+        # cross-prefix-group check reads it on every mode.
+        extend_prefix_lens_cpu=None,
         _original_forward_mode=None,
         mrope_positions=None,
     )
@@ -419,6 +422,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         batch.seq_lens = torch.tensor([width], device="cuda", dtype=torch.int32)
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.positions = torch.arange(width, device="cuda")
+        batch.extend_prefix_lens_cpu = [0]
     expected = (
         ratio == 4 and budget == 2048 and mode_name in ("DECODE", "TARGET_VERIFY")
     )
