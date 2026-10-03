@@ -83,6 +83,38 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 
+class _LastRowTrunk:
+    """Runs the trunk and returns only the last position of its output."""
+
+    __slots__ = ("_trunk",)
+
+    def __init__(self, trunk):
+        self._trunk = trunk
+
+    def __call__(self, *args, **kwargs):
+        return self._trunk(*args, **kwargs)[:, -1:, :]
+
+    def __getattr__(self, name):
+        return getattr(self._trunk, name)
+
+
+class _LastRowModel:
+    """``self`` for ``Model.__call__`` whose ``.model`` yields its last row only.
+
+    The model's own forward then applies the head (and any op after it) to one
+    position. Every other attribute resolves to the real model.
+    """
+
+    __slots__ = ("_model", "model")
+
+    def __init__(self, model, trunk):
+        self._model = model
+        self.model = _LastRowTrunk(trunk)
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
 @dataclass
 class MlxPendingPrefill:
     """Lazy prefill state, finalised after ``mx.eval``/``async_eval``.
@@ -1149,7 +1181,8 @@ class MlxModelRunner:
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Forward one chunk, returning (lazy next-token, lazy logprobs).
 
-        Skips the logit head for discarded-output chunks when possible.
+        Skips the logit head for discarded-output chunks when possible, and
+        applies it to the last position only otherwise.
         """
         if not needs_logits:
             hidden = self._trunk_forward(input_ids, cache)
@@ -1161,7 +1194,14 @@ class MlxModelRunner:
             model_output = self.model(input_ids, cache=cache)
             logits = self._extract_logits(model_output)
             return mx.argmax(logits[:, -1, :], axis=-1), None
-        model_output = self.model(input_ids, cache=cache)
+        if input_ids.shape[1] > 1 and self._trunk is not None:
+            # Head on the last position only; a [chunk, vocab] logits array is
+            # otherwise the largest transient in the process.
+            model_output = type(self.model).__call__(
+                _LastRowModel(self.model, self._trunk), input_ids, cache=cache
+            )
+        else:
+            model_output = self.model(input_ids, cache=cache)
         logits = self._extract_logits(model_output)
         edits = logit_edit_row[None, :] if logit_edit_row is not None else None
         return self._select_tokens_with_logprobs(
