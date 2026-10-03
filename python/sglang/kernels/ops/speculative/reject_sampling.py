@@ -31,6 +31,7 @@ def speculative_sampling_classic_kernel(
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    BLOCK_VERIFICATION: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
@@ -44,6 +45,8 @@ def speculative_sampling_classic_kernel(
     last_accepted_global_idx = root_global_idx
 
     num_accept = 0
+    prefix_prob = 1.0
+    residual_scale = 1.0
 
     # Verification Loop
     step = 1
@@ -51,15 +54,16 @@ def speculative_sampling_classic_kernel(
 
     while (step < NUM_SLOTS) and (continue_verifying == 1):
         draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+        proposal_row = step - 1
 
         offset_prob = (
             (pid * stride_tp_b)
-            + (cur_prob_row * stride_tp_s)
+            + (proposal_row * stride_tp_s)
             + (draft_token * stride_tp_v)
         )
         offset_draft = (
             (pid * stride_dp_b)
-            + (cur_prob_row * stride_dp_s)
+            + (proposal_row * stride_dp_s)
             + (draft_token * stride_dp_v)
         )
 
@@ -76,8 +80,54 @@ def speculative_sampling_classic_kernel(
         # from the target, which is the safe direction to fail in.
         q_is_prob = (q > 0.0) & (q <= 1.0)
 
-        if q_is_prob & (coin * q < p):
-            num_accept += 1
+        if BLOCK_VERIFICATION:
+            # Algorithm 2, Eqs. (4)-(5): https://arxiv.org/abs/2403.10444
+            prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
+            accept_prob = prefix_prob
+            if (step < NUM_SLOTS - 1) & (prefix_prob > 0.0) & (prefix_prob < 1.0):
+                residual_mass = 0.0
+                for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+                    v_offsets = v_start + tl.arange(0, BLOCK_V)
+                    mask = v_offsets < VOCAB_SIZE
+                    p_next = tl.load(
+                        TargetProbs
+                        + pid * stride_tp_b
+                        + step * stride_tp_s
+                        + v_offsets * stride_tp_v,
+                        mask=mask,
+                        other=0.0,
+                    )
+                    q_next = tl.load(
+                        DraftProbs
+                        + pid * stride_dp_b
+                        + step * stride_dp_s
+                        + v_offsets * stride_dp_v,
+                        mask=mask,
+                        other=0.0,
+                    )
+                    residual_mass += tl.sum(
+                        tl.maximum(prefix_prob * p_next - q_next, 0.0)
+                    )
+                accept_prob = residual_mass / (residual_mass + 1.0 - prefix_prob)
+            accepted = coin < accept_prob
+        else:
+            accepted = q_is_prob & (coin * q < p)
+
+        if accepted:
+            if BLOCK_VERIFICATION:
+                # A later accepted prefix also commits earlier rejected positions.
+                for skipped in range(num_accept + 1, step):
+                    skipped_token = tl.load(cand_ptr_base + skipped * stride_cand_s)
+                    tl.store(Predicts + last_accepted_global_idx, skipped_token)
+                    last_accepted_global_idx = tl.load(
+                        idx_ptr_base + skipped * stride_idx_s
+                    )
+                    tl.store(
+                        AcceptIndex + pid * stride_idx_b + skipped * stride_idx_s,
+                        last_accepted_global_idx,
+                    )
+                residual_scale = prefix_prob
+            num_accept = step
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
 
@@ -88,14 +138,14 @@ def speculative_sampling_classic_kernel(
             )
             last_accepted_global_idx = curr_global_idx
 
-            step += 1
-        else:
+        elif not BLOCK_VERIFICATION:
             continue_verifying = 0
+        step += 1
 
     tl.store(AcceptTokenNum + pid, num_accept)
 
     # Final Sampling
-    all_drafts_accepted = continue_verifying
+    all_drafts_accepted = num_accept == NUM_SLOTS - 1
     coin_final = tl.load(UniformSamplesFinal + pid)
     norm_sum = 0.0
 
@@ -123,7 +173,7 @@ def speculative_sampling_classic_kernel(
             # residual falls back to p. A comparison against NaN is false, so
             # the range test rejects it along with the infinities.
             q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
-            diff = p_val - q_val
+            diff = residual_scale * p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
 
         norm_sum += tl.sum(val)
@@ -151,7 +201,7 @@ def speculative_sampling_classic_kernel(
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Same guard as pass 1.
                 q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
-                diff = p_val - q_val
+                diff = residual_scale * p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
             block_cumsum = tl.cumsum(val, axis=0)
@@ -185,6 +235,8 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    *,
+    block_verification: bool = False,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
@@ -215,4 +267,5 @@ def chain_speculative_sampling_triton(
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
+        BLOCK_VERIFICATION=block_verification,
     )

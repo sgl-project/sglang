@@ -1,0 +1,255 @@
+import itertools
+import os
+import sys
+
+import pytest
+import torch
+
+from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_triton,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+
+
+def _verify(target, draft, candidates, coins, final_coins, *, block=True):
+    batch, slots = candidates.shape
+    # Exercise the global-index contract independently of the probability rows.
+    indices = (
+        torch.arange(batch * slots, device=target.device).flip(0).view(batch, slots)
+    )
+    predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device=target.device)
+    accepted = torch.full((batch, slots), -1, dtype=torch.int32, device=target.device)
+    lengths = torch.empty(batch, dtype=torch.int32, device=target.device)
+    chain_speculative_sampling_triton(
+        predicts,
+        accepted,
+        lengths,
+        candidates,
+        indices,
+        None,
+        None,
+        coins,
+        final_coins,
+        target,
+        draft,
+        1.0,
+        1.0,
+        True,
+        block_verification=block,
+    )
+    positions = torch.arange(slots, device=target.device)[None, :]
+    valid = positions <= lengths[:, None]
+    torch.testing.assert_close(accepted[valid].long(), indices[valid])
+    assert (accepted[~valid] == -1).all()
+    return lengths, predicts[indices]
+
+
+def _reference(target, draft, candidates, coins, final_coins, *, block):
+    batch, slots, _ = target.shape
+    lengths = torch.zeros(batch, dtype=torch.long)
+    prefix_prob = torch.ones(batch)
+    residual_scale = torch.ones(batch)
+    active = torch.ones(batch, dtype=torch.bool)
+    rows = torch.arange(batch)
+    for step in range(1, slots):
+        token = candidates[:, step]
+        ratio = target[rows, step - 1, token] / draft[rows, step - 1, token]
+        if block:
+            prefix_prob = (prefix_prob * ratio).clamp(max=1)
+            if step == slots - 1:
+                probability = prefix_prob
+            else:
+                mass = (
+                    (prefix_prob[:, None] * target[:, step] - draft[:, step])
+                    .clamp(min=0)
+                    .sum(-1)
+                )
+                probability = torch.where(
+                    prefix_prob == 1, 1, mass / (mass + 1 - prefix_prob)
+                )
+            accept = coins[:, step - 1] < probability
+            residual_scale = torch.where(accept, prefix_prob, residual_scale)
+        else:
+            active &= coins[:, step - 1] < ratio
+            accept = active
+        lengths = torch.where(accept, step, lengths)
+    weights = target[rows, lengths].clone()
+    rejected = lengths < slots - 1
+    weights[rejected] = (
+        residual_scale[rejected, None] * weights[rejected]
+        - draft[rows[rejected], lengths[rejected]]
+    ).clamp(min=0)
+    cdf = weights.cumsum(-1)
+    final = (cdf <= final_coins[:, None] * weights.sum(-1, keepdim=True)).sum(-1)
+    output = torch.full((batch, slots), -1, dtype=torch.int32)
+    for row in range(batch):
+        length = lengths[row]
+        output[row, :length] = candidates[row, 1 : length + 1]
+        output[row, length] = final[row]
+    return lengths, output
+
+
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099)])
+def test_matches_reference(steps, vocab, block):
+    torch.manual_seed(42)
+    batch = 7
+    target = torch.rand(batch, steps + 1, vocab).softmax(-1)
+    draft = torch.rand(batch, steps, vocab).softmax(-1)
+    candidates = torch.zeros(batch, steps + 1, dtype=torch.long)
+    if steps:
+        candidates[:, 1:] = torch.multinomial(draft.flatten(0, 1), 1).view(batch, steps)
+    coins = torch.rand(batch, steps + 1)
+    final_coins = torch.rand(batch)
+    expected_lengths, expected = _reference(
+        target, draft, candidates, coins, final_coins, block=block
+    )
+
+    # Non-contiguous probability, candidate and coin tensors must honor strides.
+    tensors = [
+        torch.stack([x, x], dim=-1).to(DEVICE)[..., 0]
+        for x in (target, draft, candidates, coins)
+    ]
+    lengths, output = _verify(*tensors, final_coins.to(DEVICE), block=block)
+    torch.testing.assert_close(lengths.cpu().long(), expected_lengths)
+    valid = torch.arange(steps + 1)[None, :] <= expected_lengths[:, None]
+    torch.testing.assert_close(output.cpu()[valid], expected[valid])
+
+
+def test_accepts_longer_prefix_after_rejection():
+    target = torch.tensor([[[1 / 3, 2 / 3]] * 3], device=DEVICE)
+    draft = torch.tensor([[[2 / 3, 1 / 3]] * 2], device=DEVICE)
+    candidates = torch.tensor([[0, 0, 1]], device=DEVICE)
+    coins = torch.full((1, 3), 0.9, device=DEVICE)
+    final_coins = torch.tensor([0.5], device=DEVICE)
+    lengths, output = _verify(target, draft, candidates, coins, final_coins)
+    assert lengths.item() == 2
+    assert output.tolist() == [[0, 1, 1]]
+    token_lengths, _ = _verify(
+        target, draft, candidates, coins, final_coins, block=False
+    )
+    assert token_lengths.item() == 0
+
+
+def test_scales_residual_at_last_accepted_prefix():
+    target = torch.tensor(
+        [[[0.25, 0.5, 0.25], [0.6, 0.3, 0.1], [1.0, 0.0, 0.0]]], device=DEVICE
+    )
+    draft = torch.tensor([[[0.5, 0.25, 0.25], [0.1, 0.1, 0.8]]], device=DEVICE)
+    lengths, output = _verify(
+        target,
+        draft,
+        torch.tensor([[0, 0, 2]], device=DEVICE),
+        torch.tensor([[0.2, 0.9, 0.0]], device=DEVICE),
+        torch.tensor([0.75], device=DEVICE),
+    )
+    assert lengths.item() == 1
+    # Scaled residual is [0.8, 0.2, 0]; unscaled residual would sample token 1.
+    assert output[0, :2].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("identical", [False, True])
+def test_zero_and_unit_prefix_probabilities(identical):
+    target = torch.tensor([[[1.0, 0.0]] * 4], device=DEVICE)
+    draft = target[:, :3] if identical else 1 - target[:, :3]
+    candidates = torch.full((1, 4), 0 if identical else 1, device=DEVICE)
+    lengths, output = _verify(
+        target,
+        draft,
+        candidates,
+        torch.zeros(1, 4, device=DEVICE),
+        torch.zeros(1, device=DEVICE),
+    )
+    assert lengths.item() == (3 if identical else 0)
+    assert (output[0, : lengths.item() + 1] == 0).all()
+
+
+@pytest.mark.parametrize("block,expected_length", [(False, 10 / 9), (True, 11 / 9)])
+def test_paper_example_distribution(block, expected_length):
+    torch.manual_seed(123)
+    batch = 65536
+    target_row = torch.tensor([1 / 3, 2 / 3], device=DEVICE)
+    draft_row = 1 - target_row
+    target = target_row.expand(batch, 3, 2)
+    draft = draft_row.expand(batch, 2, 2)
+    candidates = torch.cat(
+        [
+            torch.zeros(batch, 1, dtype=torch.long, device=DEVICE),
+            torch.multinomial(draft_row, batch * 2, replacement=True).view(batch, 2),
+        ],
+        dim=1,
+    )
+    lengths, output = _verify(
+        target,
+        draft,
+        candidates,
+        torch.rand(batch, 3, device=DEVICE),
+        torch.rand(batch, device=DEVICE),
+        block=block,
+    )
+    assert abs(lengths.float().mean().item() - expected_length) < 0.015
+    # Complete each variable-length output from the target before comparing joints.
+    completion = torch.multinomial(target_row, batch * 3, replacement=True).view(
+        batch, 3
+    )
+    output = torch.where(
+        torch.arange(3, device=DEVICE)[None, :] <= lengths[:, None], output, completion
+    )
+    for sequence in itertools.product(range(2), repeat=3):
+        observed = (
+            (output == torch.tensor(sequence, device=DEVICE)).all(-1).float().mean()
+        )
+        expected = target_row[list(sequence)].prod()
+        assert abs(observed.item() - expected.item()) < 0.008
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_context_dependent_output_distribution(block):
+    torch.manual_seed(456)
+    batch = 65536
+    target_initial = torch.tensor([0.4, 0.6], device=DEVICE)
+    draft_initial = torch.tensor([0.7, 0.3], device=DEVICE)
+    target_transition = torch.tensor([[0.25, 0.75], [0.65, 0.35]], device=DEVICE)
+    draft_transition = torch.tensor([[0.7, 0.3], [0.15, 0.85]], device=DEVICE)
+    first = torch.multinomial(draft_initial, batch, replacement=True)
+    second = torch.multinomial(draft_transition[first], 1).squeeze(1)
+    candidates = torch.stack([torch.zeros_like(first), first, second], dim=1)
+    target = torch.stack(
+        [
+            target_initial.expand(batch, -1),
+            target_transition[first],
+            target_transition[second],
+        ],
+        dim=1,
+    )
+    draft = torch.stack(
+        [draft_initial.expand(batch, -1), draft_transition[first]], dim=1
+    )
+    lengths, output = _verify(
+        target,
+        draft,
+        candidates,
+        torch.rand(batch, 3, device=DEVICE),
+        torch.rand(batch, device=DEVICE),
+        block=block,
+    )
+    for step in (1, 2):
+        completion = torch.multinomial(
+            target_transition[output[:, step - 1].long()], 1
+        ).squeeze(1)
+        output[:, step] = torch.where(step <= lengths, output[:, step], completion)
+    for sequence in itertools.product(range(2), repeat=3):
+        observed = (
+            (output == torch.tensor(sequence, device=DEVICE)).all(-1).float().mean()
+        )
+        a, b, c = sequence
+        expected = target_initial[a] * target_transition[a, b] * target_transition[b, c]
+        assert abs(observed.item() - expected.item()) < 0.008
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
