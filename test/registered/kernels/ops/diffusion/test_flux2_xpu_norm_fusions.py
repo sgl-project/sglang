@@ -108,6 +108,21 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         row = torch.randn(3072, device="xpu", dtype=torch.bfloat16)
         self.assertFalse(can_use_xpu_layernorm_modulate(x, row, row))
 
+    def test_swiglu_into_out_projection_input_matches_cat(self):
+        # The single-stream block writes SwiGLU straight into the to_out input
+        # buffer (row stride 1536 + 4608); it must equal the old cat input.
+        torch.manual_seed(4)
+        attn = torch.randn(1, 64, 1536, device="xpu", dtype=torch.bfloat16)
+        mlp_proj = torch.randn(1, 64, 9216, device="xpu", dtype=torch.bfloat16)
+        expected = torch.cat([attn, flux2._flux2_swiglu(mlp_proj)], dim=-1)
+
+        gemm_input = torch.full_like(expected, float("nan"))
+        returned = flux2._flux2_swiglu(mlp_proj, out=gemm_input[..., 1536:])
+        gemm_input[..., :1536].copy_(attn)
+
+        self.assertEqual(returned.data_ptr(), gemm_input[..., 1536:].data_ptr())
+        self.assertTrue(torch.equal(gemm_input, expected))
+
     def test_flux2_imports_without_intel_triton(self):
         # Regression: the kernel module imported `triton.language.extra.intel`
         # at module scope. The package facade resolves `_EXPORTS` eagerly on
