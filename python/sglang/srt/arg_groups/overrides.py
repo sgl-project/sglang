@@ -1715,7 +1715,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if cfg.enable_memory_saver:
         return False
-    if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+    if envs.SGLANG_CUSTOM_MEM_POOL.get() is not None:
         return False
     # Mooncake over EFA cannot register the CUDA VMM allocation used by
     # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
