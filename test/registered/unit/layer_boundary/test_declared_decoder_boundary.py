@@ -1973,7 +1973,7 @@ class TestTheFfnInputReduction(CustomTestCase):
             with self.subTest(is_plain_add=is_plain_add):
                 update = SimpleNamespace(is_plain_add=is_plain_add)
                 read = SimpleNamespace(
-                    update_and_read=lambda update, h, r, norm: (h, r)
+                    update_and_read=lambda update, h, r, norm, **read_kwargs: (h, r)
                 )
                 calls = []
                 with (
