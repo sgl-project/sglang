@@ -420,6 +420,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
             b"4",
             b"3",
+            struct.pack("2Q", 64, 4096),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -431,6 +432,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.agent_metadata, b"metadata")
         self.assertEqual(info.dst_kv_ptrs, kv_ptrs)
         self.assertEqual(info.dst_aux_ptrs, aux_ptrs)
+        self.assertEqual(info.dst_aux_item_lens, [64, 4096])
         self.assertEqual(info.dst_state_data_ptrs, state_ptrs)
         self.assertEqual(info.gpu_id, 3)
         self.assertEqual(info.decode_tp_size, 4)
@@ -467,6 +469,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         info = KVArgsRegisterInfo.from_zmq(msg)
 
         self.assertEqual(info.dst_state_data_ptrs, [])
+        self.assertIsNone(info.dst_aux_item_lens)
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
         self.assertEqual(info.dst_kv_item_lens, [256])
@@ -708,6 +711,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -731,7 +735,11 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
         mgr.kv_args = SimpleNamespace(
-            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+            engine_rank=0,
+            kv_data_ptrs=[0],
+            num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
@@ -759,6 +767,39 @@ class TestNixlTransferWorker(CustomTestCase):
         queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue)
+
+    def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
+        mgr = self._make_manager(21)
+        mgr.decode_kv_args_table["agent"].dst_aux_item_lens = [32]
+        healthy = self._make_manager(22)
+        healthy_req = healthy.transfer_infos[22]["agent"]
+        healthy_req.agent_name = "healthy"
+        mgr.transfer_infos[22] = {"healthy": healthy_req}
+        mgr.request_status[22] = KVPoll.WaitingForInput
+        mgr.decode_kv_args_table["healthy"] = healthy.decode_kv_args_table["agent"]
+        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.send_kv_status_message = MagicMock()
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.send_aux = MagicMock(return_value="aux_handle")
+        chunks = [self._make_chunk(room, [1], True) for room in (21, 22)]
+        queue = SimpleNamespace(get=MagicMock(side_effect=[*chunks, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(mgr.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", mgr.failure_records[21])
+        self.assertIsInstance(mgr.exceptions[21], ValueError)
+        self.assertEqual(mgr.request_status[22], KVPoll.Success)
+        mgr.send_kvcache.assert_called_once()
+        self.assertEqual(mgr.send_kvcache.call_args.args[0], "healthy")
+        mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[0], "healthy")
+        mgr.send_kv_status_message.assert_called_once()
+        self.assertEqual(
+            mgr.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
+        )
+        self.assertEqual(mgr._staging_outstanding.get(21, 0), 0)
 
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -814,6 +855,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -832,6 +874,8 @@ class TestNixlTransferWorker(CustomTestCase):
             kv_data_ptrs=[0x1000],
             page_size=4,
             num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 

@@ -137,7 +137,8 @@ def _commit_disagg_handoff(
             None,
             None,
             torch.tensor([1], dtype=torch.long),
-        )
+        ),
+        get_customized_info=lambda _: None,
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
