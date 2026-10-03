@@ -1727,6 +1727,17 @@ class HybridFp8NvFp4Config(Fp8Config):
             # Fall back to MXFP4 for MTP MoE layers
             if self.is_fp4_experts:
                 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+                # SM100 uses TRT-LLM; SM90 and SM120 have no TRT-LLM MoE kernel and use
+                # the CUTLASS MXFP8xMXFP4 method, matching Fp8Config.get_quant_method.
+                if get_platform().is_sm90 or get_platform().is_sm120:
+                    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+                        Mxfp4FlashinferCutlassMoEMethod,
+                    )
+
+                    return Mxfp4FlashinferCutlassMoEMethod(
+                        Fp8MoEMethod(self), prefix=prefix
+                    )
                 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                     Mxfp4FlashinferTrtllmMoEMethod,
                 )
