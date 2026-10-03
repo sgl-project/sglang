@@ -289,9 +289,9 @@ def refresh_deep_gemm_layout_memory_budget(
                 get_spec().speculative_moe_runner_backend
                 or get_exec().moe.moe_runner_backend
             )
-            moe_a2a_backend = (
-                get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
-            )
+            moe_a2a_backend = get_spec().speculative_moe_a2a_backend
+            if moe_a2a_backend in (None, "none"):
+                moe_a2a_backend = get_exec().moe.moe_a2a_backend
         else:
             moe_runner_backend = get_exec().moe.moe_runner_backend
             moe_a2a_backend = get_exec().moe.moe_a2a_backend

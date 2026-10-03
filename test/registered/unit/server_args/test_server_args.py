@@ -3146,12 +3146,15 @@ class TestDeepEPv2Args(CustomTestCase):
                 validate_deepep_v2_speculative_draft(args)
 
     def test_inherited_speculative_draft_backend_rejected(self):
-        args = self._args(
-            moe_runner_backend="deep_gemm",
-            speculative_algorithm="EAGLE",
-        )
-        with self.assertRaisesRegex(ValueError, "speculative draft backend"):
-            validate_deepep_v2_speculative_draft(args)
+        for draft_backend in (None, "none"):
+            with self.subTest(draft_backend=draft_backend):
+                args = self._args(
+                    moe_runner_backend="deep_gemm",
+                    speculative_algorithm="EAGLE",
+                    speculative_moe_a2a_backend=draft_backend,
+                )
+                with self.assertRaisesRegex(ValueError, "speculative draft backend"):
+                    validate_deepep_v2_speculative_draft(args)
 
     def test_ngram_does_not_inherit_a_draft_backend(self):
         args = self._args(

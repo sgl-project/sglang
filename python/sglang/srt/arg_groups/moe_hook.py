@@ -528,7 +528,7 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
     """Reject an explicit or inherited DeepEP v2 draft backend."""
     view = resolved_view(server_args)
     draft_backend = view.speculative_moe_a2a_backend
-    if draft_backend is None and view.speculative_algorithm:
+    if draft_backend in (None, "none") and view.speculative_algorithm:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)

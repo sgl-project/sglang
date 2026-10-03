@@ -1102,6 +1102,27 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(is_tbo_enabled())
         self.assertEqual(get_flags().moe.deepep_config, "")
 
+    def test_speculative_none_inherits_main_backend(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_speculative_moe_a2a_backend,
+            speculative_moe_a2a_backend_context,
+        )
+
+        for main_backend in ("none", "deepep", "ascend_fuseep"):
+            for draft_backend in (None, "none"):
+                with self.subTest(main=main_backend, draft=draft_backend):
+                    self._init(
+                        moe_a2a_backend=main_backend,
+                        speculative_moe_a2a_backend=draft_backend,
+                    )
+                    self.assertEqual(
+                        get_speculative_moe_a2a_backend().value, main_backend
+                    )
+                    with speculative_moe_a2a_backend_context():
+                        self.assertEqual(get_moe_a2a_backend().value, main_backend)
+                    self.assertEqual(get_moe_a2a_backend().value, main_backend)
+
     def test_speculative_swap_and_restore(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,
@@ -1114,11 +1135,11 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             moe_a2a_backend="deepep",
             moe_runner_backend="triton",
             speculative_moe_runner_backend="auto",
-            speculative_moe_a2a_backend="none",
+            speculative_moe_a2a_backend="ascend_fuseep",
         )
         with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.assertEqual(get_moe_runner_backend().name, "AUTO")
-            self.assertTrue(get_moe_a2a_backend().is_none())
+            self.assertTrue(get_moe_a2a_backend().is_ascend_fuseep())
             # MTP layers are unquantized: fp4 allgather is forced off
             self.assertTrue(get_flags().moe.disable_fp4_allgather)
             self.assertTrue(get_flags().moe.speculative_context)
