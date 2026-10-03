@@ -135,12 +135,53 @@ class TestDisallowedTokensLogitsProcessor(CustomTestCase):
         self.assertEqual(result[0, 4].item(), 1.0)
         self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
 
-    def test_mismatched_params_raises(self):
-        """Test that mismatched token_ids across batch items raises AssertionError."""
-        logits = torch.zeros(2, 10)
+    def test_different_token_ids_per_row(self):
+        """Two rows with different token_ids must not raise and must mask only their own."""
+        logits = torch.ones(2, 10)
         params = [{"token_ids": [1, 2]}, {"token_ids": [3, 4]}]
-        with self.assertRaises(AssertionError):
-            self.processor(logits, params)
+        result = self.processor(logits, params)
+        # Row 0 masks only its own disallowed ids.
+        self.assertTrue(torch.isinf(result[0, 1]) and result[0, 1] < 0)
+        self.assertTrue(torch.isinf(result[0, 2]) and result[0, 2] < 0)
+        # Row 1 masks only its own disallowed ids.
+        self.assertTrue(torch.isinf(result[1, 3]) and result[1, 3] < 0)
+        self.assertTrue(torch.isinf(result[1, 4]) and result[1, 4] < 0)
+        # A token banned in one row stays intact in the other unless banned there too.
+        self.assertEqual(result[0, 3].item(), 1.0)
+        self.assertEqual(result[0, 4].item(), 1.0)
+        self.assertEqual(result[1, 1].item(), 1.0)
+        self.assertEqual(result[1, 2].item(), 1.0)
+
+    def test_overlapping_token_ids_per_row(self):
+        """Shared and request-specific bans are both handled when token sets overlap."""
+        logits = torch.ones(2, 6)
+        params = [{"token_ids": [1, 2]}, {"token_ids": [2, 3]}]
+        result = self.processor(logits, params)
+        # Token 2 is banned in both rows.
+        self.assertTrue(torch.isinf(result[0, 2]) and result[0, 2] < 0)
+        self.assertTrue(torch.isinf(result[1, 2]) and result[1, 2] < 0)
+        # Token 1 is banned only in row 0.
+        self.assertTrue(torch.isinf(result[0, 1]) and result[0, 1] < 0)
+        self.assertEqual(result[1, 1].item(), 1.0)
+        # Token 3 is banned only in row 1.
+        self.assertTrue(torch.isinf(result[1, 3]) and result[1, 3] < 0)
+        self.assertEqual(result[0, 3].item(), 1.0)
+
+    def test_single_request_unchanged(self):
+        """A single request still behaves exactly as before."""
+        logits = torch.ones(1, 10)
+        params = [{"token_ids": [3]}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+        self.assertEqual(result[0, 0].item(), 1.0)
+        self.assertEqual(result[0, 4].item(), 1.0)
+
+    def test_empty_token_ids_is_noop(self):
+        """An empty token_ids set masks nothing and does not raise."""
+        logits = torch.ones(1, 5)
+        params = [{"token_ids": []}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(logits, result))
 
 
 # ThinkingBudgetLogitProcessor (using Qwen3 variant)
