@@ -1389,20 +1389,6 @@ class OpenAIServingChat(OpenAIServingBase):
         required_parsed_natively = glm_constraint
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
-                # By default only the named tool is rendered. With the switch every
-                # tool stays in the prompt, so a turn that names a tool still extends
-                # the prompt of the turns before it and reuses their prefix cache.
-                # The output constraint is built from tool_choice either way.
-                keep_tools = envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.get()
-                tools = [
-                    item.model_dump()
-                    for item in request.tools or []
-                    if keep_tools
-                    or item.function.name == request.tool_choice.function.name
-                ] or None
-            elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
@@ -1449,6 +1435,25 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+            if not isinstance(request.tool_choice, str):
+                # By default the Jinja template and the Inkling encoder render only
+                # the named tool. With the switch every tool stays in the prompt,
+                # so a turn that names a tool still extends the prompt of the turns
+                # before it and reuses their prefix cache. The switch needs an
+                # output constraint. Without one, the one-tool prompt is the only
+                # thing that selects the named tool.
+                keep_tools = (
+                    envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.get()
+                    and tool_call_constraint is not None
+                )
+                tools = [
+                    item.model_dump()
+                    for item in request.tools or []
+                    if keep_tools
+                    or item.function.name == request.tool_choice.function.name
+                ] or None
+            elif request.tools:
+                tools = [item.model_dump() for item in request.tools]
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
