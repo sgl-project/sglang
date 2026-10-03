@@ -628,6 +628,7 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,

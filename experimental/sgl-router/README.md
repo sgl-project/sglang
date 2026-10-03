@@ -161,7 +161,7 @@ all of it, and the `sgl_router_kv_bootstrap_*` series in
 ### Reorg routing
 
 Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
-and cache/session flags configure its policies; no separate file is required.
+and cache/session flags configure its policies; a bucket file is optional.
 
 ```bash
 sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
@@ -171,9 +171,21 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
 settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. Unsupported legacy options
-fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
-buckets and are not accepted on this path.
+with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
+an engine whose KV tokens plus the request's would exceed 95% of its capacity.
+Unsupported legacy options fail at startup.
+
+`--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
+bucket is plain or P/D, and each group may set its own engines, policy and
+admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+
+```json
+{"buckets": [{
+  "id": "default",
+  "prefill": {"worker_ids": ["p0", "p1"], "admission": {"max_kv_usage": 0.9}},
+  "decode": {"worker_ids": ["d0", "d1"], "admission": {"max_running_usage": 0.95}}
+}]}
+```
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 

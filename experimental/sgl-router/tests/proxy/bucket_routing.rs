@@ -67,6 +67,7 @@ fn build_app_context(
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: Some(bucket_config),
+            reorg_buckets: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,

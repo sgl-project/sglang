@@ -50,6 +50,7 @@ pub fn config() -> Config {
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
             affinity: None,

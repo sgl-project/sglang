@@ -265,6 +265,7 @@ mod tests {
             filters: vec![FilterKind::Overloaded],
             max_in_flight: Some(2),
             min_prefix_share: None,
+            max_kv_usage: None,
         });
         let reg = build_registry_with_defaults(&cfg).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
@@ -303,6 +304,7 @@ mod tests {
             filters: vec![FilterKind::PrefixCache],
             max_in_flight: None,
             min_prefix_share: Some(0.6),
+            max_kv_usage: None,
         });
         assert!(
             built(&cfg).unwrap().needs_request_tokens(),
@@ -313,6 +315,7 @@ mod tests {
             filters: vec![FilterKind::PrefixCache],
             max_in_flight: None,
             min_prefix_share: Some(0.6),
+            max_kv_usage: None,
         });
         let filter = build_filter(
             FilterKind::PrefixCache,
@@ -343,6 +346,7 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
@@ -487,6 +491,7 @@ mod tests {
             filters: vec![FilterKind::Overloaded],
             max_in_flight: Some(2),
             min_prefix_share: None,
+            max_kv_usage: None,
         });
 
         let registry = build_registry_with_defaults(&cfg)
@@ -509,6 +514,7 @@ mod tests {
                 filters: vec![FilterKind::Overloaded],
                 max_in_flight,
                 min_prefix_share: None,
+                max_kv_usage: None,
             });
 
             let error = build_registry_with_defaults(&cfg)
@@ -525,6 +531,7 @@ mod tests {
             filters: vec![FilterKind::Overloaded],
             max_in_flight: Some(2),
             min_prefix_share: None,
+            max_kv_usage: None,
         });
 
         let error = build_registry_with_defaults(&cfg)

@@ -255,6 +255,7 @@ mod tests {
                 decode_policy: DecodePolicyKind::PowerOfTwo,
                 dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
