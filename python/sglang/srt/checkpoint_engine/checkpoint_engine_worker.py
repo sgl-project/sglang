@@ -124,8 +124,24 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         return get_device_module().current_device()
 
     def get_model_loader(self) -> Callable:
-        """Get the model weight loader function."""
-        return self.model_runner.model.load_weights
+        """Get the model weight loader function.
+
+        An IPC update opens no weight-update session, yet writes checkpoint-form tensors
+        into weights postprocessing already rewrote in place (gfx94x block FP8 is FNUZ),
+        so each load restores that form first; once restored it is a no-op.
+        """
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        model = self.model_runner.model
+
+        def load_weights(weights):
+            target_device = torch.device(
+                get_device(), get_device_module().current_device()
+            )
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
+            return model.load_weights(weights)
+
+        return load_weights
 
     def get_post_hook(self) -> Optional[Callable]:
         """Get the post-processing hook after weight loading."""

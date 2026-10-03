@@ -208,6 +208,9 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # Postprocessing rewrote some weights in place (gfx94x block FP8 is FNUZ);
+            # the loader writes checkpoint-form tensors, so restore that form first.
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
