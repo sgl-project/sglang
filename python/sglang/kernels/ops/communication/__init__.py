@@ -10,6 +10,9 @@ from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 __all__ = []
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.communication import cake as _cake  # noqa: E402, F401
+
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn in [
