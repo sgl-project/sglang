@@ -125,6 +125,7 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    should_auto_prefetch_checkpoints,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
@@ -632,6 +633,8 @@ class DefaultModelLoader(BaseModelLoader):
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints
+            if configured_prefetch is None:
+                configured_prefetch = should_auto_prefetch_checkpoints(hf_weights_files)
             start_iterator_prefetch = (
                 configured_prefetch and not startup_prefetch_started
             )
