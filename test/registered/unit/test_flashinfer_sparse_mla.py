@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+    _FLASHINFER_EXTRA_PAGE_BLOCK_SIZES,
+    _FLASHINFER_PREFILL_TOPK,
+    _flashinfer_covers,
     _validate_flashinfer_sparse_mla_backend,
     flashinfer_sparse_mla_forward,
 )
@@ -117,6 +120,66 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
         self.assertIn("model_arch='DeepseekV3ForCausalLM'", message)
         self.assertIn("sm_major=12", message)
         self.assertIn("kv_cache_dtype=torch.float8_e4m3fn", message)
+
+
+class TestFlashInferSM120PrefillEnvelope(unittest.TestCase):
+    """``_flashinfer_covers`` mirrors the C++ prefill instantiation envelope.
+
+    FlashInfer's ``sparse_mla_prefill_dispatch`` returns false outside it and
+    aborts the engine, so the SM120 wrapper must divert those calls to the
+    Triton implementation by itself.
+    """
+
+    @staticmethod
+    def _q(num_tokens):
+        return torch.zeros(num_tokens, 8, 512, dtype=torch.bfloat16)
+
+    @staticmethod
+    def _cache(pages, page_block_size):
+        if page_block_size is None:
+            return torch.zeros(pages, 584, dtype=torch.uint8)
+        return torch.zeros(pages, page_block_size, 1, 584, dtype=torch.uint8)
+
+    def test_decode_is_always_covered(self):
+        # Decode goes through the Python decode dispatch table, which only
+        # takes (num_heads, topk) pairs this model instantiates.
+        indices = torch.zeros(64, 1024, dtype=torch.int32)
+        self.assertTrue(
+            _flashinfer_covers(self._q(64), indices, self._cache(4, 1024), indices)
+        )
+
+    def test_prefill_topk_envelope(self):
+        extra = self._cache(4, 64)
+        for topk in sorted(_FLASHINFER_PREFILL_TOPK):
+            with self.subTest(topk=topk):
+                indices = torch.zeros(128, topk, dtype=torch.int32)
+                self.assertTrue(_flashinfer_covers(self._q(128), indices, None, None))
+        indices = torch.zeros(128, 384, dtype=torch.int32)
+        self.assertFalse(_flashinfer_covers(self._q(128), indices, None, None))
+
+    def test_dual_cache_page_block_envelope(self):
+        indices = torch.zeros(128, 128, dtype=torch.int32)
+        for pbs in sorted(_FLASHINFER_EXTRA_PAGE_BLOCK_SIZES):
+            with self.subTest(extra_page_block_size=pbs):
+                self.assertTrue(
+                    _flashinfer_covers(
+                        self._q(128), indices, self._cache(4, pbs), indices
+                    )
+                )
+        # DeepSeek-V4.1's hierarchical candidate pool pages at 128 and 256.
+        for pbs in (128, 256):
+            with self.subTest(extra_page_block_size=pbs):
+                self.assertFalse(
+                    _flashinfer_covers(
+                        self._q(128), indices, self._cache(4, pbs), indices
+                    )
+                )
+
+    def test_malformed_extra_cache_is_not_covered(self):
+        indices = torch.zeros(128, 128, dtype=torch.int32)
+        self.assertFalse(
+            _flashinfer_covers(self._q(128), indices, self._cache(4, None), indices)
+        )
 
 
 if __name__ == "__main__":
