@@ -1149,11 +1149,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         (always >= the exact compact len); consumers only need an upper bound.
         """
         assert self.draft_window_size is not None
+        # The value filled here must be an upper bound on the DEVICE kv length,
+        # which for the draft is (compact prefix + verify block). This mirrors
+        # the non-compact path in forward_batch_generation, which does
+        # seq_lens_cpu.copy_(seq_lens) followed by .add_(block_size). The block
+        # has to be added AFTER the clamp: clamping to (window + block_size)
+        # would still come out block_size too small whenever the prefix is
+        # shorter than the window.
         bound = int(self.draft_window_size) + (
             self.page_size if self.page_size > 1 else 0
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+        out.add_(int(self.block_size))
 
     def _fill_compact_seq_lens_cpu_bound(
         self,
@@ -1171,8 +1179,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif nxt_kv_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Last resort: the legacy blocking D2H copy.
+            # Last resort: the legacy blocking D2H copy. draft_prefix_lens is
+            # the compact prefix only, so the verify block is added here too.
             out.copy_(draft_prefix_lens)
+            out.add_(int(self.block_size))
 
     def _rebuild_compact_draft_cache(
         self,
