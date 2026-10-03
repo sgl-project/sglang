@@ -1060,40 +1060,49 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return loaded_params
 
     lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+        r"^language_model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:experts|down_proj|gate_up_proj))"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
     def get_hidden_dim(self, module_name, layer_idx):
+        # LoRA buffer dims must match the per-layer shapes that Gemma4DecoderLayer /
+        # Gemma4Attention build from the SGLang-normalized text config, where the
+        # base attributes describe full-attention layers and `swa_*` overrides
+        # describe sliding-window layers (see hf_transformers/config.py).
+        config = self.config.text_config
+        if config.layer_types[layer_idx] == "full_attention":
+            head_dim = config.head_dim
+            num_heads = config.num_attention_heads
+            num_kv_heads = config.num_key_value_heads
+        else:
+            head_dim = getattr(config, "swa_head_dim", config.head_dim)
+            num_heads = getattr(
+                config, "swa_num_attention_heads", config.num_attention_heads
+            )
+            num_kv_heads = getattr(
+                config, "swa_num_key_value_heads", config.num_key_value_heads
+            )
+
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
+        is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        use_double_wide_mlp = (
+            getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
+        )
+        intermediate_size = config.intermediate_size * (2 if use_double_wide_mlp else 1)
+
         # return input_dim, output_dim
         if module_name == "qkv_proj":
-            return (
-                self.config.hidden_size,
-                self.config.head_dim
-                * (
-                    self.config.num_attention_heads
-                    + self.config.num_key_value_heads * 2
-                ),
-            )
+            return config.hidden_size, head_dim * (num_heads + num_kv_heads * 2)
         elif module_name == "o_proj":
-            return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
-            )
+            return head_dim * num_heads, config.hidden_size
         elif module_name == "gate_up_proj":
-            assert len(set(self.config.intermediate_size)) == 1, (
-                "Currently SGLang requires uniform intermediate size for all layers. "
-                "Please file an issue if you need support for non-uniform intermediate sizes."
-            )
-            return self.config.hidden_size, self.config.intermediate_size[0] * 2
+            return config.hidden_size, intermediate_size * 2
         elif module_name == "down_proj":
-            assert len(set(self.config.intermediate_size)) == 1, (
-                "Currently SGLang requires uniform intermediate size for all layers. "
-                "Please file an issue if you need support for non-uniform intermediate sizes."
-            )
-            return self.config.intermediate_size[0], self.config.hidden_size
+            return intermediate_size, config.hidden_size
         else:
             raise NotImplementedError()
 
