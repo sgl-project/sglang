@@ -406,6 +406,8 @@ class ExaoneMoEAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -532,7 +534,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         # Fully Connected
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, forward_batch)
         return ffn_exit.finish(hidden_states)
 
 
