@@ -80,7 +80,15 @@ try:
             sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
         )
         gate_scal = sparse_logits.vals.flatten()[combine_indx]
-        return ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act
+        topk_ids = sparse_logits.indx  # codespell:ignore indx
+        return (
+            ragged_metadata,
+            gather_indx,
+            scatter_indx,
+            gate_scal,
+            n_expts_act,
+            topk_ids,
+        )
 
 except ImportError:
     pass
@@ -712,10 +720,16 @@ class TopK(BaseFusedOp):
                 scatter_idx,
                 gate_scal,
                 n_expts_act,
+                topk_ids,
             ) = routing(
                 router_logits,
                 self.topk_config.top_k,
                 sm_first=not self.topk_config.renormalize,
+            )
+            capture_routed_experts_if_allowed(
+                self.topk_config,
+                self.layer_id,
+                topk_ids,
             )
             return TritonKernelTopKOutput(
                 a_ragged_metadata,
@@ -725,6 +739,15 @@ class TopK(BaseFusedOp):
                 n_expts_act,
             )
         elif output_format == TopKOutputFormat.BYPASSED:
+            if (
+                get_exec().features.enable_return_routed_experts
+                and self.topk_config.allow_routed_experts_capture
+            ):
+                raise RuntimeError(
+                    "--enable-return-routed-experts is not supported when the "
+                    "MoE runner uses BYPASSED top-k because routing is performed "
+                    "inside the fused MoE kernel and expert IDs are not exposed."
+                )
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
