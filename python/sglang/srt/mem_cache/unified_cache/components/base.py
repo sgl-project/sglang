@@ -64,6 +64,15 @@ class EvictLayer(IntFlag):
 
 
 @dataclasses.dataclass(frozen=True)
+class InternalStateBackup:
+    """Pause eviction for a host backup before freeing internal device state."""
+
+    node_id: NodeId
+    # Host capacity required by the backup, in this component's pool units.
+    num_tokens: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PrepareLoadBackResult:
     """Outcome of prepare_load_back; default = nothing to prepare."""
 
@@ -522,11 +531,12 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one eviction step and return a device leaf, if selected.
+    ) -> NodeId | InternalStateBackup | None:
+        """Return a device leaf, an internal backup request, or no selection.
 
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
+        Backup requests leave device state intact until the core resumes eviction.
         """
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
@@ -552,8 +562,8 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance the walk by at most one allocator-relevant mutation."""
+    ) -> NodeId | InternalStateBackup | None:
+        """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
 
     @abstractmethod

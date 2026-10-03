@@ -53,9 +53,8 @@ class TestDSV4FlashFP8H200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--speculative-algorithm",
@@ -114,9 +113,8 @@ class TestDSV4FlashFP8H200MegaMoE(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--moe-runner-backend",
@@ -141,10 +139,11 @@ class TestDSV4FlashFP8H200MegaMoE(
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
                 # INVARIANT: this per-rank cap MUST equal
-                # chunked_prefill_size / dp_size (= 8192 / 4 = 2048), the per-rank
-                # prefill bound under --enable-dp-attention. If you change
-                # --chunked-prefill-size or --dp above, update this to match —
-                # otherwise MegaMoE falls back whenever a prefill chunk exceeds it.
+                # chunked_prefill_size / attn_dp_size (= 8192 / 4 = 2048), the
+                # per-rank prefill bound under attention DP. If you change
+                # --chunked-prefill-size or --attn-dp-size above, update this
+                # to match — otherwise MegaMoE falls back whenever a prefill
+                # chunk exceeds it.
                 "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "2048",
             },
         )

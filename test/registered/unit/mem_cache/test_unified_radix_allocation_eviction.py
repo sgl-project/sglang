@@ -553,7 +553,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         allocator = object.__new__(TokenToKVPoolAllocator)
