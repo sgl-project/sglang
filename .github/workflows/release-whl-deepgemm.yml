@@ -25,6 +25,11 @@ on:
         type: boolean
         required: false
         default: false
+      skip_tests:
+        description: "Skip the GPU test suite (publishes untested wheels)"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
@@ -98,6 +103,7 @@ jobs:
 
   test-cu130:
     needs: build-cu130-matrix
+    if: ${{ !inputs.skip_tests }}
     strategy:
       fail-fast: false
       matrix:
@@ -218,7 +224,10 @@ jobs:
           "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh" --release
 
   release-cu130:
-    if: ${{ !inputs.validation_only }}
+    if: |
+      !cancelled() && !inputs.validation_only &&
+      needs.build-cu130-matrix.result == 'success' &&
+      (needs.test-cu130.result == 'success' || needs.test-cu130.result == 'skipped')
     needs: [build-cu130-matrix, test-cu130]
     runs-on: ubuntu-latest
     steps:
@@ -237,6 +246,12 @@ jobs:
           path: dist-pypi/
           merge-multiple: true
           pattern: deepgemm-pypi-cuda13.0-*
+
+      - name: Record that the GPU test suite was skipped
+        if: ${{ inputs.skip_tests }}
+        run: |
+          echo "Releasing v${{ inputs.version }} with the GPU test suite skipped." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload to PyPI
         run: |
@@ -266,5 +281,5 @@ jobs:
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"
           git add -A
-          git commit -m "update sgl-deep-gemm whl index for v${{ inputs.version }}"
+          git commit -m "update sgl-deep-gemm whl index for v${{ inputs.version }}${{ inputs.skip_tests && ' (GPU tests skipped)' || '' }}"
           git push
