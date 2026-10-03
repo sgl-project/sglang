@@ -193,14 +193,13 @@ class StreamingSession:
         slot = self.slots.get(session_id)
         if isinstance(req.finished_reason, FINISH_ABORT):
             if slot is not None and slot.kv is req.kv:
-                # The turn ran on the slot's record, which the caller frees:
-                # drop the slot with its tree lock and mamba state. The session
-                # keeps its last finished request and re-prefills next turn.
+                # The turn ran on the slot's record, which the caller releases
+                # (row and mamba state): drop the slot with its tree lock. The
+                # session keeps its last finished request and re-prefills next turn.
                 del self.slots[session_id]
                 if slot.last_node is not None:
                     skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
                     self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
-                self._free_slot_mamba(slot)
             req.session.abort_req()
             return False
 
