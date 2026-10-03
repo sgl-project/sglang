@@ -403,6 +403,14 @@ class _CakeContigFp8Route:
             self._retired_arenas.append(arena)
             rows = max(m, arena.rows)
         h = n // 2
+        if device.type == "cuda":
+            # Give the long-lived arena its own allocator segments instead of
+            # carving it out of cached large blocks: a 1.4 GB arena split out
+            # of a cached multi-GB block fragments the pool enough that a later
+            # multi-GiB request (DeepGEMM's masked path during graph capture)
+            # fails while ~20 GiB are reserved but unallocated.  Arenas are
+            # allocated rarely (once per (device, K, N), never inside capture).
+            torch.cuda.empty_cache()
         self._arena_serial += 1
         arena = _CakeArena(
             serial=self._arena_serial,
