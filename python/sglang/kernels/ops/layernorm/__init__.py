@@ -473,15 +473,11 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         out_weight: Optional[torch.Tensor],
         eps: float,
         scales: tuple[float, float],
-        combine_in_fp32: bool,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         if sandwich_weight is not None:
             branch = _RMSNORM.forward_native(branch, sandwich_weight, eps)
         residual = residual.to(branch.dtype)
-        dtype = branch.dtype
-        if combine_in_fp32:
-            branch, residual = branch.float(), residual.float()
-        combined = (branch * scales[0] + residual * scales[1]).to(dtype)
+        combined = branch * scales[0] + residual * scales[1]
         out = (
             _RMSNORM.forward_native(combined, out_weight, eps)
             if out_weight is not None
@@ -497,32 +493,19 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         out_weight: Optional[torch.Tensor],
         eps: float,
         scales: tuple[float, float],
-        combine_in_fp32: bool,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         import torch
 
         if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
             return self.forward_native(
-                branch,
-                residual,
-                sandwich_weight,
-                out_weight,
-                eps,
-                scales,
-                combine_in_fp32,
+                branch, residual, sandwich_weight, out_weight, eps, scales
             )
         from sglang.kernels.ops.layernorm.beam_fused import (
             fused_sandwich_residual_rmsnorm,
         )
 
         return fused_sandwich_residual_rmsnorm(
-            branch,
-            residual,
-            sandwich_weight,
-            out_weight,
-            eps,
-            *scales,
-            combine_in_fp32,
+            branch, residual, sandwich_weight, out_weight, eps, *scales
         )
 
 

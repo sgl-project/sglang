@@ -13,10 +13,9 @@
 # ==============================================================================
 """Beam sandwich RMSNorm, depth-scaled residual, and next RMSNorm in one launch.
 
-The post-norm and combined stream round to the activation dtype. FP32 combine
-rounds each product before adding; activation-dtype combine also rounds both
-products to the activation dtype. Norm reduction differences can be amplified
-by residual cancellation, so the result is not guaranteed within one ULP.
+The post-norm, both scaled operands, and the combined stream round to the
+activation dtype. Norm reduction differences can be amplified by residual
+cancellation, so the result is not guaranteed within one ULP.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -48,7 +46,6 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_SANDWICH: tl.constexpr,
     HAS_OUT_NORM: tl.constexpr,
-    COMBINE_IN_FP32: tl.constexpr,
 ):
     row = tl.program_id(axis=0).to(tl.int64)
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -69,15 +66,9 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     )
     # `depth_scaled_residual` casts the residual to the branch dtype first.
     residual = residual.to(act_dtype).to(tl.float32)
-    if COMBINE_IN_FP32:
-        # Explicit rounding also prevents ptxas from fusing packed FP32 ops.
-        xs = libdevice.mul_rn(x, x_scale)
-        rs = libdevice.mul_rn(residual, residual_scale)
-        combined = libdevice.add_rn(xs, rs).to(act_dtype)
-    else:
-        xs = (x * x_scale).to(act_dtype).to(tl.float32)
-        rs = (residual * residual_scale).to(act_dtype).to(tl.float32)
-        combined = (xs + rs).to(act_dtype)
+    xs = (x * x_scale).to(act_dtype).to(tl.float32)
+    rs = (residual * residual_scale).to(act_dtype).to(tl.float32)
+    combined = (xs + rs).to(act_dtype)
     out_offsets = row * hidden_dim + offsets
     tl.store(combined_ptr + out_offsets, combined, mask=mask)
 
@@ -96,7 +87,6 @@ def fused_sandwich_residual_rmsnorm(
     eps: float,
     x_scale: float,
     residual_scale: float,
-    combine_in_fp32: bool,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Return `(next_norm(combined), combined)`; the first is None without `out_weight`.
 
@@ -126,7 +116,6 @@ def fused_sandwich_residual_rmsnorm(
         eps,
         x_scale,
         residual_scale,
-        combine_in_fp32,
         out,
         combined,
     )
@@ -142,7 +131,6 @@ def _fused_sandwich_residual_rmsnorm(
     eps: float,
     x_scale: float,
     residual_scale: float,
-    combine_in_fp32: bool,
     out: Optional[torch.Tensor],
     combined: torch.Tensor,
 ) -> None:
@@ -169,7 +157,6 @@ def _fused_sandwich_residual_rmsnorm(
         BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
         HAS_SANDWICH=sandwich_weight is not None,
         HAS_OUT_NORM=out_weight is not None,
-        COMBINE_IN_FP32=combine_in_fp32,
         num_warps=8,
         enable_fp_fusion=False,
     )

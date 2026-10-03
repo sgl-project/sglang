@@ -105,8 +105,7 @@ def test_gemma_fused_add_rmsnorm(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 64, 1024])
-@pytest.mark.parametrize("combine_in_fp32", [False, True])
-def test_beam_sandwich_residual_rmsnorm(dtype, rows, combine_in_fp32):
+def test_beam_sandwich_residual_rmsnorm(dtype, rows):
     from sglang.kernels.ops.layernorm import _BEAM_SANDWICH_RESIDUAL_RMSNORM as op
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.models.beam import depth_scaled_residual
@@ -126,7 +125,7 @@ def test_beam_sandwich_residual_rmsnorm(dtype, rows, combine_in_fp32):
         )
         * 3
     )
-    args = (branch, residual, post, nxt, 1e-6, (0.25, 0.968), combine_in_fp32)
+    args = (branch, residual, post, nxt, 1e-6, (0.25, 0.968))
     expected_out, expected_combined = op.forward_native(*args)
     for backend in _eligible(op):
         out, combined = op(*args, backend=backend)
@@ -139,16 +138,9 @@ def test_beam_sandwich_residual_rmsnorm(dtype, rows, combine_in_fp32):
             next_norm = RMSNorm(5120, eps=1e-6).cuda().to(dtype)
             post_norm.weight.data.copy_(post)
             next_norm.weight.data.copy_(nxt)
-            if combine_in_fp32:
-                # Beam's `forward` has no FP32 combine on `dev`; this is the
-                # legacy serving arithmetic the kernel branch reproduces.
-                serving_combined = (
-                    post_norm(branch).float() * 0.25 + residual.float() * 0.968
-                ).to(dtype)
-            else:
-                serving_combined = depth_scaled_residual(
-                    post_norm(branch), residual, (0.25, 0.968)
-                )
+            serving_combined = depth_scaled_residual(
+                post_norm(branch), residual, (0.25, 0.968)
+            )
             assert (combined != serving_combined).float().mean().item() < 2e-3
             torch.testing.assert_close(
                 combined, serving_combined, atol=1e-6, rtol=2**-7
@@ -167,7 +159,7 @@ def test_beam_residual_cancellation(norms):
     post = torch.full((5120,), 5, device="cuda", dtype=branch.dtype) if norms else None
     nxt = torch.ones_like(post) if norms else None
     scales = (1 / math.sqrt(26), 5 / math.sqrt(26)) if norms else (0.5, 0.5)
-    args = (branch, residual, post, nxt, 1e-6, scales, norms)
+    args = (branch, residual, post, nxt, 1e-6, scales)
     expected = op.forward_native(*args)
     assert torch.count_nonzero(expected[1]).item() == 0
     for backend in _eligible(op):
@@ -192,7 +184,6 @@ def test_beam_custom_op_contracts(with_norms):
             1e-6,
             0.25,
             0.968,
-            True,
             torch.empty_like(x) if with_norms else None,
             torch.empty_like(x),
         ),
@@ -216,7 +207,6 @@ def test_beam_compiled_rounding(forced_backend):
         weight,
         1e-6,
         (1 / math.sqrt(26), 5 / math.sqrt(26)),
-        True,
     )
     expected = op.forward_native(*args)
     op(*args)  # Warm backend imports before full-graph capture.

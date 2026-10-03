@@ -456,7 +456,6 @@ class BeamDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm.weight,
             self.rms_norm_eps,
             self.attn_residual_scales,
-            False,  # combine_in_fp32: `forward` combines in the activation dtype.
         )
         mlp = self.mlp(normed)
         return self.sandwich_residual_norm(
@@ -466,7 +465,6 @@ class BeamDecoderLayer(nn.Module):
             next_norm_weight,
             self.rms_norm_eps,
             self.mlp_residual_scales,
-            False,  # combine_in_fp32: `forward` combines in the activation dtype.
         )
 
 
