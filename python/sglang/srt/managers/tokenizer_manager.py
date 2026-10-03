@@ -868,6 +868,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
+            and self._request_has_grammar(obj)
+            and getattr(self.server_args, "speculative_algorithm", None) == "DSPARK"
+            and getattr(self.server_args, "tp_size", 1) > 1
+        ):
+            raise ValueError(
+                "Grammar-based generation is not supported with DSPARK speculative decoding "
+                "when tp_size > 1. Please disable DSPARK or use TP=1 to avoid deadlocks."
+            )
+
+        if (
+            isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
             and not get_serving().enable_strict_thinking
         ):
