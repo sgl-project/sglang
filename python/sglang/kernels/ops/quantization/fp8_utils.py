@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import (
@@ -48,3 +49,44 @@ def fp8_dtype_to_triton(
     if fp8_dtype == torch.float8_e5m2:
         return tl.float8e5
     raise ValueError(f"Unsupported FP8 dtype: {fp8_dtype}")
+
+
+@triton.jit
+def load_fp8_e4m3fn(raw_ptr, offsets, mask, out_dtype: tl.constexpr):
+    """Decode OCP e4m3fn bytes without using the unsupported e4m3nv type."""
+    raw = tl.load(raw_ptr + offsets, mask=mask, other=0).to(tl.int32)
+    sign = (raw & 0x80) << 8
+    exponent = (raw >> 3) & 0xF
+    mantissa = raw & 0x7
+    normal_bits = ((exponent + 120) << 7) | (mantissa << 4) | sign
+    subnormal_bits = (
+        tl.where(
+            mantissa == 0,
+            0,
+            tl.where(
+                mantissa == 1,
+                0x3B00,
+                tl.where(
+                    mantissa == 2,
+                    0x3B80,
+                    tl.where(
+                        mantissa == 3,
+                        0x3BC0,
+                        tl.where(
+                            mantissa == 4,
+                            0x3C00,
+                            tl.where(
+                                mantissa == 5,
+                                0x3C20,
+                                tl.where(mantissa == 6, 0x3C40, 0x3C60),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        | sign
+    )
+    bits = tl.where(exponent == 0, subnormal_bits, normal_bits)
+    bits = tl.where((exponent == 15) & (mantissa == 7), 0x7FC0 | sign, bits)
+    return (bits << 16).to(tl.float32, bitcast=True).to(out_dtype)
