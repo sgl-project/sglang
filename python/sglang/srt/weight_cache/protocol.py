@@ -4,14 +4,17 @@
 Defines CacheConfig for validation and socket message protocol helpers.
 """
 
+import ast
+import glob
 import hashlib
 import json
 import logging
 import os
 import pickle
 import signal
+import socket
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import msgspec
 
@@ -325,19 +328,41 @@ def get_ready_path(device_uuid: str) -> str:
     return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, device_uuid)
 
 
-def _read_ready_pid(ready_path: str) -> Optional[int]:
-    """Read the daemon PID from a .ready file. Returns None if unreadable."""
+def read_ready_file(ready_path: str) -> Optional[Dict[str, Any]]:
+    """Parse a daemon ``.ready`` file into a dict, or return None if unreadable."""
     try:
+        info: Dict[str, Any] = {}
         with open(ready_path) as f:
             for line in f:
-                if line.startswith("pid="):
-                    return int(line.strip().split("=", 1)[1])
+                key, sep, value = line.strip().partition("=")
+                if not sep:
+                    continue
+                info[key] = _parse_ready_value(key, value)
+        return info or None
     except (OSError, ValueError):
-        pass
-    return None
+        return None
 
 
-def _is_pid_alive(pid: int) -> bool:
+def _parse_ready_value(key: str, value: str) -> Any:
+    if key == "pid":
+        return int(value)
+    if key == "config":
+        # The daemon writes ``config=str(dict)``; recover the dict so --json
+        # consumers get structured data. A malformed line stays a raw string.
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value
+    return value
+
+
+def _read_ready_pid(ready_path: str) -> Optional[int]:
+    """Read just the daemon PID from a .ready file. Returns None if unreadable."""
+    info = read_ready_file(ready_path)
+    return info.get("pid") if info else None
+
+
+def is_pid_alive(pid: int) -> bool:
     """Check whether a process is still running."""
     try:
         os.kill(pid, 0)
@@ -366,7 +391,7 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
 
     pid = _read_ready_pid(ready_path) if os.path.exists(ready_path) else None
 
-    if pid is not None and _is_pid_alive(pid):
+    if pid is not None and is_pid_alive(pid):
         if not force:
             raise RuntimeError(
                 f"Weight cache daemon for GPU {device_uuid} is already running "
@@ -387,3 +412,70 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
         if os.path.exists(path):
             os.unlink(path)
             logger.info(f"Removed stale daemon file: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Daemon discovery + status query (used by the `status` CLI / monitoring)
+# ---------------------------------------------------------------------------
+# Schema version of the `status` reply; the daemon outlives CLI upgrades. Bump
+# when a StatusReply field is renamed, removed, or changes meaning; adding a
+# field needs no bump. test_weight_cache_status.py pins the field set per version.
+STATUS_VERSION = 1
+
+
+class StatusReply(msgspec.Struct, frozen=True, kw_only=True):
+    """The daemon's `status` reply. The CLI reads it as a plain dict so an older
+    daemon's reply still renders; a field the CLI shows must also be rendered in
+    status.py."""
+
+    status: str = "ok"
+    status_version: int = STATUS_VERSION
+    pid: int
+    gpu_id: int
+    socket_path: str
+    ready_path: str
+    config: Optional[Dict[str, Any]]
+    transport_backend: Optional[str]
+    num_tensors: int
+    preloaded_weights_bytes: int
+    started_at: float
+    loaded_at: Optional[float]
+    load_seconds: Optional[float]
+    uptime_seconds: float
+    serve_count: int
+    mismatch_count: int
+    last_served_at: Optional[float]
+    live_client_count: int
+    live_client_pids: List[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return msgspec.structs.asdict(self)
+
+
+def iter_daemon_device_uuids() -> List[str]:
+    """Discover every weight-cache daemon on this host from its ready files."""
+    pattern = _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, "*")
+    infos = (read_ready_file(path) for path in sorted(glob.glob(pattern)))
+    return [info["device_uuid"] for info in infos if info and "device_uuid" in info]
+
+
+def query_daemon_status(socket_path: str, *, timeout: float = 5.0) -> Dict[str, Any]:
+    """Ask a daemon for its status snapshot over its Unix socket.
+
+    Returns the daemon's reply dict as-is, including an ``{"status": "error"}``
+    reply from a daemon too old to know the request; the caller decides how to
+    present that. Raises OSError when the socket does not answer.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(socket_path)
+        send_msg(sock, {"type": "status"})
+        resp = recv_msg(sock)
+    finally:
+        sock.close()
+    if not isinstance(resp, dict):
+        raise ValueError(
+            f"daemon at {socket_path} returned an unexpected reply: {resp!r}"
+        )
+    return resp
