@@ -192,6 +192,7 @@ class SnapshotWriter:
         lease: CaptureLease,
         *,
         check_current: Callable[[], None] | None = None,
+        on_prepared: Callable[[CaptureLease, bytes], None] | None = None,
     ) -> dict:
         self._check_identity(manifest, lease)
         with self.timings.measure("validation"):
@@ -230,6 +231,8 @@ class SnapshotWriter:
             },
         )
         # A lost seal response must also be recoverable from exact metadata bytes.
+        if on_prepared is not None:
+            on_prepared(lease, data)
         self.timings.call("journal_save", self.journal.save, lease, data)
         self.timings.call("catalog_seal", self._seal, manifest, data, lease)
         return self._publish(manifest, data, manifest_buffer, lease)
@@ -428,6 +431,27 @@ class SnapshotWriter:
             for obj in manifest.objects
         )
 
+    def recover_prepared(self, lease: CaptureLease, data: bytes) -> dict:
+        """Reconcile exact metadata retained after all payload WRITTEN ACKs.
+
+        The journal may be absent after a failed save or post-publish cleanup.
+        Recreate it before replay, and never use the former payload/source arena.
+        """
+        manifest = decode_manifest(data)
+        self._check_identity(manifest, lease)
+        check_seal_capacity(manifest, self._manifest_object(manifest, data), lease)
+        self.timings.call("journal_save", self.journal.save, lease, data)
+        return self._recover_publication(manifest, data, lease)
+
+    def _recover_publication(self, manifest, data, lease):
+        self.timings.call("catalog_seal", self._seal, manifest, data, lease)
+        # A journal survives producer/data-node loss. Confirm every immutable
+        # object still exists before making the recovered reference visible.
+        with self.timings.measure("recovery_read"):
+            self._verify_payloads(manifest)
+        with self._recovery_buffer(data) as buffer:
+            return self._publish(manifest, data, buffer, lease)
+
     def recover(self) -> list[dict]:
         """Retry prepared publications without rerunning target inference.
 
@@ -438,11 +462,5 @@ class SnapshotWriter:
         for lease, data in self.journal.pending():
             manifest = decode_manifest(data)
             self._check_identity(manifest, lease)
-            self.timings.call("catalog_seal", self._seal, manifest, data, lease)
-            # A journal survives producer/data-node loss. Confirm every immutable
-            # object still exists before making the recovered reference visible.
-            with self.timings.measure("recovery_read"):
-                self._verify_payloads(manifest)
-            with self._recovery_buffer(data) as buffer:
-                receipts.append(self._publish(manifest, data, buffer, lease))
+            receipts.append(self._recover_publication(manifest, data, lease))
         return receipts

@@ -34,7 +34,7 @@ it does not redefine the goal as the modules already implemented.
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including native batches and complete reads after producer exit; TCP fault/recovery and RDMA partial-read ownership checks pass, without a measured serving speedup; production retention remains open |
-| Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
+| Publication | Catalog producer client, manifest-last writer, durable journal and retained prepared metadata, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects, post-unlink cleanup and journal-creation failures tested; exact Store-only recovery preserves READY accounting and quarantine; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
 | Cohort routing observability | Bounded ingress and rank-local ticket counters, separate dashboard panels | TP2/PP2 status-to-metrics checks and real TP2 capture/pause/resume with desktop/mobile Grafana pass; production scrape discovery and alert policy remain open |
@@ -4902,6 +4902,39 @@ archived artifacts. The eight modified Python files add no Ruff diagnostics.
 The resident idle load resumed with no extra GPU allocation. Production Catalog,
 SpecForge integration, representative MaaS SLOs and trained-draft quality remain
 open.
+
+## Publication Cleanup Recovery
+
+Single-rank publication no longer decides whether an operation may have committed
+by checking for a journal file. Cleanup unlinks before syncing the directory;
+a subsequent error previously caused a failure request against an already
+AVAILABLE sample and left READY accounting at zero. A before/after coordinator
+probe reproduces **one failure request / zero READY** before the fix and
+**zero failure requests / one READY** after it, with exactly one publication.
+
+The writer now exposes `on_prepared(lease, manifest_bytes)` after all payload
+WRITTEN acknowledgements. The coordinator retains that exact immutable metadata
+through later lease renewal, journal errors and ambiguous publication. Pending
+records recover through `recover_prepared`, restoring the journal, verifying
+stored objects and using a fresh manifest buffer. Confirmation retires a healthy
+slot and increments READY once; uncertain source transfers remain quarantined.
+Failures before preparation and startup recovery from durable journals keep
+their existing semantics. In-memory metadata cannot survive a crash before the
+first successful journal save; Catalog expiry/GC still owns those orphans.
+
+All **174 shared regression methods pass in 183.509s**, including direct/staged
+coordinator fault cases. The full native Mooncake TCP suite passes **9 methods in
+237.598s**. Its new case closes the original producer and destroys its old tensor
+and manifest contents before recovering a sample whose journal was removed.
+The recovery uses one native payload-read batch, identical publication arguments,
+no payload rewrite, and passes complete content readback.
+
+The [runbook](experiments/PUBLICATION_CLEANUP.md) and
+[evidence](experiments/publication-cleanup.json) bind four terminal jobs, two
+5,624-file source audits and a 24-artifact archive. No new Ruff findings were
+introduced. The resident H100 idle load has resumed, with no additional GPU
+allocation. This is fault/transport validation with test Catalogs; new serving,
+RDMA, production integration and trained-quality acceptance remain unproven.
 
 ## Next Implementation
 

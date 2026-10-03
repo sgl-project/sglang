@@ -64,6 +64,8 @@ class CaptureReservation(msgspec.Struct, eq=False):
     queued_at: float = 0.0
     cohort_handle: CaptureHandle | None = None
     execution_sha256: str | None = None
+    publication: tuple[CaptureLease, bytes] | None = None
+    transfer_complete: bool = False
 
 
 class CaptureStep(msgspec.Struct, frozen=True):
@@ -1058,20 +1060,29 @@ class CaptureCoordinator:
         self.lease_wake.set()
 
     def _recover_pending(self):
-        self.writer.recover()
         with self.lock:
             pending = [
                 r for r in self.records.values() if r.state == "pending_publication"
             ]
         for record in pending:
+            if record.publication is None:
+                raise ContractError("pending publication is missing exact metadata")
+            self.writer.recover_prepared(*record.publication)
+            self._count("ready")
             self._retire(
                 record,
-                complete=record.slot.storage.data_ptr() not in self.store.quarantined,
+                complete=record.transfer_complete
+                and record.slot.storage.data_ptr() not in self.store.quarantined,
             )
+        self.writer.recover()
         with self.lock:
             if self.disabled_reason == "publication_pending":
                 self.disabled_reason = None
                 self.lease_wake.set()
+
+    @staticmethod
+    def _publication_prepared(record, lease, data):
+        record.publication = (lease, data)
 
     def _check_publication(self, record):
         # Full payload validation may outlive cancellation or the local lease.
@@ -1148,6 +1159,9 @@ class CaptureCoordinator:
                         check_current=lambda record=record: self._check_publication(
                             record
                         ),
+                        on_prepared=lambda lease, data, record=record: (
+                            self._publication_prepared(record, lease, data)
+                        ),
                     )
                     self._count("ready")
                     logger.info(
@@ -1167,12 +1181,10 @@ class CaptureCoordinator:
                     type(error).__name__,
                 )
                 logger.debug("Training capture write details", exc_info=True)
-                try:
-                    pending = self.journal.has_pending(record.lease.capture_id)
-                except OSError:
-                    # An inaccessible journal cannot disprove a prepared publish.
-                    pending = True
-                if pending:
+                # Cleanup unlinks before directory fsync; absence cannot disprove
+                # a committed publication. Keep the exact prepared bytes instead.
+                if record.publication is not None:
+                    record.transfer_complete = complete
                     record.state = "pending_publication"
                     with self.lock:
                         self.disabled_reason = (

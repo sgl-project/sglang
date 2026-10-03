@@ -16,7 +16,7 @@ import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec
 import torch
@@ -1056,6 +1056,12 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
             journal_directory.cleanup()
 
     def test_batch_recovery_after_producer_close_uses_only_store_payloads(self):
+        self.exercise_batch_recovery_after_producer_close(cleanup_failure=False)
+
+    def test_prepared_recovery_after_unlinked_journal_and_producer_close(self):
+        self.exercise_batch_recovery_after_producer_close(cleanup_failure=True)
+
+    def exercise_batch_recovery_after_producer_close(self, *, cleanup_failure):
         manifest, tensors = make_snapshot(response_length=4)
         data = canonical_bytes(manifest)
         data_node = connect(self.master_address, segment_bytes=64 << 20)
@@ -1081,7 +1087,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     "catalog_cursor": "batch-recovery",
                 }
                 catalog.publish.side_effect = [
-                    CatalogUnavailable("lost reply"),
+                    receipt if cleanup_failure else CatalogUnavailable("lost reply"),
                     receipt,
                 ]
                 lease = CaptureLease(
@@ -1093,10 +1099,35 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     expires_in_seconds=120,
                     renew_after_seconds=20,
                 )
-                with self.assertRaises(CatalogUnavailable):
+                prepared = []
+                complete = journal.complete
+
+                def cleanup(capture_id):
+                    if cleanup_failure:
+                        with patch.object(
+                            journal, "_sync_directory", side_effect=OSError("sync")
+                        ):
+                            complete(capture_id)
+                    else:
+                        complete(capture_id)
+
+                with (
+                    patch.object(journal, "complete", cleanup),
+                    self.assertRaises(
+                        OSError if cleanup_failure else CatalogUnavailable
+                    ),
+                ):
                     SnapshotWriter(producer, catalog, journal).write(
-                        manifest, tensors, buffer, lease
+                        manifest,
+                        tensors,
+                        buffer,
+                        lease,
+                        on_prepared=lambda lease, data: prepared.append((lease, data)),
                     )
+                self.assertEqual(prepared, [(lease, data)])
+                self.assertEqual(
+                    journal.has_pending(lease.capture_id), not cleanup_failure
+                )
                 original_publication = catalog.publish.call_args
                 journal.close()
                 producer.close()
@@ -1107,7 +1138,10 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 recovery.client = MagicMock(wraps=recovery.client)
                 journal = PublicationJournal(directory)
                 writer = SnapshotWriter(recovery, catalog, journal)
-                self.assertEqual(writer.recover(), [receipt])
+                if cleanup_failure:
+                    self.assertEqual(writer.recover_prepared(*prepared[0]), receipt)
+                else:
+                    self.assertEqual(writer.recover(), [receipt])
                 self.assertEqual(catalog.publish.call_args, original_publication)
                 self.assertEqual(recovery.client.batch_get_into.call_count, 1)
                 self.assertEqual(
@@ -1124,6 +1158,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                         {
                             "native_recovery_batches": 1,
                             "recovery_tensor_bytes": manifest.total_tensor_bytes,
+                            "journal_absent_after_cleanup": cleanup_failure,
                         }
                     ),
                     flush=True,

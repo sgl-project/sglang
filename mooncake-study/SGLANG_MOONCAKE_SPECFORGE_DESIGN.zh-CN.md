@@ -803,11 +803,22 @@ BF16/FP16/FP32 的有限性检查复用计算 SHA-256 的 little-endian Host 字
 | 对象写一半 | 没有 READY；有界重试或等待 capture lease 过期回收 |
 | 对象完成、manifest 未写 | 根据 PREPARED 和 receipts 重建同一 manifest |
 | manifest 已写、Catalog publish 超时 | 用幂等键查询/重试 publish，不重采 target |
+| publish 已确认、journal unlink 后目录同步失败 | 用保留的精确 manifest/lease 幂等重试，不因 journal 已消失就报告 sample 失败 |
 | Catalog 已提交、消息未送达 | outbox 重发，consumer 去重 |
 | consumer 重复收到 ref | 以 dataset/sample/generation/run 去重 |
 | READY 后数据节点丢失 | 读取现有副本；无法恢复则标记 sample lost |
 
 不要依赖遍历 Mooncake 全部 keys 查找训练样本。Catalog 的 objects 表负责追踪孤儿对象、未完成 capture 和清理重试。
+
+单 rank producer 在全部 payload 的 WRITTEN 已确认后，通过
+`on_prepared(lease, manifest_bytes)` 保存不可变恢复信息，随后才创建 journal。
+此后失败进入 pending publication，暂停新采集并保留槽位；后台调用
+`recover_prepared(lease, bytes)` 重建 journal、验证 Store payload、使用新的注册
+manifest 缓冲区幂等发布。lease 续租不能改变这份恢复信息，成功后 READY 只计一次。
+创建 journal 失败也可以在进程仍存活时通过该路径恢复；若尚未持久化就崩溃，则仍由
+Catalog 的 capture lease 和孤儿清理处理，不能承诺内存状态跨进程重启恢复。
+发布成功不证明旧传输已终止；传输结果不确定的源缓冲仍保持 quarantine，直到
+既有关闭屏障确认终止。内容校验或 payload WRITTEN 之前的失败保持原有失败路径。
 
 ### 8.5 HiCache 与训练快照
 

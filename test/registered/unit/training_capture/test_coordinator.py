@@ -94,8 +94,8 @@ class TestCaptureCoordinator(CustomTestCase):
         self.catalog.close()
         self.directory.cleanup()
 
-    def wait_until(self, predicate):
-        deadline = time.monotonic() + 5
+    def wait_until(self, predicate, *, timeout=5):
+        deadline = time.monotonic() + timeout
         while not predicate():
             if time.monotonic() > deadline:
                 self.fail(str(self.coordinator.stats()))
@@ -146,6 +146,131 @@ class TestCaptureCoordinator(CustomTestCase):
         _, tensors = read_snapshot(self.store, published[0])
         self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
         self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1])
+
+    def test_unlinked_journal_reconciles_exact_publication_without_failing_sample(self):
+        req, record = self.sealed_request("cleanup-recovery")
+        coordinator = self.coordinator
+        coordinator.control("pause")
+        original_lease = record.lease
+        complete = coordinator.journal.complete
+        attempts = 0
+
+        def lose_directory_sync(capture_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                with patch.object(
+                    coordinator.journal, "_sync_directory", side_effect=OSError("sync")
+                ):
+                    complete(capture_id)
+            else:
+                complete(capture_id)
+
+        with (
+            patch.object(coordinator.journal, "complete", lose_directory_sync),
+            patch.object(
+                coordinator.catalog, "fail", wraps=coordinator.catalog.fail
+            ) as fail,
+            patch.object(
+                coordinator.catalog, "publish", wraps=coordinator.catalog.publish
+            ) as publish,
+        ):
+            coordinator._detach(req, record)
+            self.wait_until(lambda: record.state == "pending_publication")
+            self.assertFalse(coordinator.journal.has_pending(record.lease.capture_id))
+            self.assertEqual(coordinator.disabled_reason, "publication_pending")
+            self.assertEqual(coordinator.pool.stats()["free"], 0)
+            self.assertEqual(coordinator.counters["ready"], 0)
+            self.assertEqual(record.publication[0], original_lease)
+            record.lease = msgspec.structs.replace(
+                original_lease, expires_in_seconds=180, renew_after_seconds=30
+            )
+            record.slot.storage.zero_()
+            self.wait_until(
+                lambda: record.state == "done" and coordinator.disabled_reason is None,
+                timeout=12,
+            )
+            fail.assert_not_called()
+            self.assertEqual(publish.call_count, 2)
+            self.assertEqual(publish.call_args_list[0], publish.call_args_list[1])
+        self.assertEqual(coordinator.counters["ready"], 1)
+        self.assertIsNone(coordinator.disabled_reason)
+        self.assertEqual(coordinator.pool.stats()["quarantined"], 0)
+        self.assertFalse(list(coordinator.journal.pending()))
+        publication = self.catalog.wait_publications(1)[0]
+        _, tensors = read_snapshot(self.store, publication)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
+        coordinator.control("resume")
+        self.wait_until(lambda: len(coordinator.available) == 1)
+        fresh = self.request("after-reconciliation")
+        coordinator.before_forward([fresh])
+        self.assertIsNotNone(fresh.training_capture_context)
+
+    def test_failed_journal_creation_recovers_from_prepared_payloads(self):
+        req, record = self.sealed_request("journal-save-recovery")
+        coordinator = self.coordinator
+        coordinator.control("pause")
+        save = coordinator.journal.save
+        attempts = 0
+
+        def fail_first_save(lease, data):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("journal unavailable before creation")
+            save(lease, data)
+
+        with (
+            patch.object(coordinator.journal, "save", fail_first_save),
+            patch.object(
+                coordinator.catalog, "fail", wraps=coordinator.catalog.fail
+            ) as fail,
+        ):
+            coordinator._detach(req, record)
+            self.wait_until(lambda: record.state == "pending_publication")
+            self.assertFalse(coordinator.journal.has_pending(record.lease.capture_id))
+            self.assertFalse(self.catalog.publications)
+            self.assertTrue(self.sdk.data)
+            record.slot.storage.zero_()
+            self.wait_until(lambda: record.state == "done", timeout=12)
+            fail.assert_not_called()
+        self.assertEqual(coordinator.counters["ready"], 1)
+        self.assertFalse(list(coordinator.journal.pending()))
+        self.assertEqual(coordinator.pool.stats()["free"], 1)
+        _, tensors = read_snapshot(self.store, self.catalog.wait_publications(1)[0])
+        self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1])
+
+    def test_manifest_transfer_uncertainty_survives_publication_recovery(self):
+        req, record = self.sealed_request("uncertain-manifest-recovery")
+        coordinator = self.coordinator
+        coordinator.control("pause")
+        put = self.sdk.put_from
+
+        def uncertain_manifest(key, *args):
+            result = put(key, *args)
+            if key.endswith("/manifest"):
+                raise RuntimeError("manifest write completion unavailable")
+            return result
+
+        with (
+            patch.object(self.sdk, "put_from", uncertain_manifest),
+            patch.object(
+                coordinator.catalog, "fail", wraps=coordinator.catalog.fail
+            ) as fail,
+        ):
+            coordinator._detach(req, record)
+            self.wait_until(lambda: record.state == "pending_publication")
+            pointer = record.slot.storage.data_ptr()
+            self.assertIn(pointer, self.store.quarantined)
+            self.assertFalse(record.transfer_complete)
+            self.wait_until(lambda: record.state == "done", timeout=12)
+            fail.assert_not_called()
+        self.assertEqual(coordinator.counters["ready"], 1)
+        self.assertEqual(coordinator.pool.stats()["quarantined"], 1)
+        self.assertEqual(coordinator.pool.stats()["free"], 0)
+        self.assertIn(pointer, self.store.registered)
+        self.assertIn(pointer, self.store.quarantined)
+        read_snapshot(self.store, self.catalog.wait_publications(1)[0])
 
     def test_manifest_budget_rejects_before_context_and_reuses_reservation(self):
         coordinator = self.coordinator

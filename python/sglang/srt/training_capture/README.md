@@ -446,6 +446,18 @@ The dashboard plots scheduler quantiles/budgets separately from serving histogra
   retries the same manifest,
   and republishes with the same idempotency identity. It needs no target forward
   or saved tensor payload. Unknown outcomes leave the journal entry intact.
+- After every payload receives WRITTEN acknowledgement, `SnapshotWriter.write`
+  calls its optional `on_prepared(lease, manifest_bytes)` callback before saving
+  the journal. The single-rank coordinator retains these immutable values until
+  publication is confirmed. A missing journal after an exception is not failure
+  evidence: cleanup unlinks the file before syncing its directory. Prepared
+  failures pause admission and retry through `recover_prepared(lease, bytes)`,
+  which restores the journal, verifies Store payloads and publishes from a fresh
+  registered manifest buffer. It preserves the original lease despite subsequent
+  renewal, counts confirmed READY once, and retains uncertain source buffers in
+  quarantine even after publication succeeds. Failures before preparation keep
+  the existing sample-failure path. See the
+  [recovery evidence](../../../../mooncake-study/experiments/PUBLICATION_CLEANUP.md).
 
 The Store adapter must have one owner thread after initialization. Stop that
 thread and complete outstanding CUDA copies before `close()`. Store failures

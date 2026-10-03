@@ -1,0 +1,358 @@
+{
+  "baseline": "c22021cd2",
+  "jobs": [
+    {
+      "role": "after",
+      "job": "01791038339906008363-9ab9d4567088",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/publication_cleanup_probe.py",
+        "--expect-recovery"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/publication_cleanup_probe.py",
+        "--expect-recovery"
+      ],
+      "submitted": "2026-10-03T14:38:59.924Z",
+      "result": {
+        "job_id": "01791038339906008363-9ab9d4567088",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791038358.9252505,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791038339906008363-9ab9d4567088.log"
+      },
+      "tests": null,
+      "probe": {
+        "record_state": "done",
+        "catalog_state": "AVAILABLE",
+        "ready_count": 1,
+        "fail_calls": 0,
+        "journal_pending": false,
+        "cleanup_calls": 2,
+        "quarantined": 0,
+        "publications": 1
+      }
+    },
+    {
+      "role": "before",
+      "job": "01791037900830310146-c2510e49c206",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/publication_cleanup_probe.py"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/publication_cleanup_probe.py"
+      ],
+      "submitted": "2026-10-03T14:31:40.848Z",
+      "result": {
+        "job_id": "01791037900830310146-c2510e49c206",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791037914.0940802,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791037900830310146-c2510e49c206.log"
+      },
+      "tests": null,
+      "probe": {
+        "record_state": "done",
+        "catalog_state": "AVAILABLE",
+        "ready_count": 0,
+        "fail_calls": 1,
+        "journal_pending": false,
+        "cleanup_calls": 1,
+        "quarantined": 0,
+        "publications": 1
+      }
+    },
+    {
+      "role": "store",
+      "job": "01791038340315470957-50fb328f9198",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submitted": "2026-10-03T14:39:00.368Z",
+      "result": {
+        "job_id": "01791038340315470957-50fb328f9198",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791038806.4317117,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791038340315470957-50fb328f9198.log"
+      },
+      "tests": {
+        "methods": 9,
+        "seconds": 237.598
+      },
+      "probe": null
+    },
+    {
+      "role": "units",
+      "job": "01791038340117031845-90a596966d4c",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/manifest_budget_units.py"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/manifest_budget_units.py"
+      ],
+      "submitted": "2026-10-03T14:39:00.128Z",
+      "result": {
+        "job_id": "01791038340117031845-90a596966d4c",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791038554.6681566,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791038340117031845-90a596966d4c.log"
+      },
+      "tests": {
+        "methods": 174,
+        "seconds": 183.509
+      },
+      "probe": null
+    }
+  ],
+  "source_audits": [
+    {
+      "version": "before",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+      "files": 5624,
+      "sha256": "2513ce9d056430d6796ea81ceddc7b39426f826aa68c8422d939981a8b3b38ab"
+    },
+    {
+      "version": "v1",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-publication-cleanup-v1",
+      "files": 5624,
+      "sha256": "39a0f6b3a02e9a0c34a2c4e143d653678bdf0ffd8ad299d6f7e743188d88d85a"
+    }
+  ],
+  "resident": {
+    "observed": "2026-10-03T14:48:11.708Z",
+    "mode": "idle_load",
+    "active_pid": null,
+    "idle_pid": 40541,
+    "queued": 0,
+    "live_processes": "    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n40541     1 Rsl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6",
+    "gpu_processes": "51566, [Not Found], 1092 MiB\n"
+  },
+  "lint": {
+    "baseline": "c22021cd2",
+    "format": "4 files already formatted",
+    "files": [
+      {
+        "path": "python/sglang/srt/training_capture/coordinator.py",
+        "before": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          }
+        ],
+        "after": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/training_capture/snapshot_writer.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "test/registered/storage/test_training_snapshot_mooncake.py",
+        "before": [
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "PLW1510",
+            "message": "`subprocess.run` without explicit `check` argument"
+          }
+        ],
+        "after": [
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "PLW1510",
+            "message": "`subprocess.run` without explicit `check` argument"
+          }
+        ]
+      },
+      {
+        "path": "test/registered/unit/training_capture/test_coordinator.py",
+        "before": [],
+        "after": []
+      }
+    ]
+  },
+  "archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/publication-cleanup-20261003",
+    "files": 24,
+    "manifest_sha256": "e991e0b4c4d61e033eb638030415c651584d6d1fae8edcaa810a0b863cedb3fb"
+  },
+  "scope": {
+    "gpu_count": 1,
+    "transport": "native Mooncake TCP",
+    "catalog": "test doubles",
+    "fault_injection": [
+      "post-unlink directory sync",
+      "journal creation",
+      "uncertain manifest transfer"
+    ],
+    "source_buffer_destroyed_before_recovery": true,
+    "original_producer_closed_in_native_test": true,
+    "no_target_forward_during_recovery": true,
+    "production_catalog": false,
+    "new_model_serving_validation": false,
+    "new_rdma_validation": false,
+    "training_quality_acceptance": false
+  }
+}

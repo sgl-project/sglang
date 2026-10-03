@@ -60,6 +60,11 @@ serving that excludes oversized metadata while preserving later small samples.
 for Base64 and HTTP envelope bytes before payload writes, and checks four-process
 rejection, pending CUDA copy ownership and subsequent Mooncake publication.
 
+[Publication Cleanup Recovery](PUBLICATION_CLEANUP.md) preserves exact prepared
+metadata when journal creation or post-publication cleanup fails, checks READY
+accounting and quarantine, and recovers through native Store reads after closing
+the original producer.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.
