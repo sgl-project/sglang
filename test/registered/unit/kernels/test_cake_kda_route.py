@@ -318,7 +318,10 @@ def test_recurrent_decode_route_on_admitted_uses_cake_contract():
         assert tuple(tensor.shape) == (B, 1, HR, D) and tensor.dtype == torch.bfloat16
     assert q.data_ptr() == inputs["q"].data_ptr()  # batch-outermost view, no copy
     assert tuple(beta.shape) == (B, 1, HR)
-    assert torch.allclose(beta.float(), torch.sigmoid(inputs["b"].float()), atol=1e-2)
+    # beta is batch-outermost (B, 1, HR); the input b is (1, B, HR).
+    assert torch.allclose(
+        beta.float(), torch.sigmoid(inputs["b"].float()).transpose(0, 1), atol=1e-2
+    )
     assert kwargs["initial_state"] is inputs["ssm_states"]
     assert kwargs["ssm_state_indices"] is inputs["cache_indices"]
     assert "cu_seqlens" not in kwargs
