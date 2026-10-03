@@ -99,16 +99,26 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
+    # HCCL options for the default group, MoE groups, and DCP, whose per-layer
+    # exchange also needs a tuned buffer.
+    is_dcp = group_name == "dcp"
+    if group_name is not None and "moe" not in group_name and not is_dcp:
         return None
 
     import torch_npu
 
+    if is_dcp:
+        # Deliberately not DEEPEP_HCCL_BUFFSIZE: that knob sizes the MoE
+        # dispatch/combine buffers and is routinely far larger than this group
+        # needs, and every rank would pay it twice.
+        hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE") or 200)
+    else:
+        hccl_buffer_size = int(
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or 200
+        )
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
-    )
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     return options
 

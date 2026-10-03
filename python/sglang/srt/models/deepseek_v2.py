@@ -62,6 +62,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -2240,6 +2241,22 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -3505,7 +3522,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu:
+        # NPU decode is #37787's and reads rank-local metadata off the attention
+        # backend. NPU DSA extend gathers the context and needs this; without it
+        # the backend reads its own shard through a full-span page table.
+        if _is_npu and not (self.use_dsa and extend_prefix_lens is not None):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

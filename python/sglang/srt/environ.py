@@ -1006,6 +1006,32 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries, and the top-k is all-gathered.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: each attention-TP rank computes every head for its slice of
+    # the tokens. Consumes no ranks, so it composes with DCP.
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
+    # DSA token-shard: also shard multi-request extends, where every prefix
+    # reaches index_topk.
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST = EnvBool(True)
+    # DSA token-shard: exchange 256-wide tensors instead of the 512-wide latent.
+    # Slower below 3k tokens and costs 4 GiB of KV pool, hence off.
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: log how much of a batch's gathered prefix is the same
+    # radix nodes fetched once per request. Probe for a deduplicated gather.
+    SGLANG_DEBUG_NPU_DCP_SHARED_PREFIX = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: run each layer's prefix gather a layer ahead on a side
+    # stream. Costs a second scratch; needs GATHER_PIECE_ROWS <= 0.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
+    # DCP on NPU: shard the latent KV in page_size runs, as #37787 and
+    # vLLM-Ascend do, instead of one position per rank.
+    SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

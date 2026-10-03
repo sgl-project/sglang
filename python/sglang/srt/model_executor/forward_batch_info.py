@@ -43,7 +43,6 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
-from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -190,21 +189,6 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
-
-
-def _localize_npu_dcp_out_cache_loc(
-    out_cache_loc: torch.Tensor,
-    *,
-    interleave_size: int,
-) -> torch.Tensor:
-    """Map allocator-global NPU DCP slots to this target rank."""
-    parallel = get_parallel()
-    return localize_dcp_indices(
-        out_cache_loc,
-        parallel.dcp_size,
-        parallel.dcp_rank,
-        interleave_size,
-    )
 
 
 class ForwardMode(IntEnum):
@@ -1050,14 +1034,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # ScheduleBatch and req_to_token keep allocator-global slot identities.
-        # Preserve that view before exposing rank-local NPU DCP write slots.
+        # The replicated index-K is written through allocator-global slots.
+        # out_cache_loc is deliberately NOT localized here: the pool localizes
+        # per write in _resolve_dcp_write, and doing both corrupts the write.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
-            if ret.out_cache_loc is not None:
-                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
-                    ret.out_cache_loc,
-                    interleave_size=model_runner.page_size,
+            if envs.SGLANG_DEBUG_NPU_DCP_SHARED_PREFIX.get():
+                # Measured here because the gather only ever sees lengths; the
+                # radix nodes that say what is shared live on the requests.
+                from sglang.srt.layers.dcp.layout import dcp_shared_prefix
+
+                ret.npu_dcp_shared_prefix = dcp_shared_prefix(
+                    [getattr(req, "last_node", None) for req in batch.reqs],
+                    [req.kv.cache_protected_len for req in batch.reqs],
                 )
         ret._maybe_init_non_generation_fields(batch)
 

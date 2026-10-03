@@ -913,7 +913,35 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        self._warn_if_pool_cannot_hold_context()
+
         self._init_post_memory_pool_components()
+
+    def _warn_if_pool_cannot_hold_context(self) -> None:
+        """Warn when the KV pool cannot hold one full-length request, which would
+        otherwise surface only as refusals at serving time. Not an error: a
+        deployment that never sends max-length requests may want a small pool."""
+        context_len = getattr(self.model_config, "context_len", None)
+        if not context_len or self.max_total_num_tokens >= context_len:
+            return
+        extra = ""
+        # Name what this branch takes before the pool is sized.
+        if envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A.get():
+            extra = (
+                " SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A is set, which holds the "
+                "full w_kc and w_vc on every rank and is measured at several GiB "
+                "per rank; unset it to get that back."
+            )
+        logger.warning(
+            "KV pool holds %d tokens, fewer than --context-length %d. One "
+            "full-length request cannot fit, so long requests will be refused "
+            "or truncated at serving time rather than here. Lower "
+            "--context-length, raise --mem-fraction-static, or free memory taken "
+            "before the pool is sized.%s",
+            self.max_total_num_tokens,
+            context_len,
+            extra,
+        )
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks

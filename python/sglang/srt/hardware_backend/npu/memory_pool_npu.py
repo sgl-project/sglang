@@ -4,7 +4,12 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.layers.dcp.layout import (
+    dcp_interleave_size,
+    dcp_owner_and_row,
+    localize_dcp_indices,
+    plan_dcp_owner_write,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -15,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -667,6 +673,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_page_padding = index_page_padding
         self.is_draft_worker = is_draft_worker
 
+        # The DCP extend write's owner filter, opened per forward by
+        # plan_dcp_extend_write. None keeps the capturable row-0 path.
+        self._dcp_extend_write_loc: Optional[torch.Tensor] = None
+        self._dcp_extend_write_plan = None
+
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -703,6 +714,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
+                # index_size, not self.size: the indexer is replicated.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
@@ -734,11 +746,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
+        # Buffer ROWS, not pages, so this must be the pool's own interleave.
         local_indices = localize_dcp_indices(
-            indices,
-            self.dcp_size,
-            self.dcp_rank,
-            self.page_size,
+            indices, self.dcp_size, self.dcp_rank, dcp_interleave_size()
         )
         return local_indices[local_indices >= 0]
 
@@ -778,9 +788,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+        layer_id: Optional[int] = None,
+    ):
+        """Gather ``(nope, rope)`` at physical rows ``loc``.
+
+        Overridden because the inherited Triton read assumes one fused buffer
+        and this pool keeps the halves apart. ``loc`` is already rank-local and
+        physical (the read door's contract), so no owner filter here.
+        ``layer_id`` reads another layer's KV, for the gather prefetch.
+        """
+        read_layer_id = layer.layer_id if layer_id is None else layer_id
+        k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
+        idx = loc.to(torch.int64)
+        cache_k_nope = k.index_select(0, idx).unsqueeze(1)
+        cache_k_rope = v.index_select(0, idx).unsqueeze(1)
+        if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
+            cache_k_nope = cache_k_nope.to(dst_dtype)
+            cache_k_rope = cache_k_rope.to(dst_dtype)
+        return cache_k_nope, cache_k_rope
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
+        # The buffer is compacted to indexer layers; range(layer_num) overruns.
         buffers = list(self.index_k_buffer)
         if self.index_k_scale_buffer is not None:
             buffers += list(self.index_k_scale_buffer)
@@ -900,6 +936,71 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         return packed.view(self.dtype)
 
+    def _resolve_dcp_write(
+        self,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Redirect a DCP-widened loc so this rank's tokens land on its rows.
+
+        CUDA filters inside the Triton store; here it cannot, because
+        ``npu_scatter_nd_update_`` is a fused vendor operator with no body.
+
+        Decode rewrites the destination rather than dropping rows: a boolean
+        index has a data-dependent shape, so torch_npu resolves it with
+        ``aclnnNonzeroV2`` and syncs the stream, which capture refuses.
+        Non-owned rows are aimed at physical row 0, which the allocator never
+        hands out (``free_pages`` starts at 1) and nothing reads.
+
+        Extend drops them instead -- never captured, and one write location is
+        shared by every layer, so the filter costs one sync per forward.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        # Against the widened space, as the CUDA pool does.
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * dcp_size,
+            "set_kv_buffer (NPU MLA, widened loc)",
+        )
+        if dcp_size == 1:
+            return loc, cache_k, cache_v
+
+        if loc is self._dcp_extend_write_loc:
+            owned_idx, dest = self._dcp_extend_write_index(loc, dcp_size)
+            return (
+                dest,
+                cache_k.index_select(0, owned_idx),
+                cache_v.index_select(0, owned_idx),
+            )
+
+        # Static shape, no NonZero, no stream sync: capturable.
+        owned, dest = dcp_owner_and_row(
+            loc, dcp_size, get_parallel().attn_dcp_rank, dcp_interleave_size()
+        )
+        return torch.where(owned, dest, loc.new_zeros(())), cache_k, cache_v
+
+    def plan_dcp_extend_write(self, loc: torch.Tensor) -> None:
+        """Let this extend forward's KV write drop the rows this rank does not own.
+
+        ``_resolve_dcp_write`` recognises the forward by tensor identity: decode's
+        loc is a different object, and the filter is discarded on every call.
+        """
+        self._dcp_extend_write_loc = loc
+        self._dcp_extend_write_plan = None
+
+    def _dcp_extend_write_index(self, loc: torch.Tensor, dcp_size: int):
+        """This forward's owner filter, computed once and reused by every layer."""
+        if self._dcp_extend_write_plan is None:
+            self._dcp_extend_write_plan = plan_dcp_owner_write(
+                loc,
+                dcp_size,
+                get_parallel().attn_dcp_rank,
+                dcp_interleave_size(),
+            )
+        return self._dcp_extend_write_plan
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -940,6 +1041,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         if self.use_fia_nz:
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
+            return
+
+        loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+        if loc.numel() == 0:
+            # A rank can own none of a short chunk's rows.
             return
 
         torch_npu.npu_scatter_nd_update_(
@@ -983,6 +1089,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        # A write to an elided layer means the pool's mask disagrees with the
+        # model's, so fail loudly. The indexer writes at the raw loc.
+        maybe_detect_oob(
+            loc,
+            0,
+            self.index_size + self.index_page_size,
+            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+        )
+        assert layer_id in self.indexer_layer_id_to_slot, (
+            f"layer {layer_id} owns no Indexer but wrote index-K; the pool's "
+            "indexer_layer_ids disagrees with the model's indexer layout"
+        )
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 

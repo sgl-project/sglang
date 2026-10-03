@@ -369,6 +369,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                # The index-K buffer is replicated under DCP while the latent KV
+                # shards, so this term is short by dcp_size without the scale.
+                # Must stay in step with index_size in kv_cache_configurator;
+                # test_dcp_index_buf_budget pins that they agree.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
@@ -522,15 +526,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if not is_npu_arch35():
-                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

@@ -130,11 +130,15 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | Backend | DCP collectives per MLA layer | Notes |
 | --- | --- | --- |
 | `ag_rs` | Query AG + LSE AG + FP32 output RS | Fallback for platforms without the a2a path; opt in with `--dcp-comm-backend ag_rs` |
-| `a2a`, gathered Q | Query AG + packed NCCL A2A | Two collectives |
-| `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
+| `a2a`, gathered Q | Query AG + one packed all-to-all | Two collectives |
+| `a2a`, replicated Q | One packed all-to-all | Canonical low-latency path |
 | `fi_a2a`, replicated Q | One FlashInfer MNNVL A2A | Requires Blackwell and a DCP group inside one MNNVL domain (GB200/GB300 fabric, or a single node) |
 
-When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm, and `ag_rs` only on platforms without the a2a path. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
+When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `ag_rs` when `--dcp-size` is 1, then `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, then `a2a` on CUDA and ROCm, and `ag_rs` on any other platform, Ascend NPU included. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
+
+### Ascend NPU
+
+Extend is where the NPU path differs most from the cost model above. A DCP rank holds only its shard of the cached prefix, so a prefill that hits a long cached prefix gathers the other ranks' shards before it can attend, once per layer. That cost grows with prefix length and with `dcp_size - 1` over `dcp_size`, so it does not shrink much as the group narrows: a rank still receives 94% of the prefix at `dcp_size` 16 and 88% at 8. Size `--mem-fraction-static` with that gather buffer in mind; running the KV pool close to full is what turns it into multi-minute stalls rather than a slowdown.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
