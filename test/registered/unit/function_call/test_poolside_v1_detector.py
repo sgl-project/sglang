@@ -106,6 +106,24 @@ class TestPoolsideV1Detector(CustomTestCase):
         self.assertEqual(result.calls[1].name, "search")
         self.assertEqual(json.loads(result.calls[1].parameters), {"query": "pizza"})
 
+    def test_same_function_called_twice_gets_sequential_indices(self):
+        """Regression (#25073): non-streaming must assign a per-response
+        sequential `tool_index`, not the function's slot in the tools list.
+        Calling the SAME function twice used to give both calls the same
+        index, so OpenAI-compatible clients merged their argument deltas into
+        one broken call. Mirror the streaming path's `current_tool_id`."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n</tool_call>\n"
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>SF</arg_value>\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1])
+
     def test_leading_text_extracted_as_normal(self):
         text = (
             "Sure, checking now. "
