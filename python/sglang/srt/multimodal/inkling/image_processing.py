@@ -86,8 +86,11 @@ def _load_image_bytes(image) -> bytes:
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
         path = image[len("file://") :] if image.startswith("file://") else image
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as e:
+            raise ValueError(f"Could not read image from path {path!r}: {e}") from e
 
     from PIL import Image
 
@@ -153,7 +156,10 @@ def _encode_image_bytes(
 
     from PIL import Image
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
         rescale_image_frac=rescale_image_frac,
