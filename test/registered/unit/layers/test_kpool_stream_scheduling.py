@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsa import triton_kernel
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
+from sglang.srt.layers.attention.dsa import kpool_fp8_index
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -417,6 +418,7 @@ def _encoding_topk(*, width, calls):
         row_starts,
         out_rows,
         page_table_row_index,
+        topk_v2_plan,
     ):
         calls.append(
             {"page_table": page_table, "page_table_row_index": page_table_row_index}
@@ -657,7 +659,7 @@ class TestKPoolPerRequestChunking(CustomTestCase):
     TOPK = 4
     POOL = 4
 
-    def _drive(self, *, q_lens, seq_lens, rows_per_chunk):
+    def _drive(self, *, q_lens, seq_lens, rows_per_chunk, events=None):
         token_nums = sum(q_lens)
         forward_batch = SimpleNamespace(
             batch_size=len(q_lens),
@@ -688,6 +690,19 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             index_topk=self.TOPK,
             index_kpool=self.POOL,
         )
+        if events is not None:
+            logits, topk = backend._fp8_mqa_logits, backend._topk_from_kpool_logits
+
+            def record_logits(**kwargs):
+                events.append(("logits",))
+                return logits(**kwargs)
+
+            def record_topk(**kwargs):
+                events.append(("topk", kwargs["topk_v2_plan"]))
+                return topk(**kwargs)
+
+            backend._fp8_mqa_logits = record_logits
+            backend._topk_from_kpool_logits = record_topk
         with _chunking_patches(
             rows_per_chunk=rows_per_chunk, kv_pool=SimpleNamespace(page_size=64)
         ):
@@ -726,6 +741,31 @@ class TestKPoolPerRequestChunking(CustomTestCase):
         )
         torch.testing.assert_close(expected, reference, rtol=0, atol=0)
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_each_chunk_plans_before_its_logits_producer(self):
+        """Each chunk builds its own plan before logits and passes that plan to top-k."""
+        events = []
+        tags = iter(range(1000))
+
+        def plan(pool_lens):
+            tag = next(tags)
+            events.append(("plan", tag))
+            return tag
+
+        with (
+            patch.object(kpool_fp8_index, "build_kpool_topk_v2_plan", plan),
+            patch.object(kpool_fp8_index, "can_use_kpool_topk_v2", return_value=True),
+        ):
+            self._drive(
+                q_lens=[5, 19], seq_lens=[40, 96], rows_per_chunk=4, events=events
+            )
+        num_chunks = len(events) // 3
+        self.assertGreater(num_chunks, 2)
+        self.assertEqual(
+            [e[0] for e in events], ["plan", "logits", "topk"] * num_chunks
+        )
+        for chunk in range(num_chunks):
+            self.assertEqual(events[3 * chunk][1], events[3 * chunk + 2][1])
 
 
 if __name__ == "__main__":
