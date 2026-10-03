@@ -148,8 +148,10 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     is_port_available,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.xpu_tensor_shm import discard_staged_segments
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
 from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
@@ -1608,7 +1610,7 @@ class Engine(EngineScoreMixin, EngineBase):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        return self.loop.run_until_complete(
+        return self._await_staged_payload_request(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
@@ -1653,6 +1655,18 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def _await_staged_payload_request(self, coro):
+        """Wait for a request carrying serialized tensors, then drop stale staging.
+
+        On XPU a payload holds a host shared-memory segment instead of a device
+        IPC handle (see utils/xpu_tensor_shm). The consumers are done once the
+        request returns, so anything still staged is an orphan of a failed load.
+        """
+        try:
+            return self.loop.run_until_complete(coro)
+        finally:
+            discard_staged_segments()
+
     def _serialize_tensors_per_rank(
         self,
         tensors,
@@ -1661,6 +1675,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """One serialized payload per TP rank: each rank deserializes only its
         own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
         load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
@@ -1687,7 +1702,7 @@ class Engine(EngineScoreMixin, EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
         )
-        return self.loop.run_until_complete(
+        return self._await_staged_payload_request(
             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
         )
 
