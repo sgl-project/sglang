@@ -92,6 +92,21 @@ def build_eagle_disagg_draft_input(
         if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
             dsa_topk_indices = None
 
+    # The prefill worker sends topk_p / topk_index but no proposal
+    # distribution, and the eager draft loop seeds its list with this field
+    # (eagle_worker_v2.draft_forward). Zeros stand in for the first draft
+    # token's q: the sampler rejects q == 0 and resamples that position from
+    # the target, which is what the graph path's zeroed buffer already does.
+    draft_probs = (
+        torch.zeros(
+            (topk_index.shape[0], batch.model_config.vocab_size),
+            device=batch.device,
+            dtype=torch.float32,
+        )
+        if spec.speculative_use_rejection_sampling
+        else None
+    )
+
     requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(
         batch.model_config.hf_config,
         spec.speculative_eagle_topk,
@@ -100,6 +115,7 @@ def build_eagle_disagg_draft_input(
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
+        draft_probs=draft_probs,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,
