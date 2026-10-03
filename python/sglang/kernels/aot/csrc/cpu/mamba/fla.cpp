@@ -1242,6 +1242,186 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
   });
 }
 
+// Speculative-verify variant of the recurrence above.
+//
+// Tokens are packed as tok = bi * steps + t, so the whole draft block for every
+// sequence arrives in a single dispatch. The per-(sequence, v_head) work item
+// walks t sequentially, which is what the recurrence requires, and writes the
+// state after token t straight into intermediate_states_buffer[widx, t]. The
+// committed pool is only read, so a rejected block needs no rollback: the caller
+// just picks the snapshot of the last accepted token.
+template <typename scalar_t, typename param_t>
+void fused_sigmoid_gating_delta_rule_update_spec_kernel_impl(
+    const scalar_t* __restrict__ q_ptr,
+    const scalar_t* __restrict__ k_ptr,
+    const scalar_t* __restrict__ v_ptr,
+    const param_t* __restrict__ A_log_ptr,
+    const scalar_t* __restrict__ a_ptr,
+    const scalar_t* __restrict__ dt_bias_ptr,
+    const scalar_t* __restrict__ b_ptr,
+    const int32_t* __restrict__ state_indices_ptr,
+    const int32_t* __restrict__ window_indices_ptr,
+    float* __restrict__ state_ptr,
+    float* __restrict__ window_ptr,
+    scalar_t* __restrict__ o_ptr,
+    float* __restrict__ qk_scale_buf,
+    int64_t steps,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t v_num_heads,
+    int64_t v_head_dim,
+    int64_t q_strideT,
+    int64_t q_strideH,
+    int64_t k_strideT,
+    int64_t k_strideH,
+    int64_t v_strideT,
+    int64_t v_strideH,
+    int64_t window_strideW,
+    int64_t window_strideT,
+    bool use_qk_l2norm_in_kernel,
+    bool disable_state_update,
+    double softplus_threshold) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int64_t VecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
+  const int64_t group_size = v_num_heads / num_heads;
+  const int64_t total_tokens = batch_size * steps;
+  const int64_t head_state_size = head_dim * v_head_dim;
+  const double scale = 1 / std::sqrt(head_dim);
+  const fVec scale_vec = fVec(scale);
+
+  if (use_qk_l2norm_in_kernel) {
+    const float eps = 1e-5;
+    at::parallel_for(0, total_tokens * num_heads, 0, [&](int64_t begin, int64_t end) {
+      int64_t ti{0}, ni{0};
+      data_index_init(begin, ti, total_tokens, ni, num_heads);
+      for (int64_t i = begin; i < end; ++i) {
+        float sum_q = float(0);
+        float sum_k = float(0);
+        fVec sum_q_fvec = fVec(float(0));
+        fVec sum_k_fvec = fVec(float(0));
+        int64_t q_offset = ti * q_strideT + ni * q_strideH;
+        int64_t k_offset = ti * k_strideT + ni * k_strideH;
+        int64_t d;
+#pragma GCC unroll 4
+        for (d = 0; d <= head_dim - VecSize; d += VecSize) {
+          auto [q_fvec0, q_fvec1] = load_float_vec2(q_ptr + q_offset + d);
+          sum_q_fvec += q_fvec0 * q_fvec0;
+          sum_q_fvec += q_fvec1 * q_fvec1;
+          auto [k_fvec0, k_fvec1] = load_float_vec2(k_ptr + k_offset + d);
+          sum_k_fvec += k_fvec0 * k_fvec0;
+          sum_k_fvec += k_fvec1 * k_fvec1;
+        }
+#pragma GCC unroll 4
+        for (; d < head_dim; ++d) {
+          float q_val = static_cast<float>(q_ptr[q_offset + d]);
+          sum_q += q_val * q_val;
+          float k_val = static_cast<float>(k_ptr[k_offset + d]);
+          sum_k += k_val * k_val;
+        }
+
+        sum_q += vec_reduce_sum(sum_q_fvec);
+        sum_k += vec_reduce_sum(sum_k_fvec);
+        qk_scale_buf[ti * num_heads + ni] = float(1) / std::sqrt(sum_q + eps);
+        qk_scale_buf[total_tokens * num_heads + ti * num_heads + ni] = float(1) / std::sqrt(sum_k + eps);
+
+        data_index_step(ti, total_tokens, ni, num_heads);
+      }
+    });
+  }
+
+  at::parallel_for(0, batch_size * v_num_heads, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, ni{0};
+    data_index_init(begin, bi, batch_size, ni, v_num_heads);
+    for (int64_t i = begin; i < end; ++i) {
+      float* const pool_state = state_ptr + (int64_t(state_indices_ptr[bi]) * v_num_heads + ni) * head_state_size;
+      float* const window_base = window_ptr + int64_t(window_indices_ptr[bi]) * window_strideW + ni * head_state_size;
+      const float A_log_exp = std::exp(float(A_log_ptr[ni]));
+      const float dt_bias_val = float(dt_bias_ptr[ni]);
+
+      for (int64_t t = 0; t < steps; ++t) {
+        const int64_t tok = bi * steps + t;
+        const float* __restrict__ src = (t == 0) ? pool_state : (window_base + (t - 1) * window_strideT);
+        float* __restrict__ dst = window_base + t * window_strideT;
+
+        float g_val_exp =
+            std::exp(-A_log_exp * softplus(float(a_ptr[tok * v_num_heads + ni]) + dt_bias_val, softplus_threshold));
+        fVec g_val_exp_vec = fVec(g_val_exp);
+        float beta_val = 1 / (1 + std::exp(-float(b_ptr[tok * v_num_heads + ni])));
+        fVec beta_vec = fVec(beta_val);
+
+        int64_t q_offset = tok * q_strideT + (ni / group_size) * q_strideH;
+        int64_t k_offset = tok * k_strideT + (ni / group_size) * k_strideH;
+        int64_t v_offset = tok * v_strideT + ni * v_strideH;
+        int64_t o_offset = (tok * v_num_heads + ni) * v_head_dim;
+        int64_t scale_offset = tok * num_heads + (ni / group_size);
+        float q_scale = use_qk_l2norm_in_kernel ? qk_scale_buf[scale_offset] : 1.0f;
+        float k_scale = use_qk_l2norm_in_kernel ? qk_scale_buf[total_tokens * num_heads + scale_offset] : 1.0f;
+
+        int64_t dvi = 0;
+        for (; dvi <= v_head_dim - VecSize; dvi += VecSize) {
+          fVec kv_mem_vec0 = fVec(float(0));
+          fVec kv_mem_vec1 = fVec(float(0));
+          for (int di = 0; di < head_dim; ++di) {
+            fVec k_val_vec = fVec(float(k_ptr[k_offset + di]) * k_scale);
+            auto [state_vec0, state_vec1] = load_float_vec2(src + di * v_head_dim + dvi);
+            kv_mem_vec0 = kv_mem_vec0 + state_vec0 * g_val_exp_vec * k_val_vec;
+            kv_mem_vec1 = kv_mem_vec1 + state_vec1 * g_val_exp_vec * k_val_vec;
+          }
+          auto [v_vec0, v_vec1] = load_float_vec2(v_ptr + v_offset + dvi);
+          fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
+          fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
+          fVec o_vec0 = fVec(float(0));
+          fVec o_vec1 = fVec(float(0));
+          for (int di = 0; di < head_dim; ++di) {
+            fVec q_vec = fVec(float(q_ptr[q_offset + di]) * q_scale);
+            fVec k_vec = fVec(float(k_ptr[k_offset + di]) * k_scale);
+            auto [state_vec0, state_vec1] = load_float_vec2(src + di * v_head_dim + dvi);
+            state_vec0 = state_vec0 * g_val_exp_vec + k_vec * dt_vec0;
+            state_vec1 = state_vec1 * g_val_exp_vec + k_vec * dt_vec1;
+            o_vec0 = o_vec0 + state_vec0 * q_vec * scale_vec;
+            o_vec1 = o_vec1 + state_vec1 * q_vec * scale_vec;
+            state_vec0.store(dst + di * v_head_dim + dvi);
+            state_vec1.store(dst + di * v_head_dim + dvi + fVecSize);
+          }
+          bVec o_vec = at::vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
+          o_vec.store(o_ptr + o_offset + dvi);
+        }
+        for (; dvi < v_head_dim; ++dvi) {
+          float kv_mem_val = 0;
+          for (int di = 0; di < head_dim; ++di) {
+            float k_val = float(k_ptr[k_offset + di]) * k_scale;
+            kv_mem_val += src[di * v_head_dim + dvi] * g_val_exp * k_val;
+          }
+          float v_val = float(v_ptr[v_offset + dvi]);
+          float dt_val = (v_val - kv_mem_val) * beta_val;
+          float o_val = 0;
+          for (int di = 0; di < head_dim; ++di) {
+            float q_val = float(q_ptr[q_offset + di]) * q_scale;
+            float k_val = float(k_ptr[k_offset + di]) * k_scale;
+            float state_val = src[di * v_head_dim + dvi] * g_val_exp + k_val * dt_val;
+            dst[di * v_head_dim + dvi] = state_val;
+            o_val += state_val * q_val * scale;
+          }
+          o_ptr[o_offset + dvi] = o_val;
+        }
+      }
+
+      if (!disable_state_update) {
+        const float* last = window_base + (steps - 1) * window_strideT;
+        for (int64_t j = 0; j < head_state_size; ++j) {
+          pool_state[j] = last[j];
+        }
+      }
+
+      data_index_step(bi, batch_size, ni, v_num_heads);
+    }
+  });
+}
+
 template <typename scalar_t>
 void fused_gdn_gating_kernel_impl(
     float* __restrict__ A_log,
@@ -1690,6 +1870,119 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
             v_strideS,
             v_strideH,
             use_qk_l2norm_in_kernel,
+            softplus_threshold);
+      });
+  return core_attn_out;
+}
+
+// q/k/v: [1, batch * steps, num_heads, head_dim], token tok = bi * steps + t
+// a/b: [batch * steps, num_v_heads]
+// initial_state_source: [pool, num_v_heads, head_dim, v_head_dim], read-only
+//   unless disable_state_update is false
+// intermediate_states_buffer: [window_pool, steps, num_v_heads, head_dim,
+//   v_head_dim], receives the state after each draft token
+at::Tensor fused_sigmoid_gating_delta_rule_update_spec_cpu(
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices,
+    at::Tensor& intermediate_states_buffer,
+    const at::Tensor& intermediate_state_indices,
+    int64_t steps,
+    bool use_qk_l2norm_in_kernel,
+    bool disable_state_update,
+    double softplus_beta = 1.0,
+    double softplus_threshold = 20.0) {
+  CHECK_DIM(4, q);
+  CHECK_DIM(4, v);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_EQ(q.size(0), 1);
+  CHECK(steps > 0);
+  int64_t total_tokens = q.size(1);
+  int64_t num_heads = q.size(2);
+  int64_t head_dim = q.size(3);
+  int64_t v_num_heads = v.size(2);
+  int64_t v_head_dim = v.size(3);
+  int64_t batch_size = initial_state_indices.size(0);
+  CHECK_EQ(total_tokens, batch_size * steps);
+  CHECK_INPUT_SHAPE_DTYPE<true>(k, {1, total_tokens, num_heads, head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(v, {1, total_tokens, v_num_heads, v_head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(a, {total_tokens, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(b, {total_tokens, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(dt_bias, {v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(initial_state_indices, {batch_size}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<true>(
+      initial_state_source, {initial_state_source.size(0), v_num_heads, head_dim, v_head_dim}, at::kFloat);
+  CHECK_DIM(5, intermediate_states_buffer);
+  CHECK_EQ(intermediate_states_buffer.scalar_type(), at::kFloat);
+  CHECK(intermediate_states_buffer.size(1) >= steps);
+  CHECK_EQ(intermediate_states_buffer.size(2), v_num_heads);
+  CHECK_EQ(intermediate_states_buffer.size(3), head_dim);
+  CHECK_EQ(intermediate_states_buffer.size(4), v_head_dim);
+  // Only the trailing [num_v_heads, head_dim, v_head_dim] block has to be
+  // packed; the pool and step axes are addressed through their own strides.
+  CHECK_EQ(intermediate_states_buffer.stride(4), 1);
+  CHECK_EQ(intermediate_states_buffer.stride(3), v_head_dim);
+  CHECK_EQ(intermediate_states_buffer.stride(2), head_dim * v_head_dim);
+  CHECK_EQ(intermediate_state_indices.scalar_type(), at::kInt);
+  CHECK_CONTIGUOUS(intermediate_state_indices);
+  // The caller may hand over the whole pool-sized slot table; only the first
+  // batch_size entries belong to this batch.
+  CHECK(intermediate_state_indices.size(0) >= batch_size);
+  CHECK_EQ(v_num_heads % num_heads, 0);
+  TORCH_CHECK(
+      A_log.sizes() == at::IntArrayRef({v_num_heads}),
+      "Input tensor shape mismatch: expected ",
+      at::IntArrayRef({v_num_heads}),
+      ", got ",
+      A_log.sizes());
+
+  int64_t q_strideT = q.stride(1);
+  int64_t q_strideH = q.stride(2);
+  int64_t k_strideT = k.stride(1);
+  int64_t k_strideH = k.stride(2);
+  int64_t v_strideT = v.stride(1);
+  int64_t v_strideH = v.stride(2);
+  at::Tensor core_attn_out = at::empty({1, total_tokens, v_num_heads, v_head_dim}, q.options());
+  at::Tensor qk_scale_buf = at::empty({2, total_tokens, num_heads}, at::kFloat);
+
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
+      q.scalar_type(), A_log.scalar_type(), "fused_sigmoid_gating_delta_rule_update_spec_kernel_impl", [&] {
+        fused_sigmoid_gating_delta_rule_update_spec_kernel_impl<scalar_t, param_t>(
+            q.data_ptr<scalar_t>(),
+            k.data_ptr<scalar_t>(),
+            v.data_ptr<scalar_t>(),
+            A_log.data_ptr<param_t>(),
+            a.data_ptr<scalar_t>(),
+            dt_bias.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            initial_state_indices.data_ptr<int32_t>(),
+            intermediate_state_indices.data_ptr<int32_t>(),
+            initial_state_source.data_ptr<float>(),
+            intermediate_states_buffer.data_ptr<float>(),
+            core_attn_out.data_ptr<scalar_t>(),
+            qk_scale_buf.data_ptr<float>(),
+            steps,
+            batch_size,
+            num_heads,
+            head_dim,
+            v_num_heads,
+            v_head_dim,
+            q_strideT,
+            q_strideH,
+            k_strideT,
+            k_strideH,
+            v_strideT,
+            v_strideH,
+            intermediate_states_buffer.stride(0),
+            intermediate_states_buffer.stride(1),
+            use_qk_l2norm_in_kernel,
+            disable_state_update,
             softplus_threshold);
       });
   return core_attn_out;
