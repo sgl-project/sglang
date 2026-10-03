@@ -775,7 +775,9 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-_minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+@eager_on_graph
+def _eager_attention_core(*args, **kwargs):
+    return _minimax_h3_attention_core_impl(*args, **kwargs)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -1173,7 +1175,7 @@ class MiniMaxH3Attention(nn.Module):
             gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
 
         attention_core = (
-            _minimax_h3_attention_core_bcg
+            _eager_attention_core
             if self.bcg_breakpoint
             else _minimax_h3_attention_core_impl
         )
@@ -2395,8 +2397,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self.release_mps_non_layer_weights("rope")
         return result
 
-    @eager_on_graph(True)
-    def _embed(
+    @eager_on_graph
+    def _eager_embed(
         self,
         *,
         x: torch.Tensor,
@@ -2428,7 +2430,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         elif torch.is_tensor(refined_prompt_embeds_length):
             # BCG turns this request-varying host constant into a scalar input
             # so different live lengths can replay one padded-text signature.
-            # _embed is an eager graph break, so this value is read outside
+            # _eager_embed is an eager graph break, so this value is read outside
             # captured CUDA graphs.
             text_len = int(refined_prompt_embeds_length.item())
         else:
@@ -2692,7 +2694,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
 
-        decoder_input, t_emb = self._embed(
+        decoder_input, t_emb = self._eager_embed(
             x=x,
             audio_x=audio_x,
             text_embeddings_selected=text_selected,

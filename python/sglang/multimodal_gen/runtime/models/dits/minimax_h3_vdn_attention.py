@@ -140,7 +140,7 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         beta = self.linear_attention.beta(x)
         gate_hidden, _ = self.linear_attention.output_gate.down(x)
         attention_core = (
-            _hybrid_attention_core_bcg
+            _eager_hybrid_attention_core
             if attention.bcg_breakpoint
             else _minimax_h3_hybrid_attention_core_impl
         )
@@ -563,9 +563,9 @@ def _vdn_return_to_rows(
     return merged[0], linear_rows
 
 
-_hybrid_attention_core_bcg = eager_on_graph(True)(
-    _minimax_h3_hybrid_attention_core_impl
-)
+@eager_on_graph
+def _eager_hybrid_attention_core(*args, **kwargs):
+    return _minimax_h3_hybrid_attention_core_impl(*args, **kwargs)
 
 
 def prepare_hybrid_attention_metadata(
