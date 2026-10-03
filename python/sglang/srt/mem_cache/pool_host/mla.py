@@ -28,6 +28,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    DirectPageIndices,
+    direct_page_kernel_segments,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -140,6 +142,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.device_pool.device,
             host_memory_registered=self.pin_memory,
         )
+        segments = (
+            direct_page_kernel_segments(
+                self.kv_buffer,
+                page_bytes=self.page_size * self.layout_dim,
+                item_bytes=self._direct_page_bytes,
+                pin_memory=self.pin_memory,
+                target_device=self.device_pool.device,
+                pool_name=f"MLA {self.pool_label}",
+            )
+            if self.layout == "page_first_direct"
+            else None
+        )
+        self.use_direct_page_kernel = segments is not None
+        self._direct_page_indices = DirectPageIndices(
+            self.page_size,
+            self.device_pool.device,
+            segments or ((0, self.page_num),),
+            pool_name=f"MLA {self.pool_label}",
+        )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
             self.packed_device_data_ptrs = torch.cat(
@@ -203,6 +224,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.layout_dim = self.token_stride_size * self.layer_num
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self.use_direct_page_kernel = False
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_buffer = None
@@ -653,6 +675,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
+    @property
+    def _direct_page_bytes(self) -> int:
+        return self.page_size * self.token_stride_size
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -731,14 +757,36 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_per_layer_direct_pf_lf(
-                    src_ptrs=[self.kv_buffer],
-                    dst_ptrs=[device_pool.kv_buffer[device_layer_id]],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=host_layer_id,
-                    page_size=self.page_size,
+                pages = (
+                    self._direct_page_indices.get(
+                        host_indices, device_indices, reuse=True
+                    )
+                    if self.use_direct_page_kernel
+                    else None
                 )
+                if pages is not None:
+                    # One gather launch per layer and host registration over
+                    # whole pages: host page p, layer l -> device rows
+                    # [p * page_size, (p + 1) * page_size).
+                    for first, end, host_pages, device_pages in pages:
+                        transfer_kv_per_layer_mla_pf_lf(
+                            src=self.kv_buffer[first:end],
+                            dst=device_pool.kv_buffer[device_layer_id],
+                            src_indices=host_pages,
+                            dst_indices=device_pages,
+                            layer_id=host_layer_id,
+                            item_size=self._direct_page_bytes,
+                            src_layout_dim=self.layer_num * self._direct_page_bytes,
+                        )
+                else:
+                    transfer_kv_per_layer_direct_pf_lf(
+                        src_ptrs=[self.kv_buffer],
+                        dst_ptrs=[device_pool.kv_buffer[device_layer_id]],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=host_layer_id,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
@@ -979,13 +1027,32 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_kv_buffers,
-                    dst_ptrs=[self.kv_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
+                pages = (
+                    self._direct_page_indices.get(
+                        host_indices, device_indices, reuse=False
+                    )
+                    if self.use_direct_page_kernel
+                    else None
                 )
+                if pages is not None:
+                    for first, end, host_pages, device_pages in pages:
+                        transfer_kv_all_layer_mla_lf_pf(
+                            src_layers=device_data_ptrs,
+                            dst=self.kv_buffer[first:end],
+                            src_indices=device_pages,
+                            dst_indices=host_pages,
+                            item_size=self._direct_page_bytes,
+                            dst_layout_dim=self.layer_num * self._direct_page_bytes,
+                            num_layers=self.layer_num,
+                        )
+                else:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_kv_buffers,
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
