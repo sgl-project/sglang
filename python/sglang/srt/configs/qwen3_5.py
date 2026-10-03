@@ -30,6 +30,14 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         if self.rope_scaling is None:
             self.rope_scaling = rope_parameters or {}
 
+        # Dense Qwen3.5 is not MoE: clear the MoE-only sizes inherited from
+        # Qwen3NextConfig (exact type: the MoE subclass keeps its defaults),
+        # or check_quantized_moe_compatibility rejects valid TP sharding of
+        # block-quantized FP8 dense checkpoints.
+        if type(self) is Qwen3_5TextConfig:
+            self.moe_intermediate_size = None
+            self.shared_expert_intermediate_size = None
+
         # Keep both names for compatibility with model code paths that read either.
         self.rope_parameters = rope_parameters or self.rope_scaling
 
