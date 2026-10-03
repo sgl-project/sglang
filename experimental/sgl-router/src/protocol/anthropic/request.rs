@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Messages request → chat request. Mirrors the engine's adapter
-//! (`entrypoints/anthropic/serving.py`), but thinking history goes to
-//! `reasoning_content`. Unconsumed fields pass through.
+//! Messages request → chat request. `Value`-based so unconsumed fields
+//! (sglang extensions) pass through.
 
 use serde_json::{json, Map, Value};
 
@@ -147,18 +146,17 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         .and_then(|c| c.get("effort"))
         .filter(|v| !v.is_null())
     {
-        let mapped = match effort.as_str() {
-            Some("low") => "low",
-            Some("medium") => "medium",
-            Some("high") => "high",
-            Some("xhigh") | Some("max") => "max",
+        // Every tier is also an engine `reasoning_effort` tier.
+        match effort.as_str() {
+            Some(e @ ("low" | "medium" | "high" | "xhigh" | "max")) => {
+                chat.insert("reasoning_effort".into(), e.into());
+            }
             _ => {
                 return Err(format!(
                     "output_config.effort: expected low, medium, high, xhigh or max, got {effort}"
                 ))
             }
-        };
-        chat.insert("reasoning_effort".into(), mapped.into());
+        }
     }
     let format = output_config
         .and_then(|c| c.get("format"))
@@ -680,7 +678,7 @@ mod tests {
             c["chat_template_kwargs"],
             json!({"thinking": true, "enable_thinking": true})
         );
-        assert_eq!(c["reasoning_effort"], "max");
+        assert_eq!(c["reasoning_effort"], "xhigh");
         assert_eq!(
             c["response_format"],
             json!({"type": "json_schema",

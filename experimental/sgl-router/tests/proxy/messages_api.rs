@@ -246,3 +246,18 @@ async fn count_tokens() {
         "count_tokens is answered by the router"
     );
 }
+
+#[tokio::test]
+async fn oversized_body_uses_the_anthropic_envelope() {
+    let mock = MockWorker::start(vec![]).await;
+    let big = "x".repeat(sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES);
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/messages",
+        json!({"model": MODEL, "max_tokens": 16,
+               "messages": [{"role": "user", "content": big}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_anthropic_error(&body, "request_too_large");
+}

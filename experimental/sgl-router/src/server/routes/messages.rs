@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
+use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
@@ -17,10 +18,14 @@ use crate::discovery::ModelId;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
 };
-use crate::protocol::transduce_body;
+use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::{chat_completions, MAX_CHAT_BODY_BYTES};
+use crate::server::routes::tokenize::tokenizer_for;
+
+/// Upstream replies are buffered up to the same cap as requests.
+const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
 
 pub(crate) async fn messages(
     State(ctx): State<Arc<AppContext>>,
@@ -49,15 +54,15 @@ pub(crate) async fn count_tokens(
         Err(e) => return adapt(e.into_response(), None).await,
     };
     let model = converted.echo.model;
-    if model != ctx.config.model.id {
-        return adapt(ApiError::ModelNotFound(model).into_response(), None).await;
+    if let Err(e) = tokenizer_for(&ctx, &model) {
+        return adapt(e.into_response(), None).await;
     }
     match crate::policies::request_tokens_for(&ctx.tokenizers, &ModelId(model), &converted.chat) {
         Some(t) => axum::Json(serde_json::json!({"input_tokens": t.ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            anthropic::error_body(500, "token counting is unavailable for this model"),
+            anthropic::error_body(500, "failed to render the request for token counting"),
         )
             .into_response(),
     }
@@ -89,7 +94,7 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
     }
 
     let status = parts.status.as_u16();
-    let bytes = match axum::body::to_bytes(body, MAX_CHAT_BODY_BYTES).await {
+    let bytes = match axum::body::to_bytes(body, MAX_REPLY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "messages: failed to read upstream reply");
@@ -120,6 +125,24 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
             )
         }
     }
+}
+
+/// The body limit rejects oversized requests before the handler runs; give
+/// that plain-text 413 the Anthropic envelope too.
+pub(crate) async fn envelope_413(req: Request, next: Next) -> Response<Body> {
+    let resp = next.run(req).await;
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|ct| ct.as_bytes().starts_with(b"application/json"));
+    if resp.status() != StatusCode::PAYLOAD_TOO_LARGE || is_json {
+        return resp;
+    }
+    let (parts, _) = resp.into_parts();
+    rebuild(
+        parts,
+        anthropic::error_body(413, "request body is too large"),
+    )
 }
 
 fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {

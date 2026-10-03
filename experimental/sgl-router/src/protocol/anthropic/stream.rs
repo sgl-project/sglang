@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Chat SSE → Messages events: message_start, content blocks, message_delta,
-//! message_stop. `message_start` waits for the first chunk with usage.
+//! message_stop. `message_start` is sent on the first usage or content chunk.
 
 use serde_json::{json, Value};
 
-use super::{new_id, stop_reason, usage_from_chat, EchoContext};
-use crate::protocol::{data_payload, write_event, LineBuffer, SseTransducer};
+use super::{error_type, new_id, stop_reason, usage_from_chat, EchoContext};
+use crate::protocol::sse::{data_payload, write_event, LineBuffer, SseTransducer};
 
 #[derive(PartialEq, Eq)]
 enum Kind {
@@ -57,7 +57,9 @@ impl MessagesStream {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("upstream error");
-            self.emit_error(message, out);
+            let status = err.get("code").and_then(Value::as_u64);
+            let status = status.and_then(|c| u16::try_from(c).ok()).unwrap_or(500);
+            self.emit_error(error_type(status), message, out);
             return;
         }
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -180,11 +182,11 @@ impl MessagesStream {
         }
     }
 
-    fn emit_error(&mut self, message: &str, out: &mut Vec<u8>) {
+    fn emit_error(&mut self, typ: &str, message: &str, out: &mut Vec<u8>) {
         write_event(
             out,
             "error",
-            &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+            &json!({"type": "error", "error": {"type": typ, "message": message}}),
         );
         self.terminal = true;
     }
@@ -212,6 +214,7 @@ impl SseTransducer for MessagesStream {
         }
         if self.finish_reason.is_none() {
             self.emit_error(
+                "api_error",
                 "upstream stream ended before the message completed",
                 &mut out,
             );
@@ -241,7 +244,7 @@ impl SseTransducer for MessagesStream {
     fn fail(&mut self, message: &str) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.terminal {
-            self.emit_error(message, &mut out);
+            self.emit_error("api_error", message, &mut out);
         }
         out
     }
@@ -415,6 +418,12 @@ mod tests {
             data["error"],
             json!({"type": "api_error", "message": "boom"})
         );
+
+        // An upstream status maps to its Anthropic error type.
+        let mut s = MessagesStream::new(echo());
+        let raw = s.feed(b"data: {\"error\": {\"message\": \"too long\", \"code\": 400}}\n\n");
+        let (_, data) = events(&raw).pop().unwrap();
+        assert_eq!(data["error"]["type"], "invalid_request_error");
 
         let evs = run(&[chunk(json!({"content": "cut"}), None, true)]);
         assert_eq!(evs.last().unwrap().0, "error");
