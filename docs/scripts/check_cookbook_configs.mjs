@@ -174,6 +174,9 @@ for (const path of walk(CONFIGS)) {
 
   for (const dim of (config.overlayDims || [])) {
     const ids = (dim.options || []).map((o) => o.id);
+    if (new Set(ids).size !== ids.length) {
+      fail(where, `overlayDims.${dim.id} has duplicate option ids`);
+    }
     if (dim.kind === "number") {
       if (!Number.isInteger(dim.min) || !Number.isInteger(dim.max) || dim.min > dim.max) {
         fail(where, `overlayDims.${dim.id} has invalid numeric bounds`);
@@ -316,7 +319,7 @@ for (const path of walk(CONFIGS)) {
         { hw: "gb200" },
         { hw: "gb300", mode: "i2va" },
         { hw: "gb300", weights: "ref2va", mode: "v2v" },
-        { hw: "gb300", quality: "extra-high" },
+        { hw: "gb300", quality: "lossless" },
         { hw: "gb300", outputs: "2" },
         { hw: "gb300", precision: "fp8" },
         { hw: "gb300", attention: "sage" },

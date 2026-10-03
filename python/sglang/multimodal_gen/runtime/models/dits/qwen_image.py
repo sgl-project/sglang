@@ -997,7 +997,7 @@ class QwenImageCrossAttention(nn.Module):
                 )
                 if self._unquantized_added_qkv_is_packed:
                     # Packing changes BF16 GEMM reduction association. Keep it
-                    # off for lossless and mount it at extra-high or high.
+                    # off for lossless and mount it at lossless or high.
                     mark_qwen_image_added_qkv_site(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(
