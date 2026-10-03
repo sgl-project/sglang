@@ -1228,8 +1228,14 @@ class AnthropicServing:
                         )
                         had_content_delta = True
 
-            # Handle text content deltas
-            if delta.content is not None and delta.content != "":
+            # Tool-call parsers can emit formatting whitespace before the
+            # current call's final argument fragment. Opening a text block
+            # here would close tool_use early and drop that fragment.
+            if (
+                delta.content is not None
+                and delta.content != ""
+                and not (content_block_type == "tool_use" and delta.content.isspace())
+            ):
                 for event in _ensure_content_block_events(
                     "text",
                     TextBlock(text=""),
