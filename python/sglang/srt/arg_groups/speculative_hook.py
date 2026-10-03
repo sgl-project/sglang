@@ -970,6 +970,23 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Currently standalone speculative decoding does not support dp attention."
         )
 
+    # The map holds global vocab ids, but the shared target lm_head is
+    # vocab-sharded at tp_size > 1, so gathering its rows by those ids reads out
+    # of bounds. EAGLE3 ignores the flag and uses the checkpoint's own reduced
+    # head, which is sharded consistently.
+    # TODO(xin-osaka-u): support tp_size > 1, sgl-project/sglang#42397.
+    if (
+        cfg.speculative_token_map is not None
+        and cfg.speculative_algorithm != "EAGLE3"
+        and cfg.tp_size > 1
+    ):
+        raise ValueError(
+            "--speculative-token-map is not supported with tp_size > 1: the hot "
+            "token ids are global, but the target lm_head is vocab-sharded over "
+            f"the {cfg.tp_size} TP ranks. Use --tp-size 1, or drop "
+            "--speculative-token-map."
+        )
+
     if cfg.max_running_requests is None:
         declare_resolution(
             server_args,

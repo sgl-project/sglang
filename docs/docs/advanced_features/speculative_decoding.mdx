@@ -234,7 +234,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
   </tbody>
 </table>
 
-These parameters are mostly the same for EAGLE-2 and EAGLE-3. `--speculative-token-map` is ignored for EAGLE-3 models.
+These parameters are mostly the same for EAGLE-2 and EAGLE-3. `--speculative-token-map` is ignored for EAGLE-3 models, and requires `--tp-size 1`: the map holds global vocab ids, which cannot index a vocab-sharded `lm_head`.
 For `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`: leave all three unset to use auto-tuning, or set all three explicitly when tuning.
 If you use EAGLE with `--speculative-eagle-topk 1` and your acceptance rate varies across requests, see [Adaptive Speculative Decoding](./adaptive_speculative_decoding).
 
