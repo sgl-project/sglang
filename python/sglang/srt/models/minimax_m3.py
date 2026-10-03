@@ -15,6 +15,7 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -90,6 +91,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
@@ -104,6 +106,11 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_gfx95_supported = _is_hip and is_gfx95_supported()
+# Using the third-party aiter package is an explicit operator opt-in across this
+# repo, not merely a consequence of running on ROCm (SGLANG_USE_AITER defaults to
+# False). Follow that so this fused path can be turned off without uninstalling
+# aiter package-wide, which would also disable every other aiter fusion.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _device_sm = get_device_sm()
 
 if _is_gfx95_supported:
@@ -136,6 +143,75 @@ if _is_hip:
         _has_rocm_qk_norm_rope = True
     except ImportError:
         _has_rocm_qk_norm_rope = False
+
+# aiter's fused qk-norm + rope + fp8 KV/index-cache store (ROCm). On a sparse
+# layer this replaces qk-norm + rope + the div_/cast/K-V-store/index-K-store
+# chain with ONE launch, which is the point: M3 decode is launch-bound.
+# The kernel hardcodes Gemma norm (`1.0f + weight[dim]`), NEOX split-half rope
+# and head_dim 128; all three are gate conditions below, never assumptions.
+_aiter_fused_qknorm_idxrqknorm = None
+# Empty unless the aiter import below succeeds, so the gate is closed by default
+# on CUDA/NPU builds, and on ROCm without SGLANG_USE_AITER, where the name would
+# otherwise be undefined.
+_AITER_FP8_CACHE_DTYPES: tuple = ()
+if _use_aiter:
+    try:
+        from aiter.ops.fused_qknorm_idxrqknorm import (
+            fused_qknorm_idxrqknorm as _aiter_fqi,
+        )
+
+        # The aiter installed in the serving container can predate the kwargs
+        # this path passes, so inspect the real signature instead of assuming a
+        # version: a missing kwarg disables the path rather than raising.
+        if all(
+            _p in inspect.signature(_aiter_fqi).parameters
+            for _p in (
+                "index_q_norm_weight",
+                "index_k_norm_weight",
+                "num_index_heads",
+                "slot_mapping",
+                "kv_cache_k",
+                "kv_cache_v",
+                "index_cache",
+                "block_size",
+                "kv_cache_dtype",
+                "index_cache_dtype",
+                "k_scale",
+                "v_scale",
+                "asm_layout",
+            )
+        ):
+            _aiter_fused_qknorm_idxrqknorm = _aiter_fqi
+
+        # Storage dtypes the fp8 cache-insert mode accepts, resolved from aiter's
+        # own arch table rather than hardcoded. aiter maps exactly ONE torch fp8
+        # variant onto its fp8 enum id -- e4m3fn on gfx950, e4m3fnuz on gfx942
+        # (aiter.utility.dtypes) -- and every tensor argument is resolved through
+        # that module's dtype-id lookup, which raises "Unsupported dtype" for the
+        # other variant. Screening against the resolved dtype (plus raw uint8
+        # storage, which the kernel's cache-insert mode also accepts) turns that
+        # hard raise inside forward into a quiet fallback.
+        from aiter.utility.dtypes import fp8 as _aiter_fp8_storage
+
+        _AITER_FP8_CACHE_DTYPES = (torch.uint8, _aiter_fp8_storage)
+    except Exception:  # noqa: BLE001 - import or JIT failure just disables the path
+        _aiter_fused_qknorm_idxrqknorm = None
+
+# Distinct fused-store rejection reasons already logged, so each is reported
+# once per process. A fast path that disables itself silently is the expensive
+# failure here: the server keeps serving and the win simply never shows up.
+_aiter_fused_store_notes: Set[str] = set()
+
+
+def _aiter_fused_store_note(reason: str) -> None:
+    if reason not in _aiter_fused_store_notes:
+        _aiter_fused_store_notes.add(reason)
+        logger.info(
+            "minimax_m3: aiter fused qknorm+rope+KV-store path not taken (%s); "
+            "falling back to the split norm/rope + store route",
+            reason,
+        )
+
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
@@ -775,6 +851,43 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
 
+        # Model-geometry half of the aiter fused-store gate. Each condition
+        # names the kernel requirement it satisfies; the per-call half lives in
+        # _aiter_fused_store_runtime_reason / _aiter_fused_store_cache_views.
+        self._aiter_fused_store_static_ok = (
+            _aiter_fused_qknorm_idxrqknorm is not None
+            and self.is_sparse_attention_layer
+            # The kernel's row layout is exactly [q|k|v|idx_q|idx_k]. An idx_v
+            # column would shift index-k off its (nq + 2*nkv + niq) slot.
+            and self.disable_index_value
+            # kHeadDim is a compile-time 128 for both main and index heads.
+            and self.head_dim == 128
+            and self.idx_head_dim == 128
+            and self.qk_norm_type == "per_head"
+            # The kernel hardcodes the Gemma (1 + w) norm scale.
+            and self.use_gemma_norm
+            # rotary_dim must be a positive multiple of 8 and <= head_dim.
+            and self.rotary_dim > 0
+            and self.rotary_dim % 8 == 0
+            and self.rotary_dim <= self.head_dim
+            # The kernel hardcodes NEOX split-half rope (no interleaved variant).
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.index_rotary_emb is self.rotary_emb
+            # All four norms share the kernel's single eps argument.
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and self.index_q_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
+        )
+        # Width of the one contiguous row the kernel reads: q, k, v, index-q and
+        # the single index-k head, all at head_dim 128.
+        self._aiter_fused_row = (
+            (self.num_heads + 2 * self.num_kv_heads + self.num_idx_heads + 1)
+            * self.head_dim
+            if self.is_sparse_attention_layer
+            else 0
+        )
+        self._aiter_kv_scales = None
+
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> bool:
@@ -1003,6 +1116,274 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    def _aiter_fused_store_scales(self):
+        """The 1-element fp32 device k/v scale tensors aiter's
+        ``kv_cache_dtype="fp8_e4m3_static"`` mode requires. SGLang only carries
+        the per-tensor scales as Python floats, and follows a None-means-unit
+        convention, hence the 1.0 default.
+
+        Built lazily, not at load time: RadixAttention.k_scale_float is assigned
+        by the KV-cache quant method's process_weights_after_loading, which runs
+        AFTER load_weights (and so after build_minimax_fused_qkv_index) -- reading
+        it there would silently capture None for every layer. Allocating under
+        graph capture is not allowed, so fall back for that one call instead;
+        warmup runs eagerly first, so in practice the tensors already exist.
+        """
+        scales = self._aiter_kv_scales
+        if scales is not None:
+            return scales
+        if get_is_capture_mode():
+            return None
+        k_scale = self.attn.k_scale_float
+        v_scale = self.attn.v_scale_float
+        device = self.q_norm.weight.device
+        scales = (
+            torch.tensor(
+                [1.0 if k_scale is None else float(k_scale)],
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.tensor(
+                [1.0 if v_scale is None else float(v_scale)],
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        self._aiter_kv_scales = scales
+        return scales
+
+    def _aiter_fused_store_cache_views(self, kv_pool):
+        """(k_cache, v_cache, index_cache, page_size) shaped for aiter's
+        asm_layout=False insert mode, or None when this pool's physical layout is
+        not the plain NHD one that mode addresses.
+
+        aiter treats the main cache as [num_blocks, page, num_kv_heads, 128] and
+        resolves a slot as (slot // page, slot % page). SGLang's NHD buffer is
+        [rows, num_kv_heads, 128] indexed directly by slot, so the 4-D reshape is
+        free and lands on the same byte for every slot. The HND and vectorized_5d
+        buffers are physically different and must not take this path -- hence the
+        dim()/shape checks rather than a blind reshape.
+        """
+        layer_id = self.attn.layer_id
+        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        index_cache = kv_pool.get_index_k_buffer(layer_id)
+        page_size = getattr(kv_pool, "page_size", 0)
+        if k_cache.dim() != 3 or v_cache.dim() != 3 or k_cache.shape != v_cache.shape:
+            return None
+        rows, n_kv, dim = k_cache.shape
+        if (
+            page_size <= 0
+            or rows % page_size != 0
+            or n_kv != self.num_kv_heads
+            or dim != self.head_dim
+            or k_cache.dtype != v_cache.dtype
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+            or not index_cache.is_contiguous()
+        ):
+            return None
+        if k_cache.dtype not in _AITER_FP8_CACHE_DTYPES:
+            return None
+        # The kernel indexes index_cache as slot * 128 + dim over the same slot
+        # space as the main cache, and asserts the element count covers it.
+        if index_cache.numel() < rows * dim:
+            return None
+        num_blocks = rows // page_size
+        return (
+            k_cache.view(num_blocks, page_size, n_kv, dim),
+            v_cache.view(num_blocks, page_size, n_kv, dim),
+            index_cache,
+            page_size,
+        )
+
+    def _aiter_fused_store_runtime_reason(self, positions, combined, loc):
+        """Per-call half of the gate: None when every tensor property the kernel
+        asserts holds, otherwise a short string naming the first one that does
+        not (so the one-time log says *why* the path went dark rather than just
+        that it did)."""
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if (
+            combined.dim() != 2
+            or combined.shape[1] != self._aiter_fused_row
+            or combined.dtype not in (torch.bfloat16, torch.float16)
+            or not combined.is_contiguous()
+        ):
+            return f"qkv row is not contiguous 2-D x {self._aiter_fused_row} bf16/fp16"
+        # cos_sin_cache must match qkv's dtype and be [max_pos, rotary_dim]. On
+        # ROCm RotaryEmbedding.__init__ casts it to the model dtype, but
+        # SGLANG_ROPE_CACHE_FP32 and _match_cos_sin_cache_dtype can both change
+        # it afterwards, so check per call rather than once at init.
+        if (
+            cos_sin.dtype != combined.dtype
+            or cos_sin.dim() != 2
+            or cos_sin.shape[1] != self.rotary_dim
+            or not cos_sin.is_contiguous()
+        ):
+            return f"cos_sin_cache is {cos_sin.dtype} {tuple(cos_sin.shape)}"
+        if (
+            self.q_norm.weight.dtype != combined.dtype
+            or self.index_q_norm.weight.dtype != combined.dtype
+        ):
+            return f"qk-norm weights are {self.q_norm.weight.dtype}"
+        # positions and slot_mapping: 1-D contiguous int64, long enough.
+        if (
+            positions.dim() != 1
+            or positions.dtype != torch.int64
+            or not positions.is_contiguous()
+            or positions.shape[0] < combined.shape[0]
+        ):
+            return "positions is not a long-enough contiguous int64 1-D tensor"
+        if (
+            loc is None
+            or loc.dim() != 1
+            or loc.dtype != torch.int64
+            or not loc.is_contiguous()
+            or loc.shape[0] < combined.shape[0]
+        ):
+            return "out_cache_loc is not a long-enough contiguous int64 1-D tensor"
+        # The kernel's index-cache store applies a hardcoded unit scale, so a
+        # non-unit index-K scale would silently corrupt it.
+        if self.attn.idx_k_scale_float not in (None, 1.0):
+            return "index-K scale is not 1.0"
+        return None
+
+    def _aiter_fused_store_buffer(self, qkv, idx_qkv, fused_out):
+        """The single contiguous [q|k|v|idx_q|idx_k] row the kernel reads in place.
+
+        maybe_build_fused_qkv_index concatenates qkv_proj and index_qkv_proj into
+        one GEMM whose output is already exactly this layout, so that output is
+        reused as-is -- the zero-copy case, and the one this config hits: the
+        MXFP4 checkpoint excludes every self_attn q/k/v/o_proj and index_q/k_proj
+        from quantization, so both projections get UnquantizedLinearMethod and the
+        fusion applies. Without it, concatenate: one extra launch plus a
+        num_tokens * row * 2 B round trip per sparse layer -- at bs 16 that is
+        ~156 KB/layer at attn TP2 (row 4992) and ~48 KB at TP8 (row 1536), since
+        the row shrinks with the TP split. Small next to the launches removed,
+        but not free, and the caller only reaches it in decode (see
+        _maybe_aiter_fused_qknorm_store).
+        """
+        if (
+            fused_out is not None
+            and fused_out.dim() == 2
+            and fused_out.shape[1] == self._aiter_fused_row
+            and fused_out.is_contiguous()
+        ):
+            return fused_out
+        return torch.cat([qkv, idx_qkv], dim=-1)
+
+    def _maybe_aiter_fused_qknorm_store(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        idx_qkv: torch.Tensor,
+        fused_out: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
+        """qk-norm + rope + fp8 K/V store + index-K store in one aiter launch.
+
+        Returns (q, k, v, idx_q, idx_k, idx_v), or None when any precondition
+        fails and the caller should fall back to the existing route.
+
+        DECODE ONLY, for two independent reasons, neither of which is a perf
+        argument:
+
+        1. In the kernel's cache-insert mode only the q and index-q lanes write
+           their normed+roped values back into the row; the k, v and index-k
+           lanes write to the caches and return without storing back. So the
+           k / v / index-k slices handed back here are RAW projection output. That is safe only where nothing
+           downstream reads them, which we establish below for decode.
+        2. RadixAttention routes extend through unified_sparse_attention_with_output,
+           which consumes q, k, v directly (layers/radix_attention.py:176-210).
+           Restricting to decode makes that route structurally unreachable from
+           here rather than relying on its other gates.
+
+        In decode the only consumer of raw k / v / index_k is the store inside
+        MinimaxSparseBackend.forward_decode
+        (layers/attention/minimax_sparse_backend.py:1626-1638), which
+        _mark_sparse_kv_cached_by_fusion suppresses; everything after it reads
+        k_cache / v_cache / idx_k_cache.
+        """
+        if not self._aiter_fused_store_static_ok:
+            return None
+        if not forward_batch.forward_mode.is_decode():
+            return None
+
+        kv_pool = self._get_sparse_kv_pool()
+        # Scope: the fp8 main cache only. With a bf16 cache the existing
+        # sparse_qk_index_gemma_rmsnorm_rope_cache fusion already applies, and
+        # this path would just be a second way to do the same thing.
+        if kv_pool is None or kv_pool.dtype not in _FP8_KV_DTYPES:
+            return None
+
+        scales = self._aiter_fused_store_scales()
+        if scales is None:
+            # Only reachable under graph capture before warmup built the scales.
+            return None
+        views = self._aiter_fused_store_cache_views(kv_pool)
+        if views is None:
+            _aiter_fused_store_note("kv pool layout is not plain NHD fp8")
+            return None
+        k_cache, v_cache, index_cache, page_size = views
+
+        combined = self._aiter_fused_store_buffer(qkv, idx_qkv, fused_out)
+        if index_cache.dtype != combined.dtype:
+            _aiter_fused_store_note("index-K cache dtype differs from the model dtype")
+            return None
+        loc = getattr(forward_batch, "out_cache_loc", None)
+        reason = self._aiter_fused_store_runtime_reason(positions, combined, loc)
+        if reason is not None:
+            _aiter_fused_store_note(reason)
+            return None
+
+        _aiter_fused_qknorm_idxrqknorm(
+            combined,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_dim,
+            self.q_norm.variance_epsilon,
+            index_q_norm_weight=self.index_q_norm.weight.data,
+            index_k_norm_weight=self.index_k_norm.weight.data,
+            num_index_heads=self.num_idx_heads,
+            slot_mapping=loc,
+            kv_cache_k=k_cache,
+            kv_cache_v=v_cache,
+            index_cache=index_cache,
+            block_size=page_size,
+            # SGLang carries per-tensor (scalar) KV scales, so this is the static
+            # mode, NOT aiter's per-token dynamic-quant mode -- that one treats
+            # k_scale/v_scale as per-token OUTPUT tensors instead. index_slot_mapping
+            # is left None so the wrapper reuses slot_mapping, which is exactly how
+            # SGLang indexes the index-K cache (it shares the main cache's loc).
+            # Both quantize as value / scale, matching MHATokenToKVPool.set_kv_buffer's
+            # div_ convention (mem_cache/memory_pool.py:2581-2586).
+            kv_cache_dtype="fp8_e4m3_static",
+            index_cache_dtype="auto",
+            k_scale=scales[0],
+            v_scale=scales[1],
+            asm_layout=False,
+        )
+
+        # The kernel already wrote K/V and index-K, so stop the backend from
+        # storing them again: a second store would re-quantize already-quantized
+        # values (correctness) on top of costing the launches this path saves.
+        self._mark_sparse_kv_cached_by_fusion(forward_batch, self.attn.layer_id)
+
+        main_end = self._fused_main_size
+        idx_q_end = main_end + self.num_idx_heads * self.idx_head_dim
+        q, k, v = combined[:, :main_end].split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+        # q and idx_q carry the kernel's normed+roped result, written back in
+        # place. k, v and idx_k are the RAW projection columns -- see the
+        # docstring; they are dead in decode and returned only to keep the tuple
+        # shape the caller already expects.
+        # idx_v is always None here: disable_index_value is a static gate condition.
+        return q, k, v, combined[:, main_end:idx_q_end], combined[:, idx_q_end:], None
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1182,10 +1563,16 @@ class MiniMaxM3Attention(nn.Module):
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                     idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
             else:
-                idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
-                q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                aiter_fused = self._maybe_aiter_fused_qknorm_store(
+                    positions, qkv, idx_qkv, fused_out, forward_batch
                 )
+                if aiter_fused is not None:
+                    q, k, v, idx_q, idx_k, idx_v = aiter_fused
+                else:
+                    idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                    q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
+                        positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
         else:
