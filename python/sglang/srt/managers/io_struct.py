@@ -1743,6 +1743,20 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
 
 
+class ProactivePrefetchReqInput(BaseReq, kw_only=True):
+    operation_id: str
+    action: str = "submit"
+    input_ids: Optional[List[int]] = None
+    cache_salt: Optional[str] = None
+    ttl_ms: int = 10000
+
+
+class ProactivePrefetchReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    result: Optional[dict] = None
+
+
 class ClearHiCacheReqInput(BaseReq, kw_only=True):
     pass
 

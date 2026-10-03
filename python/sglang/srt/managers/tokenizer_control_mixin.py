@@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    ProactivePrefetchReqInput,
+    ProactivePrefetchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -128,6 +130,7 @@ _COMMUNICATOR_SPECS = [
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
+    ("proactive_prefetch", ProactivePrefetchReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
@@ -328,6 +331,27 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def proactive_prefetch(
+        self: TokenizerManager, obj: ProactivePrefetchReqInput
+    ):
+        parallel = get_parallel()
+        if any(
+            getattr(parallel, name) != 1
+            for name in (
+                "tp_size",
+                "pp_size",
+                "dp_size",
+                "nnodes",
+                "attn_cp_size",
+                "attn_dp_size",
+            )
+        ):
+            return ProactivePrefetchReqOutput(
+                success=False, message="Single worker required"
+            )
+        self.auto_create_handle_loop()
+        return (await self.proactive_prefetch_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

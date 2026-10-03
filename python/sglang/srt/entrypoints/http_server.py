@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    ProactivePrefetchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1062,6 +1063,21 @@ async def list_external_corpora():
 
 # example usage:
 # curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
+@app.post("/hicache/prefetch")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def proactive_prefetch(obj: Annotated[ProactivePrefetchReqInput, Body()]):
+    """Restore exact token-prefix KV into resident host cache before generation.
+
+    Experimental single-worker FULL/file scope. Actions: submit, status, cancel.
+    This route allocates no generation request and never transfers KV to HBM.
+    """
+    ret = await _global_state.tokenizer_manager.proactive_prefetch(obj)
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message, "result": ret.result},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():

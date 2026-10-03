@@ -162,6 +162,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    ProactivePrefetchReqInput,
+    ProactivePrefetchReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1712,6 +1714,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (ProactivePrefetchReqInput, self.handle_proactive_prefetch),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3129,6 +3132,9 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        proactive = getattr(self, "proactive_prefetch", None)
+        if proactive is not None and proactive.blocks(req):
+            return  # The existing control operation is already reading this prefix.
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3633,6 +3639,9 @@ class Scheduler(
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
     ) -> None:
+        proactive = getattr(self, "proactive_prefetch", None)
+        if proactive is not None:
+            proactive.tick()  # Expire before terminal ACK can publish.
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
@@ -3644,6 +3653,8 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
+            if proactive is not None:
+                proactive.tick()  # Consume terminal outcomes and control accounting.
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
@@ -3994,6 +4005,9 @@ class Scheduler(
                 ):
                     break
 
+            proactive = getattr(self, "proactive_prefetch", None)
+            if proactive is not None and proactive.blocks(req):
+                continue  # Rematch normally after resident L2 publication.
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
@@ -4908,6 +4922,69 @@ class Scheduler(
             )
         return self.external_corpus_manager.list(recv_req)
 
+    def handle_proactive_prefetch(self, obj: ProactivePrefetchReqInput):
+        from sglang.srt.mem_cache.proactive_prefetch import ProactivePrefetch
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        try:
+            parallel = get_parallel()
+            if (
+                any(
+                    getattr(parallel, name) != 1
+                    for name in (
+                        "tp_size",
+                        "pp_size",
+                        "dp_size",
+                        "nnodes",
+                        "attn_cp_size",
+                        "attn_dp_size",
+                    )
+                )
+                or self.disaggregation_mode != DisaggregationMode.NULL
+                or get_spec().speculative_algorithm is not None
+                or get_lora().enable_lora
+                or self.model_config.is_multimodal
+                or not self.model_config.is_generation
+                or not isinstance(self.tree_cache, UnifiedRadixCache)
+            ):
+                raise ValueError(
+                    "Requires single-worker ordinary full-attention HiCache"
+                )
+            if obj.action == "submit":
+                if self._engine_paused:
+                    raise ValueError("Engine is paused")
+                if (
+                    not obj.input_ids
+                    or len(obj.input_ids) > self.max_req_input_len
+                    or any(
+                        type(t) is not int or not 0 <= t < self.model_config.vocab_size
+                        for t in obj.input_ids
+                    )
+                ):
+                    raise ValueError(
+                        "Provide a bounded exact token prefix within the vocabulary"
+                    )
+                if getattr(self, "proactive_prefetch", None) is None:
+                    self.proactive_prefetch = ProactivePrefetch(self.tree_cache)
+                result = self.proactive_prefetch.submit(
+                    obj.operation_id, obj.input_ids, obj.cache_salt, obj.ttl_ms
+                )
+            elif obj.action in ("status", "cancel"):
+                manager = getattr(self, "proactive_prefetch", None)
+                if manager is None:
+                    raise KeyError(obj.operation_id)
+                manager.tick()
+                result = (
+                    manager.status(obj.operation_id)
+                    if obj.action == "status"
+                    else manager.cancel(obj.operation_id)
+                )
+            else:
+                raise ValueError("action must be submit, status or cancel")
+            return ProactivePrefetchReqOutput(success=True, result=result)
+        except (ValueError, KeyError) as exc:
+            return ProactivePrefetchReqOutput(success=False, message=str(exc))
+
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
@@ -5009,6 +5086,9 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        proactive = getattr(self, "proactive_prefetch", None)
+        if proactive is not None and proactive.active is not None:
+            self._process_hicache_events()  # Drain cancelled control I/O while paused.
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
@@ -5043,6 +5123,8 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
+            proactive = getattr(self, "proactive_prefetch", None)
+            idle &= proactive is None or proactive.active is None
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5447,6 +5529,9 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        proactive = getattr(self, "proactive_prefetch", None)
+        if proactive is not None and proactive.active is not None:
+            proactive.cancel(proactive.active.operation_id)
         assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 
