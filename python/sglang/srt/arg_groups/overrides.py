@@ -1509,6 +1509,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
+        "nccl_ep",
         "deepep_v2",
         "mooncake",
         "nixl",
@@ -1517,9 +1518,47 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
-        "deepep_v2",
     }
 )
+
+
+@register_post_process
+def _nccl_ep_capability_fallback(view: Any) -> dict:
+    """Fall back off nccl_ep when nccl4py / NCCL>=2.29 / SM90+ is unavailable.
+
+    Runs before _a2a_backend_overrides so a 'deepep' fallback flows through the
+    deepep-specific handling. Prefers deepep when the deep_ep package is
+    importable, else 'none'.
+    """
+    if view.moe_a2a_backend != "nccl_ep":
+        return {}
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+        nccl_ep_unavailable_reason,
+    )
+
+    reason = nccl_ep_unavailable_reason(require_graph=view.enable_nccl_ep_cuda_graph)
+    if reason is None:
+        return {}
+    if view.enable_nccl_ep_cuda_graph:
+        raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
+    if view.enable_single_batch_overlap or view.enable_two_batch_overlap:
+        raise ValueError(f"NCCL EP overlap is unavailable: {reason}")
+    import importlib.util
+
+    fallback = (
+        "deepep"
+        if view.moe_runner_backend != "triton"
+        and importlib.util.find_spec("deep_ep") is not None
+        else "none"
+    )
+    logger.warning(
+        "NCCL EP MoE requested but unavailable (%s); falling back to "
+        "moe_a2a_backend='%s'. Install nccl4py[cu13] on a CUDA13 + NCCL>=2.29 "
+        "Hopper/Blackwell box.",
+        reason,
+        fallback,
+    )
+    return {"moe_a2a_backend": fallback}
 
 
 @register_post_process

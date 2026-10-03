@@ -1,0 +1,180 @@
+---
+title: "NCCL EP CUDA Graphs"
+description: "Install NCCL EP and opt in to serialized low-latency decode with persistent CUDA Graph resources."
+---
+
+NCCL EP can run low-latency MoE dispatch and combine inside SGLang's full decode
+CUDA Graph backend. Enable it with `--moe-a2a-backend nccl_ep` and
+`--enable-nccl-ep-cuda-graph`. Without the Graph option, NCCL EP runs eagerly.
+
+## Requirements and installation
+
+Use CUDA GPUs with compute capability SM90 or newer, on one node with peer
+access between the participating GPUs. The migration validation target uses Python
+3.12, PyTorch `2.13.0+cu130`, CUDA Toolkit 13.0,
+`nccl4py==0.4.1`, `nccl-extensions==0.1.0`, and NCCL 2.30.7.
+`nccl-extensions` provides `nccl.ep`; `nccl4py` alone provides the core binding.
+
+In a dedicated CUDA 13 environment, install from the repository root:
+
+```bash
+python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -e 'python[nccl_ep]'
+python -m pip install --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+```
+
+Check `pip check` after installation and record any dependency conflicts.
+The migration still requires native two-GPU validation on this dependency stack.
+Repeat the NCCL override if a later PyTorch installation replaces it.
+Installing the optional extra alone does not select this runtime.
+
+Set `CUDA_HOME` to the CUDA 13 Toolkit and put its `bin` directory on `PATH`.
+NCCL EP compiles specialized kernels at first use, so `nvcc` and matching CUDA
+headers must be available. Driver compatibility shown by `nvidia-smi`, the
+Toolkit reported by `nvcc --version`, and `torch.version.cuda` describe different
+components.
+
+Check the actual library selected by the binding:
+
+```bash
+python - <<'PY_CHECK'
+import torch
+import nccl.core as core
+import nccl.ep as ep
+
+print("Torch CUDA build:", torch.version.cuda)
+print("Torch NCCL compile-time version:", torch.cuda.nccl.version())
+print("Loaded NCCL:", core.get_version().libnccl)
+print("EP library:", ep.get_lib_version())
+assert callable(getattr(ep.Handle, "update", None))
+PY_CHECK
+```
+
+## Enable decode capture
+
+Add these options to your existing compatible MoE launch configuration:
+
+```bash
+--moe-a2a-backend nccl_ep \
+--nccl-ep-mode low_latency \
+--dtype bfloat16 \
+--enable-nccl-ep-cuda-graph
+```
+
+Configure batch-size buckets through the existing
+[CUDA Graph options](/docs/advanced_features/server_arguments).
+The largest decode bucket determines the Graph allocation capacity, which must
+be at most 1024 tokens per rank.
+
+The Graph path supports `expert_major` only. `rank_major` remains eager.
+
+The initial Graph path requires BF16 dispatcher inputs and compatible MoE layers
+with the same communicator, expert count, hidden size, top-k and dtype. Supported
+hidden sizes are 2048, 2560, 4096, 5120, 6144, 7168 and 8192; top-k must be at most
+9. This describes the communication input, not a new expert-compute backend.
+
+NCCL EP sets the expert-parallel size to the tensor-parallel size, so you do not
+need to repeat `--ep` when setting `--tp`. Both eager and Graph execution require
+BF16 inputs and an FP8 or W4A-FP8 expert-compute configuration. The current
+float32 group scales are incompatible with `DEEPGEMM_BLACKWELL` UE8M0 scales;
+the capability check reports this before communicator creation. SM120 with
+float32 group scales remains eligible.
+
+Prefill runs eagerly through LL. After DP divides the chunk size, SGLang limits
+each rank's chunk to `--nccl-ep-num-max-dispatch-tokens-per-rank` (default 1024),
+rounded down to a KV page boundary. Long prompts then run in multiple chunks.
+Unchunked prefill and PP dynamic chunking are unsupported. Decode-only
+disaggregation skips this prefill requirement. TBO uses the same LL budget.
+
+Prefill Graphs, piecewise or breakable decode Graphs,
+speculative decoding, PDMux, elastic EP, multiple nodes, Torch
+compile and memory saver are outside this initial scope. Unsupported opt-in
+configurations raise an error during setup.
+
+EPLB is not supported by this NCCL EP integration.
+
+## Single-batch overlap
+
+NCCL EP overlap requires single-node CUDA, DeepSeek V2/V3 block-128 FP8 experts
+and the Triton MoE runner. EPLB, PDMux, compile, memory saver and speculation
+are unsupported.
+
+For models with independent shared experts, add
+`--enable-single-batch-overlap` to your NCCL EP configuration. Shared-expert
+computation runs between dispatch initiation and receive completion, using the
+current compute stream while communication uses a separate stream automatically.
+This path runs only in the full decode Graph backend, including its dedicated
+warmup and capture, on Hopper and Blackwell with supported scales. Eager
+prefill and decode fallbacks use serial shared-expert computation and the
+current communication stream, even when the SBO option is enabled.
+
+NCCL EP uses the dispatch/shared-expert overlap path. It does not consume
+DeepEP's down-GEMM/combine signaling buffers. Leave
+`SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO` disabled; that alternate
+stream path is specific to the existing DeepEP integration. Shared-expert
+weights stay independent, and routed-expert scaling does not scale the shared
+output. Without TBO, batches, layers and Graph buckets submit EP transactions serially.
+
+## Two-batch overlap
+
+For DeepSeek MoE models using the staged TBO execution path, add
+`--enable-two-batch-overlap`. The two subbatches use independent NCCL EP groups,
+handles and communication buffers. The existing TBO executor interleaves their
+dispatch, expert computation and combine stages. You can combine this with
+independent shared experts.
+
+Each subbatch uses its own communication stream automatically. With independent
+Triton attention children, attention TP=1 and dense TP=1, both subbatches share
+one compute stream, separate from the communication streams. Communication can
+overlap the other subbatch's computation while compute stages remain ordered
+on one stream. Shared attention workspaces, unsupported allocators and TP
+collective paths keep compute on the existing stream. Graph buckets and
+replays remain serialized.
+
+TBO runs only in full decode CUDA Graphs, including their dedicated warmup and
+capture. Prefill and decode fallbacks use eager LL without TBO splitting or
+overlap streams. Padded Graph subbatches mask inactive routes, including empty
+subbatches. Graph execution requires additional communication memory for the
+second subbatch.
+
+## Resource ownership
+
+Each capture generation owns one dedicated Graph group and persistent LL handle
+per in-flight subbatch: one normally, two with TBO. Compatible layers and
+batch-size buckets reuse each subbatch's resources in strict serial order.
+Independent groups isolate mutable communication state between subbatches;
+the external API can create multiple handles within a group.
+
+Capture retains fixed-capacity storage for tokens, routing, weights and receive
+buffers. Bucket descriptors use the same base storage. `Handle.update` runs
+outside capture when preparing a bucket; replay reads the current buffer contents
+without invoking the Python update path. Routing values can change while the
+captured operation structure and buffer addresses remain fixed.
+
+Stream ordering covers input writes, forward execution and already-queued output
+consumers. Concurrent host submissions are rejected. Eager execution uses a
+separate group and retains its initialized persistent handles. A hidden-state
+mode mismatch falls back to eager on all EP ranks; the capture mode is fixed.
+Explicit generation replacement and shutdown wait for device work, release the Graph
+executables, then close their handle and group.
+
+## Validation scope
+
+The model-free tests cover native and SGLang dispatch/combine, changing routing,
+8/16/32-token buckets, two compatible layers, recapture, cross-stream ordering,
+masked padding and controlled host capture failure. They compare against an
+independent CPU oracle using weighted synthetic experts. Full-model accuracy and
+real expert GEMM performance have not been evaluated for this Graph path.
+
+Local SBO and TBO tests run real Triton expert kernels, shared MLP and
+CUDA Graph replay with external EP replaced by a narrow test double. They cover
+staged ordering, dynamic routing, empty subbatches and per-lane resource ownership.
+Native two-GPU correctness and overlap profiling for these extensions remain
+pending; local passes do not establish native communication correctness or speedup.
+
+See the [test instructions](https://github.com/sgl-project/sglang/tree/main/test/nccl_ep_test)
+for local lifecycle regressions and the inherited native correctness, benchmark
+and profiling commands. The native synthetic check is in
+`test/manual/test_nccl_ep_synthetic.py`. See
+[expert parallelism](/docs/advanced_features/expert_parallelism) for the
+surrounding MoE configuration.

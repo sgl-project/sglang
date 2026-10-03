@@ -77,6 +77,83 @@ def _get_launch_config_2d(device, m, n):
 
 
 @triton.jit
+def _rank_major_weighted_reduce_kernel(
+    expert_outputs_ptr,
+    src2dst_ptr,
+    local_ids_ptr,
+    weights_ptr,
+    output_ptr,
+    hidden_size,
+    TOPK: tl.constexpr,
+    COMPACT_WIDTH: tl.constexpr,
+    FULL_WIDTH: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Reduce local expert rows into one rank-major slot in fp32."""
+    slot = tl.program_id(0)
+    h_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_offsets < hidden_size
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for k in range(TOPK):
+        route = slot * TOPK + k
+        local_id = tl.load(local_ids_ptr + route)
+        valid = local_id >= 0
+        dst = tl.load(src2dst_ptr + route, mask=valid, other=0).to(tl.int64)
+        weight = tl.load(weights_ptr + route, mask=valid, other=0.0)
+        value = tl.load(
+            expert_outputs_ptr + dst * hidden_size + h_offsets,
+            mask=valid & h_mask,
+            other=0.0,
+        )
+        acc += value.to(tl.float32) * weight
+    rank = slot // COMPACT_WIDTH
+    rank_offset = slot - rank * COMPACT_WIDTH
+    output_slot = rank * FULL_WIDTH + rank_offset
+    tl.store(output_ptr + output_slot * hidden_size + h_offsets, acc, mask=h_mask)
+
+
+def rank_major_weighted_reduce(
+    expert_outputs: torch.Tensor,
+    src2dst: torch.Tensor,
+    local_topk_ids: torch.Tensor,
+    recv_topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    slot_shape: tuple[int, int],
+) -> torch.Tensor:
+    """GPU fused gather, route-weighting, and local rank-major reduction."""
+    if not expert_outputs.is_cuda:
+        raise ValueError("rank-major fused reduction requires CUDA tensors")
+    world_size, compact_width = slot_shape
+    num_slots = world_size * compact_width
+    topk = local_topk_ids.shape[-1]
+    hidden_size = expert_outputs.shape[-1]
+    if local_topk_ids.numel() != num_slots * topk:
+        raise ValueError("rank-major metadata does not match the compact slot shape")
+    if (
+        output.ndim != 3
+        or output.shape[0] != world_size
+        or output.shape[1] < compact_width
+        or output.shape[2] != hidden_size
+    ):
+        raise ValueError("rank-major reduction output cannot hold compact metadata")
+    full_width = output.shape[1]
+    block_h = 256
+    _rank_major_weighted_reduce_kernel[(num_slots, triton.cdiv(hidden_size, block_h))](
+        expert_outputs.flatten(0, 1),
+        src2dst.reshape(-1),
+        local_topk_ids.reshape(-1),
+        recv_topk_weights.reshape(-1),
+        output,
+        hidden_size,
+        TOPK=topk,
+        COMPACT_WIDTH=compact_width,
+        FULL_WIDTH=full_width,
+        BLOCK_H=block_h,
+    )
+    return output
+
+
+@triton.jit
 def deepep_permute_triton_kernel(
     input_ptr,
     gateup_input_ptr,
