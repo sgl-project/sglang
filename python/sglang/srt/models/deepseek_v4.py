@@ -1824,10 +1824,9 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
         )
-        # fp8 verify packs like prefill but keeps verify's store timing: the pair
-        # lands in the caller's buffers and the backend writes the ring off the
-        # per-token slot map before attention. Keyed off those buffers the same
-        # way fuse_prefill is, so the two arms cannot disagree about the layout.
+        # fp8 verify stores like decode: the kernel writes each token's ring row
+        # (swa_loc) before attention, so no packed pair, kv copy or backend
+        # scatter. Keyed off the caller's buffers the same way fuse_prefill is.
         fuse_verify_fp8 = (
             fuse_verify
             and unified
@@ -1876,7 +1875,7 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_rope_cache = None
-            if unified and fuse_verify:
+            if unified and fuse_verify and not fuse_verify_fp8:
                 # Target-verify runs through the unified_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
                 # attention (save_kv_cache=True -> store_swa_into_unified ahead
@@ -1894,12 +1893,13 @@ class MQALayer(MqaAttentionBase):
                 # it in place. The unfused path pays the same copy inside
                 # _compute_kv_bf16.
                 #
-                # Under fp8 the kernel writes the packed pair to the caller's
-                # buffers rather than norming kv in place, and the same backend
-                # store takes that pair -- only the row format changes.
+                # Under fp8, verify takes the decode arm below instead: the ring
+                # rows are per token (swa_loc is built for verify too) and are
+                # written before attention either way, so the kernel stores them
+                # itself, off the strided kv.
                 kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
-                swa_page_size, bf16_store = 1, not fuse_verify_fp8
+                swa_page_size, bf16_store = 1, True
             elif unified and fuse_prefill:
                 # No pools, so the kernel norms + RoPEs + packs and writes no
                 # ring row. It must not: those rows are this fwd's extend region
@@ -1952,8 +1952,8 @@ class MQALayer(MqaAttentionBase):
                 bf16_store=bf16_store,
                 fp8_2buff=fp8_2buff,
                 swa_rope_cache=swa_rope_cache,
-                k_nope_out=k_nope_out if (fuse_prefill or fuse_verify_fp8) else None,
-                k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
+                k_nope_out=k_nope_out if fuse_prefill else None,
+                k_rope_out=k_rope_out if fuse_prefill else None,
                 q_rope_out=q_rope_out,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
@@ -1961,14 +1961,14 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
-            if unified and (fuse_prefill or fuse_verify_fp8):
+            if unified and fuse_prefill:
                 # The packed nope half rides out on the kv slot -- attention
                 # takes it as attn_k and save_kv_cache stays on so the backend
                 # does the ring write. Its rope half went to the caller's buffer,
                 # which has no second return slot here. Prefill's write lands
                 # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
-            elif not (unified and fuse_verify):
+            elif not (unified and fuse_verify and not fuse_verify_fp8):
                 kv = None
 
             if not unified and use_cp:
