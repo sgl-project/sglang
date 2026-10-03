@@ -49,7 +49,7 @@ impl Default for LegacySpec {
     }
 }
 
-/// Native port of Python `generate_chat_conv` + `Conversation.get_prompt()`:
+/// Rust implementation of Python `generate_chat_conv` + `Conversation.get_prompt()`:
 /// fold system messages into the system prompt, keep user/assistant messages in
 /// order, always append the assistant opening, then render per `sep_style`.
 #[derive(Clone)]

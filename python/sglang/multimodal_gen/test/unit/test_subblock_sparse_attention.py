@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.router import (
+    SubBlockRouter,
     _snap_up_to_8,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
@@ -163,9 +164,31 @@ class TestSubBlockSparseSchedule(unittest.TestCase):
         self.assertEqual(schedule.skip_first_layers, 0)
         self.assertEqual(schedule.n_k, 4)
         self.assertEqual(schedule.n_q, 4)
+        self.assertEqual(schedule.compute_mode, "bf16")
+
+    def test_sage_fp8_uses_16_token_key_subblocks_by_default(self):
+        for capability, expected_n_k in (((9, 0), 8), ((12, 0), 4)):
+            with (
+                self.subTest(capability=capability),
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+                _patch_schedule({"compute_mode": "sage_fp8"}),
+            ):
+                schedule = SubBlockSparseSchedule.from_server_args()
+                self.assertEqual(schedule.n_k, expected_n_k)
+
+    def test_explicit_sage_fp8_n_k_is_respected(self):
+        with _patch_schedule({"compute_mode": "sage_fp8", "n_k": 4}):
+            schedule = SubBlockSparseSchedule.from_server_args()
+        self.assertEqual(schedule.n_k, 4)
 
     def test_rejects_out_of_range_values(self):
-        for config in ({"sparsity": 1.0}, {"n_k": 3}, {"skip_first_steps": -1}):
+        for config in (
+            {"sparsity": 1.0},
+            {"n_k": 3},
+            {"skip_first_steps": -1},
+            {"compute_mode": "fp8"},
+        ):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
                     SubBlockSparseSchedule.from_server_args()
@@ -183,6 +206,23 @@ class TestBudgetGranularity(unittest.TestCase):
         """The cap wins over the granularity: 590 blocks means at most 590."""
         self.assertEqual(_snap_up_to_8(586, 590), 590)
         self.assertEqual(_snap_up_to_8(3, 5), 5)
+
+
+class TestRouterGeometry(unittest.TestCase):
+    def test_sm90_sage_fp8_preserves_16_token_pooling_cells(self):
+        router = SubBlockRouter(
+            n_q=4,
+            n_k=8,
+            block_size_k=128,
+            budget_granularity=1,
+        )
+        self.assertEqual(64 // router.n_q, 16)
+        self.assertEqual(router.block_size_k // router.n_k, 16)
+        self.assertEqual(router.budget_granularity, 1)
+
+    def test_rejects_non_divisible_block_geometry(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            SubBlockRouter(n_q=4, n_k=8, block_size_k=100)
 
 
 class TestSubBlockSparseBackend(unittest.TestCase):
@@ -285,6 +325,19 @@ class TestSubBlockGating(unittest.TestCase):
         q = torch.empty(1, 8192, NUM_HEADS, HEAD_DIM, dtype=torch.float32)
         with _patch_step(20):
             self.assertFalse(impl._sparse_ready(q, q))
+
+    def test_sage_fp8_builds_architecture_specific_router(self):
+        for capability, key_block_size, n_k in (((9, 0), 128, 8), ((12, 0), 64, 4)):
+            with (
+                self.subTest(capability=capability),
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+            ):
+                impl = self._impl("blocks.9.attn", compute_mode="sage_fp8")
+                self.assertEqual(impl.router.block_size_k, key_block_size)
+                self.assertEqual(impl.router.n_k, n_k)
+                self.assertEqual(impl.router.block_size_k // impl.router.n_k, 16)
+                self.assertEqual(impl.router.budget_granularity, 1)
 
 
 @requires_subblock_kernel
@@ -492,6 +545,20 @@ class TestSubBlockNumerics(unittest.TestCase):
             self.skipTest("requires the SM120 SubBlock kernel")
         self._assert_kernel_backed_mixed_query_mask()
 
+    def test_head_chunks_match_one_call(self):
+        """Splitting a call by heads must not change its output."""
+        q, k, v = _structured_qkv(self.seq_len, torch.device("cuda"))
+        impl = self._impl(sparsity=0.75)
+        mask = torch.arange(self.seq_len // 64, device="cuda") >= self.seq_len // 128
+        whole = impl._sparse_attention(q, k, v, sparse_query_block_mask=mask)
+        one_head = (self.seq_len // 64) ** 2
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._MAX_ROUTED_BLOCK_PAIRS",
+            one_head,
+        ):
+            chunked = impl._sparse_attention(q, k, v, sparse_query_block_mask=mask)
+        torch.testing.assert_close(chunked, whole, rtol=0, atol=0)
+
     def test_skipped_step_is_bitwise_dense(self):
         device = torch.device("cuda")
         q, k, v = _structured_qkv(self.seq_len, device)
@@ -522,6 +589,25 @@ class TestSubBlockNumerics(unittest.TestCase):
                 HEAD_DIM**-0.5,
             )[0]
             self.assertGreater(_cosine(out[start:stop], ref), 0.999)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.mem_get_info()[0] >= 48 * 2**30,
+    "needs a CUDA GPU with 48 GiB free",
+)
+class TestRouterPastInt32(unittest.TestCase):
+    def test_last_heads_match_when_tensors_pass_int32(self):
+        """With q/k and the score matrix past 2^31 elements, the last heads must
+        still match the same heads routed alone."""
+        shape = (1, 491_520, 56, HEAD_DIM)
+        q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        router, tail = SubBlockRouter(), slice(54, 56)
+        kwargs = dict(sparsity=0.8, softmax_scale=HEAD_DIM**-0.5)
+        index = router.route(q, k, **kwargs).index[:, tail].sort(dim=-1).values
+        q, k = q[:, :, tail].contiguous(), k[:, :, tail].contiguous()
+        ref = router.route(q, k, **kwargs).index.sort(dim=-1).values
+        self.assertTrue(torch.equal(index, ref))
 
 
 if __name__ == "__main__":

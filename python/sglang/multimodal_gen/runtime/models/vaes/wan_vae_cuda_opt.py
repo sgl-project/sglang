@@ -6,8 +6,9 @@ Fuses every decoder ``WanRMS_norm -> SiLU`` chain into one Triton kernel on
 the channels_last_3d layout. Wrappers are installed once at VAE load and
 dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"``
 and ``quality="high"`` run the fused kernel (not bitwise-identical to aten,
-hence gated), while the ``"lossless"`` default runs the original module path
-bit-for-bit. Install is all-or-nothing and fail-closed.
+hence gated). The ``"lossless"`` path preserves aten's normalization reduction
+and fuses its FP32 post-ops after first-sight exactness verification.
+Install is all-or-nothing and fail-closed.
 """
 
 import torch
@@ -24,7 +25,12 @@ logger = init_logger(__name__)
 
 try:
     from sglang.kernels.ops.diffusion import (
+        BitExactFusionGate,
+        can_use_nearest_upsample_nhwc,
+        can_use_wan_norm_silu_post,
         can_use_wan_rmsnorm_silu,
+        nearest_upsample_nhwc,
+        wan_norm_silu_post,
         wan_rmsnorm_silu,
     )
 
@@ -34,10 +40,10 @@ except ImportError:  # pragma: no cover
 
 
 class FusedWanRMSNormSiLU(nn.Module):
-    """``WanRMS_norm`` + SiLU fused via the channels_last_3d Triton kernel;
-    falls back to the original op chain (bit-identical to norm + ``nn.SiLU``)
-    for unsupported inputs and whenever the gate is off. Steps aside under
-    ``torch.compile``, where Inductor already fuses this chain."""
+    """Quality-gated full fusion or lossless FP32 post-op fusion.
+
+    Unsupported inputs and ``torch.compile`` use the original op chain.
+    """
 
     def __init__(self, norm: nn.Module, gate: VaeFastPathGate) -> None:
         super().__init__()
@@ -48,12 +54,58 @@ class FusedWanRMSNormSiLU(nn.Module):
         self.bias = norm.bias
         self.scale = float(norm.scale)
         self._sgl_gate = gate
+        self._post_gate = BitExactFusionGate(
+            "Wan norm+SiLU post-ops", per_signature=True
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._sgl_gate.enabled and not torch.compiler.is_compiling():
             bias = self.bias if isinstance(self.bias, torch.Tensor) else None
             if can_use_wan_rmsnorm_silu(x, self.gamma, bias):
                 return wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
+        if (
+            not torch.compiler.is_compiling()
+            and not self._post_gate.disabled
+            and x.is_cuda
+            and torch.version.hip is None
+            and not torch.is_grad_enabled()
+            and x.ndim == 5
+            and (
+                x.dtype == torch.float32
+                or (x.dtype == torch.bfloat16 and torch.is_autocast_enabled("cuda"))
+            )
+            and (isinstance(self.bias, torch.Tensor) or self.bias == 0.0)
+        ):
+            sig = (x.device, x.dtype, x.shape, x.stride(), self.gamma.dtype)
+            verified = self._post_gate.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                # Keep this outside the custom op: CUDA autocast promotes the
+                # native norm to FP32, including for BF16 VAE activations.
+                denominator = x.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+                bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+                if can_use_wan_norm_silu_post(x, denominator, self.gamma, bias):
+                    try:
+                        out = wan_norm_silu_post(
+                            x, denominator, self.gamma, bias, scale=self.scale
+                        )
+                        if verified:
+                            return out
+                        ref = F.silu(
+                            (x / denominator) * self.scale * self.gamma + self.bias
+                        )
+                        return self._post_gate.accept_or_fallback(
+                            out,
+                            ref,
+                            sig=sig,
+                            equal=lambda a, b: torch.equal(
+                                a.view(torch.int32), b.view(torch.int32)
+                            ),
+                            logger=logger,
+                        )
+                    except Exception as exc:
+                        self._post_gate.on_exception(exc, logger=logger)
+                # Unsupported layouts/dtypes still reuse the native reduction.
+                return F.silu((x / denominator) * self.scale * self.gamma + self.bias)
         # WanRMS_norm.forward (channel-first) + SiLU, same ops in the same
         # order, so the off-path stays bit-identical.
         return F.silu(F.normalize(x, dim=1) * self.scale * self.gamma + self.bias)
@@ -74,6 +126,11 @@ class GatedChannelsLastUpsample(nn.Module):
     NHWC conv2d is not guaranteed to pick the same cuDNN algorithm as the NCHW
     one, so the stride canonicalisation stays behind the quality gate; with
     the gate off the layout is left exactly as the eager module sees it.
+
+    The upsample itself then runs the Triton ``nearest_upsample_nhwc`` gather
+    (bit-exact vs ``nn.Upsample`` for integer factors) instead of aten's
+    ``upsample_nearest2d_nhwc`` kernel, which is several times slower than
+    its NCHW sibling on the same bytes.
     """
 
     def __init__(self, upsample: nn.Upsample, gate: VaeFastPathGate) -> None:
@@ -98,6 +155,15 @@ class GatedChannelsLastUpsample(nn.Module):
             and x.is_contiguous(memory_format=torch.channels_last)
         ):
             x = x.as_strided(x.shape, canonical)
+        # The predicate admits exactly the inputs on which aten itself would
+        # run its NHWC kernel and return a dense channels_last tensor, so the
+        # Triton gather is a layout- and value-identical replacement: it runs
+        # on the lossless path too (the gate only controls the stride
+        # canonicalisation above).
+        if up.size is None and can_use_nearest_upsample_nhwc(
+            x, up.scale_factor, up.mode
+        ):
+            return nearest_upsample_nhwc(x, up.scale_factor)
         return up(x)
 
 
@@ -105,8 +171,9 @@ def _install_module_gates(
     decoder: nn.Module, gate: VaeFastPathGate, module_classes: tuple[type, ...]
 ) -> int:
     """Hand the gate to layout-sensitive modules that consult ``_sgl_gate`` in
-    their own forward (the attention block's residual operand order, so the
-    sum keeps the channels_last_3d layout)."""
+    their own forward: the ``Resample`` (channels_last_3d ``upsample3d`` frame
+    interleave, see ``resample_forward``) and the attention block (residual
+    operand order, so the sum keeps the channels_last_3d layout)."""
     count = 0
     for m in decoder.modules():
         if type(m) in module_classes:
@@ -198,9 +265,12 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
     """Install the quality-gated CUDA Wan VAE decoder fast path."""
     from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
         AutoencoderKLWan,
+        WanAttentionBlock,
         WanDecoder3d,
+        WanResample,
         WanResidualBlock,
         WanRMS_norm,
+        WanUpsample,
     )
 
     if not isinstance(vae, AutoencoderKLWan):
@@ -210,6 +280,8 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
         decoder_cls=WanDecoder3d,
         residual_block_cls=WanResidualBlock,
         rms_norm_cls=WanRMS_norm,
+        upsample_cls=WanUpsample,
+        gated_module_classes=(WanResample, WanAttentionBlock),
         label="Wan VAE",
     )
 

@@ -23,7 +23,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    nightly=True,
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -49,6 +52,9 @@ FP4_ENV_VARS = {
 }
 
 
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
     """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave (round-robin-split), tp=8."""
 

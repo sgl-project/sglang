@@ -25,6 +25,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def _make_forward_batch(
     extend_seq_lens,
     multi_item_delimiter_indices=None,
+    token_indices_to_pool=None,
     return_pooled_hidden_states=False,
     is_prefill_only=True,
 ):
@@ -33,6 +34,7 @@ def _make_forward_batch(
         extend_seq_lens=torch.tensor(extend_seq_lens, dtype=torch.long),
         extend_seq_lens_cpu=extend_seq_lens,
         multi_item_delimiter_indices=multi_item_delimiter_indices,
+        token_indices_to_pool=token_indices_to_pool,
         dimensions=None,
         return_pooled_hidden_states=return_pooled_hidden_states,
         is_prefill_only=is_prefill_only,
@@ -185,6 +187,85 @@ class TestScoreAndPool(CustomTestCase):
         self.assertIsInstance(out.embeddings, list)
         self.assertEqual(len(out.embeddings), 1)
         self.assertEqual(out.embeddings[0].shape, (0, self.num_labels))
+
+    def test_setwise_returns_per_request_list(self):
+        """Anchor positions provided -> one [num_anchors, num_labels] tensor per request."""
+        # Sequence: query + items + suffix; anchors at positions 8, 10, 12.
+        input_ids = torch.arange(14)
+        hidden = torch.randn(len(input_ids), self.hidden_dim)
+        fb = _make_forward_batch(
+            extend_seq_lens=[len(input_ids)],
+            token_indices_to_pool=[torch.tensor([8, 10, 12])],
+        )
+
+        out = score_and_pool(self.score_head, self.pooler, hidden, fb, input_ids)
+
+        self.assertIsInstance(out.embeddings, list)
+        self.assertEqual(len(out.embeddings), 1)
+        # 3 anchors -> 3 score rows (no query-boundary row, unlike MIS).
+        self.assertEqual(out.embeddings[0].shape, (3, self.num_labels))
+
+    def test_setwise_extracts_at_anchor_positions(self):
+        """Setwise pools AT the anchor index (no delimiter-1 shift)."""
+        input_ids = torch.tensor([0, 1, 2, 3, 4, 5])
+        hidden = (
+            torch.arange(len(input_ids))
+            .unsqueeze(1)
+            .float()
+            .expand(-1, self.hidden_dim)
+            .clone()
+        )
+        fb = _make_forward_batch(
+            extend_seq_lens=[len(input_ids)],
+            token_indices_to_pool=[torch.tensor([2, 5])],
+        )
+
+        identity_head = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        nn.init.eye_(identity_head.weight)
+
+        out = score_and_pool(identity_head, self.pooler, hidden, fb, input_ids)
+
+        scores = out.embeddings[0]
+        # Pooled exactly at indices 2 and 5 (not 1 and 4).
+        torch.testing.assert_close(scores[0], hidden[2])
+        torch.testing.assert_close(scores[1], hidden[5])
+
+    def test_setwise_batched_splits_per_request(self):
+        """Two batched setwise requests -> a list of length 2."""
+        req1 = list(range(10, 17))  # 7 tokens, anchors at 5, 6
+        req2 = list(range(20, 24))  # 4 tokens, anchor at 3
+        input_ids = torch.tensor(req1 + req2)
+        hidden = torch.randn(len(input_ids), self.hidden_dim)
+        fb = _make_forward_batch(
+            extend_seq_lens=[len(req1), len(req2)],
+            token_indices_to_pool=[
+                torch.tensor([5, 6]),
+                torch.tensor([3]),
+            ],
+        )
+
+        out = score_and_pool(self.score_head, self.pooler, hidden, fb, input_ids)
+
+        self.assertIsInstance(out.embeddings, list)
+        self.assertEqual(len(out.embeddings), 2)
+        self.assertEqual(out.embeddings[0].shape, (2, self.num_labels))
+        self.assertEqual(out.embeddings[1].shape, (1, self.num_labels))
+
+    def test_setwise_returns_pooled_hidden_states(self):
+        """return_pooled_hidden_states -> per-anchor pre-head hidden states."""
+        input_ids = torch.arange(6)
+        hidden = torch.randn(len(input_ids), self.hidden_dim)
+        fb = _make_forward_batch(
+            extend_seq_lens=[len(input_ids)],
+            token_indices_to_pool=[torch.tensor([3, 5])],
+            return_pooled_hidden_states=True,
+        )
+
+        out = score_and_pool(self.score_head, self.pooler, hidden, fb, input_ids)
+
+        self.assertIsNotNone(out.pooled_hidden_states)
+        self.assertEqual(len(out.pooled_hidden_states), 1)
+        self.assertEqual(out.pooled_hidden_states[0].shape, (2, self.hidden_dim))
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
+    SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -174,9 +175,13 @@ class TransformerQuantLoadSpec:
         return _get_quant_config_name(self.quant_config) == "comfy_fp8"
 
     @property
-    def is_serialized_kitchen_int8(self) -> bool:
+    def is_convrot_int8(self) -> bool:
+        return isinstance(self.quant_config, ConvRotInt8Config)
+
+    @property
+    def is_serialized_convrot_int8(self) -> bool:
         return (
-            isinstance(self.quant_config, KitchenInt8Config)
+            isinstance(self.quant_config, ConvRotInt8Config)
             and self.quant_config.is_checkpoint_int8_serialized
         )
 
@@ -192,7 +197,7 @@ class TransformerQuantLoadSpec:
     def uses_comfy_layer_markers(self) -> bool:
         return (
             self.is_comfy_fp8
-            or self.is_serialized_kitchen_int8
+            or self.is_serialized_convrot_int8
             or self.is_serialized_kitchen_w4a4
             or self.is_serialized_kitchen_w4a8
             or (
@@ -232,7 +237,7 @@ def _uses_component_offload(
 ) -> bool:
     if component_name is None:
         return legacy_enabled
-    return server_args.residency_mode(component_name) == COMPONENT_OFFLOAD
+    return server_args.should_cpu_offload_component(component_name)
 
 
 def _reject_explicit_component_selector(
@@ -243,12 +248,12 @@ def _reject_explicit_component_selector(
 ) -> None:
     if component_name is None:
         return
-    selected_by_component_residency = (
-        server_args.canonical_residency_mode(component_name) == COMPONENT_OFFLOAD
-    )
+    selected_by_component_residency = server_args.canonical_residency_mode(
+        component_name
+    ) in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD)
     if selected_by_component_residency:
         raise ComponentResidencyError(
-            f"{feature_name} does not support component-offload for "
+            f"{feature_name} does not support {server_args.canonical_residency_mode(component_name)} for "
             f"{component_name!r}; select resident or layerwise-offload"
         )
 
@@ -815,10 +820,8 @@ def _needs_device_weight_postprocess(
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
-    if quant_name == "kitchen_int8":
-        assert isinstance(quant_config, KitchenInt8Config)
-        return not quant_config.is_checkpoint_int8_serialized
-
+    # convrot_int8 is deliberately absent: both backends quantize each layer
+    # through their own CUDA round trip, so an offloaded DiT stays on the host.
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
@@ -1046,13 +1049,13 @@ def _resolve_quant_config(
                 "such as owner/repo:Q4_K_M)."
             )
 
-        # Online-quant convention: for `fp8`, `mxfp4` and `kitchen_int8`, a
+        # Online-quant convention: for `fp8`, `mxfp4` and `convrot_int8`, a
         # no-arg QuantizationConfig() selects the post-load path -- weights
         # load in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
+        if server_args.quantization in {"fp8", "mxfp4", "convrot_int8"}:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )
