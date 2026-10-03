@@ -7,8 +7,8 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::Rng;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+use crate::state::load_monitor::pressure::{compare_decode_pressure, compare_prefill_pressure};
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};

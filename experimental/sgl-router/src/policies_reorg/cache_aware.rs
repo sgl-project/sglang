@@ -14,13 +14,14 @@ use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixOutcome};
 use tokio::sync::OnceCell;
 
 use crate::config::{AffinityConfig, AffinityMode};
-use crate::policies::admission::FreshLoadLookup;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
-use crate::policies::ExternalPrefixSignal;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle};
+use crate::state::kv_events::{
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, ExternalPrefixSignal,
+    RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable,
 };
+use crate::state::load_monitor::pressure::FreshLoadLookup;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};

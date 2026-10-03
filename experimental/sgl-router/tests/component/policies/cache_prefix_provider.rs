@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sgl_kv_indexer::PrefixOutcome;
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
+use sgl_router::state::kv_events::RadixTreePrefixProvider;
 use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
 
 #[test]

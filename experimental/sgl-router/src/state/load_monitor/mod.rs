@@ -4,4 +4,5 @@
 //! Load signals: engine-reported load and router-local in-flight accounting.
 
 pub mod engine_reported_load;
+pub mod pressure;
 pub mod router_inflight_load;

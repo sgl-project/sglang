@@ -1,13 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::ExternalPrefixSignal;
-use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
-};
+use super::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// External indexer answer prepared by the async ingress path for the
+/// synchronous cache-aware policy.
+pub struct ExternalPrefixSignal {
+    pub outcome: PrefixOutcome,
+    pub query_blocks: usize,
+    /// The query's block hashes when the local tree answered, so routing can
+    /// record the placement without rehashing.
+    pub block_hashes: Option<Arc<[i64]>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct RadixTreePrefixProvider {

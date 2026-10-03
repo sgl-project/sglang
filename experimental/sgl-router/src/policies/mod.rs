@@ -9,7 +9,6 @@ pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
-pub mod prefix_provider;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
@@ -22,6 +21,7 @@ use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
+pub use crate::state::kv_events::ExternalPrefixSignal;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -35,16 +35,6 @@ pub struct RequestTokens {
     /// Whether the IDs came from rendered chat messages.
     /// Forwarding also requires the request safety guard.
     pub rendered_from_chat: bool,
-}
-
-/// External indexer answer prepared by the async ingress path for the
-/// synchronous cache-aware policy.
-pub struct ExternalPrefixSignal {
-    pub outcome: sgl_kv_indexer::PrefixOutcome,
-    pub query_blocks: usize,
-    /// The query's block hashes when the local tree answered, so routing can
-    /// record the placement without rehashing.
-    pub block_hashes: Option<Arc<[i64]>>,
 }
 
 /// Whether the caller pre-tokenized the prompt (`input_ids` present and not
