@@ -106,13 +106,19 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    """Whether non-producer DSA layers can skip their device index-K buffer.
+
+    HiCache and PD disaggregation used to block this because both consume the
+    per-layer buffer list, and eliding a layer leaves a zero-sized entry in it.
+    Both now cope: the HiCache host pool covers only the producer layers (its
+    declaration's owned_device_layers is built from skip_topk_layers), and the
+    PD transfer drops the elided entries after aligning the peers' layer spans.
+    """
     memory_config = get_memory()
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
     )
 
 
