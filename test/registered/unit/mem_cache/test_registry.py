@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.registry import (
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase, enter_override
 
 
@@ -115,8 +116,7 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
     def test_dispatches_to_registered_factory(self):
-        cache = MagicMock()
-        cache.supports_streaming_session.return_value = True
+        cache = MagicMock(spec=UnifiedRadixCache)
         factory = MagicMock(return_value=cache)
         register_radix_cache_backend("custom", factory)
 
@@ -131,8 +131,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
     @patch("sglang.srt.mem_cache.registry.default_radix_cache_factory")
     def test_unset_backend_falls_back_to_default(self, default_factory):
-        cache = MagicMock()
-        cache.supports_streaming_session.return_value = True
+        cache = MagicMock(spec=UnifiedRadixCache)
         default_factory.return_value = cache
 
         result = create_tree_cache(_make_ctx(self, backend=None))
@@ -142,7 +141,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
     def test_streaming_rejected_when_cache_does_not_support_it(self):
         inner = MagicMock()
-        inner.supports_streaming_session.return_value = False
         register_radix_cache_backend("nonstreaming", MagicMock(return_value=inner))
 
         with self.assertRaisesRegex(NotImplementedError, "not verified"):
@@ -151,8 +149,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             )
 
     def test_streaming_kept_when_cache_supports_it(self):
-        inner = MagicMock()
-        inner.supports_streaming_session.return_value = True
+        inner = MagicMock(spec=UnifiedRadixCache)
         register_radix_cache_backend("streaming", MagicMock(return_value=inner))
 
         result = create_tree_cache(
@@ -226,7 +223,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_streaming_with_pure_swa_is_rejected(self):
         inner = MagicMock()
-        inner.supports_streaming_session.return_value = False
         with patch(
             "sglang.srt.mem_cache.registry.default_radix_cache_factory",
             return_value=inner,

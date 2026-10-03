@@ -281,9 +281,10 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "option that selected another tree cache for this model."
             )
 
-    if (
-        get_serving().enable_streaming_session
-        and not cache.supports_streaming_session()
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if get_serving().enable_streaming_session and not isinstance(
+        cache, UnifiedRadixCache
     ):
         raise NotImplementedError(
             f"--enable-streaming-session is not verified with {type(cache).__name__}; "

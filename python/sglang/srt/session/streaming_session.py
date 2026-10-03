@@ -8,15 +8,9 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    CacheRequestHandle,
-    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
-    EvictParams,
-    EvictResult,
     IncLockRefResult,
-    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -25,8 +19,7 @@ from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 logger = logging.getLogger(__name__)
@@ -90,71 +83,21 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
-class StreamingSession(BasePrefixCache):
-    """Adds streaming-session KV save/restore on top of any BasePrefixCache.
+class StreamingSession:
+    """Streaming-session KV save/restore, owned by ``UnifiedRadixCache``.
 
-    Works both as an external wrapper (``StreamingSession(RadixCache(...))``)
-    and in embedded composition (``StreamingSession(inner=self)``). For the
-    embedded case, the composing cache must pre-check dispatch conditions
-    (``_is_streaming`` / ``find_active_slot`` / ``has_slot``) so the internal
-    fall-through to ``self.inner.xxx`` never fires -- otherwise it recurses.
+    The cache calls the ``try_*`` entries first; each runs the session body
+    when it applies and tells the cache whether to run its own path.
     """
 
-    def __init__(self, inner: BasePrefixCache):
-        self.inner = inner
+    def __init__(self, cache: UnifiedRadixCache):
+        self.cache = cache
         self.slots: Dict[str, SessionSlot] = {}
-
-    # -- Forward PrefixCacheTrait properties to inner cache --
-
-    @property
-    def req_to_token_pool(self):
-        return self.inner.req_to_token_pool
-
-    @req_to_token_pool.setter
-    def req_to_token_pool(self, value):
-        self.inner.req_to_token_pool = value
-
-    @property
-    def token_to_kv_pool_allocator(self):
-        return self.inner.token_to_kv_pool_allocator
-
-    @token_to_kv_pool_allocator.setter
-    def token_to_kv_pool_allocator(self, value):
-        self.inner.token_to_kv_pool_allocator = value
-
-    @property
-    def page_size(self):
-        return self.inner.page_size
-
-    @page_size.setter
-    def page_size(self, value):
-        self.inner.page_size = value
-
-    @property
-    def disable(self):
-        return self.inner.disable
-
-    @disable.setter
-    def disable(self, value):
-        self.inner.disable = value
-
-    @property
-    def metrics_collector(self):
-        return self.inner.metrics_collector
-
-    @metrics_collector.setter
-    def metrics_collector(self, value):
-        self.inner.metrics_collector = value
-
-    # -- Condition helpers (used by embedded-mode callers for pre-dispatch) --
-
-    def has_slot(self, session_id: str) -> bool:
-        return session_id in self.slots
 
     def any_holding_kv(self) -> bool:
         return any(s.kv.holds_kv for s in self.slots.values())
 
-    # -- Try-handle entries for composition (see class docstring) --
+    # -- Try-handle entries (see class docstring) --
 
     def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
         """No-op lock if ``node`` is a session-internal sentinel; returns
@@ -188,17 +131,6 @@ class StreamingSession(BasePrefixCache):
             return None
         return slot
 
-    # -- BasePrefixCache abstract methods --
-
-    def reset(self):
-        self.slots.clear()
-        self.inner.reset()
-
-    # -- Streaming entries: contract with embedded composers (e.g.
-    # UnifiedRadixCache) is a uniform "try_handle_*" pattern. Each method
-    # executes the streaming body if applicable and signals whether the
-    # caller still needs to run its raw path.
-
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
         otherwise None (caller falls back to its raw match)."""
@@ -211,11 +143,11 @@ class StreamingSession(BasePrefixCache):
         # [NPU] When aligned context < page_size, release the slot's KV and
         # fall back to radix cache (full prefill). Once context >= page_size,
         # streaming session kicks in with page-aligned KV reuse.
-        if is_npu() and self.page_size > 1:
+        if is_npu() and self.cache.page_size > 1:
             expected_prefix_len = min(slot.kv.kv_committed_len, len(params.key))
             aligned_prefix_len = (
-                expected_prefix_len // self.page_size
-            ) * self.page_size
+                expected_prefix_len // self.cache.page_size
+            ) * self.cache.page_size
             if (
                 aligned_prefix_len < slot.kv.cache_protected_len
                 or aligned_prefix_len == 0
@@ -242,8 +174,10 @@ class StreamingSession(BasePrefixCache):
         # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
         # cursor must also land on a page boundary -- free_kv_row_segments
         # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
-        if self.page_size > 1 and (is_npu() or req.kv.max_evicted_seqlen > prefix_len):
-            prefix_len = (prefix_len // self.page_size) * self.page_size
+        if self.cache.page_size > 1 and (
+            is_npu() or req.kv.max_evicted_seqlen > prefix_len
+        ):
+            prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
@@ -253,7 +187,7 @@ class StreamingSession(BasePrefixCache):
         # or speculative draft tokens).
         self._free_tail(req.kv, prefix_len)
 
-        device_indices = self.req_to_token_pool.req_to_token[
+        device_indices = self.cache.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
 
@@ -331,57 +265,11 @@ class StreamingSession(BasePrefixCache):
         turns run on the slot's KV, so only the chunk cursor is kept."""
         if not _is_streaming(req) or req.session.session_id not in self.slots:
             return False
-        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
+        kv_indices = self.cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :up_to
+        ]
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
-
-    # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
-
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.try_match_prefix(params)
-        if result is not None:
-            return result
-        return self.inner.match_prefix(params)
-
-    def claim_kv_row(self, req: Req) -> bool:
-        return self.try_cache_finished_req(req)
-
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        self.inner.on_release(req, inserted=inserted)
-
-    def checkpoint(self, req: Req, **kwargs):
-        if self.try_checkpoint(req, **kwargs):
-            return
-        self.inner.checkpoint(req, **kwargs)
-
-    def unpin(self, req: Req) -> None:
-        self.inner.unpin(req)
-
-    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
-        self.inner.finish(handle, outcome)
-
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
-        self.inner.release_aborted_request(handle)
-
-    def evict(self, params: EvictParams) -> EvictResult:
-        return self.inner.evict(params)
-
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        return self.inner.evict_for_alloc(params)
-
-    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        result = self.try_inc_lock_ref(node)
-        if result is not None:
-            return result
-        return self.inner.inc_lock_ref(node)
-
-    def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
-    ) -> DecLockRefResult:
-        result = self.try_dec_lock_ref(node, params)
-        if result is not None:
-            return result
-        return self.inner.dec_lock_ref(node, params)
 
     # -- Session lifecycle --
 
@@ -400,18 +288,15 @@ class StreamingSession(BasePrefixCache):
 
         if lock_node is not None:
             # skip_swa is an SWA-cache extension kwarg; a slot can only have
-            # early-released when the inner cache supports SWA locks.
+            # early-released when the cache supports SWA locks.
             skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
-            self.inner.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
+            self.cache.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
 
         if slot.kv.holds_kv:
-            self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
-            self.req_to_token_pool.free(slot)
+            self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
+            self.cache.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
-
-    def release_radix_session(self, session_id: str) -> None:
-        self.inner.release_radix_session(session_id)
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
@@ -427,7 +312,7 @@ class StreamingSession(BasePrefixCache):
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
             if slot.kv.holds_kv and not in_batch:
-                allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+                allocated = ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
                 total += allocated - slot.kv.cache_protected_len
         return total
 
@@ -444,7 +329,7 @@ class StreamingSession(BasePrefixCache):
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
             if slot.kv.holds_kv and not in_batch:
-                allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+                allocated = ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
                 total += allocated - max(
                     slot.kv.cache_protected_len,
                     slot.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -485,7 +370,7 @@ class StreamingSession(BasePrefixCache):
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = getattr(self.cache.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is None:
             return
         if slot.kv.holds_mamba:
@@ -515,10 +400,10 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        if self.page_size > 1 and req.kv.max_evicted_seqlen > target:
+        if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
             # Same hazard as the match-path rewind: the cursor must stay
             # page-aligned; the partial page is re-prefilled next turn.
-            target = (target // self.page_size) * self.page_size
+            target = (target // self.cache.page_size) * self.cache.page_size
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
@@ -535,101 +420,6 @@ class StreamingSession(BasePrefixCache):
         if end <= target:
             return
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
-        self.free_kv_row(kv, [(start, end)])
-
-    # -- Pass-through methods --
-
-    def evictable_size(self):
-        return self.inner.evictable_size()
-
-    def full_evictable_size(self):
-        return self.inner.full_evictable_size()
-
-    def swa_evictable_size(self):
-        return self.inner.swa_evictable_size()
-
-    def protected_size(self):
-        return self.inner.protected_size()
-
-    def full_protected_size(self):
-        return self.inner.full_protected_size()
-
-    def swa_protected_size(self):
-        return self.inner.swa_protected_size()
-
-    def total_size(self):
-        return self.inner.total_size()
-
-    def pretty_print(self):
-        return self.inner.pretty_print()
-
-    def init_load_back(self, params: InitLoadBackParams):
-        return self.inner.init_load_back(params)
-
-    @property
-    def buffer_pipeline(self) -> Optional[BufferModePipeline]:
-        return self.inner.buffer_pipeline
-
-    @property
-    def storage_prefetch_retries(self) -> Optional[StoragePrefetchRetries]:
-        return self.inner.storage_prefetch_retries
-
-    def pop_prefetch_loaded_span(
-        self, handle: CacheRequestHandle
-    ) -> tuple[int, Optional[int]]:
-        return self.inner.pop_prefetch_loaded_span(handle)
-
-    def finish_storage_prefetch_admission(
-        self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
-    ) -> None:
-        self.inner.finish_storage_prefetch_admission(handle, fulfilled_tokens, reason)
-
-    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
-        self.inner.discard_storage_prefetch_accounting(handle)
-
-    def ready_to_load_host_cache(self):
-        return self.inner.ready_to_load_host_cache()
-
-    def check_hicache_events(self):
-        return self.inner.check_hicache_events()
-
-    def flush_pending_backups(self) -> None:
-        self.inner.flush_pending_backups()
-
-    def take_events(self):
-        return self.inner.take_events()
-
-    def supports_swa(self):
-        return self.inner.supports_swa()
-
-    def supports_mamba(self):
-        return self.inner.supports_mamba()
-
-    def supports_streaming_session(self) -> bool:
-        return True
-
-    def is_chunk_cache(self):
-        return self.inner.is_chunk_cache()
-
-    def is_tree_cache(self):
-        return self.inner.is_tree_cache()
-
-    def available_and_evictable_str(self):
-        return self.inner.available_and_evictable_str()
-
-    def init_metrics_collector(self):
-        return self.inner.init_metrics_collector()
-
-    def sanity_check(self):
-        # Skip inner sanity check when sessions hold tree locks, because
-        # the check asserts all nodes are unlocked during idle.
-        if self.any_holding_kv():
-            return
-        self.inner.sanity_check()
-
-    # Forward attribute access for cache-specific methods (e.g.
-    # sliding_window_size, all_values_flatten, etc.)
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
+        if self.cache.page_size > 1:
+            start = ceil_align(start, self.cache.page_size)
+        self.cache.free_kv_row(kv, [(start, end)])
