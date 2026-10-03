@@ -471,6 +471,7 @@ POSITIONAL_FIELD_ORDER = (
     "prefill_delayer_queue_min_ratio",
     "prefill_delayer_max_delay_ms",
     "min_free_slots_delay",
+    "min_free_slots_max_delay_passes",
     "enable_deterministic_inference",
     "rl_on_policy_target",
     "kv_canary",
