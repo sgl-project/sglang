@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
+use super::routing::BootstrapParams;
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls,
@@ -53,6 +54,8 @@ struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    bootstrap: BootstrapParams,
 }
 
 async fn chat_completions(
@@ -62,6 +65,7 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        bootstrap,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -87,6 +91,9 @@ async fn chat_completions(
     }
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
+    }
+    if let Err(message) = bootstrap.validate(1) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
@@ -204,7 +211,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = FrontendRequest {
+        let mut native = FrontendRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -218,6 +225,7 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
+        bootstrap.apply(&mut native, 0, index);
         let call = match submit_generation(&state, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
