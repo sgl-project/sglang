@@ -22,7 +22,7 @@ from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.musa import MusaSRTPlatform
-from sglang.srt.platforms.npu import NpuSRTPlatform
+from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -44,20 +44,22 @@ def _is_cpu_available() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
 
 
-def _is_xpu_available() -> bool:
-    return torch.xpu.is_available()
-
-
 def _is_npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+def _is_xpu_available() -> bool:
+    return torch.xpu.is_available()
+
+
 def _is_musa_available() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -80,9 +82,9 @@ def _resolve_platform() -> SRTPlatform:
            (checked first; an explicit opt-in wins over CUDA/ROCm availability,
            so developers on GPU hosts can intentionally exercise the CPU path)
          - 0 activated + CUDA available → fallback CudaSRTPlatform
+         - 0 activated + NPU available  → fallback NPUSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
-         - 0 activated + NPU available  → fallback NpuSRTPlatform
          - 0 activated + MUSA available → fallback MusaSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
@@ -143,6 +145,9 @@ def _resolve_platform() -> SRTPlatform:
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
             )
             return CudaSRTPlatform()
+        if _is_npu_available():
+            logger.debug("No platform plugin detected. Using NPU SRTPlatform defaults.")
+            return NPUSRTPlatform()
         if _is_rocm_available():
             logger.debug(
                 "No platform plugin detected. Using ROCm SRTPlatform defaults."
@@ -151,9 +156,6 @@ def _resolve_platform() -> SRTPlatform:
         if _is_xpu_available():
             logger.debug("No platform plugin detected. Using XPU SRTPlatform defaults.")
             return XpuSRTPlatform()
-        if _is_npu_available():
-            logger.debug("No platform plugin detected. Using NPU SRTPlatform defaults.")
-            return NpuSRTPlatform()
         if _is_musa_available():
             logger.debug(
                 "No platform plugin detected. Using MUSA SRTPlatform defaults."

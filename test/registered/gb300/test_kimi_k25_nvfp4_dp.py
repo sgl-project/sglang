@@ -48,9 +48,7 @@ class TestKimiK25Nvfp4Dp(CustomTestCase):
                 ModelLaunchSettings(
                     MODEL_PATH,
                     tp_size=4,
-                    extra_args=COMMON_ARGS
-                    + ["--dp-size=4", "--enable-dp-attention"]
-                    + DP_EAGLE_ARGS,
+                    extra_args=COMMON_ARGS + ["--attn-dp-size=4"] + DP_EAGLE_ARGS,
                     variant="TP4+DP4+DPA+EAGLE3",
                 )
             ],
@@ -62,7 +60,6 @@ class TestKimiK25Nvfp4Dp(CustomTestCase):
                 max_tokens=32768,
                 temperature=0.7,
                 seed=0,
-                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],

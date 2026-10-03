@@ -12,7 +12,8 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional, Type
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Type
 
 import msgspec
 
@@ -33,7 +34,16 @@ __all__ = [
     "reject_out_of_tree_path",
 ]
 
+logger = logging.getLogger(__name__)
+
 KVPoolKind = Literal["mha", "mla", "dsa"]
+
+_LEGACY_KV_POOL_HOOKS: dict[str, str] = {
+    "mha": "get_mha_kv_pool_cls",
+    "mla": "get_mla_kv_pool_cls",
+    "dsa": "get_dsa_kv_pool_cls",
+}
+_warned_legacy_kv_pool_hooks: set[tuple[type, str]] = set()
 
 
 class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
@@ -94,12 +104,20 @@ class SRTPlatform(DeviceMixin):
         """Return the default attention backend name for this platform."""
         raise NotImplementedError
 
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        """Return the default draft attention backend for an algorithm."""
+        raise NotImplementedError
+
     def get_graph_runner_cls(self) -> Optional[type]:
         """Return the graph runner class, or None for the in-tree default.
 
         ``None`` means "no platform opinion": the caller falls back to the
         in-tree device-keyed selection.
         """
+        return None
+
+    def get_full_graph_backend_cls(self) -> type[Any]:
+        """Return the full device-graph backend class for this platform."""
         return None
 
     def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
@@ -115,8 +133,26 @@ class SRTPlatform(DeviceMixin):
         translation, PD registration) stays core's. ``None`` (the default)
         means the in-tree class, which allocates on ``device`` and is
         correct for any torch device.
+
+        A platform that still overrides the removed
+        ``get_{mha,mla,dsa}_kv_pool_cls`` hooks is served from them, with a
+        deprecation warning.
         """
-        return None
+        hook = _LEGACY_KV_POOL_HOOKS[kind]
+        legacy = getattr(self, hook, None)
+        if legacy is None:
+            return None
+        key = (type(self), hook)
+        if key not in _warned_legacy_kv_pool_hooks:
+            _warned_legacy_kv_pool_hooks.add(key)
+            logger.warning(
+                "%s.%s() is deprecated and will be removed; override "
+                "get_kv_pool_cls(kind=%r) instead.",
+                type(self).__name__,
+                hook,
+                kind,
+            )
+        return legacy()
 
     def get_paged_allocator_cls(self) -> Optional[type]:
         """Return the paged allocator class, or None for the in-tree default.
@@ -140,6 +176,12 @@ class SRTPlatform(DeviceMixin):
         in-tree device-keyed default."""
         return None
 
+    def get_speculative_cache_locs_fn(
+        self,
+    ) -> Optional[Callable[..., torch.Tensor]]:
+        """Return a platform implementation for speculative KV-cache locations."""
+        return None
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
@@ -147,6 +189,20 @@ class SRTPlatform(DeviceMixin):
         quantization scheme, raise an error if not supported or return None
         to use the default config."""
         return None
+
+    # ------------------------------------------------------------------
+    # Speculative decoding support (safe conservative defaults)
+    # ------------------------------------------------------------------
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Whether this platform supports the named speculative algorithm."""
+        return False
+
+    def supports_speculative_draft_attention_backend(
+        self, algorithm: str, backend: str
+    ) -> bool:
+        """Whether this platform supports a draft backend for an algorithm."""
+        return False
 
     # ------------------------------------------------------------------
     # Initialization

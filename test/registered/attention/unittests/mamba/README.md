@@ -83,7 +83,7 @@ call.
 - **PCG / BCG split-op extend** — `MambaMixer2.forward` asserts
   `num_actual_tokens == projected_states.shape[0]`
   (`mamba.py:467`) at the projection step, BEFORE the
-  `num_token_non_padded_cpu` slicing kicks in at the attention
+  `global_num_token_non_padded_cpu` slicing kicks in at the attention
   dispatch. The shared `_run_split_op_extend_case` pads
   `hidden_states` to a fixed `static_num_tokens` upper bound to
   exercise the per-layer slicing contract, but Mamba2 trips this

@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
+    resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
@@ -314,7 +315,7 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
-        self.enable_mis = model_runner.server_args.enable_mis
+        self.enable_mis = get_exec().features.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -472,9 +473,25 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if get_platform().is_sm100:
+            fmha_backend = "fa2"
             # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs.
-            if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            # due to TMA descriptor initialization issues on SM100 GPUs. The
+            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
+            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
+            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
+            cutlass_supported_head_dims = {
+                (64, 64),
+                (128, 128),
+                (192, 128),
+            }
+            head_dims = (
+                model_runner.model_config.head_dim,
+                model_runner.model_config.v_head_dim,
+            )
+            if (
+                head_dims in cutlass_supported_head_dims
+                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -1299,11 +1316,6 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         logits_soft_cap = layer.logit_cap
 
@@ -1337,7 +1349,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1439,7 +1455,11 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1460,18 +1480,17 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1703,7 +1722,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
@@ -1975,6 +1994,14 @@ class FlashInferIndicesUpdaterPrefill:
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+            elif use_ragged:
+                # Extend K/V lands after the paged pass: plan over the prefix only.
+                paged_kernel_lens = prefix_lens
+                if extend_prefix_lens_cpu is not None:
+                    paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+                else:
+                    paged_kernel_lens_sum = prefix_lens.sum().item()
+                kv_start_idx = None
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
@@ -2128,7 +2155,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
@@ -2341,6 +2368,9 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
+            model_runner
+        )
 
     def common_template(
         self,
@@ -2379,6 +2409,8 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            self.draft_window_size,
+            self.draft_sink_size,
         )
 
         assert forward_batch.spec_info is not None

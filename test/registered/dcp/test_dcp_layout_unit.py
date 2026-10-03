@@ -29,11 +29,11 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 DCP_SIZES = [1, 2, 3, 4, 8]
 LENS = list(range(0, 41))
@@ -134,7 +134,9 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def test_identity_without_dcp(self):
         kv = torch.arange(37)
-        with rc.get_parallel().override(dcp_enabled=False, dcp_size=1, dcp_rank=0):
+        with rc.get_parallel().override(
+            dcp_enabled=False, dcp_size=1, dcp_rank=0, attn_dcp_rank=0
+        ):
             self.assertIs(
                 filter_dcp_local_chunk_kv_indices(
                     kv, torch.tensor([0]), torch.tensor([37])
@@ -263,6 +265,38 @@ class TestGetDcpLens(CustomTestCase):
         # In TP4/DCP4 with two KV heads, ranks 0 and 1 both belong to KV head 0.
         self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
         self.assertTrue(torch.equal(out, q))
+
+    def test_triton_dcp_write_marks_the_rank_local_loc(self):
+        """Each rank writes at `out_cache_loc // dcp_size` with the batch's
+        physical mark, masked by position to the tokens it owns."""
+        writes = []
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.dcp_size, backend.dcp_rank = 2, 1
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_kv_buffer=lambda *args, **kwargs: writes.append((args, kwargs))
+        )
+        out_cache_loc = torch.tensor([8, 9, 10, 11, 12])
+        forward_batch = SimpleNamespace(
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_is_physical=True,
+            positions=torch.arange(5),
+            dcp_kv_mask=None,
+        )
+        k = torch.zeros(5, 1, 2)
+
+        backend._set_kv_buffer(forward_batch, SimpleNamespace(), None, k, k.clone())
+
+        ((args, kwargs),) = writes
+        loc_info = args[1]
+        self.assertIsInstance(loc_info, KVWriteLoc)
+        self.assertTrue(loc_info.physical)
+        self.assertTrue(torch.equal(loc_info.loc, out_cache_loc // 2))
+        self.assertTrue(
+            torch.equal(
+                kwargs["dcp_kv_mask"],
+                torch.tensor([False, True, False, True, False]),
+            )
+        )
 
     def test_dense_q_indptr_matches_the_arange_it_replaces(self):
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend

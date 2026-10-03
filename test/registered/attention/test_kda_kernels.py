@@ -19,7 +19,7 @@ from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
@@ -645,6 +645,122 @@ class TestKDAPackedDecode(unittest.TestCase):
             atol=2e-2,
             rtol=1e-2,
         )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAVerifyDecodeParity(CustomTestCase):
+    """With ``match_cutedsl_decode`` a T-token verify launch must reproduce the
+    T single-token launches a decode loop runs over a BF16 state pool, bit for
+    bit; the default path carries FP32 state across the chain and drifts."""
+
+    @staticmethod
+    def _run_decode_loop_and_verify(B, T, H, K, state_dtype, match_decode):
+        torch.manual_seed(1234)
+        device = get_device()
+        q = torch.randn(1, B * T, H, K, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, B * T, H, K, dtype=torch.bfloat16, device=device)
+        v = torch.randn(1, B * T, H, K, dtype=torch.bfloat16, device=device)
+        a = torch.randn(B * T, H * K, dtype=torch.bfloat16, device=device)
+        b = torch.randn(1, B * T, H, dtype=torch.bfloat16, device=device)
+        if match_decode:
+            # The parity contract: beta arrives already sigmoided in FP32.
+            b = b.float().sigmoid()
+        A_log = torch.randn(H, dtype=torch.float32, device=device)
+        dt_bias = torch.randn(H * K, dtype=torch.float32, device=device)
+        num_slots = B + 2
+        pool = torch.randn(num_slots, H, K, K, dtype=torch.float32, device=device).to(
+            state_dtype
+        )
+        slots = torch.arange(B, dtype=torch.int32, device=device)
+        common = dict(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state_indices=slots,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=True,
+            match_cutedsl_decode=match_decode,
+        )
+
+        # Token t of request i sits at row i * T + t.
+        decode_pool = pool.clone()
+        decode_cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=device)
+        decode_outputs, decode_states = [], []
+        for t in range(T):
+            rows = [i * T + t for i in range(B)]
+            decode_outputs.append(
+                fused_sigmoid_gating_delta_rule_update(
+                    q=q[:, rows].contiguous(),
+                    k=k[:, rows].contiguous(),
+                    v=v[:, rows].contiguous(),
+                    a=a[rows].contiguous(),
+                    b=b[:, rows].contiguous(),
+                    initial_state_source=decode_pool,
+                    cu_seqlens=decode_cu_seqlens,
+                    **common,
+                )
+            )
+            decode_states.append(decode_pool[slots].clone())
+        decode_output = torch.stack(decode_outputs, dim=2).reshape(1, B * T, H, K)
+        decode_state = torch.stack(decode_states, dim=1)
+
+        verify_pool = pool.clone()
+        verify_state = torch.zeros(
+            num_slots, T, H, K, K, dtype=state_dtype, device=device
+        )
+        verify_output = fused_sigmoid_gating_delta_rule_update(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=verify_pool,
+            cu_seqlens=torch.arange(0, B * T + 1, T, dtype=torch.int32, device=device),
+            disable_state_update=True,
+            intermediate_states_buffer=verify_state,
+            intermediate_state_indices=slots,
+            cache_steps=T,
+            retrieve_parent_token=None,
+            **common,
+        )
+        return decode_output, decode_state, verify_output, verify_state[slots]
+
+    def test_bf16_state_verify_matches_single_token_launches(self):
+        for K in (128, 64):
+            with self.subTest(head_dim=K):
+                decode_output, decode_state, verify_output, verify_state = (
+                    self._run_decode_loop_and_verify(
+                        B=2,
+                        T=16,
+                        H=4,
+                        K=K,
+                        state_dtype=torch.bfloat16,
+                        match_decode=True,
+                    )
+                )
+                self.assertTrue(torch.equal(verify_output, decode_output))
+                self.assertTrue(torch.equal(verify_state, decode_state))
+
+    def test_default_path_keeps_fp32_state_across_the_chain(self):
+        decode_output, decode_state, verify_output, verify_state = (
+            self._run_decode_loop_and_verify(
+                B=2, T=16, H=4, K=128, state_dtype=torch.bfloat16, match_decode=False
+            )
+        )
+        self.assertFalse(torch.equal(verify_state, decode_state))
+        # Still the same recurrence: the drift is BF16 rounding, not a bug.
+        torch.testing.assert_close(
+            verify_output.float(), decode_output.float(), atol=2e-2, rtol=1e-2
+        )
+
+    def test_fp32_state_pool_is_not_rounded(self):
+        _, decode_state, _, verify_state = self._run_decode_loop_and_verify(
+            B=2, T=16, H=4, K=128, state_dtype=torch.float32, match_decode=True
+        )
+        self.assertTrue(torch.equal(verify_state, decode_state))
+        rounded = verify_state.to(torch.bfloat16).to(torch.float32)
+        self.assertFalse(torch.equal(verify_state, rounded))
 
 
 if __name__ == "__main__":
