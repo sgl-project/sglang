@@ -596,6 +596,7 @@ class _MlxBenchRunner:
         init_kwargs = dict(
             model_path=cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
             disable_radix_cache=True,
             mem_fraction_static=cfg.mem_fraction_static,
             quantization=cfg.quantization,
