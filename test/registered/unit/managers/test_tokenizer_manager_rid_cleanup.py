@@ -990,6 +990,105 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
 
 
+class TestTargetedAbortDispatch(CustomTestCase):
+    def test_empty_unknown_and_completed_ids(self):
+        tm = _make_tm_for_generate(self)
+        tm._dispatch_to_scheduler = Mock()
+        for rid in ("", "missing", "completed"):
+            tm.abort_request(rid)
+        tm._dispatch_to_scheduler.assert_not_called()
+        tm.abort_request(abort_all=True)
+        sent = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertTrue(sent.abort_all)
+
+    def test_nonlocal_rid_is_forwarded_with_multiple_tokenizers(self):
+        tm = _make_tm_for_generate(self)
+        override = get_context().override_server_args(tokenizer_worker_num=2)
+        override.install()
+        self.addCleanup(override.restore)
+        tm._dispatch_to_scheduler = Mock()
+        tm.abort_request("job-1")
+        sent = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(sent.rid, "job-1")
+        self.assertFalse(sent.abort_all)
+
+
+class TestBatchCancellationUsesActualRids(CustomTestCase):
+    def test_cancel_handler_aborts_every_dispatched_child(self):
+        # Use real normalization and batch expansion, including the UUIDs
+        # generated for n > 1, rather than inventing a parent RID prefix.
+        for stream in (False, True):
+            for n in (1, 3):
+                with self.subTest(stream=stream, n=n):
+                    tm = _make_tm_for_generate(self)
+                    tm._dispatch_to_scheduler = Mock()
+                    tm._should_use_batch_tokenization = Mock(return_value=False)
+                    sent = {}
+                    samples_ready = asyncio.Event()
+
+                    async def tokenize(obj):
+                        tokenized = Mock()
+                        tokenized.rid = obj.rid
+                        tokenized.mm_inputs = None
+                        tokenized.sampling_params = Mock(max_new_tokens=100)
+                        return tokenized
+
+                    async def send(obj):
+                        sent[obj.rid] = obj
+                        tm.rid_to_state[obj.rid].dispatched = True
+                        if (
+                            sum(
+                                x.sampling_params.max_new_tokens != 0
+                                for x in sent.values()
+                            )
+                            == 2 * n
+                        ):
+                            samples_ready.set()
+
+                    async def wait(obj, request):
+                        if sent[obj.rid].sampling_params.max_new_tokens == 0:
+                            del tm.rid_to_state[obj.rid]
+                            yield {}
+                        else:
+                            await asyncio.Event().wait()
+
+                    tm._tokenize_one_request = tokenize
+                    tm._send_one_request = send
+                    tm._wait_one_response = wait
+                    obj = GenerateReqInput(
+                        text=["first", "second"],
+                        rid="parent_with_underscore",
+                        sampling_params={"n": n, "max_new_tokens": 100},
+                        stream=stream,
+                    )
+                    unrelated = "parent_with_underscore_0_extra"
+                    tm.rid_to_state[unrelated] = _make_req_state(unrelated)
+
+                    async def drive():
+                        task = asyncio.create_task(tm.generate_request(obj).__anext__())
+                        try:
+                            await asyncio.wait_for(samples_ready.wait(), timeout=5)
+                        finally:
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+
+                    asyncio.run(drive())
+                    samples = {
+                        rid
+                        for rid, child in sent.items()
+                        if child.sampling_params.max_new_tokens != 0
+                    }
+                    aborts = [
+                        c.args[0] for c in tm._dispatch_to_scheduler.call_args_list
+                    ]
+                    self.assertEqual(len(samples), 2 * n)
+                    self.assertTrue(all(isinstance(a, AbortReq) for a in aborts))
+                    self.assertEqual({a.rid for a in aborts}, samples)
+                    self.assertEqual(len(aborts), len(samples))
+                    self.assertFalse(tm.rid_to_state[unrelated].abort_sent)
+
+
 class TestWaitOneResponseAfterStateFreed(CustomTestCase):
     """A waiter built before its request finishes must still deliver the output.
 
