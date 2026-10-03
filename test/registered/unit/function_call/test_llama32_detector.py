@@ -185,6 +185,125 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(params["city"], "Tokyo")
         self.assertEqual(params["unit"], "celsius")
 
+    def test_streaming_preserves_non_tool_json(self):
+        texts = [
+            "{}",
+            '{"a": 1} is a dict',
+            '{"nested": {"name": "get_weather"}, "items": [1, 2]}',
+            "{\"text\": \"你好 — 'key': 'value'\"}  trailing: 'text'\n",
+            "{'text': '你好', 'number': 1} is a Python dict",
+        ]
+        for text in texts:
+            chunkings = [[text], list(text)] + [
+                [text[:split], text[split:]] for split in range(1, len(text))
+            ]
+            for chunks in chunkings:
+                with self.subTest(text=text, chunks=chunks):
+                    detector = Llama32Detector()
+                    results = [
+                        detector.parse_streaming_increment(chunk, self.tools)
+                        for chunk in chunks
+                    ]
+                    results.append(detector.finish(self.tools))
+                    self.assertEqual("".join(r.normal_text for r in results), text)
+                    self.assertFalse([call for r in results for call in r.calls])
+                    self.assertEqual(detector.finish(self.tools).normal_text, "")
+
+    def test_streaming_non_tool_json_is_released_when_complete(self):
+        detector = Llama32Detector()
+        result = detector.parse_streaming_increment('{"a":', self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+        result = detector.parse_streaming_increment(" 1}", self.tools)
+        self.assertEqual(result.normal_text, '{"a": 1}')
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_tool_arguments_before_name(self):
+        texts = [
+            '{"arguments": {"city": "Tokyo"}, "name": "get_weather"}',
+            "{'arguments': {'city': 'Tokyo'}, 'name': 'get_weather'}",
+        ]
+        for text in texts:
+            for prefix in ["", "<|python_tag|>"]:
+                response = prefix + text
+                chunkings = [[response], list(response)] + [
+                    [response[:split], response[split:]]
+                    for split in range(1, len(response))
+                ]
+                for chunks in chunkings:
+                    with self.subTest(chunks=chunks):
+                        detector = Llama32Detector()
+                        results = [
+                            detector.parse_streaming_increment(chunk, self.tools)
+                            for chunk in chunks
+                        ]
+                        # The base parser emits the name before arguments, including
+                        # when both arrive together in the final input chunk.
+                        results.append(
+                            detector.parse_streaming_increment("", self.tools)
+                        )
+                        results.append(detector.finish(self.tools))
+                        self.assertEqual("".join(r.normal_text for r in results), "")
+                        calls = [call for r in results for call in r.calls]
+                        self.assertEqual(
+                            [c.name for c in calls if c.name], ["get_weather"]
+                        )
+                        self.assertEqual(
+                            json.loads("".join(c.parameters for c in calls)),
+                            {"city": "Tokyo"},
+                        )
+
+    def test_streaming_json_before_split_tool_marker(self):
+        for prefix in ["{}", '{"a": 1} ']:
+            text = (
+                prefix
+                + '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Tokyo"}}'
+            )
+            for split in range(1, len(text)):
+                with self.subTest(prefix=prefix, split=split):
+                    detector = Llama32Detector()
+                    results = [
+                        detector.parse_streaming_increment(text[:split], self.tools),
+                        detector.parse_streaming_increment(text[split:], self.tools),
+                        detector.parse_streaming_increment("", self.tools),
+                    ]
+                    calls = [call for result in results for call in result.calls]
+                    self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
+                    self.assertEqual(
+                        json.loads("".join(c.parameters for c in calls)),
+                        {"city": "Tokyo"},
+                    )
+                    normal_text = "".join(result.normal_text for result in results)
+                    self.assertNotIn("python_tag", normal_text)
+                    self.assertNotIn("get_weather", normal_text)
+
+    def test_streaming_does_not_echo_explicit_or_unknown_tools(self):
+        texts = [
+            '<|python_tag|>{"a": 1}',
+            '{"name": "unknown", "arguments": {"city": "Tokyo"}}',
+            '<|python_tag|>{"name": "unknown", "arguments": {"city": "Tokyo"}}',
+        ]
+        for text in texts:
+            with self.subTest(text=text):
+                detector = Llama32Detector()
+                result = detector.parse_streaming_increment(text, self.tools)
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual(result.calls, [])
+                self.assertEqual(detector.finish(self.tools).normal_text, "")
+
+    def test_streaming_unknown_tool_arguments_do_not_become_plain_json(self):
+        for prefix in ["", "<|python_tag|>"]:
+            with self.subTest(prefix=prefix):
+                detector = Llama32Detector()
+                text = prefix + '{"name":"unknown","arguments":{"city":"Tokyo"}}'
+                results = [
+                    detector.parse_streaming_increment(char, self.tools)
+                    for char in text
+                ]
+                results.append(detector.finish(self.tools))
+                self.assertFalse([call for result in results for call in result.calls])
+                self.assertNotIn("Tokyo", "".join(r.normal_text for r in results))
+
 
 if __name__ == "__main__":
     import unittest
