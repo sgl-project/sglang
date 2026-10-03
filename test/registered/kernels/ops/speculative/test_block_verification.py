@@ -10,7 +10,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
 
@@ -94,7 +94,9 @@ def _reference(target, draft, candidates, coins, final_coins, *, block):
 
 
 @pytest.mark.parametrize("block", [False, True])
-@pytest.mark.parametrize("steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099)])
+@pytest.mark.parametrize(
+    "steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099), (3, 131073)]
+)
 def test_matches_reference(steps, vocab, block):
     torch.manual_seed(42)
     batch = 7
@@ -150,6 +152,62 @@ def test_scales_residual_at_last_accepted_prefix():
     assert lengths.item() == 1
     # Scaled residual is [0.8, 0.2, 0]; unscaled residual would sample token 1.
     assert output[0, :2].tolist() == [0, 0]
+
+
+def test_selects_longest_accepted_prefix():
+    steps = 5
+    batch = steps + 1
+    target = torch.tensor([0.25, 0.625, 0.125]).repeat(batch, steps + 1, 1)
+    draft = torch.tensor([0.25, 0.125, 0.625]).repeat(batch, steps, 1)
+    draft[:, 0] = torch.tensor([0.5, 0.125, 0.375])
+    candidates = torch.zeros(batch, steps + 1, dtype=torch.long)
+    expected_lengths = torch.arange(batch)
+    # Every shorter prefix also passes, so descending selection must stop at tau.
+    coins = torch.where(
+        torch.arange(steps + 1)[None, :] < expected_lengths[:, None], 0.0, 0.9
+    )
+    final_coins = torch.full((batch,), 0.75)
+    reference_lengths, expected = _reference(
+        target, draft, candidates, coins, final_coins, block=True
+    )
+    torch.testing.assert_close(reference_lengths, expected_lengths)
+    lengths, output = _verify(
+        *(x.to(DEVICE) for x in (target, draft, candidates, coins, final_coins))
+    )
+    torch.testing.assert_close(lengths.cpu().long(), expected_lengths)
+    valid = torch.arange(steps + 1)[None, :] <= expected_lengths[:, None]
+    torch.testing.assert_close(output.cpu()[valid], expected[valid])
+
+
+@pytest.mark.parametrize(
+    "target_next,draft_next,threshold",
+    [([0.5, 0.5], [0.125, 0.875], 0.5), ([1.0, 0.0], [0.0, 1.0], 0.75)],
+)
+def test_prefix_acceptance_boundary(target_next, draft_next, threshold):
+    target = torch.tensor([[[0.375, 0.625], target_next, [0.5, 0.5]]]).repeat(3, 1, 1)
+    draft = torch.tensor([[[0.5, 0.5], draft_next]]).repeat(3, 1, 1)
+    candidates = torch.tensor([[0, 0, 1]]).repeat(3, 1)
+    coins = torch.full((3, 3), 0.99)
+    # Exercise strict comparison at h_1, including the h_1 == r_1 shortcut boundary.
+    threshold = torch.tensor(threshold)
+    coins[:, 0] = torch.stack(
+        [
+            torch.nextafter(threshold, torch.tensor(0.0)),
+            threshold,
+            torch.nextafter(threshold, torch.tensor(1.0)),
+        ]
+    )
+    final_coins = torch.full((3,), 0.5)
+    expected_lengths, expected = _reference(
+        target, draft, candidates, coins, final_coins, block=True
+    )
+    assert expected_lengths.tolist() == [1, 0, 0]
+    lengths, output = _verify(
+        *(x.to(DEVICE) for x in (target, draft, candidates, coins, final_coins))
+    )
+    torch.testing.assert_close(lengths.cpu().long(), expected_lengths)
+    valid = torch.arange(3)[None, :] <= expected_lengths[:, None]
+    torch.testing.assert_close(output.cpu()[valid], expected[valid])
 
 
 @pytest.mark.parametrize("identical", [False, True])
@@ -208,46 +266,52 @@ def test_paper_example_distribution(block, expected_length):
 
 
 @pytest.mark.parametrize("block", [False, True])
-def test_context_dependent_output_distribution(block):
+@pytest.mark.parametrize("steps", [2, 5])
+def test_context_dependent_output_distribution(block, steps):
     torch.manual_seed(456)
     batch = 65536
     target_initial = torch.tensor([0.4, 0.6], device=DEVICE)
     draft_initial = torch.tensor([0.7, 0.3], device=DEVICE)
     target_transition = torch.tensor([[0.25, 0.75], [0.65, 0.35]], device=DEVICE)
     draft_transition = torch.tensor([[0.7, 0.3], [0.15, 0.85]], device=DEVICE)
-    first = torch.multinomial(draft_initial, batch, replacement=True)
-    second = torch.multinomial(draft_transition[first], 1).squeeze(1)
-    candidates = torch.stack([torch.zeros_like(first), first, second], dim=1)
+    tokens = [torch.multinomial(draft_initial, batch, replacement=True)]
+    for _ in range(1, steps):
+        tokens.append(torch.multinomial(draft_transition[tokens[-1]], 1).squeeze(1))
+    candidates = torch.stack([torch.zeros_like(tokens[0]), *tokens], dim=1)
     target = torch.stack(
         [
             target_initial.expand(batch, -1),
-            target_transition[first],
-            target_transition[second],
+            *[target_transition[token] for token in tokens],
         ],
         dim=1,
     )
     draft = torch.stack(
-        [draft_initial.expand(batch, -1), draft_transition[first]], dim=1
+        [
+            draft_initial.expand(batch, -1),
+            *[draft_transition[token] for token in tokens[:-1]],
+        ],
+        dim=1,
     )
     lengths, output = _verify(
         target,
         draft,
         candidates,
-        torch.rand(batch, 3, device=DEVICE),
+        torch.rand(batch, steps + 1, device=DEVICE),
         torch.rand(batch, device=DEVICE),
         block=block,
     )
-    for step in (1, 2):
+    for step in range(1, steps + 1):
         completion = torch.multinomial(
             target_transition[output[:, step - 1].long()], 1
         ).squeeze(1)
         output[:, step] = torch.where(step <= lengths, output[:, step], completion)
-    for sequence in itertools.product(range(2), repeat=3):
+    for sequence in itertools.product(range(2), repeat=steps + 1):
         observed = (
             (output == torch.tensor(sequence, device=DEVICE)).all(-1).float().mean()
         )
-        a, b, c = sequence
-        expected = target_initial[a] * target_transition[a, b] * target_transition[b, c]
+        expected = target_initial[sequence[0]]
+        for previous, token in zip(sequence, sequence[1:]):
+            expected = expected * target_transition[previous, token]
         assert abs(observed.item() - expected.item()) < 0.008
 
 
