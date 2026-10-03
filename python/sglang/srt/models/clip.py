@@ -208,6 +208,7 @@ class CLIPAttention(nn.Module):
             type(self).__name__,
             shard_tp_size=parallel.attn_tp_size,
             reduces_over_attn_tp=False,
+            multimodal_encoder=True,
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,

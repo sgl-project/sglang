@@ -550,7 +550,10 @@ class Step3VisionMLP(nn.Module):
         # group; reduce over the attention-TP group so attention DP and attention
         # CP narrower than TP can run it.
         reject_attn_tp_shard_with_tp_reduce(
-            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
+            type(self).__name__,
+            shard_tp_size=attn_tp_size,
+            reduces_over_attn_tp=False,
+            multimodal_encoder=True,
         )
         self.fc2 = RowParallelLinear(
             intermediate_size,

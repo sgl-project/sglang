@@ -465,8 +465,31 @@ def get_dp_tp_group() -> GroupCoordinator:
     return parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
 
 
+def multimodal_encoder_runs_here() -> bool:
+    """Whether a multimodal tower built on this worker is also forwarded here.
+
+    A tower is built unconditionally by most models, but an encoder-disaggregated
+    language instance forwards it on the encoder instance, a language-model-only
+    instance rejects multimodal requests, and a PD decode instance embeds nothing
+    (`general_mm_embed_routine` skips decode and target-verify forwards).
+    """
+    from sglang.srt.runtime_context import get_disagg
+
+    disagg = get_disagg()
+    return not (
+        disagg.language_only
+        or disagg.language_model_only
+        or disagg.disaggregation_mode == "decode"
+    )
+
+
 def reject_attn_tp_shard_with_tp_reduce(
-    layer: str, *, shard_tp_size: int, reduces_over_attn_tp: bool, hint: str = ""
+    layer: str,
+    *,
+    shard_tp_size: int,
+    reduces_over_attn_tp: bool,
+    multimodal_encoder: bool = False,
+    hint: str = "",
 ) -> None:
     """Reject a layer that shards over attention TP but all-reduces over the TP group.
 
@@ -478,12 +501,7 @@ def reject_attn_tp_shard_with_tp_reduce(
     tp_size = get_parallel().tp_size
     if reduces_over_attn_tp or not 1 < shard_tp_size < tp_size:
         return
-    from sglang.srt.runtime_context import get_disagg
-
-    # A language-only instance builds its multimodal tower but never forwards
-    # it; the encoder runs on the encoder instance instead.
-    disagg = get_disagg()
-    if disagg.language_only or disagg.language_model_only:
+    if multimodal_encoder and not multimodal_encoder_runs_here():
         return
     raise ValueError(
         f"{layer} shards over the attention TP group ({shard_tp_size} ranks) "

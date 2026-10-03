@@ -1218,6 +1218,7 @@ class VisionAttention(nn.Module):
                 type(self).__name__,
                 shard_tp_size=self.tp_size,
                 reduces_over_attn_tp=use_dp_attention_reduce,
+                multimodal_encoder=True,
                 hint=", or --mm-enable-dp-encoder where the model supports it",
             )
         self.proj = RowParallelLinear(
