@@ -53,7 +53,7 @@ def load_clef_config(model_path: str, revision: str | None) -> dict | None:
 
 
 def validate_clef_settings(args: Any, dtype: torch.dtype, quant_config: Any) -> None:
-    """Reject engine settings that do not preserve the complete joint prompt."""
+    """Enforce single-GPU eager execution with complete joint prefills."""
     required = {
         "tp_size": 1,
         "pp_size": 1,
@@ -167,7 +167,6 @@ def validate_clef_request(request: Any, model_config: Any) -> None:
         return
     if "clef_record" not in (params.get("custom_params") or {}):
         return
-    # ponytail: one complete text prefill; extend this contract with batching.
     unsupported = (
         "image_data",
         "audio_data",

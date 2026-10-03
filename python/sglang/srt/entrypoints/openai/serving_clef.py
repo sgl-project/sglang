@@ -42,10 +42,9 @@ def decision_record(request: Any) -> dict:
 async def handle_clef_request(
     serving: Any, request: Any, raw_request: Any
 ) -> ORJSONResponse:
-    """Validate, jointly encode, execute, and return every field in one prefill."""
+    """Answer all fields from one complete joint prefill."""
     manager = serving.tokenizer_manager
-    # Retain the validated default-template/server restrictions even though the
-    # joint encoder constructs a fixed native prompt rather than a chat template.
+    # Custom server/template configurations are unsupported by the fixed encoder.
     error = serving._validate_server(request.model)
     if error:
         raise ValueError(error)
