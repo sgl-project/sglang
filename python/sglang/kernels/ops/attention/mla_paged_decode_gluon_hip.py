@@ -27,15 +27,6 @@ def enabled() -> bool:
     )
 
 
-def m1_enabled() -> bool:
-    """Allow M=1 only when a short-context deployment opts in explicitly."""
-    return os.environ.get("SGLANG_ROCM_K3_MLA_DECODE_ENABLE_M1", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def entrypoint_name(rows: int) -> str | None:
     if rows in (1, 2, 4, 8, 64, 128, 256):
         return f"paged_attention_decode_m{rows}"
@@ -110,7 +101,6 @@ def covered(
     rows = q.shape[0] if isinstance(q, torch.Tensor) and q.ndim == 3 else 0
     return (
         entrypoint_name(rows) is not None
-        and (rows != 1 or m1_enabled())
         and has_mla
         and not use_pdl
         and page_size == 1
@@ -273,10 +263,5 @@ def install(backend, model_runner) -> bool:
 
     backend.decode_attention_fwd = decode
     backend._k3_gluon_mla_decode_installed = True
-    rows = (
-        "1,2,4,8,12,16,24,32,64,128,256"
-        if m1_enabled()
-        else "2,4,8,12,16,24,32,64,128,256"
-    )
-    rank0_log(f"K3 Gluon MLA paged decode enabled: M={rows}.")
+    rank0_log("K3 Gluon MLA paged decode enabled: M=1,2,4,8,12,16,24,32,64,128,256.")
     return True

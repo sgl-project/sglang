@@ -232,7 +232,7 @@ def _m1_merge_small(Partials, Stats, Out, SPLITS: gl.constexpr):
 def _m1_launch_config(tokens):
 
     if tokens == 1:
-        return (32, 64, 64, 0)
+        return (64, 64, 64, 0)
     if tokens == 2:
         return (32, 64, 128, 16)
     if tokens == 4:

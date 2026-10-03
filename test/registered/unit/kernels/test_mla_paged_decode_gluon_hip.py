@@ -119,11 +119,7 @@ class TestMlaPagedDecode(unittest.TestCase):
             1.0,
             1.0,
         )
-        self.assertFalse(adapter.covered(*m1_args, **kwargs))
-        with mock.patch.dict(
-            "os.environ", {"SGLANG_ROCM_K3_MLA_DECODE_ENABLE_M1": "1"}
-        ):
-            self.assertTrue(adapter.covered(*m1_args, **kwargs))
+        self.assertTrue(adapter.covered(*m1_args, **kwargs))
 
     def test_install_preserves_fallback_and_propagates_launch_failure(self):
         native = mock.Mock(return_value="native")
