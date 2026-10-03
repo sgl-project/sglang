@@ -27,6 +27,7 @@ from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -953,7 +954,7 @@ def _chunk_random(text: str, rng: random.Random):
     yield text[prev:]
 
 
-class ResponseEventStreamTest(unittest.TestCase):
+class ResponseEventStreamTest(CustomTestCase):
     def test_stream_matches_whole_string_all_templates_fixed_chunking(self):
         """For every fixed chunking step we try, the streamed finalize()
         output must equal the whole-string parse. Regression coverage for
@@ -1066,16 +1067,17 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertIn("tool_calls", per_field_close_value)
 
     def test_dirty_flag_marks_structured_regions(self):
-        """A template with one text field and one structured field per parser
-        family: text/int/float/bool stream chunks with `dirty=False`, while
-        json/xml-inline/kv-lines stream chunks with `dirty=True`, and those
-        dirty chunks concatenate to the raw region body before parsing."""
+        """Only plain text without a `transform` streams `dirty=False` chunks; int/float/bool,
+        structured parsers and transforms stream dirty chunks of the raw region body."""
         spec = {
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
             "fields": {
                 "thinking": {"open": "<t>", "close": "</t>", "content": "text"},
                 "score": {"open": "<n>", "close": "</n>", "content": "int"},
+                "ratio": {"open": "<f>", "close": "</f>", "content": "float"},
+                "flag": {"open": "<b>", "close": "</b>", "content": "bool"},
+                "labeled": {"open": "<l>", "close": "</l>", "transform": {"label": "{content}"}},
                 "json_call": {"open": "<j>", "close": "</j>", "content": "json"},
                 "xml_call": {
                     "open": "<x>",
@@ -1090,7 +1092,10 @@ class ResponseEventStreamTest(unittest.TestCase):
                 },
             },
         }
-        text = '<t>hello world</t><n>42</n><j>{"a": 1, "b": 2}</j><x><name=foo><age=10></x><kv>k1: v1\nk2: v2</kv>'
+        text = (
+            "<t> hello world </t><n>42</n><f>0.5</f><b>true</b><l>tag</l>"
+            '<j>{"a": 1, "b": 2}</j><x><name=foo><age=10></x><kv>k1: v1\nk2: v2</kv>'
+        )
         # Drive byte-by-byte to maximise chunk count.
         streamer = ResponseParser(spec, prefix="")
         events: list[dict] = []
@@ -1101,22 +1106,24 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         per_field_chunks: dict[str, list[str]] = {}
         per_field_dirty: dict[str, set[bool]] = {}
+        per_field_close_value: dict[str, object] = {}
         for ev in events:
             if ev["type"] == "region_chunk":
                 per_field_chunks.setdefault(ev["field"], []).append(ev["text"])
                 per_field_dirty.setdefault(ev["field"], set()).add(ev["dirty"])
+            elif ev["type"] == "region_close":
+                per_field_close_value[ev["field"]] = ev["value"]
 
-        # Clean (streamable) regions.
-        for field in ("thinking", "score"):
-            self.assertEqual(per_field_dirty[field], {False}, f"{field} should be clean")
-        # Dirty (structured) regions.
-        for field in ("json_call", "xml_call", "kv_call"):
+        self.assertEqual(per_field_dirty["thinking"], {False}, "thinking should be clean")
+        for field in ("score", "ratio", "flag", "labeled", "json_call", "xml_call", "kv_call"):
             self.assertEqual(per_field_dirty[field], {True}, f"{field} should be dirty")
 
         # Dirty chunks reconstruct the raw region body (un-parsed). Clean
         # chunks reconstruct the verbatim body too: stripping happens at close.
-        self.assertEqual("".join(per_field_chunks["thinking"]), "hello world")
+        self.assertEqual("".join(per_field_chunks["thinking"]), " hello world ")
+        self.assertEqual(per_field_close_value["thinking"], "hello world")
         self.assertEqual("".join(per_field_chunks["score"]), "42")
+        self.assertEqual(per_field_close_value["labeled"], {"label": "tag"})
         self.assertEqual("".join(per_field_chunks["json_call"]), '{"a": 1, "b": 2}')
         self.assertEqual("".join(per_field_chunks["xml_call"]), "<name=foo><age=10>")
         self.assertEqual("".join(per_field_chunks["kv_call"]), "k1: v1\nk2: v2")
@@ -1167,26 +1174,26 @@ class ResponseEventStreamTest(unittest.TestCase):
                 "tag": {"open_pattern": r"<tag id=\d+>", "close": "</tag>"},
             },
         }
-        parser = ResponseParser(spec, prefix="")
-        events = parser.feed("plain<tag id=7>body</tag>tail")
-        events += parser.finalize()[1]
-
-        boundaries = [
-            (event["type"], event["field"], parser.input_text[event["start"] : event["end"]])
-            for event in events
-            if event["type"] != "region_chunk"
+        text = "plain<tag id=7>body</tag>tail"
+        expected = [
+            {"type": "region_open", "field": "content", "start": 0, "end": 0},
+            {"type": "region_close", "field": "content", "start": 5, "end": 5, "value": "plain"},
+            {"type": "region_open", "field": "tag", "start": 5, "end": 15, "captures": {}},
+            {"type": "region_close", "field": "tag", "start": 19, "end": 25, "value": "body"},
+            {"type": "region_open", "field": "content", "start": 25, "end": 25},
+            {"type": "region_close", "field": "content", "start": 29, "end": 29, "value": "tail"},
         ]
-        self.assertEqual(
-            boundaries,
-            [
-                ("region_open", "content", ""),
-                ("region_close", "content", ""),
-                ("region_open", "tag", "<tag id=7>"),
-                ("region_close", "tag", "</tag>"),
-                ("region_open", "content", ""),
-                ("region_close", "content", ""),
-            ],
-        )
+        for prefix_len in (0, len("plain<tag")):
+            generated = text[prefix_len:]
+            chunkings = [[generated], list(generated)]
+            chunkings += [[generated[:i], generated[i:]] for i in range(1, len(generated))]
+            for chunks in chunkings:
+                with self.subTest(prefix=text[:prefix_len], chunks=chunks):
+                    parser = ResponseParser(spec, prefix="<assistant>" + text[:prefix_len])
+                    events = parser.initial_events + [event for chunk in chunks for event in parser.feed(chunk)]
+                    events += parser.finalize()[1]
+                    self.assertEqual(parser.input_text, text)
+                    self.assertEqual([event for event in events if event["type"] != "region_chunk"], expected)
 
     def test_open_captures_and_prefix_boundary(self):
         spec = {
@@ -1202,12 +1209,13 @@ class ResponseEventStreamTest(unittest.TestCase):
         }
         parser = ResponseParser(spec, prefix="history[BEGIN]<call:get_")
         prefix_end = len(parser.input_text)
-        events = parser.feed('weather>{"city":"Paris"}</call>')
-        opening = events[0]
+        opening = parser.feed('weather>{"city":"Paris"}')[0]
 
         self.assertEqual(prefix_end, len("<call:get_"))
         self.assertEqual((opening["type"], opening["start"], opening["end"]), ("region_open", 0, len("<call:get_weather>")))
         self.assertEqual(opening["captures"], {"name": "get_weather"})
+        opening["captures"]["name"] = "edited"
+        self.assertEqual(parser.feed("</call>")[-1]["value"]["name"], "get_weather")
 
     def test_held_prefix_bytes_are_not_rechunked(self):
         spec = {"start_anchor": "[BEGIN]", "fields": {"content": {}, "tag": {"open": "<tag>", "close": "</tag>"}}}
@@ -1254,6 +1262,15 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "region_malformed")
         self.assertEqual(events[-1]["start"], len(parser.input_text))
 
+        deep = "[" * 20000
+        tools = [{"type": "function", "function": {"name": "good", "parameters": {"properties": {"x": {"type": "array"}}}}}]
+        parser = ResponseParser(spec, prefix="", tools=tools)
+        events = parser.feed(f'<call:bad>{deep}</call><call:good>{{"x": "{deep}"}}</call>')
+        message, _ = parser.finalize()
+        self.assertEqual(events[2]["type"], "region_malformed")
+        self.assertIsInstance(events[2]["error"], ValueError)
+        self.assertEqual(message["tool_calls"], [{"type": "function", "function": {"name": "good", "arguments": {"x": deep}}}])
+
     def test_parse_response_raises_for_malformed_region(self):
         spec = {
             "start_anchor": "<|assistant|>",
@@ -1263,6 +1280,22 @@ class ResponseEventStreamTest(unittest.TestCase):
             parse_response('<x>{"name":', spec, prefix="")
         with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
             parse_response("", spec, prefix='<|assistant|><x>{"name":</x>')
+
+        required = {
+            "start_anchor": "<|assistant|>",
+            "fields": {
+                "x": {"open": "<x>", "close": "</x>", "content": "json", "optional": False},
+                "y": {"open": "<y>", "close": "</y>", "optional": False},
+                "n": {"open": "<n>", "close": "</n>", "content": "int"},
+            },
+        }
+        for prefix, text in [("", "<x>{</x>"), ("<|assistant|><x>{</x>", ""), ("", "<x>{"), ("", "<x>{</x><n>a</n>")]:
+            with self.subTest(prefix=prefix, text=text), self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+                parse_response(text, required, prefix=prefix)
+        parser = ResponseParser(required, prefix="")
+        parser.feed("<x>{</x>")
+        with self.assertRaisesRegex(ValueError, r"missing from parsed output: \['y'\]"):
+            parser.finalize()
 
 
 class PrefixAndTruncationTest(unittest.TestCase):

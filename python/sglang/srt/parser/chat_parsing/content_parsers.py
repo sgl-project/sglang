@@ -79,7 +79,7 @@ def _json(text: str, args: dict) -> Any:
 
     try:
         return json.loads(working)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
         if args.get("allow_non_json"):
             return _text(text, args)
         if working == text:
@@ -149,12 +149,12 @@ CONTENT_PARSERS = {
     "kv-lines": _kv_lines,
 }
 
-# Parsers whose output is the verbatim body text (modulo whitespace) — chunks
-# from these fields stream with `dirty=False` because each chunk is part of
-# the final value. Structured parsers (`json`, `xml-inline`, `kv-lines`) only
-# produce a meaningful value on close, so their chunks stream raw bytes
-# flagged `dirty=True` while the parsed value is delivered in `region_close`.
-STREAMABLE_PARSERS = frozenset({"text", "int", "float", "bool"})
+# Parsers whose output is the verbatim body text, apart from outer whitespace that
+# `strip` trims at close. Their chunks stream with `dirty=False` unless a `transform`
+# reshapes the value. Every other parser only produces its value on close, so its
+# chunks stream raw bytes flagged `dirty=True` while the parsed value is delivered
+# in `region_close`.
+STREAMABLE_PARSERS = frozenset({"text"})
 
 
 def parse_content(text: str, name: str, args: dict) -> Any:

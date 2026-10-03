@@ -62,7 +62,7 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
                 decoded = json.loads(raw)
                 if isinstance(decoded, dict if type_name == "object" else list):
                     return decoded
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
     return raw  # `string` params, unknown types and failed casts all keep the original text
 
@@ -82,11 +82,14 @@ def parse_response(
     """
     response_template = load_response_template(response_template)
     stream = ResponseParser(response_template, prefix=prefix, tools=tools)
-    events = stream.feed(text)
-    message, final_events = stream.finalize()
-    for event in stream.initial_events + events + final_events:
-        if event["type"] == "region_malformed":
-            raise event["error"]
+    stream.feed(text)
+    try:
+        message, _ = stream.finalize()
+    except ValueError:
+        if not stream._malformed:
+            raise
+    if stream._malformed:
+        raise next(iter(stream._malformed.values()))
     return message
 
 
@@ -115,7 +118,9 @@ class ResponseParser:
     event consumed: its opening or closing delimiter, empty for implicit boundaries.
     Explicit opens also carry the opener's named `captures`. A region whose value fails to
     parse ends with "region_malformed" instead of "region_close", carrying the `error`, and
-    parsing continues after it.
+    parsing continues after it. Only a plain "text" field without a `transform` streams
+    `dirty=False` chunks: verbatim pieces of the region's value, whose outer whitespace
+    `strip` may still trim at close. Other chunks are raw input parsed on close.
 
     ResponseParser requires the chat `prefix` (i.e. the chat history, the prefill before the current generation).
     This is because chat templates or assistant prefills can sometimes write part of the message, and if we
@@ -161,7 +166,7 @@ class ResponseParser:
         self._opened: bool = False
         self._finalized: bool = False
         self._prefix_len: int = 0
-        self._malformed_fields: set[str] = set()
+        self._malformed: dict[str, Exception] = {}
         self.initial_events: list[dict] = []
         if prefix:
             self._consume_prefix(prefix)
@@ -214,7 +219,7 @@ class ResponseParser:
         missing = [
             n
             for n, f in self._spec.fields.items()
-            if not f.optional and n not in self._output and n not in self._malformed_fields
+            if not f.optional and n not in self._output and n not in self._malformed
         ]
         if missing:
             raise ValueError(f"Required response_template fields missing from parsed output: {missing}")
@@ -352,9 +357,8 @@ class ResponseParser:
         """Route `text` into the currently active region. When the current
         region is the null sink (no implicit declared, no explicit open), we
         silently discard. Every routed chunk emits a `region_chunk` event so
-        consumers can render live; `dirty=True` flags chunks from structured
-        parsers (json, xml-inline, kv-lines) whose raw bytes will only be
-        parsed into the final value on close."""
+        consumers can render live; `dirty=True` flags chunks whose raw bytes
+        only become the final value once parsed or transformed on close."""
         if not text or self._current is None:
             return
         field = self._spec.fields[self._current]
@@ -365,7 +369,7 @@ class ResponseParser:
         # Prefix bytes held back as a possible delimiter belong to the prompt, not the chunk.
         text = text[max(0, self._prefix_len - self._pos) :]
         if text:
-            dirty = field.content not in STREAMABLE_PARSERS
+            dirty = field.content not in STREAMABLE_PARSERS or field.transform is not None
             events.append({"type": "region_chunk", "field": self._current, "text": text, "dirty": dirty})
 
     def _open_explicit(self, events: list[dict], field: ResponseTemplateField, m: Any) -> None:
@@ -374,7 +378,7 @@ class ResponseParser:
         self._body = ""
         self._opened = True
         events.append(
-            {"type": "region_open", "field": field.name, "start": m.start(), "end": m.end(), "captures": self._captures}
+            {"type": "region_open", "field": field.name, "start": m.start(), "end": m.end(), "captures": dict(self._captures)}
         )
 
     def _close_current(self, events: list[dict], close_start: int, close_end: int) -> None:
@@ -395,7 +399,7 @@ class ResponseParser:
                     f"got {type(value).__name__}."
                 )
         except (KeyError, TypeError, ValueError) as error:
-            self._malformed_fields.add(self._current)
+            self._malformed.setdefault(self._current, error)
             events.append(
                 {"type": "region_malformed", "field": self._current, "start": close_start, "end": close_end, "error": error}
             )
