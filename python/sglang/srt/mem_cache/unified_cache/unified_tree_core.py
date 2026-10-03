@@ -1053,11 +1053,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
-        self, node: UnifiedTreeNode, chunked: bool = False
-    ) -> bool:
+    def _inc_hit_count_and_check(self, node: UnifiedTreeNode) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
@@ -1307,7 +1305,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        # Nodes this request already inserted were counted back then.
+        node_end = state.total_prefix_length + prefix_len
+        if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1368,8 +1368,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
-            return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+            leaf_end = state.total_prefix_length + len(state.target_node.key)
+            return (
+                leaf_end > state.params.inserted_len
+                and self._inc_hit_count_and_check(state.target_node)
             )
 
         node = state.target_node
@@ -1381,7 +1383,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append terminal backup actions."""
+        """Refresh the LRUs and append the insert backup: a new-leaf write-through,
+        or an SWA window publish on an existing backed node."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1392,7 +1395,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self._should_backup_after_insert(state):
             state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+                self._build_backup_kv_action(
+                    state.target_node, write_back=self.is_write_back
+                )
             )
 
     def _split_node(
@@ -2461,7 +2466,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its not-yet-persisted ancestors."""
+        """Build the backup action for a node; write-through also chains its
+        unbacked ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent

@@ -25,21 +25,32 @@ class _Norm(nn.Module):
         return x + residual, x + residual
 
 
+class _Partial(nn.Module):
+    def __init__(self, tp):
+        super().__init__()
+        self.tp = tp
+
+    def forward(self, x, **kwargs):
+        return x / self.tp
+
+
 class TestNemotronMTPReduction(CustomTestCase):
     def test_attention_partial_is_reduced_once(self):
         """Under DP attention, the MTP MoE layer sums the attention output over the
-        attention TP group exactly once before the residual add."""
+        attention TP group exactly once before the residual add, and its own
+        output over the MoE-TP group once at its exit."""
         for tp in (1, 2):
             with self.subTest(tp=tp):
                 reduce = Mock(side_effect=lambda x: x * tp)
                 group = SimpleNamespace(all_reduce=reduce)
+                moe_reduce = Mock(side_effect=lambda x: x * tp)
+                moe_group = SimpleNamespace(all_reduce=moe_reduce)
                 with (
-                    get_context().override_server_args(
-                        tp_size=tp, enable_dp_attention=True
-                    ),
+                    get_context().override_server_args(tp_size=tp),
                     get_flags().dp.override(enabled=True),
                     get_parallel().override(
                         attn_tp_group=group,
+                        moe_tp_group=moe_group,
                         launch_world_rank=0,
                         tp_rank=0,
                         tp_size=tp,
@@ -68,7 +79,8 @@ class TestNemotronMTPReduction(CustomTestCase):
                     nn.Module.__init__(layer)
                     layer.has_start_projections = False
                     layer.has_end_norm = False
-                    layer.mixer = nn.Identity()
+                    # A MoE stand-in leaving its output's sum to the exit.
+                    layer.mixer = _Partial(tp)
                     layer.norm = _Norm()
                     layer._init_stage_boundary(
                         SimpleNamespace(hybrid_override_pattern="*E"), 1
@@ -95,6 +107,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                     torch.testing.assert_close(hidden, expected)
                     torch.testing.assert_close(batch.residual_stream.residual, expected)
                     self.assertEqual(reduce.call_count, int(tp > 1))
+                    self.assertEqual(moe_reduce.call_count, int(tp > 1))
 
 
 if __name__ == "__main__":

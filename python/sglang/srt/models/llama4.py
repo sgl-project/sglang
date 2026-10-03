@@ -41,7 +41,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -98,7 +97,6 @@ class Llama4MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.top_k = config.num_experts_per_tok
         self.device_module = torch.get_device_module()
 
@@ -148,8 +146,6 @@ class Llama4MoE(nn.Module):
         )
 
         out_aD = routed_out + shared_out
-
-        out_aD = reduce_moe_output(out_aD)
 
         return out_aD
 
@@ -385,8 +381,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = config.max_position_embeddings
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = Llama4Attention(
             config=config,
@@ -421,6 +415,7 @@ class Llama4DecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -477,9 +472,8 @@ class Llama4DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         # Fully Connected
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.feed_forward(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
