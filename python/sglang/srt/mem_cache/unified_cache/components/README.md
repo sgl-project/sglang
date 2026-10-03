@@ -228,7 +228,7 @@ receipt proves were taken. The eventual full release must pass
 
 ---
 
-### `insert_req(req: Req, *, up_to: int)`
+### `checkpoint(req: Req, *, up_to: int)`
 
 Insert a request's KV into the tree: at every checkpoint while it runs, and once more when it finishes.
 

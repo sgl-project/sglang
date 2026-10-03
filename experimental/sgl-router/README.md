@@ -4,11 +4,11 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
-`/v1/chat/completions` and SGLang's native [`/generate`](#native-generate)
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
-pools come from either a static URL list or Kubernetes EndpointSlice
-discovery. Both edges speak cleartext HTTP/2 where the peer does — see
-[HTTP/2](#http2).
+[`/v1/classify`](#classify), [`/v1/rerank`](#rerank), `/v1/chat/completions` and
+SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+`/healthz` / `/readyz` and `/metrics`. Worker pools come from either a static URL
+list or Kubernetes EndpointSlice discovery. Both edges speak cleartext HTTP/2
+where the peer does — see [HTTP/2](#http2).
 
 ## Building
 
@@ -405,6 +405,20 @@ Blank prompts and multimodal items stay as sent, for the engine to reject or
 render. A list is a batch for one worker, routed on load. A single prompt with no
 `rid` gets a minted one. Under `--dp-aware` the engine picks the rank, since its
 embeddings endpoint reads none.
+
+## Classify
+
+`/v1/classify` has the engine's interface: the same `ClassifyRequest` body and
+response. It is served as embeddings are, except that a batch of text stays text,
+since the engine takes token IDs for only one prompt.
+
+## Rerank
+
+`/v1/rerank` has the engine's interface: the same `V1RerankReqInput` body and
+response, sent as `POST` or `PUT` to the model this router serves. The body is
+forwarded as sent, since the engine renders and tokenizes each query-document
+pair. Routing is on load, with each pair's size estimated from its text. As for
+embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
