@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -6,8 +8,19 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
-from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+from sglang.srt.layers.attention.dsv4.v41_indexer.sm90_decode import (
+    CandidateBlocks,
+    _candidate_mask,
+    try_sm90_decode,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
+    Selection,
+    get_tail_row_indices,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,6 +127,102 @@ class TestBlockIdsTail(CustomTestCase):
             ).tolist(),
             [3, 4, 5, 6, 7],
         )
+
+
+class TestSm90CandidateCompatibility(CustomTestCase):
+    def test_standard_blocks_to_prefix_mask_tracks_updates(self):
+        blocks = torch.tensor([[2, 0, -1], [-1, -1, -1]], dtype=torch.int32)
+        published = BlockIds(blocks=blocks)
+        mask = _candidate_mask(published, width=11, block_size=4)
+        expected = torch.tensor([[True] * 4 + [False] * 4 + [True] * 3, [False] * 11])
+        torch.testing.assert_close(mask, expected)
+        # A later replay updates the same block storage; conversion must read it.
+        blocks[0] = torch.tensor([1, -1, -1])
+        expected[0] = torch.tensor([False] * 4 + [True] * 4 + [False] * 3)
+        torch.testing.assert_close(
+            _candidate_mask(published, width=11, block_size=4), expected
+        )
+
+    def test_compact_publish_is_consumed_by_ordinary_decode(self):
+        scores = torch.tensor(
+            [[1.0, 4.0, 90.0, 80.0, 3.0, 2.0], [60.0, 50.0, 7.0, 99.0, 80.0, 70.0]]
+        )
+        slots = torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]])
+        d = DecodeScores(
+            bs=2, lmax=6, lens=torch.tensor([6, 3]), slots=slots, scores=scores
+        )
+        published = CandidateBlocks(
+            blocks=torch.tensor([[0, 2], [1, -1]], dtype=torch.int32),
+            lengths=torch.tensor([4, 2], dtype=torch.int32),
+            is_prefix=torch.tensor([0, 0], dtype=torch.int32),
+            width=6,
+            block_size=2,
+        )
+        backend = dense_blocks.DenseBlocksBackend(
+            token_to_kv_pool=None,
+            req_to_token=None,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            use_deep_gemm_prefill=False,
+        )
+        inputs = SimpleNamespace(
+            indexer=SimpleNamespace(index_topk=3),
+            compress_ratio=1,
+            is_verify=False,
+            group_size=1,
+        )
+        for with_raw in (True, False):
+            with self.subTest(with_raw=with_raw):
+                out = Selection(
+                    page_indices=torch.full((2, 3), -1, dtype=torch.int32),
+                    raw_indices=(
+                        torch.full((2, 3), -1, dtype=torch.int32) if with_raw else None
+                    ),
+                )
+                with (
+                    envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+                    patch.object(dense_blocks, "decode_scores", return_value=d),
+                ):
+                    backend.consume_decode(inputs, published, out)
+                torch.testing.assert_close(
+                    out.page_indices,
+                    torch.tensor([[11, 14, 15], [22, -1, -1]], dtype=torch.int32),
+                )
+                if with_raw:
+                    torch.testing.assert_close(
+                        out.raw_indices,
+                        torch.tensor([[1, 4, 5], [2, -1, -1]], dtype=torch.int32),
+                    )
+
+    def test_unsupported_batches_preserve_fallback_outputs(self):
+        for enabled, verify, group_size, ratio in (
+            (False, True, 5, 1),
+            (True, False, 5, 1),
+            (True, True, 1, 1),
+            (True, True, 5, 4),
+        ):
+            with self.subTest(
+                enabled=enabled, verify=verify, group_size=group_size, ratio=ratio
+            ):
+                out = Selection(
+                    page_indices=torch.full((2, 3), 42, dtype=torch.int32),
+                    raw_indices=torch.full((2, 3), 24, dtype=torch.int32),
+                )
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(enabled):
+                    handled, published = try_sm90_decode(
+                        inputs=SimpleNamespace(
+                            compress_ratio=ratio,
+                            is_verify=verify,
+                            group_size=group_size,
+                        ),
+                        out=out,
+                        token_to_kv_pool=None,
+                        req_to_token=None,
+                    )
+                self.assertFalse(handled)
+                self.assertIsNone(published)
+                self.assertTrue((out.page_indices == 42).all())
+                self.assertTrue((out.raw_indices == 24).all())
 
 
 if __name__ == "__main__":

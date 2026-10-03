@@ -82,6 +82,8 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: torch.Tensor  # [rows] req_to_token row of each query row
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
+    # Fixed request-major groups, validated by the attention backend for static verify.
+    group_size: int = 1
 
 
 class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
