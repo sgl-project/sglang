@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -438,6 +440,358 @@ def test_graph_mode_buffers_are_stable_and_capture_replays(overlap):
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
 
+def _mla_v_reference(attn_output, a_buf, b_buf, token_slots, qk_nope, v_dim):
+    """attn_bmm delta = (attn @ A[slot][:r].T) @ B_vc[slot, h][:, :r].T * scaling, per (token, head)."""
+    tokens, heads, _ = attn_output.shape
+    full_k = b_buf.shape[1] // heads
+    delta = torch.zeros(tokens, heads, v_dim, dtype=torch.float32, device=DEVICE)
+    for t, slot in enumerate(token_slots.tolist()):
+        if slot < 0 or RANKS[slot] == 0:
+            continue
+        r = RANKS[slot]
+        bridge = attn_output[t].float() @ a_buf[slot, :r].float().T  # [H, r]
+        b_vc = (
+            b_buf[slot]
+            .view(heads, full_k, -1)[:, qk_nope : qk_nope + v_dim, :r]
+            .float()
+        )  # [H, v, r]
+        delta[t] = torch.einsum("hr,hvr->hv", bridge, b_vc) * SCALINGS[slot]
+    return delta
+
+
+def _mla_attention(engine, batch_info, a_buf, b_buf, heads, qk_nope, v_dim):
+    return SimpleNamespace(
+        num_local_heads=heads,
+        qk_nope_head_dim=qk_nope,
+        v_head_dim=v_dim,
+        kv_b_proj=SimpleNamespace(
+            set_lora=True,
+            A_buffer=a_buf,
+            B_buffer=b_buf,
+            lora_backend=SimpleNamespace(
+                name="triton_v2", runner=engine, batch_info=batch_info
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("phase", [Phase.DECODE, Phase.PREFILL])
+def test_mla_correction_chain_replays_under_a_cuda_graph(phase):
+    """Replay the q/v shrink, bmm, and expand chain with changed inputs and slot maps.
+    Include zero-rank/no-adapter lanes and a smaller batch using the same route buffers.
+    """
+    from sglang.srt.lora.dense import mla_correction
+
+    plan = mla_correction._mla_plan(phase)
+    generator = torch.Generator(device=DEVICE).manual_seed(11)
+    batch_info, _ = _batch("decode")
+    num_tokens = int(batch_info.seg_indptr[-1])
+    heads, qk_nope, v_dim, kv = 4, 64, 32, 96
+    a_buf = (
+        torch.randn(
+            SLOTS, RANK_MAX, kv, generator=generator, device=DEVICE, dtype=DTYPE
+        )
+        * 0.1
+    )
+    b_buf = (
+        torch.randn(
+            SLOTS,
+            heads * (qk_nope + v_dim),
+            RANK_MAX,
+            generator=generator,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.1
+    )
+    w_kc = (
+        torch.randn(heads, qk_nope, kv, generator=generator, device=DEVICE, dtype=DTYPE)
+        * 0.1
+    )
+    w_vc = (
+        torch.randn(heads, kv, v_dim, generator=generator, device=DEVICE, dtype=DTYPE)
+        * 0.1
+    )
+    q_nope = torch.randn(
+        num_tokens, heads, qk_nope, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    attn_output = torch.randn(
+        num_tokens, heads, kv, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    q_out = torch.empty(num_tokens, heads, kv, device=DEVICE, dtype=DTYPE)
+    v_out = torch.empty(num_tokens, heads, v_dim, device=DEVICE, dtype=DTYPE)
+
+    engine = DenseLoraRunner(LoraWorkspace(), max_loras=SLOTS, device=DEVICE)
+    attention = _mla_attention(engine, batch_info, a_buf, b_buf, heads, qk_nope, v_dim)
+    static_slots = torch.full((num_tokens + 27,), -1, dtype=torch.int32, device=DEVICE)
+
+    def begin(live_requests: int = num_tokens):
+        _compute_moe_lora_info(
+            live_requests,
+            batch_info.seg_indptr[: live_requests + 1],
+            batch_info.lora_ranks,
+            batch_info.weight_indices[:live_requests],
+            None,
+            static_slots,
+            max_len=batch_info.max_len,
+        )
+        engine.begin_batch(
+            token_slots=static_slots,
+            lora_ranks=batch_info.lora_ranks,
+            scalings=batch_info.scalings,
+            num_tokens=live_requests,
+            phase=phase,
+            graph_mode=True,
+        )
+
+    def forward():
+        engine.reset_routes()
+        # the model's order: fork the shrink, run the base bmm, join and expand into the
+        # [H, S, *] bmm result through its transposed view
+        prepared = mla_correction.prepare_q_correction(attention, q_nope)
+        q_bmm = torch.bmm(q_nope.transpose(0, 1), w_kc)
+        q_out.copy_(
+            mla_correction.apply_q_correction(
+                attention, q_nope, q_bmm.transpose(0, 1), prepared
+            )
+        )
+        prepared = mla_correction.prepare_v_correction(attention, attn_output)
+        v_bmm = torch.bmm(attn_output.transpose(0, 1), w_vc)
+        v_out.copy_(
+            mla_correction.apply_v_correction(
+                attention,
+                attn_output,
+                v_bmm.transpose(0, 1),
+                prepared,
+            )
+        )
+
+    def check():
+        slots = static_slots[:num_tokens]
+        q_ref = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(
+            0, 1
+        ).float() + _mla_reference(q_nope, a_buf, b_buf, slots, qk_nope)
+        v_ref = torch.bmm(attn_output.transpose(0, 1), w_vc).transpose(
+            0, 1
+        ).float() + _mla_v_reference(attn_output, a_buf, b_buf, slots, qk_nope, v_dim)
+        torch.testing.assert_close(q_out.float(), q_ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(v_out.float(), v_ref, rtol=2e-2, atol=2e-2)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        begin()
+        forward()  # warm-up allocates the workspace, the side-stream events and the pair route buffers
+        route = engine.pair_route(
+            heads,
+            plan.block_size,
+            num_tokens=num_tokens,
+            aligned=plan.needs_aligned_route,
+        )
+        route_ptr = route.group_ids.data_ptr()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    check()
+
+    graph = torch.cuda.CUDAGraph()
+    begin()
+    with torch.cuda.graph(graph, stream=stream):
+        forward()
+        captured_route = engine.pair_route(
+            heads,
+            plan.block_size,
+            num_tokens=num_tokens,
+            aligned=plan.needs_aligned_route,
+        )
+    assert captured_route.group_ids.data_ptr() == route_ptr
+
+    for live in (num_tokens, num_tokens - 13):
+        q_nope.copy_(
+            torch.randn(
+                num_tokens,
+                heads,
+                qk_nope,
+                generator=generator,
+                device=DEVICE,
+                dtype=DTYPE,
+            )
+        )
+        attn_output.copy_(
+            torch.randn(
+                num_tokens, heads, kv, generator=generator, device=DEVICE, dtype=DTYPE
+            )
+        )
+        batch_info.weight_indices.copy_(
+            torch.roll(batch_info.weight_indices, 1)
+        )  # every request changes slot
+        begin(live)
+        assert torch.all(static_slots[live:] == -1)
+        assert not engine.workspace.routes
+        assert captured_route.group_ids.data_ptr() == route_ptr
+        captured_route.group_ids.fill_(-7)
+        if plan.needs_aligned_route:
+            captured_route.sorted_pair_ids.fill_(-7)
+            captured_route.block_bucket_ids.fill_(-7)
+            captured_route.num_pairs_post_padded.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+
+
+@pytest.mark.parametrize("rebind_before_capture", [True, False])
+@pytest.mark.parametrize("phase", [Phase.DECODE, Phase.PREFILL])
+def test_mla_pair_route_is_rebuilt_by_the_replayed_graph(phase, rebind_before_capture):
+    """Each forward resets its cache; only graph replay rebuilds pair routing."""
+    from sglang.srt.lora.dense import mla_correction
+
+    generator = torch.Generator(device=DEVICE).manual_seed(23)
+    batch_info, _ = _batch("decode")
+    num_tokens = int(batch_info.seg_indptr[-1])
+    heads, qk_nope, v_dim, kv = 4, 64, 32, 96
+    a_buf = (
+        torch.randn(
+            SLOTS, RANK_MAX, kv, generator=generator, device=DEVICE, dtype=DTYPE
+        )
+        * 0.1
+    )
+    b_buf = (
+        torch.randn(
+            SLOTS,
+            heads * (qk_nope + v_dim),
+            RANK_MAX,
+            generator=generator,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.1
+    )
+    w_kc = (
+        torch.randn(heads, qk_nope, kv, generator=generator, device=DEVICE, dtype=DTYPE)
+        * 0.1
+    )
+    w_vc = (
+        torch.randn(heads, kv, v_dim, generator=generator, device=DEVICE, dtype=DTYPE)
+        * 0.1
+    )
+    q_nope = torch.randn(
+        num_tokens, heads, qk_nope, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    attn_output = torch.randn(
+        num_tokens, heads, kv, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    q_out = torch.empty(num_tokens, heads, kv, device=DEVICE, dtype=DTYPE)
+    v_out = torch.empty(num_tokens, heads, v_dim, device=DEVICE, dtype=DTYPE)
+
+    engine = DenseLoraRunner(LoraWorkspace(), max_loras=SLOTS, device=DEVICE)
+    attention = _mla_attention(engine, batch_info, a_buf, b_buf, heads, qk_nope, v_dim)
+    static_slots = torch.full((num_tokens + 27,), -1, dtype=torch.int32, device=DEVICE)
+    block = 16 if phase is Phase.DECODE else 64
+
+    def begin(live_requests: int = num_tokens):
+        _compute_moe_lora_info(
+            live_requests,
+            batch_info.seg_indptr[: live_requests + 1],
+            batch_info.lora_ranks,
+            batch_info.weight_indices[:live_requests],
+            None,
+            static_slots,
+            max_len=batch_info.max_len,
+        )
+        engine.begin_batch(
+            token_slots=static_slots,
+            lora_ranks=batch_info.lora_ranks,
+            scalings=batch_info.scalings,
+            num_tokens=live_requests,
+            phase=phase,
+            graph_mode=True,
+        )
+
+    def forward():
+        engine.reset_routes()
+        prepared = mla_correction.prepare_q_correction(attention, q_nope)
+        q_bmm = torch.bmm(q_nope.transpose(0, 1), w_kc)
+        q_out.copy_(
+            mla_correction.apply_q_correction(
+                attention, q_nope, q_bmm.transpose(0, 1), prepared
+            )
+        )
+        prepared = mla_correction.prepare_v_correction(attention, attn_output)
+        v_bmm = torch.bmm(attn_output.transpose(0, 1), w_vc)
+        v_out.copy_(
+            mla_correction.apply_v_correction(
+                attention,
+                attn_output,
+                v_bmm.transpose(0, 1),
+                prepared,
+            )
+        )
+
+    def check():
+        slots = static_slots[:num_tokens]
+        q_ref = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(
+            0, 1
+        ).float() + _mla_reference(q_nope, a_buf, b_buf, slots, qk_nope)
+        v_ref = torch.bmm(attn_output.transpose(0, 1), w_vc).transpose(
+            0, 1
+        ).float() + _mla_v_reference(attn_output, a_buf, b_buf, slots, qk_nope, v_dim)
+        torch.testing.assert_close(q_out.float(), q_ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(v_out.float(), v_ref, rtol=2e-2, atol=2e-2)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        begin()
+        assert not engine.workspace.routes  # the host built no pair route
+        forward()  # warm-up: first use builds the route and allocates its buffers
+        assert engine.workspace.routes
+        route_ptr = engine.pair_route(
+            heads, block, num_tokens=num_tokens
+        ).sorted_pair_ids.data_ptr()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    check()
+
+    # The real graph runner resets routes before every warmup and capture forward.
+    graph = torch.cuda.CUDAGraph()
+    if rebind_before_capture:
+        begin()
+        assert not engine.workspace.routes
+    else:
+        assert engine.workspace.routes  # the warm-up's route is still cached
+    with torch.cuda.graph(graph, stream=stream):
+        forward()  # the route build is captured here either way
+        captured_route = engine.pair_route(heads, block, num_tokens=num_tokens)
+    assert captured_route.sorted_pair_ids.data_ptr() == route_ptr
+
+    for live in (num_tokens, num_tokens - 13):
+        q_nope.copy_(
+            torch.randn(
+                num_tokens,
+                heads,
+                qk_nope,
+                generator=generator,
+                device=DEVICE,
+                dtype=DTYPE,
+            )
+        )
+        attn_output.copy_(
+            torch.randn(
+                num_tokens, heads, kv, generator=generator, device=DEVICE, dtype=DTYPE
+            )
+        )
+        batch_info.weight_indices.copy_(torch.roll(batch_info.weight_indices, 1))
+        begin(live)
+        assert torch.all(static_slots[live:] == -1)
+        # Nothing built between begin_batch and replay.
+        assert not engine.workspace.routes
+        captured_route.sorted_pair_ids.fill_(-7)
+        captured_route.block_bucket_ids.fill_(-7)
+        captured_route.num_pairs_post_padded.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+
+
 def test_workspace_side_stream_is_never_the_calling_stream():
     """Advance the CUDA stream pool through 64 draws to catch caller/side-stream aliasing."""
     for advance in range(1, 65):
@@ -510,6 +864,82 @@ def test_workspace_side_streams_are_keyed_by_the_calling_stream():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _mla_reference(q_nope, a_buf, b_buf, token_slots, qk_nope):
+    """q_nope_out delta = (q @ B_kc[slot, h][:, :r]) @ A[slot][:r] * scaling, per (token, head)."""
+    tokens, heads, _ = q_nope.shape
+    kv = a_buf.shape[2]
+    full_k = b_buf.shape[1] // heads
+    delta = torch.zeros(tokens, heads, kv, dtype=torch.float32, device=DEVICE)
+    for t, slot in enumerate(token_slots.tolist()):
+        if slot < 0 or RANKS[slot] == 0:
+            continue
+        r = RANKS[slot]
+        b_kc = (
+            b_buf[slot].view(heads, full_k, -1)[:, :qk_nope, :r].float()
+        )  # [H, qk, r]
+        bridge = torch.einsum("hk,hkr->hr", q_nope[t].float(), b_kc)
+        delta[t] = bridge @ a_buf[slot, :r].float() * SCALINGS[slot]
+    return delta
+
+
+def test_mla_q_correction_accumulates_into_the_transposed_bmm_output():
+    """Accumulate into the model's [tokens, heads, kv] view of [heads, tokens, kv].
+    The pre-bmm shrink must join correctly without destination scratch.
+    """
+    from sglang.srt.lora.dense import mla_correction
+
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    batch_info, token_slots = _batch("decode")
+    engine = _engine(batch_info, token_slots, Phase.DECODE)
+    tokens = token_slots.numel()
+    heads, qk_nope, v_dim, kv = 4, 64, 32, 96
+    q_nope = torch.randn(
+        tokens, heads, qk_nope, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    a_buf = (
+        torch.randn(
+            SLOTS, RANK_MAX, kv, generator=generator, device=DEVICE, dtype=DTYPE
+        )
+        * 0.1
+    )
+    b_buf = (
+        torch.randn(
+            SLOTS,
+            heads * (qk_nope + v_dim),
+            RANK_MAX,
+            generator=generator,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.1
+    )
+    base = torch.randn(
+        tokens, heads, kv, generator=generator, device=DEVICE, dtype=DTYPE
+    )
+    expected = base.float() + _mla_reference(q_nope, a_buf, b_buf, token_slots, qk_nope)
+
+    attention = _mla_attention(engine, batch_info, a_buf, b_buf, heads, qk_nope, v_dim)
+    contiguous = base.clone()
+    mla_correction.apply_q_correction(attention, q_nope, contiguous)
+    transposed = torch.empty(heads, tokens, kv, dtype=DTYPE, device=DEVICE).transpose(
+        0, 1
+    )
+    assert not transposed.is_contiguous()
+    transposed.copy_(base)
+    mla_correction.apply_q_correction(attention, q_nope, transposed)
+    torch.testing.assert_close(
+        transposed, contiguous
+    )  # same kernel math, different strides
+    torch.testing.assert_close(contiguous.float(), expected, rtol=2e-2, atol=2e-2)
+
+    prepared = mla_correction.prepare_q_correction(attention, q_nope)
+    assert prepared.done is not None  # decode: the shrink ran on the side stream
+    ahead = torch.empty(heads, tokens, kv, dtype=DTYPE, device=DEVICE).transpose(0, 1)
+    ahead.copy_(base)
+    mla_correction.apply_q_correction(attention, q_nope, ahead, prepared)
+    torch.testing.assert_close(ahead, contiguous)
 
 
 @pytest.mark.parametrize("zero_sentinel", [False, True])
