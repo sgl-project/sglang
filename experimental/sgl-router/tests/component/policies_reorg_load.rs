@@ -94,6 +94,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
         EngineMetrics {
             running_requests: Some(4),
             waiting_requests: Some(4),
+            request_tokens: 10,
             ..EngineMetrics::default()
         }
     );
@@ -127,7 +128,10 @@ async fn missing_stale_and_incomplete_reports_reach_admission_as_unknown() {
             .unwrap();
         assert_eq!(
             *admission.observations.lock().unwrap(),
-            [EngineMetrics::default()],
+            [EngineMetrics {
+                request_tokens: 10,
+                ..EngineMetrics::default()
+            }],
             "{case}"
         );
     }

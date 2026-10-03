@@ -148,34 +148,30 @@ fn body(content: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
-    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops() {
+    use sgl_router::policies_reorg::factory::build_resolver;
+    use sgl_router::state::kv_events::KvEventIndex;
     use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
     use std::time::Instant;
 
     let worker = MockWorker::start(vec![]).await;
     let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
         .unwrap_or_else(|_| panic!("context is not shared yet"));
-    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
-    policy.admission = Arc::new(AdmissionLimits {
-        max_running_requests: Some(1),
-        max_kv_tokens: Some(100),
-        ..Default::default()
-    });
-    ctx.chat_routing = ChatRouting::Reorg(
-        [(
-            ModelId("tiny".into()),
-            BucketResolver::new(vec![Bucket::new(
-                "default",
-                BucketGroups::Plain(EngineGroup {
-                    worker_ids: Some([WorkerId("w".into())].into()),
-                    policy: Arc::new(policy),
-                }),
-            )])
-            .unwrap(),
-        )]
-        .into(),
+    let state = KvEventIndex::new();
+    ctx.engine_reported_load = state.engine_reported_load();
+    ctx.config.model.policy = PolicyKind::PowerOfTwo;
+    ctx.config.model.reorg_buckets = Some(
+        serde_json::from_value(serde_json::json!({"buckets": [{
+            "id": "default",
+            "plain": {
+                "worker_ids": ["w"],
+                "admission": {"max_running_usage": 0.1, "max_kv_usage": 0.1}
+            }
+        }]}))
+        .unwrap(),
     );
+    let (resolver, _) = build_resolver(&ctx.config.model, &state, None).unwrap();
+    ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let ctx = Arc::new(ctx);
     let app = build_router(ctx.clone());
     for (running, kv_tokens, expected) in [
@@ -724,6 +720,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         filters: vec![FilterKind::Overloaded],
         max_in_flight: Some(1),
         min_prefix_share: None,
+        max_kv_usage: None,
     });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
     let (resolver, _) =

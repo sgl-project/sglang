@@ -41,6 +41,7 @@ async fn failover_when_one_worker_dies() {
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,

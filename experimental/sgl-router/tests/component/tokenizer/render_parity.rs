@@ -118,6 +118,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
             circuit_breaker: None,
             cache_aware: None,
             affinity: None,
