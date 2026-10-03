@@ -298,7 +298,9 @@ def engine_token_logprobs(engine, token_ids, count, vocab_size):
     )
 
 
-def assert_logprobs_close(test, actual, expected, *, tag, max_kl=BEAM_FIXTURE_MAX_KL):
+def assert_logprobs_close(
+    test, actual, expected, *, tag, max_kl=BEAM_FIXTURE_MAX_KL, atol=0.15
+):
     delta = (actual - expected).abs()
     kl = (expected.exp() * (expected - actual)).sum(-1).max().item()
     print(
@@ -309,5 +311,5 @@ def assert_logprobs_close(test, actual, expected, *, tag, max_kl=BEAM_FIXTURE_MA
     # Optimized BF16 attention and TP partial sums have different rounding
     # orders; the elementwise envelope bounds every token, the KL bound each
     # distribution. Primitive precision and window membership have strict tests.
-    torch.testing.assert_close(actual, expected, atol=0.15, rtol=0.002)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=0.002)
     test.assertLessEqual(kl, max_kl, msg=f"{tag}: per-token KL")

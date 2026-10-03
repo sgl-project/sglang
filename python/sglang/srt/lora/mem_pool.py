@@ -342,6 +342,25 @@ class LoRAMemoryPool:
         )
 
     @staticmethod
+    def _has_dense_module(base_model: torch.nn.Module, module_name: str) -> bool:
+        """Whether a decoder layer has a linear layer of this name outside the
+        routed experts, e.g. the MLP of a leading dense layer in a MoE model."""
+        # Imported here, like FusedMoE below: unit tests import this module with
+        # sglang.srt.lora.layers stubbed out and drop what the import loaded.
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.utils import get_layer_id
+
+        return any(
+            name.endswith(f".{module_name}")
+            and get_layer_id(name) is not None
+            and isinstance(
+                module.base_layer if isinstance(module, BaseLayerWithLoRA) else module,
+                LinearBase,
+            )
+            for name, module in base_model.named_modules()
+        )
+
+    @staticmethod
     def _has_moe_module(base_model: torch.nn.Module) -> bool:
         # Config-only detection isn't reliable: some dense configs (e.g.
         # `Qwen3_5TextConfig`) inherit `num_experts > 1` from an MoE parent.
@@ -627,8 +646,11 @@ class LoRAMemoryPool:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
-                    # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
+                    # Allocate the dense version (3D) for shared experts or for
+                    # dense MLP layers mixed with MoE layers.
+                    if has_shared_experts or self._has_dense_module(
+                        base_model, module_name
+                    ):
                         buffer[module_name] = [
                             torch.zeros(
                                 get_lora_shape_fn(

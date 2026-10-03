@@ -596,6 +596,18 @@ class BeamForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The attention output gate keeps its qualified name: its leaf, gate_proj,
+    # also names the MLP gate, which is fused into gate_up_proj.
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "self_attn.gate_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
     def __init__(
         self,
         config: BeamConfig,
