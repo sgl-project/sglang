@@ -6,7 +6,9 @@ import torch
 
 from sglang.srt.models.dflash import (
     CandidateSelector,
+    DFlash2BeamDraftModel,
     DFlash2DraftModel,
+    EntryClass,
     _grouped_conv,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
@@ -463,6 +465,11 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def test_beam_draft_architecture_keeps_the_candidate_selector():
+    assert issubclass(DFlash2BeamDraftModel, DFlash2DraftModel)
+    assert DFlash2BeamDraftModel in EntryClass
 
 
 if __name__ == "__main__":
