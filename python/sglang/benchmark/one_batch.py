@@ -82,6 +82,7 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
@@ -315,6 +316,18 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+    if not spec_algorithm.is_none():
+        rank_print("Using speculative decoding: " + server_args.speculative_algorithm)
+        model_runner = _SpecBenchRunner(server_args, port_args, gpu_id, tp_rank)
+        rank_print(
+            f"max_total_num_tokens={model_runner._model_runner.max_total_num_tokens}"
+        )
+        if server_args.tp_size > 1:
+            dist.barrier()
+        return model_runner, model_runner.tokenizer
+
     model_config = ModelConfig.from_server_args(server_args)
     runner_kwargs = dict(
         model_config=model_config,
@@ -547,6 +560,124 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )
+
+
+class _SpecBenchRunner:
+    """Wraps TpModelWorker + draft worker for speculative decode benchmark."""
+
+    def __init__(self, server_args, port_args, gpu_id, tp_rank):
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+
+        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+
+        # Create TpModelWorker (target model)
+        self.tp_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+            dp_rank=0,
+            nccl_port=port_args.nccl_port,
+        )
+
+        # Create draft worker
+        draft_kwargs = dict(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            nccl_port=port_args.nccl_port,
+            target_worker=self.tp_worker,
+            dp_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+        )
+        DraftWorkerClass = self.spec_algorithm.create_worker(server_args)
+        self.draft_worker = DraftWorkerClass(**draft_kwargs)
+        self.model_worker = self.draft_worker
+
+        # Determine whether the created worker expects ModelWorkerBatch (V2/overlap-style)
+        # or ScheduleBatch (V1). This must align with create_worker() logic which uses
+        # ``not get_schedule().disable_overlap_schedule``.
+        self._use_model_worker_batch = not get_schedule().disable_overlap_schedule
+
+        # Model runner reference for pool operations
+        self._model_runner = self.tp_worker.model_runner
+        self.tokenizer = self.tp_worker.tokenizer
+
+    def clear(self):
+        self._model_runner.req_to_token_pool.clear()
+        self._model_runner.token_to_kv_pool_allocator.clear()
+
+    def _prepare_forward_batch(self, batch):
+        """Return (ModelWorkerBatch | ScheduleBatch) depending on worker type."""
+        if self._use_model_worker_batch:
+            return batch.get_model_worker_batch()
+        return batch
+
+    def extend(self, reqs):
+        dummy_tree_cache = TreeCacheNamespace(
+            page_size=get_schedule().page_size,
+            device=self._model_runner.device,
+            token_to_kv_pool_allocator=self._model_runner.token_to_kv_pool_allocator,
+        )
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self._model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self._model_runner.token_to_kv_pool_allocator,
+            tree_cache=dummy_tree_cache,
+            model_config=self._model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.spec_algorithm,
+        )
+        batch.prepare_for_extend()
+
+        result = self.model_worker.forward_batch_generation(
+            self._prepare_forward_batch(batch)
+        )
+
+        # Carry spec_info from the result back to ScheduleBatch so that
+        # future decode steps see it via get_model_worker_batch().
+        if self._use_model_worker_batch and result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
+
+        next_token_ids = result.next_token_ids
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return next_token_ids, logits, batch
+
+    def decode(self, next_token_ids, batch):
+        batch.output_ids = next_token_ids
+        batch.prepare_for_decode()
+        result = self.model_worker.forward_batch_generation(
+            self._prepare_forward_batch(batch)
+        )
+
+        # Carry spec_info from the result back to ScheduleBatch so that
+        # future decode steps see it via get_model_worker_batch().
+        if self._use_model_worker_batch and result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
+
+        next_token_ids = result.next_token_ids
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return next_token_ids, logits
+
+    def cleanup(self, batch):
+        pass
+
+    def synchronize(self):
+        synchronize(self._model_runner.device)
+
+    def max_batch_size(self, input_len, output_len):
+        return self._model_runner.max_total_num_tokens // (input_len + output_len)
 
 
 class _TorchBenchRunner:
