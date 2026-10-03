@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_residency_strategies as residency_strategies,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
@@ -208,8 +211,22 @@ def test_snapshot_offload_sleep_uses_existing_host_storage():
     assert module.weight.data_ptr() == host_pointer
 
 
-def test_component_offload_keeps_preferred_component_after_warmup():
-    strategy = ComponentOffloadStrategy()
+@pytest.mark.parametrize(
+    "strategy_cls", [ComponentOffloadStrategy, SnapshotOffloadStrategy]
+)
+@pytest.mark.parametrize("free_bytes", [None, 8 * 1024**3])
+def test_component_offload_keeps_preferred_component_after_warmup(
+    monkeypatch, strategy_cls, free_bytes
+):
+    empty_cache = Mock()
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", empty_cache)
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", lambda: free_bytes)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    strategy = strategy_cls()
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
     strategy.finish_use = Mock()
@@ -226,6 +243,216 @@ def test_component_offload_keeps_preferred_component_after_warmup():
     strategy.prepare_for_use.assert_called_once_with(module, use, state)
     strategy.wait_for_use.assert_called_once_with(module, use, state)
     strategy.finish_use.assert_not_called()
+    empty_cache.assert_not_called()
+
+
+def test_component_offload_warmup_rechecks_memory_after_releasing_cache(monkeypatch):
+    empty_cache = Mock()
+    free_bytes = Mock(side_effect=[0, 8 * 1024**3])
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", empty_cache)
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", free_bytes)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("denoise", "transformer")
+    state = ResidencyState(batch_is_warmup=True)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    empty_cache.assert_called_once_with()
+    assert free_bytes.call_count == 2
+    strategy.prepare_for_use.assert_called_once_with(module, use, state)
+    strategy.wait_for_use.assert_called_once_with(module, use, state)
+    strategy.finish_use.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_component_offload_warmup_keeps_ready_component_without_budget_check(
+    monkeypatch,
+):
+    empty_cache = Mock()
+    free_bytes = Mock(return_value=0)
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", empty_cache)
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", free_bytes)
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    module = torch.nn.Linear(2, 2, device="cuda", dtype=torch.bfloat16)
+    use = ComponentUse("denoise", "transformer", target_dtype=torch.bfloat16)
+    state = ResidencyState(batch_is_warmup=True)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    free_bytes.assert_not_called()
+    empty_cache.assert_not_called()
+    strategy.prepare_for_use.assert_not_called()
+    strategy.wait_for_use.assert_called_once_with(module, use, state)
+    strategy.finish_use.assert_not_called()
+
+
+def test_component_offload_warmup_propagates_non_oom_errors(monkeypatch):
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    empty_cache = Mock()
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", empty_cache)
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock(side_effect=RuntimeError("invalid dtype"))
+    strategy.finish_use = Mock()
+
+    with pytest.raises(RuntimeError, match="invalid dtype"):
+        strategy.finish_request(
+            torch.nn.Linear(2, 2),
+            ComponentUse("denoise", "transformer"),
+            ResidencyState(batch_is_warmup=True),
+            preferred=True,
+        )
+
+    strategy.finish_use.assert_not_called()
+    empty_cache.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "free_bytes, prepare_error",
+    [
+        (64, None),
+        (8 * 1024**3, torch.OutOfMemoryError("CUDA out of memory")),
+    ],
+    ids=["does-not-fit", "oom"],
+)
+def test_component_offload_warmup_preload_failure_leaves_component_offloaded(
+    monkeypatch, free_bytes, prepare_error
+):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=Mock(),
+        mem_get_info=lambda: (free_bytes, 16 * 1024**3),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock(side_effect=prepare_error)
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    module = torch.nn.Linear(64, 64)
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        preferred_ready_after_request=True,
+    )
+    state = ResidencyState(batch_is_warmup=True)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    assert strategy.prepare_for_use.call_count == (prepare_error is not None)
+    strategy.wait_for_use.assert_not_called()
+    strategy.finish_use.assert_called_once_with(module, use, state)
+    device_module.empty_cache.assert_called_once_with()
+
+
+def test_component_offload_warmup_preload_sizes_cast_to_target_dtype(monkeypatch):
+    """A wider target dtype must count toward the preload budget, not host bytes."""
+    module = torch.nn.Linear(64, 64, bias=False).to(dtype=torch.float16)
+    host_bytes = sum(tensor.nbytes for tensor in module.parameters())
+    cast_bytes = sum(
+        tensor.numel() * torch.float32.itemsize for tensor in module.parameters()
+    )
+    assert cast_bytes == 2 * host_bytes
+    # Enough free memory for the host copy + margin, but not for the cast copy.
+    free_bytes = host_bytes + (1 * 1024**3) + 1
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=Mock(),
+        mem_get_info=lambda: (free_bytes, 16 * 1024**3),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        preferred_ready_after_request=True,
+        target_dtype=torch.float32,
+    )
+    state = ResidencyState(batch_is_warmup=True)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    strategy.prepare_for_use.assert_not_called()
+    strategy.finish_use.assert_called_once_with(module, use, state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "strategy_cls", [ComponentOffloadStrategy, SnapshotOffloadStrategy]
+)
+@pytest.mark.parametrize("root_parameter", [False, True])
+def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
+    monkeypatch, strategy_cls, root_parameter
+):
+    strategy = strategy_cls()
+    module = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    module[0].register_buffer("counter", torch.ones((), dtype=torch.int64))
+    if root_parameter:
+        module.register_parameter("root", torch.nn.Parameter(torch.zeros(1)))
+    expected = {name: tensor.clone() for name, tensor in module.state_dict().items()}
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        preferred_ready_after_request=True,
+    )
+    state = ResidencyState(batch_is_warmup=True)
+
+    # Module.to visits children before parent parameters; parameters() does not
+    failing_tensor = module.root if root_parameter else module[1].bias
+    original_to = torch.Tensor.to
+
+    def fail_partial_move(tensor, *args, **kwargs):
+        if tensor is failing_tensor and torch.device(args[0]).type == "cuda":
+            assert module[0].weight.device.type == "cuda"
+            assert module[0].counter.device.type == "cuda"
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_partial_move)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    for name, tensor in module.state_dict().items():
+        assert tensor.device.type == "cpu", name
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+    monkeypatch.setattr(torch.Tensor, "to", original_to)
+    state.batch_is_warmup = False
+    x = torch.randn(2, 4)
+    expected_output = module(x)
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    torch.testing.assert_close(module(x.cuda()).cpu(), expected_output)
+    strategy.finish_request(module, use, state, preferred=False)
+    assert all(tensor.device.type == "cpu" for tensor in module.state_dict().values())
 
 
 def test_request_tail_uses_dynamic_component_instance():
@@ -1044,3 +1271,58 @@ def test_component_is_not_kept_across_another_component_use():
     manager.end_use(text_use)
 
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
+
+
+def _dual_expert_manager():
+    names = ("transformer", "transformer_2")
+    uses = {
+        name: ComponentUse("denoise", name, phase=name, memory_intensive=True)
+        for name in names
+    }
+    denoise = _Stage(*uses.values())
+    decode = _Stage(ComponentUse("decode", "vae", memory_intensive=True))
+    pipeline = SimpleNamespace(
+        modules={name: torch.nn.Linear(2, 2) for name in (*names, "vae")},
+        _stage_name_mapping={"denoise": denoise, "decode": decode},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+    batch = SimpleNamespace(is_warmup=False)
+    manager.begin_request([denoise, decode], batch, server_args)
+    manager.before_stage(denoise, 0, batch, server_args)
+    return manager, uses
+
+
+@pytest.mark.parametrize(
+    "offload, experts_run, expected_finished",
+    [
+        (True, ("transformer",), ["transformer"]),
+        # Non-offload strategies prefetch transformer_2 while transformer runs.
+        (False, ("transformer",), ["transformer", "transformer_2"]),
+        (True, ("transformer", "transformer_2"), ["transformer", "transformer_2"]),
+    ],
+    ids=["one-expert-offload", "one-expert-prefetch-while-busy", "both-experts"],
+)
+def test_stage_exit_does_not_keep_unused_same_stage_expert(
+    offload, experts_run, expected_finished
+):
+    manager, uses = _dual_expert_manager()
+    strategy = Mock(spec=ComponentOffloadStrategy) if offload else Mock()
+    strategy.prefetch_for_use.return_value = True
+    manager.strategy_for = Mock(return_value=strategy)
+
+    for name in experts_run:
+        manager.begin_use(uses[name])
+    # DenoisingStage finishes its DiT inside the stage; the executor then
+    # calls end_stage.
+    manager.finish_active_use()
+    manager.end_stage()
+
+    finished = [
+        call.args[1].component_name for call in strategy.finish_use.call_args_list
+    ]
+    assert finished == expected_finished
+    assert strategy.prefetch_for_use.call_args.args[1].component_name == "vae"
+    assert manager._use_key(uses["transformer_2"]) not in manager._prefetched_use_keys
