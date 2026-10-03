@@ -26,11 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
-    """Sentinel node for streaming session requests.
-
-    Passed to inc_lock_ref / dec_lock_ref so the cache can distinguish
-    streaming-session locks (no-op) from real radix-tree locks (forwarded).
-    """
+    """Lock target for session-owned KV; locking it is a no-op."""
 
     pass
 
@@ -72,11 +68,8 @@ class SessionSlot:
         req.lock_receipt = self.lock_receipt
         req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
-        # NOTE: the slot keeps sharing the record it just handed out. During
-        # chunked prefill, a request may be rejected by
-        # the scheduler (e.g. budget exhausted) and retried in the next cycle.
-        # Each retry calls match_prefix -> restore_to_req again, so the slot
-        # must remain intact for idempotent restoration.
+        # The slot keeps sharing the record: a rejected chunked request calls
+        # match_prefix -> restore_to_req again next cycle.
 
 
 def _is_streaming(req: Optional[Req]) -> bool:
@@ -114,12 +107,8 @@ class StreamingSession:
         return None
 
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
-        """Returns an active slot for this req, or None.
-
-        Side effect: if req is pre-aborted (to_finish set, e.g. input too
-        long), detach it from the session so release_kv_cache treats it
-        as a normal req. The slot stays intact for the next request.
-        """
+        """A pre-aborted req (to_finish set) is detached from the session and
+        gets None; the slot stays for the next request."""
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
@@ -140,9 +129,7 @@ class StreamingSession:
 
         req = params.req
 
-        # [NPU] When aligned context < page_size, release the slot's KV and
-        # fall back to radix cache (full prefill). Once context >= page_size,
-        # streaming session kicks in with page-aligned KV reuse.
+        # [NPU] Below one aligned page, drop the slot's KV and fully prefill.
         if is_npu() and self.cache.page_size > 1:
             expected_prefix_len = min(slot.kv.kv_committed_len, len(params.key))
             aligned_prefix_len = (
@@ -180,11 +167,6 @@ class StreamingSession:
             prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
-        # Free orphaned tail: alloc_for_extend will overwrite
-        # req_to_token[prefix_len:] with new indices. The range
-        # [prefix_len, kv_allocated_len) has stale indices from the
-        # previous turn's decode (e.g. alloc-commit gap on retract,
-        # or speculative draft tokens).
         self._free_tail(req.kv, prefix_len)
 
         device_indices = self.cache.req_to_token_pool.req_to_token[
@@ -211,19 +193,13 @@ class StreamingSession:
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
+        # Mid-processing abort: free all session KV and drop the slot; req_nodes
+        # still points at the last finished request, so the next turn re-prefills.
         if isinstance(req.finished_reason, FINISH_ABORT):
             kv = req.detach_kv()
             if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup;
-                # the detached record carries the mamba refs for
-                # _free_slot_mamba, and last_node lets release_session
-                # dec_lock_ref the tree lock.
+                # First turn: a throwaway slot lets release_session free the
+                # record (mamba refs included) and drop the tree lock.
                 slot = SessionSlot(
                     kv=kv,
                     last_node=req.last_node,
@@ -248,10 +224,8 @@ class StreamingSession:
         self._trim_overshoot(req, finished_len)
 
         slot.save_from_req(req, is_first=is_first)
-        # Inherit the authoritative finished length on the slot, not the lagging
-        # req clock (under overlap + honest committed the clock lags the in-flight
-        # verify by ~1, which would short-change inheritance). Clamp to allocated
-        # to keep committed <= allocated for prepare_for_decode.
+        # Use the finished length, not the req clock (it lags an in-flight verify
+        # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
@@ -299,12 +273,8 @@ class StreamingSession:
         self._free_slot_mamba(slot)
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree.
-
-        Excludes slots whose KV is currently owned by an owning request --
-        those tokens are counted via uncached_size in the busy mem check.
-        A slot's pool_idx being in active_pool_idxs indicates a req owns it.
-        """
+        """KV tokens held by idle session slots; a slot whose pool idx is in
+        ``active_pool_idxs`` is counted via uncached_size instead."""
         total = 0
         for slot in self.slots.values():
             in_batch = (
@@ -317,7 +287,6 @@ class StreamingSession:
         return total
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """An alias to align the naming style of SWA"""
         return self.session_held_tokens(active_pool_idxs)
 
     def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
@@ -348,12 +317,8 @@ class StreamingSession:
         return sum(_owned(s) for s in self.slots.values())
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total mamba_pool entries held by session slots (mamba_pool_idx +
-        mamba_ping_pong_track_buffer). Excludes slots whose owning req is
-        currently in the batch -- those slots are counted via the normal
-        alloc/free paths (same convention as the sibling ``session_held_*``
-        accessors).
-        """
+        """mamba_pool entries held by idle session slots (same exclusion as
+        ``session_held_tokens``)."""
         total = 0
         for slot in self.slots.values():
             in_batch = (
@@ -383,22 +348,16 @@ class StreamingSession:
     # -- Internal helpers (streaming body bits) --
 
     def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
-        """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
-        before alloc_for_extend overwrites it. The gap appears when spec
-        decoding pushes allocated above committed, or when retract retry's
-        logit-reserve pulls prefix_len below committed.
-        """
+        """Free [prefix_len, allocated) before alloc_for_extend overwrites it:
+        spec decoding or a retract retry leaves stale indices there."""
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
         kv.clamp_evicted_seqlens(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
-        """Trim slot KV to finished_len boundary. Spec v2 may overshoot
-        max_new_tokens (verify round commits M+1 at a time); next turn's
-        input is output_ids[:finished_len], so positions past that must
-        be released to avoid token/KV mismatch.
-        """
+        """Spec v2 can commit past max_new_tokens; the next turn's input is
+        output_ids[:finished_len], so release the KV past it."""
         target = len(req.origin_input_ids) + finished_len
         if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
             # Same hazard as the match-path rewind: the cursor must stay
@@ -411,12 +370,8 @@ class StreamingSession:
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
-        """Free the record's kv row over [ceil_align(target), end). Page-aligned
-        because PagedTokenToKVPoolAllocator.free returns whole pages
-        (free_index // page_size), so partial-page free would corrupt pages
-        still holding committed tokens. The range [target, ceil_align(target))
-        stays attached until release_session frees the whole page.
-        """
+        """Free [ceil_align(target), end): paged free returns whole pages, so
+        the partial page stays until release_session."""
         if end <= target:
             return
         start = target
