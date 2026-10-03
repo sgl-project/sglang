@@ -101,19 +101,26 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    page_table_col_stride: tl.constexpr,
+    topk_indices_row_stride: tl.constexpr,
+    topk_indices_col_stride: tl.constexpr,
+    result_row_stride: tl.constexpr,
+    result_col_stride: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
     page_table_ptr = page_table_ptr + req_id * page_table_row_stride
-    topk_indices_ptr = topk_indices_ptr + req_id * TOPK
-    result_ptr = result_ptr + req_id * TOPK
+    topk_indices_ptr = topk_indices_ptr + req_id * topk_indices_row_stride
+    result_ptr = result_ptr + req_id * result_row_stride
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
+    loaded_topk_indices = tl.load(topk_indices_ptr + offset * topk_indices_col_stride)
     mask = loaded_topk_indices >= 0
-    loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
+    loaded_kv_indices = tl.load(
+        page_table_ptr + loaded_topk_indices * page_table_col_stride, mask=mask
+    )
+    tl.store(result_ptr + offset * result_col_stride, loaded_kv_indices, mask=mask)
+    tl.store(result_ptr + offset * result_col_stride, -1, mask=~mask)
 
 
 @triton.jit
@@ -122,6 +129,7 @@ def transform_index_page_table_decode_tiled_kernel(
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_table_row_stride: tl.constexpr,
+    page_table_col_stride: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
     result_stride_0: tl.constexpr,
@@ -149,7 +157,9 @@ def transform_index_page_table_decode_tiled_kernel(
     )
     selected = in_row & (loaded_topk_indices >= 0)
     loaded_kv_indices = tl.load(
-        page_table_ptr + req_id * page_table_row_stride + loaded_topk_indices,
+        page_table_ptr
+        + req_id * page_table_row_stride
+        + loaded_topk_indices * page_table_col_stride,
         mask=selected,
         other=-1,
     )
@@ -251,6 +261,11 @@ def transform_index_page_table_decode_fast(
             result,
             page_size,
             page_table_row_stride=page_table.stride(0),
+            page_table_col_stride=page_table.stride(1),
+            topk_indices_row_stride=topk_indices.stride(0),
+            topk_indices_col_stride=topk_indices.stride(1),
+            result_row_stride=result.stride(0),
+            result_col_stride=result.stride(1),
         )
         return result
 
@@ -262,6 +277,7 @@ def transform_index_page_table_decode_fast(
         topk_indices,
         result,
         page_table.stride(0),
+        page_table.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
         result.stride(0),
