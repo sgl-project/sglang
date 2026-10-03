@@ -100,9 +100,11 @@ _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 # The FlashInfer prepared runners bind tensor *storage* (addresses, shapes,
 # dtypes) at preparation and their first ``launch()`` is not CUDA-graph
 # capturable.  The DeepGEMM runner input tensors are freshly allocated by the
-# dispatcher on every call, so this route owns one static buffer set per
-# (device, M, K, N) shared by every MoE layer, copies the dispatcher tensors
-# into it, and keeps one prepared runner pair per (buffer set, expert weights).
+# dispatcher on every call, so this route owns one static buffer arena per
+# (device, K, N), sized to the largest M seen and shared by every MoE layer and
+# every M (runners are prepared on leading-row views of it), copies the
+# dispatcher tensors into it, and keeps one prepared runner pair per
+# (arena, M, expert weights).
 # Admission is all-or-nothing: both expert GEMMs run on Cake or the call falls
 # through to the unchanged DeepGEMM code below.
 # ---------------------------------------------------------------------------
@@ -298,21 +300,35 @@ class _CakeContigPlan:
     debug_described: bool = False
 
 
+@dataclass
+class _CakeArena:
+    """Full-capacity static buffers for one ``(device, K, N)``; plans use ``[:M]`` views."""
+
+    serial: int
+    rows: int
+    buffers: Dict[str, torch.Tensor]
+
+
 class _CakeContigFp8Route:
-    """Static buffers + prepared Cake runners for the contiguous FP8 expert GEMMs.
+    """Static buffer arena + prepared Cake runners for the contiguous FP8 expert GEMMs.
 
     FlashInfer binds ``M`` (the padded row count ``all_tokens``) at preparation,
-    so buffers and runners are cached per exact ``M``.  One buffer set per
-    ``(device, M, K, N)`` is shared by all layers and costs
-    ``M * (K + K/32 + 4 + N/2 + N/64 + 2K)`` bytes (plus ``2 * M * N`` when the
-    fused SwiGLU route is not admitted and a BF16 gate_up buffer is needed);
-    e.g. 6.7 KiB per row for K=2048, N=1024.  CUDA-graph capture adds one set
-    per captured batch size.  Prepared runners are per layer (weight storage)
+    so runners are cached per exact ``M``; their tensors are leading-row views
+    of one arena per ``(device, K, N)`` sized to the largest ``M`` seen, which
+    costs ``M_max * (K + K/32 + 4 + N/2 + N/64 + 2K)`` bytes (plus
+    ``2 * M_max * N`` when the fused SwiGLU route is not admitted and a BF16
+    gate_up buffer is needed); e.g. 6.7 KiB per row for K=2048, N=1024, i.e.
+    one ~1.1 GiB arena for a 16384-token prefill instead of one set per captured
+    batch size.  An arena that must grow is replaced (its plans are dropped and
+    rebuilt) and the old one is retained because CUDA graphs captured against
+    it still replay into it.  Prepared runners are per layer (weight storage)
     and hold only descriptor workspace.
     """
 
     def __init__(self) -> None:
-        self._buffers: Dict[Tuple[Any, ...], Dict[str, torch.Tensor]] = {}
+        self._arenas: Dict[Tuple[Any, ...], _CakeArena] = {}
+        self._retired_arenas: List[_CakeArena] = []
+        self._arena_serial = 0
         self._plans: Dict[Tuple[Any, ...], Optional[_CakeContigPlan]] = {}
 
     # -- admission ---------------------------------------------------------
@@ -370,30 +386,54 @@ class _CakeContigFp8Route:
             and not req.silu_mul_keep_fp32
         )
 
+    def _arena(
+        self, device: torch.device, m: int, k: int, n: int, *, grow: bool
+    ) -> Optional[_CakeArena]:
+        """The arena for ``(device, K, N)`` with at least ``m`` rows; ``None`` if it
+        would have to be (re)allocated and ``grow`` is false."""
+        key = (device.type, device.index, k, n)
+        arena = self._arenas.get(key)
+        if arena is not None and arena.rows >= m:
+            return arena
+        if not grow:
+            return None
+        rows = m
+        if arena is not None:
+            # Captured graphs replay into the old buffers: keep them alive.
+            self._retired_arenas.append(arena)
+            rows = max(m, arena.rows)
+        h = n // 2
+        self._arena_serial += 1
+        arena = _CakeArena(
+            serial=self._arena_serial,
+            rows=rows,
+            buffers={
+                "a": torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device),
+                "a_scale": torch.empty(
+                    (rows, k // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
+                ),
+                "m_indices": torch.empty((rows,), dtype=torch.int32, device=device),
+                "act": torch.empty((rows, h), dtype=torch.float8_e4m3fn, device=device),
+                "act_scale": torch.empty(
+                    (rows, h // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
+                ),
+                "down_out": torch.empty((rows, k), dtype=torch.bfloat16, device=device),
+            },
+        )
+        self._arenas[key] = arena
+        return arena
+
     def _get_buffers(
         self, device: torch.device, m: int, k: int, n: int, fused: bool
     ) -> Dict[str, torch.Tensor]:
-        key = (device.type, device.index, m, k, n)
-        buffers = self._buffers.get(key)
-        if buffers is None:
-            h = n // 2
-            buffers = {
-                "a": torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device),
-                "a_scale": torch.empty(
-                    (m, k // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
-                ),
-                "m_indices": torch.empty((m,), dtype=torch.int32, device=device),
-                "act": torch.empty((m, h), dtype=torch.float8_e4m3fn, device=device),
-                "act_scale": torch.empty(
-                    (m, h // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
-                ),
-                "down_out": torch.empty((m, k), dtype=torch.bfloat16, device=device),
-            }
-            self._buffers[key] = buffers
-        if not fused and "gateup" not in buffers:
+        """Leading-row ``[:m]`` views (contiguous, same base alignment) of the arena."""
+        arena = self._arena(device, m, k, n, grow=True)
+        if not fused and "gateup" not in arena.buffers:
             # Only the plain gate_up route materializes the BF16 (M, N) output.
-            buffers["gateup"] = torch.empty((m, n), dtype=torch.bfloat16, device=device)
-        return buffers
+            arena.buffers["gateup"] = torch.empty(
+                (arena.rows, n), dtype=torch.bfloat16, device=device
+            )
+        return {name: t[:m] for name, t in arena.buffers.items()}
 
     def _build_plan(
         self, req: _CakeContigRequest
@@ -515,16 +555,29 @@ class _CakeContigFp8Route:
                 "fallback", f"Cake {_CAKE_ROUTE}: DeepGEMM fallback, {reason}"
             )
             return None
-        key = self._plan_key(req)
+        hs = req.hidden_states
+        m, k = (int(v) for v in hs.shape)
+        n = int(req.w13_weight.shape[1])
+        capturing = _cake_stream_capturing()
+        arena = self._arena(hs.device, m, k, n, grow=not capturing)
+        if arena is None:
+            _cake_log_once(
+                "capture_fallback",
+                f"Cake {_CAKE_ROUTE}: shape {tuple(hs.shape)} first seen inside "
+                "CUDA-graph capture; using DeepGEMM for this graph "
+                "(warm the shape up eagerly before capture)",
+            )
+            return None
+        key = (arena.serial,) + self._plan_key(req)
         if key in self._plans:
             plan = self._plans[key]
             if plan is None:
                 return None
         else:
-            if _cake_stream_capturing():
+            if capturing:
                 _cake_log_once(
                     "capture_fallback",
-                    f"Cake {_CAKE_ROUTE}: shape {tuple(req.hidden_states.shape)} first "
+                    f"Cake {_CAKE_ROUTE}: shape {tuple(hs.shape)} first "
                     "seen inside CUDA-graph capture; using DeepGEMM for this graph "
                     "(warm the shape up eagerly before capture)",
                 )
@@ -589,7 +642,8 @@ class _CakeContigFp8Route:
         return out
 
     def reset_for_tests(self) -> None:
-        self._buffers.clear()
+        self._arenas.clear()
+        self._retired_arenas.clear()
         self._plans.clear()
         _cake_weight_scale_cache.clear()
         _cake_logged.clear()

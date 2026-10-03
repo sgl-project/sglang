@@ -4,7 +4,8 @@ The FlashInfer adapter, DeepGEMM and the SwiGLU/quant kernels are replaced by
 fakes; no GPU is needed.  Covered: route switch off -> DeepGEMM path (Cake API
 never touched); route on + admission -> prepared Cake runners launched once per
 shape and reused; first sight of a shape inside CUDA-graph capture -> DeepGEMM
-fallback; the UE8M0 scale unpack and the ``-1`` padding fill the route relies on.
+fallback; one buffer arena per (device, K, N) serving every M through views;
+the UE8M0 scale unpack and the ``-1`` padding fill the route relies on.
 """
 
 import os
@@ -387,3 +388,51 @@ def test_weight_scale_fp32_from_row_repeated_packed_layout():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _request_rows(weights, rows):
+    """A request with ``rows`` padded rows (two expert blocks, 8 padding rows)."""
+    kg = K // 128
+    m_indices = torch.full((rows,), -1, dtype=torch.int32)
+    m_indices[: rows // 2] = 0
+    m_indices[rows // 2 : rows - 8] = 1
+    return _request(
+        weights,
+        hidden_states=torch.zeros((rows, K), dtype=torch.bfloat16).to(FP8),
+        hidden_states_scale=_pack_ue8m0(
+            torch.randint(120, 130, (rows, kg), dtype=torch.uint8)
+        ),
+        m_indices=m_indices,
+    )
+
+
+def test_one_arena_per_device_k_n_serves_every_m(api, monkeypatch):
+    route = dg._CAKE_CONTIG_FP8
+    weights = _weights()
+
+    def run(rows):
+        return route.try_run(
+            _request_rows(weights, rows),
+            lambda: torch.empty((rows, K), dtype=torch.bfloat16),
+        )
+
+    assert run(256) is not None
+    (arena,) = route._arenas.values()
+    assert arena.rows == 256 and len(api.prepared) == 2
+    # A smaller M reuses the arena through leading-row views (same base address).
+    assert run(128) is not None
+    assert list(route._arenas.values()) == [arena] and len(api.prepared) == 4
+    small = [p for p in route._plans.values() if p.buffers["a"].shape[0] == 128]
+    assert len(small) == 1
+    assert small[0].buffers["a"].data_ptr() == arena.buffers["a"].data_ptr()
+    assert small[0].buffers["down_out"].shape == (128, K)
+    # A larger M replaces the arena; the old one stays alive for captured graphs.
+    assert run(512) is not None
+    (grown,) = route._arenas.values()
+    assert grown.rows == 512 and grown.serial != arena.serial
+    assert route._retired_arenas == [arena] and len(api.prepared) == 6
+    # Growth is never attempted inside CUDA-graph capture.
+    monkeypatch.setattr(dg, "_cake_stream_capturing", lambda: True)
+    assert run(1024) is None
+    assert list(route._arenas.values()) == [grown] and len(api.prepared) == 6
+    assert run(512) is not None  # prepared shape still served inside capture
