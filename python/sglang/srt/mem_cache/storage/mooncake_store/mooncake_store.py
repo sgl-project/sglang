@@ -1334,7 +1334,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pass
 
     def clear(self) -> None:
-        self.store.remove_all()
+        # A non-forced remove only clears objects whose leases have expired.
+        # The admin clear endpoint, however, promises to drop the storage
+        # backend now, including objects that were just written or read.
+        ret_code = self.store.remove_all(True)
+        if ret_code < 0:
+            raise RuntimeError(
+                f"Failed to clear Mooncake storage backend, error code: {ret_code}"
+            )
 
     def _put_batch_zero_copy_impl(
         self,
