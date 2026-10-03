@@ -7,12 +7,12 @@ import torch
 
 from sglang.srt.kv_canary import api
 from sglang.srt.kv_canary.api import torch_reference_conflicts_with_decode_graph
-from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
 )
+from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
