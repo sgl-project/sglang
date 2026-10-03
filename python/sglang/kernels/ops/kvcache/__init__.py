@@ -56,7 +56,7 @@ def reshape_and_cache_flash(
 __all__ = ["reshape_and_cache_flash"]
 
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
-from sglang.kernels.ops.kvcache import cake as _cake  # noqa: E402
+from sglang.kernels.ops.kvcache import cake as _cake  # noqa: E402, F401
 
 
 # Other Triton kernels migrated into this group (from attention/mem_cache
