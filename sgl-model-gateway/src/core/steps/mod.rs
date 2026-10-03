@@ -26,8 +26,8 @@ pub use tokenizer_registration::{
 };
 pub use wasm_module_registration::{
     create_wasm_module_registration_workflow, create_wasm_registration_workflow_data,
-    CalculateHashStep, CheckDuplicateStep, LoadWasmBytesStep, RegisterModuleStep,
-    ValidateDescriptorStep, ValidateWasmComponentStep, WasmModuleConfigRequest,
+    AcquireModuleStep, CheckDuplicateStep, RegisterModuleStep, ValidateDescriptorStep,
+    ValidateWasmComponentStep, WasmModuleConfigRequest,
 };
 pub use wasm_module_removal::{
     create_wasm_module_removal_workflow, create_wasm_removal_workflow_data, FindModuleToRemoveStep,

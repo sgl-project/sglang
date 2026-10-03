@@ -378,6 +378,15 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn wasm_module_roots<I, S>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.wasm_module_roots = roots.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn model_path<S: Into<String>>(mut self, path: S) -> Self {
         self.config.model_path = Some(path.into());
         self
