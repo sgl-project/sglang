@@ -360,9 +360,17 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub stable_pair: bool,
 
-    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
+    /// Affinity mode: reorg prefer (default) or balanced; legacy session strict or soft.
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
+
+    /// Reorg balanced affinity: switch only above this load ratio (>= 1, default 2).
+    #[arg(long)]
+    pub affinity_load_factor: Option<f64>,
+
+    /// Reorg balanced affinity: minimum waiting uncached token difference (default 1024).
+    #[arg(long)]
+    pub affinity_load_gap: Option<u64>,
 
     /// Session lookup mode (--policy session_aware). Defaults to bucket (search the target bucket).
     #[arg(long, value_enum)]
@@ -404,21 +412,55 @@ pub struct AffinityArgs {
 
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
-    pub fn into_config(self) -> Result<Config> {
-        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+    pub fn into_config(mut self) -> Result<Config> {
+        let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
+        if reorg {
             ensure!(
-                self.affinity.affinity_mode != Some(AffinityMode::Soft),
-                "reorg sessions do not support --affinity-mode soft"
+                self.affinity.affinity_mode.is_none_or(|mode| matches!(
+                    mode,
+                    AffinityMode::Prefer | AffinityMode::Balanced
+                )),
+                "reorg --affinity-mode must be prefer or balanced"
             );
             ensure!(
-                self.routing.policy != PolicyKind::SessionAware
-                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                self.affinity.pressure_abs_threshold_tokens.is_none()
                         && self.affinity.pressure_abs_threshold_ms.is_none()
                         && self.affinity.pressure_rel_threshold.is_none()
-                        && !self.affinity.disable_pressure_guard),
-                "reorg pressure guard options only apply to cache_aware"
+                        && !self.affinity.disable_pressure_guard
+                        && self.cache.worker_queue_limit.is_none()
+                        && self.cache.saturation_queue_floor.is_none()
+                        && self.cache.cache_switch_margin_tokens.is_none(),
+                "reorg uses --affinity-mode and --affinity-load-* instead of pressure guards and cache queue gates"
+            );
+            if matches!(
+                self.routing.policy,
+                PolicyKind::SessionAware | PolicyKind::CacheAware
+            ) {
+                self.affinity
+                    .affinity_mode
+                    .get_or_insert(AffinityMode::Prefer);
+            }
+        } else {
+            ensure!(
+                self.affinity
+                    .affinity_mode
+                    .is_none_or(|mode| matches!(mode, AffinityMode::Strict | AffinityMode::Soft))
+                    && self.affinity.affinity_load_factor.is_none()
+                    && self.affinity.affinity_load_gap.is_none(),
+                "prefer, balanced and --affinity-load-* require --chat-routing reorg"
+            );
+            ensure!(
+                self.affinity.affinity_mode.is_none()
+                    || self.routing.policy == PolicyKind::SessionAware,
+                "legacy --affinity-mode requires --policy session_aware"
             );
         }
+        ensure!(
+            (self.affinity.affinity_load_factor.is_none()
+                && self.affinity.affinity_load_gap.is_none())
+                || self.affinity.affinity_mode == Some(AffinityMode::Balanced),
+            "--affinity-load-* require --affinity-mode balanced"
+        );
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -781,12 +823,15 @@ impl AffinityArgs {
             || self.session_idle_secs.is_some()
             || self.session_eviction_interval_secs.is_some()
             || self.stable_pair
-            || self.affinity_mode.is_some()
             || self.session_affinity_mode.is_some();
         ensure!(
             !tuned_session_affinity || policy == PolicyKind::SessionAware,
-            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+            "--session-id-header, --session-*-secs, --stable-pair, and \
                  --session-affinity-mode require --policy session_aware"
+        );
+        ensure!(
+            self.affinity_mode.is_none() || affinity_policy,
+            "--affinity-mode requires --policy session_aware or cache_aware"
         );
         ensure!(
             !self.disable_pressure_guard || affinity_policy,
@@ -842,6 +887,11 @@ impl AffinityArgs {
             return Ok(None);
         }
         let defaults = AffinityConfig::default();
+        let load_factor = self.affinity_load_factor.unwrap_or(defaults.load_factor);
+        ensure!(
+            load_factor.is_finite() && load_factor >= 1.0,
+            "--affinity-load-factor must be finite and at least 1"
+        );
         let session_id_header = self
             .session_id_header
             .clone()
@@ -909,6 +959,8 @@ impl AffinityArgs {
             session_eviction_interval_secs,
             stable_pair: self.stable_pair,
             mode: self.affinity_mode.unwrap_or(defaults.mode),
+            load_factor,
+            load_gap: self.affinity_load_gap.unwrap_or(defaults.load_gap),
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -1034,13 +1086,13 @@ mod tests {
         let cache = parse(&[
             "--policy",
             "cache_aware",
-            "--worker-queue-limit",
-            "3",
+            "--affinity-mode",
+            "balanced",
             "--kv-indexer-endpoint",
             "http://localhost:50051",
         ])
         .unwrap();
-        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert_eq!(cache.model.affinity.unwrap().mode, AffinityMode::Balanced);
         assert!(cache
             .model
             .cache_aware
@@ -1074,6 +1126,7 @@ mod tests {
             vec!["--policy", "session_aware", "--affinity-mode", "soft"],
             vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
             vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec!["--policy", "cache_aware", "--worker-queue-limit", "3"],
             vec![
                 "--filter",
                 "prefix_cache",
@@ -1082,6 +1135,28 @@ mod tests {
             ],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn reorg_affinity_modes_share_validated_load_settings() {
+        for policy in ["session_aware", "cache_aware"] {
+            let base = format!("--chat-routing reorg --policy {policy}");
+            assert_eq!(
+                cfg_of(&base).unwrap().model.affinity.unwrap().mode,
+                AffinityMode::Prefer
+            );
+            for factor in ["1", "2", "0.5", "NaN", "inf"] {
+                let result = cfg_of(&format!("{base} --affinity-mode balanced --affinity-load-factor {factor} --affinity-load-gap 10"));
+                assert_eq!(result.is_ok(), matches!(factor, "1" | "2"));
+                if let Ok(config) = result {
+                    let affinity = config.model.affinity.unwrap();
+                    assert_eq!(affinity.load_factor, factor.parse::<f64>().unwrap());
+                    assert_eq!(affinity.load_gap, 10);
+                }
+            }
+            assert!(cfg_of(&format!("{base} --affinity-load-gap 10")).is_err());
+            assert!(cfg_of(&format!("--policy {policy} --affinity-mode balanced")).is_err());
         }
     }
 

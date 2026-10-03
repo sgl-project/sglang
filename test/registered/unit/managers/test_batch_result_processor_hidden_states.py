@@ -257,7 +257,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 with (
                     patch(
                         "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.maybe_cache_unfinished_req"
+                        "batch_result_processor.checkpoint_kv_cache"
                     ),
                     patch(
                         "sglang.srt.managers.scheduler_components."

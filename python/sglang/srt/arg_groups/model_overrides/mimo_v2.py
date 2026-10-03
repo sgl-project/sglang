@@ -47,4 +47,13 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
                 "MiMoV2 on SM100: moe_runner_backend=%s.",
                 overrides["moe_runner_backend"],
             )
+    elif (
+        get_platform().is_sm90
+        and cfg.moe_runner_backend == "auto"
+        and get_quantization_config(hf_config) == "fp8"
+        and model_config_of(server_args).is_fp4_experts
+    ):
+        # The auto runner resolves to Triton FP8, which cannot read packed MXFP4.
+        overrides["moe_runner_backend"] = "marlin"
+        logger.info("MiMoV2 on SM90: moe_runner_backend=marlin.")
     return overrides
