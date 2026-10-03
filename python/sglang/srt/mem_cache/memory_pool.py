@@ -141,6 +141,26 @@ def conv_window_dedup_enabled(
     )
 
 
+# KV dtypes that force a uint8 store_dtype (see KVCache.__init__) and therefore
+# carry a cast on every write -- the cast the fused writers fold into the scatter.
+_FP8_KV_CACHE_DTYPES = (
+    torch.float8_e5m2,
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+)
+
+
+def _is_token_major_contiguous(t: torch.Tensor, head_dim: int) -> bool:
+    """True iff ``t`` is [tokens, heads, head_dim] with each token contiguous.
+
+    The reshape_and_cache_flash kernels index a token as ``stride(0) * i + h *
+    head_dim + d``, i.e. they honour an arbitrary outer token stride but assume
+    the heads and dims behind it are packed. A non-contiguous inner layout would
+    be scattered to the wrong offsets without raising.
+    """
+    return t.dim() == 3 and t.stride(2) == 1 and t.stride(1) == head_dim
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -1910,7 +1930,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if dtype in _FP8_KV_CACHE_DTYPES:
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -5856,6 +5876,93 @@ class MiniMaxSparseKVPool(KVCache):
             and (main.head_dim * main.dtype.itemsize) % 16 == 0
         )
 
+    def _can_fuse_fp8_main_kv_store(
+        self,
+        layer: RadixAttention,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float],
+        v_scale: Optional[float],
+    ) -> bool:
+        """Precondition for writing main K/V with ``reshape_and_cache_flash``.
+
+        Mirrors ``AiterAttnBackend._use_fused_fp8_kv_write`` (which already runs
+        this kernel on the dense layers) plus the pool-layout facts that
+        backend cannot see from here.
+        """
+        main = self.main_pool
+        # Only worth routing here when there is a cast to fuse: an fp8 pool fed
+        # model-dtype activations. A model-dtype pool has no cast, so
+        # set_kv_buffer's scatter is already the whole operation.
+        if main.dtype not in _FP8_KV_CACHE_DTYPES or cache_k.dtype == main.dtype:
+            return False
+        # The kernel addresses the cache as [num_pages, page_size, heads, dim];
+        # only the NHD buffer reshapes to that. hnd / vectorized_5d / the FP4
+        # quantized pool each have their own writer inside set_kv_buffer.
+        if main.use_hnd or main.kv_cache_layout != "nhd" or main.is_quantized_kv_cache:
+            return False
+        # Buffer is [size + page_size, heads, dim]; the 4-D view needs the row
+        # count to divide by page_size. PoolConfigurator page-aligns
+        # max_total_num_tokens, so this holds in practice -- fall back rather
+        # than raise if some caller ever sizes a pool by hand.
+        if main.size % main.page_size != 0:
+            return False
+        # One (num_heads, head_size) pair covers both K and V in the kernel.
+        if main.head_dim != main.v_head_dim:
+            return False
+        if cache_k.shape[1:] != (main.head_num, main.head_dim):
+            return False
+        if cache_v.shape[1:] != (main.head_num, main.v_head_dim):
+            return False
+        # The kernel takes stride(0) as the token stride and assumes each token's
+        # heads/dims are contiguous behind it. Checking is cheap and the failure
+        # mode otherwise is silently mis-scattered KV, not an exception.
+        if not _is_token_major_contiguous(cache_k, main.head_dim):
+            return False
+        if not _is_token_major_contiguous(cache_v, main.v_head_dim):
+            return False
+        # USE_SCALE is one constexpr covering both K and V, and the launcher
+        # substitutes the *key* tensor for a missing scale pointer -- so a
+        # one-sided scale would make the kernel read garbage as v_scale.
+        if (k_scale is None) != (v_scale is None):
+            return False
+        # Non-unit scales are divided out inside the kernel, which loads them
+        # from a device tensor, while the backend hands us the float mirrors.
+        # Those agree by construction: BaseKVCacheMethod.process_weights_after_loading
+        # (layers/quantization/kv_cache.py) copies the same resolved value into
+        # layer.k_scale/.v_scale and into the *_float attributes. A float scale with no tensor behind it means that method
+        # never ran, so there is nothing safe to tl.load -- fall back.
+        if k_scale is not None and (layer.k_scale is None or layer.v_scale is None):
+            return False
+        return True
+
+    def _store_main_kv_fused_fp8(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        use_scale: bool,
+    ) -> None:
+        """Main-KV store only; the index caches keep their own scatter."""
+        from sglang.kernels.ops.kvcache.cache_ops import (
+            launch_reshape_and_cache_flash,
+        )
+
+        main = self.main_pool
+        page_size = main.page_size
+        k_cache = main.get_key_buffer(layer.layer_id)
+        v_cache = main.get_value_buffer(layer.layer_id)
+        launch_reshape_and_cache_flash(
+            cache_k,
+            cache_v,
+            k_cache.view(-1, page_size, main.head_num, main.head_dim),
+            v_cache.view(-1, page_size, main.head_num, main.v_head_dim),
+            loc,
+            k_scale=layer.k_scale if use_scale else None,
+            v_scale=layer.v_scale if use_scale else None,
+        )
+
     def set_fused_kv_index_buffer(
         self,
         layer: RadixAttention,
@@ -5871,6 +5978,21 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         """Store main K/V + index K (+ optional index V) for a sparse layer in
         one fused JIT launch, falling back to separate stores when not applicable."""
+        # Both fused routes below write through raw kernel launches, bypassing the
+        # stale-slot detectors that MHATokenToKVPool.set_kv_buffer runs on the
+        # fallback route. Hoisting them here keeps every exit from this function
+        # covered, so a bad `loc` cannot become silent KV corruption on whichever
+        # route a layout capability check happens to select. Both are no-ops
+        # unless SGLANG_ENABLE_ASYNC_ASSERT is set, so the fallback repeating
+        # them costs nothing outside that debug mode.
+        _pool = self._pool_for(layer.layer_id)
+        maybe_detect_oob(
+            loc, 0, _pool.size + _pool.page_size, "set_fused_kv_index_buffer"
+        )
+        maybe_detect_kernel_facing_loc(
+            loc, _pool.page_size, _pool.kernel_page_blocks, "set_fused_kv_index_buffer"
+        )
+
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
@@ -5910,7 +6032,15 @@ class MiniMaxSparseKVPool(KVCache):
         # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
         # applies any non-None scale with an IN-PLACE div_ (extra kernel +
         # caller-tensor mutation), which must not fire for unit scale.
-        self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
+        if self._can_fuse_fp8_main_kv_store(layer, cache_k, cache_v, k_scale, v_scale):
+            # Same bf16->fp8 cast, folded into the paged scatter instead of
+            # running as a separate div_ + .to() + index_put_ chain. Leaves
+            # cache_k/cache_v untouched (set_kv_buffer's div_ is in place).
+            self._store_main_kv_fused_fp8(
+                layer, loc, cache_k, cache_v, use_scale=k_scale is not None
+            )
+        else:
+            self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
         else:
