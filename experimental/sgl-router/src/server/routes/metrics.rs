@@ -15,7 +15,7 @@ use crate::server::metrics::{escape_label, WorkerSnapshot};
 use crate::state::kv_events::bootstrap::{
     BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
 };
-use crate::state::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
+use crate::state::kv_events::{KvIndexMetrics, ReplayOutcome, Tiers, ACCOUNTING_REASONS};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
@@ -296,6 +296,17 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         "sgl_router_kv_event_batches_lost_total {}\n",
         kv.tally.batches_lost(),
     ));
+    out.push_str(
+        "# HELP sgl_router_kv_event_replays_total Sequence gaps a subscriber asked the engine's replay socket to fill, by outcome. Batches an incomplete or failed replay could not recover still count in sgl_router_kv_event_batches_lost_total.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_event_replays_total counter\n");
+    for outcome in ReplayOutcome::ALL {
+        out.push_str(&format!(
+            "sgl_router_kv_event_replays_total{{outcome=\"{}\"}} {}\n",
+            outcome.label(),
+            kv.tally.replays(outcome),
+        ));
+    }
 
     out.push_str(
         "# HELP sgl_router_kv_tree_accounting_errors_total Times the tree's per-tier occupancy bookkeeping contradicted itself. Always 0 on a correct tree. Nonzero means sgl_router_kv_tree_blocks understates what the tree holds, and can drop a worker's series entirely — which the gauge's own HELP would have you read as a worker that publishes nothing.\n",
