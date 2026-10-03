@@ -777,6 +777,31 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
 
     @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
     def test_cohort_collectors_preserve_worker_data_and_committed_history(self):
+        self.exercise_cohort_collectors(
+            (
+                "tp_pp",
+                "replicated",
+                "inactive_ingress",
+                "verify",
+                "abort",
+                "factory_cuda",
+            ),
+            expected_publications=11,
+        )
+
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_cohort_manifest_rejection_drains_and_accepts_fresh_requests(self):
+        self.exercise_cohort_collectors(
+            (
+                "budget_tp_pp",
+                "budget_replicated",
+                "budget_inactive",
+                "budget_peer_cuda",
+            ),
+            expected_publications=8,
+        )
+
+    def exercise_cohort_collectors(self, cases, *, expected_publications):
         store = connect(self.master_address, segment_bytes=64 << 20)
         catalog = TestCaptureCatalog()
         workers = []
@@ -786,7 +811,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 workers = [
                     context.Process(
                         target=cohort_runtime_worker,
-                        args=(rank, root, self.master_address, catalog.endpoint),
+                        args=(rank, root, self.master_address, catalog.endpoint, cases),
                     )
                     for rank in range(4)
                 ]
@@ -807,6 +832,9 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 }
                 for rank_results in results:
                     self.assertEqual(
+                        [case["case"] for case in rank_results], list(cases)
+                    )
+                    self.assertEqual(
                         {
                             row["capture_id"]: row["expected"]
                             for case in rank_results
@@ -819,8 +847,50 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                         self.assertTrue(writer["stopping"])
                         self.assertEqual(writer["pending"], 0)
                         self.assertIsNone(writer["error"])
-                publications = catalog.wait_publications(11)
-                self.assertEqual(len(catalog.publications), 11)
+                for index, case in enumerate(cases):
+                    if not case.startswith("budget_"):
+                        continue
+                    rows = [
+                        rank_results[index]["rejection"] for rank_results in results
+                    ]
+                    self.assertEqual(len({row["capture_id"] for row in rows}), 1)
+                    self.assertTrue(all(row["stale_ticket_rejected"] for row in rows))
+                    self.assertGreaterEqual(
+                        sum(row["budget_rejections"] for row in rows), 1
+                    )
+                    if case == "budget_peer_cuda":
+                        self.assertEqual(
+                            [row["rejected_before_capture"] for row in rows],
+                            [False, True, False, False],
+                        )
+                        self.assertTrue(all(row["copy_gate_checked"] for row in rows))
+                    else:
+                        self.assertTrue(
+                            all(row["rejected_before_capture"] for row in rows)
+                        )
+                    rejected = catalog.captures[rows[0]["capture_id"]]
+                    self.assertEqual(rejected["state"], "FAILED")
+                    self.assertFalse(rejected["registered"])
+                    self.assertFalse(rejected["written"])
+                    if case == "budget_replicated":
+                        self.assertEqual(
+                            results[3][index]["stats"]["host_pool"]["allocated_bytes"],
+                            0,
+                        )
+                    elif case == "budget_inactive":
+                        for rank in (0, 1):
+                            self.assertEqual(
+                                results[rank][index]["stats"]["host_pool"][
+                                    "allocated_bytes"
+                                ],
+                                0,
+                            )
+                    print(
+                        json.dumps({"cohort_manifest_rejection": case, "ranks": rows}),
+                        flush=True,
+                    )
+                publications = catalog.wait_publications(expected_publications)
+                self.assertEqual(len(catalog.publications), expected_publications)
                 for capture_id, state in expected_states.items():
                     self.assertEqual(catalog.captures[capture_id]["state"], state)
                 base, expected = make_snapshot(response_length=4)

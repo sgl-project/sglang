@@ -28,7 +28,7 @@ it does not redefine the goal as the modules already implemented.
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
 | KV coverage validation | Token-endpoint sweep with disjoint active head intervals | Independent grid-oracle comparisons and 123 shared/Store tests pass; 32K metadata validation falls 69.4%, with 16 complete long-context post-exit snapshots and no established serving speedup |
-| Manifest capacity admission | Conservative global JSON bound before capture context/copies, with a dedicated rejection counter | 165 tests pass, including real oversized-request serving continuity, later small-sample publication and post-exit readback; conservative early-response exclusion and production workload acceptance remain explicit |
+| Manifest capacity admission | Conservative global Host/HTTP seal bounds before capture context/copies, with a dedicated rejection counter | 176 shared/Store regressions pass, including four-process rejection/drain/reuse; prior real-model serving continuity and post-exit readback pass; conservative early-response exclusion and production workload acceptance remain explicit |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
@@ -4871,6 +4871,37 @@ the source copy completed; the final frozen source was verified before retry.
 No new Ruff diagnostics were added. All jobs are terminal, no additional GPU
 was allocated, and the resident idle load has resumed. This adds single-rank
 eager TCP runtime evidence, not new multi-GPU/RDMA or production SLO acceptance.
+
+## Catalog Seal Capacity And Cohort Retirement
+
+A manifest that fits its Host reservation can exceed the Catalog HTTP client's
+8 MiB body limit after Base64 encoding. A loopback HTTP probe reproduced the
+failure with a 6,299,187-byte manifest: the old writer had already written 16
+payload objects and saved one pending journal before rejecting seal locally.
+The corrected writer rejects the identical input with zero writes and journals.
+Admission now bounds both Host and seal capacity. Single-owner writes, partition
+writes and the final publisher also check exact seal size before their first
+object registration, payload write or journal creation. Wire format, HTTP limit
+and existing-journal recovery behavior remain unchanged.
+
+The final source passes **168 regression methods in 149.979s** and the full
+native Mooncake TCP suite, **8 methods in 233.861s**. HTTP tests compare predicted
+sizes against serialized request bodies across Base64 padding and the exact
+8 MiB boundary. Four new collector scenarios cover TP2/PP2, replicated heads,
+inactive ingress ranks, and one rejecting peer after three peers start CUDA
+copies. A held copy-completion gate prevents global slot reuse until draining.
+Failed samples have no registered/written Catalog objects, stale tickets cannot
+rebind, and all eight subsequent accepted samples pass complete post-exit
+readback. These use synthetic forwards in four processes on one resident H100;
+they do not constitute multi-GPU model inference or new RDMA validation.
+
+The [runbook](experiments/CATALOG_SEAL_BUDGET.md) and
+[evidence](experiments/catalog-seal-budget.json) preserve five terminal jobs,
+the failure/success comparison, a 5,624-file final Python source audit and 31
+archived artifacts. The eight modified Python files add no Ruff diagnostics.
+The resident idle load resumed with no extra GPU allocation. Production Catalog,
+SpecForge integration, representative MaaS SLOs and trained-draft quality remain
+open.
 
 ## Next Implementation
 

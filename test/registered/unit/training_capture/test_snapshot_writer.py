@@ -9,10 +9,15 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 from sglang.srt.training_capture.catalog import (
+    MAX_CATALOG_REQUEST_BYTES,
     CaptureLease,
     CatalogConflict,
+    CatalogError,
     CatalogUnavailable,
     HTTPCaptureCatalog,
+    check_seal_capacity,
+    manifest_descriptor,
+    seal_request_nbytes,
 )
 from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
@@ -173,6 +178,48 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertEqual(stages["store_payload"]["errors"], 1)
         self.assertEqual(stages["journal_save"]["calls"], 0)
         self.assertEqual(stages["catalog_publish"]["calls"], 0)
+
+    def test_oversized_seal_fails_before_objects_or_journal_on_every_writer_path(self):
+        self.manifest = msgspec.structs.replace(
+            self.manifest,
+            provenance=msgspec.structs.replace(
+                self.manifest.provenance,
+                sampling_config={"payload": "x" * (6 << 20)},
+            ),
+        )
+        self.manifest_buffer = torch.empty(8 << 20, dtype=torch.uint8)
+        self.store.register(self.manifest_buffer)
+        data = canonical_bytes(self.manifest)
+        self.assertLess(len(data), self.manifest_buffer.numel())
+        receipts = [
+            OwnerWriteReceipt(
+                capture_id=self.lease.capture_id,
+                fencing_token=self.lease.fencing_token,
+                owner_id=self.manifest.topology.aux_owner,
+                manifest_sha256=digest_bytes(data),
+            )
+        ]
+        operations = {
+            "single": self.write,
+            "owner": lambda: self.writer.write_partition(
+                self.manifest,
+                self.tensors,
+                self.lease,
+                owner_id=self.manifest.topology.aux_owner,
+            ),
+            "publisher": lambda: self.writer.publish_partitions(
+                self.manifest, receipts, self.manifest_buffer, self.lease
+            ),
+        }
+        for name, operation in operations.items():
+            with (
+                self.subTest(path=name),
+                self.assertRaisesRegex(CatalogError, "seal request budget"),
+            ):
+                operation()
+            self.assertFalse(self.catalog.events)
+            self.assertFalse(self.client.data)
+            self.assertFalse(list(self.journal.pending()))
 
     def test_lost_publish_response_replays_without_tensor_sources(self):
         self.catalog.fail_publish = True
@@ -438,6 +485,81 @@ class TestSnapshotPublication(CustomTestCase):
 
 
 class TestCatalogHTTPContract(CustomTestCase):
+    def seal_fixture(self):
+        manifest, _ = make_snapshot()
+        lease = CaptureLease(
+            capture_id="c" * 160,
+            fencing_token=18446744073709551615,
+            dataset_id=manifest.dataset_id,
+            sample_id=manifest.sample_id,
+            generation_id=manifest.generation_id,
+            expires_in_seconds=120,
+            renew_after_seconds=20,
+        )
+        catalog = HTTPCaptureCatalog("http://127.0.0.1:12345")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        catalog.opener = MagicMock()
+        catalog.opener.open.return_value = response
+        return manifest, lease, catalog, response
+
+    def test_seal_size_matches_actual_http_body_with_base64_padding(self):
+        manifest, lease, catalog, response = self.seal_fixture()
+        writer = SnapshotWriter(None, catalog, None)
+        for n in (1, 2, 3, 4, 31, 32, 33, 255, 256, 257, 4096):
+            data = bytes(index % 256 for index in range(n))
+            descriptor = manifest_descriptor(
+                manifest, nbytes=n, sha256=digest_bytes(data)
+            )
+            response.read.return_value = canonical_bytes(
+                {"state": "PREPARED", "manifest_sha256": descriptor["sha256"]}
+            )
+            writer._seal(manifest, data, lease)
+            body = catalog.opener.open.call_args.args[0].data
+            self.assertEqual(
+                seal_request_nbytes(manifest, descriptor, lease), len(body)
+            )
+            self.assertEqual(
+                base64.b64decode(json.loads(body)["manifest_base64"]), data
+            )
+
+    def test_seal_capacity_boundary_matches_http_limit(self):
+        manifest, lease, catalog, response = self.seal_fixture()
+        low, high = 1, MAX_CATALOG_REQUEST_BYTES
+        while low < high:
+            mid = (low + high + 1) // 2
+            descriptor = manifest_descriptor(manifest, nbytes=mid, sha256="0" * 64)
+            if (
+                seal_request_nbytes(manifest, descriptor, lease)
+                <= MAX_CATALOG_REQUEST_BYTES
+            ):
+                low = mid
+            else:
+                high = mid - 1
+        writer = SnapshotWriter(None, catalog, None)
+        for size in (low, low + 1):
+            data = b"x" * size
+            descriptor = manifest_descriptor(
+                manifest, nbytes=size, sha256=digest_bytes(data)
+            )
+            response.read.return_value = canonical_bytes(
+                {"state": "PREPARED", "manifest_sha256": descriptor["sha256"]}
+            )
+            if size == low:
+                check_seal_capacity(manifest, descriptor, lease)
+                writer._seal(manifest, data, lease)
+                self.assertLessEqual(
+                    len(catalog.opener.open.call_args.args[0].data),
+                    MAX_CATALOG_REQUEST_BYTES,
+                )
+            else:
+                with self.assertRaises(CatalogError):
+                    check_seal_capacity(manifest, descriptor, lease)
+                catalog.opener.open.reset_mock()
+                with self.assertRaises(CatalogError):
+                    writer._seal(manifest, data, lease)
+                catalog.opener.open.assert_not_called()
+
     def test_timeout_retries_identical_body_and_object_ack_is_checked(self):
         catalog = HTTPCaptureCatalog("http://127.0.0.1:12345", attempts=2)
         response = MagicMock()

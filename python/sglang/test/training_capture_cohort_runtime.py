@@ -152,14 +152,150 @@ def _forward(coordinator, req, *, end, raw_logits, pp_last, token):
     return result.training_capture if pp_last else None
 
 
+def _route_request(coordinator, raw, *, rank, index):
+    if rank == 0:
+        coordinator.request_router.prepare([raw])
+        assert raw.training_capture_ticket is not None, coordinator.stats()
+    messages = [msgpack_encode(raw) if rank == 0 else None]
+    dist.broadcast_object_list(messages, src=0)
+    raw = msgpack_decode(messages[0])
+    req = Req(
+        raw.rid,
+        raw.input_text,
+        raw.input_ids,
+        raw.sampling_params,
+        vocab_size=256,
+        training_capture_ticket=raw.training_capture_ticket,
+    )
+    req.req_pool_idx = index
+    coordinator.request_router.attach(raw, req)
+    assert req.training_capture_route is not None
+    return req
+
+
+def _reject_manifest(coordinator, *, rank, case, pp_last):
+    raw = _incoming(f"{case}-rejected")
+    peer = case == "budget_peer_cuda"
+    if not peer:
+        # Fits the request identity budget but exceeds the smaller manifest arena.
+        raw.sampling_params.stop_strs = ["x" * (32 << 10)]
+    req = _route_request(coordinator, raw, rank=rank, index=0)
+    ticket = req.training_capture_route.ticket.cohort
+    gate_entered, gate_release = threading.Event(), threading.Event()
+    copy_patch = None
+    record = None
+    try:
+        if peer:
+            if rank != 1:
+                coordinator.before_forward([req])
+                record = req.training_capture_context
+                assert record is not None, coordinator.stats()
+                first = _forward(
+                    coordinator,
+                    req,
+                    end=2,
+                    raw_logits=torch.randn(1, 256, device="cuda"),
+                    pp_last=pp_last,
+                    token=5,
+                )
+                req.output_ids.append(5)
+                coordinator.after_result(first, requests=[req])
+                assert record.context.kv_end == 2
+                if rank == 2:
+                    wait_for_copies = record.context.wait_for_copies
+
+                    def held_completion():
+                        gate_entered.set()
+                        assert gate_release.wait(30), "copy completion gate timed out"
+                        wait_for_copies()
+
+                    copy_patch = patch.object(
+                        record.context, "wait_for_copies", side_effect=held_completion
+                    )
+                    copy_patch.start()
+            dist.barrier()
+            if rank == 1:
+                provenance = coordinator._provenance(req)
+                oversized = msgspec.structs.replace(
+                    provenance,
+                    sampling_config={"local_test_metadata": "x" * (32 << 10)},
+                )
+                with patch.object(coordinator, "_provenance", return_value=oversized):
+                    coordinator.before_forward([req])
+                assert req.training_capture_context is None
+                assert coordinator.counters["admission_manifest_budget"] == 1
+            dist.barrier()
+            if record is not None:
+                _wait(
+                    coordinator,
+                    lambda: (
+                        coordinator.service.status(record.cohort_handle)[1] is not None
+                    ),
+                )
+                coordinator.before_forward([])
+                assert req.training_capture_context is None
+            if rank == 2:
+                assert gate_entered.wait(15)
+            dist.barrier()
+            with coordinator.service.lock:
+                handle = coordinator.service.records[ticket.capture_id]
+                assert handle.invalid_reason is not None
+                assert handle.cohort.slot.state == "filling"
+                if rank == 2:
+                    assert not handle.drained
+            assert (
+                coordinator.writer_actor.stats()["stage_timings"]["store_payload"][
+                    "calls"
+                ]
+                == 0
+            )
+            dist.barrier()
+            gate_release.set()
+        else:
+            coordinator.before_forward([req])
+            assert req.training_capture_context is None
+        _wait(
+            coordinator,
+            lambda: (
+                ticket.capture_id not in coordinator.service.records
+                and not coordinator.records
+                and coordinator.writer_actor.stats()["pending"] == 0
+                and coordinator.stats()["states"].get("available", 0) == 2
+            ),
+        )
+        assert coordinator.service.bind(ticket, ticket.request_sha256) is None
+        assert coordinator.stats()["host_pool"]["quarantined"] == 0
+        timings = coordinator.writer_actor.stats()["stage_timings"]
+        assert timings["snapshot_build"]["calls"] == 0
+        assert timings["store_payload"]["calls"] == 0
+        if not peer:
+            assert timings["copy_wait"]["calls"] == 0
+        handle = req.training_capture_route.handle
+        if handle is not None:
+            assert handle.drained and handle.transfer_complete
+        return {
+            "capture_id": ticket.capture_id,
+            "expected": "FAILED",
+            "rejected_before_capture": record is None,
+            "budget_rejections": coordinator.counters["admission_manifest_budget"],
+            "copy_gate_checked": peer,
+            "stale_ticket_rejected": True,
+        }
+    finally:
+        gate_release.set()
+        if copy_patch is not None:
+            copy_patch.stop()
+
+
 def _run_case(rank, root, master, endpoint, case):
     base, tensors = make_snapshot(response_length=4)
-    factory = case == "factory_cuda"
-    replicated = case == "replicated"
+    factory = case in ("factory_cuda", "budget_peer_cuda")
+    replicated = case in ("replicated", "budget_replicated")
+    inactive_ingress = case in ("inactive_ingress", "budget_inactive")
     ranges = (
         [(0, 4)]
         if replicated
-        else ([(0, 1), (1, 4)] if case == "inactive_ingress" else [(0, 2), (2, 4)])
+        else ([(0, 1), (1, 4)] if inactive_ingress else [(0, 2), (2, 4)])
     )
     tp_size = 4 if replicated else 2
     layout = plan_capture_layout(
@@ -181,6 +317,7 @@ def _run_case(rank, root, master, endpoint, case):
         max_sample_tokens=8,
         max_inflight_samples=2,
         max_host_bytes=4 << 20,
+        manifest_buffer_bytes=(32 << 10) if case.startswith("budget_") else (1 << 20),
         sample_ratio=1.0,
     )
     sources = _sources(base, tensors, partition)
@@ -304,25 +441,17 @@ def _run_case(rank, root, master, endpoint, case):
         _wait(
             coordinator, lambda: coordinator.stats()["states"].get("available", 0) == 2
         )
+        pp_last = rank // tp_size == len(ranges) - 1
+        rejected = (
+            _reject_manifest(coordinator, rank=rank, case=case, pp_last=pp_last)
+            if case.startswith("budget_")
+            else None
+        )
         requests = []
         for index in range(2):
-            raw = _incoming(f"{case}-{index}")
-            if rank == 0:
-                coordinator.request_router.prepare([raw])
-                assert raw.training_capture_ticket is not None
-            messages = [msgpack_encode(raw) if rank == 0 else None]
-            dist.broadcast_object_list(messages, src=0)
-            raw = msgpack_decode(messages[0])
-            req = Req(
-                raw.rid,
-                raw.input_text,
-                raw.input_ids,
-                raw.sampling_params,
-                vocab_size=256,
-                training_capture_ticket=raw.training_capture_ticket,
+            req = _route_request(
+                coordinator, _incoming(f"{case}-{index}"), rank=rank, index=index
             )
-            req.req_pool_idx = index
-            coordinator.request_router.attach(raw, req)
             requests.append(req)
         coordinator.before_forward(requests)
         records = [req.training_capture_context for req in requests]
@@ -331,7 +460,6 @@ def _run_case(rank, root, master, endpoint, case):
         raw_rows = torch.randn(4, 256, generator=torch.Generator().manual_seed(42))
         if factory:
             raw_rows = raw_rows.cuda()
-        pp_last = rank // tp_size == len(ranges) - 1
         for index in (0, 1) if rank < 2 else (1, 0):
             req = requests[index]
             first = _forward(
@@ -413,7 +541,12 @@ def _run_case(rank, root, master, endpoint, case):
         dist.barrier()
         assert coordinator.close(), coordinator.stats()
         assert resources.closed
-        return {"case": case, "samples": rows, "stats": coordinator.stats()}
+        return {
+            "case": case,
+            "samples": rows,
+            "rejection": rejected,
+            "stats": coordinator.stats(),
+        }
     finally:
         release_recovery.set()
         if startup_patch is not None:
@@ -424,7 +557,7 @@ def _run_case(rank, root, master, endpoint, case):
             dist.destroy_process_group(control)
 
 
-def cohort_runtime_worker(rank, root, master, endpoint):
+def cohort_runtime_worker(rank, root, master, endpoint, cases=None):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -435,7 +568,7 @@ def cohort_runtime_worker(rank, root, master, endpoint):
     )
     try:
         results = []
-        for case in (
+        for case in cases or (
             "tp_pp",
             "replicated",
             "inactive_ingress",
@@ -446,7 +579,7 @@ def cohort_runtime_worker(rank, root, master, endpoint):
             with (
                 get_context().override_server_args(enable_dp_attention=False),
                 get_parallel().override(
-                    tp_rank=rank % (4 if case == "replicated" else 2)
+                    tp_rank=rank % (4 if "replicated" in case else 2)
                 ),
             ):
                 results.append(_run_case(rank, root, master, endpoint, case))

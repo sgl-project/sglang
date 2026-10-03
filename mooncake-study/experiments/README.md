@@ -56,6 +56,10 @@ and actual 32K serving/readback comparisons using an explicit manifest budget.
 JSON bound before collecting a request, with slot/ticket reuse tests and real
 serving that excludes oversized metadata while preserving later small samples.
 
+[Catalog Seal Capacity And Cohort Retirement](CATALOG_SEAL_BUDGET.md) accounts
+for Base64 and HTTP envelope bytes before payload writes, and checks four-process
+rejection, pending CUDA copy ownership and subsequent Mooncake publication.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

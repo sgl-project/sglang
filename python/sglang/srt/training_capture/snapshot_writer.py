@@ -12,7 +12,14 @@ from pathlib import Path
 
 import msgspec
 import torch
-from sglang.srt.training_capture.catalog import CaptureLease, Catalog, CatalogConflict
+from sglang.srt.training_capture.catalog import (
+    CaptureLease,
+    Catalog,
+    CatalogConflict,
+    check_seal_capacity,
+    manifest_descriptor,
+    seal_payload,
+)
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
     DTYPES,
@@ -155,27 +162,20 @@ class SnapshotWriter:
 
     @staticmethod
     def _manifest_object(manifest, data):
-        return {
-            "object_id": "manifest",
-            "kind": "manifest",
-            "key": manifest.key_prefix + "manifest",
-            "nbytes": len(data),
-            "sha256": digest_bytes(data),
-            "owner_id": manifest.topology.aux_owner,
-        }
+        return manifest_descriptor(
+            manifest, nbytes=len(data), sha256=digest_bytes(data)
+        )
 
     def _seal(self, manifest, data, lease):
         descriptor = self._manifest_object(manifest, data)
         receipt = self.catalog.seal(
             lease,
-            {
-                "owner_id": manifest.topology.aux_owner,
-                "sequence": msgspec.to_builtins(manifest.sequence),
-                "manifest": descriptor,
-                "manifest_base64": base64.b64encode(data).decode("ascii"),
-                "total_tensor_bytes": manifest.total_tensor_bytes,
-                "idempotency_key": f"seal-{lease.capture_id}-{descriptor['sha256']}",
-            },
+            seal_payload(
+                manifest,
+                descriptor,
+                lease,
+                manifest_base64=base64.b64encode(data).decode("ascii"),
+            ),
         )
         if (
             receipt.get("state") not in ("PREPARED", "READY")
@@ -203,6 +203,7 @@ class SnapshotWriter:
             raise ContractError("manifest exceeds reserved Host buffer")
         objects = [msgspec.to_builtins(obj) for obj in manifest.objects]
         descriptor = self._manifest_object(manifest, data)
+        check_seal_capacity(manifest, descriptor, lease)
         self.timings.call(
             "catalog_register",
             self.catalog.objects,
@@ -254,7 +255,10 @@ class SnapshotWriter:
         self.timings.call(
             "validation", validate_tensors, manifest, tensors, owner_id=owner_id
         )
-        digest = digest_bytes(canonical_bytes(manifest))
+        data = canonical_bytes(manifest)
+        descriptor = self._manifest_object(manifest, data)
+        check_seal_capacity(manifest, descriptor, lease)
+        digest = descriptor["sha256"]
         objects = [obj for obj in manifest.objects if obj.owner_id == owner_id]
         descriptors = [msgspec.to_builtins(obj) for obj in objects]
         operation = f"{lease.capture_id}-{owner_id}-{digest}"
@@ -310,6 +314,7 @@ class SnapshotWriter:
             raise ContractError("manifest exceeds reserved Host buffer")
         self._check_receipts(manifest, receipts, lease, data)
         descriptor = self._manifest_object(manifest, data)
+        check_seal_capacity(manifest, descriptor, lease)
         self.timings.call(
             "catalog_register",
             self.catalog.objects,

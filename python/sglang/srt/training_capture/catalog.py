@@ -17,6 +17,8 @@ from sglang.srt.training_capture.protocol import (
     canonical_bytes,
 )
 
+MAX_CATALOG_REQUEST_BYTES = 8 << 20
+
 
 class CatalogError(CaptureError):
     pass
@@ -64,6 +66,40 @@ class Catalog(Protocol):
     def fail(self, lease: CaptureLease, reason: str) -> dict: ...
 
 
+def manifest_descriptor(manifest, *, nbytes, sha256):
+    return {
+        "object_id": "manifest",
+        "kind": "manifest",
+        "key": manifest.key_prefix + "manifest",
+        "nbytes": nbytes,
+        "sha256": sha256,
+        "owner_id": manifest.topology.aux_owner,
+    }
+
+
+def seal_payload(manifest, descriptor, lease, *, manifest_base64):
+    return {
+        "owner_id": manifest.topology.aux_owner,
+        "sequence": msgspec.to_builtins(manifest.sequence),
+        "manifest": descriptor,
+        "manifest_base64": manifest_base64,
+        "total_tensor_bytes": manifest.total_tensor_bytes,
+        "idempotency_key": f"seal-{lease.capture_id}-{descriptor['sha256']}",
+    }
+
+
+def seal_request_nbytes(manifest, descriptor, lease):
+    payload = seal_payload(manifest, descriptor, lease, manifest_base64="")
+    envelope = canonical_bytes({**payload, **lease.credentials()})
+    # Standard Base64 needs no JSON escaping and has four bytes per input triple.
+    return len(envelope) + 4 * ((descriptor["nbytes"] + 2) // 3)
+
+
+def check_seal_capacity(manifest, descriptor, lease):
+    if seal_request_nbytes(manifest, descriptor, lease) > MAX_CATALOG_REQUEST_BYTES:
+        raise CatalogError("manifest exceeds Catalog seal request budget")
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(
@@ -103,7 +139,7 @@ class HTTPCaptureCatalog:
 
     def _post(self, route: str, payload: dict) -> dict:
         body = canonical_bytes(payload)
-        if len(body) > 8 << 20:
+        if len(body) > MAX_CATALOG_REQUEST_BYTES:
             raise CatalogError("Catalog request exceeds metadata budget")
         headers = {
             "Content-Type": "application/json",

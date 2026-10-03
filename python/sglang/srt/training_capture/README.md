@@ -38,15 +38,21 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 `manifest_buffer_bytes` defaults to 1 MiB per auxiliary-owner slot and counts
 toward `max_host_bytes`. Admission bounds the final JSON size using the request's
 maximum response length, current provenance, and all canonical TP/PP owners.
-If the bound exceeds that reservation, capture is skipped before constructing
+Admission also bounds the Catalog seal body, including the Base64-encoded
+manifest and the JSON envelope, against the HTTP client's 8 MiB request limit.
+If either bound exceeds its limit, capture is skipped before constructing
 its request context or enqueueing KV/teacher copies. The reservation is retired
 through the existing background lifecycle; inference continues and smaller
 requests remain eligible. `events_total{event="admission_manifest_budget"}`
 counts these rank-local decisions. The bound is conservative, so a request
 whose eventual short response would fit can still be excluded. Increase the
-manifest reservation (and total Host budget as needed), reduce the capture
-length limit, or use larger storage chunks. Writer-side exact size checks remain
-mandatory; this check does not certify payload contents or replace publication.
+manifest reservation (and total Host budget as needed) for Host capacity, reduce
+the capture length limit, or use larger storage chunks. Increasing the Host
+reservation cannot bypass the Catalog limit; the raw manifest limit is slightly
+less than 6 MiB because seal also carries credentials and metadata. All writer
+paths check the exact seal size before object registration, payload writes or
+journal creation. These checks do not certify payload contents or replace
+publication, and do not discard journals left by earlier writer versions.
 
 Synchronous and normal overlap scheduling are supported for ordinary AR and
 DSpark verification. Ordinary AR can use TP/PP with DP=1;

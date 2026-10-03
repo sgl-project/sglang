@@ -34,7 +34,7 @@ from sglang.srt.training_capture.protocol import (
     SequenceInfo,
 )
 from sglang.srt.training_capture.resources import CaptureResources
-from sglang.srt.training_capture.snapshot import SnapshotMetadata, manifest_size_bound
+from sglang.srt.training_capture.snapshot import SnapshotMetadata, manifest_fits_budget
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 from sglang.srt.training_capture.startup import (
     coordinate_capture_activation,
@@ -635,9 +635,11 @@ class CaptureCoordinator:
             contract_id=self.config.contract_id,
             topology=self.layout.topology,
         )
-        return (
-            manifest_size_bound(metadata, layout=self.layout)
-            <= self.config.manifest_buffer_bytes
+        return manifest_fits_budget(
+            metadata,
+            layout=self.layout,
+            lease=record.lease,
+            manifest_buffer_bytes=self.config.manifest_buffer_bytes,
         )
 
     def _provenance(self, req, *, config_sha256=None):

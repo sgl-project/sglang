@@ -583,12 +583,17 @@ Store: WRITTEN -> SAMPLE_READY -> LEASED/RETAINED -> GC_ELIGIBLE -> REMOVED
 
 manifest 的注册缓冲区由 `manifest_buffer_bytes` 配置，默认每个 auxiliary-owner
 槽位 1 MiB，计入总 Host 预算。请求准入按最大回复长度、当前 provenance 和全局
-canonical TP/PP 分片估算 JSON 大小上界；超预算时在创建采集 context、排入 KV/teacher
+canonical TP/PP 分片估算 JSON 大小上界；同时检查 Base64 manifest 加上 JSON envelope、
+lease credentials 后的 seal 请求是否超过 HTTP client 的 8 MiB body 限制。
+任一限制超预算时，在创建采集 context、排入 KV/teacher
 拷贝前跳过采集，通过既有后台流程退还 reservation，推理继续。
 `admission_manifest_budget` 是逐 rank 的拒绝计数，不是独立样本总数。
 上界可能比最终提前结束的回复更大，因此会保守拒绝部分最终本可容纳的样本。
-可增加 manifest/Host 预算、降低采集长度上限或增大 storage chunk；最终 writer
-仍须精确检查 manifest 大小并校验完整内容，准入估算不能替代发布校验。
+可增加 manifest/Host 预算解决 Host 容量不足，或降低采集长度上限、增大 storage chunk。
+增加 Host 预算不能绕过 Catalog 限制；扣除 envelope 后，原始 manifest 上限略小于
+6 MiB。单 owner、分片 owner 和最终 publisher 都须在登记对象、写入 payload 或保存
+journal 前精确检查 seal 大小，并保留内容校验。旧版本留下的 journal 不自动丢弃，
+仍走原有恢复流程。准入估算不能替代发布校验。
 
 单 rank producer 的 Catalog 配额在后台补充至有界 Host 槽位容量，每次成功申请
 之后重新检查租约、暂停与关闭状态，再继续申请。writer 归还槽位后唤醒补充线程；

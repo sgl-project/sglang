@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 
 import msgspec
 import torch
+from sglang.srt.training_capture.catalog import (
+    MAX_CATALOG_REQUEST_BYTES,
+    manifest_descriptor,
+    seal_request_nbytes,
+)
 from sglang.srt.training_capture.protocol import (
     ELEMENT_BYTES,
     OWNER,
@@ -63,6 +68,18 @@ def manifest_size_bound(metadata: SnapshotMetadata, *, layout: CaptureLayout) ->
     Only one sizing descriptor per layer/component/owner is encoded, independent
     of token chunk count. Payload tensors are neither allocated nor inspected.
     """
+    return _manifest_size_bound(metadata, layout=layout)[1]
+
+
+def manifest_fits_budget(metadata, *, layout, lease, manifest_buffer_bytes):
+    envelope, nbytes = _manifest_size_bound(metadata, layout=layout)
+    descriptor = manifest_descriptor(envelope, nbytes=nbytes, sha256="0" * 64)
+    return nbytes <= manifest_buffer_bytes and (
+        seal_request_nbytes(envelope, descriptor, lease) <= MAX_CATALOG_REQUEST_BYTES
+    )
+
+
+def _manifest_size_bound(metadata, *, layout):
     n, r = metadata.sequence.total_length, metadata.sequence.response_length
     kv = metadata.kv
     prefix = f"draft-data/{metadata.dataset_id}/{metadata.sample_id}/{metadata.generation_id}/"
@@ -130,7 +147,9 @@ def manifest_size_bound(metadata: SnapshotMetadata, *, layout: CaptureLayout) ->
         objects=[],
         total_tensor_bytes=total_tensor_bytes,
     )
-    return len(canonical_bytes(envelope)) + descriptor_bytes + object_count - 1
+    return envelope, len(
+        canonical_bytes(envelope)
+    ) + descriptor_bytes + object_count - 1
 
 
 def build_snapshot(

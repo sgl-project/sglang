@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import msgspec
 import torch
+from sglang.srt.training_capture.catalog import CaptureLease
 from sglang.srt.training_capture.protocol import (
     DTYPES,
     SequenceInfo,
@@ -16,6 +17,7 @@ from sglang.srt.training_capture.protocol import (
 from sglang.srt.training_capture.snapshot import (
     SnapshotMetadata,
     assemble_snapshot,
+    manifest_fits_budget,
     manifest_size_bound,
     prepare_snapshot_partition,
 )
@@ -152,6 +154,36 @@ class TestManifestBudget(CustomTestCase):
         ):
             self.assertGreater(manifest_size_bound(metadata, layout=layout), 1 << 40)
         self.assertLessEqual(encode.call_count, 32)
+
+    def test_host_capacity_does_not_override_catalog_seal_budget(self):
+        metadata = self.metadata
+        layout = plan_capture_layout(metadata.kv, tp_size=1, pp_layer_ranges=[(0, 4)])
+        lease = CaptureLease(
+            capture_id="c" * 160,
+            fencing_token=18446744073709551615,
+            dataset_id=metadata.dataset_id,
+            sample_id=metadata.sample_id,
+            generation_id=metadata.generation_id,
+            expires_in_seconds=120,
+            renew_after_seconds=20,
+        )
+        self.assertTrue(
+            manifest_fits_budget(
+                metadata, layout=layout, lease=lease, manifest_buffer_bytes=8 << 20
+            )
+        )
+        oversized = msgspec.structs.replace(
+            metadata,
+            provenance=msgspec.structs.replace(
+                metadata.provenance, sampling_config={"payload": "x" * (6 << 20)}
+            ),
+        )
+        self.assertLess(manifest_size_bound(oversized, layout=layout), 8 << 20)
+        self.assertFalse(
+            manifest_fits_budget(
+                oversized, layout=layout, lease=lease, manifest_buffer_bytes=8 << 20
+            )
+        )
 
 
 if __name__ == "__main__":

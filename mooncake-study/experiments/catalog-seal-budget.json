@@ -1,0 +1,571 @@
+{
+  "baseline": "ea55af8cc",
+  "source_audits": [
+    {
+      "version": "v1",
+      "files": 5048,
+      "sha256": "15330edd6d840f44b78e13132125970aca546d0f17650d71f694fd3552df9e10"
+    },
+    {
+      "version": "v2",
+      "files": 5624,
+      "sha256": "2513ce9d056430d6796ea81ceddc7b39426f826aa68c8422d939981a8b3b38ab"
+    }
+  ],
+  "jobs": [
+    {
+      "role": "seal_after",
+      "job": "01791036796165325886-a3966baa4ffd",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/catalog_seal_budget_probe.py",
+        "--expect-early-rejection"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/catalog_seal_budget_probe.py",
+        "--expect-early-rejection"
+      ],
+      "submitted": "2026-10-03T14:13:16.187Z",
+      "result": {
+        "job_id": "01791036796165325886-a3966baa4ffd",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791036805.6980958,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791036796165325886-a3966baa4ffd.log"
+      },
+      "tests": null,
+      "probe": {
+        "manifest_bytes": 6299187,
+        "arena_bytes": 8388608,
+        "objects_written": 0,
+        "pending_journals": 0,
+        "published": 0,
+        "error_type": "CatalogError",
+        "error": "manifest exceeds Catalog seal request budget"
+      }
+    },
+    {
+      "role": "seal_before",
+      "job": "01791035937202671592-4d6bcf8a6dd1",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/catalog_seal_budget_probe.py"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/catalog_seal_budget_probe.py"
+      ],
+      "submitted": "2026-10-03T13:58:57.215Z",
+      "result": {
+        "job_id": "01791035937202671592-4d6bcf8a6dd1",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791035946.712432,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791035937202671592-4d6bcf8a6dd1.log"
+      },
+      "tests": null,
+      "probe": {
+        "manifest_bytes": 6299187,
+        "arena_bytes": 8388608,
+        "objects_written": 16,
+        "pending_journals": 1,
+        "published": 0,
+        "error_type": "CatalogError",
+        "error": "Catalog request exceeds metadata budget"
+      }
+    },
+    {
+      "role": "store",
+      "job": "01791035540468226199-611d840d5458",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submitted": "2026-10-03T13:52:20.486Z",
+      "result": {
+        "job_id": "01791035540468226199-611d840d5458",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791035789.878291,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791035540468226199-611d840d5458.log"
+      },
+      "tests": {
+        "methods": 8,
+        "seconds": 233.643
+      },
+      "probe": null
+    },
+    {
+      "role": "store_v2",
+      "job": "01791036796582329214-fda222edbaa2",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-v",
+        "-f"
+      ],
+      "submitted": "2026-10-03T14:13:16.597Z",
+      "result": {
+        "job_id": "01791036796582329214-fda222edbaa2",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791037216.2006974,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791036796582329214-fda222edbaa2.log"
+      },
+      "tests": {
+        "methods": 8,
+        "seconds": 233.861
+      },
+      "probe": null
+    },
+    {
+      "role": "units_v2",
+      "job": "01791036796377020052-0fe06d93f7c0",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/manifest_budget_units.py"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-cohort-manifest-budget-v2/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/manifest_budget_units.py"
+      ],
+      "submitted": "2026-10-03T14:13:16.388Z",
+      "result": {
+        "job_id": "01791036796377020052-0fe06d93f7c0",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791036968.1818056,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791036796377020052-0fe06d93f7c0.log"
+      },
+      "tests": {
+        "methods": 168,
+        "seconds": 149.979
+      },
+      "probe": null
+    }
+  ],
+  "cohort_rejections": [
+    {
+      "cohort_manifest_rejection": "budget_tp_pp",
+      "ranks": [
+        {
+          "budget_rejections": 1,
+          "capture_id": "f388b50a283643b6afaebebec463ef35",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "f388b50a283643b6afaebebec463ef35",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "f388b50a283643b6afaebebec463ef35",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "f388b50a283643b6afaebebec463ef35",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        }
+      ]
+    },
+    {
+      "cohort_manifest_rejection": "budget_replicated",
+      "ranks": [
+        {
+          "budget_rejections": 1,
+          "capture_id": "92886759cec54fcc88d7dd594bf054a7",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "92886759cec54fcc88d7dd594bf054a7",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "92886759cec54fcc88d7dd594bf054a7",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "92886759cec54fcc88d7dd594bf054a7",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        }
+      ]
+    },
+    {
+      "cohort_manifest_rejection": "budget_inactive",
+      "ranks": [
+        {
+          "budget_rejections": 1,
+          "capture_id": "6a31c7c3cde14934abbf8ceaccadc156",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "6a31c7c3cde14934abbf8ceaccadc156",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "6a31c7c3cde14934abbf8ceaccadc156",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "6a31c7c3cde14934abbf8ceaccadc156",
+          "copy_gate_checked": false,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        }
+      ]
+    },
+    {
+      "cohort_manifest_rejection": "budget_peer_cuda",
+      "ranks": [
+        {
+          "budget_rejections": 0,
+          "capture_id": "603d004450ca4ed5a5c5495418ab7bc6",
+          "copy_gate_checked": true,
+          "expected": "FAILED",
+          "rejected_before_capture": false,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 1,
+          "capture_id": "603d004450ca4ed5a5c5495418ab7bc6",
+          "copy_gate_checked": true,
+          "expected": "FAILED",
+          "rejected_before_capture": true,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 0,
+          "capture_id": "603d004450ca4ed5a5c5495418ab7bc6",
+          "copy_gate_checked": true,
+          "expected": "FAILED",
+          "rejected_before_capture": false,
+          "stale_ticket_rejected": true
+        },
+        {
+          "budget_rejections": 0,
+          "capture_id": "603d004450ca4ed5a5c5495418ab7bc6",
+          "copy_gate_checked": true,
+          "expected": "FAILED",
+          "rejected_before_capture": false,
+          "stale_ticket_rejected": true
+        }
+      ]
+    }
+  ],
+  "final_regression_methods": 176,
+  "accepted_rejection_followup_snapshots": 8,
+  "snapshot_objects": 32,
+  "snapshot_tensor_bytes": 4532,
+  "resident": {
+    "observed": "2026-10-03T14:21:03.881Z",
+    "mode": "idle_load",
+    "active_pid": null,
+    "idle_pid": 29465,
+    "queued": 0,
+    "live_processes": "    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n29465     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6",
+    "gpu_processes": "10512, [Not Found], 1092 MiB\n"
+  },
+  "lint": {
+    "baseline": "ea55af8cc",
+    "format": "8 files already formatted",
+    "files": [
+      {
+        "path": "python/sglang/srt/training_capture/catalog.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "python/sglang/srt/training_capture/coordinator.py",
+        "before": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          }
+        ],
+        "after": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/training_capture/snapshot.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "python/sglang/srt/training_capture/snapshot_writer.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "python/sglang/test/training_capture_cohort_runtime.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "test/registered/storage/test_training_snapshot_mooncake.py",
+        "before": [
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "PLW1510",
+            "message": "`subprocess.run` without explicit `check` argument"
+          }
+        ],
+        "after": [
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "PLW1510",
+            "message": "`subprocess.run` without explicit `check` argument"
+          }
+        ]
+      },
+      {
+        "path": "test/registered/unit/training_capture/test_manifest_budget.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "path": "test/registered/unit/training_capture/test_snapshot_writer.py",
+        "before": [],
+        "after": []
+      }
+    ]
+  },
+  "archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/cohort-manifest-budget-20261003",
+    "files": 31,
+    "manifest_sha256": "f73ef9bab1658a4bfca6d57660e6cbd16258b0731a747f1b1714636786969fe1"
+  },
+  "scope": {
+    "gpu_count": 1,
+    "cohort_processes": 4,
+    "forward_inputs": "synthetic",
+    "transport": "tcp",
+    "catalog": "loopback TestCaptureCatalog",
+    "probe_store": "byte-addressed Store test double",
+    "production_catalog": false,
+    "multi_gpu_inference": false,
+    "new_rdma_validation": false,
+    "production_slo_acceptance": false,
+    "training_quality_acceptance": false
+  }
+}
