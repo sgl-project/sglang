@@ -9,6 +9,7 @@ diffusion models.
 """
 
 import atexit
+import functools
 import json
 import mmap
 import os
@@ -298,11 +299,29 @@ def _pick_audio_sample_rate(
     return selected_sr
 
 
-def _resolve_ffmpeg_exe() -> str:
-    ffmpeg_exe = "ffmpeg"
+@functools.lru_cache(maxsize=1)
+def _system_ffmpeg_with_libx264() -> Optional[str]:
     ffmpeg_on_path = shutil.which("ffmpeg")
-    if ffmpeg_on_path:
-        ffmpeg_exe = ffmpeg_on_path
+    if not ffmpeg_on_path:
+        return None
+    try:
+        encoders = subprocess.run(
+            [ffmpeg_on_path, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return ffmpeg_on_path if "libx264" in encoders else None
+
+
+def _resolve_ffmpeg_exe() -> str:
+    # imageio-ffmpeg's bundled 4.2.2 converts rgb24->yuv420p ~20x slower on aarch64
+    ffmpeg_exe = _system_ffmpeg_with_libx264()
+    if ffmpeg_exe is not None:
+        return ffmpeg_exe
+    ffmpeg_exe = "ffmpeg"
     try:
         if _imageio_ffmpeg is not None:
             ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()

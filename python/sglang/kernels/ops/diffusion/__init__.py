@@ -232,6 +232,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.vsa_block_sparse_sm100",
+        KernelBackend.JIT,
+        "attention.vsa_block_sparse_sm100_jit:vsa_block_sparse_sm100",
+        frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}),
+        "FastVideo's warp-specialized tcgen05 block-sparse VSA forward (64-token tiles).",
+    ),
+    (
         "diffusion.flux2_layernorm_modulate_fp8_quant",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate_fp8_quant_raw",
@@ -673,6 +680,8 @@ _EXPORTS: dict[str, str] = {
     "prepare_rope_tables": "attention.sana_wm_gdn_triton",
     "_attn_fwd": "attention.sparse_linear_attn_triton",
     "get_block_map": "attention.sparse_linear_attn_triton",
+    "can_use_vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
+    "vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
     # MoE routing
     "can_use_group_limited_topk": "routing.group_limited_topk_triton",
     "group_limited_topk": "routing.group_limited_topk_triton",

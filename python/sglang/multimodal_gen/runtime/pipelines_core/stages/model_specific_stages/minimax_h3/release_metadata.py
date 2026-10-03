@@ -51,6 +51,8 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
+    # trained DMD rungs of a distilled release, unshifted; None keeps the uniform grid
+    dmd_denoising_steps: tuple[int, ...] | None = None
 
     @classmethod
     def from_model_index(
@@ -91,6 +93,21 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.sigma_shift_scales requires numeric "
                 "video and audio values"
             ) from exc
+        dmd_steps = raw.get("dmd_denoising_steps")
+        if dmd_steps is not None:
+            if (
+                not isinstance(dmd_steps, list)
+                or not dmd_steps
+                or any(
+                    type(step) is not int or not 0 < step <= 1000 for step in dmd_steps
+                )
+                or any(left <= right for left, right in zip(dmd_steps, dmd_steps[1:]))
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.dmd_denoising_steps must be "
+                    "strictly decreasing integers in (0, 1000]"
+                )
+            dmd_steps = tuple(dmd_steps)
         metadata = cls(
             schema_version=1,
             partition=partition,
@@ -98,6 +115,7 @@ class MiniMaxH3ReleaseMetadata:
             task_aliases=dict(aliases),
             video_sigma_shift=video_sigma,
             audio_sigma_shift=audio_sigma,
+            dmd_denoising_steps=dmd_steps,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
