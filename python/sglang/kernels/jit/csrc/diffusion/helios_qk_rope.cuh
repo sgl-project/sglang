@@ -79,10 +79,18 @@ struct HeliosQKRoPEKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
-    TensorMatcher({N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+    int64_t batch = 1;
+    if (q.ndim() == 4) {
+      auto B = SymbolicSize{"batch"};
+      TensorMatcher({B, N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
+      TensorMatcher({B, N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+      batch = B.unwrap();
+    } else {
+      TensorMatcher({N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
+      TensorMatcher({N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+    }
 
-    const int64_t tokens = N.unwrap();
+    const int64_t tokens = batch * N.unwrap();
     const int64_t heads = H.unwrap();
     const int64_t head_dim = D.unwrap();
     const int64_t freq_dim = F.unwrap();

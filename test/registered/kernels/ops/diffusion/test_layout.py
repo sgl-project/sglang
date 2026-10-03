@@ -104,15 +104,16 @@ def test_usp_merge_heads_bitwise(dtype, world, seq, batch, h_local, head_dim):
 
 def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
     # The wrapper degrades to the aten permute for anything the fast path
-    # rejects -- a wrong rank, a transposed view, an empty leading dim, or a
-    # ROCm build -- so callers never need their own guard.
+    # rejects: a transposed view, an empty leading dim, or a ROCm build.
     x = torch.randn(2, 4, 1, 4, 64, dtype=torch.bfloat16, device=DEVICE)
-    for value in (x.transpose(0, 1), x[:0], x[0]):
+    for value in (x.transpose(0, 1), x[:0]):
         assert not can_use_usp_merge_heads(value)
-        if value.dim() == 5:
-            assert torch.equal(
-                usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
-            )
+        assert torch.equal(
+            usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
+        )
+
+    with pytest.raises((ValueError, RuntimeError)):
+        usp_merge_heads(x[0])
 
     with patch.object(torch.version, "hip", "6.3"):
         assert not can_use_usp_merge_heads(x)
@@ -500,6 +501,21 @@ def test_causal_conv3d_cat_pad_cuda_matches_triton(
     actual = fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
     expected = fused_causal_conv3d_cat_pad_triton(x, cache_x, padding)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("bad_input", ["shape", "layout", "device", "padding"])
+def test_causal_conv3d_cat_pad_launcher_rejects_invalid_inputs(bad_input):
+    x, cache, padding = _conv3d_inputs(8, 1, 6, 6, 1)
+    if bad_input == "shape":
+        cache = cache[:, :4].contiguous()
+    elif bad_input == "layout":
+        x = x.transpose(-1, -2)
+    elif bad_input == "device":
+        cache = cache.cpu()
+    else:
+        padding = (1, 1, 1, 1, 0, 0)
+    with pytest.raises(RuntimeError):
+        fused_causal_conv3d_cat_pad_cuda(x, cache, padding)
 
 
 def test_causal_conv3d_cat_pad_torch_compile():

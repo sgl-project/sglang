@@ -80,18 +80,33 @@ GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
 
 ## Entry-point protocol
 
-Every public kernel is a **predicate + kernel** pair:
+Keep backend selection separate from input validation.
 
-```python
-if can_use_<op>(...):
-    out = <op>(...)
-else:
-    out = <reference chain>
-```
+- Select a backend using properties that distinguish supported implementations:
+  device family, dtype, layout, alignment, architecture, and numerical contract.
+  A shape restriction belongs here only when it is a real specialization, such
+  as a fixed head dimension or an unsupported broadcast mode.
+- Validate the selected implementation's inputs before launching. For JIT CUDA,
+  use `TensorMatcher` and `CHECK_HOST` in the C++ launcher; keep dtype checks in
+  the cached module factory. For Triton, validate in the Python launch wrapper.
+  Mismatched shapes or devices are errors, not reasons to silently try another
+  backend. Preserve tensor dimensions until they have been validated.
+- Add a `can_use_*` predicate only when a caller needs a backend choice. A direct
+  kernel entry point does not need a second copy of the same predicate. Keep
+  fallback selection in one wrapper when several callers share it.
+- Let errors from a selected implementation propagate. Do not catch every
+  exception and permanently disable a kernel for later requests. First-use
+  numerical verification in `sites/` is a separate policy: retain its reference
+  comparison when exactness depends on a library's reduction or rounding order.
 
-The kernel raises on an unsupported input. It does not return `None` — a
-silent `None` is too easy to forget to check, and the failure mode is a
-wrong-looking image rather than an exception.
+For example, Helios chooses the packed RoPE kernel for supported dtypes and
+contiguous, pair-aligned inputs. Its C++ launcher checks the Q/K and frequency
+shapes and common device. The same launcher accepts the model's batched tensors
+without flattening away their shape relationships.
+
+Existing `try_*` entry points return `None` for an unsupported specialization.
+Keep that convention explicit at their call sites; do not add it to direct
+kernel entry points.
 
 ## Selection matrix
 
@@ -127,13 +142,12 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `residual_gate_add` | KDA (JIT CUDA) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 
-The transposed-dense path uses a shared-memory tile to read the update in
-logical row-major order while keeping residual reads and output writes
-coalesced in their `[B, hidden, tokens]` backing layout. Do not insert a
-`.contiguous()` merely to reach the ordinary path; that restores an entire
-tensor copy per residual site.
+The transposed-dense path tiles along the physical stride-1 token dimension
+for coalesced residual reads and output writes. The contiguous layouts use
+JIT CUDA. Do not insert a `.contiguous()` to reach that path: it adds a full
+tensor copy at each residual site.
 
 ### RoPE / QK-norm
 
@@ -218,7 +232,8 @@ inspecting model modules is its whole job.
    with its source revision and any JIT CUDA source files.
 2. Export it from `__init__.py` (`_EXPORTS`) and register a `KernelSpec`
    (`_SPECS`).
-3. Give it a `can_use_*` predicate; raise, don't return `None`.
+3. Keep selection and validation separate as described above. Reuse an existing
+   wrapper when the fallback policy is shared.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
 5. If it is not bit-exact, gate it through `sites/`. It must mount for both

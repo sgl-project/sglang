@@ -72,7 +72,6 @@ def test_helios_qk_rope_runtime_guards() -> None:
     assert not can_use_helios_qk_rope(q, k.float(), freqs)
     assert not can_use_helios_qk_rope(q, k, freqs.bfloat16())
     assert not can_use_helios_qk_rope(q.cpu(), k.cpu(), freqs.cpu())
-    assert not can_use_helios_qk_rope(q, k, freqs[..., :-2])
     assert not can_use_helios_qk_rope(q[:, :, :, ::2], k, freqs)
     assert not can_use_helios_qk_rope(q[:, :0], k[:, :0], freqs[:, :0])
 
@@ -106,9 +105,9 @@ def test_helios_attention_dispatch_and_tp_fallback() -> None:
     assert q_out is q
     assert k_out is k
     fused.assert_called_once()
-    assert fused.call_args.args[0].shape == (17, 8, 128)
-    assert fused.call_args.args[1].shape == (17, 8, 128)
-    assert fused.call_args.args[2].shape == (17, 256)
+    assert fused.call_args.args[0] is q
+    assert fused.call_args.args[1] is k
+    assert fused.call_args.args[2] is freqs
 
     attention.tp_rmsnorm = True
     with patch.object(helios, "fused_inplace_helios_qk_rope") as fused:
@@ -156,6 +155,71 @@ def test_helios_attention_fullgraph_dispatch() -> None:
 
     assert torch.equal(q_out, q_ref)
     assert torch.equal(k_out, k_ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_helios_qk_rope_batched(dtype):
+    q = torch.randn(2, 17, 8, 128, device="cuda", dtype=dtype)
+    k = torch.randn_like(q)
+    freqs = torch.randn(2, 17, 256, device="cuda", dtype=torch.float32)
+    q_ref, k_ref = _reference(q, freqs), _reference(k, freqs)
+    fused_inplace_helios_qk_rope(q, k, freqs)
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+
+
+@pytest.mark.parametrize(
+    "freq_shape,key_heads",
+    [
+        ((1, 17, 256), 8),
+        ((2, 1, 256), 8),
+        ((256,), 8),
+        ((2, 17, 4), 8),
+        ((2, 17, 256), 4),
+    ],
+)
+def test_helios_attention_preserves_broadcast_fallback(freq_shape, key_heads):
+    import sglang.multimodal_gen.runtime.models.dits.helios as helios
+
+    attention = helios.HeliosSelfAttention.__new__(helios.HeliosSelfAttention)
+    nn.Module.__init__(attention)
+    attention.tp_rmsnorm = False
+    q = torch.randn(2, 17, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 17, key_heads, 128, device="cuda", dtype=q.dtype)
+    freqs = torch.randn(freq_shape, device="cuda", dtype=torch.float32)
+    assert not can_use_helios_qk_rope(q, k, freqs)
+    with patch.object(helios, "fused_inplace_helios_qk_rope") as fused:
+        q_out, k_out = attention._apply_rotary_qk(q, k, freqs)
+    fused.assert_not_called()
+    assert torch.equal(q_out, _reference(q, freqs))
+    assert torch.equal(k_out, _reference(k, freqs))
+
+
+@pytest.mark.parametrize(
+    "bad_input", ["q_rank", "k_shape", "freq_shape", "freq_batch", "device"]
+)
+def test_helios_qk_rope_launcher_rejects_invalid_inputs(bad_input):
+    q = torch.randn(2, 17, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    freqs = torch.randn(2, 17, 256, device="cuda", dtype=torch.float32)
+    if bad_input == "q_rank":
+        q = q.flatten(1)
+    elif bad_input == "k_shape":
+        k = k.view(2, 17, 4, 256)
+    elif bad_input == "freq_shape":
+        freqs = freqs[..., :128].contiguous()
+    elif bad_input == "freq_batch":
+        # Flattening before validation would hide this mismatch.
+        freqs = freqs.view(1, 34, 256)
+    else:
+        k = k.cpu()
+    if bad_input == "device":
+        assert can_use_helios_qk_rope(q, k, freqs)
+    q_before, k_before = q.clone(), k.clone()
+    with pytest.raises(RuntimeError):
+        fused_inplace_helios_qk_rope(q, k, freqs)
+    assert torch.equal(q, q_before)
+    assert torch.equal(k, k_before)
 
 
 def test_helios_qk_rope_rejects_bad_frequency_shape() -> None:

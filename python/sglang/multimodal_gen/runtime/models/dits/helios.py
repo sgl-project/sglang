@@ -298,11 +298,7 @@ class HeliosSelfAttention(nn.Module):
         rotary_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.tp_rmsnorm and can_use_helios_qk_rope(q, k, rotary_emb):
-            fused_inplace_helios_qk_rope(
-                q.view(-1, q.shape[-2], q.shape[-1]),
-                k.view(-1, k.shape[-2], k.shape[-1]),
-                rotary_emb.view(-1, rotary_emb.shape[-1]),
-            )
+            fused_inplace_helios_qk_rope(q, k, rotary_emb)
             return q, k
         return (
             apply_rotary_emb_transposed(q, rotary_emb),
