@@ -40,6 +40,10 @@ register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
+CUDA_NATIVE_ONLY = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="the bit-exact residual-gate fast path is CUDA-only",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -170,9 +174,12 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
 
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
     ref = residual + update * gate
-    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
+    if torch.version.hip is None:
+        assert can_use_residual_gate_add_cuda(residual, update, gate)
+        _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
+    else:
+        assert not can_use_residual_gate_add_cuda(residual, update, gate)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
 
 
@@ -181,6 +188,7 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     "shape,gate_shape",
     [((1, 9, 64), (1, 1, 64)), ((1, 9, 64), (1, 9, 64)), PER_TOKEN_GATE_CASES[0]],
 )
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_dtypes(dtype, shape, gate_shape):
     residual = torch.randn(shape, device=DEVICE, dtype=dtype)
     update = torch.randn_like(residual)
@@ -192,6 +200,7 @@ def test_residual_gate_add_dtypes(dtype, shape, gate_shape):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 17, 65), (1, 7800, 2240), (2, 33, 128)])
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_residual(dtype, shape):
     batch, tokens, hidden_size = shape
     residual = torch.randn(
@@ -208,6 +217,7 @@ def test_residual_gate_add_transposed_residual(dtype, shape):
     assert out.stride() == ref.stride() == residual.stride()
 
 
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_storage_offsets():
     tokens, hidden_size = 33, 128
     residual = (
@@ -231,6 +241,7 @@ def test_residual_gate_add_transposed_storage_offsets():
 
 
 @pytest.mark.parametrize("transposed", [False, True])
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_torch_compile_fullgraph(transposed):
     shape = (1, 128, 32) if transposed else (1, 32, 128)
     residual = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
@@ -244,6 +255,7 @@ def test_residual_gate_add_torch_compile_fullgraph(transposed):
     assert out.stride() == residual.stride()
 
 
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_cuda_graph():
     residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
         1, 2
@@ -269,7 +281,9 @@ def test_residual_gate_add_guards_and_eager_fallback():
     residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn((1, 1, 64), device=DEVICE, dtype=torch.bfloat16)
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    assert can_use_residual_gate_add_cuda(residual, update, gate) == (
+        torch.version.hip is None
+    )
 
     rejected = [
         (residual.cpu(), update, gate),  # not on device

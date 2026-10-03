@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
@@ -47,6 +48,12 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _assert_exact_or_rocm_close(actual, expected, *, atol, rtol):
+    if not current_platform.is_hip():
+        atol = rtol = 0
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 @pytest.fixture(scope="module")
@@ -215,7 +222,15 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
     weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
+    target_names = (
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.0.img_mlp.out",
+    )
+    base_weights = {
+        name: actual_model.get_submodule(name).weight.detach().clone()
+        for name in target_names
+    }
+    for name in target_names:
         layer = reference.get_submodule(name)
         a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
         b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
@@ -236,7 +251,11 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
         assert not torch.equal(actual, baseline)
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
         pipeline.unmerge_lora_weights("transformer")
-        torch.testing.assert_close(actual_model(**kwargs), baseline, atol=0, rtol=0)
+        for name, base_weight in base_weights.items():
+            assert torch.equal(actual_model.get_submodule(name).weight, base_weight)
+        _assert_exact_or_rocm_close(
+            actual_model(**kwargs), baseline, atol=1e-6, rtol=1e-5
+        )
 
 
 @pytest.mark.parametrize("edit", [False, True])
