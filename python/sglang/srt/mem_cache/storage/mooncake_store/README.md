@@ -36,8 +36,10 @@ This integration is particularly valuable for production deployments involving l
 **Method 1: with pip**
 
 ```bash
-pip install mooncake-transfer-engine
+pip install 'mooncake-transfer-engine>=0.3.12'
 ```
+
+KV-cache dtype isolation uses Mooncake `tenant_id`, which requires **0.3.12+**. Upgrade an older install with `pip install -U 'mooncake-transfer-engine>=0.3.12'`.
 
 **Method 2: from source**
 
@@ -262,7 +264,7 @@ When `tenant_id` is set, SGLang forwards it to `MooncakeDistributedStore.setup(.
 
 You can configure it through `tenant_id` in `--hicache-storage-backend-extra-config`, `tenant_id` in the JSON config file, or `MOONCAKE_TENANT_ID`.
 
-> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` also requires a Mooncake version that supports the `tenant_id` parameter in `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client.
+> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` requires **mooncake-transfer-engine >= 0.3.12**, which added `tenant_id` to `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client. If you use `--enable_multi_tenants=true`, register the composed tenant name produced by KV-cache dtype isolation (for example `dtype_bfloat16` or `tenant-a_dtype_float8_e4m3fn`).
 
 **SSD Offload (`enable_ssd_offload`):**
 
@@ -319,6 +321,25 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
 ```
 
+**KV Cache Dtype Isolation:**
+
+SGLang appends the resolved KV-cache dtype to the Mooncake tenant, keeping different cache formats in separate namespaces:
+
+- Default tenant + `bfloat16` → `dtype_bfloat16`
+- Explicit tenant `tenant-a` + `float8_e4m3fn` → `tenant-a_dtype_float8_e4m3fn`
+
+The suffix uses the logical torch dtype, so `--kv-cache-dtype fp8_e4m3` resolves to `float8_e4m3fn` on CUDA, even when buffers store FP8 bytes as `uint8`. `auto` uses the resolved cache dtype, including checkpoint quantization settings. `extra_backend_tag` and `model_name` continue to prefix object keys independently.
+
+Enable `--enable_multi_tenants=true` on the Mooncake master and register the composed tenant names in its quota policy. Without this, Mooncake uses the default namespace and dtype isolation is not enforced. Older clients that reject `tenant_id` fail at startup with an upgrade hint.
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --kv-cache-dtype fp8_e4m3 \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "tenant_id": "tenant-a"}'
+```
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
@@ -359,6 +380,8 @@ mooncake_master --eviction_high_watermark_ratio=0.95
 ```bash
 mooncake_client --global_segment_size=4GB
 ```
+
+Dummy `setup_dummy()` does not pass `tenant_id`. For dtype isolation, start `mooncake_client` with the matching composed tenant, e.g. `--tenant_id=dtype_float8_e4m3fn`.
 
 **Parameter Explanation:**
 
