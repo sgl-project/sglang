@@ -41,6 +41,7 @@ def _make_unit_server_args():
         enable_breakable_cuda_graph=False,
         enable_layerwise_nvtx_marker=False,
         enable_torch_compile=False,
+        ep_size=1,
         kv_gather_degree=1,
         sp_split_auto=False,
         model_loaded={},
