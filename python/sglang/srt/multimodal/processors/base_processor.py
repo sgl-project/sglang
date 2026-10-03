@@ -1910,7 +1910,7 @@ class BaseMultimodalProcessor(ABC):
                 all_collected_items.append(
                     MultimodalDataItem(
                         modality=modality,
-                        feature=feature,
+                        precomputed_embeddings=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         model_specific_data=dict_item,
                     )
