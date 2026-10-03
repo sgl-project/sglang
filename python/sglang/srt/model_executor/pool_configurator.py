@@ -257,6 +257,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
+                        dcp_replicated=True,
                     )
                     if _is_npu and dcp_size > 1:
                         target_indexer_size *= dcp_size
@@ -372,6 +373,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
+                    dcp_replicated=True,
                 )
                 if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
                     indexer_cell_size *= dcp_size
@@ -513,6 +515,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
+        dcp_replicated: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = (
@@ -537,6 +540,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
+            # Hopper DCP: the cell size is per PHYSICAL slot of the rank's
+            # striped MLA pool, but the target's index-K is replicated over the
+            # dcp-times-wider virtual loc space (kv_cache_configurator passes
+            # index_buf_size = (size + page) * dcp). Callers pricing the target's
+            # own index-K pass dcp_replicated=True; the EAGLE draft term multiplies
+            # by dcp itself (see the draft branch in _compute_cell_size), so it
+            # must not be scaled here as well.
+            if dcp_replicated and not kvc.is_draft_worker:
+                indexer_ratio *= get_parallel().attn_dcp_size
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
