@@ -107,6 +107,20 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+class Phase(str, Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+def architecture_for_capability(major: int) -> str:
+    """Plan-table name for compute capability major: sm90, sm100 (>= 10) or default."""
+    if major == 9:
+        return "sm90"
+    if major >= 10:
+        return "sm100"
+    return "default"
+
+
 def copy_weight_into_buffer(
     buffer_view: torch.Tensor,
     weight: torch.Tensor,
