@@ -255,6 +255,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
     },
     {
+      name: "FLUX 3 Action",
+      modelIds: ["black-forest-labs/flux-3-action-droid"],
+      cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
+    },
+    {
       name: "LingBotWorld",
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::forward::{forward_chat_request, SelectedWorkers};
-use super::preparation::{parse_routing_fields, PreparedChatRequest};
+use super::forward::SelectedWorkers;
+use super::preparation::PreparedRequest;
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
     X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
@@ -12,49 +12,33 @@ use crate::discovery::ModelId;
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use axum::body::Body;
-use axum::http::{HeaderMap, Response};
-use bytes::Bytes;
-use std::collections::HashMap;
-use std::time::Instant;
+use axum::http::HeaderMap;
 
-/// Bucket-first implementation selected by `AppContext::chat_routing`.
-pub(super) async fn chat_completions(
+/// Bucket-first selection used when `AppContext::chat_routing` is reorg.
+pub(super) async fn select_workers(
     ctx: &AppContext,
-    resolvers: &HashMap<ModelId, BucketResolver>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>, ApiError> {
-    let start = Instant::now();
-    let mut fields = parse_routing_fields(&body)?;
-    let model = ModelId(
-        fields
-            .model
-            .take()
-            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
-    );
-    let resolver = resolvers
-        .get(&model)
-        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
-    // Length-based routing needs tokenization even for load-only group policies.
-    let request = PreparedChatRequest::prepare(ctx, model, fields, body, true)?;
-    let input_tokens = request.input_token_count as u64;
-    let expected_peak_tokens = request
-        .max_output_tokens
-        .map(|output| {
-            input_tokens.checked_add(output).ok_or_else(|| {
-                ApiError::BadRequest("input and output token counts overflow".into())
-            })
-        })
-        .transpose()?;
+    resolver: &BucketResolver,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+) -> Result<SelectedWorkers, ApiError> {
+    let input_tokens = request.sequence_token_count as u64;
+    if request
+        .output_tokens
+        .is_some_and(|output| input_tokens.checked_add(output).is_none())
+    {
+        return Err(ApiError::BadRequest(
+            "input and output token counts overflow".into(),
+        ));
+    }
+    let expected_peak_tokens = request.expected_peak_sequence_tokens;
 
     let ttft_ms = if resolver.ttft_slo != SloPreference::Disabled {
-        parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?
+        parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?
     } else {
         None
     };
     let tokens_per_second = if resolver.tps_slo != SloPreference::Disabled {
-        parse_optional_positive_f64_header(&headers, &X_SGL_TPS_SLO, "TPS SLO")?
+        parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?
     } else {
         None
     };
@@ -85,13 +69,13 @@ pub(super) async fn chat_completions(
             .model
             .affinity
             .as_ref()
-            .and_then(|config| nonempty_header(&headers, &config.session_id_header)),
+            .and_then(|config| nonempty_header(headers, &config.session_id_header)),
         routing_key: ctx
             .config
             .model
             .sticky
             .as_ref()
-            .and_then(|config| nonempty_header(&headers, &config.header_name)),
+            .and_then(|config| nonempty_header(headers, &config.header_name)),
     };
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
@@ -99,12 +83,11 @@ pub(super) async fn chat_completions(
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
-                let workers = SelectedWorkers {
+                return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,
                     decode: picks.decode.map(|pick| pick.engine),
                     track_dispatch_timestamps: false,
-                };
-                return forward_chat_request(ctx, request, workers, headers, start).await;
+                });
             }
             Err((stage, error)) => {
                 tracing::debug!(bucket = %bucket.id, ?stage, %error, "bucket selection failed");

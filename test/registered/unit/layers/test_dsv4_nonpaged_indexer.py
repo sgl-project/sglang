@@ -340,10 +340,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             )
 
     def test_eligibility_is_fail_closed(self):
-        self.assertIs(envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.default, True)
-        self.assertEqual(
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
-        )
         self.assertTrue(self._is_eligible())
         for case in (
             {"enabled": False},

@@ -42,7 +42,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
+    model_forward_stages,
 )
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
@@ -57,12 +57,14 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -129,7 +131,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
@@ -1036,7 +1038,7 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
                     out_cache_loc
                 )
-        return KVWriteLoc(forward_batch.out_cache_loc, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1541,14 +1543,6 @@ class Dots3DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = Dots3MoE(
                 config=config,
@@ -1559,7 +1553,7 @@ class Dots3DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1578,11 +1572,21 @@ class Dots3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
@@ -1600,13 +1604,10 @@ class Dots3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -1615,18 +1616,17 @@ class Dots3DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 ffn_exit.fuse_mlp_allreduce,
                 ffn_exit.mlp_reduce_scatter,
             )
-        return ffn_exit.finish(hidden_states, residual)
+        return ffn_exit.finish(hidden_states)
 
     def op_comm_prepare_attn(
         self,
@@ -1634,12 +1634,11 @@ class Dots3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
+            hidden_states, forward_batch
         )
         state.update(
             dict(
@@ -1651,18 +1650,17 @@ class Dots3DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
+        hidden_states = self.attn_boundary.finish(
+            state.pop("hidden_states_after_attn"), state.forward_batch
+        )
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            hidden_states, state.forward_batch
         )
 
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
         if not (
-            enable_moe_dense_fully_dp()
+            is_dense_ffn_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
@@ -1673,16 +1671,13 @@ class Dots3DecoderLayer(nn.Module):
             state.hidden_states_mlp_output = hidden_states
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
+        hidden_states = self.ffn_boundary.finish_complete_output(
+            state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -1723,7 +1718,7 @@ class Dots3Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Dots3DecoderLayer(
                 config=config,
@@ -1732,8 +1727,6 @@ class Dots3Model(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1765,11 +1758,12 @@ class Dots3Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
@@ -1785,38 +1779,28 @@ class Dots3Model(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
+                hidden_states = layer(
+                    positions, hidden_states, forward_batch, zero_allocator
                 )
 
         if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states = model_forward_stages(
                 layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
                 zero_allocator=zero_allocator,
             )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
         return hidden_states
 
 
@@ -1848,7 +1832,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = Dots3Model(
@@ -2730,7 +2713,6 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
         language_model = self.thinker.language_model
         self.pp_group = language_model.pp_group
-        self.tp_size = language_model.tp_size
         self.quant_config = language_model.quant_config
         self.num_fused_shared_experts = language_model.num_fused_shared_experts
         self.forward = self.thinker.forward

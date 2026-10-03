@@ -109,8 +109,6 @@ class DSparkAttention(MqaAttentionBase):
             layer_id,
             quant_config,
             prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
             compress_ratio=0,
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
@@ -798,6 +796,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+    precompile_kernels_after_loading = (
+        DeepseekV4ForCausalLM.precompile_kernels_after_loading
+    )
 
     @classmethod
     def shared_experts_fusion_disable_reason(
