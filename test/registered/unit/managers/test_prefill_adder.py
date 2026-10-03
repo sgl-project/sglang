@@ -12,7 +12,12 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
@@ -1649,6 +1654,88 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             ).memory_budget.swa_never_fits(**req)
         )
+
+    def test_charge_head_prefix_pin_shrinks_both_full_budgets(self):
+        # A head prefix pinned mid-pass must not stay sellable to the lookahead
+        # candidates scanned after it.
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.full_evictable_size.return_value = 20_000
+        adder = self.create_adder(self.create_running_batch())
+        before_total = adder.rem_total_tokens
+        before_cur = adder.cur_rem_tokens
+
+        adder.charge_head_prefix_pin(30_000)
+
+        self.assertEqual(adder.rem_total_tokens, before_total - 30_000)
+        self.assertEqual(adder.cur_rem_tokens, before_cur - 30_000)
+
+    def test_charge_head_prefix_pin_ignores_a_zero_or_negative_amount(self):
+        adder = self.create_adder(self.create_running_batch())
+        budget = adder.memory_budget
+        offsets = (budget.total_offset, budget.current_offset)
+
+        adder.charge_head_prefix_pin(0)
+        adder.charge_head_prefix_pin(-5)
+
+        self.assertEqual((budget.total_offset, budget.current_offset), offsets)
+
+    def test_charge_head_prefix_pin_past_the_budget_reads_as_no_token(self):
+        # Over-charging is allowed to drive the budget negative: budget_state
+        # then refuses the next candidate, which is the intended outcome.
+        self.mock_token_allocator.available_size.return_value = 1_000
+        self.mock_tree_cache.full_evictable_size.return_value = 1_000
+        adder = self.create_adder(self.create_running_batch())
+
+        adder.charge_head_prefix_pin(10_000)
+
+        self.assertLess(adder.rem_total_tokens, 0)
+        self.assertEqual(adder.budget_state(), AddReqResult.NO_TOKEN)
+
+
+class TestPrefillBudgetHeadroom(CustomTestCase):
+    """The head prefix lock's capacity gate reads `headroom()` outside a
+    PrefillAdder, so each allocator's budget has to report the same pool halves
+    its `remaining_total` is built from."""
+
+    def create_tree_cache(self, *, supports_mamba: bool) -> MagicMock:
+        tree_cache = MagicMock()
+        tree_cache.supports_mamba.return_value = supports_mamba
+        tree_cache.evictable_size.return_value = 11
+        tree_cache.full_evictable_size.return_value = 22
+        tree_cache.swa_evictable_size.return_value = 33
+        return tree_cache
+
+    def headroom_of(self, allocator_cls, *, supports_mamba: bool = False):
+        # Goes through the allocator class's own create_prefill_budget, so the
+        # test also pins which budget each allocator hands the scheduler.
+        allocator = MagicMock(spec=allocator_cls)
+        allocator.page_size = 1
+        allocator.swa_req_ring = False
+        # Assigned, not configured: the base spec has no full/swa accessors.
+        allocator.available_size = MagicMock(return_value=1)
+        allocator.full_available_size = MagicMock(return_value=2)
+        allocator.swa_available_size = MagicMock(return_value=3)
+        budget = allocator_cls.create_prefill_budget(
+            allocator, self.create_tree_cache(supports_mamba=supports_mamba)
+        )
+        available, evictable = budget.headroom()
+        self.assertEqual(budget.remaining_total, available + evictable)
+        return available, evictable
+
+    def test_plain_pool_reads_available_and_evictable(self):
+        self.assertEqual(self.headroom_of(BaseTokenToKVPoolAllocator), (1, 11))
+
+    def test_mamba_pool_reads_the_full_evictable_half(self):
+        self.assertEqual(
+            self.headroom_of(BaseTokenToKVPoolAllocator, supports_mamba=True),
+            (1, 22),
+        )
+
+    def test_hybrid_swa_reads_the_full_pool(self):
+        self.assertEqual(self.headroom_of(SWATokenToKVPoolAllocator), (2, 22))
+
+    def test_all_swa_reads_the_swa_pool(self):
+        self.assertEqual(self.headroom_of(PureSWATokenToKVPoolAllocator), (3, 33))
 
 
 if __name__ == "__main__":

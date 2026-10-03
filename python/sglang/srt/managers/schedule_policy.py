@@ -852,6 +852,22 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def charge_head_prefix_pin(self, tokens: int) -> None:
+        """Charge a head prefix pinned mid-pass to both full-KV budgets, so the
+        candidates scanned after it cannot sell KV the head now owns.
+
+        Takes only what the tree did not already account for: every cache in
+        mem_cache/ moves the newly-locked tokens out of `evictable_size()` inside
+        `inc_lock_ref`, and `rem_total_tokens` reads that live, so the usual
+        charge is 0 (see `HeadPrefixLock._record_pin`). The offsets only ever
+        grow, and a budget driven negative reads as NO_TOKEN in `budget_state`,
+        which is the intended refusal, not a broken counter.
+        """
+        if tokens <= 0:
+            return
+        self.memory_budget.total_offset += tokens
+        self.memory_budget.current_offset += tokens
+
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
