@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
+from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpRankMajorCombineInput
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKOutput,
@@ -301,7 +302,22 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
+        elif DispatchOutputChecker.format_is_nccl_ep_rank_major(dispatch_output):
+            if self.use_w4afp8:
+                output = self.forward_cutlass_w4afp8_rank_major(dispatch_output)
+            else:
+                raise NotImplementedError(
+                    "NCCL EP rank-major currently supports W4AFP8 expert compute only"
+                )
 
+        if DispatchOutputChecker.format_is_nccl_ep_rank_major(dispatch_output):
+            return NcclEpRankMajorCombineInput(
+                hidden_states=output,
+                src2dst=dispatch_output.src2dst,
+                local_topk_ids=dispatch_output.local_topk_ids,
+                recv_topk_weights=dispatch_output.recv_topk_weights,
+                slot_shape=dispatch_output.slot_shape,
+            )
         combine_input_wrapper = (
             DeepEPNormalCombineInput
             if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
@@ -350,6 +366,13 @@ class DeepEPMoE(FusedMoE):
             dispatch_output=dispatch_output,
         )
 
+    def forward_cutlass_w4afp8_rank_major(self, dispatch_output):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_nccl_ep_rank_major(
+            layer=self, dispatch_output=dispatch_output
+        )
+
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
@@ -359,6 +382,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         or get_moe_a2a_backend().is_deepep_v2()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
+        or get_moe_a2a_backend().is_nccl_ep()
         or get_moe_a2a_backend().is_pplx()
     ):
         return DeepEPMoE

@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     _a2a_fusion_adjustments,
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
+    _nccl_ep_capability_fallback,
     cutedsl_moe_max_num_tokens,
     declare_resolution,
     max_prefill_buffer_tokens,
@@ -243,6 +244,9 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    # Resolve nccl_ep availability first: a fallback to 'deepep' must flow
+    # through the deepep-specific handling in the passes below.
+    run_post_process_pass(server_args, _nccl_ep_capability_fallback)
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 
@@ -381,6 +385,14 @@ def handle_a2a_moe(server_args: Any):
             "per-rank communication buffer capacity, not a model limit; "
             "increase it for large prefill/chunked-prefill workloads.",
             cfg.deepep_v2_mode,
+        )
+
+    if a2a_backend == "nccl_ep":
+        logger.warning(
+            "NCCL EP MoE is enabled. The expert parallel size is adjusted to be "
+            "the same as the tensor parallel size[%s]. Only the low-latency (LL) "
+            "path is implemented; prefill and decode both run through LL.",
+            cfg.tp_size,
         )
 
     # The resolving view, not the field: `_a2a_backend_overrides` may have
