@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
+    normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.local_attention import (
@@ -1329,12 +1330,6 @@ class XPUAttentionBackend(AttentionBackend):
         )
         metadata.max_seq_len_k = max_len + kv_len_offset
 
-        kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
-        metadata.cache_seqlens_int32.copy_(kv_seqlens)
-
-        metadata.cu_seqlens_k[0] = 0
-        metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
-
         # target-verify and draft-extend pack multiple query rows per request;
         # rebuild cu_seqlens_q as a strided ramp (0, q, 2q, ...). Plain/draft
         # decode keep the identity ramp already stored in the pre-allocated buffer.
@@ -1353,6 +1348,11 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.max_seq_len_q = 1
 
         if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+            kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
+            metadata.cache_seqlens_int32.copy_(kv_seqlens)
+            metadata.cu_seqlens_k[0] = 0
+            metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
+
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
             metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
             metadata.encoder_lens_int32.copy_(encoder_lens)
@@ -1375,18 +1375,14 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.page_table[:bs, text_max:].zero_()
         else:
-            raw_page = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][
-                    : ((metadata.max_seq_len_k + self.page_size - 1) // self.page_size)
-                ][None, :],
-            ]
-            if self.page_size > 1:
-                raw_page = raw_page // self.page_size
-            metadata.page_table[:bs, : raw_page.shape[1]].copy_(
-                raw_page.to(torch.int32)
+            # cache_seqlens_int32, cu_seqlens_k, page_table (and swa_page_table)
+            # in one fused Triton launch.
+            self._set_decode_page_metadata(
+                metadata=metadata,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_len_delta=kv_len_offset,
             )
-            metadata.page_table[:bs, raw_page.shape[1] :].zero_()
 
         if self.use_sliding_window_kv_pool:
             if forward_batch.out_cache_loc is None:
@@ -1405,30 +1401,45 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
 
-            if not (self.is_encoder_decoder and forward_batch.encoder_lens is not None):
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-                swa_page_table = self.decode_cuda_graph_metadata["swa_page_table"]
-                swa_page_table[:bs, max_seq_pages:].zero_()
-                swa_page_table[:bs, :max_seq_pages].copy_(
-                    (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_page)
-                        if self.page_size == 1
-                        else self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            self.req_to_token[
-                                req_pool_indices[:, None],
-                                self.decode_cuda_graph_metadata["strided_indices"][
-                                    :max_seq_pages
-                                ][None, :],
-                            ]
-                        )
-                        // self.page_size
-                    ).to(torch.int32)
-                )
-                metadata.swa_page_table = swa_page_table[:bs, :]
-
         self.forward_metadata = metadata
+
+    def _set_decode_page_metadata(
+        self,
+        *,
+        metadata: FlashAttentionMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_len_delta: int,
+    ) -> None:
+        """Fill ``cache_seqlens_int32``, ``cu_seqlens_k`` and the page table(s)
+        for (speculative) decode with one fused Triton launch.
+
+        Uses the same ``normal_decode_set_metadata`` kernel as the FlashAttention
+        backend instead of the separate gather / floor-divide / int32 cast /
+        copy / zero_ sequence plus the seq-len cast and cumsum.
+
+        Contract (shared with the FlashAttention backend): only the live prefix
+        of each page-table row, ``cdiv(seq_len + seq_len_delta, page_size)``
+        pages, is rewritten; columns past it keep their previous values.
+        Consumers bound their reads by ``cache_seqlens_int32``, and stale
+        entries are always in-range page ids written by earlier steps (or zero
+        from allocation), so whole-table gathers stay in bounds too.
+        """
+        max_seq_pages = (metadata.max_seq_len_k + self.page_size - 1) // self.page_size
+        use_swa = self.use_sliding_window_kv_pool
+        normal_decode_set_metadata(
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            page_table=metadata.page_table,
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            max_seq_pages=max_seq_pages,
+            seq_lens=seq_lens,
+            seq_len_delta=seq_len_delta,
+            page_size=self.page_size,
+            swa_page_table=metadata.swa_page_table if use_swa else None,
+            token_to_kv_pool=self.token_to_kv_pool if use_swa else None,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable ops for XPU graph (no-op: all metadata setup is
