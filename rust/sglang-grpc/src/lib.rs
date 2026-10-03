@@ -4,7 +4,7 @@ pub mod tokenizers;
 pub(crate) mod utils;
 
 use pyo3::prelude::*;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -134,6 +134,19 @@ fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo>
     })
 }
 
+fn parse_bind_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
+    let formatted = format!("{}:{}", host, port);
+    match formatted.parse::<SocketAddr>() {
+        Ok(addr) => Ok(addr),
+        Err(error) => host
+            .parse::<IpAddr>()
+            .map(|ip| SocketAddr::new(ip, port))
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", error))
+            }),
+    }
+}
+
 /// Start the gRPC server in a background thread with its own Tokio runtime.
 ///
 /// Args:
@@ -160,9 +173,7 @@ fn start_server(
         )
         .try_init();
 
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
+    let addr = parse_bind_addr(&host, port)?;
     let worker_threads = worker_threads.max(1);
     let response_channel_capacity = if response_channel_capacity == 0 {
         tracing::warn!(
@@ -258,4 +269,35 @@ fn _grpc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GrpcServerHandle>()?;
     m.add_class::<ChunkSendStatus>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind_addr;
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn parse_bind_addr_accepts_ipv4_and_ipv6_hosts() {
+        assert_eq!(
+            parse_bind_addr("127.0.0.1", 40000).unwrap(),
+            SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 40000)
+        );
+        assert_eq!(
+            parse_bind_addr("[::1]", 40000).unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 40000)
+        );
+        assert_eq!(
+            parse_bind_addr("::1", 40000).unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 40000)
+        );
+        assert_eq!(
+            parse_bind_addr("::", 40000).unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 40000)
+        );
+    }
+
+    #[test]
+    fn parse_bind_addr_rejects_invalid_hosts() {
+        assert!(parse_bind_addr("not-an-address", 40000).is_err());
+    }
 }
