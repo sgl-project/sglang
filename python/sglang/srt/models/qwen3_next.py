@@ -28,6 +28,10 @@ from sglang.srt.layers.layer_boundary import (
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -88,6 +92,83 @@ if _is_npu:
     )
 
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
+def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
+    quant_method = getattr(linear, "quant_method", None)
+    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+        getattr(quant_method, "block_quant", False)
+        or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
+    """Pick the member of a fused-AR output tuple that ``linear`` can consume."""
+    if not isinstance(hidden_states, tuple):
+        return hidden_states
+    if len(hidden_states) == 3:
+        hs_bf16, hs_fp8, hs_scale = hidden_states
+        if _linear_accepts_fp8_tuple(linear):
+            return (hs_fp8, hs_scale)
+        return hs_bf16
+    if len(hidden_states) == 2 and _linear_accepts_fp8_tuple(linear):
+        return hidden_states
+    raise TypeError(
+        f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
+    )
+
+
+class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
+    """MoE block that can consume the fused AR+norm+quant tuple.
+
+    With ``Fp8Input.TUPLE_AND_BF16`` declared on the FFN stage, the boundary
+    hands down ``(bf16, fp8, scale)``. Only the shared expert's FP8
+    ``gate_up_proj`` consumes ``(fp8, scale)``; the router gate, the
+    shared-expert gate and the MoE runner all stay on bf16. Subclassing keeps
+    ``qwen2_moe.py``, which several models share, byte-identical to upstream.
+    """
+
+    def forward(
+        self,
+        hidden_states,
+        forward_batch: Optional[ForwardBatch] = None,
+        defer_finalize: bool = False,
+    ) -> torch.Tensor:
+        if not isinstance(hidden_states, tuple):
+            return super().forward(hidden_states, forward_batch, defer_finalize)
+
+        hs_bf16, hs_fp8, hs_scale = hidden_states
+        shared = getattr(self, "shared_expert", None)
+        if shared is None or not _linear_accepts_fp8_tuple(
+            getattr(shared, "gate_up_proj", None)
+        ):
+            # Nothing downstream can take the fp8; drop it rather than requantize.
+            return super().forward(hs_bf16, forward_batch, defer_finalize)
+
+        original = self._forward_shared_experts
+
+        def shared_with_fp8(hidden, apply_gate: bool = True):
+            # Gates stay on bf16; only the FP8 projection sees (fp8, scale).
+            shared_output = self.shared_expert((hs_fp8, hs_scale))
+            if self.shared_expert_gate is not None and apply_gate:
+                shared_output = (
+                    torch.sigmoid(self.shared_expert_gate(hidden)) * shared_output
+                )
+            return shared_output
+
+        self._forward_shared_experts = shared_with_fp8
+        try:
+            return super().forward(hs_bf16, forward_batch, defer_finalize)
+        finally:
+            self._forward_shared_experts = original
+
+
+def _moe_accepts_fp8_tuple(mlp) -> bool:
+    """True when this MLP is the subclass that unpacks (bf16, fp8, scale)."""
+    shared = getattr(mlp, "shared_expert", None)
+    return isinstance(mlp, Qwen3NextSparseMoeBlock) and _linear_accepts_fp8_tuple(
+        getattr(shared, "gate_up_proj", None)
+    )
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -392,7 +473,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
-        seq_len, _ = hidden_states.shape
+        # With Fp8Input.TUPLE_AND_BF16 declared, the boundary hands down a
+        # (bf16, fp8, scale) triple: an FP8 in_proj_qkvz takes (fp8, scale)
+        # directly, while the small in_proj_ba gating projection is not
+        # block-quantized and takes the bf16 side-output.
+        if isinstance(hidden_states, tuple):
+            hs_shape = hidden_states[0]
+            hs_qkvz = _select_fused_ar_input_for_linear(
+                hidden_states, self.in_proj_qkvz
+            )
+            hs_ba = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_ba)
+        else:
+            hs_shape = hs_qkvz = hs_ba = hidden_states
+
+        seq_len, _ = hs_shape.shape
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -400,13 +494,13 @@ class Qwen3GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba, _ = self.in_proj_ba(hs_ba)
             current_stream.wait_stream(self.alt_stream)
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hs_ba)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -515,7 +609,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -537,12 +631,30 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Declare the fused AR+RMSNorm+per-group-quant read only when the
+        # consuming projection can take the (fp8, scale) pair; otherwise the
+        # boundary keeps the plain AR+RMSNorm path.
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
+                    # Only the Qwen3Next MoE subclass unpacks the tuple; a dense
+                    # Qwen2MoeMLP layer keeps the plain AR+RMSNorm read.
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16
+                        if self.is_layer_sparse and _moe_accepts_fp8_tuple(self.mlp)
+                        else None
+                    ),
                 ),
                 self.post_attention_layernorm,
             ),
@@ -679,7 +791,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         is_next_layer_sparse = True
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -705,12 +817,30 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Declare the fused AR+RMSNorm+per-group-quant read only when the
+        # consuming projection can take the (fp8, scale) pair; otherwise the
+        # boundary keeps the plain AR+RMSNorm path.
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
+                    # Only the Qwen3Next MoE subclass unpacks the tuple; a dense
+                    # Qwen2MoeMLP layer keeps the plain AR+RMSNorm read.
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16
+                        if self.is_layer_sparse and _moe_accepts_fp8_tuple(self.mlp)
+                        else None
+                    ),
                 ),
                 self.post_attention_layernorm,
             ),
@@ -747,7 +877,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         return q, k
 
     def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(
+            _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
+        )
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -766,7 +898,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(
+            _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
+        )
         # Calculate first full attention layer ID based on config
         if self.attn.layer_id == (self.config.full_attention_interval - 1):
             self.rotary_emb.get_cos_sin_with_position(positions)
