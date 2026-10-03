@@ -106,12 +106,12 @@ async fn missing_and_empty_keys_use_admitted_power_of_two_without_binding() {
         admission.reject.store(true, Ordering::Relaxed);
         assert!(matches!(
             policy.pick(&engines, &request).await,
-            Err(PickError::AdmissionRejected(_))
+            Err(PickError::NoAdmissibleEngine(rejections)) if rejections.len() == 2
         ));
         admission.reject.store(false, Ordering::Relaxed);
     }
     assert!(store.is_empty());
-    assert_eq!(admission.calls.lock().unwrap().len(), 4);
+    assert_eq!(admission.calls.lock().unwrap().len(), 6);
 }
 
 #[tokio::test]
@@ -125,7 +125,7 @@ async fn failed_fallback_preserves_existing_binding() {
     admission.reject.store(true, Ordering::Relaxed);
     assert!(matches!(
         policy.pick(&engines, &request).await,
-        Err(PickError::AdmissionRejected(_))
+        Err(PickError::NoAdmissibleEngine(_))
     ));
     assert!(store.is_empty());
     admission.reject.store(false, Ordering::Relaxed);
@@ -142,7 +142,7 @@ async fn failed_fallback_preserves_existing_binding() {
         "a"
     );
     assert_eq!(store.len(), 1);
-    assert_eq!(admission.calls.lock().unwrap().len(), 5);
+    assert_eq!(admission.calls.lock().unwrap().len(), 6);
 }
 
 #[tokio::test]

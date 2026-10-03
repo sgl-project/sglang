@@ -221,9 +221,9 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 }
 ```
 
-Policies own their required state handles and read observations locally. Nested
-fallback uses `pick_fallback(engines, request)`, which calls the fallback's `pick`;
-the fallback reads its own state. There is no shared observation context or cache.
+Policies own their required state handles and read observations locally.
+Affinity policies fall back through `PowerOfTwoPolicy::pick_admitted` with their
+own admission; it reads its own state. There is no shared observation context or cache.
 Buckets and HTTP handlers supply only candidates and request facts.
 
 `Pick` identifies one engine and a selection reason for metrics and tracing.
@@ -277,12 +277,12 @@ limits fail open; the in-flight count is always known. Policies attach the
 checker as `Arc<dyn EngineAdmission>` and decide where checking belongs in
 their selection algorithm; there is no placement setting or filtering wrapper.
 
-Power-of-two first selects an engine, then calls admission exactly once on that
-engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
-resample, choose the other sampled engine, or run a policy fallback. No candidates
-returns `NoCandidates` without invoking admission. A single candidate is selected
-directly; otherwise two distinct candidates are sampled uniformly, and the one
-with lower stage pressure wins. A complete tie keeps the first sampled engine.
+Power-of-two selects an engine, then checks its admission. A rejected engine is
+dropped and the remaining engines are sampled again, so the bucket loop sees
+`AdmissionRejected` or `NoAdmissibleEngine` only when no engine is admitted. No
+candidates returns `NoCandidates` without invoking admission. A single candidate
+is selected directly; otherwise two distinct candidates are sampled uniformly, and
+the one with lower stage pressure wins. A complete tie keeps the first sampled engine.
 
 Power-of-two reuses the existing pure pressure-comparison functions. Plain and
 prefill stages compare estimated prefill queue time when both reports provide it,
@@ -326,8 +326,7 @@ Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
 use power-of-two without creating assignments. A new or out-of-group binding
-uses power-of-two with `AdmissionLimits::default()`, then the session policy
-checks its selected engine before binding. A concurrent live assignment wins,
+uses power-of-two with the session policy's admission before binding. A concurrent live assignment wins,
 but is checked before returning it; rejection ends that attempt without
 rewriting the binding or retrying another engine. Existing bindings follow the
 shared affinity modes below. Session policies can be attached
@@ -355,9 +354,7 @@ or ties preserve affinity. Bindings commit during selection after
 admission, as with initial placement; dispatch failure does not roll them back.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
-with round-robin as the default. Nested fallbacks use
-`AdmissionLimits::default()`; the owning policy explicitly checks the engine
-returned by its fallback.
+with round-robin as the default. Nested fallbacks use the owning policy's admission.
 
 ### Cache-aware behavior
 
@@ -372,8 +369,8 @@ set. Its responsibilities are:
 5. Apply the shared affinity mode. With no admitted prefix owner, fall back
    within the group, excluding rejected engines.
 
-Fallback samples two engines and checks the selected engine's admission; it
-does not resample on rejection. Candidate limits apply only to prefix selection.
+Fallback is power-of-two with the cache policy's admission, resampling after a
+rejection. Candidate limits apply only to prefix selection.
 
 Memoize the prefix lookup once per request, including remote I/O. Each policy
 restricts those matches to its own candidates. A memoized lookup does not imply
@@ -553,7 +550,7 @@ validation, including dispatch-time breaker probes and request cancellation.
 
 | Behavior | Target |
 | --- | --- |
-| Power-of-two admission | Check only the chosen engine; rejection advances to the next bucket |
+| Power-of-two admission | Resample after a rejection; advance to the next bucket only when no engine admits |
 | Round-robin cursor | One cursor per role-group policy instance |
 | Capacity exhaustion | Try the next compatible bucket; return accumulated rejection details if all fail |
 | Primary/backup proposals and post-policy substitution | Removed; each policy returns one engine |
@@ -605,8 +602,9 @@ Implemented here:
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
   and `AdmissionLimits` with running and KV usage shares plus waiting,
-  pending-prefill and in-flight counts. Power-of-two samples two distinct engines, compares stage pressure,
-  and checks its selected engine with no replacement on rejection.
+  pending-prefill and in-flight counts. Power-of-two samples two distinct
+  engines, compares stage pressure, checks the winner, and resamples without it
+  on rejection.
 - Policy-owned load dependency and local observations. Power-of-two passes the
   selected engine's load record directly to admission, without another snapshot.
   `PickRequest`, `Pick`, and bucket APIs carry no load observations.
@@ -625,7 +623,7 @@ Implemented here:
   `Arc<CacheSource>` so different index namespaces remain independent. Each pick
   reruns its own candidate filtering and admission after obtaining a fresh snapshot.
 - Cache selection checks bounded candidates explicitly; rejected owners are
-  excluded from fallback. The cache policy checks its fallback winner's admission.
+  excluded from fallback, which uses the cache policy's admission.
   Cache policies require plain/prefill groups.
 - `SessionAwarePolicy` reuses admitted model/bucket/role-scoped bindings from a
   shared `AffinityStore`, falling back to power-of-two for new or keyless sessions.

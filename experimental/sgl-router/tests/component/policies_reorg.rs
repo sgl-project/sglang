@@ -442,7 +442,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
 }
 
 #[tokio::test]
-async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
+async fn power_of_two_resamples_after_rejection_until_none_admit() {
     use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
     use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
@@ -488,16 +488,25 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
             let result = policy.pick(&engines, &request).await;
             if invalid {
                 assert!(matches!(result, Err(PickError::InvalidSignal(_))));
-            } else if reject {
+            } else if reject && engines.len() == 1 {
                 assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
                 if reason.engine == engine.id && reason.reason == "full"));
+            } else if reject {
+                assert!(matches!(result, Err(PickError::NoAdmissibleEngine(r)) if r.len() == 2));
             } else {
                 assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
             }
-            assert_eq!(
-                check.calls.lock().unwrap().as_slice(),
-                std::slice::from_ref(&engine.id)
-            );
+            // The lower-pressure engine is checked first; the other only after a rejection.
+            let checked = if reject { engines.len() } else { 1 };
+            assert_eq!(check.calls.lock().unwrap()[0], engine.id);
+            assert_eq!(check.calls.lock().unwrap().len(), checked);
         }
-    }
+    } // A rejected winner no longer fails the group while another engine admits.
+    let mut policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
+    policy.admission = Arc::new(Reject("a"));
+    let pick = policy
+        .pick(&[other.clone(), engine], &request)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&pick.engine, &other));
 }

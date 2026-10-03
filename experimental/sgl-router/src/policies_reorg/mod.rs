@@ -106,21 +106,4 @@ pub trait Policy: Send + Sync + Debug {
     fn needs_request_tokens(&self) -> bool {
         false
     }
-
-    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
-    fn fallback(&self) -> Option<&dyn Policy> {
-        None
-    }
-
-    /// Delegate within the same candidates; the fallback reads its own state.
-    fn pick_fallback<'a>(
-        &'a self,
-        engines: &'a [Arc<Worker>],
-        request: &'a PickRequest<'a>,
-    ) -> BoxFuture<'a, Result<Pick, PickError>> {
-        match self.fallback() {
-            Some(fallback) => fallback.pick(engines, request),
-            None => Box::pin(async { Err(PickError::NoCandidates) }),
-        }
-    }
 }
