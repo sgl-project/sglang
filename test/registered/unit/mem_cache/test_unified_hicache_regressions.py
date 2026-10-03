@@ -16,9 +16,10 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.pool_host.group import PoolEntry
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=25, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestHiCacheIndexDomains(unittest.TestCase):
@@ -340,6 +341,104 @@ class TestTriPoolAssembly(unittest.TestCase):
                     self.assertIs(entry.device_alloc_fn, swa_allocator.alloc)
                     self.assertIs(entry.device_free_fn, swa_allocator.free)
                     self.assertIsNone(entry.device_indices_from_anchor_fn)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and get_device_sm() >= 100,
+    "MXFP8 KV cache requires the FA4 backend (SM100+).",
+)
+class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
+    """A restored page must bring its UE8M0 scales back, or it dequantizes
+    against whatever exponents were left in the slot."""
+
+    _SBS, _PS, _H, _D, _L, _PAGES = 32, 128, 2, 128, 2, 8
+
+    def _spec(self, name, grow):
+        from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec
+
+        return MHASubPoolSpec(
+            name=name,
+            layer_num=self._L,
+            head_num=self._H,
+            head_dim=self._D,
+            store_dtype=torch.uint8,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            scale_block_size=self._SBS,
+            grow_direction=grow,
+        )
+
+    def _random_scales(self, n):
+        return (
+            torch.randint(
+                100, 140, (n, self._H, self._D // self._SBS), dtype=torch.uint8
+            )
+            .cuda()
+            .view(torch.float8_e8m0fnu)
+        )
+
+    def test_scales_round_trip_through_the_host_tier(self):
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedKVPool,
+            build_unified_mha_pool,
+        )
+
+        full = self._spec("full", "down")
+        buffer = UnifiedKVPool(
+            total_bytes=self._PAGES * self._PS * full.entry_bytes(),
+            sub_pool_specs=[full, self._spec("swa", "up")],
+            device="cuda",
+            enable_memory_saver=False,
+            page_size=self._PS,
+        )
+        pool = build_unified_mha_pool(
+            unified_buffer=buffer, sub_pool_name="full", page_size=self._PS
+        )
+        host = MHATokenToKVPoolMXFP8Host(
+            pool,
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=self._PS,
+            layout="page_first",
+            pin_memory=True,
+            device="cpu",
+        )
+        self.addCleanup(host.destroy)
+
+        loc = torch.arange(3 * self._PS, 4 * self._PS, dtype=torch.int64, device="cuda")
+        payload = (
+            torch.randint(1, 200, (self._PS, self._H, self._D), dtype=torch.uint8)
+            .cuda()
+            .view(torch.float8_e4m3fn)
+        )
+        expected = []
+        for layer in range(self._L):
+            k_sf, v_sf = self._random_scales(self._PS), self._random_scales(self._PS)
+            pool.set_kv_buffer(
+                None, loc, payload, payload, k_sf, v_sf, layer_id_override=layer
+            )
+            expected.append((k_sf, v_sf))
+
+        host_loc = torch.arange(self._PS, dtype=torch.int64, device="cuda")
+        host.backup_from_device_all_layer(pool, host_loc, loc, io_backend="kernel")
+        torch.cuda.synchronize()
+        for layer in range(self._L):
+            pool.k_scale_buffer[layer].view(torch.uint8).fill_(0)
+            pool.v_scale_buffer[layer].view(torch.uint8).fill_(0)
+        for layer in range(self._L):
+            host.load_to_device_per_layer(
+                pool, host_loc, loc, layer, io_backend="kernel"
+            )
+        torch.cuda.synchronize()
+
+        for layer, (k_sf, v_sf) in enumerate(expected):
+            got_k, got_v = pool._read_scales(layer, loc)
+            self.assertTrue(
+                torch.equal(got_k.view(torch.uint8), k_sf.view(torch.uint8))
+            )
+            self.assertTrue(
+                torch.equal(got_v.view(torch.uint8), v_sf.view(torch.uint8))
+            )
 
 
 if __name__ == "__main__":
