@@ -27,6 +27,9 @@ class LowConfidence(DllmAlgorithm):
         logits = full_logits.view(batch_size, self.block_size, vocab_size)
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         block_mask_index = input_ids == self.mask_id
+        prompt_mask = getattr(forward_batch, "dllm_prompt_mask", None)
+        if prompt_mask is not None:
+            block_mask_index &= ~prompt_mask
         done = block_mask_index.sum(dim=1) == 0
 
         x = torch.argmax(logits, dim=-1)

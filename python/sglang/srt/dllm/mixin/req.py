@@ -60,12 +60,14 @@ class ReqDllmMixin:
         if len(self.full_untruncated_fill_ids) < min_required_length:
             return
 
-        input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
-        self.dllm_phase = (
-            DllmReqPhase.STAGING_PREFILL
-            if self.dllm_config.mask_id not in input_block
-            else DllmReqPhase.STAGING_DECODE
-        )
+        # A mask ID inside the user's prompt is a real token, not a request to
+        # denoise that position. Only positions beyond the prompt are generated.
+        is_prefill_phase = min_required_length <= len(self.origin_input_ids)
+
+        if is_prefill_phase:
+            self.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        else:
+            self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_incomplete_ids:
