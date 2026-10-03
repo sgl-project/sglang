@@ -158,11 +158,8 @@ class BeamMoE(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
-        supported_runners = {
-            "bf16": ("auto", "triton"),
-            "fp8": ("auto", "triton"),
-            "nvfp4": ("flashinfer_trtllm",),
-        }.get(get_beam_quantization(quant_config), ())
+        quant_scheme = get_beam_quantization(quant_config)
+        supported_runners = get_beam_supported_moe_runners(quant_scheme)
         if (
             backend.value not in supported_runners
             or not get_moe_a2a_backend().is_none()
@@ -526,6 +523,14 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
     return None
 
 
+def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
+    return {
+        "bf16": ("auto", "triton"),
+        "fp8": ("auto", "triton"),
+        "nvfp4": ("flashinfer_trtllm",),
+    }.get(quant_scheme, ())
+
+
 class BeamForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -635,11 +640,8 @@ class BeamForCausalLM(nn.Module):
             ):
                 continue
             if (
-                name in ("model.norm.weight", "lm_head.weight")
-                and not self.model.pp_group.is_last_rank
-            ):
-                continue
-            if name.startswith("lm_head.") and not self.model.pp_group.is_last_rank:
+                name == "model.norm.weight" or name.startswith("lm_head.")
+            ) and not self.model.pp_group.is_last_rank:
                 continue
             for source, target, shard_id in packed_projections:
                 if source in name:
