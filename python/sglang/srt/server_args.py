@@ -50,7 +50,11 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port_below_ephemeral,
+    wait_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -699,7 +703,8 @@ class PortArgs:
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
-            nccl_port = get_free_port()
+            # The scheduler child binds this later; keep it out of the ephemeral range.
+            nccl_port = get_free_port_below_ephemeral()
         else:
             nccl_port = server_args.nccl_port
 
