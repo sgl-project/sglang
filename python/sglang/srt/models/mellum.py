@@ -436,6 +436,7 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 hidden_act=cfg.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
         is_previous_layer_sparse = _is_sparse(layer_id - 1)

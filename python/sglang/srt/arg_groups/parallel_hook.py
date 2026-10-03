@@ -82,7 +82,7 @@ def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
     # position must also win here, or a package permitting prefill CP on its
-    # own qualified HIP/NPU/MUSA build would still hit the original rejection
+    # own qualified NPU/MUSA build would still hit the original rejection
     # at this later, nested call.
     run_hook(validate_prefill_cp_platform, server_args)
 
@@ -98,6 +98,15 @@ def handle_context_parallelism(server_args: Any):
                 cfg, model_config.hf_text_config.model_type
             ),
         )
+        if (
+            cfg.enable_prefill_cp
+            and get_platform().is_hip
+            and model_arch != "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError(
+                "Prefill CP on HIP is only supported for "
+                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+            )
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
@@ -741,7 +750,7 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
+    if cfg.enable_prefill_cp and platform.is_musa:
         raise ValueError(
-            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )
