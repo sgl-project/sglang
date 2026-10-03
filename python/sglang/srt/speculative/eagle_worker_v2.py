@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional
@@ -60,6 +61,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -443,7 +445,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if (
+            _is_cpu
+            or get_disagg().enable_pdmux
+            or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+        ):
             return
 
         if get_model().model_impl == "mindspore":
@@ -1446,6 +1452,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        forward_batch = batch.split_forward_batch
+        if (
+            forward_batch.split_index
+            < self.target_worker.model_runner.model_config.num_hidden_layers
+        ):
+            return batch_output
+
+        # Scheduler releases ScheduleBatch.input_ids after each slice. The
+        # persistent ForwardBatch still owns them, including any DP padding.
+        # Draft rotation/spec_info must not mutate the split target batch.
+        draft_batch = copy.copy(batch)
+        draft_batch.input_ids = forward_batch.input_ids[: batch.extend_num_tokens]
+        if not draft_batch.forward_mode.is_idle():
+            draft_batch.forward_mode = ForwardMode.EXTEND
+        draft_batch.sampling_info = batch.sampling_info.copy_for_forward()
+
+        # Draft prefill and draft decode share planner/index-share scratch.
+        # Only fence the final draft handoff; target slices remain concurrent.
+        from sglang.srt.multiplex.pdmux_context import (
+            get_current_stream_idx,
+            get_stream_groups,
+        )
+
+        prefill_stream, decode_stream = get_stream_groups()[get_current_stream_idx()]
+        prefill_stream.wait_stream(decode_stream)
+        # draft_tp_context uses the ambient prefill placement on current main.
+        return self._finish_prefill_batch(draft_batch, batch_output)
+
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
@@ -1460,7 +1498,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
         )
+        return self._finish_prefill_batch(
+            batch_output=batch_output,
+            batch=batch,
+            on_publish=on_publish,
+            coordination_plan=coordination_plan,
+        )
 
+    def _finish_prefill_batch(
+        self,
+        batch,
+        batch_output,
+        on_publish=None,
+        coordination_plan=None,
+    ):
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
         # Extend processed L prompt tokens; next verify iter expects same L.
         batch_output.new_seq_lens = batch.seq_lens
@@ -1594,7 +1645,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
-        attn_backend = self._target_worker.model_runner.attn_backend
+        attn_backend = self._target_worker.model_runner.get_decode_attn_backend()
         verify_mask = attn_backend.verify_mask
         # Every position in a 1-node tree is visible, so an all-True fill is
         # correct under either layout.

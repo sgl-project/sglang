@@ -1,4 +1,6 @@
+import mmap
 import unittest
+from enum import IntEnum
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,23 +47,37 @@ class _FakeBuffer:
         return 1
 
 
+class _FakeCudaError(IntEnum):
+    SUCCESS = 0
+    INVALID_VALUE = 1
+
+
 class _FakeCudart:
-    def __init__(self, fail_on_registration: int | None = None):
+    def __init__(
+        self,
+        fail_on_registration: int | None = None,
+        reject_larger_than: int | None = None,
+    ):
         self.registrations = []
         self.unregistrations = []
         self.fail_on_registration = fail_on_registration
+        self.reject_larger_than = reject_larger_than
 
-    def cudaHostRegister(self, ptr: int, size: int, flags: int) -> int:
+    def cudaHostRegister(self, ptr: int, size: int, flags: int) -> _FakeCudaError:
         self.registrations.append((ptr, size, flags))
-        if len(self.registrations) == self.fail_on_registration:
-            return 1
-        return 0
+        if len(self.registrations) == self.fail_on_registration or (
+            self.reject_larger_than is not None and size > self.reject_larger_than
+        ):
+            return _FakeCudaError.INVALID_VALUE
+        return _FakeCudaError.SUCCESS
 
-    def cudaHostUnregister(self, ptr: int) -> int:
+    def cudaHostUnregister(self, ptr: int) -> _FakeCudaError:
         self.unregistrations.append(ptr)
-        return 0
+        return _FakeCudaError.SUCCESS
 
-    def cudaGetErrorString(self, rc: int) -> str:
+    def cudaGetErrorString(self, rc: _FakeCudaError) -> str:
+        if not isinstance(rc, _FakeCudaError):
+            raise TypeError("cudaGetErrorString requires a CUDA error enum")
         return "injected error"
 
 
@@ -355,6 +371,75 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         self.assertEqual(cudart.unregistrations, [base])
 
+    def test_large_registration_retries_after_invalid_value(self):
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 4 * gib)
+        cudart = _FakeCudart(reject_larger_than=gib)
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=256,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+            _cuda_host_unregister(buffer)
+
+        self.assertEqual(
+            cudart.registrations,
+            [(base, 4 * gib, 0)] + [(base + i * gib, gib, 0) for i in range(4)],
+        )
+        self.assertEqual(
+            cudart.unregistrations,
+            [base + i * gib for i in reversed(range(4))],
+        )
+
+    def test_large_registration_keeps_single_call_when_it_succeeds(self):
+        gib = 1024**3
+        base = 0x10000000
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=256,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, 4 * gib), registration_granularity_bytes=gib
+            )
+
+        self.assertEqual(cudart.registrations, [(base, 4 * gib, 0)])
+
+    def test_large_registration_rolls_back_before_retry(self):
+        gib = 1024**3
+        base = 0x10000000
+        cudart = _FakeCudart(fail_on_registration=2)
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=2,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, 4 * gib), registration_granularity_bytes=gib
+            )
+
+        self.assertEqual(
+            cudart.registrations,
+            [(base, 2 * gib, 0), (base + 2 * gib, 2 * gib, 0)]
+            + [(base + i * gib, gib, 0) for i in range(4)],
+        )
+        self.assertEqual(cudart.unregistrations, [base])
+
     def test_missing_copy_granularity_preserves_single_registration(self):
         gib = 1024**3
         base = 0x10000000
@@ -407,6 +492,57 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+    def test_copy_page_larger_than_chunk_limit_stays_whole(self):
+        gib = 1024**3
+        base = 0x10000000
+        page_copy_bytes = 2 * gib
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, 2 * page_copy_bytes),
+                registration_granularity_bytes=page_copy_bytes,
+            )
+
+        self.assertEqual(
+            cudart.registrations,
+            [
+                (base, page_copy_bytes, 0),
+                (base + page_copy_bytes, page_copy_bytes, 0),
+            ],
+        )
+
+    def test_registration_boundaries_are_also_os_page_aligned(self):
+        gib = 1024**3
+        base = 0x10000000
+        page_copy_bytes = 3000
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, 2 * gib),
+                registration_granularity_bytes=page_copy_bytes,
+            )
+
+        self.assertGreater(len(cudart.registrations), 1)
+        for ptr, _, _ in cudart.registrations:
+            self.assertEqual((ptr - base) % page_copy_bytes, 0)
+            self.assertEqual(ptr % mmap.PAGESIZE, 0)
 
 
 if __name__ == "__main__":

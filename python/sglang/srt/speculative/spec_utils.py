@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_spec,
@@ -1146,7 +1147,7 @@ def commit_mamba_states_after_verify(
         )
         return
 
-    attn_backend = model_runner.attn_backend
+    attn_backend = model_runner.get_decode_attn_backend()
 
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
@@ -1199,7 +1200,9 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
 def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+    # PDMux selects its own streams; ordinary planner streams would escape
+    # the green-context partition and complicate draft scratch ownership.
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get() and not get_disagg().enable_pdmux:
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx

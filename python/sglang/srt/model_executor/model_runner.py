@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1686,13 +1687,25 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def get_decode_attn_backend(self):
+        # Target verification and its mask/state updates belong to the decode
+        # lane. Draft workers install their own specialized attention backend.
+        if get_disagg().enable_pdmux and not self.is_draft_worker:
+            return self.decode_attn_backend
+        return self.attn_backend
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
-    ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
+    ) -> Optional[LogitsProcessorOutput]:
+        # An idle DP rank still runs every layer to participate in MLP
+        # collectives, but it has no requests or attention work to plan.
+        # DSA's planner reads max(seq_lens_cpu), which is empty on this rank.
+        if not forward_batch.forward_mode.is_idle() and (
+            forward_batch.split_index == 0 or reinit_attn_backend
+        ):
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
@@ -1714,7 +1727,7 @@ class ModelRunner:
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
+        split_forward_count: Optional[int] = None,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1859,20 +1872,26 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
+        split_forward_count: Optional[int] = None,
     ) -> ModelRunnerOutput:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            # Draft graphs are captured on ordinary streams, rather than the
+            # scheduler's green-context partitions. Keep PDMux drafts eager.
+            pdmux_draft = self.is_draft_worker and get_disagg().enable_pdmux
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                split_forward_count is None
+                and not forward_batch.forward_mode.is_split_prefill()
+                and not pdmux_draft
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1909,15 +1928,21 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
-            if forward_batch.forward_mode.is_split_prefill():
+            if (
+                split_forward_count is not None
+                or forward_batch.forward_mode.is_split_prefill()
+            ):
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
+                    forward_count=(
+                        split_forward_count if split_forward_count is not None else 1
+                    ),
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not pdmux_draft
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
@@ -2410,7 +2435,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool,
-        split_forward_count: int,
+        split_forward_count: Optional[int],
     ) -> ModelRunnerOutput:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(

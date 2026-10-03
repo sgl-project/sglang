@@ -950,6 +950,11 @@ class ReqKvInfo:
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    # Allocated during admission, consumed by HiCache load-back or extend setup.
+    mamba_prefill_live_slot: Optional[torch.Tensor] = None  # shape (1)
+    mamba_prefill_ping_pong_slots: Optional[torch.Tensor] = None
+    # Held from prefill admission until the result can donate a checkpoint.
+    mamba_cache_reserve_slot: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
@@ -1998,6 +2003,9 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
+        assert self.kv.mamba_prefill_live_slot is None
+        assert self.kv.mamba_prefill_ping_pong_slots is None
+        assert self.kv.mamba_cache_reserve_slot is None
         self.kv.mamba_ping_pong_track_buffer = None
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
@@ -2394,6 +2402,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Raw scheduler metadata gathered across attention-DP ranks. This stays
+    # global even when `global_num_tokens` is intentionally reduced to the
+    # local count because the model forward does not require an MLP TP gather.
+    scheduler_global_num_tokens: Optional[List[int]] = None
 
     # For split prefill
     split_index: int = 0

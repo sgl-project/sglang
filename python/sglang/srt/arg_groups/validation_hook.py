@@ -25,6 +25,21 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pdmux_speculative_compat(cfg: Any) -> None:
+    if cfg.speculative_algorithm is None:
+        return
+    assert cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN"), (
+        "PD-Multiplexing currently supports only single-layer MTP/EAGLE "
+        "speculative decoding."
+    )
+    assert not cfg.enable_multi_layer_eagle, (
+        "PD-Multiplexing does not support multi-layer EAGLE."
+    )
+    assert not cfg.speculative_adaptive, (
+        "PD-Multiplexing requires fixed speculative parameters."
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -166,18 +181,37 @@ def check_server_args(server_args: Any):
 
     # Check pdmux
     if cfg.enable_pdmux:
+        check_pdmux_speculative_compat(cfg)
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
         )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
-        )
+        if cfg.chunked_prefill_size > 0:
+            assert not cfg.enable_mixed_chunk, (
+                "PD-Multiplexing is not compatible with mixed chunk: prefill "
+                "and decode run on separate streams."
+            )
         assert cfg.disaggregation_mode == "null", (
             "PD-Multiplexing is not compatible with disaggregation mode."
         )
         assert cfg.disable_overlap_schedule, (
             "PD-Multiplexing is not compatible with overlap schedule."
         )
+
+        if cfg.enable_hierarchical_cache and cfg.hicache_write_policy == "write_back":
+            logger.warning(
+                "PD-Multiplexing with --hicache-write-policy write_back may "
+                "stall decode while write-back eviction completes; prefer "
+                "write_through."
+            )
+
+        if cfg.pdmux_config_path:
+            from sglang.srt.multiplex.pdmux_context import load_pdmux_config
+
+            yaml_sm_group_num = load_pdmux_config(cfg.pdmux_config_path).sm_group_num
+            assert yaml_sm_group_num == cfg.sm_group_num, (
+                "--sm-group-num must match the PD-Multiplexing config's "
+                f"sm_group_num (CLI={cfg.sm_group_num}, YAML={yaml_sm_group_num})."
+            )
 
         # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
         import torch

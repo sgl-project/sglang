@@ -17,6 +17,8 @@ import logging
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multiplex.pdmux_context import get_pdmux_decode_alt_stream
+from sglang.srt.runtime_context import get_disagg
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,21 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         )
         return Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True
+        )
+
+    def forward(self, input_ids, positions, forward_batch, pp_proxy_tensors=None):
+        if get_disagg().enable_pdmux:
+            # The inherited NextN block owns an ordinary helper stream. Never
+            # let it escape the prefill or decode green-context SM partition.
+            alt_stream = get_pdmux_decode_alt_stream(self.model.alt_stream)
+            decoder = self.model.decoder
+            decoder.self_attn.alt_stream = alt_stream
+            if decoder.self_attn.indexer is not None:
+                decoder.self_attn.indexer.alt_stream = alt_stream
+            if decoder.is_layer_sparse:
+                decoder.mlp.alt_stream = alt_stream
+        return super().forward(
+            input_ids, positions, forward_batch, pp_proxy_tensors=pp_proxy_tensors
         )
 
 
