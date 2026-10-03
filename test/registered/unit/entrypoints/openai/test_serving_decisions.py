@@ -12,6 +12,7 @@ import torch
 from pydantic import ValidationError
 from transformers import AddedToken, AutoTokenizer
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import (
@@ -182,6 +183,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         logits = torch.randn(len(tokenizer), generator=generator, dtype=torch.float64)
         self.logprobs = torch.log_softmax(logits * 4, dim=0)
         self.requests = []
+        self.output_prefix = []
         self.served_model_name = "served-model"
 
     def config_value(self, name):
@@ -194,7 +196,19 @@ class ScoringManager(TokenizerManagerScoreMixin):
         for ids, labels in zip(request.input_ids, request.token_ids_logprob):
             logprobs = [(self.logprobs[token].item(), token, None) for token in labels]
             meta = {"prompt_tokens": len(ids), "output_token_ids_logprobs": [logprobs]}
-            results.append({"meta_info": meta})
+            if self.output_prefix:
+                # Prefix slots favor the opposite candidate: using them must
+                # change the decision compared with the actual answer slot.
+                decoy = [
+                    (self.logprobs[token].item(), label, None)
+                    for token, label in zip(reversed(labels), labels)
+                ]
+                meta["output_token_ids_logprobs"] = [decoy] * len(
+                    self.output_prefix
+                ) + [logprobs]
+            results.append(
+                {"meta_info": meta, "output_ids": self.output_prefix + [labels[0]]}
+            )
         yield results
 
 
@@ -227,6 +241,9 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+        cls.diffusion_tokenizer = AutoTokenizer.from_pretrained(
+            "google/diffusiongemma-26B-A4B-it"
+        )
 
     def setUp(self):
         self.addCleanup(restore_context, snapshot_context())
@@ -584,6 +601,118 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
             [answers[q]["label_token_ids"] for q in ("team", "urgent")],
             scored.token_ids_logprob,
         )
+
+    async def test_diffusion_decisions_replay_final_canvas_scores(self):
+        """The empty thought scaffold has different scores from the answer slot."""
+        manager = ScoringManager(
+            self.diffusion_tokenizer, dllm_algorithm="Gemma4Renoise"
+        )
+        manager.dllm_scoring_config = DllmConfig(
+            "Gemma4Renoise",
+            {},
+            256,
+            -1,
+            1,
+            requires_separate_context_encoding=True,
+        )
+        manager.output_prefix = [100, 45518, 107, 101]
+        request = _request(
+            "s",
+            {
+                "team": _question("choice", {"a": None, "b": None}),
+                "mood": _question("score", ["calm", "angry"]),
+                "urgent": _question("yes_no"),
+            },
+            temperature=2.0,
+            return_prompt_token_ids=True,
+        )
+        response = await _handler(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200, response.body)
+        body = json.loads(response.body)
+        self.assertEqual(body["usage"]["completion_tokens"], 0)
+        self.assertEqual(manager.requests[0].sampling_params[0]["max_new_tokens"], 5)
+        prompt = self.diffusion_tokenizer.decode(manager.requests[0].input_ids[0])
+        self.assertTrue(prompt.endswith("<|turn>model\n"))
+        for answer in body["answers"].values():
+            replay = await manager.score_prompts(
+                prompts=[answer["prompt_token_ids"]],
+                label_token_ids=[answer["label_token_ids"]],
+                apply_softmax=True,
+                temperature=2.0,
+                return_token_logprobs=True,
+            )
+            self.assertEqual(list(answer["probabilities"].values()), replay.scores[0])
+            self.assertAlmostEqual(
+                answer["label_mass"],
+                math.fsum(math.exp(lp) for lp in replay.token_logprobs[0]),
+            )
+
+        manager.output_prefix = [100, 45518, 107, 4443]
+        response = await _handler(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("different prefix", json.loads(response.body)["message"])
+
+    async def test_diffusion_scoring_reserves_the_configured_canvas(self):
+        """A prompt fitting one output token can still overrun the full canvas."""
+        request = _request("s", {"urgent": _question("yes_no")})
+        prompt_len = len(
+            _encoded(_handler(ScoringManager(self.diffusion_tokenizer)), request)[0][0]
+        )
+        for canvas in (8, 256):
+            for spare in (canvas - 1, canvas):
+                with self.subTest(canvas=canvas, spare=spare):
+                    manager = ScoringManager(
+                        self.diffusion_tokenizer,
+                        dllm_algorithm="Gemma4Renoise",
+                        context_len=prompt_len + spare,
+                        allow_auto_truncate=True,
+                    )
+                    manager.dllm_scoring_config = DllmConfig(
+                        "Gemma4Renoise",
+                        {},
+                        canvas,
+                        -1,
+                        1,
+                    )
+                    manager.output_prefix = [100, 45518, 107, 101]
+                    response = await _handler(manager).handle_request(request, None)
+                    self.assertEqual(
+                        response.status_code, 200 if spare == canvas else 400
+                    )
+                    if spare < canvas:
+                        self.assertEqual(manager.requests, [])
+                        # /v1/score must refuse the same boundary before generation.
+                        with self.assertRaisesRegex(ValueError, "canvas"):
+                            await manager.score_prompts(
+                                [[1] * prompt_len],
+                                [[2, 3]],
+                                apply_softmax=True,
+                            )
+
+    async def test_diffusion_scoring_refuses_input_position_readouts(self):
+        """Input anchors and packed MIS have no corresponding denoiser slots."""
+        for kwargs, score_kwargs in (
+            ({"enable_mis": True}, {}),
+            ({}, {"score_extraction_token_id": 1}),
+        ):
+            with self.subTest(kwargs=kwargs, score_kwargs=score_kwargs):
+                manager = ScoringManager(
+                    self.diffusion_tokenizer,
+                    dllm_algorithm="Gemma4Renoise",
+                    **kwargs,
+                )
+                manager.dllm_scoring_config = DllmConfig(
+                    "Gemma4Renoise",
+                    {},
+                    256,
+                    -1,
+                    1,
+                )
+                with self.assertRaisesRegex(ValueError, "answer canvas position"):
+                    await manager.score_request(
+                        query=[], items=[[1]], label_token_ids=[[2, 3]], **score_kwargs
+                    )
+                self.assertEqual(manager.requests, [])
 
     async def test_refusals_name_the_question_and_skip_scoring(self):
         request = _request("s", {"first": _question("choice", {"a": None, "b": None})})

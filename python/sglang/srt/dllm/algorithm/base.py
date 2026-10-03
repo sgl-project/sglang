@@ -69,6 +69,9 @@ class DllmAlgorithm:
     def max_steps(self, block_size: int) -> int:
         return block_size + 1
 
+    def finalize_output(self, forward_batch, logits_output, states) -> None:
+        """Attach algorithm-specific results after the last scheduler-visible step."""
+
     def step(
         self,
         forward_batch: ForwardBatch,
@@ -129,6 +132,7 @@ class DllmAlgorithm:
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+        self.finalize_output(forward_batch, out.logits_output, states)
         return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
 
     def _run_fdfo(
@@ -160,6 +164,7 @@ class DllmAlgorithm:
             batch_size, self.block_size
         ).tolist()
         states_out = [None if done[i] else states[i] for i in range(batch_size)]
+        self.finalize_output(forward_batch, out.logits_output, states)
 
         return (
             out.logits_output,
