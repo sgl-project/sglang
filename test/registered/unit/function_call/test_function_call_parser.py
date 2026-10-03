@@ -2901,6 +2901,91 @@ class TestGptOssDetector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+    def _stream(self, text, chunk_size):
+        # A detector carries streaming state, so every run needs a fresh one.
+        detector = GptOssDetector()
+        normal_text, calls = "", []
+        for i in range(0, len(text), chunk_size):
+            result = detector.parse_streaming_increment(
+                text[i : i + chunk_size], self.tools
+            )
+            normal_text += result.normal_text
+            calls += result.calls
+        end = detector.finish(self.tools)
+        return normal_text + end.normal_text, calls + end.calls
+
+    def test_streaming_tool_call_split_across_chunks(self):
+        """A tool call streamed in pieces must parse exactly like the whole text.
+
+        Regression: parse_streaming_increment handed every chunk to HarmonyParser
+        and also kept its own copy of the same characters. Whenever the parser
+        produced no event it emitted that copy as normal text, so the text was
+        streamed twice; the second copy arrived as raw scaffolding, because once a
+        marker showed up the parser replayed everything it had been holding. The
+        tool call itself was dropped too: the "do we have a tool call" check looked
+        at the current chunk rather than at what the parser had seen, so a
+        completed tool_call event took the no-tool-call branch and was discarded.
+        """
+        text = (
+            "Let me check that."
+            "<|start|>assistant<|channel|>commentary to=get_weather"
+            '<|constrain|>json<|message|>{"city":"Paris"}<|call|>'
+        )
+
+        for chunk_size in range(1, 30):
+            with self.subTest(chunk_size=chunk_size):
+                normal_text, calls = self._stream(text, chunk_size)
+                self.assertEqual(normal_text, "Let me check that.")
+                self.assertNotIn("<|", normal_text)
+                self.assertEqual([c.name for c in calls], ["get_weather"])
+                self.assertEqual(calls[0].parameters, '{"city": "Paris"}')
+
+    def test_streaming_multiple_tool_calls_split_across_chunks(self):
+        text = (
+            "<|start|>assistant<|channel|>commentary to=get_weather"
+            '<|constrain|>json<|message|>{"city":"Paris"}<|call|>'
+            "<|start|>assistant<|channel|>commentary to=search"
+            '<|constrain|>json<|message|>{"query":"news"}<|call|>'
+        )
+
+        for chunk_size in range(1, 40):
+            with self.subTest(chunk_size=chunk_size):
+                normal_text, calls = self._stream(text, chunk_size)
+                self.assertEqual(normal_text, "")
+                self.assertEqual([c.name for c in calls], ["get_weather", "search"])
+                self.assertEqual(calls[1].parameters, '{"query": "news"}')
+
+    def test_streaming_plain_text_is_emitted_as_it_arrives(self):
+        """Text with no structural marker still reaches the client immediately."""
+        detector = GptOssDetector()
+        emitted = ""
+        for char in "Hello there":
+            emitted += detector.parse_streaming_increment(char, self.tools).normal_text
+        self.assertEqual(emitted, "Hello there")
+        self.assertEqual(detector.finish(self.tools).normal_text, "")
+
+    def test_streaming_holds_a_partial_marker_until_the_stream_ends(self):
+        """A trailing fragment that could still become a marker is withheld.
+
+        finish() then releases it: once the stream is over the fragment can no
+        longer become a marker, so dropping it would lose text the model emitted.
+        """
+        detector = GptOssDetector()
+        result = detector.parse_streaming_increment("the tag is <|sta", self.tools)
+        self.assertEqual(result.normal_text, "the tag is ")
+        self.assertEqual(result.calls, [])
+
+        self.assertEqual(detector.finish(self.tools).normal_text, "<|sta")
+
+    def test_streaming_truncated_protocol_block_is_not_shown(self):
+        """A block that had already become a marker is not user-visible text."""
+        text = '<|start|>assistant<|channel|>commentary to=get_weather<|constrain|>json<|message|>{"city"'
+        for chunk_size in (1, 5, len(text)):
+            with self.subTest(chunk_size=chunk_size):
+                normal_text, calls = self._stream(text, chunk_size)
+                self.assertEqual(normal_text, "")
+                self.assertEqual(calls, [])
+
 
 class TestGlm4MoeDetector(unittest.TestCase):
     def setUp(self):
