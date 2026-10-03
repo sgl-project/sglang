@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EmbeddingReqInput,
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
@@ -1351,6 +1352,59 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
+
+
+class TestAbortReqMatchesRid(unittest.TestCase):
+    """Regression tests for AbortReq.matches_rid (issue #41474).
+
+    ``POST /abort_request {"rid": "job-1"}`` previously aborted ``job-1`` and
+    every in-flight request whose rid merely started with ``job-1``
+    (``job-10``, ``job-11`` ...). The scheduler must now match exactly plus
+    the child rids the engine itself derives from the parent via
+    ``GenerateReqInput._normalize_rid`` (``<rid>_<i>``).
+    """
+
+    def test_exact_match(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        self.assertTrue(req.matches_rid("job-1"))
+
+    def test_prefix_only_does_not_match(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        for other in ("job-10", "job-11", "job-100", "job-1a", "job-1-bogus"):
+            with self.subTest(other=other):
+                self.assertFalse(req.matches_rid(other))
+
+    def test_child_rids_match(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        for child in ("job-1_0", "job-1_1", "job-1_99"):
+            with self.subTest(child=child):
+                self.assertTrue(req.matches_rid(child))
+
+    def test_child_of_unrelated_parent_does_not_match(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        self.assertFalse(req.matches_rid("job-10_0"))
+
+    def test_abort_all_matches_everything(self):
+        req = AbortReq(rid="", abort_all=True)
+        for other in ("job-1", "job-10", "anything", ""):
+            with self.subTest(other=other):
+                self.assertTrue(req.matches_rid(other))
+
+    def test_empty_rid_without_abort_all_matches_nothing(self):
+        # TokenizerManager already short-circuits this case, but the
+        # scheduler-side helper must still be defensive.
+        req = AbortReq(rid="", abort_all=False)
+        for other in ("job-1", "", None):
+            with self.subTest(other=other):
+                self.assertFalse(req.matches_rid(other))
+
+    def test_none_other_rid_is_safe(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        self.assertFalse(req.matches_rid(None))
+
+    def test_unrelated_rid_does_not_match(self):
+        req = AbortReq(rid="job-1", abort_all=False)
+        self.assertFalse(req.matches_rid("job-2"))
 
 
 if __name__ == "__main__":

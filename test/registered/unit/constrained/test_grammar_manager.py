@@ -26,6 +26,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
@@ -396,9 +397,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = future
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
         mgr.abort_requests(abort_req)
         future.cancel.assert_called_once()
@@ -410,9 +409,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
         mgr.abort_requests(abort_req)
         req.set_finish_with_abort.assert_not_called()
@@ -426,9 +423,7 @@ class TestAbortRequests(unittest.TestCase):
             mgr.grammar_queue.append(req)
             reqs.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(rid="", abort_all=True)
 
         mgr.abort_requests(abort_req)
         for req in reqs:
@@ -437,23 +432,39 @@ class TestAbortRequests(unittest.TestCase):
     def test_abort_empty_queue(self):
         """Aborting on an empty queue should not raise."""
         mgr = self._make_mgr_with_queue()
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(rid="", abort_all=True)
         mgr.abort_requests(abort_req)  # Should not raise
 
-    def test_abort_prefix_match(self):
-        """rid.startswith means prefix matching, not exact matching."""
+    def test_abort_prefix_only_does_not_match_unrelated_rid(self):
+        """Regression for issue #41474.
+
+        Aborting ``req-123`` must NOT cancel ``req-123-suffix`` or any other
+        rid that merely happens to start with ``req-123``. The scheduler
+        matches the rid exactly plus child rids derived by
+        ``GenerateReqInput._normalize_rid`` (``<rid>_<i>``).
+        """
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123-suffix")
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
         mgr.abort_requests(abort_req)
+        req.set_finish_with_abort.assert_not_called()
+
+    def test_abort_child_rid_does_match(self):
+        """Engine-derived child rids like ``req-123_0`` are still matched."""
+        mgr = self._make_mgr_with_queue()
+        req = _make_req(rid="req-123_0")
+        future = MagicMock(spec=Future)
+        req.grammar = future
+        mgr.grammar_queue.append(req)
+
+        abort_req = AbortReq(rid="req-123", abort_all=False)
+
+        mgr.abort_requests(abort_req)
+        future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
 
 
