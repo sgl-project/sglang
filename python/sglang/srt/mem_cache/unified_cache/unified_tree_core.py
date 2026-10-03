@@ -682,9 +682,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
         node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
-            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
-        )
+        assert params.node_id == node.id or (
+            params.node_id is None and node.parent is None
+        ), f"lock receipt anchored on node {params.node_id} released on node {node.id}"
 
     def _release_components(
         self,

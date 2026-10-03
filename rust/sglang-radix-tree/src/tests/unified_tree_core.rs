@@ -518,6 +518,7 @@ fn dec_lock_ref_skip_swa_skips_the_swa_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -558,6 +559,7 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -673,10 +675,14 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         swa_sliding_window_size: Some(2),
         ..Default::default()
     });
+    let a_id = tc.arena.node(a).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         a,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(a_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
@@ -4424,6 +4430,7 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
         tc.arena.node(child).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(child).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -7371,6 +7378,11 @@ fn sanity_check_passes_on_a_healthy_tree() {
             .id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(
+                tc.arena
+                    .node(tc.arena.resolve(leaf).expect("live test node"))
+                    .id,
+            ),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },

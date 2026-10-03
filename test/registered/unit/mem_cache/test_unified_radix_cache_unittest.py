@@ -2310,7 +2310,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
     def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
@@ -2618,7 +2618,7 @@ class UnifiedRadixCacheSuite:
             "SWA stays in LRU for drive_eviction to pick later",
         )
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         self.assertTrue(cache.tree_core.is_device_leaf(node_a))
         cache.sanity_check()
 
@@ -9688,7 +9688,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
-        cache.dec_lock_ref(node, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
 
@@ -10765,7 +10765,10 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
 
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(
-                leaf, DecLockRefParams(component_lock_uuids={ComponentType.SWA: None})
+                leaf,
+                DecLockRefParams(
+                    node_id=leaf, component_lock_uuids={ComponentType.SWA: None}
+                ),
             ),
             "lock_ref=0",
         )

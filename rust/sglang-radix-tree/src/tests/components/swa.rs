@@ -2649,10 +2649,14 @@ fn dec_swa_lock_only_evicts_a_fully_unlocked_device_leaf() {
             .set_device_value(node, FULL, Tensor::from_slice(&vec![9i64; len]));
     }
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
@@ -2803,16 +2807,23 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let first = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let _ = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
@@ -2851,10 +2862,14 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     // A holds a lock beyond the window (e.g. another request's window).
