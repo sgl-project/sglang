@@ -135,16 +135,19 @@ def _check_tool_schema_once(parameters: Any) -> None:
     """Run check_schema, and skip it for a schema that already passed.
 
     An agent sends the same tools on every request. check_schema is pure Python
-    and takes about 2 ms per tool on the event loop of the API server. A schema
-    that fails is not remembered, so it is checked and reported every time.
+    and runs on the event loop of the API server. A schema that fails is not
+    remembered, so it is checked and reported every time.
     """
     try:
-        digest = hashlib.blake2b(
-            orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS), digest_size=16
-        ).digest()
-    except (TypeError, RecursionError, orjson.JSONEncodeError):
+        payload = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS)
+        if b"null" in payload:
+            # orjson writes NaN and Infinity as null. A schema with one of them
+            # must not share a digest with the schema that has a real null.
+            json.dumps(parameters, allow_nan=False)
+    except (TypeError, ValueError):
         Draft202012Validator.check_schema(parameters)
         return
+    digest = hashlib.blake2b(payload, digest_size=16).digest()
     if digest in _VALID_TOOL_SCHEMAS:
         _VALID_TOOL_SCHEMAS.move_to_end(digest)
         return
