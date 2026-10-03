@@ -591,6 +591,11 @@ class DFlashDraftModel(nn.Module):
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
+        # Layer prefixes and a quantizable fc follow the draft's own checkpoint;
+        # a target --quantization the draft only inherits leaves both as before.
+        self.quantizable = self.is_nemotron_35_draft or (
+            getattr(config, "quantization_config", None) is not None
+        )
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -619,7 +624,11 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
+                    prefix=(
+                        (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
+                        if self.quantizable
+                        else ""
+                    ),
                 )
                 for i in range(num_layers)
             ]
@@ -641,14 +650,19 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        # Quantizable, like every other linear of the draft.
-        self.fc = ReplicatedLinear(
-            self.num_context_features * hidden_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc" if prefix else "fc",
-        )
+        if self.quantizable:
+            fc_prefix = f"{prefix}.fc" if prefix else "fc"
+            self.fc = ReplicatedLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=fc_prefix,
+            )
+        else:
+            self.fc = nn.Linear(
+                self.num_context_features * hidden_size, hidden_size, bias=False
+            )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -706,7 +720,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.input_size)
+        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -716,7 +730,9 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected, _ = self.fc(target_hidden)
+        projected = self.fc(target_hidden)
+        if self.quantizable:
+            projected = projected[0]
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -1003,7 +1019,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(self.fc.input_size)
+        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -1022,7 +1038,9 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected, _ = self.fc(fused)
+        projected = self.fc(fused)
+        if self.quantizable:
+            projected = projected[0]
         return self.hidden_norm(projected)
 
 

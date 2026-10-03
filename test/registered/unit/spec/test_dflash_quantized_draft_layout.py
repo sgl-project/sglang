@@ -5,7 +5,9 @@ empty layer prefix every attention and MLP projection was matched as a bare
 applied and the checkpoint's tensors for those layers were dropped without a
 word; ``fc`` was a plain ``nn.Linear`` that could not take packed tensors at
 all. These cases pin the layer names, the quantizable ``fc``, and the refusal
-to drop a tensor whose module the draft does have."""
+to drop a tensor whose module the draft does have. Both apply only to a draft
+whose own checkpoint is quantized; an unquantized draft that inherits the
+target's ``--quantization`` keeps its dense ``fc``."""
 
 import sys
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import dflash
 from sglang.srt.models.dflash import DFlashDecoderLayer, DFlashDraftModel
@@ -34,14 +37,18 @@ TARGET_LAYER_IDS = [1, 3]
 K = len(TARGET_LAYER_IDS)
 
 
-def _draft_config(num_layers=2):
-    return SimpleNamespace(
+def _draft_config(num_layers=2, quantized=False):
+    config = SimpleNamespace(
         architectures=["DFlash2DraftModel"],
         hidden_size=HIDDEN,
         num_hidden_layers=num_layers,
         rms_norm_eps=1e-6,
         dflash_config={"block_size": 4, "target_layer_ids": TARGET_LAYER_IDS},
     )
+    if quantized:
+        # Only a quantized checkpoint's config.json has this key.
+        config.quantization_config = {"quant_method": "compressed-tensors"}
+    return config
 
 
 def _int8_config(ignore=()):
@@ -126,7 +133,7 @@ def _fc_tensors():
 def test_every_layer_is_built_under_its_checkpoint_name(model_prefix):
     """Names reach the quantization config through this chain; an empty
     prefix at either link turns every projection into a bare name."""
-    _Draft(_draft_config(), quant_config=None, prefix=model_prefix)
+    _Draft(_draft_config(quantized=True), quant_config=None, prefix=model_prefix)
     root = f"{model_prefix}." if model_prefix else ""
     assert _RecordingAttention.prefixes == [
         f"{root}layers.0.self_attn",
@@ -152,7 +159,7 @@ def test_shard_only_ignore_reaches_the_fused_projection():
 
 
 def test_fc_is_quantized_by_a_config_that_targets_linear():
-    model = _Draft(_draft_config(), quant_config=_int8_config())
+    model = _Draft(_draft_config(quantized=True), quant_config=_int8_config())
     assert isinstance(model.fc, ReplicatedLinear)
     assert isinstance(model.fc.quant_method, CompressedTensorsLinearMethod)
     assert model.fc.weight_packed.shape == (HIDDEN, K * HIDDEN // 4)
@@ -160,14 +167,28 @@ def test_fc_is_quantized_by_a_config_that_targets_linear():
 
 
 def test_fc_stays_dense_when_ignored_or_unquantized():
-    ignored = _Draft(_draft_config(), quant_config=_int8_config(ignore=["re:^fc$"]))
+    ignored = _Draft(
+        _draft_config(quantized=True), quant_config=_int8_config(ignore=["re:^fc$"])
+    )
     assert isinstance(ignored.fc.quant_method, UnquantizedLinearMethod)
     plain = _Draft(_draft_config(), quant_config=None)
     assert plain.fc.weight.shape == (HIDDEN, K * HIDDEN)
 
 
+def test_inherited_online_quantization_leaves_an_unquantized_draft_dense():
+    """An unquantized draft inherits the target's --quantization (online FP8
+    here). Its fc must stay a dense nn.Linear and its layers unnamed, as on
+    main; giving it a quantizable fc turned fc into FP8 too."""
+    online_fp8 = Fp8Config(is_checkpoint_fp8_serialized=False)
+    model = _Draft(_draft_config(), quant_config=online_fp8, prefix="draft")
+    assert type(model.fc) is nn.Linear
+    assert model.fc.weight.shape == (HIDDEN, K * HIDDEN)
+    assert _RecordingAttention.prefixes == ["", ""]
+    assert _RecordingMLP.prefixes == ["", ""]
+
+
 def test_packed_fc_tensors_load():
-    model = _Draft(_draft_config(), quant_config=_int8_config())
+    model = _Draft(_draft_config(quantized=True), quant_config=_int8_config())
     packed = torch.randint(
         -(2**31), 2**31 - 1, model.fc.weight_packed.shape, dtype=torch.int32
     )
