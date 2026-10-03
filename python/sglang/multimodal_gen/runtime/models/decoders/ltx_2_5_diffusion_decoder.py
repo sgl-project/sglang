@@ -942,6 +942,25 @@ def _tile_intervals(
     ]
 
 
+def _assign_tiles_lpt(volumes: list[int], world_size: int) -> list[int]:
+    """Longest-processing-time tile->rank assignment for parallel decode.
+
+    Largest tiles first, each to the least-loaded rank, using the tile volume as
+    a decode-cost proxy. Balances load better than round-robin when tiles differ
+    in size (edge/trailing tiles are larger). Deterministic across ranks: every
+    rank sees the identical volumes and tie-breaks (stable order + lowest-index
+    rank on ties), so ownership needs no communication.
+    """
+    loads = [0] * world_size
+    owners = [0] * len(volumes)
+    order = sorted(range(len(volumes)), key=lambda i: volumes[i], reverse=True)
+    for idx in order:
+        rank = min(range(world_size), key=lambda r: loads[r])
+        owners[idx] = rank
+        loads[rank] += volumes[idx]
+    return owners
+
+
 class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin):
     """Checkpoint-level wrapper: the decoder plus the latent statistics.
 
@@ -1203,11 +1222,22 @@ class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin)
             ), "tile noise shape does not match the context it conditions on"
             return decoder.denoise(context, x_t, num_inference_steps)
 
+        # Balance decode load by tile volume (LPT) rather than round-robin: the
+        # trailing/edge tiles are larger, so `index % world_size` can leave one
+        # rank gating every all-gather round. Ownership is derived identically
+        # on every rank (no communication).
+        owners = _assign_tiles_lpt(
+            [(t1 - t0) * (h1 - h0) * (w1 - w0) for t0, t1, h0, h1, w0, w1 in coords],
+            world_size,
+        )
+
         local_indices = []
         local_tiles = []
         for index in range(len(coords)):
+            # Draw every tile's noise in grid order on every rank so ownership
+            # never shifts the generator's draw sequence, then decode only ours.
             x_t = _tile_x_t(index)
-            if index % world_size != rank:
+            if owners[index] != rank:
                 del x_t
                 continue
             local_indices.append(index)
