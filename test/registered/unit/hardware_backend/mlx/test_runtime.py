@@ -108,11 +108,18 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         for mlx_version in ("0.32.9", "0.33.0", "1.0.0"):
             with self.subTest(mlx=mlx_version):
                 fake_mlx, fake_core = _fake_mlx(mlx_version)
+                fake_transformers = types.ModuleType("transformers")
+                fake_transformers.__version__ = "5.12.1"
                 runtime._validate_runtime.cache_clear()
                 try:
                     with (
                         mock.patch.dict(
-                            sys.modules, {"mlx": fake_mlx, "mlx.core": fake_core}
+                            sys.modules,
+                            {
+                                "mlx": fake_mlx,
+                                "mlx.core": fake_core,
+                                "transformers": fake_transformers,
+                            },
                         ),
                         mock.patch.object(torch, "__version__", "2.13.7"),
                         mock.patch.object(
@@ -122,6 +129,33 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
                         self.assertIsNone(runtime._validate_runtime())
                 finally:
                     runtime._validate_runtime.cache_clear()
+
+    def test_transformers_major_below_five_is_rejected(self):
+        fake_mlx, fake_core = _fake_mlx("0.32.0")
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.__version__ = "4.57.6"
+        runtime._validate_runtime.cache_clear()
+        try:
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "mlx": fake_mlx,
+                        "mlx.core": fake_core,
+                        "transformers": fake_transformers,
+                    },
+                ),
+                mock.patch.object(torch, "__version__", "2.13.0"),
+                mock.patch.object(
+                    torch.backends.mps, "is_available", return_value=True
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, r"transformers>=5 \(found 4\.57\.6\)"
+                ),
+            ):
+                runtime._validate_runtime()
+        finally:
+            runtime._validate_runtime.cache_clear()
 
     def test_missing_mlx_has_an_actionable_error(self):
         runtime._validate_runtime.cache_clear()
@@ -137,6 +171,8 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         fake_core = types.ModuleType("mlx.core")
         fake_core.__version__ = "0.32.0"
         fake_mlx.core = fake_core
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.__version__ = "5.12.1"
 
         cases = (
             (False, True, "PyTorch MPS device"),
@@ -150,7 +186,12 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
                 runtime._validate_runtime.cache_clear()
                 try:
                     with mock.patch.dict(
-                        sys.modules, {"mlx": fake_mlx, "mlx.core": fake_core}
+                        sys.modules,
+                        {
+                            "mlx": fake_mlx,
+                            "mlx.core": fake_core,
+                            "transformers": fake_transformers,
+                        },
                     ):
                         with mock.patch.object(torch, "__version__", "2.13.0"):
                             with mock.patch.object(
