@@ -1990,28 +1990,13 @@ def exports_expert_balancedness_to_prometheus() -> bool:
     return get_exec().moe.expert_balancedness_report_mode in ("prometheus", "both")
 
 
-def flashinfer_a2a_max_dispatch_tokens_per_rank(prefill_buffer_tokens: int) -> int:
-    """Per-rank token capacity of the FlashInfer A2A workspace.
-
-    Shared by the dispatcher (allocation) and the startup budget check, so the
-    checked capacity is the allocated one. 4096 covers default decode graphs.
-    """
-    from sglang.srt.environ import envs
-
-    configured = envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    if configured is not None:
-        return configured
-    return max(prefill_buffer_tokens, 4096)
-
-
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 

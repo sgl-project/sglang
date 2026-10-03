@@ -6,6 +6,7 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.arg_groups.overrides import flashinfer_a2a_max_dispatch_tokens_per_rank
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     is_dp_attention_enabled,
@@ -31,7 +32,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.runtime_context import (
-    flashinfer_a2a_max_dispatch_tokens_per_rank,
     get_flags,
     get_parallel,
     get_spec,
@@ -146,15 +146,9 @@ class FlashinferDispatcher(BaseDispatcher):
         # which reserves ep_size * max_num_tokens * payload bytes, and the C++
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
         #
-        # The workspace must fit both:
-        #  (a) the largest eager prefill chunk on one rank (the prefill buffer
-        #      ceiling, which includes PP dynamic-chunking growth), and
-        #  (b) the largest decode batch (bounded by max_running_requests, which
-        #      resolve_max_num_reqs caps at 4096 per DP worker).
-        # max_running_requests is not yet resolved at model-construction time,
-        # so we use 4096 as a floor to cover decode batches and _dummy_run
-        # (which warms up at batch_size = req_to_token_pool.size).
-        # validate_flashinfer_a2a_token_budget rejects configs exceeding this.
+        # The workspace must fit both the largest eager prefill chunk on one rank
+        # (the prefill buffer ceiling, incl. PP dynamic chunking) and the largest
+        # decode batch.
         self.max_num_tokens = flashinfer_a2a_max_dispatch_tokens_per_rank(
             max_prefill_buffer_tokens()
         )

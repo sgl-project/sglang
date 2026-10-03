@@ -1752,28 +1752,6 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     return True
 
 
-def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
-    """Largest number of tokens a single forward routes through a CuteDSL
-    MoE layer on one (DP) rank; sizes the standard-allgather wrapper buffers.
-    The FlashInfer A2A budget is required_flashinfer_a2a_dispatch_tokens_per_rank.
-    Max over the prefill (max_prefill_tokens), piecewise-prefill
-    capture, and decode/verify bounds; num_tokens_per_req is
-    speculative_num_draft_tokens under speculative decoding, else 1.
-    """
-    cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm:
-        num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
-    else:
-        num_tokens_per_req = 1
-    prefill_tokens = cfg.max_prefill_tokens
-    cg_config = cfg.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-    decode_tokens = decode_max_bs * num_tokens_per_req
-    return max(prefill_tokens, decode_tokens)
-
-
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
     chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
@@ -1793,6 +1771,17 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         record = record_of(server_args)
     return prefill_buffer_ceiling_of(record, tokens)
+
+
+def flashinfer_a2a_max_dispatch_tokens_per_rank(prefill_buffer_tokens: int) -> int:
+    """Per-rank token capacity of the FlashInfer A2A workspace; the allocation
+    and the startup budget check must both read it from here."""
+    configured = envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if configured is not None:
+        return configured
+    # max_running_requests is unresolved at model construction; 4096 covers the
+    # per-DP-worker cap resolve_max_num_reqs applies, and _dummy_run.
+    return max(prefill_buffer_tokens, 4096)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

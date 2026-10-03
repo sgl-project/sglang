@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
     declare_resolution,
+    flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     model_config_of,
@@ -28,11 +29,7 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import (
-    attn_dp_enabled_of,
-    flashinfer_a2a_max_dispatch_tokens_per_rank,
-    get_platform,
-)
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -555,6 +552,29 @@ def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     )
 
 
+def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
+    """(requests, tokens per request) of the largest decode/verify CUDA graph on
+    one DP rank; (0, 1) when this instance captures no decode graph."""
+    view = resolved_view(server_args)
+    cg_config = view.cuda_graph_config
+    if (
+        view.disaggregation_mode == "prefill"
+        or cg_config is None
+        or cg_config.decode.backend == Backend.DISABLED
+    ):
+        return 0, 1
+    graph_bs = cg_config.decode.max_bs or 0
+    if view.max_running_requests is not None:
+        per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
+        graph_bs = min(graph_bs, per_rank_pool_bs)
+    tokens_per_req = (
+        max_speculative_num_draft_tokens(server_args) or 1
+        if view.speculative_algorithm
+        else 1
+    )
+    return graph_bs, tokens_per_req
+
+
 def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     """Check the configured prefill and decode-graph buffer bounds."""
     view = resolved_view(server_args)
@@ -573,21 +593,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
                 "--max-prefill-tokens."
             )
 
-    if view.disaggregation_mode == "prefill":
-        return
-    decode_config = getattr(view.cuda_graph_config, "decode", None)
-    if decode_config is None or decode_config.backend == Backend.DISABLED:
-        return
-
-    graph_bs = decode_config.max_bs or 0
-    if view.max_running_requests is not None:
-        per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
-        graph_bs = min(graph_bs, per_rank_pool_bs)
-    tokens_per_req = (
-        max_speculative_num_draft_tokens(server_args) or 1
-        if view.speculative_algorithm
-        else 1
-    )
+    graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
     graph_tokens = graph_bs * tokens_per_req
     if graph_tokens > capacity:
         raise ValueError(
@@ -624,7 +630,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         )
 
 
-def required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
+def _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
     """Largest token count one DP rank dispatches through FlashInfer A2A in one
     forward: eager prefill chunks, prefill CUDA graphs, and decode/verify graphs.
     """
@@ -635,30 +641,13 @@ def required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
         tokens = max_prefill_buffer_tokens(server_args)
         if cg_config is not None and cg_config.prefill.backend != Backend.DISABLED:
             tokens = max(tokens, cg_config.prefill.max_bs or 0)
-    if (
-        view.disaggregation_mode != "prefill"
-        and cg_config is not None
-        and cg_config.decode.backend != Backend.DISABLED
-    ):
-        graph_bs = cg_config.decode.max_bs or 0
-        if view.max_running_requests is not None:
-            graph_bs = min(
-                graph_bs, max(1, view.max_running_requests // view.attn_dp_size)
-            )
-        tokens_per_req = (
-            max_speculative_num_draft_tokens(server_args) or 1
-            if view.speculative_algorithm
-            else 1
-        )
-        tokens = max(tokens, graph_bs * tokens_per_req)
-    return tokens
+    graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
+    return max(tokens, graph_bs * tokens_per_req)
 
 
 def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
-    largest forward; at runtime the dispatcher asserts on the first such batch.
-    Runs after speculative decoding is resolved so draft-token counts are final.
-    """
+    largest forward; at runtime the dispatcher asserts on the first such batch."""
     view = resolved_view(server_args)
     if view.moe_a2a_backend != "flashinfer":
         return
@@ -669,7 +658,7 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
             "workspace, so --chunked-prefill-size must be > 0."
         )
 
-    required = required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
+    required = _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
     capacity = flashinfer_a2a_max_dispatch_tokens_per_rank(
         max_prefill_buffer_tokens(server_args)
     )
