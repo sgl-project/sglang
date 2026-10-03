@@ -701,6 +701,29 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_keeps_every_media_item_of_a_single_request(self):
+        """With n > 1, each sample of a multi-image/video/audio request gets all of its media."""
+        for field_name in ("image_data", "video_data", "audio_data"):
+            with self.subTest(field_name=field_name):
+                req = GenerateReqInput(
+                    text="Compare these",
+                    sampling_params={"n": 2},
+                    **{field_name: ["m1", "m2"]},
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(getattr(req[0], field_name), ["m1", "m2"])
+
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=["i1", "i2"],
+            mm_hashes=["h1", "h2"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].image_data, ["i1", "i2"])
+        self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
+        self.assertEqual(req[0].modalities, "multi-images")
+
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",
