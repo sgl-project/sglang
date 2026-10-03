@@ -5,6 +5,7 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod affinity;
 pub mod cache_aware;
 pub mod factory;
 pub mod power_of_two;
@@ -96,7 +97,13 @@ pub trait Policy: Send + Sync + Debug {
         true
     }
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// Whether picks read request tokens (prefix matching). Load-only policies
+    /// work from the request-size estimate when no tokenizer is loaded.
+    fn needs_request_tokens(&self) -> bool {
+        false
+    }
+
+    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
     }

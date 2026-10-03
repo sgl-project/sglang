@@ -3437,7 +3437,9 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
+def test_write_back_swa_repair_backup_leaves_the_unbacked_parent_to_eviction(backend):
+    """Write-back builds the SWA repair backup as the repaired node alone; the
+    parent's missing Full copy waits for eviction instead of joining at insert."""
     cache, allocator = _swa_cache(window=4, backend=backend)
     core = cache.tree_core
     values = allocator.alloc(12)
@@ -3458,7 +3460,6 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
     for node in nodes:
         _complete_backup(core, node, full_offset=10000, aux_offset=20000)
 
-    # Repairing SWA later must issue an async backup even in write-back mode.
     # Reclaim the two internal SWA states and the parent's Full host copy.
     tracker = {}
     core.evict_device_start(ComponentType.SWA, 8)
@@ -3478,8 +3479,8 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
         _accumulate_step(step, {}, {}, {})
     assert not core.is_backuped(parent) and core.is_backuped(child)
 
-    # Mock DMA submission only; insertion, backup publication, the pending
-    # split and FIFO acknowledgment all use the real shared controller.
+    # Mock DMA submission only; insertion, backup publication and FIFO
+    # acknowledgment all use the real shared controller.
     cache.cache_controller = SimpleNamespace(write_policy="write_back")
     cache._build_backup_sidecar = Mock(return_value=[])
     submissions = []
@@ -3499,23 +3500,19 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
             component_evicted_seqlens={ComponentType.SWA: 4},
         )
     )
-    assert submissions == [(parent, 4), (child, 0)]
-    assert set(cache.ongoing_write_through) == {parent, child}
-    core.sanity_check([(node, node) for node in cache.ongoing_write_through], [])
-    cache.match_prefix(MatchPrefixParams(key=_key([0, 1])))
-    prefix, suffix = cache.ongoing_write_through[parent].publish_node_ids
-    assert suffix == parent and prefix != parent
-    core.sanity_check([(node, node) for node in cache.ongoing_write_through], [])
-    for node in (parent, child):
-        cache._finish_write_through_ack(node)
+    # Repairing SWA still issues the async backup in write-back mode, but for
+    # the repaired node alone: a chained parent could already be pending under
+    # another request's window publish.
+    assert submissions == [(child, 0)]
+    assert set(cache.ongoing_write_through) == {child}
+    core.sanity_check([(child, child)], [])
+    cache._finish_write_through_ack(child)
     core.sanity_check([], [])
 
-    # The existing child keeps its place. New Full copies join at ack in
-    # prefix/suffix order, including when the pending node was internal.
+    # The existing Full copies keep their order; the parent stays unbacked
+    # until write-back eviction backs it up.
     expected = [
         (values[4:8] + 10000).tolist(),
-        (values[:2] + 40000).tolist(),
-        (values[2:4] + 40000).tolist(),
         (values[8:] + 10000).tolist(),
     ]
     for host_indices in expected:
@@ -3526,7 +3523,7 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
         assert [value.tolist() for value in host_frees[ComponentType.FULL]] == [
             host_indices
         ]
-    assert all(not core.is_backuped(node) for node in (prefix, parent, child, leaf))
+    assert all(not core.is_backuped(node) for node in nodes)
     core.sanity_check([], [])
 
 

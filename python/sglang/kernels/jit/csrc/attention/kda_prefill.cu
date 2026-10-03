@@ -32,8 +32,10 @@
 //   h_per_chunk is an optional preallocated per-chunk state output.
 //
 // Build (torch cpp_extension JIT):
-//   -O3 -std=c++20 -gencode arch=compute_103a,code=sm_103a -use_fast_math
-//   -lineinfo, link -lcuda (cuTensorMapEncodeTiled). sm_103a (GB300) only.
+//   -O3 -std=c++20 -gencode arch=compute_{100a,103a},code=sm_{100a,103a}
+//   (the device's arch) -use_fast_math -lineinfo, link -lcuda
+//   (cuTensorMapEncodeTiled). Only the tcgen05 cta_group::1 subset that sm_100a
+//   and sm_103a share is used, so both B200 and B300 run it.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
