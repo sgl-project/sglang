@@ -19,7 +19,7 @@ import msgspec
 import torch
 import torch.distributed as dist
 from sglang.srt.training_capture import startup
-from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
+from sglang.srt.training_capture.catalog import CatalogConflict, HTTPCaptureCatalog
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
@@ -117,6 +117,7 @@ def resource_worker(rank, root):
         "policy",
         "store_policy",
         "policy_error",
+        "capabilities",
         "phase",
         "registration",
         "budget",
@@ -213,6 +214,17 @@ def resource_worker(rank, root):
                         side_effect=AssertionError("passive resources performed HTTP"),
                     )
                 )
+                capabilities = stack.enter_context(
+                    patch.object(
+                        HTTPCaptureCatalog,
+                        "check_compatibility",
+                        side_effect=(
+                            CatalogConflict("unsupported peer capabilities")
+                            if case == "capabilities" and rank == 2
+                            else None
+                        ),
+                    )
+                )
                 dist.barrier()
                 try:
                     value = coordinate_resource_startup(
@@ -240,6 +252,7 @@ def resource_worker(rank, root):
                     connects=connect.call_count,
                     exports=export.call_count,
                     http=http.call_count,
+                    capabilities=capabilities.call_count,
                     closed=store.closed,
                     held=len(store.registered),
                     prepared_closed=all(value.closed for value in prepared),
@@ -275,9 +288,12 @@ class TestCaptureResources(CustomTestCase):
                 max_device_bytes=1 << 20,
             )
             store = MooncakeSnapshotStore(BufferStore(), FakeReplicateConfig())
-            with patch(
-                "sglang.srt.training_capture.resources.MooncakeSnapshotStore.connect",
-                return_value=store,
+            with (
+                patch(
+                    "sglang.srt.training_capture.resources.MooncakeSnapshotStore.connect",
+                    return_value=store,
+                ),
+                patch.object(HTTPCaptureCatalog, "check_compatibility"),
             ):
                 resources = CaptureResources.prepare(
                     config=config,
@@ -335,6 +351,7 @@ class TestCaptureResources(CustomTestCase):
             "policy": ("policy_agreement", [0, 1, 2, 3]),
             "store_policy": ("policy_agreement", [0, 1, 2, 3]),
             "policy_error": ("policy", [3]),
+            "capabilities": ("resources", [2]),
             "phase": ("protocol", [0, 1, 2, 3]),
             "registration": ("resources", [0]),
             "budget": ("resources", [2]),
@@ -366,8 +383,14 @@ class TestCaptureResources(CustomTestCase):
                     self.assertEqual(rows[inactive]["connects"], 0)
                     self.assertEqual(rows[aux]["exports"], 0)
                     self.assertEqual(rows[inactive]["exports"], 0)
+                    self.assertEqual(rows[inactive]["capabilities"], 0)
+                    self.assertEqual(rows[aux]["capabilities"], 1)
                 if case.startswith("policy") or case in ("store_policy", "phase"):
                     self.assertTrue(all(row["connects"] == 0 for row in rows))
+                    self.assertTrue(all(row["capabilities"] == 0 for row in rows))
+                if case == "capabilities":
+                    self.assertEqual(rows[2]["connects"], 0)
+                    self.assertEqual(rows[2]["exports"], 0)
                 for rank, row in enumerate(rows):
                     if case == "cleanup" and rank == 2:
                         self.assertEqual(
@@ -559,6 +582,7 @@ class TestCaptureResources(CustomTestCase):
             with (
                 patch.object(MooncakeSnapshotStore, "connect", return_value=store),
                 patch.object(SelectedLayerKVExporter, "from_pool") as exporter,
+                patch.object(HTTPCaptureCatalog, "check_compatibility"),
             ):
                 resources = CaptureResources.prepare(
                     config=resource_config(root),
@@ -618,7 +642,7 @@ class TestCaptureResources(CustomTestCase):
                     exporter=cpu_exporter(manifest.kv),
                     req_to_token=None,
                     store=store,
-                    catalog=catalog,
+                    catalog=HTTPCaptureCatalog(catalog.endpoint),
                     pin_memory=False,
                     autostart=False,
                 )

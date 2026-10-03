@@ -32,10 +32,6 @@ class CaptureResources:
         if not partition.active:
             return resources
         try:
-            if partition.heads:
-                resources.exporter = SelectedLayerKVExporter.from_pool(
-                    kv, source_pool, partition=partition
-                )
             token = (
                 os.environ[config.catalog_token_env]
                 if config.catalog_token_env
@@ -47,6 +43,15 @@ class CaptureResources:
                 timeout=config.http_timeout_seconds,
                 attempts=config.http_attempts,
             )
+            resources.catalog.check_compatibility(
+                contract_id=config.contract_id,
+                kv_codec=kv.codec,
+                store_protocol=config.store.protocol,
+            )
+            if partition.heads:
+                resources.exporter = SelectedLayerKVExporter.from_pool(
+                    kv, source_pool, partition=partition
+                )
             resources.store = MooncakeSnapshotStore.connect(
                 msgspec.to_builtins(config.store),
                 replica_num=config.replica_num,
@@ -75,6 +80,12 @@ class CaptureResources:
             exporter,
         )
         try:
+            if catalog is not None:
+                catalog.check_compatibility(
+                    contract_id=config.contract_id,
+                    kv_codec=kv.codec,
+                    store_protocol=config.store.protocol,
+                )
             if store.payload_hasher.workers != config.payload_hash_workers:
                 raise ContractError(
                     "connected Store hash workers differ from capture config"

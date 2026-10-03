@@ -18,6 +18,7 @@ from sglang.srt.training_capture.protocol import (
 )
 
 MAX_CATALOG_REQUEST_BYTES = 8 << 20
+MAX_CATALOG_RESPONSE_BYTES = 1 << 20
 
 
 class CatalogError(CaptureError):
@@ -30,6 +31,22 @@ class CatalogConflict(CatalogError):
 
 class CatalogUnavailable(CatalogError):
     pass
+
+
+class CatalogContract(StrictStruct):
+    contract_id: Identifier
+    schema_version: Positive
+    payload_format: str
+    kv_codecs: list[str]
+
+
+class CatalogCapabilities(StrictStruct):
+    protocol_version: Positive
+    contracts: list[CatalogContract]
+    store_protocols: list[str]
+    hard_pin: bool
+    retention_policy: str
+    max_request_bytes: Positive
 
 
 class CaptureLease(StrictStruct):
@@ -53,6 +70,10 @@ class CaptureLease(StrictStruct):
 
 
 class Catalog(Protocol):
+    def check_compatibility(
+        self, *, contract_id: str, kv_codec: str, store_protocol: str
+    ) -> CatalogCapabilities: ...
+
     def begin(self, identity: dict) -> CaptureLease: ...
 
     def heartbeat(self, lease: CaptureLease) -> CaptureLease: ...
@@ -137,24 +158,23 @@ class HTTPCaptureCatalog:
             urllib.request.ProxyHandler({}), _NoRedirect()
         )
 
-    def _post(self, route: str, payload: dict) -> dict:
-        body = canonical_bytes(payload)
-        if len(body) > MAX_CATALOG_REQUEST_BYTES:
+    def _request(self, method: str, route: str, payload: dict | None = None) -> dict:
+        body = canonical_bytes(payload) if payload is not None else None
+        if body is not None and len(body) > MAX_CATALOG_REQUEST_BYTES:
             raise CatalogError("Catalog request exceeds metadata budget")
-        headers = {
-            "Content-Type": "application/json",
-            "X-Training-Capture-Protocol": "1",
-        }
+        headers = {"X-Training-Capture-Protocol": "1"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         if self.bearer_token:
             headers["Authorization"] = "Bearer " + self.bearer_token
         for attempt in range(self.attempts):
             request = urllib.request.Request(
-                self.endpoint + route, data=body, headers=headers, method="POST"
+                self.endpoint + route, data=body, headers=headers, method=method
             )
             try:
                 with self.opener.open(request, timeout=self.timeout) as response:
-                    content = response.read((1 << 20) + 1)
-                    if len(content) > 1 << 20:
+                    content = response.read(MAX_CATALOG_RESPONSE_BYTES + 1)
+                    if len(content) > MAX_CATALOG_RESPONSE_BYTES:
                         raise CatalogError("Catalog response exceeds metadata budget")
                     result = msgspec.json.decode(content)
                     if not isinstance(result, dict):
@@ -179,6 +199,40 @@ class HTTPCaptureCatalog:
         raise CatalogUnavailable(
             f"Catalog operation has no confirmed result after bounded retries: {route}"
         )
+
+    def _post(self, route: str, payload: dict) -> dict:
+        return self._request("POST", route, payload)
+
+    def capabilities(self) -> CatalogCapabilities:
+        result = self._request("GET", "/capabilities")
+        try:
+            return msgspec.convert(result, type=CatalogCapabilities)
+        except msgspec.ValidationError as error:
+            raise CatalogError("invalid Catalog capabilities") from error
+
+    def check_compatibility(
+        self, *, contract_id: str, kv_codec: str, store_protocol: str
+    ) -> CatalogCapabilities:
+        capabilities = self.capabilities()
+        if capabilities.protocol_version != 1:
+            raise CatalogConflict("unsupported Catalog producer protocol")
+        if not any(
+            contract.contract_id == contract_id
+            and contract.schema_version == 1
+            and contract.payload_format == "maas_target_kv_v1"
+            and kv_codec in contract.kv_codecs
+            for contract in capabilities.contracts
+        ):
+            raise CatalogConflict("Catalog does not support the capture contract/codec")
+        if store_protocol not in capabilities.store_protocols:
+            raise CatalogConflict("Catalog does not support the Store transport")
+        if not capabilities.hard_pin:
+            raise CatalogConflict("Catalog must require hard-pinned payloads")
+        if capabilities.retention_policy != "retain_until_checkpoint":
+            raise CatalogConflict("Catalog must retain payloads through checkpoints")
+        if capabilities.max_request_bytes < MAX_CATALOG_REQUEST_BYTES:
+            raise CatalogConflict("Catalog request budget is below the producer limit")
+        return capabilities
 
     def begin(self, identity: dict) -> CaptureLease:
         result = self._post("/captures:begin", identity)

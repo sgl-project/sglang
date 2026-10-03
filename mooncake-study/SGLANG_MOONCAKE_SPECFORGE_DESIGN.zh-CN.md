@@ -860,6 +860,17 @@ Catalog 不能与现有 `MooncakeFeatureStore.release()` 同时拥有删除权�
 
 claim/filter 在记录分发前执行，避免 incompatible sample 占住一个 DP window。控制 payload 限制大小，tensor 只走 Store。
 
+producer 对 `GET /capabilities` 使用严格、限长的响应结构，schema 与示例分别见
+[`catalog-capabilities.schema.json`](training-data-contract/catalog-capabilities.schema.json)
+和 [`catalog-capabilities.example.json`](training-data-contract/catalog-capabilities.example.json)。
+每条 `contracts[]` 是不可拆分的兼容记录；不能从一条取 `contract_id`、另一条取
+codec 后拼成匹配。每个 active TP/PP owner 在创建 KV exporter、连接 Mooncake、
+申请 Host pool 和打开 journal 前独立检查 producer protocol、contract/schema、
+payload format、实际 KV codec、Store protocol、hard pin、checkpoint retention 与
+HTTP metadata 上限。不兼容 rank 通过既有 resource-startup vote 让全组失败并回收，
+不能先开始 lease 或写对象。Mooncake 客户端本身的注册 buffer、hard-pin 和返回值
+能力仍在 SDK 边界再次检查；Catalog 声明不能替代本地探测。
+
 publish 请求的具体结构示例，所有 ID/digest 为示意值:
 
 ```json

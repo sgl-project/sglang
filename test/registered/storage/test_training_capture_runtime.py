@@ -144,6 +144,7 @@ class TestTrainingCaptureRuntime(CustomTestCase):
 
     @classmethod
     def launch_server(cls, path, *, cuda_graph=False):
+        capability_requests = cls.catalog.capability_requests
         graph_args = (
             [
                 "--cuda-graph-backend-decode",
@@ -191,6 +192,14 @@ class TestTrainingCaptureRuntime(CustomTestCase):
                 str(path),
                 *graph_args,
             ],
+        )
+        if cls.catalog.capability_requests != capability_requests + 1:
+            raise AssertionError("serving startup must validate Catalog capabilities")
+        print(
+            json.dumps(
+                {"catalog_startup_handshake": {"cuda_graph": cuda_graph, "requests": 1}}
+            ),
+            flush=True,
         )
 
     @classmethod

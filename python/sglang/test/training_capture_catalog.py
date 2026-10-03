@@ -20,9 +20,38 @@ class TestCaptureCatalog:
         self.captures = {}
         self.publications = {}
         self.errors = []
+        self.capability_requests = 0
+        self.capabilities = {
+            "protocol_version": 1,
+            "contracts": [
+                {
+                    "contract_id": "maas-target-kv-top128-v1",
+                    "schema_version": 1,
+                    "payload_format": "maas_target_kv_v1",
+                    "kv_codecs": [
+                        "dense_bf16_post_rope_v1",
+                        "dense_fp16_post_rope_v1",
+                        "dense_bf16_pre_rope_v1",
+                        "dense_fp16_pre_rope_v1",
+                    ],
+                }
+            ],
+            "store_protocols": ["tcp", "rdma"],
+            "hard_pin": True,
+            "retention_policy": "retain_until_checkpoint",
+            "max_request_bytes": 8 << 20,
+        }
         catalog = self
 
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                with catalog.condition:
+                    if self.path == "/capabilities":
+                        catalog.capability_requests += 1
+                        self.respond(200, catalog.capabilities)
+                    else:
+                        self.respond(404, {"error": "unknown test Catalog route"})
+
             def do_POST(self):
                 try:
                     content_length = int(self.headers["Content-Length"])
@@ -42,6 +71,9 @@ class TestCaptureCatalog:
                     with catalog.condition:
                         catalog.errors.append(repr(error))
                     status, result = 409, {"error": str(error)}
+                self.respond(status, result)
+
+            def respond(self, status, result):
                 data = json.dumps(result).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")

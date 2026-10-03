@@ -1,0 +1,358 @@
+{
+  "status": "completed",
+  "baseline": "87561d795",
+  "jobs": [
+    {
+      "role": "focused",
+      "job": "01791043600868193090-5abda898319a",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+      "argv": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-p",
+        "test_catalog_capabilities.py",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+        "--timeout-seconds",
+        "1800",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-p",
+        "test_catalog_capabilities.py",
+        "-v",
+        "-f"
+      ],
+      "result": {
+        "job_id": "01791043600868193090-5abda898319a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791043618.734799,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791043600868193090-5abda898319a.log"
+      },
+      "tests": {
+        "methods": 8,
+        "seconds": 4.721
+      }
+    },
+    {
+      "role": "runtime",
+      "job": "01791043988702838784-212d98c8afef",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+      "argv": [
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "TestTrainingCaptureRuntime.test_chunk_prefix_single_token_and_raw_teacher_reference",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+        "--timeout-seconds",
+        "1800",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "TestTrainingCaptureRuntime.test_chunk_prefix_single_token_and_raw_teacher_reference",
+        "-v",
+        "-f"
+      ],
+      "result": {
+        "job_id": "01791043988702838784-212d98c8afef",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791044567.9710805,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791043988702838784-212d98c8afef.log"
+      },
+      "tests": {
+        "methods": 1,
+        "seconds": 565.995
+      }
+    },
+    {
+      "role": "units",
+      "job": "01791043601074686866-03b8b8d158ab",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+      "argv": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-v",
+        "-f"
+      ],
+      "submit_args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+        "--timeout-seconds",
+        "1800",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1/python",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-v",
+        "-f"
+      ],
+      "result": {
+        "job_id": "01791043601074686866-03b8b8d158ab",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791043922.2836204,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791043601074686866-03b8b8d158ab.log"
+      },
+      "tests": {
+        "methods": 345,
+        "seconds": 288.732
+      }
+    }
+  ],
+  "handshakes": [
+    {
+      "cuda_graph": false,
+      "requests": 1
+    },
+    {
+      "cuda_graph": true,
+      "requests": 1
+    }
+  ],
+  "runtime_markers": {
+    "catalog_startup_handshake": 2,
+    "capture_after_response": 3,
+    "runtime_kv_teacher_exact": 3,
+    "graph_capture": 1,
+    "overlap_after_request": 14,
+    "expected_samples": 14,
+    "overlap_capture": 2,
+    "samples": 10,
+    "cuda_graph_enabled": 12,
+    "padded_graph": 6,
+    "aborted": 6,
+    "canonical_remaps": 2,
+    "speculative_capture": 4,
+    "overlap_enabled": 4,
+    "target_kv_serving": 4,
+    "dspark_memory_pressure": 4,
+    "layer": 18,
+    "component": 18,
+    "worst_index": 18,
+    "actual_at_worst": 18,
+    "reference_at_worst": 18,
+    "per_position_max": 18,
+    "max_abs": 18,
+    "reference_max_abs": 18,
+    "relative_rms": 18,
+    "sample_id": 3,
+    "sequence": 3,
+    "parity": 3,
+    "adaptive_capture": 1,
+    "latency_capture": 1,
+    "observed_requests": 1,
+    "lifecycle_capture": 2,
+    "evicted_tokens": 2,
+    "reused_kv_slots": 2,
+    "cached_tokens": 2,
+    "resumed_output_tokens": 2,
+    "num_retractions": 2,
+    "staging_http_metrics_verified": 2
+  },
+  "source_audit": {
+    "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-catalog-caps-v1",
+    "files": 5629,
+    "sha256": "a7933d778a04daf4d48aed17d69f4b572f49e58343296d9e86fc8c8991d1bda1",
+    "changed": [
+      "mooncake-study/IMPLEMENTATION_STATUS.md",
+      "mooncake-study/SGLANG_MOONCAKE_SPECFORGE_DESIGN.zh-CN.md",
+      "mooncake-study/experiments/CATALOG_CAPABILITIES.md",
+      "mooncake-study/experiments/README.md",
+      "mooncake-study/experiments/catalog-capabilities.json",
+      "mooncake-study/training-data-contract/catalog-capabilities.example.json",
+      "mooncake-study/training-data-contract/catalog-capabilities.schema.json",
+      "python/sglang/srt/training_capture/README.md",
+      "python/sglang/srt/training_capture/catalog.py",
+      "python/sglang/srt/training_capture/resources.py",
+      "python/sglang/test/training_capture_catalog.py",
+      "test/registered/storage/test_training_capture_runtime.py",
+      "test/registered/unit/training_capture/test_catalog_capabilities.py",
+      "test/registered/unit/training_capture/test_resources.py"
+    ]
+  },
+  "lint": {
+    "baseline": "87561d795",
+    "format": "6 files already formatted",
+    "files": [
+      {
+        "file": "python/sglang/srt/training_capture/catalog.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "file": "python/sglang/srt/training_capture/resources.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "file": "python/sglang/test/training_capture_catalog.py",
+        "before": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          }
+        ],
+        "after": [
+          {
+            "code": "BLE001",
+            "message": "Do not catch blind exception: `Exception`"
+          },
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          }
+        ]
+      },
+      {
+        "file": "test/registered/storage/test_training_capture_runtime.py",
+        "before": [
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          },
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          }
+        ],
+        "after": [
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          },
+          {
+            "code": "SIM115",
+            "message": "Use a context manager for opening files"
+          },
+          {
+            "code": "C408",
+            "message": "Unnecessary `dict()` call (rewrite as a literal)"
+          }
+        ]
+      },
+      {
+        "file": "test/registered/unit/training_capture/test_catalog_capabilities.py",
+        "before": [],
+        "after": []
+      },
+      {
+        "file": "test/registered/unit/training_capture/test_resources.py",
+        "before": [],
+        "after": []
+      }
+    ]
+  },
+  "resident": {
+    "time": "2026-10-03T16:25:56.559Z",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791044755.4655561,
+      "idle_pid": 6772,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.5733733177185059
+    },
+    "processes": [
+      "PID  PPID STAT COMMAND",
+      "    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60",
+      " 6772     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6",
+      " 6911     0 Rs   ps -eo pid,ppid,stat,args"
+    ],
+    "gpu": "NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB",
+    "compute_processes": "6620, [Not Found], 1092 MiB",
+    "additional_gpu_allocations": 0
+  },
+  "archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/catalog-capabilities-20261003",
+    "files": 28,
+    "manifest_sha256": "b10332a3ebc37ac7e4690d5f36ad3159eb3b55c17389a9f5962af2f2c7653c0c"
+  },
+  "scope": {
+    "catalog": "HTTP test double implementing the production producer contract",
+    "store": "native Mooncake TCP in runtime test",
+    "gpu_count": 1,
+    "pre_allocation_rejection": true,
+    "distributed_failure_vote": true,
+    "serving_startup_handshake": true,
+    "production_catalog": false,
+    "new_rdma_validation": false,
+    "consumer_claim_handshake": false,
+    "retention_implementation": false,
+    "training_quality": false
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "protocol_version": 1,
+  "contracts": [
+    {
+      "contract_id": "maas-target-kv-top128-v1",
+      "schema_version": 1,
+      "payload_format": "maas_target_kv_v1",
+      "kv_codecs": [
+        "dense_bf16_post_rope_v1",
+        "dense_fp16_post_rope_v1",
+        "dense_bf16_pre_rope_v1",
+        "dense_fp16_pre_rope_v1"
+      ]
+    }
+  ],
+  "store_protocols": ["tcp", "rdma"],
+  "hard_pin": true,
+  "retention_policy": "retain_until_checkpoint",
+  "max_request_bytes": 8388608
+}

@@ -70,6 +70,10 @@ every validation boundary while assigning bounded CPU workers to construction,
 validation and batch transfer checks. It includes source-reader failure barriers
 and single-versus-four-worker serving comparisons.
 
+[Catalog Producer Capability Handshake](CATALOG_CAPABILITIES.md) makes the
+versioned Catalog/contract/codec/retention agreement a required pre-allocation
+startup gate and validates local plus distributed rollback and real serving.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

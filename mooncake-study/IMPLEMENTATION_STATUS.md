@@ -35,6 +35,7 @@ it does not redefine the goal as the modules already implemented.
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including native batches and complete reads after producer exit; TCP fault/recovery and RDMA partial-read ownership checks pass, without a measured serving speedup; production retention remains open |
+| Catalog capability gate | Strict authenticated `GET /capabilities` before active-rank exporter, Store, Host pool or journal construction | Schema/example, HTTP failure coverage, four-process failure voting and real eager/graph startup pass; production SpecForge Catalog and retention remain open |
 | Publication | Catalog producer client, manifest-last writer, durable journal and retained prepared metadata, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects, post-unlink cleanup and journal-creation failures tested; exact Store-only recovery preserves READY accounting and quarantine; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
@@ -4986,6 +4987,43 @@ a 5,626-file source audit and 109 archived artifacts. All 14 changed Python
 files add no Ruff findings. The resident H100 has resumed its idle load, with
 no additional GPU allocation. Production Catalog, distributed CPU contention,
 representative MaaS SLOs and trained-draft acceptance remain open.
+
+## Catalog Producer Capability Gate
+
+Every active capture owner now performs a strict `GET /capabilities` handshake
+before creating its selected-layer exporter, connecting Mooncake, allocating
+registered Host storage or opening the publication journal. The response must
+contain one complete matching contract record, protocol version 1, the configured
+Store transport, hard-pin support, `retain_until_checkpoint` semantics and an
+HTTP request limit of at least 8 MiB. Fields from different contract records are
+never combined. Inactive ranks make no Catalog or Store call. An incompatible
+active rank enters the existing distributed resource-phase vote, allowing peers
+to close prepared resources before activation.
+
+The capability response has a strict JSON Schema and checked example. The HTTP
+client applies its existing optional Bearer credential, direct no-proxy opener,
+redirect rejection and bounded retry policy to the bodyless GET, and rejects
+responses over 1 MiB. The local Mooncake adapter independently checks registered
+buffer support and requests hard pin, so a Catalog declaration cannot make an
+incompatible Store SDK usable.
+
+All **8 focused methods pass in 4.721s**, covering schema validation, complete
+record matching, malformed data, authentication, retries, response bounds,
+redirects and rejection before allocation. The complete capture unit directory
+passes **345 methods in 288.732s**, including a four-process incompatible-rank
+failure and peer cleanup. One real Qwen3-0.6B runtime method passes in
+**565.995s** with native Mooncake TCP. It records exactly one successful startup
+handshake in eager mode and one in decode CUDA graph mode; the final lifecycle
+case publishes five samples and the runtime matrix verifies complete post-exit
+readback.
+
+The [runbook](experiments/CATALOG_CAPABILITIES.md) and generated
+[evidence](experiments/catalog-capabilities.json) bind the terminal jobs, frozen
+source audit, logs and resident-worker state. The resident H100 idle load resumed
+with no additional GPU allocation. Runtime Catalog calls still use an HTTP test
+double implementing this contract. SpecForge production persistence, consumer
+claims, checkpoint watermarks, retention GC, HA storage and trained-model quality
+remain open.
 
 ## Next Implementation
 

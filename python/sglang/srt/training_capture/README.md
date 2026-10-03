@@ -1038,8 +1038,21 @@ leases, checkpoints, or GC. The endpoint is the API base URL. Requests include
 `X-Training-Capture-Protocol: 1` and an optional Bearer credential supplied at
 construction. Internal traffic ignores external-network proxy settings.
 
-| POST Route | Request | Required Response |
+Every active capture owner performs `GET /capabilities` before creating a KV
+exporter, connecting Mooncake, allocating the Host pool or opening its journal.
+The response must be a bounded, strict object matching
+`catalog-capabilities.schema.json`. One complete contract record must match the
+configured contract ID, schema version 1, `maas_target_kv_v1` payload and actual
+KV codec; fields from separate records are never combined. The response must
+also accept the configured Store protocol, require hard pinning, retain through
+checkpoint and advertise at least the producer's 8 MiB metadata limit. Missing,
+malformed or incompatible capabilities fail startup. In TP/PP, this local error
+participates in the existing all-rank resource vote and all prepared peers roll
+back before capture activation.
+
+| Method / Route | Request | Required Response |
 | --- | --- | --- |
+| `GET /capabilities` | No body | Producer protocol, complete contract/codec records, Store protocols, hard-pin/retention semantics and metadata limit |
 | `/captures:begin` | Immutable dataset/sample/generation identity, contract/owner metadata, reserved budget, idempotency key | `CaptureLease` |
 | `/captures/{id}/heartbeat` | Capture ID and fence | Renewed `CaptureLease`, same identity/fence |
 | `/captures/{id}/objects` | Fence, `phase=REGISTERED` or `WRITTEN`, descriptors, idempotency key | Same phase and sorted `accepted_object_ids` |
