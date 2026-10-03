@@ -123,6 +123,7 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.preferred_sampling_params = None
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
