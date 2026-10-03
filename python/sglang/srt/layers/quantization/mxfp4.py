@@ -227,6 +227,20 @@ def _pad_hopper_mxfp4_scale(scale, k_size):
     return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
 
 
+@lru_cache(maxsize=1)
+def _mx_block_kwargs():
+    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
+    # absent in 3.7, which ROCm still ships, so probe before importing the value.
+    from triton_kernels.matmul import PrecisionConfig
+
+    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
+        return {}
+
+    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_details.opt_flags as opt_flags
@@ -1026,7 +1040,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
             from triton_kernels.matmul import FlexCtx, PrecisionConfig
-            from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -1043,13 +1056,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
-            # triton_kernels 3.8 rejects an mx scale without its block size; the
-            # field is absent in 3.7, which ROCm still ships.
-            mx_block = (
-                {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
-                if "b_microblock_size" in {f.name for f in fields(PrecisionConfig)}
-                else {}
-            )
+            mx_block = _mx_block_kwargs()
             self.w13_precision_config = PrecisionConfig(
                 b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
             )
