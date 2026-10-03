@@ -2203,12 +2203,31 @@ def pdmux_prefill_tp_group():
     """Use the duplicate TP communicator for the prefill stream.
 
     PD multiplexing keeps prefill and decode on separate communicators with
-    the same ranks. Only the TP handle changes within this scope.
+    the same ranks. Groups that alias TP must follow the prefill handle too:
+    with EP=1 MoE-TP is TP, and with EP=TP MoE-EP is TP.
     """
     assert _PDMUX_PREFILL_TP_GROUP is not None, (
         "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
     )
-    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
+    parallel = get_parallel()
+    decode_tp_group = parallel.tp_group
+    overrides = {"tp_group": _PDMUX_PREFILL_TP_GROUP}
+    for name in (
+        "attn_tp_group",
+        "attn_cp_group",
+        "moe_ep_group",
+        "moe_dp_group",
+        "moe_tp_group",
+        "shared_experts_tp_group",
+        "dcp_group",
+    ):
+        try:
+            group = getattr(parallel, name)
+        except (AttributeError, RuntimeError):
+            continue
+        if group is decode_tp_group:
+            overrides[name] = _PDMUX_PREFILL_TP_GROUP
+    with parallel.override(**overrides):
         yield
 
 

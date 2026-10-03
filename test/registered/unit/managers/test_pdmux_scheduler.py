@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import sglang.srt.distributed.parallel_state as parallel_state
+from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -339,6 +341,42 @@ class TestPDMuxScheduler(unittest.TestCase):
         load_pdmux_config.assert_called_once_with("pdmux.yaml")
         initialize_stream_groups.assert_called_once_with(3, config)
         self.assertEqual(scheduler.real_sm_group_num, 3)
+
+    def test_pdmux_prefill_switches_tp_aliases(self):
+        normal_group = object()
+        prefill_group = object()
+        separate_group = object()
+        parallel = SimpleNamespace(
+            tp_group=normal_group,
+            moe_tp_group=normal_group,
+            moe_ep_group=normal_group,
+            attn_tp_group=separate_group,
+        )
+
+        @contextmanager
+        def override(**kwargs):
+            previous = {name: getattr(parallel, name) for name in kwargs}
+            for name, value in kwargs.items():
+                setattr(parallel, name, value)
+            try:
+                yield
+            finally:
+                for name, value in previous.items():
+                    setattr(parallel, name, value)
+
+        parallel.override = override
+        with (
+            patch.object(parallel_state, "_PDMUX_PREFILL_TP_GROUP", prefill_group),
+            patch.object(parallel_state, "get_parallel", return_value=parallel),
+        ):
+            with pdmux_prefill_tp_group():
+                self.assertIs(parallel.tp_group, prefill_group)
+                self.assertIs(parallel.moe_tp_group, prefill_group)
+                self.assertIs(parallel.moe_ep_group, prefill_group)
+                self.assertIs(parallel.attn_tp_group, separate_group)
+            self.assertIs(parallel.tp_group, normal_group)
+            self.assertIs(parallel.moe_tp_group, normal_group)
+            self.assertIs(parallel.moe_ep_group, normal_group)
 
     def _make_merge_streams(self, operations):
         prefill_stream = Mock()

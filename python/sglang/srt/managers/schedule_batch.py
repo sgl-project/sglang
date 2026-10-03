@@ -2402,8 +2402,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
-    # Raw scheduler metadata for rank-consistent PDMux split decisions.
+    # Raw scheduler metadata gathered across attention-DP ranks. This stays
+    # global even when `global_num_tokens` is intentionally reduced to the
+    # local count because the model forward does not require an MLP TP gather.
     scheduler_global_num_tokens: Optional[List[int]] = None
+
     # For split prefill
     split_index: int = 0
     split_prefill_finished: bool = False

@@ -12,6 +12,7 @@ from sglang.srt.layers.layer_boundary import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.glm5_next import (
     Glm5NextDecoderLayer,
     Glm5NextForConditionalGeneration,
@@ -126,6 +127,31 @@ class TestGlm5NextPDMux(unittest.TestCase):
                 layer, SimpleNamespace(forward_mode=ForwardMode.DECODE)
             )
             self.assertIs(layer.self_attn.alt_stream, helper)
+
+    def test_idle_dp_rank_skips_split_prefill_attention_plan(self):
+        runner = SimpleNamespace(
+            attn_backend=Mock(),
+            model=SimpleNamespace(forward_split_prefill=Mock(return_value=None)),
+            model_config=SimpleNamespace(num_hidden_layers=2),
+            device_timer=None,
+        )
+        batch = SimpleNamespace(
+            split_index=0,
+            forward_mode=ForwardMode.IDLE,
+            input_ids=torch.empty(0, dtype=torch.long),
+            positions=torch.empty(0, dtype=torch.long),
+        )
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.device_timer_ctx",
+            return_value=nullcontext(),
+        ):
+            result = ModelRunner.forward_split_prefill(runner, batch, forward_count=1)
+
+        self.assertIsNone(result)
+        self.assertEqual(batch.split_index, 1)
+        runner.attn_backend.init_forward_metadata.assert_not_called()
+        runner.model.forward_split_prefill.assert_called_once()
 
     def test_intermediate_segment_restores_mlp_sync_padding(self):
         batch = SimpleNamespace(

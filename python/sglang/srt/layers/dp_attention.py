@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import (
     derive_attention_ranks,
     derive_attn_tp_size,
     get_device,
+    get_disagg,
     get_exec,
     get_flags,
     get_forward,
@@ -356,12 +357,17 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    real_counts_gpu = getattr(forward_batch, "global_num_tokens_unpadded_gpu", None)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
-        forward_batch.global_num_tokens_gpu,
+        (
+            real_counts_gpu
+            if real_counts_gpu is not None
+            else forward_batch.global_num_tokens_gpu
+        ),
     )
 
 
@@ -444,6 +450,15 @@ def init_dp_gathered_buffer(model_config: ModelConfig):
     get_flags().dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
+    if get_disagg().enable_pdmux:
+        from sglang.srt.configs.hybrid_arch import glm5_next_config
+
+        if glm5_next_config(model_config) is not None:
+            # GLM's eager split-prefill skips attention on IDLE ranks. Keep
+            # these ranks empty instead of fabricating a full prefill request.
+            # Backend-specific symmetric collectives still force MAX_LEN in
+            # get_dp_padding_mode; prefill graph buckets do so in batch prep.
+            get_flags().dp.max_len_with_idle = False
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
@@ -721,7 +736,8 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
     AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
     the mapping table's last entry).  Capture-safe: per-batch state is read
-    only from the replay-updated global_num_tokens_gpu tensor.
+    only from the published real-count tensor. Eager batches preserve it
+    separately from their writable gather counts across PDMux layer slices.
     """
     counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
