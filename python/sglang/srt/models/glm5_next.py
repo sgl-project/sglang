@@ -927,7 +927,10 @@ class Glm5NextDecoderLayer(nn.Module):
     def _set_pdmux_alt_stream(self, forward_batch: ForwardBatch) -> None:
         alt_stream = (
             get_pdmux_decode_alt_stream(self.pdmux_alt_stream)
-            if forward_batch.forward_mode.is_decode_or_idle()
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             else None
         )
         if not self.is_linear_attn:

@@ -1581,11 +1581,25 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
+            write_key = key
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+            out_cache_loc = forward_batch.out_cache_loc
+            num_write_tokens = plan.req.shape[0] * num_draft_tokens
+            assert num_write_tokens <= key.shape[0], (num_write_tokens, key.shape)
+            if num_write_tokens < key.shape[0]:
+                # Eager draft extend plans metadata before DP padding. Keep
+                # that plan (and its paged-MQA schedule) on the real requests;
+                # dummy rows must not write request/cache slot zero. The top-k
+                # path separately restores the padded query shape for MLP sync.
+                assert num_write_tokens == metadata.get_seqlens_expanded().shape[0]
+                write_key = key[:num_write_tokens]
+                score = score[:num_write_tokens]
+                out_cache_loc = out_cache_loc[:num_write_tokens]
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=write_key,
+                score=score,
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
@@ -1593,7 +1607,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_start=plan.write_start,
                 tail_logical_start=plan.tail_logical_start,
                 write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,

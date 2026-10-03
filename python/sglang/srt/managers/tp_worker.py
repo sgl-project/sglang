@@ -717,7 +717,12 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+    def forward_batch_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+    ):
         # Re-install this batch's HiCache consumer index on every segment: the
         # decode forward that runs between segments resets it to the decode
         # batch's -1, which turns the KV pool's per-layer load-back fence into
@@ -729,6 +734,7 @@ class TpModelWorker(BaseTpWorker):
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
             batch.split_forward_batch = forward_batch
