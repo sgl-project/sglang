@@ -299,7 +299,11 @@ def _normalize_text(text: str) -> str:
 
 
 def cache_root() -> pathlib.Path:
-    configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
+    # Fall back under SGLANG_CACHE_DIR so setting one root moves every cache
+    # (this one included) together; an explicit SGLANG_JIT_CACHE_DIR still wins.
+    configured = envs.SGLANG_JIT_CACHE_DIR.get() or os.path.join(
+        os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), "jit"
+    )
     return pathlib.Path(configured).expanduser()
 
 
