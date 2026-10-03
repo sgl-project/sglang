@@ -24,6 +24,15 @@ ROUTES = {
     "moe_nvfp4_warp_decode": "NVFP4 small-token MoE warp-decode runner (moe.warp_decode_*)",
     "kimi_k3_fp8_projection": "Kimi-K3 FP8 dense projection GEMMs (gemm.kimi_k3_fp8_projection)",
     "kimi_k3_mla": "Kimi-K3 FP8 MLA paged decode (attention.kimi_k3_mla_fp8_paged_attention)",
+    # P1/P2 model routes (wiring + CPU route tests; model-level validation pending weights on a reachable route).
+    "dsv3_grouped_routing": "DeepSeek-V3/R1/V3.2 grouped (node-limited) top-k routing (moe.fused_topk_deepseek)",
+    "dsa_indexer": "DeepSeek-V3.2 lightning indexer logits + top-k (attention.sparse_mqa_logits / dsa_indexer_topk)",
+    "dsv4_sparse_mla_decode": "DeepSeek-V4/Flash sparse MLA decode (attention.trtllm_batch_decode_sparse_mla_dsv4 / SM120 NVFP4 variants)",
+    "msa_nvfp4_sparse_decode": "MiniMax-M3 NVFP4 sparse MSA decode (attention.msa_nvfp4_sparse_decode)",
+    "mamba_ssu": "Mamba2 / Nemotron-H / granite selective state update decode (mamba.selective_state_update)",
+    "mamba_ssd_prefill": "Mamba2 / Nemotron-H / granite SSD combined prefill (mamba.ssd_combined)",
+    "sp_all_gather_matmul": "Sequence-parallel all-gather + matmul (communication.all_gather_matmul, Llama-3.1-70B SP)",
+    "minimax_h3_diffusion": "MiniMax-H3 diffusion attention / pre-attention / projection stages (diffusion.minimax_h3_*)",
 }
 
 ENV_VAR = "SGLANG_CAKE_ROUTES"
