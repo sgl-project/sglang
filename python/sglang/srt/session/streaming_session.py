@@ -182,37 +182,19 @@ class StreamingSession:
         )
 
     def try_cache_finished_req(self, req: Req) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
-        Returns True if handled; False means caller runs its raw path."""
+        """Hands a finished turn's row to the session slot. Returns False for
+        non-streaming requests and aborts, which the caller releases."""
         if not _is_streaming(req):
             return False
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            return False
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
-
-        # Mid-processing abort: free all session KV and drop the slot; req_nodes
-        # still points at the last finished request, so the next turn re-prefills.
-        if isinstance(req.finished_reason, FINISH_ABORT):
-            kv = req.detach_kv()
-            if slot is None:
-                # First turn: a throwaway slot lets release_session free the
-                # record (mamba refs included) and drop the tree lock.
-                slot = SessionSlot(
-                    kv=kv,
-                    last_node=req.last_node,
-                    lock_receipt=req.lock_receipt,
-                    swa_prefix_lock_released=req.swa_prefix_lock_released,
-                )
-                self.slots[session_id] = slot
-            else:
-                assert kv is slot.kv
-            self.release_session(session_id)
-            req.session.abort_req()
-            return True
-
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
@@ -246,6 +228,28 @@ class StreamingSession:
         return True
 
     # -- Session lifecycle --
+
+    def try_on_release(self, req: Req, *, inserted: bool) -> None:
+        """After a release the slot did not claim. A later turn ran on the
+        slot's record, which was just freed: drop the slot and its tree lock.
+        The session keeps its last finished request, so the next turn
+        re-prefills."""
+        if not _is_streaming(req):
+            return
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        session_id = req.session.session_id
+        slot = self.slots.get(session_id)
+        if slot is not None and slot.kv is req.kv:
+            del self.slots[session_id]
+            if slot.last_node is not None:
+                skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+                self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
+            if inserted:
+                # The tree's component cleanup skipped this record.
+                self._free_slot_mamba(slot)
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            req.session.abort_req()
 
     def release_session(self, session_id: str) -> None:
         slot = self.slots.pop(session_id, None)
