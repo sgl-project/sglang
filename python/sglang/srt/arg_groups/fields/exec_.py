@@ -174,6 +174,15 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    sampling_filter_order: A[
+        str,
+        Arg(
+            help="Apply top-k before top-p on renormalized probabilities (top_k_first), "
+            "or filter both against the full distribution (joint). "
+            "Applies to regular and speculative sampling.",
+            choices=["top_k_first", "joint"],
+        ),
+    ] = "top_k_first"
     grammar_backend: A[
         Optional[str],
         Arg(
