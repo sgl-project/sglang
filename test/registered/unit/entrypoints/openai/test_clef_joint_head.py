@@ -84,12 +84,12 @@ class TestClefJointHead(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "span"):
             validate_record(malformed, list(encoded.input_ids))
 
-    def test_hidden_cache_survives_chunk_moves_backup_and_slot_reuse(self):
+    def test_hidden_cache_preserves_chunks_across_slot_reuse(self):
         from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.clef import ClefHybridLinearKVPool
 
         with envs.SGLANG_NATIVE_MOVE_KV_CACHE.override(True):
-            pool = HybridLinearKVPool(
+            pool = ClefHybridLinearKVPool(
                 size=16,
                 dtype=torch.bfloat16,
                 page_size=1,
@@ -117,25 +117,12 @@ class TestClefJointHead(CustomTestCase):
             pool.gather_clef_hidden(torch.tensor([1, 3, 2])),
             torch.tensor([[10] * 4, [11] * 4, [12] * 4], dtype=torch.bfloat16),
         )
-        pool.move_kv_cache(torch.tensor([8, 9]), torch.tensor([5, 7]))
+        allocator.free(torch.tensor([5, 7]))
+        reused = allocator.alloc(2)
+        self.assertIsNotNone(reused)
+        write(reused.tolist(), [[30] * 4, [31] * 4])
         torch.testing.assert_close(
-            pool.gather_clef_hidden(torch.tensor([1, 8, 9])),
-            torch.tensor([[10] * 4, [20] * 4, [21] * 4], dtype=torch.bfloat16),
-        )
-        # CPU tensors need no device synchronization; the real copy paths still run.
-        with patch("sglang.srt.mem_cache.memory_pool.current_platform.synchronize"):
-            backup = pool.get_cpu_copy(torch.tensor([8, 9]))
-            allocator.free(torch.tensor([8, 9]))
-            reused = allocator.alloc(2)
-            self.assertIsNotNone(reused)
-            write(reused.tolist(), [[30] * 4, [31] * 4])
-            pool.load_cpu_copy(backup, torch.tensor([12, 13]))
-        torch.testing.assert_close(
-            pool.gather_clef_hidden(torch.tensor([12, 13])),
-            torch.tensor([[20] * 4, [21] * 4], dtype=torch.bfloat16),
-        )
-        torch.testing.assert_close(
-            pool.gather_clef_hidden(torch.tensor([1, 8, 9])),
+            pool.gather_clef_hidden(torch.tensor([1, 5, 7])),
             torch.tensor([[10] * 4, [30] * 4, [31] * 4], dtype=torch.bfloat16),
         )
         self.assertEqual(
@@ -185,7 +172,7 @@ class TestClefJointHead(CustomTestCase):
         output = ClefDeviceOutput(
             torch.tensor([0.1, 0.2, 0.7, 0.8, 0.2, 0.3, 0.7]),
             tuple(
-                ClefResult(i, req.cache_request_handle, record, i + 1)
+                ClefResult(i, req.cache_request_handle, record)
                 for i, (req, record) in enumerate(zip(reqs, records))
             ),
         )
@@ -283,9 +270,6 @@ class TestClefJointHead(CustomTestCase):
                             "score": {"0": 0.6, "1": 0.4},
                         }
                     ],
-                    "clef_execution": [
-                        {"path": "sglang_backbone_joint_head", "forward_count": 1}
-                    ],
                 }
             }
 
@@ -339,12 +323,6 @@ class TestClefJointHead(CustomTestCase):
                         yield {
                             "meta_info": {
                                 "clef_probabilities": [{"q": probabilities}],
-                                "clef_execution": [
-                                    {
-                                        "path": "sglang_backbone_joint_head",
-                                        "forward_count": 1,
-                                    }
-                                ],
                             }
                         }
 

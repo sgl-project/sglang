@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Alibaba Cloud
-# Vendored from Cloudflare/clef-flash, revision 17f0b0ad64efb65d273590632833508766b2aae6.
 # Source: https://huggingface.co/Cloudflare/clef-flash/blob/17f0b0ad64efb65d273590632833508766b2aae6/joint_schema_model.py
-# See the repository LICENSE. Encoder and head math are unchanged.
 # Omitted: native Transformers backbone loader, collation, and inference wrapper.
 """Clef's native record encoder, trained joint head, and answer formatting."""
 

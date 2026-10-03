@@ -47,11 +47,13 @@ class _FakeReq:
         customized_info=None,
         *,
         finished=False,
+        is_prefill_only=False,
         sampling_mask_rows=None,
     ):
         self.rid = rid
         self.http_worker_ipc = None
         self._finished = finished
+        self.is_prefill_only = is_prefill_only
         self.finished_reason = (
             SimpleNamespace(to_json=lambda: {"type": "stop"}) if finished else None
         )
@@ -142,18 +144,32 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             )
         )
         accumulator.accept(req=_FakeReq("r2", [30], customized_info={"other": [300]}))
+        accumulator.accept(
+            req=_FakeReq(
+                "r3",
+                [],
+                customized_info={"summary": [{"choice": "yes"}]},
+                finished=True,
+                is_prefill_only=True,
+            )
+        )
 
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
         customized_info = unwrap_from_pickle(payload.customized_info)
 
-        self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30]])
+        self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30], []])
         self.assertEqual(
             customized_info["probe"],
-            [[None, None], [200, 201, 202], [None]],
+            [[None, None], [200, 201, 202], [None], []],
         )
         self.assertEqual(
             customized_info["other"],
-            [[None, None], [None, None, None], [300]],
+            [[None, None], [None, None, None], [300], []],
+        )
+
+        self.assertEqual(
+            customized_info["summary"],
+            [[None, None], [None, None, None], [None], [{"choice": "yes"}]],
         )
 
     def test_additional_customized_info_uses_the_existing_payload(self):

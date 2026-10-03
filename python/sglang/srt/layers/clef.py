@@ -242,7 +242,6 @@ class ClefResult(msgspec.Struct, frozen=True):
     batch_index: int
     request_handle: Any
     record: EncodedRecord
-    forward_count: int
 
 
 class ClefDeviceOutput(msgspec.Struct, frozen=True):
@@ -285,16 +284,14 @@ class ClefHostOutput(msgspec.Struct, frozen=True):
             if req.customized_info is None:
                 req.customized_info = {}
             req.customized_info["clef_probabilities"] = [probabilities]
-            req.customized_info["clef_execution"] = [
-                {
-                    "path": "sglang_backbone_joint_head",
-                    "forward_count": result.forward_count,
-                }
-            ]
 
 
 def forward_clef(
-    model: Any, input_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch: Any
+    head: JointSchemaHead,
+    lm_head: torch.nn.Module,
+    input_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: Any,
 ) -> ClefDeviceOutput | None:
     """Retain every backbone row and run the native head on complete records."""
     from sglang.srt.model_executor.forward_context import (
@@ -328,24 +325,16 @@ def forward_clef(
         token_ids = torch.tensor(
             record.input_ids, dtype=input_ids.dtype, device=input_ids.device
         )
-        logits = model.clef_head(
+        logits = head(
             sequence_hidden.unsqueeze(0),
             token_ids.unsqueeze(0),
             torch.ones_like(token_ids).unsqueeze(0),
             [record],
-            model.lm_head.weight,
+            lm_head.weight,
             sequence_lengths=[sequence_length],
         )[0]
         probabilities.extend(values.float().softmax(-1) for values in logits)
-        model.clef_forward_count += 1
-        results.append(
-            ClefResult(
-                index,
-                handle,
-                record,
-                model.clef_forward_count,
-            )
-        )
+        results.append(ClefResult(index, handle, record))
     if not results:
         return None
     return ClefDeviceOutput(torch.cat(probabilities), tuple(results))

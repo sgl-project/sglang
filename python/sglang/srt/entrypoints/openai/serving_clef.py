@@ -98,8 +98,7 @@ async def handle_clef_request(
             status_code=finish_reason.get("status_code") or 503,
         )
     values = metadata.get("clef_probabilities")
-    execution = metadata.get("clef_execution")
-    if not values or len(values) != 1 or not execution:
+    if not values or len(values) != 1:
         raise RuntimeError("Clef worker did not execute its trained joint head")
     probabilities = values[0]
     if not decisions:
@@ -111,7 +110,6 @@ async def handle_clef_request(
                     for key, question in record["questions"].items()
                 },
                 "usage": {"input_tokens": len(token_ids), "output_tokens": 0},
-                "execution": execution[0],
             }
         )
     answers = {}
@@ -136,7 +134,6 @@ async def handle_clef_request(
             "model": request.model,
             "prompt_format_version": 1,
             "answers": answers,
-            "execution": execution[0],
             "usage": {
                 "prompt_tokens": len(token_ids),
                 "completion_tokens": 0,

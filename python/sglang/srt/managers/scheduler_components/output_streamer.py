@@ -668,11 +668,7 @@ class _GenerationStreamAccumulator:
                     if req_values is None
                     else (
                         req_values
-                        if (
-                            req.is_prefill_only
-                            and req.finished()
-                            and key in ("clef_probabilities", "clef_execution")
-                        )
+                        if (req.is_prefill_only and req.finished())
                         else req_values[send_token_offset : len(output_ids_)]
                     )
                 )
