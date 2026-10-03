@@ -113,6 +113,14 @@ class MetalTorchProfiler:
         self.torch_profiler = torch_profiler
         self.metal_profiler = None
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()
+        return False
+
     def start(self):
         trace_path = _new_temp_gputrace_path()
         self.metal_profiler, result = self.start_metal_capture(trace_path)
