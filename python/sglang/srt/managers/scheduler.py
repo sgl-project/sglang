@@ -5711,9 +5711,12 @@ class Scheduler(
         output = self.session_controller.open(recv_req)
         if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
+        # Each DP queue must install the session before the tokenizer can
+        # acknowledge it. TP/CP followers process this open before receiving
+        # their next work broadcast from the same leader.
         if (
             get_parallel().pp_rank == 0
-            and get_parallel().tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
         ):
             return output
