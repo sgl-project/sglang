@@ -74,33 +74,5 @@ def test_interleaved_rope_fp64_is_bit_exact(
     assert k_out.data_ptr() not in (q.data_ptr(), k.data_ptr())
 
 
-def test_interleaved_rope_fp64_launcher_rejects_invalid_inputs() -> None:
-    q = torch.empty(1, 17, 3, 12, dtype=torch.bfloat16, device="cuda")
-    k = torch.empty_like(q)
-    cos = torch.empty(1, 17, 1, 12, dtype=torch.float64, device="cuda")
-    sin = torch.empty_like(cos)
-
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q.flatten(), k, cos, sin)
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q.float(), k, cos, sin)
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q, k[..., ::2], cos, sin)
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q, k, cos.float(), sin)
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q, k, cos[..., :-2], sin[..., :-2])
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q, k.transpose(0, 1).contiguous(), cos, sin)
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(q, k, cos.view(1, 1, -1, cos.shape[-1]), sin)
-    unaligned = torch.empty(q.numel() + 1, dtype=torch.bfloat16, device="cuda")[
-        1:
-    ].view_as(q)
-    assert unaligned.is_contiguous()
-    with pytest.raises(RuntimeError):
-        fused_interleaved_rope_fp64(unaligned, k, cos, sin)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

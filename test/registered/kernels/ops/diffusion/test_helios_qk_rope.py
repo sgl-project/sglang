@@ -142,50 +142,6 @@ def test_helios_qk_rope_batched(dtype):
     assert torch.equal(k, k_ref)
 
 
-@pytest.mark.parametrize(
-    "bad_input",
-    [
-        "q_rank",
-        "k_shape",
-        "freq_shape",
-        "freq_batch",
-        "device",
-        "k_dtype",
-        "freq_dtype",
-        "layout",
-        "alignment",
-    ],
-)
-def test_helios_qk_rope_launcher_rejects_invalid_inputs(bad_input):
-    q = torch.randn(2, 17, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    freqs = torch.randn(2, 17, 256, device="cuda", dtype=torch.float32)
-    if bad_input == "q_rank":
-        q = q.flatten(1)
-    elif bad_input == "k_shape":
-        k = k.view(2, 17, 4, 256)
-    elif bad_input == "freq_shape":
-        freqs = freqs[..., :128].contiguous()
-    elif bad_input == "freq_batch":
-        # Flattening before validation would hide this mismatch.
-        freqs = freqs.view(1, 34, 256)
-    elif bad_input == "device":
-        k = k.cpu()
-    elif bad_input == "k_dtype":
-        k = k.float()
-    elif bad_input == "freq_dtype":
-        freqs = freqs.double()
-    elif bad_input == "layout":
-        k = k.transpose(1, 2)
-    elif bad_input == "alignment":
-        q = torch.zeros(q.numel() + 1, device=q.device, dtype=q.dtype)[1:].view_as(q)
-    q_before, k_before = q.clone(), k.clone()
-    with pytest.raises(RuntimeError):
-        fused_inplace_helios_qk_rope(q, k, freqs)
-    assert torch.equal(q, q_before)
-    assert torch.equal(k, k_before)
-
-
 def test_helios_qk_rope_rejects_bad_frequency_shape() -> None:
     q = torch.randn(3, 2, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)

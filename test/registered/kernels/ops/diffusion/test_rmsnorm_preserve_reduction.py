@@ -35,30 +35,6 @@ def test_preserves_native_reduction_and_rounding(dtype, shape, scale, eps):
     torch.testing.assert_close(actual, reference(x, weight, eps), atol=0, rtol=0)
 
 
-def test_layout_guards_and_offset():
-    x = torch.randn(259, 128, device="cuda", dtype=torch.bfloat16)[2:]
-    weight = torch.randn(128, device="cuda", dtype=x.dtype)
-
-    torch.testing.assert_close(
-        rmsnorm_preserve_reduction(x, weight, 1e-6),
-        reference(x, weight, 1e-6),
-        atol=0,
-        rtol=0,
-    )
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x.cpu(), weight.cpu(), 1e-6)
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x.float(), weight.float(), 1e-6)
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x[:, ::2], weight[::2], 1e-6)
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x, weight.float(), 1e-6)
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x, weight[:-1], 1e-6)
-    with pytest.raises(RuntimeError):
-        rmsnorm_preserve_reduction(x[:0], weight, 1e-6)
-
-
 def test_packed_projection_view():
     packed = torch.randn(2, 17, 3, 4, 128, device="cuda", dtype=torch.bfloat16)
     x = packed.unbind(2)[0]

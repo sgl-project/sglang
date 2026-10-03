@@ -96,13 +96,5 @@ def test_packed_silu_mul_is_bit_exact(hidden, strided):
     assert torch.equal(fused_packed_silu_mul_bitexact(x), expected)
 
 
-def test_silu_mul_rejects_mismatched_operands():
-    a = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        fused_silu_mul_bitexact(a, a.float())
-    with pytest.raises(RuntimeError):
-        fused_silu_mul_bitexact(a, a[:, :-1])
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

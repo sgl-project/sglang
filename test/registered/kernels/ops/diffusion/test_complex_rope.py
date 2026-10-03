@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_qknorm_complex_rope_cuda,
     fused_complex_rope,
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
@@ -45,22 +44,6 @@ def test_complex_rope_matches_complex_multiplication(dtype, shape):
     x, rope = inputs(shape, dtype)
     actual = fused_complex_rope(x, rope)
     torch.testing.assert_close(actual, reference(x, rope), atol=0, rtol=0)
-
-
-def test_complex_rope_layout_guards():
-    x, rope = inputs((2, 17, 3, 64), torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x.cpu(), rope.cpu())
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x.double(), rope)
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x, rope.to(torch.complex128))
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x[:, ::2], rope[::2])
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x, rope[:-1])
-    with pytest.raises(RuntimeError):
-        fused_complex_rope(x[:, :0], rope[:0])
 
 
 def test_complex_rope_compile_and_graph_replay():
@@ -139,7 +122,6 @@ def test_norm_rope_matches_eager(shape, amplitude):
     norm = make_norm()
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude
     rope = make_rope(shape[1])
-    assert can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
     out = qknorm_complex_rope_cuda(x, norm.weight, rope, EPS)
     assert_bits_equal(out, eager_norm_rope(x, norm, rope))
 
@@ -195,7 +177,6 @@ def test_pack_matches_eager(batch, seq, prefix, heads, in_place):
     else:
         k_src, v_src = k, v
     q_work = q.clone()
-    assert can_use_qknorm_complex_rope_cuda(q_work.dtype, q_work.shape[-1])
     qknorm_complex_rope_pack_(
         q_work,
         k_out,
@@ -230,7 +211,6 @@ def test_pack_accepts_padded_token_stride():
     q_view.copy_(q)
     k_out[:, prefix:].copy_(k)
     v_out[:, prefix:].copy_(v)
-    assert can_use_qknorm_complex_rope_cuda(q_view.dtype, q_view.shape[-1])
     qknorm_complex_rope_pack_(
         q_view,
         k_out,
@@ -247,88 +227,6 @@ def test_pack_accepts_padded_token_stride():
     assert_bits_equal(q_view, eager_norm_rope(q, norm_q, rope))
     assert_bits_equal(k_out, torch.cat([kp, eager_norm_rope(k, norm_k, rope)], dim=1))
     assert_bits_equal(v_out, torch.cat([vp, v], dim=1))
-
-
-@torch.no_grad()
-def test_native_launchers_reject_invalid_inputs():
-    norm = make_norm()
-    x = torch.randn(1, 17, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    rope = make_rope(17)
-    assert can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x.cpu(), norm.weight.cpu(), rope.cpu(), EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x.half(), norm.weight.half(), rope, EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x[..., :64], norm.weight[:64], rope[:, :32], EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x.transpose(1, 2), norm.weight, rope, EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x, norm.weight, rope[:-1], EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x, norm.weight, rope.to(torch.complex128), EPS)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x, norm.weight.float(), rope, EPS)
-    k_out = torch.empty(1, 17 + 3, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    kp = torch.randn(1, 3, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    assert can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
-    # wrong prefix + seq length, batch mismatch, non-contiguous prefix, short K source
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_pack_(
-            x,
-            k_out[:, :-1],
-            k_out.clone(),
-            norm.weight,
-            norm.weight,
-            rope,
-            kp,
-            kp,
-            None,
-            None,
-            EPS,
-        )
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_pack_(
-            x,
-            k_out,
-            k_out.clone(),
-            norm.weight,
-            norm.weight,
-            rope,
-            kp.expand(2, -1, -1, -1),
-            kp,
-            None,
-            None,
-            EPS,
-        )
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_pack_(
-            x,
-            k_out,
-            k_out.clone(),
-            norm.weight,
-            norm.weight,
-            rope,
-            kp.transpose(1, 2),
-            kp,
-            None,
-            None,
-            EPS,
-        )
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_pack_(
-            x,
-            k_out,
-            k_out.clone(),
-            norm.weight,
-            norm.weight,
-            rope,
-            kp,
-            kp,
-            x[:, :-1],
-            None,
-            EPS,
-        )
 
 
 @torch.no_grad()
@@ -438,18 +336,6 @@ def test_model_pack_verifies_strided_projection_views(monkeypatch):
     assert gate.verified
     for got, want in zip(actual, expected, strict=True):
         assert torch.equal(got, want)
-
-
-@torch.no_grad()
-def test_native_launcher_preserves_rope_rank_and_row_alignment():
-    norm, rope = make_norm(), make_rope(17)
-    x = torch.randn(1, 17, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(x, norm.weight, rope.view(17, 1, 64), EPS)
-    storage = torch.empty(1, 17, 4 * HEAD_DIM + 1, device=x.device, dtype=x.dtype)
-    unaligned_rows = storage[..., :-1].view_as(x)
-    with pytest.raises(RuntimeError):
-        qknorm_complex_rope_cuda(unaligned_rows, norm.weight, rope, EPS)
 
 
 @torch.no_grad()

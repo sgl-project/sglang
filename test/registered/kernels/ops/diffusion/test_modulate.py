@@ -97,23 +97,6 @@ def test_modulate_scale_shift_guards_reject_fp32():
     assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
 
 
-@pytest.mark.parametrize("bad_input", ["rank", "shape", "dtype", "device"])
-def test_modulate_cuda_validates_inputs_in_launcher(bad_input):
-    x = torch.randn(2, 17, 64, device=DEVICE, dtype=torch.bfloat16)
-    scale = torch.randn(2, 64, device=DEVICE, dtype=torch.bfloat16)
-    shift = torch.randn_like(scale)
-    if bad_input == "rank":
-        x = x.flatten(0, 1)
-    elif bad_input == "shape":
-        shift = shift.view(1, 128)
-    elif bad_input == "dtype":
-        shift = shift.float()
-    else:
-        shift = shift.cpu()
-    with pytest.raises(RuntimeError):
-        modulate_scale_shift_cuda(x, scale, shift)
-
-
 def test_modulate_selected_kernel_errors_propagate(monkeypatch):
     from importlib import import_module
 

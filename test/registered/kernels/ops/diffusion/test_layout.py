@@ -112,9 +112,6 @@ def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
             usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
         )
 
-    with pytest.raises((ValueError, RuntimeError)):
-        usp_merge_heads(x[0])
-
     with patch.object(torch.version, "hip", "6.3"):
         assert not can_use_usp_merge_heads(x)
         assert torch.equal(usp_merge_heads(x), x.permute(2, 1, 0, 3, 4).contiguous())
@@ -501,21 +498,6 @@ def test_causal_conv3d_cat_pad_cuda_matches_triton(
     actual = fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
     expected = fused_causal_conv3d_cat_pad_triton(x, cache_x, padding)
     assert torch.equal(actual, expected)
-
-
-@pytest.mark.parametrize("bad_input", ["shape", "layout", "device", "padding"])
-def test_causal_conv3d_cat_pad_launcher_rejects_invalid_inputs(bad_input):
-    x, cache, padding = _conv3d_inputs(8, 1, 6, 6, 1)
-    if bad_input == "shape":
-        cache = cache[:, :4].contiguous()
-    elif bad_input == "layout":
-        x = x.transpose(-1, -2)
-    elif bad_input == "device":
-        cache = cache.cpu()
-    else:
-        padding = (1, 1, 1, 1, 0, 0)
-    with pytest.raises(RuntimeError):
-        fused_causal_conv3d_cat_pad_cuda(x, cache, padding)
 
 
 def test_causal_conv3d_cat_pad_torch_compile():

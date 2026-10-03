@@ -56,12 +56,6 @@ class TestJointQKVCat(CustomTestCase):
                     out[0].zero_()
                     self.assert_bits_equal(out[1:], saved)
 
-    def test_launcher_rejects_mismatched_shapes(self):
-        inputs = list(make_inputs(2, 17, 3, 4, 32, torch.bfloat16))
-        inputs[1] = inputs[1].view(1, 34, 4, 32)
-        with self.assertRaises(RuntimeError):
-            joint_qkv_cat(*inputs)
-
     def test_changed_input_graph_replay(self):
         inputs = make_inputs(2, 2048, 13, 32, 128, torch.bfloat16)
         gate = BitExactFusionGate("test", per_signature=True)

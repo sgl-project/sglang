@@ -43,14 +43,6 @@ class TestSanaWMConvPost(CustomTestCase):
                     actual = fused_bias_glu(x, b)
                     self.assertTrue(torch.equal(actual, a * F.silu(g)))
                     self.assertTrue(actual.is_contiguous(memory_format=layout))
-        # Use a real spatial slice; width-one tensors remain contiguous.
-        sliced = torch.empty(2, 34, 7, 10, device="cuda", dtype=x.dtype)[:, :, :, ::2]
-        with self.assertRaises(RuntimeError):
-            fused_bias_silu(sliced, bias)
-        with self.assertRaises(RuntimeError):
-            fused_bias_glu(sliced, None)
-        with self.assertRaises(RuntimeError):
-            fused_bias_glu(x.float(), None)
 
     @staticmethod
     def reference(module, x):

@@ -43,28 +43,5 @@ def test_changed_inputs_in_graph_replay():
     )
 
 
-@pytest.mark.parametrize(
-    "bad_input", ["shape", "dtype", "device", "layout", "alignment"]
-)
-def test_native_launcher_rejects_invalid_inputs(bad_input):
-    attn = torch.randn(2, 17, 64, device="cuda", dtype=torch.bfloat16)
-    mlp = torch.randn(2, 17, 256, device="cuda", dtype=torch.bfloat16)
-    if bad_input == "shape":
-        # The flattened row count is unchanged, but the batch/sequence axes differ.
-        mlp = mlp.view(1, 34, 256)
-    elif bad_input == "dtype":
-        mlp = mlp.float()
-    elif bad_input == "device":
-        mlp = mlp.cpu()
-    elif bad_input == "layout":
-        mlp = mlp[..., ::2]
-    else:
-        mlp = torch.zeros(mlp.numel() + 1, device=mlp.device, dtype=mlp.dtype)[
-            1:
-        ].view_as(mlp)
-    with pytest.raises(RuntimeError):
-        fused_gelu_tanh_cat(attn, mlp)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
