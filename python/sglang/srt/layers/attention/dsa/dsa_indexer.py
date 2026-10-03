@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.mqa_logits_backend import DSAMQALogitsBackend
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -402,6 +403,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
+        self.mqa_logits_backend = DSAMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_mqa_logits_backend
         )
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
@@ -1546,8 +1550,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
+                    fp8_mqa_logits = self.mqa_logits_backend.get_hip_kernel()
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
@@ -1614,8 +1617,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
+                    fp8_mqa_logits = self.mqa_logits_backend.get_hip_kernel()
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
                     logits_chunk = fp8_mqa_logits(
