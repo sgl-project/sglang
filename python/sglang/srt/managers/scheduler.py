@@ -295,6 +295,8 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaSlotExhausted
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3847,6 +3849,17 @@ class Scheduler(
             return bool(self.tree_cache.check_hicache_events())
         return False
 
+    def _release_unadmitted_mamba_state(self, req: Req) -> None:
+        """Undo slot ownership acquired while examining a queued request."""
+        pool = self.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            pool.release_mamba_prefill_slots(req)
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and not getattr(req, "session", None):
+            pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+            req.kv.mamba_pool_idx = None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3950,7 +3963,14 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            try:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            except MambaSlotExhausted:
+                # Do not attach this unscheduled chunk to a batch of other
+                # requests: its result would otherwise stash the old chunk.
+                if not running_batch.is_empty():
+                    running_batch.batch_is_full = True
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {
@@ -4024,7 +4044,26 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            try:
+                req.init_next_round_input(self.tree_cache)
+            except MambaSlotExhausted:
+                # Prefix matching allocates a private Mamba copy before the
+                # admission check. Under pressure, all reclaimable cache slots
+                # can be exhausted while running requests still own theirs.
+                # Leave this request queued and let decode release capacity.
+                self._release_unadmitted_mamba_state(req)
+                now = time.monotonic()
+                if now - getattr(self, "_last_mamba_slot_warning_ts", 0.0) >= 10.0:
+                    logger.warning(
+                        "Deferring prefill: no Mamba state slot is available "
+                        "after cache eviction"
+                    )
+                    self._last_mamba_slot_warning_ts = now
+                # Avoid rescanning the same queue on every decode step. The
+                # normal running-batch update clears this when a request ends.
+                if not running_batch.is_empty():
+                    running_batch.batch_is_full = True
+                break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4035,11 +4074,28 @@ class Scheduler(
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
                 continue
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
+            try:
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
+            except MambaSlotExhausted:
+                # HiCache load-back may need a private Mamba state slot after
+                # admission's token budget check. Its preparation has rolled
+                # back the cache locks; keep the request queued until an ack or
+                # a running decode frees a slot.
+                self._release_unadmitted_mamba_state(req)
+                now = time.monotonic()
+                if now - getattr(self, "_last_mamba_slot_warning_ts", 0.0) >= 10.0:
+                    logger.warning(
+                        "Deferring prefill: no Mamba state slot is available "
+                        "for HiCache load-back"
+                    )
+                    self._last_mamba_slot_warning_ts = now
+                if not running_batch.is_empty():
+                    running_batch.batch_is_full = True
+                break
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -4063,15 +4119,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                    self._release_unadmitted_mamba_state(req)
                 break
 
         if mamba_allocator is not None:

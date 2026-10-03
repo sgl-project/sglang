@@ -950,6 +950,7 @@ class UnifiedMambaSlotAllocator:
         self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
+        self._alloc_group_remaining = 0
 
     # -- translation (owns the v<->p mapping) --
 
@@ -977,6 +978,10 @@ class UnifiedMambaSlotAllocator:
         # drainable holes since alloc flushes the peer before extending.
         return self._multi_ended_allocator.schedulable_available_size()
 
+    def admission_available_size(self) -> int:
+        """Include unused grouped COW slots that are already reserved."""
+        return self.schedulable_available_size() + self._alloc_group_remaining
+
     @property
     def free_slots(self) -> torch.Tensor:
         # Watermark-derived physical free-list for the invariant checker.
@@ -1000,6 +1005,7 @@ class UnifiedMambaSlotAllocator:
         if self._alloc_iter is not None and need_size == 1:
             slot = next(self._alloc_iter, None)
             if slot is not None:
+                self._alloc_group_remaining -= 1
                 return slot
         return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
 
@@ -1008,15 +1014,18 @@ class UnifiedMambaSlotAllocator:
 
     def clear(self):
         self._alloc_iter = None
+        self._alloc_group_remaining = 0
         return self._multi_ended_allocator.clear()
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
         self._alloc_iter = None
+        self._alloc_group_remaining = 0
         if num_reqs > 0:
             result = self._multi_ended_allocator.alloc(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
+                self._alloc_group_remaining = result.numel()
 
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
@@ -1025,6 +1034,7 @@ class UnifiedMambaSlotAllocator:
             if remaining:
                 self._multi_ended_allocator.free(torch.cat(remaining))
         self._alloc_iter = None
+        self._alloc_group_remaining = 0
 
     def is_slot_allocated(self, slot) -> bool:
         return self._multi_ended_allocator.is_slot_allocated(int(slot))

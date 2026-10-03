@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaSlotExhausted
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -7715,6 +7716,21 @@ class UnifiedRadixCacheSuite:
         evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
+
+        # If eviction cannot free a slot, admission must defer this host hit
+        # without binding a bogus request-owned state index.
+        comp.finalize_load_back(req, prep, success=False)
+        with (
+            mock.patch.object(
+                req_to_token_pool.mamba_allocator,
+                "alloc",
+                side_effect=[None, None],
+            ),
+            mock.patch.object(cache, "evict_for_alloc", autospec=True),
+        ):
+            with self.assertRaises(MambaSlotExhausted):
+                comp.prepare_load_back(leaf, req=req)
+        self.assertIsNone(req.kv.mamba_pool_idx)
 
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""

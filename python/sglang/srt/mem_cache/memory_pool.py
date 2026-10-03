@@ -1445,9 +1445,95 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    # For chunk prefill req, we do not need to allocate mamba cache,
-    # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+    def needs_mamba_cache_reservation(self, req: Req) -> bool:
+        return (
+            (self.mamba_ckpt_pool is None or self.enable_mamba_extra_buffer)
+            and not req.skip_radix_cache_insert
+            and req.kv.mamba_cache_reserve_slot is None
+        )
+
+    def mamba_slots_needed_for_extend(
+        self, req: Req, *, reserve_cache_slot: bool = False
+    ) -> int:
+        needed = int(not req.kv.holds_mamba and req.kv.mamba_prefill_live_slot is None)
+        if (
+            self.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+            and req.kv.mamba_prefill_ping_pong_slots is None
+        ):
+            needed += (
+                1
+                if self.enable_mamba_extra_buffer_lazy
+                else self.mamba_ping_pong_track_buffer_size
+            )
+        if reserve_cache_slot and self.needs_mamba_cache_reservation(req):
+            needed += 1
+        return needed
+
+    def reserve_mamba_prefill_slots(
+        self, req: Req, *, reserve_cache_slot: bool
+    ) -> bool:
+        """Take every remaining state slot before HiCache can change the gap.
+
+        Keep the allocation transactional: a shortfall leaves the request and
+        allocator in their pre-admission state, so the scheduler can defer it.
+        """
+        need_live = not req.kv.holds_mamba and req.kv.mamba_prefill_live_slot is None
+        need_ping_pong = (
+            self.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+            and req.kv.mamba_prefill_ping_pong_slots is None
+        )
+        ping_pong_count = 0
+        if need_ping_pong:
+            ping_pong_count = (
+                1
+                if self.enable_mamba_extra_buffer_lazy
+                else self.mamba_ping_pong_track_buffer_size
+            )
+        need_checkpoint = reserve_cache_slot and self.needs_mamba_cache_reservation(req)
+        slots = []
+        for _ in range(int(need_live) + ping_pong_count + int(need_checkpoint)):
+            slot = self.mamba_allocator.alloc(1)
+            if slot is None:
+                for allocated in slots:
+                    self.mamba_allocator.free(allocated)
+                return False
+            slots.append(slot)
+        offset = 0
+        if need_live:
+            req.kv.mamba_prefill_live_slot = slots[offset]
+            offset += 1
+        if need_ping_pong:
+            req.kv.mamba_prefill_ping_pong_slots = (
+                slots[offset]
+                if ping_pong_count == 1
+                else torch.cat(slots[offset : offset + ping_pong_count])
+            )
+            offset += ping_pong_count
+        if need_checkpoint:
+            req.kv.mamba_cache_reserve_slot = slots[offset]
+        return True
+
+    def release_mamba_prefill_slots(self, req: Req) -> None:
+        for name in ("mamba_prefill_live_slot", "mamba_prefill_ping_pong_slots"):
+            slots = getattr(req.kv, name)
+            if slots is not None:
+                setattr(req.kv, name, None)
+                self.mamba_allocator.free(slots)
+        self.release_mamba_cache_reservation(req)
+
+    def release_mamba_cache_reservation(self, req: Req) -> None:
+        slot = req.kv.mamba_cache_reserve_slot
+        if slot is not None:
+            req.kv.mamba_cache_reserve_slot = None
+            self.mamba_allocator.free(slot)
+
+    # For chunk prefill req, reuse the live Mamba state, but reserve the
+    # checkpoint replacement until its forward result is cached.
+    def alloc(
+        self, reqs: List[Req], *, reserve_mamba_cache_slot: bool = False
+    ) -> Optional[List[int]]:
         fresh_req_rows = [req.kv.req_pool_idx is None for req in reqs]
         select_index = super().alloc(reqs)
         if select_index is None:
@@ -1469,7 +1555,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.kv.holds_mamba:  # for radix cache / continuing chunked
                 pass
             else:
-                mid = self.mamba_allocator.alloc(1)
+                mid = req.kv.mamba_prefill_live_slot
+                if mid is not None:
+                    req.kv.mamba_prefill_live_slot = None
+                else:
+                    mid = self.mamba_allocator.alloc(1)
                 assert mid is not None, (
                     f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 )
@@ -1488,6 +1578,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
+            if reserve_mamba_cache_slot and self.needs_mamba_cache_reservation(req):
+                slot = self.mamba_allocator.alloc(1)
+                assert slot is not None, (
+                    "Not enough space for the Mamba prefill checkpoint reservation"
+                )
+                req.kv.mamba_cache_reserve_slot = slot
         assert len(select_index) == len(mamba_indices), (
             "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         )
@@ -1623,7 +1719,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if self.enable_mamba_extra_buffer_lazy
             else self.mamba_ping_pong_track_buffer_size
         )
-        slots = self.mamba_allocator.alloc(n)
+        slots = req.kv.mamba_prefill_ping_pong_slots
+        if slots is not None:
+            req.kv.mamba_prefill_ping_pong_slots = None
+            assert slots.numel() == n
+        else:
+            slots = self.mamba_allocator.alloc(n)
         assert slots is not None, (
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
@@ -1682,6 +1783,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
+        self.release_mamba_prefill_slots(req)
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))

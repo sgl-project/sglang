@@ -58,6 +58,10 @@ if TYPE_CHECKING:
     )
 
 
+class MambaSlotExhausted(RuntimeError):
+    """No request-owned Mamba state slot is available after cache eviction."""
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -206,12 +210,17 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-                dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                self.cache.dec_lock_ref(
-                    result.best_match_node, lock_result.to_dec_params()
-                )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                try:
+                    self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                    dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                finally:
+                    self.cache.dec_lock_ref(
+                        result.best_match_node, lock_result.to_dec_params()
+                    )
+                if dst_index is None:
+                    raise MambaSlotExhausted(
+                        "No Mamba state slot is available for prefix matching"
+                    )
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
@@ -504,10 +513,31 @@ class MambaComponent(TreeComponent):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            evicted = self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                pool = self.cache.req_to_token_pool
+                ct = self.component_type
+                pool_size = getattr(
+                    getattr(pool, "mamba_pool", None), "size", "unknown"
+                )
+                raise AssertionError(
+                    "Can not alloc mamba cache: "
+                    f"pool_size={pool_size}, "
+                    f"free={pool.mamba_allocator.available_size()}, "
+                    f"evictable={self.tree_core.component_evictable_size_[ct]}, "
+                    f"protected={self.tree_core.component_protected_size_[ct]}, "
+                    f"evicted_on_retry={getattr(evicted, 'mamba_num_evicted', 'unknown')}"
+                )
         return slot
+
+    def _take_mamba_cache_slot(self, req: Req) -> torch.Tensor:
+        """Use the slot reserved before this prefill entered the forward queue."""
+        slot = req.kv.mamba_cache_reserve_slot
+        if slot is not None:
+            req.kv.mamba_cache_reserve_slot = None
+            return slot
+        return self._alloc_mamba_slot()
 
     @property
     def int8_ckpt_pool(self):
@@ -607,7 +637,7 @@ class MambaComponent(TreeComponent):
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
+                    new_slot = self._take_mamba_cache_slot(req)
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -620,14 +650,14 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
+                new_slot = self._take_mamba_cache_slot(req)
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = self._take_mamba_cache_slot(req)
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
@@ -645,6 +675,11 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        # A finished request, an untracked interval, or a declined insert did
+        # not need the reserved replacement. Consumed reservations are already
+        # detached from the request and remain owned by the ping-pong buffer or
+        # the radix cache.
+        self.cache.req_to_token_pool.release_mamba_cache_reservation(req)
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
@@ -709,11 +744,18 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        dst = req.kv.mamba_prefill_live_slot
+        if dst is not None:
+            req.kv.mamba_prefill_live_slot = None
+        else:
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
+            if dst is None:
+                raise MambaSlotExhausted(
+                    "No Mamba state slot is available for HiCache load-back"
+                )
         req.kv.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
