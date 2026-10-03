@@ -45,7 +45,6 @@ from sglang.srt.layers.layer_boundary.ops import (
     update_attn_tp_gather_output,
 )
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
@@ -369,7 +368,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 max_len, communicator.ffn.plan.output.plan.path_for(max_len)
             )
             self.assertTrue(
-                communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                communicator.ffn.plan.output._sum_in_reduce_scatter(
                     communicator.ffn.plan.output.plan.path_for(max_len), step
                 )
             )
@@ -1125,7 +1124,7 @@ class TestPrefillCP(CustomTestCase):
                     patch_communicator("_batch_shards_over_cp", lambda fb: shards),
                 ):
                     self.assertIs(
-                        communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                        communicator.ffn.plan.output._sum_in_reduce_scatter(
                             communicator.ffn.plan.output.plan.path_for(
                                 SimpleNamespace(forward_mode=ForwardMode.DECODE)
                             ),
@@ -1591,7 +1590,6 @@ class Flags:
     """The per-forward flags an FFN exit publishes, one set per rank."""
 
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
@@ -1860,7 +1858,7 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = finish_exit(ffn_exit, hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = export_output(hidden, residual, forward_batch)
+            hidden, residual = residual.export(hidden)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
@@ -1974,7 +1972,7 @@ class TestTheFfnInputReduction(CustomTestCase):
             with self.subTest(is_plain_add=is_plain_add):
                 update = SimpleNamespace(is_plain_add=is_plain_add)
                 read = SimpleNamespace(
-                    update_and_read=lambda update, h, r, norm: (h, r)
+                    update_and_read=lambda update, h, r, norm, **read_kwargs: (h, r)
                 )
                 calls = []
                 with (

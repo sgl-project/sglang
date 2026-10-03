@@ -226,6 +226,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
     torch.nn.Module.__init__(moe)
     vars(moe).update(
         tp_size=4,
+        reduce_results=True,
         is_deepseek_v4=True,
         _shared_expert_tp1=shared_tp1,
         layer_id=0,
@@ -287,13 +288,12 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
         return hidden, next_pre
 
     with (
-        get_forward().scoped(
-            sp_active=False, fuse_mlp_allreduce=False, flashinfer_trtllm_bypass=False
-        ),
+        get_forward().scoped(sp_active=False, flashinfer_trtllm_bypass=False),
         patch(
             "sglang.srt.models.deepseek_v2.post_experts_all_reduce",
             side_effect=group.all_reduce,
         ) as original_reduce,
+        patch("sglang.srt.layers.moe.post_experts_all_reduce", original_reduce),
         patch(
             "sglang.srt.layers.moe.get_moe_a2a_backend", return_value=MoeA2ABackend.NONE
         ),
@@ -326,12 +326,12 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             torch.testing.assert_close(unfused[1], fused[1], atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("flag", ["mlp_reduce_scatter", "fuse_mlp_allreduce"])
+@pytest.mark.parametrize("flag", ["mlp_reduce_scatter"])
 @pytest.mark.parametrize("dual", [False, True], ids=["normal", "dual-stream"])
 def test_moe_skipped_reduction_declines_fusion(group, dual, flag):
-    """A reduce-scattered or elsewhere-fused MoE output must not reach the fused
-    all-reduce + mHC post: moe_mhc_fusion declines, so the MoE is never asked to
-    defer, and its own path runs no collective either."""
+    """A reduce-scattered MoE output must not reach the fused all-reduce + mHC
+    post: moe_mhc_fusion declines, so the MoE is never asked to defer, and its
+    own path runs no collective either."""
     from sglang.srt.layers.moe import MoeA2ABackend
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
         moe_mhc_fusion,

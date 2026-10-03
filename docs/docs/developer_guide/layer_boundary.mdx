@@ -43,9 +43,8 @@ A declaration states how its compute cooperates with the boundary's reduction de
 
 | Contract or state | Meaning |
 | --- | --- |
-| `ProducerReduction.ALWAYS_PARTIAL` | Attention only (the `declare_attn()` default): compute always returns a contribution requiring a sum and publishes it with `finish()`. Build its output projection so that it never reduces (for example `reduce_results=False`). `declare_ffn()` rejects it |
-| `ProducerReduction.EXIT_SCOPED` | Compute obeys the exit's reduction decision and publishes through `exit()`: the `declare_ffn()` default, and `declare_attn(reduction=ProducerReduction.EXIT_SCOPED)` for a mixer |
-| `ProducerReduction.TAIL_AFTER_SUM` | FFN only: compute adds a replicated component after its internal sum. The boundary never defers that sum to the next layer, but reduce-scatter permissions remain, so compute that skips its sum for `mlp_reduce_scatter` must add the component exactly once. `declare_attn()` rejects it |
+| `ProducerReduction.ALWAYS_PARTIAL` | Attention only (the `declare_attn()` default): compute always returns a contribution requiring a sum and publishes it with `finish()`; the next stage's input completes the sum. Build its output projection so that it never reduces (for example `reduce_results=False`) |
+| `ProducerReduction.EXIT_SCOPED` | The exit completes the sum or carries it to the next stage's input: every FFN, and `declare_attn(reduction=ProducerReduction.EXIT_SCOPED)` for a mixer |
 | `OutputContract.may_*` | Construction-time permission to leave the sum to a particular later step |
 | `Contribution.owed` | Work this specific output still requires |
 | `OwedOutput` | Model-facing handle preventing ordinary tensor use of that unfinished output |
@@ -159,14 +158,13 @@ if hidden_states.shape[0] != 0:
 hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
 
 hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-with self.ffn_boundary.exit(forward_batch) as output:
-    hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-hidden_states = output.finish(hidden_states)
+hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 ```
 
 This example uses Qwen3's compute member name `mlp`; boundary construction does not require renaming compute classes or checkpoint parameters.
 
-`prepare()` returns input in the consumer read's format, which can include quantized tensors. An attention with an `ALWAYS_PARTIAL` output contract uses `finish()` to register its contribution. An FFN or single-stage mixer runs its compute under `exit()`, then calls the returned object's `finish()` once. The exit context restores the previous runtime flags even when compute raises; do not call `finish()` on a failed computation.
+`prepare()` returns input in the consumer read's format, which can include quantized tensors. An attention with an `ALWAYS_PARTIAL` output contract uses `finish()` to register its contribution, and an FFN or single-stage mixer uses `finish()` to complete or carry on the sum its output owes. An FFN whose boundary has fusions, which may take a MoE finalize handoff, runs its compute under `exit()` instead and calls the returned object's `finish()` once (`finish()` on the boundary rejects it); the exit context restores the previous runtime flags even when compute raises, so do not call `finish()` on a failed computation.
 
 Compute never sums a stage's output: build every output projection, MLP and MoE block of a stage with `reduce_results=False`, and leave the sum the output owes to the boundary. The boundary completes it at the exit, or carries it to the next stage's input, where a fused all-reduce + add + norm may take it:
 
@@ -258,7 +256,6 @@ Common errors and their usual cause:
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
 | `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel) is not supported by this stage; add a server-argument check that rejects the configuration |
 | `a prepared branch must enter through branch_input, not prepare` | A `prepared_from` stage was entered with `prepare()` |
-| `ALWAYS_PARTIAL is not supported for ffn stages` / `TAIL_AFTER_SUM is not supported for attention stages` | The declaration's `reduction` does not match the stage kind |
 | `snapshot requires a plain residual update` | A snapshot was taken on a nonlinear (for example MHC) update |
 
 ## Boundary internals

@@ -30,10 +30,12 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input
+from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, sum_output
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
+    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
@@ -168,20 +170,26 @@ class StageBoundary:
         return hidden_states
 
     def finish(self, hidden_states, forward_batch):
-        """Hand this attention's actual contribution to the following stage."""
-        if self.kind is not StageKind.ATTENTION or not self.plan.finishes_directly:
-            raise RuntimeError(
-                "use the stage exit scope for an FFN or single-stage mixer"
+        """Hand this stage's output to the following stage: an attention's
+        actual contribution, or an FFN's or a mixer's output with its sum
+        completed or carried on. An FFN whose boundary has fusions (which may
+        take a MoE finalize handoff) finishes through exit() instead."""
+        if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
+            produced = self.plan.produced(forward_batch)
+            return stream_of(forward_batch).record(
+                hidden_states,
+                produced.update,
+                declared_sum=produced.group if produced.always_partial else None,
             )
-        produced = self.plan.produced(forward_batch)
-        return stream_of(forward_batch).record(
-            hidden_states,
-            produced.update,
-            declared_sum=produced.group if produced.always_partial else None,
-        )
+        if self.kind is StageKind.FFN and self.plan.fusions is not None:
+            raise RuntimeError(
+                "an FFN whose boundary has fusions finishes through exit()"
+            )
+        return self.exit(forward_batch).finish(hidden_states)
 
     def exit(self, forward_batch):
-        """Select and scope one FFN or single-stage mixer's output decision.
+        """Select and scope one FFN or single-stage mixer's output decision,
+        for an FFN whose MoE may hand off its finalize (see finish()).
 
         Args:
             forward_batch: Active batch whose stream receives the compute result.
@@ -261,6 +269,20 @@ class StageBoundary:
         return self.plan.output.complete_now(
             hidden_states, stream_of(forward_batch), forward_batch
         )
+
+    def sum_part(self, hidden_states, forward_batch, group: SumGroup):
+        """Complete the sum over ``group`` that one part of this FFN's output
+        owes.
+
+        For an FFN that builds the next stream itself (REPLACE_AT_EXIT) from
+        several complete parts, normalizing each before combining them; the
+        stream it hands to its exit is then complete.
+        """
+        if self.declaration.update is not REPLACE_AT_EXIT:
+            raise RuntimeError(
+                "only an FFN that writes the next stream itself sums its parts"
+            )
+        return sum_output(hidden_states, group, forward_batch, may_quantize=False)
 
     def branch_input(self, source, hidden_states, forward_batch):
         hidden_states, stream = branch.branch_input(

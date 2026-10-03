@@ -472,12 +472,11 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if isinstance(self.mlp, Ernie4_5_VLMoeMoE):
-                hidden_states = self.mlp(hidden_states, visual_token_mask, **kwargs)
-            else:
-                hidden_states = self.mlp(hidden_states)
-        return ffn_exit.finish(hidden_states)
+        if isinstance(self.mlp, Ernie4_5_VLMoeMoE):
+            hidden_states = self.mlp(hidden_states, visual_token_mask, **kwargs)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 # only used as text backbone for ernie4.5 vl

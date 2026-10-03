@@ -1011,7 +1011,6 @@ class DeepseekV2MoE(nn.Module):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
-                    fwd.fuse_mlp_allreduce,
                     fwd.mlp_reduce_scatter,
                 )
             elif (
@@ -2655,9 +2654,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         post_attention_layernorm: nn.Module,
         qkv_latent_func: Optional[Callable],
         output=None,
+        attn_output=None,
     ):
         """The stage boundaries for this layer's norms; they choose their
-        steps from them at construction."""
+        steps from them at construction. ``attn_output`` and ``output``: the
+        attention's and the FFN's output transforms, if any."""
         fusions = None
         if (
             not get_parallel().enable_prefill_cp
@@ -2670,7 +2671,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             fusions = CuteDSLFusion()
         attn_boundary, ffn_boundary = make_stages(
             (
-                declare_attn(),
+                declare_attn(output_transform=attn_output),
                 input_layernorm,
                 {"qkv_latent_func": qkv_latent_func, "fusions": fusions},
             ),
@@ -3467,7 +3468,6 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 def dsv2_flashinfer_moe_dual_stream_graph(
     hidden_states: torch.Tensor,
     layer_id: int,
-    fuse_mlp_allreduce: bool,
     mlp_reduce_scatter: bool,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
@@ -3480,7 +3480,6 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
     with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
         lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
