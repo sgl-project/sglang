@@ -403,10 +403,6 @@ def _local_prefill_cuda_graph_vote(
         ),
         lora_ineligible=prefill_graph_runner.enable_lora,
         is_mixed=mode == ForwardMode.MIXED,
-        contains_image_inputs=any(
-            mm_input is not None and mm_input.contains_image_inputs()
-            for mm_input in local_batch.multimodal_inputs or ()
-        ),
         batch_max_context_len=(
             int(local_batch.seq_lens_cpu.max().item())
             if prefill_graph_runner.max_context_size is not None

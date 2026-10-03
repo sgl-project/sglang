@@ -557,11 +557,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             [(first, True), (second, True), (second, False)],
         )
 
-    def test_fa4_image_batch_cannot_replay_text_only_full_graph(self):
-        """Image prefill must fall back before replay bypasses the mask guard.
+    def test_fa4_multimodal_batch_cannot_replay_text_only_full_graph(self):
+        """FA4 multimodal prefill must fall back before full graph replay.
 
-        Both the DP vote and forward-time gate must reject the image batch,
-        even before the model has installed image_token_ranges.
+        Both the DP vote and forward-time gate reject multimodal batches;
+        image batches are rejected before image_token_ranges is installed.
         """
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
@@ -589,24 +589,23 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             mm_items=[MultimodalDataItem(modality=Modality.IMAGE, offsets=[(0, 1)])]
         )
         audio = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.AUDIO)])
+        video = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.VIDEO)])
         for backend, fa4 in (
             (Backend.FULL, True),
             (Backend.FULL, False),
             (Backend.BREAKABLE, True),
+            (Backend.TC_PIECEWISE, True),
         ):
             runner.prefill_backend_name = backend
             runner._is_full_backend = backend == Backend.FULL
             runner._fa4_prefill = fa4
             # Text -> mixed text/image -> text also checks that the fallback
             # is per batch, not a permanent disabling of captured graphs.
-            for mm_inputs in (None, [None, image], [None, audio], None):
+            for mm_inputs in (None, [None, image], [None, audio], [None, video], None):
                 with self.subTest(backend=backend, fa4=fa4, mm_inputs=mm_inputs):
                     batch.mm_inputs = mm_inputs
                     expected = not (
-                        backend == Backend.FULL
-                        and fa4
-                        and mm_inputs is not None
-                        and mm_inputs[1] is image
+                        backend == Backend.FULL and fa4 and mm_inputs is not None
                     )
                     self.assertEqual(runner.can_run_graph(batch), expected)
                     schedule_batch = SimpleNamespace(
@@ -655,7 +654,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             global_num_tokens_cpu=None,
             dp_prefill_cuda_graph_max_prefix_len=0,
             contains_mm_inputs=lambda: False,
-            contains_image_inputs=lambda: False,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
         )
