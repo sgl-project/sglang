@@ -6247,6 +6247,67 @@ class UnifiedRadixCacheSuite:
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
+    def test_hicache_write_back_internal_mamba_evict_demotes_state_when_full_on_host(
+        self,
+    ):
+        """write_back: an internal node whose Full KV is already on host still
+        demotes its device-only mamba state instead of dropping it."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
+            "write_back"
+        )
+        # Read the node off the LRU: a match_prefix lookup would refresh it.
+        node = cache.tree_core.get_component_device_lru_node_ids(ComponentType.MAMBA)[
+            -1
+        ]
+        (leaf,) = _node_children(cache, node)
+        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        # Drop the state from both tiers, then re-insert the path: the node
+        # keeps its Full host copy but its state is back on device only.
+        cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertEqual(cache.evict_host(1, ComponentType.MAMBA), 1)
+        self._insert(cache, cache.token_to_kv_pool_allocator, req_to_token_pool, seq_a)
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNone(_host_value(cache, node, ComponentType.MAMBA))
+
+        # The state-only backup must be committed while the device state is
+        # still held, so record the outcome before the tombstone frees it.
+        seen = []
+        backup = cache.backup_node_for_write_back
+
+        def record_backup(node_id):
+            ok = backup(node_id)
+            seen.append(
+                (
+                    ok,
+                    _device_value(cache, node, ComponentType.MAMBA) is not None,
+                    bool(cache.ongoing_write_through),
+                )
+            )
+            return ok
+
+        # The re-insert made the node MRU; pin the leaf so eviction reaches it.
+        leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
+        try:
+            with mock.patch.object(cache, "backup_node_for_write_back", record_backup):
+                result = cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+        finally:
+            cache.dec_lock_ref(leaf, leaf_lock)
+
+        self.assertEqual(seen, [(True, True, False)])
+        self.assertEqual(result.mamba_num_evicted, 1)
+        self.assertIsNone(_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNotNone(
+            _host_value(cache, node, ComponentType.MAMBA),
+            "state demoted to host, not dropped",
+        )
+        cache.sanity_check()
+
     def test_hicache_internal_mamba_backup_waits_for_pending_swa(self):
         if not (self.cfg.has_swa and self.cfg.has_mamba):
             self.skipTest("requires Full, SWA and Mamba components")
@@ -6377,6 +6438,66 @@ class UnifiedRadixCacheSuite:
         )
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
+    def test_hicache_write_back_internal_swa_evict_demotes_kv_when_full_on_host(
+        self,
+    ):
+        """write_back: an internal node whose Full KV is already on host still
+        demotes its device-only SWA KV instead of dropping it."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        cache, req_to_token_pool, seq_a, seq_b = self._build_internal_swa_fixture(
+            "write_back"
+        )
+        # Read the node off the LRU: a match_prefix lookup would refresh it.
+        node = cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)[-1]
+        self.assertTrue(_node_children(cache, node))
+        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        # Drop the SWA KV from both tiers, then re-insert the path: the node
+        # keeps its Full host copy but its SWA KV is back on device only.
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_a)))
+        swa_len = len(seq_a)
+        self.assertEqual(cache.evict_host(swa_len, ComponentType.SWA), swa_len)
+        self._insert(cache, cache.token_to_kv_pool_allocator, req_to_token_pool, seq_b)
+        self.assertEqual(
+            cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)[-1],
+            node,
+        )
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+        # The SWA-only backup must be committed while the device KV is still
+        # held, so record the outcome before the tombstone frees it.
+        seen = []
+        backup = cache.backup_node_for_write_back
+
+        def record_backup(node_id):
+            ok = backup(node_id)
+            seen.append(
+                (
+                    ok,
+                    _device_value(cache, node, ComponentType.SWA) is not None,
+                    bool(cache.ongoing_write_through),
+                )
+            )
+            return ok
+
+        # Request only the node's own SWA size, so the walk stops after it.
+        node_len = _node_key_length(cache, node)
+        with mock.patch.object(cache, "backup_node_for_write_back", record_backup):
+            cache.evict(EvictParams(num_tokens=0, swa_num_tokens=node_len))
+
+        self.assertEqual(seen, [(True, True, False)])
+        self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertIsNotNone(
+            _host_value(cache, node, ComponentType.SWA),
+            "SWA KV demoted to host, not dropped",
+        )
         cache.sanity_check()
 
     def test_hicache_write_through_internal_swa_evict_keeps_drop(self):

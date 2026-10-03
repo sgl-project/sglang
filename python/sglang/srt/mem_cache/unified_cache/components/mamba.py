@@ -411,7 +411,6 @@ class MambaComponent(TreeComponent):
             self.tree_core.enable_hicache
             and self.tree_core.is_write_back
             and cd.host_value is None
-            and not x.backuped
             and x.component_data[BASE_COMPONENT_TYPE].value is not None
         ):
             # Keep the state live until the controller has attempted its host
