@@ -1,0 +1,1094 @@
+{
+  "status": "completed",
+  "scope": "Finite single-H100 repeated serving lifetime evidence; overall SGLang/Mooncake goal remains active",
+  "base_commit": "47eb9e870",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/capture-soak-20261003",
+  "runs": {
+    "smoke": {
+      "job": "01791027883600292385-8c9b39b6a97d",
+      "result": {
+        "job_id": "01791027883600292385-8c9b39b6a97d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791027974.3822978,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791027883600292385-8c9b39b6a97d.log"
+      },
+      "requests": 16,
+      "samples": 16,
+      "objects": 1088,
+      "payload_bytes": 128086016,
+      "manifest_bytes": 537520,
+      "repeated_load_seconds": 31.07730618864298,
+      "serving_elapsed_seconds": 74.0533064454794,
+      "total_seconds": 77.630765106529,
+      "native_client_seconds": 3.0244637094438076,
+      "requests_per_client_second": 5.290194076404496,
+      "capture_counters": {
+        "considered": 16,
+        "excluded_health_check": 0,
+        "admitted": 16,
+        "overlap_forwards": 832,
+        "eager_forwards": 64,
+        "cuda_graph_forwards": 768,
+        "sealed": 16,
+        "writer_started": 16,
+        "copies_completed": 16,
+        "snapshot_built": 16,
+        "ready": 16
+      },
+      "stage_totals": {
+        "queue_wait": {
+          "calls": 16,
+          "seconds": 1.4726610407233238,
+          "errors": 0
+        },
+        "copy_wait": {
+          "calls": 16,
+          "seconds": 0.0035986676812171936,
+          "errors": 0
+        },
+        "snapshot_build": {
+          "calls": 16,
+          "seconds": 0.16970693692564964,
+          "errors": 0
+        },
+        "validation": {
+          "calls": 16,
+          "seconds": 0.2052944377064705,
+          "errors": 0
+        },
+        "catalog_register": {
+          "calls": 16,
+          "seconds": 0.023225225508213043,
+          "errors": 0
+        },
+        "store_payload": {
+          "calls": 16,
+          "seconds": 0.2015245482325554,
+          "errors": 0
+        },
+        "catalog_written": {
+          "calls": 32,
+          "seconds": 0.03266802057623863,
+          "errors": 0
+        },
+        "journal_save": {
+          "calls": 16,
+          "seconds": 0.16079961135983467,
+          "errors": 0
+        },
+        "catalog_seal": {
+          "calls": 16,
+          "seconds": 0.37426428869366646,
+          "errors": 0
+        },
+        "store_manifest": {
+          "calls": 16,
+          "seconds": 0.007937144488096237,
+          "errors": 0
+        },
+        "catalog_publish": {
+          "calls": 16,
+          "seconds": 0.009790651500225067,
+          "errors": 0
+        },
+        "journal_complete": {
+          "calls": 16,
+          "seconds": 0.017020586878061295,
+          "errors": 0
+        },
+        "recovery_read": {
+          "calls": 0,
+          "seconds": 0,
+          "errors": 0
+        }
+      },
+      "host_pool": {
+        "allocated_bytes": 153317376,
+        "device_allocated_bytes": 0,
+        "device_limit_bytes": 0,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 16,
+        "quarantined": 0
+      },
+      "memory": [
+        {
+          "pid": 34112,
+          "created": 1791027894.75,
+          "name": "python",
+          "rss_bytes": {
+            "first": 1342963712,
+            "last": 1343107072,
+            "minimum": 1342963712,
+            "maximum": 1343107072,
+            "peak_growth": 143360
+          },
+          "uss_bytes": {
+            "first": 976535552,
+            "last": 976547840,
+            "minimum": 976535552,
+            "maximum": 976547840,
+            "peak_growth": 12288
+          },
+          "pss_bytes": {
+            "first": 1068893184,
+            "last": 1068905472,
+            "minimum": 1068893184,
+            "maximum": 1068905472,
+            "peak_growth": 12288
+          },
+          "threads": {
+            "first": 204,
+            "last": 204,
+            "minimum": 204,
+            "maximum": 204,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 58,
+            "last": 58,
+            "minimum": 58,
+            "maximum": 58,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 34134,
+          "created": 1791027907.65,
+          "name": "python",
+          "rss_bytes": {
+            "first": 14856192,
+            "last": 14856192,
+            "minimum": 14856192,
+            "maximum": 14856192,
+            "peak_growth": 0
+          },
+          "uss_bytes": {
+            "first": 7655424,
+            "last": 7655424,
+            "minimum": 7655424,
+            "maximum": 7655424,
+            "peak_growth": 0
+          },
+          "pss_bytes": {
+            "first": 8678400,
+            "last": 8678400,
+            "minimum": 8678400,
+            "maximum": 8678400,
+            "peak_growth": 0
+          },
+          "threads": {
+            "first": 1,
+            "last": 1,
+            "minimum": 1,
+            "maximum": 1,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 4,
+            "last": 4,
+            "minimum": 4,
+            "maximum": 4,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 34135,
+          "created": 1791027907.65,
+          "name": "sglang::scheduler",
+          "rss_bytes": {
+            "first": 2556084224,
+            "last": 2556088320,
+            "minimum": 2556084224,
+            "maximum": 2556088320,
+            "peak_growth": 4096
+          },
+          "uss_bytes": {
+            "first": 2168377344,
+            "last": 2168459264,
+            "minimum": 2168377344,
+            "maximum": 2168459264,
+            "peak_growth": 81920
+          },
+          "pss_bytes": {
+            "first": 2270832640,
+            "last": 2270914560,
+            "minimum": 2270832640,
+            "maximum": 2270914560,
+            "peak_growth": 81920
+          },
+          "threads": {
+            "first": 249,
+            "last": 249,
+            "minimum": 249,
+            "maximum": 249,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 107,
+            "last": 107,
+            "minimum": 107,
+            "maximum": 107,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 34143,
+          "created": 1791027919.53,
+          "name": "sglang::detokenizer",
+          "rss_bytes": {
+            "first": 1323552768,
+            "last": 1323552768,
+            "minimum": 1323552768,
+            "maximum": 1323552768,
+            "peak_growth": 0
+          },
+          "uss_bytes": {
+            "first": 956514304,
+            "last": 956518400,
+            "minimum": 956514304,
+            "maximum": 956518400,
+            "peak_growth": 4096
+          },
+          "pss_bytes": {
+            "first": 1048285184,
+            "last": 1048289280,
+            "minimum": 1048285184,
+            "maximum": 1048289280,
+            "peak_growth": 4096
+          },
+          "threads": {
+            "first": 6,
+            "last": 6,
+            "minimum": 6,
+            "maximum": 6,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 35,
+            "last": 35,
+            "minimum": 35,
+            "maximum": 35,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        }
+      ],
+      "request_lifetime": {
+        "after_workload": {
+          "pid": 34112,
+          "rss_bytes": 1343107072,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            88,
+            6,
+            1
+          ],
+          "stats": [
+            {
+              "collections": 2210,
+              "collected": 19647,
+              "uncollectable": 0
+            },
+            {
+              "collections": 200,
+              "collected": 2560,
+              "uncollectable": 0
+            },
+            {
+              "collections": 10,
+              "collected": 953,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923189,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 22,
+          "retained_weakrefs": 22,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": null,
+          "new_cycle_collected": null
+        },
+        "after_collection": {
+          "pid": 34112,
+          "rss_bytes": 1343107072,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            14,
+            0,
+            0
+          ],
+          "stats": [
+            {
+              "collections": 2210,
+              "collected": 19647,
+              "uncollectable": 0
+            },
+            {
+              "collections": 200,
+              "collected": 2560,
+              "uncollectable": 0
+            },
+            {
+              "collections": 11,
+              "collected": 954,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923189,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 22,
+          "retained_weakrefs": 22,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": 1,
+          "new_cycle_collected": true
+        }
+      },
+      "natural_live_request_states": [
+        0,
+        0
+      ]
+    },
+    "off": {
+      "job": "01791028023644109128-28077f985074",
+      "result": {
+        "job_id": "01791028023644109128-28077f985074",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791028587.4320185,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791028023644109128-28077f985074.log"
+      },
+      "requests": 2048,
+      "samples": 0,
+      "objects": 0,
+      "payload_bytes": 0,
+      "manifest_bytes": 0,
+      "repeated_load_seconds": 504.408435665071,
+      "serving_elapsed_seconds": 547.092314042151,
+      "total_seconds": 551.1584028489888,
+      "native_client_seconds": 283.0410666242242,
+      "requests_per_client_second": 7.235699131670532,
+      "capture_counters": {},
+      "stage_totals": {},
+      "host_pool": null,
+      "memory": [
+        {
+          "pid": 35721,
+          "created": 1791028034.19,
+          "name": "python",
+          "rss_bytes": {
+            "first": 1344000000,
+            "last": 1344835584,
+            "minimum": 1344000000,
+            "maximum": 1344835584,
+            "peak_growth": 835584
+          },
+          "uss_bytes": {
+            "first": 977108992,
+            "last": 977907712,
+            "minimum": 977108992,
+            "maximum": 977907712,
+            "peak_growth": 798720
+          },
+          "pss_bytes": {
+            "first": 1069903872,
+            "last": 1070702592,
+            "minimum": 1069903872,
+            "maximum": 1070702592,
+            "peak_growth": 798720
+          },
+          "threads": {
+            "first": 204,
+            "last": 204,
+            "minimum": 204,
+            "maximum": 204,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 58,
+            "last": 58,
+            "minimum": 58,
+            "maximum": 58,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 35730,
+          "created": 1791028047.01,
+          "name": "python",
+          "rss_bytes": {
+            "first": 14692352,
+            "last": 14692352,
+            "minimum": 14692352,
+            "maximum": 14692352,
+            "peak_growth": 0
+          },
+          "uss_bytes": {
+            "first": 7659520,
+            "last": 7659520,
+            "minimum": 7659520,
+            "maximum": 7659520,
+            "peak_growth": 0
+          },
+          "pss_bytes": {
+            "first": 8665088,
+            "last": 8665088,
+            "minimum": 8665088,
+            "maximum": 8665088,
+            "peak_growth": 0
+          },
+          "threads": {
+            "first": 1,
+            "last": 1,
+            "minimum": 1,
+            "maximum": 1,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 4,
+            "last": 4,
+            "minimum": 4,
+            "maximum": 4,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 35731,
+          "created": 1791028047.01,
+          "name": "sglang::scheduler",
+          "rss_bytes": {
+            "first": 2179051520,
+            "last": 2179051520,
+            "minimum": 2179051520,
+            "maximum": 2179051520,
+            "peak_growth": 0
+          },
+          "uss_bytes": {
+            "first": 1805664256,
+            "last": 1805680640,
+            "minimum": 1805664256,
+            "maximum": 1805680640,
+            "peak_growth": 16384
+          },
+          "pss_bytes": {
+            "first": 1899046912,
+            "last": 1899063296,
+            "minimum": 1899046912,
+            "maximum": 1899063296,
+            "peak_growth": 16384
+          },
+          "threads": {
+            "first": 27,
+            "last": 27,
+            "minimum": 27,
+            "maximum": 27,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 90,
+            "last": 90,
+            "minimum": 90,
+            "maximum": 90,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 35736,
+          "created": 1791028058.89,
+          "name": "sglang::detokenizer",
+          "rss_bytes": {
+            "first": 1323642880,
+            "last": 1324556288,
+            "minimum": 1323642880,
+            "maximum": 1324556288,
+            "peak_growth": 913408
+          },
+          "uss_bytes": {
+            "first": 955887616,
+            "last": 956649472,
+            "minimum": 955887616,
+            "maximum": 956649472,
+            "peak_growth": 761856
+          },
+          "pss_bytes": {
+            "first": 1048208384,
+            "last": 1048970240,
+            "minimum": 1048208384,
+            "maximum": 1048970240,
+            "peak_growth": 761856
+          },
+          "threads": {
+            "first": 6,
+            "last": 6,
+            "minimum": 6,
+            "maximum": 6,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 35,
+            "last": 35,
+            "minimum": 35,
+            "maximum": 35,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        }
+      ],
+      "request_lifetime": {
+        "after_workload": {
+          "pid": 35721,
+          "rss_bytes": 1344835584,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            116,
+            6,
+            0
+          ],
+          "stats": [
+            {
+              "collections": 2802,
+              "collected": 19163,
+              "uncollectable": 0
+            },
+            {
+              "collections": 254,
+              "collected": 2871,
+              "uncollectable": 0
+            },
+            {
+              "collections": 15,
+              "collected": 1108,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923082,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 2054,
+          "retained_weakrefs": 2054,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": null,
+          "new_cycle_collected": null
+        },
+        "after_collection": {
+          "pid": 35721,
+          "rss_bytes": 1344835584,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            14,
+            0,
+            0
+          ],
+          "stats": [
+            {
+              "collections": 2802,
+              "collected": 19163,
+              "uncollectable": 0
+            },
+            {
+              "collections": 254,
+              "collected": 2871,
+              "uncollectable": 0
+            },
+            {
+              "collections": 16,
+              "collected": 1109,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923082,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 2054,
+          "retained_weakrefs": 2054,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": 1,
+          "new_cycle_collected": true
+        }
+      },
+      "natural_live_request_states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "on": {
+      "job": "01791028023867751847-827ca8b491e7",
+      "result": {
+        "job_id": "01791028023867751847-827ca8b491e7",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791029311.3944893,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791028023867751847-827ca8b491e7.log"
+      },
+      "requests": 2048,
+      "samples": 2048,
+      "objects": 139264,
+      "payload_bytes": 16395010048,
+      "manifest_bytes": 68802560,
+      "repeated_load_seconds": 603.0852420404553,
+      "serving_elapsed_seconds": 646.0946417674422,
+      "total_seconds": 711.2302357070148,
+      "native_client_seconds": 380.47749664261937,
+      "requests_per_client_second": 5.3827099317878355,
+      "capture_counters": {
+        "considered": 2048,
+        "excluded_health_check": 0,
+        "admitted": 2048,
+        "overlap_forwards": 96256,
+        "eager_forwards": 8192,
+        "cuda_graph_forwards": 88064,
+        "sealed": 2048,
+        "writer_started": 2048,
+        "copies_completed": 2048,
+        "snapshot_built": 2048,
+        "ready": 2048
+      },
+      "stage_totals": {
+        "queue_wait": {
+          "calls": 2048,
+          "seconds": 106.387440148741,
+          "errors": 0
+        },
+        "copy_wait": {
+          "calls": 2048,
+          "seconds": 0.3626689463853836,
+          "errors": 0
+        },
+        "snapshot_build": {
+          "calls": 2048,
+          "seconds": 21.19750278815627,
+          "errors": 0
+        },
+        "validation": {
+          "calls": 2048,
+          "seconds": 27.751625929027796,
+          "errors": 0
+        },
+        "catalog_register": {
+          "calls": 2048,
+          "seconds": 3.906207390129566,
+          "errors": 0
+        },
+        "store_payload": {
+          "calls": 2048,
+          "seconds": 25.7013587243855,
+          "errors": 0
+        },
+        "catalog_written": {
+          "calls": 4096,
+          "seconds": 4.584201071411371,
+          "errors": 0
+        },
+        "journal_save": {
+          "calls": 2048,
+          "seconds": 8.771469458937645,
+          "errors": 0
+        },
+        "catalog_seal": {
+          "calls": 2048,
+          "seconds": 7.225384216755629,
+          "errors": 0
+        },
+        "store_manifest": {
+          "calls": 2048,
+          "seconds": 0.8489565886557102,
+          "errors": 0
+        },
+        "catalog_publish": {
+          "calls": 2048,
+          "seconds": 1.4222897440195084,
+          "errors": 0
+        },
+        "journal_complete": {
+          "calls": 2048,
+          "seconds": 2.192736826837063,
+          "errors": 0
+        },
+        "recovery_read": {
+          "calls": 0,
+          "seconds": 0,
+          "errors": 0
+        }
+      },
+      "host_pool": {
+        "allocated_bytes": 153317376,
+        "device_allocated_bytes": 0,
+        "device_limit_bytes": 0,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 16,
+        "quarantined": 0
+      },
+      "memory": [
+        {
+          "pid": 40001,
+          "created": 1791028597.27,
+          "name": "python",
+          "rss_bytes": {
+            "first": 1344880640,
+            "last": 1344946176,
+            "minimum": 1344880640,
+            "maximum": 1344946176,
+            "peak_growth": 65536
+          },
+          "uss_bytes": {
+            "first": 979550208,
+            "last": 979566592,
+            "minimum": 979550208,
+            "maximum": 979566592,
+            "peak_growth": 16384
+          },
+          "pss_bytes": {
+            "first": 1071357952,
+            "last": 1071374336,
+            "minimum": 1071357952,
+            "maximum": 1071374336,
+            "peak_growth": 16384
+          },
+          "threads": {
+            "first": 204,
+            "last": 204,
+            "minimum": 204,
+            "maximum": 204,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 58,
+            "last": 58,
+            "minimum": 58,
+            "maximum": 58,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 40027,
+          "created": 1791028610.04,
+          "name": "python",
+          "rss_bytes": {
+            "first": 14716928,
+            "last": 14716928,
+            "minimum": 14716928,
+            "maximum": 14716928,
+            "peak_growth": 0
+          },
+          "uss_bytes": {
+            "first": 7663616,
+            "last": 7663616,
+            "minimum": 7663616,
+            "maximum": 7663616,
+            "peak_growth": 0
+          },
+          "pss_bytes": {
+            "first": 8669184,
+            "last": 8669184,
+            "minimum": 8669184,
+            "maximum": 8669184,
+            "peak_growth": 0
+          },
+          "threads": {
+            "first": 1,
+            "last": 1,
+            "minimum": 1,
+            "maximum": 1,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 4,
+            "last": 4,
+            "minimum": 4,
+            "maximum": 4,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 40029,
+          "created": 1791028610.04,
+          "name": "sglang::scheduler",
+          "rss_bytes": {
+            "first": 2569125888,
+            "last": 2569396224,
+            "minimum": 2569125888,
+            "maximum": 2569396224,
+            "peak_growth": 270336
+          },
+          "uss_bytes": {
+            "first": 2180435968,
+            "last": 2180632576,
+            "minimum": 2180435968,
+            "maximum": 2180632576,
+            "peak_growth": 196608
+          },
+          "pss_bytes": {
+            "first": 2283515904,
+            "last": 2283712512,
+            "minimum": 2283515904,
+            "maximum": 2283712512,
+            "peak_growth": 196608
+          },
+          "threads": {
+            "first": 249,
+            "last": 249,
+            "minimum": 249,
+            "maximum": 249,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 108,
+            "last": 107,
+            "minimum": 107,
+            "maximum": 108,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        },
+        {
+          "pid": 40034,
+          "created": 1791028621.94,
+          "name": "sglang::detokenizer",
+          "rss_bytes": {
+            "first": 1323147264,
+            "last": 1323413504,
+            "minimum": 1323147264,
+            "maximum": 1323413504,
+            "peak_growth": 266240
+          },
+          "uss_bytes": {
+            "first": 955293696,
+            "last": 955305984,
+            "minimum": 955293696,
+            "maximum": 955305984,
+            "peak_growth": 12288
+          },
+          "pss_bytes": {
+            "first": 1047425024,
+            "last": 1047437312,
+            "minimum": 1047425024,
+            "maximum": 1047437312,
+            "peak_growth": 12288
+          },
+          "threads": {
+            "first": 6,
+            "last": 6,
+            "minimum": 6,
+            "maximum": 6,
+            "peak_growth": 0
+          },
+          "fds": {
+            "first": 35,
+            "last": 35,
+            "minimum": 35,
+            "maximum": 35,
+            "peak_growth": 0
+          },
+          "rss_within_budget": true
+        }
+      ],
+      "request_lifetime": {
+        "after_workload": {
+          "pid": 40001,
+          "rss_bytes": 1344946176,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            117,
+            1,
+            5
+          ],
+          "stats": [
+            {
+              "collections": 2853,
+              "collected": 19381,
+              "uncollectable": 0
+            },
+            {
+              "collections": 259,
+              "collected": 2826,
+              "uncollectable": 0
+            },
+            {
+              "collections": 15,
+              "collected": 953,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923116,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 2054,
+          "retained_weakrefs": 2054,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": null,
+          "new_cycle_collected": null
+        },
+        "after_collection": {
+          "pid": 40001,
+          "rss_bytes": 1344946176,
+          "enabled": true,
+          "thresholds": [
+            700,
+            10,
+            10
+          ],
+          "counts": [
+            14,
+            0,
+            0
+          ],
+          "stats": [
+            {
+              "collections": 2853,
+              "collected": 19381,
+              "uncollectable": 0
+            },
+            {
+              "collections": 259,
+              "collected": 2826,
+              "uncollectable": 0
+            },
+            {
+              "collections": 16,
+              "collected": 954,
+              "uncollectable": 0
+            }
+          ],
+          "freeze_count": 923116,
+          "policy": {
+            "serving_freeze_requested": true,
+            "temporary_scopes": 0
+          },
+          "active_requests": 0,
+          "created_request_states": 2054,
+          "retained_weakrefs": 2054,
+          "dropped_weakrefs": 0,
+          "live_request_states": 0,
+          "collected": 1,
+          "new_cycle_collected": true
+        }
+      },
+      "natural_live_request_states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "source_audit": {
+    "files": 5046,
+    "sha256": "1debd02e8175570eebc832497cbb7c44494f938dce47b33246e551eef4411538"
+  },
+  "artifacts": {
+    "count": 151,
+    "manifest_sha256": "db97b6974ff4ba5874e3cb6a45fae35be32d1a0e1e427bd92c917b72995af275"
+  },
+  "cleanup": {
+    "inspected": "2026-10-03T12:09:01.878Z",
+    "status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791029341.2364535,
+      "idle_pid": 58397,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.13926315307617188
+    },
+    "live_processes": "  PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n58397     1 Rsl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6\n58492     0 Rs   ps -eo pid,ppid,stat,args\n",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB, 60 %\n",
+    "compute_processes": "23726, 1092 MiB\n"
+  },
+  "preparation_note": "Initial hardlink copy for the smoke tree could not link root-owned bytecode caches and returned nonzero. The smoke ran successfully. Full runs use a separately completed rsync snapshot excluding caches, with every source file audited before submission and after execution.",
+  "limitations": [
+    "Only one off/on pair, one model, single rank, local TCP, fixed random-ID lengths and explicit post-warmup GC freeze.",
+    "Client startup and observation gaps separate batches; no claim of uninterrupted saturated load.",
+    "RSS/USS/PSS are boundary observations, not transient peak tracking or proof of absence of leaks over days.",
+    "The test Catalog and Store segment retain the full dataset outside serving processes; no production consumer retention/GC acceptance.",
+    "No production SLO, distributed sustained workload or trained-draft quality acceptance."
+  ]
+}

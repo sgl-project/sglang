@@ -1603,6 +1603,16 @@ streaming 客户端内记录每请求时延，并在 producer 退出、Store 内
 但已采集/未采集分组本身不证明因果关系，同一 serving batch 可能共享采集开销。
 详见 [D2H 与请求时延实验](experiments/D2H_LATENCY.md)。
 
+持续运行检查使用 `soak_training_capture.py`，在同一服务进程中运行多批
+原生 streaming 请求，批间不重启、不清缓存、不强制 GC。每批排空后检查
+Host/device arena 的固定大小、队列、quarantine、journal 和请求对象生命周期，
+记录各进程 RSS/USS/PSS、线程及文件描述符；producer 退出后再完整读回全部
+READY 样本。进程重启、采集计数不一致或超过预先声明的内存增长预算都必须失败。
+实验显式记录 GC 策略，不能把 warmup 后 freeze 的结果当作默认策略证据。
+有限时长、固定输入分布的批次边界观测不证明长期无泄漏，也不覆盖瞬时峰值；
+保留全部训练样本的 Store/Catalog 与 serving 进程分别核算。复现和证据见
+[持续运行实验](experiments/CAPTURE_SOAK.md)。
+
 SLO 阈值由实际服务基线制定，未测之前不给出“低于某个百分比”的承诺。上线 gate 同时要求完整性、服务 SLO 和缓存消费可持续，不只看训练 loss 下降。
 
 模型比较至少包含 hidden-input DSpark 基线、新 KV 输入版的 CE/TV、各 block 位置准确率、真实接受长度及端到端加速。KV 表示不同于 hidden，能省数据生成计算不代表训练效果自动相等。

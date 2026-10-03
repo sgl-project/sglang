@@ -44,6 +44,10 @@ GC while preserving snapshot validation and the default GC policy.
 graph scopes revoking a serving freeze, exercises explicit post-warmup freezing,
 and checks request lifetime with exact publication/readback validation.
 
+[Repeated Serving Lifetime](CAPTURE_SOAK.md) keeps one producer alive across
+multiple measured batches, checks process memory and pool ownership without
+forced collection between batches, and validates all READY samples after exit.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

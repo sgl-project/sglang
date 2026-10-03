@@ -4759,6 +4759,45 @@ resident idle load is live with an empty queue. Long-duration memory stability,
 actual device-fault recovery, RDMA outage behavior, production retention and
 trained draft quality remain separate requirements.
 
+## Repeated Serving Lifetime
+
+The new `soak_training_capture.py` reuses the existing native streaming client,
+real TCP Store, HTTP test Catalog and post-exit tensor validation. It keeps one
+producer alive across measured batches, changes the random-input seed per batch
+and checks process identity, fixed Host/device allocation, drained publication
+ownership and per-process memory. No forced GC, cache flush or restart occurs
+between batches. Explicit final collection checks complete request-state
+tracking and continued collection of new cycles under serving freeze.
+
+Both full runs finish **2,048 requests across 16 batches** on the resident H100,
+with post-warmup GC freeze explicitly requested. The repeated-load intervals
+are **504.408 seconds off / 603.085 seconds on**, including client startup and
+boundary observation gaps. All **2,048 capture requests** reach READY; independent
+post-producer readback validates **139,264 tensor objects / 16,395,010,048 payload
+bytes**. The smoke adds 16 validated samples. No admission backpressure, writer
+stage error, quarantine or pending journal is observed.
+
+The registered Host arena remains **153,317,376 bytes**, below its 256 MiB
+budget, with no device staging. All batch boundaries show zero active/live
+tokenizer request states. Peak per-process RSS growth after the first batch is
+at most **0.871 MiB off / 0.258 MiB on**, below the predeclared 128 MiB budget.
+Threads remain fixed and file descriptor counts never increase from the settled
+baseline. These finite boundary observations do not prove absence of transient
+peaks or leaks over hours/days; the retained dataset lives outside serving
+processes and does not establish production retention/GC behavior.
+
+Native-client aggregate throughput is **7.236 requests/s off / 5.383 on**,
+approximately **74.4%** of the control at 100% sampling. This is one fixed-length
+single-rank pair, not a production SLO result or an improvement claim. Default
+GC policy is unchanged. Distributed saturation and representative service
+workloads remain open.
+
+All three worker jobs are terminal; 5,046 Python files match the frozen tested
+source and the driver passes full Ruff. The 151-artifact archive and exact
+source/cleanup hashes are recorded in the [runbook](experiments/CAPTURE_SOAK.md)
+and [evidence](experiments/capture-soak.json). No extra GPU was allocated; live
+process inspection confirms the resident idle load has resumed.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4810,8 +4849,10 @@ trained draft quality remain separate requirements.
    half-second tokenizer generation-two GC pauses with capture on and off,
    and exposes them below the p99 fraction. The explicit warmup-freeze comparison
    removes the reproduced GC pauses for this workload, with request lifetime and
-   resource checks; long-duration memory, broader workloads and production policy
-   acceptance remain open. Continue reducing the residual capture overhead and
+   resource checks. A 16-batch same-process soak now checks fixed allocation,
+   request lifetime and post-exit readback over an approximately ten-minute
+   capture workload; longer memory observation, broader workloads and production
+   policy acceptance remain open. Continue reducing the residual capture overhead and
    investigating separate client-loop pauses.
    Existing D2H
    staging comparisons do not justify changing the defaults. Per-model numerical/runtime validation and
