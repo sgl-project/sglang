@@ -18,12 +18,13 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update as _causal_conv1d_update_triton,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 # The compiled causal conv1d is CUDA-only -- the sgl_kernel wheel never built it
 # for ROCm / MUSA either, so the old import probe always fell through to Triton
 # there. Select that fallback directly instead of via a failed import.
 _HAS_CONV1D_KERNEL = is_cuda()
+_IS_NPU = is_npu()
 
 if _HAS_CONV1D_KERNEL:
     from sglang.kernels.ops.mamba import (
@@ -38,6 +39,18 @@ def _get_seq_lens_cpu(query_start_loc, x):
     if query_start_loc is not None:
         return (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
     return [x.shape[-1]]
+
+
+if _IS_NPU:
+    # NPU implementations for the short-conv hybrid models (LFM2 / LFM2-MoE)
+    # live in sgl_kernel_npu as causal_conv1d_fn_v2 (varlen prefill) and
+    # causal_conv1d_update_npu_v2 (decode, dispatching to the
+    # causal_conv1d_update_v2 Triton kernel with a torch fallback); bind them
+    # here with the sglang-side convention (weight: (dim, width)).
+    from sgl_kernel_npu.mamba.causal_conv1d import (
+        causal_conv1d_fn_v2 as _causal_conv1d_fn_npu,
+        causal_conv1d_update_npu_v2 as _causal_conv1d_update_npu,
+    )
 
 
 def causal_conv1d_fn(
@@ -81,6 +94,18 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
+    if _IS_NPU:
+        return _causal_conv1d_fn_npu(
+            x,
+            weight,
+            bias,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            conv_states=conv_states,
+            pad_slot_id=pad_slot_id,
+            activation=activation,
+        )
     # Use Triton when: (1) there is no compiled conv1d kernel for this device,
     # or (2) input is non-contiguous and seq_lens_cpu is pre-computed by caller.
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
@@ -157,6 +182,20 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    if _IS_NPU:
+        if cache_seqlens is not None:
+            raise NotImplementedError(
+                "circular-buffer conv-state updates are not supported on NPU"
+            )
+        return _causal_conv1d_update_npu(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices=conv_state_indices,
+            pad_slot_id=pad_slot_id,
+        )
     use_triton = not _HAS_CONV1D_KERNEL
     if use_triton:
         return _causal_conv1d_update_triton(
