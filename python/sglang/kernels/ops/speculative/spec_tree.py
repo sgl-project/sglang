@@ -11,8 +11,118 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Optional
+
+import torch
 import triton
 import triton.language as tl
+
+_NGRAM_MASK_BLOCK_SIZE = 256
+
+
+@triton.jit
+def _pack_ngram_full_mask_kernel(
+    draft_tree_mask_ptr,
+    seq_lens_ptr,
+    seq_lens_cumsum_ptr,
+    full_mask_ptr,
+    num_draft_tokens: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Pack one NGRAM query row as ``[prefix ones | tree ancestors]``."""
+    row_idx = tl.program_id(0)
+    batch_idx = row_idx // num_draft_tokens
+    draft_idx = row_idx % num_draft_tokens
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int64)
+    seq_lens_cumsum = tl.load(seq_lens_cumsum_ptr + batch_idx).to(tl.int64)
+    seq_len_prefix_sum = seq_lens_cumsum - seq_len
+    row_start = (
+        seq_len_prefix_sum * num_draft_tokens
+        + batch_idx * num_draft_tokens * num_draft_tokens
+        + draft_idx * (seq_len + num_draft_tokens)
+    )
+
+    offsets = tl.arange(0, block_size)
+    prefix_start = 0
+    while prefix_start < seq_len:
+        prefix_offsets = prefix_start + offsets
+        tl.store(
+            full_mask_ptr + row_start + prefix_offsets,
+            1,
+            mask=prefix_offsets < seq_len,
+        )
+        prefix_start += block_size
+
+    tree_offsets = offsets
+    tree_row_start = (
+        batch_idx * num_draft_tokens * num_draft_tokens + draft_idx * num_draft_tokens
+    )
+    tree_values = tl.load(
+        draft_tree_mask_ptr + tree_row_start + tree_offsets,
+        mask=tree_offsets < num_draft_tokens,
+        other=0,
+    )
+    tl.store(
+        full_mask_ptr + row_start + seq_len + tree_offsets,
+        tree_values,
+        mask=tree_offsets < num_draft_tokens,
+    )
+
+
+def pack_ngram_full_mask(
+    *,
+    draft_tree_mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+    max_seq_len: int,
+    output: torch.Tensor,
+    seq_lens_cumsum: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the packed NGRAM full mask using GPU sequence lengths only.
+
+    ``output`` may be a static upper-bound buffer. Consumers derive all offsets
+    from ``seq_lens`` and only read the packed prefix of that buffer.
+    """
+    if not draft_tree_mask.is_cuda or not seq_lens.is_cuda or not output.is_cuda:
+        raise ValueError("pack_ngram_full_mask requires CUDA tensors.")
+    if draft_tree_mask.dtype != torch.bool or output.dtype != torch.bool:
+        raise ValueError("NGRAM tree masks must use torch.bool.")
+    if draft_tree_mask.numel() != seq_lens.numel() * num_draft_tokens**2:
+        raise ValueError(
+            "draft_tree_mask must contain one [draft, draft] mask per request."
+        )
+    if num_draft_tokens <= 0 or num_draft_tokens > 256:
+        raise ValueError("num_draft_tokens must be in [1, 256].")
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive.")
+    required_capacity = (
+        seq_lens.numel() * num_draft_tokens * (max_seq_len + num_draft_tokens)
+    )
+    if output.numel() < required_capacity:
+        raise ValueError(
+            "output is too small for the configured maximum sequence length."
+        )
+
+    if seq_lens_cumsum is None:
+        seq_lens_cumsum = torch.empty_like(seq_lens)
+    elif (
+        not seq_lens_cumsum.is_cuda
+        or seq_lens_cumsum.device != seq_lens.device
+        or seq_lens_cumsum.dtype != seq_lens.dtype
+        or seq_lens_cumsum.numel() != seq_lens.numel()
+    ):
+        raise ValueError("seq_lens_cumsum must match seq_lens.")
+    torch.cumsum(seq_lens, dim=0, out=seq_lens_cumsum)
+    _pack_ngram_full_mask_kernel[(seq_lens.numel() * num_draft_tokens,)](
+        draft_tree_mask,
+        seq_lens,
+        seq_lens_cumsum,
+        output,
+        num_draft_tokens=num_draft_tokens,
+        block_size=_NGRAM_MASK_BLOCK_SIZE,
+    )
+    return output
 
 
 @triton.jit

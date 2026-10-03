@@ -2,14 +2,68 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <list>
 #include <queue>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace sglang {
 
 namespace ngram {
+
+namespace {
+
+template <typename ChildrenForNode>
+std::vector<int32_t> collectRootCandidates(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+    size_t max_candidates,
+    size_t max_bfs_breadth,
+    ChildrenForNode&& children_for_node) {
+  std::vector<int32_t> candidates;
+  if (max_candidates == 0) {
+    return candidates;
+  }
+
+  candidates.reserve(max_candidates);
+  std::unordered_set<int32_t> seen_tokens;
+  std::queue<const TrieNode*> fallback_queue;
+
+  auto visit_children = [&](const TrieNode* node, size_t max_children) {
+    size_t scanned = 0;
+    for (const auto* child : children_for_node(node)) {
+      if (scanned++ >= max_children || candidates.size() >= max_candidates) {
+        break;
+      }
+      if (seen_tokens.insert(child->token).second) {
+        candidates.emplace_back(child->token);
+      }
+      if (candidates.size() >= max_candidates) {
+        return true;
+      }
+      fallback_queue.emplace(child);
+    }
+    return false;
+  };
+
+  for (const auto& [node, _] : anchors) {
+    if (visit_children(node, std::numeric_limits<size_t>::max())) {
+      return candidates;
+    }
+  }
+
+  while (!fallback_queue.empty()) {
+    const auto* node = fallback_queue.front();
+    fallback_queue.pop();
+    if (visit_children(node, max_bfs_breadth)) {
+      break;
+    }
+  }
+  return candidates;
+}
+
+}  // namespace
 
 Trie::Trie(size_t capacity, const Param& param) : param_(param) {
   nodes_.resize(capacity);
@@ -328,6 +382,32 @@ Result Trie::buildFrequency(
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+std::vector<int32_t> Trie::getRootCandidatesRecency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param, MatchState& state, size_t total_len)
+    const {
+  if (max_candidates == 0) {
+    return {};
+  }
+  return collectRootCandidates(
+      match(context, len, state, total_len),
+      max_candidates,
+      param.max_bfs_breadth,
+      [](const TrieNode* node) -> const auto& { return node->lru; });
+}
+
+std::vector<int32_t> Trie::getRootCandidatesFrequency(
+    const int32_t* context, size_t len, size_t max_candidates, const Param& param, MatchState& state, size_t total_len)
+    const {
+  if (max_candidates == 0) {
+    return {};
+  }
+  return collectRootCandidates(
+      match(context, len, state, total_len),
+      max_candidates,
+      param.max_bfs_breadth,
+      [](const TrieNode* node) -> const auto& { return node->sorted_children; });
 }
 
 }  // namespace ngram
