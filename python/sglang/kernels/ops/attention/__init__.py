@@ -133,6 +133,7 @@ __all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
 
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
 from sglang.kernels.ops.attention import cake as _cake  # noqa: E402, F401
+from sglang.kernels.ops.attention import cake_linear as _cake_linear  # noqa: E402, F401
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated
