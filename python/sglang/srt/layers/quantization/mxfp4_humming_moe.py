@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Module, Parameter
 
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -21,9 +21,11 @@ class Mxfp4HummingMoEMethod:
     Used for DeepSeek-V4 FP8 checkpoints when `--moe-runner-backend humming` is
     selected together with `SGLANG_DSV4_FP4_EXPERTS=1` (which sets
     ``Fp8Config.is_fp4_experts``). The FP8 base method handles raw weight
-    creation; after load we cast ``w{13,2}_weight_scale_inv`` to
+    creation; after load we register ``w{13,2}_weight_scale`` in
     ``float8_e8m0fnu`` and call ``prepare_humming_moe_layer`` to lay out the
-    experts in the format the Humming kernel expects.
+    experts in the format the Humming kernel expects. Since MXFP4 scales use
+    E8M0, create them directly in that dtype for Humming. MegaMoE keeps FP32
+    scales because its current DeepGEMM layout transform expects FP32.
     """
 
     def __init__(self, fp8_method, prefix: str):
@@ -44,12 +46,18 @@ class Mxfp4HummingMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        fp4_scale_dtype = (
+            torch.float32
+            if get_moe_a2a_backend().is_megamoe()
+            else torch.float8_e8m0fnu
+        )
         self._fp8.create_weights(
             layer,
             num_experts,
             hidden_size,
             intermediate_size_per_partition,
             params_dtype,
+            fp4_scale_dtype=fp4_scale_dtype,
             **extra_weight_attrs,
         )
 
