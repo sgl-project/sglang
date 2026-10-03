@@ -341,6 +341,8 @@ class Envs:
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Encode a chat prompt one message at a time and reuse the ids across turns.
+    SGLANG_CHAT_PROMPT_SEGMENT_CACHE = EnvBool(True)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
