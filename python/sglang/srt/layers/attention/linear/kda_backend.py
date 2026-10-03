@@ -86,7 +86,6 @@ class KDAKernelDispatcher:
             self.decode_kernel = CuteDSLKDAKernel()
         elif decode_backend.is_flashinfer():
             # FlashInfer recurrent_kda: SM100 decode + MTP (target_verify).
-            # Prefill stays on Triton / CuTe DSL (FlashInfer has no KDA chunk kernel).
             if not is_cuda():
                 raise ValueError("KDA FlashInfer backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
@@ -145,6 +144,14 @@ class KDAKernelDispatcher:
             )
 
             self.extend_kernel = FlashKDAKernel()
+        elif prefill_backend.is_flashinfer():
+            if not is_cuda():
+                raise ValueError("KDA FlashInfer prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+                FlashInferKDAPrefillKernel,
+            )
+
+            self.extend_kernel = FlashInferKDAPrefillKernel(triton_kernel)
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -195,7 +202,7 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
+                "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'cutedsl', "
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
                 "SM100, ptx_kda SM100 or SM103)."
             )
@@ -917,7 +924,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=gate_was_flat,
+            beta_is_raw=(
+                gate_was_flat
+                or getattr(
+                    self.kernel_dispatcher.extend_kernel, "expects_beta_logits", False
+                )
+            ),
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
@@ -933,6 +945,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
+            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=(
+                self.forward_metadata.state_checkpoint_every_n_tokens
+            ),
+            state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
+            track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
+            prefill_metadata=self.forward_metadata,
+            prefill_forward_batch=forward_batch,
+            prefill_chunk_size=self.mamba_chunk_size,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
