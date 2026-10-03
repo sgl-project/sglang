@@ -959,6 +959,7 @@ class Envs:
     # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
     # runs mla_decode_fwd with persistent metadata and return_lse=True.
     SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
+    SGLANG_AITER_GFX942_BLOCKSCALE_USE_TRITON = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
