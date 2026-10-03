@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from typing import Callable, Optional
 
 import torch
@@ -234,7 +235,7 @@ CAKE_ROUTE_SP_ALL_GATHER_MATMUL = "sp_all_gather_matmul"
 _CAKE_LOG_PREFIX = "[cake-route]"
 _CAKE_SP_MAX_LAUNCHERS_PER_WEIGHT = 8
 
-_cake_sp_logged: set[str] = set()
+_cake_sp_logged: set[tuple[str, str]] = set()
 _cake_sp_rejected: set[tuple] = set()
 # id(linear) -> (weight storage key, K-major weight copy)
 _cake_sp_weights: dict[int, tuple[tuple, torch.Tensor]] = {}
@@ -242,10 +243,17 @@ _cake_sp_weights: dict[int, tuple[tuple, torch.Tensor]] = {}
 _cake_sp_launchers: dict[tuple, Callable[[torch.Tensor], torch.Tensor]] = {}
 
 
+def _cake_sp_reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
 def _log_cake_sp_once(event: str, detail: str) -> None:
-    if event in _cake_sp_logged:
+    key = (event, _cake_sp_reason_kind(detail) if event == "fallback" else "")
+    if key in _cake_sp_logged:
         return
-    _cake_sp_logged.add(event)
+    _cake_sp_logged.add(key)
     if event.startswith("taken"):
         logger.info(
             "%s %s: Cake kernel selected (%s)",

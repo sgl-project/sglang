@@ -669,7 +669,10 @@ def test_sp_route_on_prepared_launcher_is_prepared_once_and_reused(sp_env, caplo
     # K-major contiguous weight copy (FI contract), equal to weight.T.
     assert tuple(p_w.shape) == (K, N) and p_w.is_contiguous()
     assert torch.equal(p_w, linear.weight.detach().t())
-    s_inp, s_w = supports_prepare.call_args.args
+    # Admission runs on the real tensors of every call; the launcher is prepared
+    # once and reused.
+    assert supports_prepare.call_count == 2
+    s_inp, s_w = supports_prepare.call_args_list[0].args
     assert s_inp is inp and s_w is p_w
     assert supports_prepare.call_args.kwargs == {"world_size": TP}
     assert len(launchers) == 1 and launchers[0].call_count == 2

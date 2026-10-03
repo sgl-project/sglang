@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
@@ -176,8 +177,14 @@ _cake_route_logged: set = set()
 _cake_route_rejected: set = set()
 
 
+def _cake_reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
 def _log_cake_route_once(route: str, event: str, detail: str) -> None:
-    key = (route, event)
+    key = (route, event, _cake_reason_kind(detail) if event == "fallback" else "")
     if key in _cake_route_logged:
         return
     _cake_route_logged.add(key)

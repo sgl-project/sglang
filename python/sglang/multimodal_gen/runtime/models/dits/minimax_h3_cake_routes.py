@@ -17,7 +17,8 @@ Every stage is admitted per call by the adapter's ``supports_*`` on the exact
 tensors the engine is about to use; a stage that is not admitted (route off,
 other arch, TP > 1 weight shards, quantized weights, AdaLN table with a row
 count other than 9, ...) returns ``None`` and the block runs its stock code,
-unchanged.  The first "taken" and the first "fallback" per stage are logged so
+unchanged.  The first "taken" and the first "fallback" of each distinct reason per
+stage are logged so
 an e2e run can prove which kernel executed.
 
 CUDA graphs (breakable CUDA graph runner): the three GEMM stages run inside the
@@ -56,6 +57,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from typing import Callable, Optional, Sequence, Tuple
 
 import torch
@@ -76,8 +78,17 @@ _QKV_KINDS = 3
 # FlashInfer validates on the host before launching; these are its rejections.
 _CAKE_ERRORS = (RuntimeError, ValueError, NotImplementedError)
 
-# (stage, event) pairs already logged; keeps the per-call path free of I/O.
-_logged: set[tuple[str, str]] = set()
+# (stage, event, reason kind) triples already logged; keeps the per-call path
+# free of I/O while still naming every distinct fallback reason once.
+_logged: set[tuple[str, str, str]] = set()
+
+
+def _reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
 # Per (stage, shape key) admission verdict; False after a FlashInfer rejection.
 _verdicts: dict[tuple, bool] = {}
 # Stages that completed one eager launch (safe to use under graph capture).
@@ -95,7 +106,7 @@ def reset_state_for_tests() -> None:
 
 
 def _log_once(stage: str, event: str, detail: str) -> None:
-    key = (stage, event)
+    key = (stage, event, _reason_kind(detail) if event == "fallback" else "")
     if key in _logged:
         return
     _logged.add(key)
