@@ -574,10 +574,10 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
