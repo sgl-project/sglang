@@ -130,7 +130,7 @@ struct ActivationKernel {
   static constexpr auto kBlockSize = 256u;
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
-  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+  using unary_kernel_fn_t = void (*const)(UnaryActivationParams);
 
   template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
   static constexpr kernel_fn_t activation_kernel =
