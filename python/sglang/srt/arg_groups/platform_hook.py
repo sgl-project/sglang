@@ -45,6 +45,16 @@ def handle_ppu_backends(server_args: Any):
     # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
     if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
         envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
+    # Disable custom allreduce by default on PPU (use pccl allreduce for perf).
+    if not cfg.disable_custom_all_reduce:
+        declare_resolution(
+            server_args,
+            "_handle_ppu_backends",
+            disable_custom_all_reduce=True,
+        )
+        logger.info(
+            "Disable custom allreduce and use pccl allreduce on ppu for better perf."
+        )
     if cfg.chunked_prefill_size is not None:
         set_acext_token_limit(
             acext_num_tokens=int(cfg.chunked_prefill_size * 0.5),

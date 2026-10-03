@@ -116,6 +116,8 @@ class W8A8Int8Config(QuantizationConfig):
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
 
+        self.mix_layer = quant_config.get("mix_layer", None)
+
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]

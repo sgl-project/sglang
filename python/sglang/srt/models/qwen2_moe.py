@@ -1130,6 +1130,16 @@ class Qwen2MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        def _quant_config_new(idx, prefix):
+            _layer_idx = int(prefix.split(".")[-1])
+            _mix_layer = (
+                quant_config.mix_layer
+                if quant_config and hasattr(quant_config, "mix_layer")
+                else None
+            )
+            _mix_layer = _mix_layer or []
+            return None if _layer_idx in _mix_layer else quant_config
+
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
         pp_start_layer, _ = get_pp_indices(
@@ -1143,7 +1153,7 @@ class Qwen2MoeModel(nn.Module):
                 layer_id=idx,
                 start_layer=pp_start_layer,
                 config=config,
-                quant_config=quant_config,
+                quant_config=_quant_config_new(idx, prefix),
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
