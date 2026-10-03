@@ -123,16 +123,12 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_req: int
     ):
-        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
-
-        Called during CudaGraphRunner.__init__(), after init_memory_pool().
-        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
-        """
-        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        self.lora_backend.init_cuda_graph_batch_info(
+        """Initialize decode-runner metadata after model memory-pool setup."""
+        self.max_bs_in_decode_cuda_graph = max_bs_in_cuda_graph
+        self.lora_backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
@@ -218,12 +214,16 @@ class LoRAManager:
         )
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
         Called before init_memory_pool() so memory profiling accounts for them.
-        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        Phase 2 (dense batch metadata) uses init_decode_cuda_graph_batch_info().
         """
         self.lora_backend.init_cuda_graph_moe_buffers(
             max_bs=max_bs,
@@ -451,6 +451,9 @@ class LoRAManager:
         metadata."""
         self.lora_backend.reset_batch_state()
 
+    def reset_routing_cache(self) -> None:
+        self.lora_backend.reset_routing_cache()
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
@@ -465,15 +468,16 @@ class LoRAManager:
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        use_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and bs <= self.max_bs_in_cuda_graph
+        # ForwardMode.is_cuda_graph() identifies decode-runner modes, including verify.
+        use_decode_cuda_graph = (
+            hasattr(self, "max_bs_in_decode_cuda_graph")
+            and bs <= self.max_bs_in_decode_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
         # Eligible extend batches refresh the static prefill batch info in
         # place so captured kernels read current values at replay.
-        use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
-            forward_batch
+        use_prefill_cuda_graph = (
+            not use_decode_cuda_graph and self.can_use_prefill_cuda_graph(forward_batch)
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
@@ -487,18 +491,21 @@ class LoRAManager:
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
-        # Do in-place updates when CUDA graph is enabled and the batch forward mode
-        # could use CUDA graph.
+        # Legacy overrides call the positional decode selector use_cuda_graph.
         self.lora_backend.prepare_lora_batch(
-            forward_batch=forward_batch,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
-            use_cuda_graph=use_cuda_graph,
+            forward_batch,
+            weight_indices,
+            lora_ranks,
+            scalings,
+            use_decode_cuda_graph,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+        self.lora_backend.batch_info.is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_cuda_graph()
         )
 
     def prepare_lora_token_segments(

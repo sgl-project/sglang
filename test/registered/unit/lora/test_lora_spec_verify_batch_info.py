@@ -70,7 +70,9 @@ class TestLoRASpecVerifyBatchInfo(CustomTestCase):
         The matching case also pins that bs is rebound per batch, which is
         what makes a mixed-adapter batch index the right slots."""
         backend = self._backend()
-        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_req=4)
+        backend.init_decode_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=4, num_tokens_per_req=4
+        )
 
         batch_info = self._prepare(
             backend, _verify_batch(bs=2, draft_token_num=4), use_cuda_graph=True
