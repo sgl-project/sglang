@@ -3511,6 +3511,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
                 dcp_size=1,
+                attn_cp_size=1,
                 moe_dense_tp_size=None,
             )
             defaults.update(kw)
@@ -3587,7 +3588,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             },
                         )
                         # Interleave keeps attention DP and the configured dense TP.
-                        for attn_dp_size, dense_tp_size in ((1, None), (2, 8), (2, 1)):
+                        for attn_dp_size, dense_tp_size, cp_size, expected_cp in (
+                            (1, None, 1, 8),
+                            (2, 8, 1, 4),
+                            (2, 1, 1, 4),
+                            # An explicit CP2 leaves two attention-TP ranks
+                            # within each DP group; it must not become CP4.
+                            (2, 8, 2, 2),
+                        ):
                             result = _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
@@ -3595,6 +3603,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                     tp_size=8,
                                     dp_size=1,
                                     attn_dp_size=attn_dp_size,
+                                    attn_cp_size=cp_size,
                                     moe_dense_tp_size=dense_tp_size,
                                     ep_size=1,
                                     moe_a2a_backend="none",
@@ -3603,7 +3612,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 None,
                             )
                             self.assertEqual(result["attn_dp_size"], attn_dp_size)
-                            self.assertEqual(result["attn_cp_size"], 8 // attn_dp_size)
+                            self.assertEqual(result["attn_cp_size"], expected_cp)
                             self.assertNotIn("moe_dense_tp_size", result)
                             self.assertNotIn("ep_size", result)
                             self.assertNotIn("moe_a2a_backend", result)

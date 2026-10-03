@@ -105,9 +105,14 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 assert cfg.tp_size <= 8, (
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
-                # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSA attention runs all heads on each context shard.
-                attn_cp_size = cfg.tp_size // attn_dp_size
+                # Interleave can shard attention heads within each CP rank.
+                # Keep an explicit CP width; default to attention TP1 as before.
+                # Zigzag still requires attention TP1.
+                attn_cp_size = (
+                    cfg.attn_cp_size
+                    if cfg.cp_strategy == "interleave" and cfg.attn_cp_size > 1
+                    else cfg.tp_size // attn_dp_size
+                )
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "

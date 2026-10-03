@@ -76,16 +76,24 @@ class TestAttentionCpBoundary(CustomTestCase):
         ]
 
     @contextmanager
-    def as_rank(self, cp, collectives, moe_group=None):
-        """Rank ``cp`` of attention CP 2 (attention DP and TP 1, TP 2), with
-        the attention-CP collectives the case gives."""
+    def as_rank(self, cp, collectives):
+        """The first attention-TP lane of CP rank ``cp``, with fake CP collectives.
+
+        Other attention-TP lanes hold identical rows after attention's sum.
+        """
+        attn_tp_size = getattr(self, "attn_tp_size", 1)
+        tp_size = CP_SIZE * attn_tp_size
+        tp_rank = cp * attn_tp_size
+        moe_tp_size = getattr(self, "moe_tp_size", tp_size)
+        moe_start = tp_rank // moe_tp_size * moe_tp_size
+        moe_group = group("moe", range(moe_start, moe_start + moe_tp_size))
         parallel = SimpleNamespace(
-            tp_size=CP_SIZE,
-            tp_rank=cp,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
             attn_dp_size=1,
             attn_dp_rank=0,
             attn_dp_enabled=False,
-            attn_tp_size=1,
+            attn_tp_size=attn_tp_size,
             attn_tp_rank=0,
             attn_cp_size=CP_SIZE,
             attn_cp_rank=cp,
@@ -93,12 +101,12 @@ class TestAttentionCpBoundary(CustomTestCase):
             moe_dense_tp_size=1 if getattr(self, "sparse", True) else None,
             moe_dp_size=1,
             moe_ep_size=1,
-            moe_tp_size=CP_SIZE,
+            moe_tp_size=moe_tp_size,
             dwdp_size=1,
             enable_attn_tp_input_scattered=False,
-            tp_group=group("tp", range(CP_SIZE)),
-            attn_tp_group=group("attn_tp", [cp]),
-            attn_cp_group=group("attn_cp", range(CP_SIZE)),
+            tp_group=group("tp", range(tp_size)),
+            attn_tp_group=group("attn_tp", range(tp_rank, tp_rank + attn_tp_size)),
+            attn_cp_group=group("attn_cp", range(0, tp_size, attn_tp_size)),
         )
         flags = Flags()
         with ExitStack() as stack:
@@ -123,7 +131,7 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ),
                 (
                     (comm, "post_experts_reduction_group"),
-                    lambda: moe_group or parallel.tp_group,
+                    lambda: moe_group,
                 ),
                 (
                     (comm, "get_exec"),
@@ -332,14 +340,46 @@ class TestAttentionCpBoundary(CustomTestCase):
 
     def test_a_sum_over_other_ranks_is_not_left_to_it(self):
         # A MoE group narrower than attention CP, as when MoE DP splits CP.
-        def unused(*args):
-            raise AssertionError("not run")
+        self.moe_tp_size = 1
+        published, back, reduced = self.run_ranks(use_reduce_scatter=True)
+        self.assertEqual(published, {0: False, 1: False}, "the MoE sums itself")
+        self.assertEqual(reduced, {}, "CP must not sum over the wrong ranks")
+        for cp in range(CP_SIZE):
+            torch.testing.assert_close(
+                back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
+            )
 
-        with self.as_rank(
-            0, dict(gather=unused, reduce_scatter=unused), moe_group=group("moe", [0])
-        ):
-            with self.assertRaises(NotImplementedError):
-                self.build(use_reduce_scatter=True)
+    def test_attention_tp_completes_ffn_sum_before_cp_take_back(self):
+        # DP1 x CP2 x attention TP2: the FFN sums over TP4, not CP2.
+        self.attn_tp_size = 2
+        complete_output = torch.cat(self.values)
+
+        def unused(*args):
+            raise AssertionError("a complete FFN output needs no CP collective")
+
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                self.sparse = sparse
+                for cp in range(CP_SIZE):
+                    with self.as_rank(
+                        cp, dict(gather=unused, reduce_scatter=unused)
+                    ) as rank:
+                        stages = self.build(use_reduce_scatter=True)
+                        stream = ResidualStream(self.residuals[cp])
+                        with stages.ffn.plan.output.ffn_exit(
+                            self.cp_extend(), stream=stream
+                        ) as exit_:
+                            self.assertFalse(rank.flags.mlp_reduce_scatter)
+                            self.assertFalse(rank.flags.fuse_mlp_allreduce)
+                            # Compute must return its completed TP4 sum.
+                            output = complete_output.clone()
+                        back, stream = finish_exit(exit_, output, stream)
+                        torch.testing.assert_close(
+                            back, self.values[cp], rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            stream.residual, self.residuals[cp], rtol=0, atol=0
+                        )
 
 
 if __name__ == "__main__":
