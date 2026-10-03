@@ -68,9 +68,9 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow --override scripts/ci/torch-override.txt
           uv pip install pytest
-          uv pip install -e "tools/sglang-simulator[aic]"
+          uv pip install -e "tools/sglang-simulator[aic]" --override scripts/ci/torch-override.txt
 
       - name: Prebuild HiCache native hash extension
         timeout-minutes: 5
