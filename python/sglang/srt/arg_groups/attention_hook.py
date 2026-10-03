@@ -95,6 +95,14 @@ def handle_attention_backend_compatibility(server_args: Any):
             "Speculative decoding is currently not supported with Flex Attention backend"
         )
 
+    if (
+        attention_backend == "torch_native"
+        and resolved_view(server_args).speculative_algorithm is not None
+    ):
+        raise ValueError(
+            "Speculative decoding is currently not supported with torch_native attention backend"
+        )
+
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
     if (

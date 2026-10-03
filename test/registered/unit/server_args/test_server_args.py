@@ -95,6 +95,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    default_cuda_graph_config,
 )
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
@@ -1416,6 +1417,50 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
+
+
+class TestNgramTorchNativeIncompatible(CustomTestCase):
+    """NGRAM speculative decoding does not work with the torch_native attention
+    backend and should fail early during argument validation instead of crashing
+    in the warmup path."""
+
+    def _make_args(
+        self, attention_backend="torch_native", speculative_algorithm="NGRAM"
+    ):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.speculative_algorithm = speculative_algorithm
+        args.cuda_graph_config = default_cuda_graph_config()
+        # Short-circuit model_config_of(): the compatibility handler only needs
+        # a few hf_config flags, not a real checkpoint.
+        args._model_config = MagicMock()
+        args._model_config.hf_config.dual_chunk_attention_config = None
+        args._model_config.is_encoder_decoder = False
+        return args
+
+    @override_platform(is_sm100=False)
+    def test_ngram_with_torch_native_raises(self):
+        args = self._make_args()
+        with self.assertRaisesRegex(
+            ValueError,
+            "Speculative decoding is currently not supported with torch_native attention backend",
+        ):
+            handle_attention_backend_compatibility(args)
+
+    @override_platform(is_sm100=False)
+    def test_eagle_with_torch_native_raises(self):
+        args = self._make_args(speculative_algorithm="EAGLE")
+        with self.assertRaisesRegex(
+            ValueError,
+            "Speculative decoding is currently not supported with torch_native attention backend",
+        ):
+            handle_attention_backend_compatibility(args)
+
+    @override_platform(is_sm100=False)
+    def test_no_speculative_with_torch_native_allowed(self):
+        args = self._make_args(speculative_algorithm=None)
+        # Should not raise; the assertion is simply reaching this point.
+        handle_attention_backend_compatibility(args)
 
 
 class TestContextParallelServerArgs(CustomTestCase):
