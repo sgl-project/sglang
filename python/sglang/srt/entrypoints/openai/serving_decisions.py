@@ -8,7 +8,7 @@ import string
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 import msgspec
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
 
@@ -135,6 +135,12 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
             try:
                 return await handle_clef_request(self, request, raw_request)
+            except HTTPException as error:
+                return self.create_error_response(
+                    message=error.detail,
+                    err_type=str(error.status_code),
+                    status_code=error.status_code,
+                )
             except ValueError as error:
                 return self.create_error_response(str(error))
         return await super().handle_request(request, raw_request)

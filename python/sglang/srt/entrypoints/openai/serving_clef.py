@@ -42,7 +42,7 @@ def decision_record(request: Any) -> dict:
 async def handle_clef_request(
     serving: Any, request: Any, raw_request: Any
 ) -> ORJSONResponse:
-    """Answer all fields from one complete joint prefill."""
+    """Answer all fields from one joint prompt."""
     manager = serving.tokenizer_manager
     # Custom server/template configurations are unsupported by the fixed encoder.
     error = serving._validate_server(request.model)
@@ -90,6 +90,13 @@ async def handle_clef_request(
     if result is None:
         raise RuntimeError("Clef worker returned no result")
     metadata = result["meta_info"]
+    finish_reason = metadata.get("finish_reason") or {}
+    if finish_reason.get("type") == "abort":
+        return serving.create_error_response(
+            message=finish_reason.get("message") or "Clef decision request aborted.",
+            err_type="RequestAborted",
+            status_code=finish_reason.get("status_code") or 503,
+        )
     values = metadata.get("clef_probabilities")
     execution = metadata.get("clef_execution")
     if not values or len(values) != 1 or not execution:

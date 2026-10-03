@@ -222,6 +222,21 @@ def _actual_memory_used(mr, config):
 class TestDefaultConfigurator(CustomTestCase):
     """Default (MHA): available_bytes -> tokens, memory invariant holds."""
 
+    def test_clef_hidden_states_reduce_admitted_capacity(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        runner = _make_model_runner(
+            self, num_kv_heads=1, head_dim=4, v_head_dim=4, num_layers=1
+        )
+        with mock_cpu_env():
+            ordinary = DefaultPoolConfigurator(runner).calculate_pool_sizes(1584, 1)
+            runner.model_config.clef_config = {"hidden_size": 4}
+            clef = DefaultPoolConfigurator(runner).calculate_pool_sizes(1584, 1)
+        self.assertEqual(ordinary.max_total_num_tokens, 99)
+        # Sixteen KV bytes plus eight hidden-state bytes/token, with one padded hidden row.
+        self.assertEqual(clef.max_total_num_tokens, 65)
+        self.assertLessEqual(clef.max_total_num_tokens * 24 + 8, 1584)
+
     def _run(self, available_bytes, page_size=1, **kwargs):
         mr = _make_model_runner(self, page_size=page_size, **kwargs)
         with mock_cpu_env():

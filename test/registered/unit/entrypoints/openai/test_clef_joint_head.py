@@ -1,4 +1,4 @@
-"""CPU checks for the restricted Clef integration; no model weights or GPU needed."""
+"""CPU checks for Clef serving; no model weights or GPU needed."""
 
 import asyncio
 import json
@@ -84,6 +84,159 @@ class TestClefJointHead(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "span"):
             validate_record(malformed, list(encoded.input_ids))
 
+    def test_hidden_cache_survives_chunk_moves_backup_and_slot_reuse(self):
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        with envs.SGLANG_NATIVE_MOVE_KV_CACHE.override(True):
+            pool = HybridLinearKVPool(
+                size=16,
+                dtype=torch.bfloat16,
+                page_size=1,
+                head_num=1,
+                head_dim=4,
+                full_attention_layer_ids=[0],
+                device="cpu",
+                mamba_pool=None,
+                clef_hidden_size=4,
+            )
+
+        allocator = TokenToKVPoolAllocator(
+            16, torch.bfloat16, "cpu", pool, need_sort=False
+        )
+        self.assertIsNotNone(allocator.alloc(16))
+
+        def write(slots, values):
+            pool.store_clef_hidden(
+                torch.tensor(slots), torch.tensor(values, dtype=torch.bfloat16)
+            )
+
+        write([1, 5, 3], [[10] * 4, [20] * 4, [11] * 4])
+        write([7, 2], [[21] * 4, [12] * 4])
+        torch.testing.assert_close(
+            pool.gather_clef_hidden(torch.tensor([1, 3, 2])),
+            torch.tensor([[10] * 4, [11] * 4, [12] * 4], dtype=torch.bfloat16),
+        )
+        pool.move_kv_cache(torch.tensor([8, 9]), torch.tensor([5, 7]))
+        torch.testing.assert_close(
+            pool.gather_clef_hidden(torch.tensor([1, 8, 9])),
+            torch.tensor([[10] * 4, [20] * 4, [21] * 4], dtype=torch.bfloat16),
+        )
+        # CPU tensors need no device synchronization; the real copy paths still run.
+        with patch("sglang.srt.mem_cache.memory_pool.current_platform.synchronize"):
+            backup = pool.get_cpu_copy(torch.tensor([8, 9]))
+            allocator.free(torch.tensor([8, 9]))
+            reused = allocator.alloc(2)
+            self.assertIsNotNone(reused)
+            write(reused.tolist(), [[30] * 4, [31] * 4])
+            pool.load_cpu_copy(backup, torch.tensor([12, 13]))
+        torch.testing.assert_close(
+            pool.gather_clef_hidden(torch.tensor([12, 13])),
+            torch.tensor([[20] * 4, [21] * 4], dtype=torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            pool.gather_clef_hidden(torch.tensor([1, 8, 9])),
+            torch.tensor([[10] * 4, [30] * 4, [31] * 4], dtype=torch.bfloat16),
+        )
+        self.assertEqual(
+            pool.clef_hidden_states.numel() * pool.clef_hidden_states.element_size(),
+            17 * 4 * 2,
+        )
+
+    def test_ragged_results_follow_request_attempts_after_host_copy(self):
+        from sglang.srt.layers.clef import ClefDeviceOutput, ClefResult
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        records = [
+            encode_record(
+                Tokenizer(),
+                {
+                    "state": {},
+                    "questions": questions,
+                },
+                max_length=10000,
+            )
+            for questions in (
+                {
+                    "a": {
+                        "type": "choice",
+                        "instructions": "Pick",
+                        "criteria": {"x": "X", "y": "Y", "z": "Z"},
+                    }
+                },
+                {
+                    "b": {"type": "noul", "instructions": "Accept"},
+                    "c": {
+                        "type": "score",
+                        "instructions": "Rate",
+                        "criteria": ["low", "high"],
+                    },
+                },
+            )
+        ]
+        reqs = [
+            Req(str(i), "", list(record.input_ids), SamplingParams(max_new_tokens=0))
+            for i, record in enumerate(records)
+        ]
+        for req in reqs:
+            req.finished_reason = FINISH_LENGTH(0)
+        output = ClefDeviceOutput(
+            torch.tensor([0.1, 0.2, 0.7, 0.8, 0.2, 0.3, 0.7]),
+            tuple(
+                ClefResult(i, req.cache_request_handle, record, i + 1)
+                for i, (req, record) in enumerate(zip(reqs, records))
+            ),
+        )
+        host = output.copy_to_host(torch.clone)
+        output.probabilities.zero_()
+        batch = SimpleNamespace(reqs=reqs)
+        host.consume(batch, [None, None])
+        self.assertEqual(set(reqs[0].customized_info["clef_probabilities"][0]), {"a"})
+        self.assertAlmostEqual(
+            reqs[0].customized_info["clef_probabilities"][0]["a"]["z"], 0.7, places=6
+        )
+        self.assertEqual(
+            set(reqs[1].customized_info["clef_probabilities"][0]), {"b", "c"}
+        )
+        self.assertAlmostEqual(
+            reqs[1].customized_info["clef_probabilities"][0]["b"]["true"], 0.8, places=6
+        )
+        for reason in ("retry", "aborted", "unfinished"):
+            with self.subTest(reason=reason):
+                req = reqs[0]
+                req.customized_info = None
+                req.cache_request_handle = output.results[0].request_handle
+                req.finished_reason = FINISH_LENGTH(0)
+                if reason == "retry":
+                    req.cache_request_handle = CacheRequestHandle(req.rid, 1)
+                elif reason == "aborted":
+                    req.finished_reason = FINISH_ABORT()
+                else:
+                    req.finished_reason = None
+                reqs[1].customized_info = None
+                host.consume(batch, [None, None])
+                self.assertIsNone(req.customized_info)
+                live = reqs[1].customized_info["clef_probabilities"][0]
+                self.assertAlmostEqual(live["b"]["true"], 0.8, places=6)
+                self.assertAlmostEqual(live["c"]["0"], 0.3, places=6)
+
+    def test_default_offload_parameters_do_not_enable_offloading(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy", dtype="bfloat16", disable_prefill_cuda_graph=True
+        )
+        validate_clef_settings(resolving_view(args), torch.bfloat16, None)
+        for field in ("cpu_offload_gb", "offload_group_size"):
+            with self.subTest(field=field):
+                setattr(args, field, 1)
+                with self.assertRaisesRegex(ValueError, "offload"):
+                    validate_clef_settings(resolving_view(args), torch.bfloat16, None)
+                setattr(args, field, 0)
+
     def test_restricted_settings_fail_closed(self):
         args = SimpleNamespace(
             tp_size=1,
@@ -110,8 +263,11 @@ class TestClefJointHead(CustomTestCase):
             validate_clef_settings(args, torch.bfloat16, None)
         args.lora_paths = None
         args.disable_radix_cache = False
-        with self.assertRaisesRegex(ValueError, "disable_radix_cache=True"):
-            validate_clef_settings(args, torch.bfloat16, None)
+        args.max_running_requests = 8
+        args.disable_cuda_graph = False
+        args.disable_overlap_schedule = False
+        args.chunked_prefill_size = 512
+        validate_clef_settings(args, torch.bfloat16, None)
 
     def test_api_uses_one_prefill_and_preserves_probabilities(self):
         calls = []
@@ -244,6 +400,62 @@ class TestClefJointHead(CustomTestCase):
                         expected,
                     )
 
+    def test_aborted_requests_preserve_worker_errors_on_both_routes(self):
+        from fastapi import HTTPException
+
+        for serving_class in (OpenAIServingDecisions, SystemOneServing):
+            for status in (None, 400, 503, 500, "missing_head"):
+                with self.subTest(route=serving_class.route, status=status):
+
+                    async def generate(internal, raw):
+                        if status == "missing_head":
+                            yield {"meta_info": {"finish_reason": {"type": "length"}}}
+                            return
+                        if status == 400:
+                            raise ValueError("worker refused request")
+                        if status is not None:
+                            raise HTTPException(
+                                status_code=status, detail="worker interrupted request"
+                            )
+                        yield {
+                            "meta_info": {
+                                "finish_reason": {"type": "abort", "message": "Aborted"}
+                            }
+                        }
+
+                    serving = object.__new__(serving_class)
+                    serving.tokenizer_manager = SimpleNamespace(
+                        tokenizer=Tokenizer(),
+                        context_len=10000,
+                        num_reserved_tokens=0,
+                        generate_request=generate,
+                        served_model_name="clef",
+                        model_config=SimpleNamespace(clef_config={}),
+                    )
+                    serving._validate_server = lambda model: None
+                    wire = (
+                        request()
+                        if serving_class is OpenAIServingDecisions
+                        else SystemOneRequest.model_validate(
+                            {"model": "clef", **decision_record(request())}
+                        )
+                    )
+                    if status == "missing_head":
+                        with self.assertRaisesRegex(RuntimeError, "did not execute"):
+                            asyncio.run(serving.handle_request(wire, None))
+                        continue
+                    response = asyncio.run(serving.handle_request(wire, None))
+                    body = json.loads(response.body)
+                    self.assertEqual(response.status_code, status or 503)
+                    self.assertEqual(body["code"], status or 503)
+                    self.assertEqual(body["object"], "error")
+                    self.assertNotIn("answers", body)
+                    if status is None:
+                        self.assertEqual(body["type"], "RequestAborted")
+                        self.assertEqual(body["message"], "Aborted")
+                    else:
+                        self.assertIn("worker", body["message"])
+
     def test_metadata_validator_rejects_unsupported_request_features(self):
         from sglang.srt.layers.clef import validate_clef_request
 
@@ -277,6 +489,9 @@ class TestClefJointHead(CustomTestCase):
 
         probabilities = normalized_probabilities(
             torch.tensor([0.1, 0.2, 0.3], dtype=torch.bfloat16)
+            .float()
+            .softmax(-1)
+            .tolist()
         )
         assert abs(sum(probabilities) - 1) < 1e-12
         assert (
@@ -416,8 +631,15 @@ class TestClefJointHead(CustomTestCase):
     def test_torch_compile_is_refused(self):
         self._check_unsupported_execution_mode("enable_torch_compile", True)
 
-    def test_dynamic_chunking_is_refused(self):
-        self._check_unsupported_execution_mode("enable_dynamic_chunking", True)
+    def test_unmirrored_cache_modes_are_refused(self):
+        for feature in (
+            "enable_unified_memory",
+            "enable_hierarchical_cache",
+            "enable_lmcache",
+            "enable_flexkv",
+        ):
+            with self.subTest(feature=feature):
+                self._check_unsupported_execution_mode(feature, True)
 
     def test_disaggregation_is_refused(self):
         self._check_unsupported_execution_mode("disaggregation_mode", "prefill")

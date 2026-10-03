@@ -1,13 +1,15 @@
-"""Restricted, prefill-only integration of the trained Clef joint decision head."""
+"""Cached prompt states and asynchronous results for Clef joint decisions."""
 
 from __future__ import annotations
 
 import json
 import logging
 import math
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from typing import Any
 
+import msgspec
 import torch
 from pydantic import BaseModel, ConfigDict, PositiveInt, TypeAdapter
 from safetensors.torch import load_file
@@ -53,15 +55,11 @@ def load_clef_config(model_path: str, revision: str | None) -> dict | None:
 
 
 def validate_clef_settings(args: Any, dtype: torch.dtype, quant_config: Any) -> None:
-    """Enforce single-GPU eager execution with complete joint prefills."""
+    """Enforce the supported single-GPU storage and execution modes."""
     required = {
         "tp_size": 1,
         "pp_size": 1,
         "dp_size": 1,
-        "max_running_requests": 1,
-        "disable_radix_cache": True,
-        "disable_cuda_graph": True,
-        "disable_overlap_schedule": True,
         "allow_auto_truncate": False,
     }
     errors = [
@@ -73,11 +71,36 @@ def validate_clef_settings(args: Any, dtype: torch.dtype, quant_config: Any) -> 
         errors.append("Python HTTP server (SGLANG_RUST_SERVER=0)")
     if getattr(args, "enable_lora", None) or getattr(args, "lora_paths", None):
         errors.append("LoRA disabled with no lora_paths")
-    if getattr(args, "chunked_prefill_size", None) not in (-1, None):
-        errors.append("chunked_prefill_size=-1")
-    for feature in ("enable_torch_compile", "enable_dynamic_chunking"):
+    graph_config = getattr(args, "cuda_graph_config", None)
+    prefill_backend = (
+        graph_config.prefill.backend
+        if graph_config is not None
+        else getattr(args, "cuda_graph_backend_prefill", None)
+    )
+    if prefill_backend not in (None, "disabled"):
+        errors.append("cuda_graph_backend_prefill='disabled'")
+    for feature in (
+        "enable_torch_compile",
+        "enable_unified_memory",
+        "enable_hierarchical_cache",
+        "enable_unified_cache_external_linker",
+        "enable_hisparse",
+        "enable_lmcache",
+        "enable_flexkv",
+        "enable_memory_saver",
+        "enable_two_batch_overlap",
+        "enable_single_batch_overlap",
+        "prefill_only_disable_kv_cache",
+    ):
         if getattr(args, feature, False):
             errors.append(f"{feature}=False")
+    if (
+        getattr(args, "cpu_offload_gb", 0) > 0
+        or getattr(args, "offload_group_size", -1) > 0
+    ):
+        errors.append("CPU weight offload disabled")
+    if getattr(args, "radix_cache_backend", None) in ("flexkv", "lmcache"):
+        errors.append("standard radix cache backend")
     if getattr(args, "disaggregation_mode", "null") != "null":
         errors.append("disaggregation_mode='null'")
     if getattr(args, "speculative_algorithm", None) is not None:
@@ -207,57 +230,122 @@ def validate_clef_request(request: Any, model_config: Any) -> None:
     validate_record(params["custom_params"]["clef_record"], request.input_ids)
 
 
-def normalized_probabilities(logits: torch.Tensor) -> list[float]:
-    """Retain native FP32 softmax, then normalize its serialized double values."""
-    values = logits.float().softmax(-1).tolist()
+def normalized_probabilities(values: list[float]) -> list[float]:
+    """Normalize the native FP32 softmax values after their asynchronous copy."""
     total = math.fsum(values)
     if not math.isfinite(total) or total <= 0:
         raise ValueError("Clef head produced non-finite probabilities")
     return [value / total for value in values]
 
 
-def forward_clef(
-    model: Any, input_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch: Any
-) -> Any:
-    """Execute the full trained head over final SGLang backbone states on GPU."""
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+class ClefResult(msgspec.Struct, frozen=True):
+    batch_index: int
+    request_handle: Any
+    record: EncodedRecord
+    forward_count: int
 
-    records = getattr(forward_batch.sampling_info, "clef_records", None)
-    if not records or not any(record is not None for record in records):
-        return None  # Ordinary warmup/generation remains a backbone request.
-    if (
-        len(records) != 1
-        or records[0] is None
-        or not forward_batch.is_prefill_only
-        or not forward_batch.forward_mode.is_extend()
-    ):
-        raise ValueError("Clef requires one complete prefill-only request")
-    record = validate_record(records[0], input_ids.tolist())
-    if hidden_states.shape[0] != len(record.input_ids):
-        raise ValueError("Clef did not receive every final prompt hidden state")
-    logits = model.clef_head(
-        hidden_states.unsqueeze(0),
-        input_ids.unsqueeze(0),
-        torch.ones_like(input_ids).unsqueeze(0),
-        [record],
-        model.lm_head.weight,
-    )[0]
-    probabilities = {
-        question.question_id: dict(
-            zip(question.option_ids, normalized_probabilities(values))
-        )
-        for question, values in zip(record.questions, logits)
-    }
-    model.clef_forward_count += 1
-    return LogitsProcessorOutput(
-        next_token_logits=None,
-        customized_info={
-            "clef_probabilities": [probabilities],
-            "clef_execution": [
+
+class ClefDeviceOutput(msgspec.Struct, frozen=True):
+    probabilities: torch.Tensor
+    results: tuple[ClefResult, ...]
+
+    def copy_to_host(
+        self, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
+    ) -> ClefHostOutput:
+        return ClefHostOutput(copy_tensor(self.probabilities), self.results)
+
+
+class ClefHostOutput(msgspec.Struct, frozen=True):
+    probabilities: torch.Tensor
+    results: tuple[ClefResult, ...]
+
+    def consume(self, batch: Any, commits: Sequence[Any]) -> None:
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        values = self.probabilities.tolist()
+        offset = 0
+        for result in self.results:
+            probabilities = {}
+            for question in result.record.questions:
+                count = len(question.option_ids)
+                question_values = values[offset : offset + count]
+                offset += count
+                probabilities[question.question_id] = dict(
+                    zip(question.option_ids, normalized_probabilities(question_values))
+                )
+            req = batch.reqs[result.batch_index]
+            if (
+                req.cache_request_handle != result.request_handle
+                or req.is_retracted
+                or isinstance(req.finished_reason, FINISH_ABORT)
+                or isinstance(req.to_finish, FINISH_ABORT)
+                or not req.finished()
+            ):
+                continue
+            if req.customized_info is None:
+                req.customized_info = {}
+            req.customized_info["clef_probabilities"] = [probabilities]
+            req.customized_info["clef_execution"] = [
                 {
                     "path": "sglang_backbone_joint_head",
-                    "forward_count": model.clef_forward_count,
+                    "forward_count": result.forward_count,
                 }
-            ],
-        },
+            ]
+
+
+def forward_clef(
+    model: Any, input_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch: Any
+) -> ClefDeviceOutput | None:
+    """Retain every backbone row and run the native head on complete records."""
+    from sglang.srt.model_executor.forward_context import (
+        get_req_to_token_pool,
+        get_token_to_kv_pool,
     )
+
+    pool = get_token_to_kv_pool()
+    # Ordinary generation can seed a prefix later reused by a decision request.
+    pool.store_clef_hidden(forward_batch.out_cache_loc, hidden_states)
+    if not forward_batch.forward_mode.is_extend():
+        return None
+    records = getattr(forward_batch.sampling_info, "clef_records", None)
+    if not records:
+        return None
+    results = []
+    probabilities = []
+    for index, item in enumerate(records):
+        if item is None:
+            continue
+        serialized, handle = item
+        record = _RECORD_ADAPTER.validate_json(serialized)
+        sequence_length = len(record.input_ids)
+        prefix_length = forward_batch.extend_prefix_lens_cpu[index]
+        if prefix_length + forward_batch.extend_seq_lens_cpu[index] != sequence_length:
+            continue
+        locations = get_req_to_token_pool().req_to_token[
+            forward_batch.req_pool_indices_cpu[index], :sequence_length
+        ]
+        sequence_hidden = pool.gather_clef_hidden(locations)
+        token_ids = torch.tensor(
+            record.input_ids, dtype=input_ids.dtype, device=input_ids.device
+        )
+        logits = model.clef_head(
+            sequence_hidden.unsqueeze(0),
+            token_ids.unsqueeze(0),
+            torch.ones_like(token_ids).unsqueeze(0),
+            [record],
+            model.lm_head.weight,
+            sequence_lengths=[sequence_length],
+        )[0]
+        probabilities.extend(values.float().softmax(-1) for values in logits)
+        model.clef_forward_count += 1
+        results.append(
+            ClefResult(
+                index,
+                handle,
+                record,
+                model.clef_forward_count,
+            )
+        )
+    if not results:
+        return None
+    return ClefDeviceOutput(torch.cat(probabilities), tuple(results))

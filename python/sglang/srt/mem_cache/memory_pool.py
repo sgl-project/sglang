@@ -3984,7 +3984,19 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        clef_hidden_size: int = 0,
     ):
+        if clef_hidden_size and post_capture_active:
+            raise ValueError("Clef hidden cache does not support post-capture resizing")
+        self.clef_hidden_states = (
+            torch.empty(
+                (size + page_size, clef_hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            if clef_hidden_size
+            else None
+        )
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -4100,6 +4112,22 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+        if self.clef_hidden_states is not None:
+            self.mem_usage += (
+                self.clef_hidden_states.numel()
+                * self.clef_hidden_states.element_size()
+                / GB
+            )
+
+    def store_clef_hidden(
+        self, locations: torch.Tensor, hidden_states: torch.Tensor
+    ) -> None:
+        """Keep final backbone states under the same slot ownership as KV."""
+        self.clef_hidden_states[locations] = hidden_states
+
+    def gather_clef_hidden(self, locations: torch.Tensor) -> torch.Tensor:
+        return self.clef_hidden_states[locations]
 
     def host_pool_decls(self):
         # Only the full-attention sub-pool owns HiCache-addressable buffers here.
@@ -4318,6 +4346,8 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+        if self.clef_hidden_states is not None:
+            self.clef_hidden_states[tgt_loc] = self.clef_hidden_states[src_loc]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices, req_pool_index=req_pool_index)
@@ -4327,12 +4357,18 @@ class HybridLinearKVPool(KVCache):
             if mamba_indices is not None
             else None
         )
+        if self.clef_hidden_states is not None:
+            return kv_cpu, mamba_cpu, self.clef_hidden_states[indices].cpu()
         return kv_cpu, mamba_cpu
 
     def load_cpu_copy(
         self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        kv_cpu, mamba_cpu = cache_cpu
+        if self.clef_hidden_states is not None:
+            kv_cpu, mamba_cpu, hidden_cpu = cache_cpu
+            self.clef_hidden_states[indices] = hidden_cpu.to(self.device)
+        else:
+            kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices, req_pool_index=req_pool_index)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(

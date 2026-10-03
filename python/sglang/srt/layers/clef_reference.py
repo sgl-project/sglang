@@ -316,11 +316,16 @@ class JointSchemaHead(torch.nn.Module):
         attention_mask: torch.Tensor,
         records: list[EncodedRecord],
         output_embedding_weight: torch.Tensor,
+        sequence_lengths: list[int] | None = None,
     ) -> list[list[torch.Tensor]]:
         results: list[list[torch.Tensor]] = []
         normalized_hidden = self.hidden_norm(hidden_states)
         for batch_index, record in enumerate(records):
-            sequence_length = int(attention_mask[batch_index].sum().item())
+            sequence_length = (
+                sequence_lengths[batch_index]
+                if sequence_lengths is not None
+                else int(attention_mask[batch_index].sum().item())
+            )
             sequence_hidden = normalized_hidden[batch_index, :sequence_length]
             memory = self.memory_projection(sequence_hidden).unsqueeze(0)
             global_vector = sequence_hidden[-1]

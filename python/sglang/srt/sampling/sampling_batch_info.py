@@ -270,7 +270,15 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             clef_records=[
-                (r.sampling_params.custom_params or {}).get("clef_record") for r in reqs
+                (
+                    (
+                        r.sampling_params.custom_params["clef_record"],
+                        r.cache_request_handle,
+                    )
+                    if "clef_record" in (r.sampling_params.custom_params or {})
+                    else None
+                )
+                for r in reqs
             ],
             custom_logit_processor=merged_custom_logit_processor,
             device=device,

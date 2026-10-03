@@ -229,6 +229,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        clef_config = getattr(kvc.model_config, "clef_config", None)
+        self._clef_bytes_per_token = (
+            clef_config["hidden_size"] * torch.bfloat16.itemsize
+            if clef_config is not None
+            else 0
+        )
+        self._cell_size += self._clef_bytes_per_token
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -590,7 +597,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(
+            available_bytes - page_size * self._clef_bytes_per_token, 0
+        )
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

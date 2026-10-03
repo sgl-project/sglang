@@ -5,11 +5,13 @@ description: Cloudflare's joint decision models in SGLang, with API semantics an
 
 Clef is Cloudflare's family of joint decision models, available as [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) and the smaller [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash).
 
-SGLang loads Clef's `joint_head_config.json` and `joint_head.safetensors` strictly and runs the trained head inside the GPU model worker, using the SGLang Qwen backbone. Both `/v1/decisions` and `/v1/systemone` encode all questions into one native Clef prompt and answer them together in one complete prefill. No checkpoint Python code or Transformers inference fallback is used.
+SGLang loads Clef's `joint_head_config.json` and `joint_head.safetensors` strictly and runs the trained head inside the GPU model worker, using the SGLang Qwen backbone. Both `/v1/decisions` and `/v1/systemone` encode all questions into one native Clef prompt and answer them together after the complete prompt has been processed. No checkpoint Python code or Transformers inference fallback is used.
 
 ## Current integration limits
 
-The current SGLang integration requires text-only, unquantized BF16 inference on one CUDA GPU. The head consumes final hidden states for the entire joint prompt. Cached-prefix reconstruction, accumulation across prefill chunks, and batched record handling are not implemented, so only one eager, complete, uncached prefill at a time is supported. The Python HTTP server is required because the Rust HTTP server does not expose these decision routes.
+The current SGLang integration supports concurrent requests, chunked prefill, standard prefix caching, and overlap scheduling with text-only, unquantized BF16 inference on one CUDA GPU. Final prompt states share KV-cache slot ownership and memory admission; the trained head runs once each complete joint prompt is available. Decode CUDA graphs are supported; disable prefill graphs with `--disable-prefill-cuda-graph`.
+
+Distributed execution, quantization, LoRA, multimodal input, speculative decoding, unified-memory and external/offloaded caches are not supported. The Python HTTP server is required because the Rust HTTP server does not expose these decision routes.
 
 ## API semantics
 
