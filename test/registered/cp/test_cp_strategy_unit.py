@@ -146,6 +146,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
@@ -614,6 +615,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         swa_loc = torch.arange(5) + 16
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
+            out_cache_loc_is_physical=False,
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(

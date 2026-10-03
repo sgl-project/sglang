@@ -187,3 +187,8 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def abort(self):
         self.conclude_state = KVPoll.Failed
+
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """No prefill rank holds a fake receiver's destinations, so there is
+        nothing to notify: ``abort_notified`` stays False and decode releases
+        the pages at once."""

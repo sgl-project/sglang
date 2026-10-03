@@ -6,13 +6,20 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
+from functools import partial
 from unittest.mock import patch
+
+import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
+)
+from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_RECV_REQUESTS,
 )
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
@@ -117,9 +124,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
-        tp_rank=0,
-        pp_rank=0,
-        dp_rank=0,
         metrics_collector_context=context,
         metrics_collector=None,
     )
@@ -341,7 +345,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
 
-class TestIdleMetrics(unittest.TestCase):
+class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
@@ -365,6 +369,61 @@ class TestIdleMetrics(unittest.TestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_host_receive_metrics_survive_queue_drain(self):
+        registry = prometheus_client.CollectorRegistry()
+        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
+        sample_labels = {key: str(value) for key, value in labels.items()}
+        with patch.multiple(
+            prometheus_client,
+            **{
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
+                for kind in ("Counter", "Gauge", "Histogram", "Summary")
+            },
+        ):
+            collector = SchedulerMetricsCollector(
+                labels=labels, server_args=self.scheduler.server_args
+            )
+        self.reporter.metrics_collector = collector
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        self.scheduler.enable_priority_scheduling = True
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        host_reqs = [
+            types.SimpleNamespace(host_staged=True, priority=priority)
+            for priority in (1, 2)
+        ]
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)]
+        )
+        for _ in host_reqs:
+            collector.increment_decode_host_receive_reqs()
+
+        with get_context().override_server_args(
+            disaggregation_decode_host_receive_threshold=0.8
+        ):
+            for waiting in (True, False):
+                for req in host_reqs:
+                    req.host_staged = waiting
+                with patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                    return_value=collector.last_log_time + 31,
+                ):
+                    self.reporter._maybe_log_idle_metrics()
+                for priority, expected in (("", 2), ("1", 1), ("2", 1)):
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:num_decode_host_receive_queue_reqs",
+                            {**sample_labels, "priority": priority},
+                        ),
+                        expected if waiting else 0,
+                    )
+                self.assertEqual(
+                    registry.get_sample_value(
+                        "sglang:num_decode_host_receive_reqs_total", sample_labels
+                    ),
+                    2,
+                )
 
     def test_idle_clears_cached_forward_occupancy_immediately(self):
         self.reporter.current_scheduler_metrics_enabled = True
@@ -410,7 +469,14 @@ class TestIdleMetrics(unittest.TestCase):
 
 class TestSchedulerTimeAccounting(CustomTestCase):
     def setUp(self):
-        self.reporter = _make_reporter(self, types.SimpleNamespace())
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+        )
+        self.reporter = _make_reporter(self, types.SimpleNamespace(device="cpu"))
         self.idle_seconds = []
         self.process_cpu_seconds = []
         self.stage_seconds = []
@@ -428,9 +494,12 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         wall_timestamps = [
             0,
             1_200_000_000,
+            1_200_000_000,
             1_500_000_000,
             2_700_000_000,
+            2_900_000_000,
             3_000_000_000,
+            4_000_000_000,
             4_100_000_000,
         ]
         process_cpu_timestamps = [
@@ -451,12 +520,19 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         ):
             self.reporter.start_scheduler_time_accounting()
             self.reporter.record_scheduler_idle()
-            self.reporter.record_scheduler_active()
-            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active(event_ns=1_300_000_000)
+            self.assertEqual(
+                self.reporter._forward_occupancy_log_window.idle_ns, 1_300_000_000
+            )
+            self.reporter.record_scheduler_active(event_ns=0)
+            # Time between idle capture and accounting still counts as idle.
             self.reporter.record_scheduler_idle()
             self.reporter.record_scheduler_idle()
 
-        self.assertAlmostEqual(sum(self.idle_seconds), 2.6)
+        self.assertAlmostEqual(sum(self.idle_seconds), 2.5)
+        self.assertEqual(
+            self.reporter._forward_occupancy_log_window.idle_ns, 1_200_000_000
+        )
         self.assertAlmostEqual(sum(self.process_cpu_seconds), 1.9)
         self.assertAlmostEqual(
             sum(sample["seconds"] for sample in self.stage_seconds), 4.1
@@ -466,8 +542,21 @@ class TestSchedulerTimeAccounting(CustomTestCase):
     def test_state_transitions_accumulate_until_periodic_update(self):
         with (
             patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
-                side_effect=[0, 200_000_000, 400_000_000, 700_000_000, 1_100_000_000],
+                side_effect=[
+                    0,
+                    200_000_000,
+                    400_000_000,
+                    400_000_000,
+                    700_000_000,
+                    1_100_000_000,
+                    1_200_000_000,
+                    1_300_000_000,
+                ],
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
@@ -476,16 +565,34 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         ):
             self.reporter.start_scheduler_time_accounting()
             accounting = self.reporter._scheduler_time_accounting
-            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active(event_ns=200_000_000)
             self.reporter.record_scheduler_idle()
-            self.reporter.record_scheduler_active()
             self.assertEqual(self.idle_seconds, [])
             self.assertEqual(self.process_cpu_seconds, [])
-            self.assertEqual(
-                self.reporter._scheduler_time_accounting.accumulate_idle_ns,
-                500_000_000,
+            with self.reporter.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_RECV_REQUESTS
+            ):
+                pass
+            # Receive crossed the reporting deadline. Backdate only idle time,
+            # not the stage drain (which has already sampled receive completion).
+            self.reporter.record_scheduler_active(event_ns=700_000_000)
+            self.assertEqual(self.idle_seconds, [0.5])
+            self.assertEqual(accounting.last_sample_ns, 1_200_000_000)
+            self.assertAlmostEqual(
+                sum(sample["seconds"] for sample in self.stage_seconds), 1.2
             )
-            self.reporter.record_scheduler_active()
+            self.assertTrue(
+                all(sample["seconds"] >= 0 for sample in self.stage_seconds)
+            )
+            self.assertAlmostEqual(
+                sum(
+                    sample["seconds"]
+                    for sample in self.stage_seconds
+                    if sample["stage"] == SCHEDULER_STAGE_RECV_REQUESTS
+                ),
+                0.4,
+            )
+            self.reporter.record_scheduler_active(event_ns=1_300_000_000)
 
         self.assertIs(self.reporter._scheduler_time_accounting, accounting)
         self.assertEqual(process_time.call_count, 2)
@@ -504,8 +611,9 @@ class TestSchedulerTimeAccounting(CustomTestCase):
             ),
         ):
             self.reporter.start_scheduler_time_accounting()
-            self.reporter.record_scheduler_active()
-            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active(event_ns=-1)
+            self.assertEqual(self.reporter._forward_occupancy_log_window.idle_ns, 0)
+            self.reporter.record_scheduler_active(event_ns=1_000_000_000)
 
         self.assertEqual(self.idle_seconds, [])
         self.assertEqual(self.process_cpu_seconds, [0.0])

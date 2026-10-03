@@ -46,6 +46,13 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def restore_weights_before_loading(self, layer: nn.Module) -> None:
+        """Undo an in-place repack so checkpoint-format weights can be loaded again.
+
+        Needed only when `process_weights_after_loading` changes parameter shapes.
+        """
+        return
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
@@ -259,6 +266,20 @@ class QuantizationConfig(ABC):
             method.
         """
         raise NotImplementedError()
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        """Whether a linear layer at ``prefix`` keeps its checkpoint precision.
+
+        A query for deciding module layouts before layers are built, so an
+        override must not register ``prefix`` as a quantized layer.
+        """
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return isinstance(
+            self.get_quant_method(LinearBase(1, 1), prefix=prefix),
+            UnquantizedLinearMethod,
+        )
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:

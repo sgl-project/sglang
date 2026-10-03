@@ -222,11 +222,13 @@ def is_cpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -1542,6 +1544,29 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+def make_pp_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
+
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
+    )
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
@@ -1950,7 +1975,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1959,7 +1984,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2262,16 +2287,7 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 
 def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
-    """
-    Check if a package is installed and meets the minimum version requirement.
-
-    Args:
-        pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.18")
-
-    Returns:
-        True if package is installed and version >= min_version, False otherwise
-    """
+    """Check if a package is installed and meets the minimum version requirement."""
     if _should_skip_kernel_pkg_version_check(pkg):
         return True
 
@@ -2962,18 +2978,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -3962,15 +3974,22 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 
-    # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
+
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3984,9 +4003,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3996,7 +4015,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive
@@ -4012,7 +4031,7 @@ def require_mlp_tp_gather():
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
             )
     else:
         return False
@@ -4036,8 +4055,8 @@ def require_attn_tp_gather():
         not get_moe_a2a_backend().is_none()
         or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
         else:
             return True
     else:
@@ -4050,7 +4069,7 @@ def require_gathered_buffer():
 
 def require_mlp_sync():
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer()
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
@@ -4708,7 +4727,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,
