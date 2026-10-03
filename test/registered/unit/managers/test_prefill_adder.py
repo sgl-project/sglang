@@ -128,6 +128,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.token_indices_to_pool = None
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -230,6 +231,35 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_readout_request_waits_instead_of_being_chunked(self):
+        """A request read at fixed positions must never be split across chunks:
+        its positions index the whole prompt, and a split one read out of bounds
+        and crashed the scheduler with a device-side assert."""
+        override = get_context().override_server_args(chunked_prefill_size=16)
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=16)
+        first = self.create_shared_req("first")
+        adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+        readout = self.create_shared_req("readout")
+        readout.token_indices_to_pool = [3, 7]
+        self.assertEqual(
+            adder.add_one_req(
+                readout, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertIsNone(adder.new_chunked_req)
+        readout.set_extend_range.assert_not_called()
+
+        plain = self.create_shared_req("plain")
+        adder.add_one_req(plain, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, plain)
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
