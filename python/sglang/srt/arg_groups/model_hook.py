@@ -11,6 +11,7 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
+    _dsa_dcp_validation,
     _dsa_kv_cache_dtype_default,
     _dsa_split_backend_resolution,
     _enforce_disable_allreduce_fusion,
@@ -314,10 +315,16 @@ def handle_model_specific_adjustments(server_args: Any):
 
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # Hopper DCP: the DSA+DCP composition guard runs right after
+                # the split backends and kv dtype it validates are resolved.
+                run_post_process_pass(server_args, _dsa_dcp_validation)
 
             elif get_platform().is_xpu:
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # Hopper DCP: the DSA+DCP composition guard runs right after
+                # the split backends and kv dtype it validates are resolved.
+                run_post_process_pass(server_args, _dsa_dcp_validation)
                 # Disable fused topk (requires sgl-kernel ops not available on XPU)
                 if (
                     envs.SGLANG_DSA_FUSE_TOPK.is_set()
