@@ -546,6 +546,14 @@ void multimodal_rotary_embedding_cpu(
     bool mrope_interleaved,
     bool is_neox);
 
+// timestep_embedding
+at::Tensor timestep_embedding_cpu(
+    const at::Tensor& timesteps,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period);
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
@@ -971,7 +979,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "multimodal_rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor "
       "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> ()");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
-
+  // timestep_embedding
+  m.def(
+      "timestep_embedding_cpu(Tensor timesteps, int dim, bool flip_sin_to_cos, float downscale_freq_shift, float "
+      "scale, int max_period) -> Tensor");
+  m.impl("timestep_embedding_cpu", torch::kCPU, &timestep_embedding_cpu);
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
 
