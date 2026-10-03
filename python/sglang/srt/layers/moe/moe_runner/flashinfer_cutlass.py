@@ -1,15 +1,15 @@
 """FlashInfer CUTLASS MoE fused funcs.
 
 This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
-unquantized, ModelOpt FP8, ModelOpt NVFP4, and CUTLASS MXFP4 MoE paths, plus
-the shared ``flashinfer_mxfp4`` dispatcher. Quantization methods prepare a
-small quant_info payload and route through ``MoeRunner``.
+unquantized, ModelOpt FP8, ModelOpt NVFP4, W4AFP8, and CUTLASS MXFP4 MoE paths,
+plus the shared ``flashinfer_mxfp4`` dispatcher. Quantization methods prepare
+a small quant_info payload and route through ``MoeRunner``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
@@ -47,9 +47,11 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
       - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
       - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
       - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+      - ``"w4afp8"``: INT4/group-128 packed weights with static FP8
+        activation scales.
     """
 
-    quant_type: str
+    quant_type: Literal["bf16", "fp8", "fp4", "w4afp8"]
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
     quant_scales: Optional[list[torch.Tensor]] = None
@@ -333,6 +335,60 @@ def _run_flashinfer_cutlass(
     return output
 
 
+def _run_flashinfer_w4afp8(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    *,
+    symmetric_output: bool = True,
+) -> torch.Tensor:
+    x = dispatch_output.hidden_states
+    if quant_info.quant_type != "w4afp8":
+        raise ValueError(
+            f"Expected W4AFP8 quantization payload, got {quant_info.quant_type!r}."
+        )
+    if quant_info.quant_scales is None or len(quant_info.quant_scales) != 8:
+        raise ValueError("FlashInfer W4AFP8 requires exactly eight quant scales.")
+    if x.dtype != torch.bfloat16:
+        raise ValueError("FlashInfer W4AFP8 requires BF16 hidden states.")
+    if x.shape[0] == 0:
+        return torch.empty_like(x)
+
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    topk = dispatch_output.topk_output
+    if TopKOutputChecker.format_is_bypassed(topk):
+        topk = topk.to_standard()
+    fused_moe, _ = _flashinfer_cutlass_fused_moe()
+    with use_symmetric_memory(
+        get_parallel().tp_group,
+        disabled=not symmetric_output or not is_allocation_symmetric(),
+    ):
+        output = torch.empty_like(x)
+    fused_moe(
+        input=x,
+        output=output,
+        token_selected_experts=topk.topk_ids.to(torch.int32),
+        token_final_scales=topk.topk_weights,
+        fc1_expert_weights=quant_info.w13_weight,
+        fc2_expert_weights=quant_info.w2_weight,
+        quant_scales=quant_info.quant_scales,
+        output_dtype=torch.bfloat16,
+        tp_size=quant_info.moe_tp_size,
+        tp_rank=quant_info.moe_tp_rank,
+        ep_size=quant_info.moe_ep_size,
+        ep_rank=quant_info.moe_ep_rank,
+        activation_type=_activation_type(runner_config),
+        use_w4_group_scaling=True,
+        use_packed_weights=True,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+    )
+    if runner_config.routed_scaling_factor is not None:
+        output.mul_(runner_config.routed_scaling_factor)
+    return output
+
+
 @register_fused_func("none", "flashinfer_cutlass")
 def fused_experts_none_to_flashinfer_cutlass(
     dispatch_output: StandardDispatchOutput,
@@ -344,6 +400,13 @@ def fused_experts_none_to_flashinfer_cutlass(
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
     )
+
+    if quant_info.quant_type == "w4afp8":
+        return StandardCombineInput(
+            hidden_states=_run_flashinfer_w4afp8(
+                dispatch_output, quant_info, runner_config
+            )
+        )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,

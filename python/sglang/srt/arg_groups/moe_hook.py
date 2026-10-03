@@ -50,14 +50,21 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp4",
             "modelopt_fp8",
             "modelopt_mixed",
+            "w4afp8",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', 'w4afp8', or bfloat16 (None)."
         )
         assert view.ep_size in [
             1,
             cfg.tp_size,
         ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if view.quantization == "w4afp8" and view.moe_a2a_backend != "none":
+            raise ValueError(
+                "FlashInfer W4AFP8 supports only --moe-a2a-backend none. "
+                "For DeepEP, use --moe-runner-backend cutlass."
+            )
 
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
