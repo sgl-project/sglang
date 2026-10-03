@@ -18,12 +18,13 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
+from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
@@ -252,6 +253,27 @@ def uses_kda_attention(config) -> bool:
 
 def is_dspark_draft(config) -> bool:
     return _hf_arch(config) == "DSparkDraftModel"
+
+
+@lru_cache
+def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """decision_config.json of a checkpoint whose LM head is a decision readout."""
+    path = cached_file(
+        model_path,
+        "decision_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        config = json.load(f)
+    if config["format_version"] != 1:
+        raise ValueError(
+            f"decision_config.json format_version {config['format_version']} "
+            "is not supported, only version 1 is"
+        )
+    return config
 
 
 def is_qwen3_5(config) -> bool:
@@ -495,6 +517,12 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.decision_config = None
+        if self.hf_config.architectures == ["Qwen3_5Model"]:
+            self.decision_config = load_decision_config(self.model_path, revision)
+            if self.decision_config is not None:
+                # A bare backbone whose readout the loader places in the LM head.
+                self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
@@ -1002,7 +1030,10 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
             self.hf_text_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "ExaoneMoEForCausalLM",
+            "ExaoneMoeForCausalLM",
+        ):
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 

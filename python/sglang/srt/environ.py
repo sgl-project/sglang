@@ -663,6 +663,8 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in: keep receiving prefill requests while forward results are pending.
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -1028,6 +1030,9 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
+    # Disable to save the additional weight memory or allow online updates.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)

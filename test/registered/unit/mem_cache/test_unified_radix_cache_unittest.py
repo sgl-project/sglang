@@ -8522,6 +8522,68 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone(
+        self,
+    ):
+        """Write-back builds the insert backup as [target] only, so a second SWA
+        window publish never re-marks an ancestor another ack still holds."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        ps = self.cfg.page_size
+        if self.cfg.sliding_window_size <= 2 * ps:
+            self.skipTest("window must span past the leaf and its parent to reach c")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        # c(Full unbacked) -> b(Full backed) -> t1(Full backed)
+        #                  -> d(Full unbacked) -> t2(Full backed)
+        # Every node holds a device-only SWA value inside the window.
+        c_seq = self._make_seq(1, 2)
+        t1_seq = c_seq + self._make_seq(1000, 1) + self._make_seq(2000, 1)
+        t2_seq = c_seq + self._make_seq(3000, 1) + self._make_seq(4000, 1)
+        for seq in (t1_seq, t2_seq, t1_seq[:-ps], t2_seq[:-ps]):
+            self._insert(cache, allocator, req_to_token_pool, seq)
+
+        def leaf(seq):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+
+        c, b, t1 = self._path_chain(cache, leaf(t1_seq))
+        _, d, t2 = self._path_chain(cache, leaf(t2_seq))
+        for node in (b, t1, t2):
+            cache.tree_core.set_component_host_value_raw(
+                node,
+                ComponentType.FULL,
+                _device_value(cache, node, ComponentType.FULL).clone(),
+            )
+        for node in (c, b, t1, d, t2):
+            self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+            self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+        # Two requests in one batch finish at t1 and t2; neither ack drains.
+        with mock.patch.object(
+            cache,
+            "_execute_and_commit_kv_backup",
+            wraps=cache._execute_and_commit_kv_backup,
+        ) as backups:
+            for seq, target in ((t1_seq, t1), (t2_seq, t2)):
+                backups.reset_mock()
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                self.assertEqual(
+                    [call.args[0].node_ids for call in backups.call_args_list],
+                    [[target]],
+                )
+
+        for node, ack in ((c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)):
+            self.assertEqual(cache.tree_core.get_write_through_pending_id(node), ack)
+        # Write-back defers the unbacked Full prefix to eviction.
+        self.assertFalse(cache.tree_core.is_backuped(c))
+        self.assertFalse(cache.tree_core.is_backuped(d))
+
 
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
     components = (ComponentType.FULL, ComponentType.SWA)

@@ -113,6 +113,7 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             tp_rank=mlp_tp_rank,
             tp_size=mlp_tp_size,
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
@@ -154,12 +155,9 @@ class MiMoV2MTPLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with (
-            self.ffn_boundary.exit(forward_batch) as ffn_exit,
-            get_global_expert_distribution_recorder().disable_this_region(),
-        ):
+        with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 

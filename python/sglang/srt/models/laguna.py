@@ -37,11 +37,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -105,8 +104,6 @@ class LagunaMLP(nn.Module):
     ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        # RowParallelLinear honors ForwardFlags (fuse_mlp_allreduce /
-        # mlp_reduce_scatter) published by the decoder via scoped().
         x, _ = self.down_proj(x)
         return x
 
@@ -226,8 +223,7 @@ class LagunaMoE(nn.Module):
         else:
             final = routed_out + shared_out
 
-        final = reduce_moe_output(final)
-        if self._shared_expert_tp1 and should_add_replicated_moe_output():
+        if self._shared_expert_tp1 and adds_replicated_output_to_partial():
             final = final + shared_out
         return final
 
@@ -448,7 +444,7 @@ class LagunaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=True,
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
 
@@ -493,12 +489,11 @@ class LagunaDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 

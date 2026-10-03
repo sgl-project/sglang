@@ -1410,6 +1410,9 @@ class Qwen4ExpPLELayer(nn.Module):
 
 
 class Qwen4ExpLayerExtensionMixin:
+    # These layers drop the stage boundaries they inherit.
+    _ffn_sums_itself = True
+
     def _init_qwen4_exp_layer_extensions(
         self,
         config: Qwen4ExpTextConfig,

@@ -1392,6 +1392,9 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
             transfer_queue, priority_enabled
         )
+        self.stats.num_decode_deferred_kv_release_reqs = (
+            self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
+        )
         host_reqs = (
             [req for req in transfer_queue if req.host_staged]
             if get_disagg().disaggregation_decode_host_receive_threshold > 0
