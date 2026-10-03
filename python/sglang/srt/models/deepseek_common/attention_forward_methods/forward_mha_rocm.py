@@ -149,6 +149,7 @@ class DeepseekMHARocmForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
+        kv_a_quanted = None
         if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
@@ -196,6 +197,9 @@ class DeepseekMHARocmForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
+            # The fused quantization above only covers the new tokens. After
+            # restoring a prefix, project the full, already normalized KV below.
+            kv_a_quanted = None
             if (
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
@@ -240,7 +244,7 @@ class DeepseekMHARocmForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
+            if kv_a_quanted is not None:
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]
