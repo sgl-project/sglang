@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
@@ -98,6 +98,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_RING: tl.constexpr = False,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    ROUND_STATE_PRODUCT: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -328,7 +329,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v *= b_beta
 
         # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+        if ROUND_STATE_PRODUCT:
+            b_h = tl.inline_asm_elementwise(
+                "add.rn.f32 $0, $1, $2;",
+                constraints="=f,f,f",
+                args=[b_h, b_k[:, None] * b_v[None, :]],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            b_h += b_k[:, None] * b_v[None, :]
 
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -429,6 +440,21 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BV, num_warps = _select_recurrent_launch_config(N, H, HV, K, V, is_kda)
+    round_state_product = False
+    if (
+        is_kda
+        and disable_state_update
+        and intermediate_states_buffer is not None
+        and retrieve_parent_token is None
+        and not cache_ring
+        and (N, H, HV, K, V, cache_steps) == (1, 8, 8, 128, 128, 8)
+        and q.device.type == "cuda"
+        and is_arch_support_pdl()
+    ):
+        arch = get_jit_cuda_arch()
+        if (arch.major, arch.minor) == (10, 3):
+            BV = 4
+            round_state_product = True
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -551,6 +577,7 @@ def fused_sigmoid_gating_delta_rule_update(
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
         SPLIT_N_HV_GRID=split_n_hv_grid,
+        ROUND_STATE_PRODUCT=round_state_product,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

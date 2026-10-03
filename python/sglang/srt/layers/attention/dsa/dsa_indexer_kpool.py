@@ -806,9 +806,14 @@ class IndexerKPool(MultiPlatformOp):
         if plan is not None and plan.pool_seqlens_per_q is not None:
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-            pool_block_tables = build_pooled_page_table_64(
-                block_tables, self.index_kpool
-            ).contiguous()
+            pool_block_tables = attn_metadata.pooled_real_page_table
+            if (
+                pool_block_tables is None
+                or attn_metadata.pooled_index_kpool != self.index_kpool
+            ):
+                pool_block_tables = build_pooled_page_table_64(
+                    block_tables, self.index_kpool
+                ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(

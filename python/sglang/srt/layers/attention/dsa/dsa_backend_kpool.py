@@ -102,7 +102,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
             )
 
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
             metadata = init_pooled_paged_mqa_metadata(
                 metadata,
                 metadata.cache_seqlens_int32,
@@ -112,6 +112,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
             )
+
+        if forward_mode.is_decode_or_idle():
             return init_kpool_write_plan(
                 metadata,
                 forward_batch,
@@ -170,7 +172,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
             metadata = init_pooled_paged_mqa_metadata(
                 metadata,
                 metadata.cache_seqlens_int32,
@@ -218,7 +220,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
             update_pooled_paged_mqa_metadata(
                 metadata,
                 metadata.cache_seqlens_int32,
@@ -270,7 +272,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
             update_pooled_paged_mqa_metadata(
                 metadata,
                 precomputed.cache_seqlens,
