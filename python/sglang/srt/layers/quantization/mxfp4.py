@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
@@ -1026,6 +1026,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
             from triton_kernels.matmul import FlexCtx, PrecisionConfig
+            from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -1042,11 +1043,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            # triton_kernels 3.8 rejects an mx scale without its block size; the
+            # field is absent in 3.7, which ROCm still ships.
+            mx_block = (
+                {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
+                if "b_microblock_size" in {f.name for f in fields(PrecisionConfig)}
+                else {}
+            )
             self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
             )
             self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
             )
 
             self.w13_weight_triton_tensor = w13_weight
