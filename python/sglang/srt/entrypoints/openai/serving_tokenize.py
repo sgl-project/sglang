@@ -51,30 +51,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
             ):
                 max_model_len = self.tokenizer_manager.model_config.context_len
 
-            if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
-                tokens = token_ids
-                count = len(token_ids)
-            elif isinstance(request.prompt, str):
-                token_ids = tokenizer.encode(
-                    request.prompt,
-                    add_special_tokens=request.add_special_tokens,
-                )
-                tokens = token_ids
-                count = len(token_ids)
-            elif isinstance(request.prompt, list):
-                token_ids_list = [
-                    tokenizer.encode(
-                        text, add_special_tokens=request.add_special_tokens
-                    )
-                    for text in request.prompt
-                ]
-                tokens = token_ids_list
-                count = [len(ids) for ids in token_ids_list]
-            else:
+            if request.messages is None and not isinstance(request.prompt, (str, list)):
                 return self.create_error_response(
                     f"Invalid prompt type: {type(request.prompt)}. Expected str or List[str]."
                 )
+            tokens, count = await self._preprocess(self._tokenize_request, request)
 
             return TokenizeResponse(
                 tokens=tokens, count=count, max_model_len=max_model_len
@@ -88,6 +69,24 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    def _tokenize_request(
+        self, request: TokenizeRequest
+    ) -> tuple[Union[List[int], List[List[int]]], Union[int, List[int]]]:
+        if request.messages is not None:
+            token_ids = self._tokenize_chat_request(request)
+            return token_ids, len(token_ids)
+        tokenizer = self.tokenizer_manager.tokenizer
+        if isinstance(request.prompt, str):
+            token_ids = tokenizer.encode(
+                request.prompt, add_special_tokens=request.add_special_tokens
+            )
+            return token_ids, len(token_ids)
+        token_ids_list = [
+            tokenizer.encode(text, add_special_tokens=request.add_special_tokens)
+            for text in request.prompt
+        ]
+        return token_ids_list, [len(ids) for ids in token_ids_list]
 
     def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
         if self.chat_serving is None:

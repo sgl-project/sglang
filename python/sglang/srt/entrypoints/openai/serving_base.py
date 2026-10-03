@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, TypeVar, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
@@ -35,6 +37,18 @@ class OpenAIServingBase(ABC):
             and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
         )
+
+    async def _preprocess(
+        self, func: Callable[..., T], *args: Any, inline_if_idle: bool = False
+    ) -> T:
+        """Run blocking request preprocessing off the event loop."""
+        return await self.tokenizer_manager.preprocess_executor.run(
+            func, *args, inline_if_idle=inline_if_idle
+        )
+
+    def _is_cheap_to_preprocess(self, request: OpenAIServingRequest) -> bool:
+        """Whether converting ``request`` is too cheap to be worth a thread hop."""
+        return False
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
@@ -89,8 +103,11 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            adapted_request, processed_request = await self._preprocess(
+                self._convert_to_internal_request,
+                request,
+                raw_request,
+                inline_if_idle=self._is_cheap_to_preprocess(request),
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):

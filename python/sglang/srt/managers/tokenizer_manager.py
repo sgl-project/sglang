@@ -106,6 +106,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.preprocess_executor import (
+    INLINE_PREPROCESS_MAX_CHARS,
+    PreprocessExecutor,
+    resolve_tokenizer,
+    with_own_backend,
+)
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -425,6 +431,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
 
+    @property
+    def tokenizer(self):
+        # Inside a preprocessing job this is the worker's own clone, so no
+        # offloaded path can reach the instance the event loop is using.
+        return resolve_tokenizer(self._tokenizer)
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer):
+        self._tokenizer = tokenizer
+
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
 
@@ -511,6 +527,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Init request preprocessing worker
+        self.init_preprocess_executor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -539,6 +558,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
+        )
+
+    def init_preprocess_executor(self):
+        self.preprocess_executor = PreprocessExecutor(
+            get_shared_tokenizer=lambda: self._tokenizer
         )
 
     def init_model_config(self):
@@ -605,8 +629,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             get_serving().enable_dynamic_batch_tokenizer
             and not get_serving().skip_tokenizer_init
         ):
+            # Its own backend: the batcher encodes on its own thread.
             self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
-                self.tokenizer,
+                with_own_backend(self.tokenizer),
                 max_batch_size=get_serving().dynamic_batch_tokenizer_batch_size,
                 batch_wait_timeout_s=get_serving().dynamic_batch_tokenizer_batch_timeout,
             )
@@ -1021,15 +1046,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.preprocess_executor.run(
+                tokenize,
+                inline_if_idle=input_format == InputFormat.SINGLE_STRING
+                and len(texts) <= INLINE_PREPROCESS_MAX_CHARS,
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS

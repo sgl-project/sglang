@@ -19,6 +19,8 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
+from sglang.srt.managers.preprocess_executor import PreprocessExecutor  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -29,12 +31,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
+    _preprocess = OpenAIServingBase._preprocess
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
-            tokenizer=SimpleNamespace(chat_template=chat_template)
+            tokenizer=SimpleNamespace(chat_template=chat_template),
+            preprocess_executor=PreprocessExecutor(),
         )
         self.supports_inline_system = detect_inline_system_support(chat_template)
 
@@ -58,9 +62,14 @@ class _FakeOpenAIServingChat:
 class _FakeNonStreamingErrorOpenAI:
     """Returns a configurable error response from the OpenAI handler."""
 
+    _preprocess = OpenAIServingBase._preprocess
+
     supports_inline_system = False
 
     def __init__(self, status_code=400, body=None, content=None):
+        self.tokenizer_manager = SimpleNamespace(
+            preprocess_executor=PreprocessExecutor()
+        )
         self._status_code = status_code
         self._body = body
         self._content = content
@@ -92,7 +101,12 @@ class _FakeNonStreamingErrorOpenAI:
 class _FakeNonStreamingOpenAI:
     """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
 
+    _preprocess = OpenAIServingBase._preprocess
+
     def __init__(self, response):
+        self.tokenizer_manager = SimpleNamespace(
+            preprocess_executor=PreprocessExecutor()
+        )
         self._response = response
 
     def _validate_request(self, chat_request):

@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import string
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from sglang.srt.entrypoints.systemone.serving import (
     _score_confidence,
     _view,
 )
+from sglang.srt.managers.preprocess_executor import PreprocessExecutor
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
@@ -157,6 +159,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         self.context_len = context_len
         self.num_reserved_tokens = 0
         self.request_logger = SimpleNamespace(log_requests=False)
+        self.preprocess_executor = PreprocessExecutor()
         generator = torch.Generator().manual_seed(0)
         logits = torch.randn(len(tokenizer), generator=generator, dtype=torch.float64)
         self.logprobs = torch.log_softmax(logits * 4, dim=0)
@@ -462,7 +465,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 encode = handler._encode_question
 
                 def recorded(**kwargs):
-                    events.append("encode")
+                    events.append(threading.current_thread().name)
                     return encode(**kwargs)
 
                 async def other_request():
@@ -475,7 +478,14 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 response = await handler.handle_request(request, None)
                 await other
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(events, ["encode", "other"] * 3)
+                # Questions encode on the preprocessing worker, so the other
+                # request gets the loop before any of them.
+                self.assertEqual(events[0], "other")
+                self.assertEqual(events.count("other"), 3)
+                encodes = [e for e in events if e != "other"]
+                self.assertEqual(len(encodes), 3)
+                for thread_name in encodes:
+                    self.assertTrue(thread_name.startswith("sglang-preprocess"))
 
     async def test_all_questions_are_scored_in_one_call(self):
         manager = ScoringManager(self.tokenizer)

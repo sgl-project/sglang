@@ -97,6 +97,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.preprocess_executor import INLINE_PREPROCESS_MAX_CHARS
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -1023,6 +1024,18 @@ class OpenAIServingChat(OpenAIServingBase):
             and self._effective_tools(request)
             and self.tool_call_parser
         )
+
+    def _is_cheap_to_preprocess(self, request: ChatCompletionRequest) -> bool:
+        # Plain-text conversations only: tools and content parts can render far
+        # more template output than their character count suggests.
+        if request.tools:
+            return False
+        num_chars = 0
+        for message in request.messages:
+            if not isinstance(message.content, (str, type(None))):
+                return False
+            num_chars += len(message.content or "")
+        return num_chars <= INLINE_PREPROCESS_MAX_CHARS
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
         """Validate that the input is valid."""
