@@ -1678,6 +1678,30 @@ class MlxModelRunner:
         """Check if a request has active state."""
         return req_id in self._req_caches
 
+    def discard_request(self, req_id: str) -> None:
+        """Drop all runner state for *req_id* without syncing to the pool.
+
+        Retract/abort disposal path. The scheduler has already freed the
+        request's req_to_token row and KV slots
+        (``release_kv_cache(..., is_insert=False)``), and the row can be
+        reused by a new prefill before the next forward runs — reading it
+        to sync the dirty decode tail would scatter KV through slots that
+        may already belong to another request (issue #33547). A pure
+        discard is therefore the only safe disposal.
+
+        Unlike :meth:`remove_request`, this never syncs. That is correct
+        only for retracted/aborted requests, whose slots are freed; the
+        finish path keeps using :meth:`remove_request`, where the
+        radix-held slots remain valid targets for the final flush.
+        """
+        self._req_token_ids.pop(req_id, None)
+        self._req_sampling.pop(req_id, None)
+        cache = self._req_caches.pop(req_id, None)
+        if cache is not None:
+            self._release_cache(cache)
+        self._req_pool_idx.pop(req_id, None)
+        self._req_synced_offset.pop(req_id, None)
+
     def remove_request(self, req_id: str):
         """Sync remaining decode KV to pool, then release request state."""
         if not self.disable_radix_cache:
