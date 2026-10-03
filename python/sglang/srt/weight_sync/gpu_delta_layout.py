@@ -49,20 +49,6 @@ def swizzle_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
     )
 
 
-def unswizzle_scale_bytes(scale: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Inverse on the unpadded canonical plane; padding is not canonical data."""
-    if scale.dtype != torch.uint8:
-        raise ValueError("block-scale layout requires uint8")
-    padded_rows, padded_cols = (rows + 127) // 128 * 128, (cols + 3) // 4 * 4
-    batch = scale.numel() // (padded_rows * padded_cols)
-    return (
-        scale.reshape(batch, padded_rows // 128, padded_cols // 4, 32, 4, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .reshape(*scale.shape[:-2], padded_rows, padded_cols)[..., :rows, :cols]
-    )
-
-
 def interleave_gate_up_bytes(
     gate: torch.Tensor, up: torch.Tensor, *, group_rows: int, up_first: bool
 ) -> torch.Tensor:
@@ -80,21 +66,6 @@ def interleave_gate_up_bytes(
         ),
         dim=-3,
     ).reshape(*gate.shape[:-2], 2 * rows, cols)
-
-
-def deinterleave_gate_up_bytes(
-    fused: torch.Tensor, *, group_rows: int, up_first: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, cols = fused.shape[-2:]
-    if fused.dtype != torch.uint8 or rows % (2 * group_rows):
-        raise ValueError("invalid interleaved gate/up geometry")
-    groups = fused.reshape(
-        *fused.shape[:-2], rows // (2 * group_rows), 2, group_rows, cols
-    )
-    first, second = groups.unbind(-3)
-    first = first.reshape(*fused.shape[:-2], rows // 2, cols)
-    second = second.reshape(*fused.shape[:-2], rows // 2, cols)
-    return (second, first) if up_first else (first, second)
 
 
 def flashinfer_delta_layout(
@@ -195,11 +166,9 @@ class TensorBinding:
     dtype: str
     shape: tuple[int, ...]
     slices: list[list[int]]
-    read: Callable[[], torch.Tensor]
     xor: Callable[[torch.Tensor], None] | None
     storage: tuple[torch.Tensor, ...]
     encoding: str = "xor_bytes"
-    refresh: Callable[[], None] | None = None
 
     def __post_init__(self):
         # The admitted binding is immutable for the session. Keep dtype and
@@ -239,7 +208,7 @@ def _byte_view(tensor):
     return tensor.detach().view(torch.uint8)
 
 
-def _direct_binding(name, meta, target, slices=None, refresh=None):
+def _direct_binding(name, meta, target, slices=None):
     dtype = _TORCH_DTYPES[meta["dtype"]]
     slices = _full_slices(meta["shape"]) if slices is None else slices
     view_shape = tuple(stop - start for start, stop in slices)
@@ -257,19 +226,14 @@ def _direct_binding(name, meta, target, slices=None, refresh=None):
         def xor(mask):
             byte_target.bitwise_xor_(mask.reshape(byte_target.shape))
 
-    def read():
-        return _bytes(target).reshape(-1)
-
     return TensorBinding(
         name,
         meta["dtype"],
         tuple(meta["shape"]),
         slices,
-        read,
         xor,
         (target,),
         encoding="raw_bytes" if direct else "xor_bytes",
-        refresh=refresh,
     )
 
 
@@ -290,7 +254,6 @@ def _indexer_norm_binding(name, meta, target):
         meta["dtype"],
         tuple(meta["shape"]),
         _full_slices(meta["shape"]),
-        lambda: _bytes(target),
         None,
         (target,),
         encoding="raw_bytes",
@@ -339,10 +302,6 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         raise ValueError("runtime NVFP4 delta currently requires gated experts")
     if getattr(layer, "use_presharded_weights", False):
         raise ValueError("presharded canonical checkpoints are not admitted")
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
-        raise ValueError("NVFP4 direct deltas currently require CuTe DSL W4A16")
     local = layer._map_global_expert_id_to_local_expert_id(expert)
     stem = "w2" if projection == "down" else "w13"
     half = 0 if projection == "gate" else 1  # scalar metadata stays gate-first
@@ -376,13 +335,6 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         if image.numel() != ((full_rows + 127) // 128 * 128) * ((cols + 3) // 4 * 4):
             raise ValueError(f"unexpected scale padding geometry: {name}")
 
-    def gather(image):
-        result = unswizzle_scale_bytes(image.view(torch.uint8), full_rows, cols)
-        if projection != "down":
-            gate, up = deinterleave_gate_up_bytes(result, group_rows=64, up_first=True)
-            result = gate if projection == "gate" else up
-        return result.contiguous().reshape(-1)
-
     def xor(mask):
         transformed = flashinfer_delta_layout(
             mask.reshape(rows, cols),
@@ -394,19 +346,14 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         for image in images:
             image.view(torch.uint8).bitwise_xor_(transformed)
 
-    binding = TensorBinding(
+    return TensorBinding(
         name,
         meta["dtype"],
         tuple(meta["shape"]),
         _full_slices(meta["shape"]),
-        lambda: gather(images[0]),
         xor,
         tuple(images),
     )
-    binding.mirror_reads = tuple(
-        lambda image=image: gather(image) for image in images[1:]
-    )
-    return binding
 
 
 @dataclass

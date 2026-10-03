@@ -2136,8 +2136,7 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
 
 
 class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
-    success: bool = True
-    message: str = ""
+    pass
 
 
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
@@ -2158,8 +2157,7 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    success: bool = True
-    message: str = ""
+    pass
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -2169,8 +2167,7 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    success: bool = True
-    message: str = ""
+    pass
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):

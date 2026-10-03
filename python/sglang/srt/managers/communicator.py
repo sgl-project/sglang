@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import uuid
 from typing import Callable, Generic, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -20,9 +19,7 @@ class FanOutCommunicator(Generic[T]):
     - "watching": concurrent callers share a single in-flight request and all
       receive the same result when it completes.
 
-    Only one request is in-flight at any time in either mode. ``correlate_rid``
-    additionally rejects late replies after cancellation; participating handlers
-    must echo the generated request rid in every response.
+    Only one request is in-flight at any time in either mode.
     """
 
     def __init__(
@@ -30,20 +27,16 @@ class FanOutCommunicator(Generic[T]):
         send: Callable[[T], None],
         fan_out: int,
         mode: str = "queueing",
-        correlate_rid: bool = False,
     ):
         self._send = send
         self._fan_out = fan_out
         self._mode = mode
-        self._correlate_rid = correlate_rid
-        self._active_rid = None
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._result_fan_out: Optional[int] = None
         self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
-        assert not correlate_rid or mode == "queueing"
 
     async def queueing_call(self, obj: T):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
@@ -51,19 +44,17 @@ class FanOutCommunicator(Generic[T]):
         # arrival order. It also releases on exception/cancellation, so a
         # failed caller never blocks the callers queued behind it.
         async with self._queueing_lock:
+            if obj is not None:
+                self._send(obj)
+
             self._result_event = asyncio.Event()
             self._result_values = []
             self._result_fan_out = self._fan_out
-            if self._correlate_rid:
-                obj.rid = self._active_rid = uuid.uuid4().hex
-            try:
-                if obj is not None:
-                    self._send(obj)
-                await self._result_event.wait()
-                return self._result_values
-            finally:
-                self._result_event = self._result_values = None
-                self._result_fan_out = self._active_rid = None
+            await self._result_event.wait()
+            result_values = self._result_values
+            self._result_event = self._result_values = None
+            self._result_fan_out = None
+            return result_values
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -97,8 +88,6 @@ class FanOutCommunicator(Generic[T]):
         self._fan_out = fan_out
 
     def handle_recv(self, recv_obj: T):
-        if self._correlate_rid and getattr(recv_obj, "rid", None) != self._active_rid:
-            return
         if (
             self._result_values is None
             or self._result_event is None

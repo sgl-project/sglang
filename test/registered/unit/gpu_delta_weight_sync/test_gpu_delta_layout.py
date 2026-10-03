@@ -65,17 +65,23 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     current, full(new_gate, new_up), rtol=0, atol=0
                 )
 
-    def test_swizzle_inverse_and_zero_padding(self):
+    def test_scale_swizzle_matches_physical_offsets_and_zero_padding(self):
         for rows, cols in ((17, 3), (128, 64), (256, 19)):
             source = torch.randint(256, (2, rows, cols), dtype=torch.uint8)
             swizzled = layout.swizzle_scale_bytes(source)
-            restored = layout.unswizzle_scale_bytes(swizzled, rows, cols)
-            torch.testing.assert_close(restored, source, rtol=0, atol=0)
-            padded = layout.unswizzle_scale_bytes(
-                swizzled, swizzled.shape[-2], swizzled.shape[-1]
+            row = torch.arange(rows)[:, None]
+            col = torch.arange(cols)[None, :]
+            # Physical order: row tile, column tile, row within 32,
+            # row group within 128, column within 4. Padding stays zero.
+            offsets = (
+                ((row // 128 * ((cols + 3) // 4) + col // 4) * 32 + row % 32) * 4
+                + row % 128 // 32
+            ) * 4 + col % 4
+            expected = torch.zeros_like(swizzled).reshape(2, -1)
+            expected[:, offsets.flatten()] = source.reshape(2, -1)
+            torch.testing.assert_close(
+                swizzled, expected.reshape_as(swizzled), rtol=0, atol=0
             )
-            self.assertEqual(torch.count_nonzero(padded[:, rows:]).item(), 0)
-            self.assertEqual(torch.count_nonzero(padded[:, :, cols:]).item(), 0)
 
     def test_gate_up_order_is_backend_specific(self):
         gate = torch.ones((128, 8), dtype=torch.uint8)
@@ -85,12 +91,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertTrue(torch.all(cute[:64] == 2))
         self.assertTrue(torch.all(cute[64:128] == 1))
         self.assertTrue(torch.all(mega[:16] == 1))
-        for fused, group, up_first in ((cute, 64, True), (mega, 16, False)):
-            a, b = layout.deinterleave_gate_up_bytes(
-                fused, group_rows=group, up_first=up_first
-            )
-            torch.testing.assert_close(a, gate)
-            torch.testing.assert_close(b, up)
+        self.assertTrue(torch.all(mega[16:32] == 2))
 
     def test_noncontiguous_gate_destination_preserves_up(self):
         destination = torch.randint(256, (256, 32), dtype=torch.uint8)
@@ -101,9 +102,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         mask = torch.randint(256, (128 * 32,), dtype=torch.uint8)
         pointer = destination.data_ptr()
-        before = binding.read().clone()
+        before = layout._bytes(gate).clone()
         binding.xor(mask)
-        torch.testing.assert_close(binding.read(), before ^ mask)
+        torch.testing.assert_close(layout._bytes(gate), before ^ mask)
         torch.testing.assert_close(
             destination.reshape(2, 2, 64, 32)[:, 0], old.reshape(2, 2, 64, 32)[:, 0]
         )
@@ -212,15 +213,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             binding = layout._direct_binding(
                 "weight_scale_2", {"dtype": "F32", "shape": []}, current
             )
-            mask = current.reshape(1).view(torch.uint8) ^ expected.reshape(1).view(
-                torch.uint8
-            )
             pointer = current.data_ptr()
             self.assertEqual(binding.encoding, "raw_bytes")
             self.assertIsNone(binding.xor)
             torch._foreach_copy_([binding.storage[0]], [expected])
             torch.testing.assert_close(
-                binding.read(), expected.reshape(1).view(torch.uint8)
+                current.reshape(1).view(torch.uint8),
+                expected.reshape(1).view(torch.uint8),
             )
             self.assertEqual(current.data_ptr(), pointer)
 
@@ -290,8 +289,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     self.assertEqual(other_target.data_ptr(), other_pointer)
 
     def test_w4a16_calibration_is_static_but_weight_scales_remain_mutable(self):
-        from sglang.srt.environ import envs
-
         prefix = "model.layers.0.mlp.experts"
         layer = SimpleNamespace(
             moe_tp_size=1,
@@ -312,30 +309,23 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         plan._modules, plan._moe_layers, plan.excluded = {prefix: layer}, {}, {}
         meta = {"dtype": "F32", "shape": []}
-        mode = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
-        with patch.object(mode, "get", return_value=True):
-            for projection in ("gate", "up", "down"):
-                for expert in (0, 3):
-                    name = f"{prefix}.{expert}.{projection}_proj.input_scale"
-                    self.assertIsNone(plan._bind(name, meta))
-                    self.assertEqual(
-                        plan.excluded[name], "static W4A16 activation calibration"
-                    )
-                name = f"{prefix}.0.{projection}_proj.weight_scale_2"
-                binding = plan._bind(name, meta)
-                before, after = torch.tensor(1.0), torch.tensor(0.5)
-                self.assertEqual(binding.encoding, "raw_bytes")
-                torch._foreach_copy_([binding.storage[0]], [after])
-                torch.testing.assert_close(binding.read(), layout._bytes(after))
-            self.assertTrue(torch.all(layer.w13_input_scale == 7))
-            self.assertTrue(torch.all(layer.w2_input_scale == 11))
-        # Excluding calibration does not admit a W4A4 receiver, where activation
-        # scales are consumed and require a different update contract.
-        with (
-            patch.object(mode, "get", return_value=False),
-            self.assertRaisesRegex(ValueError, "require CuTe DSL W4A16"),
-        ):
-            plan._bind(f"{prefix}.0.gate_proj.input_scale", meta)
+        for projection in ("gate", "up", "down"):
+            for expert in (0, 3):
+                name = f"{prefix}.{expert}.{projection}_proj.input_scale"
+                self.assertIsNone(plan._bind(name, meta))
+                self.assertEqual(
+                    plan.excluded[name], "static W4A16 activation calibration"
+                )
+            name = f"{prefix}.0.{projection}_proj.weight_scale_2"
+            binding = plan._bind(name, meta)
+            after = torch.tensor(0.5)
+            self.assertEqual(binding.encoding, "raw_bytes")
+            torch._foreach_copy_([binding.storage[0]], [after])
+            torch.testing.assert_close(
+                layout._bytes(binding.storage[0]), layout._bytes(after)
+            )
+        self.assertTrue(torch.all(layer.w13_input_scale == 7))
+        self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
     def test_publication_cannot_reintroduce_static_calibration(self):
         name = "model.layers.0.mlp.experts.0.gate_proj.input_scale"

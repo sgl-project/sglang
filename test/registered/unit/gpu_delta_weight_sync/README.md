@@ -8,9 +8,9 @@ runtime on this branch.
 
 ```bash
 python -m pytest -q \
-  test/registered/unit/weight_sync/test_gpu_delta_layout.py \
-  test/registered/unit/weight_sync/test_gpu_delta_payload.py \
-  test/registered/unit/weight_sync/test_gpu_delta_session.py
+  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout.py \
+  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_payload.py \
+  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_session.py
 python -m pytest -q test/manual/weight_sync/test_gpu_delta_codec.py
 ```
 

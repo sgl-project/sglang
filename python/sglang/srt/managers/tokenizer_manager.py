@@ -2290,7 +2290,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             if not result["success"]:
                 raise ValueError(result["message"] or "GPU delta resume rejected")
-            self._gpu_delta_session_id = None
+            if getattr(self, "_gpu_delta_session_id", None) == obj.delta_session_id:
+                self._gpu_delta_session_id = None
             self._update_weight_version_if_provided(
                 str(result["participants"][0]["target_version"])
             )

@@ -6,6 +6,7 @@ on the scheduler thread after a retract pause and a reader-completion fence.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -18,8 +19,43 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-# Both tokenizer and scheduler enforce the lease. The scheduler check also covers
-# another HTTP worker which has not seen the preparation request.
+
+class GpuDeltaCommunicator:
+    """Serialize delta controls and correlate replies without blocking generation."""
+
+    def __init__(self, send: Callable, fan_out: int):
+        self._send = send
+        self._fan_out = fan_out
+        self._lock = asyncio.Lock()
+        self._rid = self._event = self._results = self._expected = None
+
+    async def __call__(self, request):
+        async with self._lock:
+            request.rid = self._rid = uuid.uuid4().hex
+            self._event = asyncio.Event()
+            self._results = []
+            self._expected = self._fan_out
+            try:
+                self._send(request)
+                await self._event.wait()
+                return self._results
+            finally:
+                self._rid = self._event = self._results = self._expected = None
+
+    def handle_recv(self, reply):
+        # Canceled requests can still reply after the next control was sent.
+        if self._event is None or reply.rid != self._rid:
+            return
+        self._results.append(reply)
+        if len(self._results) == self._expected:
+            self._event.set()
+
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
+
+
+# GPU delta admits one Python tokenizer worker. It rejects competing mutations
+# before dispatch; the scheduler also enforces the lease before model access.
 _CONFLICTING_REQUESTS = {
     "UpdateWeightFromDiskReqInput",
     "PullWeightsReqInput",
@@ -40,10 +76,16 @@ _CONFLICTING_REQUESTS = {
 
 
 def guard_tokenizer_dispatch(manager, request):
-    if (
-        getattr(manager, "_gpu_delta_session_id", None)
-        and type(request).__name__ in _CONFLICTING_REQUESTS
-    ):
+    active = getattr(manager, "_gpu_delta_session_id", None)
+    name = type(request).__name__
+    if name == "PrepareWeightsFromDeltaReqInput":
+        if active is not None and active != request.session_id:
+            raise ValueError("another delta session is active")
+        # Acquire only at the FIFO communicator's actual send. An earlier
+        # abort/resume completion cannot clear a prepare still in its queue.
+        # Keep the lease if sending or receiving the acknowledgment fails.
+        manager._gpu_delta_session_id = request.session_id
+    elif active is not None and name in _CONFLICTING_REQUESTS:
         raise ValueError("GPU delta session owns the model; competing mutation refused")
 
 
@@ -547,6 +589,13 @@ class GpuDeltaSchedulerControl:
 
         name = type(request).__name__.replace("ReqInput", "ReqOutput")
         cls = getattr(io, name)
+        if "success" not in cls.__struct_fields__:
+            # These existing APIs have empty ACKs. The admitted single Python
+            # tokenizer rejects conflicts before sending, so reaching here is
+            # an internal invariant violation, never a successful empty ACK.
+            raise RuntimeError(
+                "competing mutation bypassed the GPU delta dispatch guard"
+            )
         if "error_message" in cls.__struct_fields__:
             return cls(success=False, error_message="GPU delta session owns the model")
         return cls(success=False, message="GPU delta session owns the model")

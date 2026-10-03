@@ -16,6 +16,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 from sglang.srt.weight_sync.gpu_delta_session import (
     DeltaSession,
+    GpuDeltaCommunicator,
     GpuDeltaSchedulerControl,
     guard_tokenizer_dispatch,
 )
@@ -400,11 +401,9 @@ def test_apply_requires_whole_cohort_quiescence(make_session):
 
 
 def test_late_reply_after_cancellation_cannot_acknowledge_resume():
-    from sglang.srt.managers.communicator import FanOutCommunicator
-
     async def scenario():
         sent = []
-        comm = FanOutCommunicator(sent.append, 1, correlate_rid=True)
+        comm = GpuDeltaCommunicator(sent.append, 1)
         old = asyncio.create_task(comm(SimpleNamespace(rid=None)))
         await asyncio.sleep(0)
         old_rid = sent[-1].rid
@@ -418,6 +417,124 @@ def test_late_reply_after_cancellation_cannot_acknowledge_resume():
         assert not resume.done()
         comm.handle_recv(SimpleNamespace(rid=sent[-1].rid, state="RESUMED"))
         assert (await resume)[0].state == "RESUMED"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "request_type",
+    [
+        "UpdateWeightVersionReqInput",
+        "ReleaseMemoryOccupationReqInput",
+        "ResumeMemoryOccupationReqInput",
+    ],
+)
+def test_queued_legacy_request_checks_lease_at_actual_send(request_type):
+    from sglang.srt.managers.communicator import FanOutCommunicator
+
+    async def scenario():
+        manager = SimpleNamespace(_gpu_delta_session_id=None)
+        sent = []
+
+        def send(obj):
+            guard_tokenizer_dispatch(manager, obj)
+            sent.append(obj)
+
+        comm = FanOutCommunicator(send, 1)
+        request_class = type(request_type, (), {})
+        first = asyncio.create_task(comm(request_class()))
+        await asyncio.sleep(0)
+        queued = asyncio.create_task(comm(request_class()))
+        await asyncio.sleep(0)
+        assert len(sent) == 1
+        prepare = type("PrepareWeightsFromDeltaReqInput", (), {})()
+        prepare.session_id = "publication-1"
+        delta_comm = GpuDeltaCommunicator(send, 1)
+        preparing = asyncio.create_task(delta_comm(prepare))
+        await asyncio.sleep(0)
+        comm.handle_recv(SimpleNamespace())
+        await first
+        with pytest.raises(ValueError, match="competing mutation"):
+            await queued
+        assert len(sent) == 2 and sent[-1] is prepare
+        assert manager._gpu_delta_session_id == "publication-1"
+        delta_comm.handle_recv(SimpleNamespace(rid=prepare.rid))
+        await preparing
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "completion_type",
+    ["AbortWeightsFromDeltaReqInput", "ContinueWeightsFromDeltaReqInput"],
+)
+@pytest.mark.parametrize("next_id", ["publication-1", "publication-2"])
+def test_queued_prepare_acquires_lease_after_prior_completion(completion_type, next_id):
+    async def scenario():
+        manager = SimpleNamespace(_gpu_delta_session_id="publication-1")
+        sent = []
+
+        def send(obj):
+            guard_tokenizer_dispatch(manager, obj)
+            sent.append(obj)
+
+        comm = GpuDeltaCommunicator(send, 1)
+        previous = type(completion_type, (), {})()
+        previous.session_id = "publication-1"
+
+        async def complete_previous():
+            await comm(previous)
+            if manager._gpu_delta_session_id == previous.session_id:
+                manager._gpu_delta_session_id = None
+
+        completion = asyncio.create_task(complete_previous())
+        await asyncio.sleep(0)
+        prepare = type("PrepareWeightsFromDeltaReqInput", (), {})()
+        prepare.session_id = next_id
+        queued = asyncio.create_task(comm(prepare))
+        await asyncio.sleep(0)
+        assert sent == [previous]
+        assert manager._gpu_delta_session_id == "publication-1"
+        comm.handle_recv(SimpleNamespace(rid=previous.rid))
+        await completion
+        await asyncio.sleep(0)
+        assert sent == [previous, prepare]
+        assert manager._gpu_delta_session_id == next_id
+        comm.handle_recv(SimpleNamespace(rid=prepare.rid))
+        await queued
+        assert manager._gpu_delta_session_id == next_id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["send", "cancel"])
+def test_prepare_lease_survives_ambiguous_send_or_ack(failure):
+    async def scenario():
+        manager = SimpleNamespace(_gpu_delta_session_id=None)
+
+        def send(obj):
+            guard_tokenizer_dispatch(manager, obj)
+            if failure == "send":
+                raise RuntimeError("send failed")
+
+        comm = GpuDeltaCommunicator(send, 1)
+        prepare_class = type("PrepareWeightsFromDeltaReqInput", (), {})
+        prepare = prepare_class()
+        prepare.session_id = "publication-1"
+        task = asyncio.create_task(comm(prepare))
+        await asyncio.sleep(0)
+        assert manager._gpu_delta_session_id == "publication-1"
+        if failure == "cancel":
+            task.cancel()
+        with pytest.raises(
+            RuntimeError if failure == "send" else asyncio.CancelledError
+        ):
+            await task
+        assert manager._gpu_delta_session_id == "publication-1"
+        replacement = prepare_class()
+        replacement.session_id = "publication-2"
+        with pytest.raises(ValueError, match="another delta session"):
+            await comm(replacement)
 
     asyncio.run(scenario())
 

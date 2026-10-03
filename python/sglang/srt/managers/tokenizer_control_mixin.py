@@ -111,7 +111,6 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
-    ("gpu_delta", DeltaWeightsReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -186,7 +185,14 @@ class TokenizerControlMixin:
     """
 
     def init_communicators(self: TokenizerManager):
-        dispatch_pairs = []
+        from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaCommunicator
+
+        self.gpu_delta_communicator = GpuDeltaCommunicator(
+            self._dispatch_to_scheduler, get_parallel().dp_size
+        )
+        dispatch_pairs = [
+            (DeltaWeightsReqOutput, self.gpu_delta_communicator.handle_recv)
+        ]
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
@@ -194,7 +200,6 @@ class TokenizerControlMixin:
                 self._dispatch_to_scheduler,
                 get_parallel().dp_size,
                 mode,
-                correlate_rid=name == "gpu_delta",
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
@@ -216,6 +221,7 @@ class TokenizerControlMixin:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.gpu_delta_communicator.set_fan_out(worker_count)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -999,11 +1005,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        results = await self.release_memory_occupation_communicator(obj)
-        if not all(result.success for result in results):
-            raise ValueError(
-                " | ".join(result.message for result in results if not result.success)
-            )
+        await self.release_memory_occupation_communicator(obj)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -1011,11 +1013,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        results = await self.resume_memory_occupation_communicator(obj)
-        if not all(result.success for result in results):
-            raise ValueError(
-                " | ".join(result.message for result in results if not result.success)
-            )
+        await self.resume_memory_occupation_communicator(obj)
 
     async def gpu_delta_request(self, obj, request=None):
         """No model-update writer lock: preparation must overlap generation."""
@@ -1044,16 +1042,10 @@ class TokenizerControlMixin:
                     "message": "prepare must bind the original described participants",
                     "participants": [],
                 }
-            active = getattr(self, "_gpu_delta_session_id", None)
-            if active is not None and active != obj.session_id:
-                return {
-                    "success": False,
-                    "message": "another delta session is active",
-                    "participants": [],
-                }
-            # Preserve the lease if a request or acknowledgement is lost.
-            self._gpu_delta_session_id = obj.session_id
-        results = await self.gpu_delta_communicator(obj)
+        try:
+            results = await self.gpu_delta_communicator(obj)
+        except ValueError as exc:
+            return {"success": False, "message": str(exc), "participants": []}
         participants = [result.participant for result in results]
         identities = [item.get("identity") for item in participants]
 
@@ -1091,6 +1083,7 @@ class TokenizerControlMixin:
             isinstance(obj, AbortWeightsFromDeltaReqInput)
             and success
             and all(item["state"] == "ABORTED" for item in participants)
+            and getattr(self, "_gpu_delta_session_id", None) == obj.session_id
         ):
             self._gpu_delta_session_id = None
         return {
@@ -1268,11 +1261,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: UpdateWeightVersionReqInput
     ) -> None:
         self.auto_create_handle_loop()
-        results = await self.update_weight_version_communicator(obj)
-        if not all(result.success for result in results):
-            raise ValueError(
-                " | ".join(result.message for result in results if not result.success)
-            )
+        await self.update_weight_version_communicator(obj)
         self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(
