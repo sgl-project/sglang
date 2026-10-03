@@ -21,7 +21,7 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
-from typing import Dict, Optional
+from typing import Optional
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
@@ -43,12 +43,9 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.template_detection import (
-    REASONING_PARSER_RULES,
-    TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
-    build_detection_context,
     detect_reasoning_pattern,
-    match_rules,
+    resolve_hf_chat_template,
 )
 from sglang.srt.runtime_context import get_serving
 
@@ -70,8 +67,6 @@ class TemplateManager:
         self._jinja_template_content_format: Optional[str] = "openai"
         self._force_reasoning: bool = False
         self._reasoning_config: Optional[ReasoningToggleConfig] = None
-        self._suggested_reasoning_parser: Optional[str] = None
-        self._suggested_tool_call_parser: Optional[str] = None
         self._jinja_template_may_reorder_tool_results: bool = False
 
     @property
@@ -105,39 +100,15 @@ class TemplateManager:
         return self._reasoning_config
 
     @property
-    def suggested_reasoning_parser(self) -> Optional[str]:
-        """Get the auto-detected reasoning parser name, or None."""
-        return self._suggested_reasoning_parser
-
-    @property
-    def suggested_tool_call_parser(self) -> Optional[str]:
-        """Get the auto-detected tool-call parser name, or None."""
-        return self._suggested_tool_call_parser
-
-    @property
     def jinja_template_may_reorder_tool_results(self) -> bool:
         return self._jinja_template_may_reorder_tool_results
 
     def _run_template_detection(self, template, tokenizer) -> None:
-        """Run reasoning pattern and parser detection on a template."""
         self._jinja_template_may_reorder_tool_results = (
             jinja_template_may_reorder_tool_results(template)
         )
         self._force_reasoning, self._reasoning_config = detect_reasoning_pattern(
             template
-        )
-        # Build context once, reuse for both parser detections (avoids
-        # duplicate tokenizer.get_vocab() calls).
-        ctx = build_detection_context(
-            template, tokenizer, self._reasoning_config, self._force_reasoning
-        )
-        if ctx is None:
-            return
-        self._suggested_reasoning_parser = match_rules(
-            ctx, REASONING_PARSER_RULES, "reasoning parser"
-        )
-        self._suggested_tool_call_parser = match_rules(
-            ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
         )
 
     def load_chat_template(
@@ -181,17 +152,12 @@ class TemplateManager:
                         "No chat template found, defaulting to 'string' content format"
                     )
 
-        # Detect reasoning pattern and suggest parser from chat template
         if tokenizer_manager.tokenizer:
             template = tokenizer_manager.tokenizer.chat_template
             self._run_template_detection(template, tokenizer_manager.tokenizer)
             parts = []
             if self._reasoning_config:
                 parts.append(f"reasoning_config={self._reasoning_config}")
-            if self._suggested_reasoning_parser:
-                parts.append(f"reasoning_parser={self._suggested_reasoning_parser}")
-            if self._suggested_tool_call_parser:
-                parts.append(f"tool_call_parser={self._suggested_tool_call_parser}")
             if parts:
                 logger.info(f"Auto-detected template features: {', '.join(parts)}")
 
@@ -348,53 +314,8 @@ class TemplateManager:
     def _resolve_hf_chat_template(
         self, tokenizer_manager: TokenizerManager
     ) -> Optional[str]:
-        try:
-            # Try (mm-)processor first, then tokenizer
-            template = (
-                getattr(tokenizer_manager.processor, "chat_template", None)
-                if tokenizer_manager.processor
-                else None
-            ) or (
-                getattr(tokenizer_manager.tokenizer, "chat_template", None)
-                if tokenizer_manager.tokenizer
-                else None
-            )
-
-            if template is None:
-                logger.warning("No HuggingFace chat template found")
-                return None
-
-            # Handle dict templates (multiple named templates)
-            if isinstance(template, dict):
-                return self._select_named_template(template, tokenizer_manager)
-
-            # Single string template
-            return template
-
-        except Exception as e:
-            logger.warning(f"Error getting chat template: {e}")
-            return None
-
-    def _select_named_template(
-        self, templates: Dict[str, str], tokenizer_manager: TokenizerManager
-    ) -> str:
-        if not templates:
-            raise ValueError("Empty templates dict provided")
-
-        available_names = list(templates.keys())
-        logger.info(f"Multiple HuggingFace chat templates available: {available_names}")
-
-        # Use specified template if provided
-        if preferred_name := get_serving().hf_chat_template_name:
-            if preferred_name not in templates:
-                raise ValueError(
-                    f"Specified template '{preferred_name}' not found. "
-                    f"Available templates: {available_names}"
-                )
-            logger.info(f"Using specified chat template: '{preferred_name}'")
-            return templates[preferred_name]
-
-        # Fallback: Use first available template
-        first_name = available_names[0]
-        logger.info(f"Using first available template: '{first_name}'")
-        return templates[first_name]
+        return resolve_hf_chat_template(
+            tokenizer_manager.tokenizer,
+            processor=tokenizer_manager.processor,
+            preferred_name=get_serving().hf_chat_template_name,
+        )
