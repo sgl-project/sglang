@@ -129,10 +129,11 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len. The gather spans the TP group, whose ranks are
-        # laid out DP-major over attn_cp_size * attn_tp_size.
+        # waiting_queue_len, queue_timeout_expired. The gather spans the TP
+        # group, whose ranks are laid out DP-major over
+        # attn_cp_size * attn_tp_size.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -184,6 +185,14 @@ class PrefillDelayer:
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
+        # Each rank starts its own delay timer, so the deadline is checked
+        # locally and then decided from TP0's view like every other input.
+        local_queue_timeout_expired = (
+            self._queue_trigger_enabled
+            and prev_state is not None
+            and (time.perf_counter() - prev_state.start_time) * 1000.0
+            >= self._max_delay_ms
+        )
 
         # Gather global states
         tp0_info = self._gather_info(
@@ -192,12 +201,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            queue_timeout_expired=local_queue_timeout_expired,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_queue_timeout_expired = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -248,29 +259,34 @@ class PrefillDelayer:
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
             # Queue-based trigger: delay prefill until the waiting queue
-            # reaches queue_min = min(running_req * ratio, max_prefill_bs),
+            # reaches queue_min = running_req * ratio, capped by
+            # prefill_max_requests when a request limit is configured, and
             # capped by a wall-clock timeout to bound worst-case TTFT.
             # Targets workloads where decode requests finish one-at-a-time
             # and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
-                queue_capacity = (
-                    self._prefill_max_requests
-                    if self._prefill_max_requests is not None
-                    else global_max_prefill_bs_max
+                queue_min_effective = int(
+                    global_running_batch_max * self._queue_min_ratio
                 )
-                queue_min_effective = min(
-                    int(global_running_batch_max * self._queue_min_ratio),
-                    queue_capacity,
-                )
+                if self._prefill_max_requests is not None:
+                    # Never wait for more requests than one prefill batch may
+                    # admit. Only a static limit may cap the threshold: the
+                    # observed max_prefill_bs is a high-watermark over recent
+                    # attempts, and a delayed pass feeds it a waiting-queue
+                    # estimate, so capping by it collapses the threshold from
+                    # inside the very delay it is supposed to bound.
+                    queue_min_effective = min(
+                        queue_min_effective, self._prefill_max_requests
+                    )
                 queue_condition = (
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                # Ranks whose own clocks straddle the deadline would
+                # otherwise pick prefill and decode on the same pass.
+                if queue_condition and global_queue_timeout_expired.max().item() > 0:
+                    queue_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -280,9 +296,23 @@ class PrefillDelayer:
             if slot_condition or queue_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
+                # The one-shot bypass belongs to that merge, so a queue-only
+                # trigger must not consume it - and must not be skipped by it.
+                if self.skip_first_delayer and slot_condition:
                     self.skip_first_delayer = False
                     pass
+                elif queue_condition:
+                    # A queue-triggered delay is bounded by max_delay_ms alone:
+                    # queue_condition above already turns false once the wall
+                    # clock expires, so max_delay_passes must not cut it short.
+                    next_state = prev_state or _State()
+                    next_state = next_state.bump_delayed_count()
+                    return _NegotiateOutput(
+                        next_state=next_state,
+                        output_allow=False,
+                        output_reason="delay",
+                        **debug_info,
+                    )
                 else:
                     # Bound the wait like the "mixed" branch: on a saturated
                     # engine slot_condition may never turn false, so cap the
@@ -359,6 +389,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        queue_timeout_expired: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -367,6 +398,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                int(queue_timeout_expired),
             ],
             device=self._gather_device,
             dtype=torch.int64,

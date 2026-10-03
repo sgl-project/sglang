@@ -55,7 +55,7 @@ class TestPrefillDelayerGather(CustomTestCase):
                 parallel = get_parallel()
                 dp_groups = parallel.num_dp_ranks if parallel.attn_dp_enabled else 1
                 ranks_per_dp_group = parallel.tp_size // dp_groups
-                local = torch.tensor([1, 0, 3, 4, 5])
+                local = torch.tensor([1, 0, 3, 4, 5, 0])
                 expected = torch.stack(
                     [local + 100 * g * ranks_per_dp_group for g in range(dp_groups)]
                 )
