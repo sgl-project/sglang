@@ -1553,7 +1553,20 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
-        if not self.use_mla:
+        # Hybrid-pool models (e.g. Glm5Next full-attn layers inside a hybrid
+        # linear/full layout) call this backend in plain-MHA form: q/k/v share
+        # the head count and q_rope is absent. Route such calls to the standard
+        # MHA path even when the backend is MLA-enabled, mirroring the triton
+        # backend's per-call form dispatch. Absorbed-MLA calls keep k as a
+        # single latent head (or pass q_rope), which never matches this
+        # predicate, so DeepSeek-style MLA behavior is unchanged (#42012).
+        mha_form = (
+            q_rope is None
+            and k is not None
+            and k.dim() == 3
+            and k.shape[1] == layer.tp_q_head_num
+        )
+        if not self.use_mla or mha_form:
             # Do multi-head attention
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
@@ -1965,7 +1978,12 @@ class FlashAttentionBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if not self.use_mla:
+                if not self.use_mla or (
+                    q_rope is None
+                    and k is not None
+                    and k.dim() == 3
+                    and k.shape[1] == layer.tp_q_head_num
+                ):
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(
@@ -2063,7 +2081,13 @@ class FlashAttentionBackend(AttentionBackend):
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
-        if not self.use_mla:
+        mha_form = (
+            q_rope is None
+            and k is not None
+            and k.dim() == 3
+            and k.shape[1] == layer.tp_q_head_num
+        )
+        if not self.use_mla or mha_form:
             # Do multi-head attention
 
             key_cache, value_cache = self.get_paged_mha_kv_cache(
