@@ -73,9 +73,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    checkpoint_kv_cache,
     kv_to_page_indices,
     kv_to_page_num,
-    maybe_cache_unfinished_req,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -513,7 +513,12 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+                    (
+                        req.prefill_attempt_count
+                        < get_disagg().optimistic_prefill_attempts
+                        or get_disagg().disaggregation_decode_allocation_policy
+                        == "prefill_complete"
+                    )
                     and not req.is_retracted  # engine paused
                     and not (
                         _uses_write_through_cache(self.scheduler.tree_cache)
@@ -581,15 +586,13 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
-    def cache_unfinished_disagg_prefill(
-        self: Scheduler, req: Req, *, chunked: bool = False
-    ) -> None:
+    def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
-            cache.advance_unpublished_req(req, chunked=chunked)
+            cache.advance_unpublished_req(req)
             return
 
-        maybe_cache_unfinished_req(req, cache, chunked=chunked)
+        checkpoint_kv_cache(req, cache)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -897,7 +900,7 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                self.cache_unfinished_disagg_prefill(req)
+                self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -931,6 +934,11 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
+                if (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    == "prefill_complete"
+                ):
+                    req.disagg_kv_sender.mark_prefill_complete()
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -1140,6 +1148,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if req.finished_reason is None:
+            req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1228,7 +1238,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-            self.cache_unfinished_disagg_prefill(req)
+            self.checkpoint_disagg_prefill(req)
             return True
         else:
             raise RuntimeError(
@@ -1255,13 +1265,17 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            self.cache_unfinished_disagg_prefill(req, chunked=True)
+            self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
-                elif self.has_bootstrapped_waiting_req():
+                elif (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete"
+                    and self.has_bootstrapped_waiting_req()
+                ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
                     if not self.enable_overlap:
@@ -1555,7 +1569,7 @@ class SchedulerDisaggregationPrefillMixin:
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
         if not uses_write_through_cache:
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
         # The cached prefix is evictable once the KV is released. Its length
         # (capped at what a retry can match) seeds the retry's storage baseline,
         # so an evicted prefix is looked up in L3 once before it is recomputed.
@@ -1568,11 +1582,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        # Mamba insertion donates the checkpoint and clears its sequence marker.
-        is_insert = (
-            not uses_write_through_cache and not self.tree_cache.supports_mamba()
-        )
-        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        # The checkpoint above already handed the prefill KV to the tree; the
+        # request is not finished, so the release only frees the rest.
+        release_kv_cache(req, self.tree_cache, is_insert=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
@@ -1588,7 +1600,11 @@ class SchedulerDisaggregationPrefillMixin:
         # A fresh lookup budget for the new attempt, as after a retraction.
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = yielded_prefix_len or None
-        if req.prefill_attempt_count >= max_attempts:
+        if (
+            req.prefill_attempt_count >= max_attempts
+            and get_disagg().disaggregation_decode_allocation_policy
+            != "prefill_complete"
+        ):
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
                 "falling back to bootstrap queue"

@@ -5,6 +5,7 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
+pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;

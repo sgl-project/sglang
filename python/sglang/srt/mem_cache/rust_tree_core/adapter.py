@@ -726,7 +726,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
-                chunked=params.chunked,
+                inserted_len=params.inserted_len,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
                 rotation_base=params.rotation_base,
