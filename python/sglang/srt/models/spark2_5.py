@@ -139,8 +139,7 @@ class Spark2_5Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("q_k_v_proj", prefix),
         )
         if self.headwise_attn_output_gate:
