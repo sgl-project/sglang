@@ -18,6 +18,7 @@ module collapses to a thin wrapper that delegates to it.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from itertools import chain
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
@@ -294,6 +295,18 @@ class MiniCPMV4_6ImageProcessor:
         }
 
 
+@dataclass(frozen=True)
+class MiniCPMVMediaProfile:
+    """Image preprocessing settings resolved for a single request."""
+
+    image_processor: MiniCPMV4_6ImageProcessor
+    downsample_mode: str
+
+    @property
+    def pad_divisor(self) -> int:
+        return 4 if self.downsample_mode == "4x" else 16
+
+
 class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
     """4.6-only mm processor.
 
@@ -305,6 +318,30 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV4_6ForConditionalGeneration]
     support_dynamic_frame_expansion = False
     gpu_image_decode = False
+
+    def _build_image_processor(self, patch_size, downsample_mode, max_slice_nums):
+        return MiniCPMV4_6ImageProcessor(
+            max_slice_nums=max_slice_nums,
+            scale_resolution=448,
+            patch_size=patch_size,
+            slice_mode=True,
+            downsample_mode=downsample_mode,
+            use_image_id=True,
+        )
+
+    def _media_profile(self, request_obj) -> MiniCPMVMediaProfile:
+        """Image preprocessing settings for one request.
+
+        Everything that depends on them is threaded through as an argument
+        rather than swapped onto ``self``: requests are preprocessed
+        concurrently, so per-request state on the processor instance would leak
+        across them.
+        """
+        return self.default_media_profile
+
+    @staticmethod
+    def _pad_divisor(downsample_mode: str) -> int:
+        return 4 if downsample_mode == "4x" else 16
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -319,16 +356,18 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             getattr(vision_cfg, "patch_size", 14) if vision_cfg is not None else 14
         )
         downsample_mode = getattr(hf_config, "downsample_mode", "16x")
+        self.downsample_mode = downsample_mode
+        self.patch_size = patch_size
+
         # Per-image preprocessor; reused for video frames (HF ref's
         # video slicing geometry matches image slicing exactly).
-        self.image_processor = MiniCPMV4_6ImageProcessor(
-            max_slice_nums=9,
-            scale_resolution=448,
-            patch_size=patch_size,
-            slice_mode=True,
+        self.default_media_profile = MiniCPMVMediaProfile(
+            image_processor=self._build_image_processor(
+                patch_size, downsample_mode, max_slice_nums=9
+            ),
             downsample_mode=downsample_mode,
-            use_image_id=True,
         )
+        self.image_processor = self.default_media_profile.image_processor
 
         self.image_token = "<|image_pad|>"
         self.video_token = "<|video_pad|>"
@@ -353,8 +392,6 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self.slice_start_id = self._token_id(self.slice_start_token)
         self.slice_end_id = self._token_id(self.slice_end_token)
 
-        self.pad_divisor = 16 if downsample_mode != "4x" else 4
-
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.image_token,
             image_token_id=self.image_token_id,
@@ -375,19 +412,20 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self,
         tgt_sizes: List[List[int]],
         grid: List[int],
+        pad_divisor: int,
     ) -> str:
         """``<image>...</image>`` (+ optional ``<slice>...</slice>`` rows) for
         one image or video frame; inner pads are ``_PAD_PLACEHOLDER`` (caller
         swaps back after splicing).
         """
         h0, w0 = tgt_sizes[0]
-        n_src = (h0 * w0) // self.pad_divisor
+        n_src = (h0 * w0) // pad_divisor
         out = self.image_start_token + _PAD_PLACEHOLDER * n_src + self.image_end_token
 
         if len(tgt_sizes) > 1 and grid and grid[0] > 0 and grid[1] > 0:
             grid_y, grid_x = int(grid[0]), int(grid[1])
             h_s, w_s = tgt_sizes[1]
-            n_slice = (h_s * w_s) // self.pad_divisor
+            n_slice = (h_s * w_s) // pad_divisor
             slice_chunk = (
                 self.slice_start_token
                 + _PAD_PLACEHOLDER * n_slice
@@ -397,14 +435,24 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             out += "\n".join(row_chunks)
         return out
 
+    def _image_id_prefix(self, index: int, modality: Modality) -> str:
+        """``<image_id>{index}</image_id>`` in front of an image / video item.
+
+        4.7 drops it for videos; keeping it behind a hook lets the 4.7 processor
+        change only that without forking the expansion.
+        """
+        return f"{self.image_id_start_token}{index}{self.image_id_end_token}"
+
     def _expand_media(
         self,
         index: int,
         frames: Sequence[Tuple[List[List[int]], List[int]]],
+        modality: Modality = Modality.IMAGE,
+        pad_divisor: int = 16,
     ) -> str:
         """One image or one video. Image is a single-frame video."""
-        body = "".join(self._expand_frame(ts, grid) for ts, grid in frames)
-        return f"{self.image_id_start_token}{index}{self.image_id_end_token}" + body
+        body = "".join(self._expand_frame(ts, grid, pad_divisor) for ts, grid in frames)
+        return self._image_id_prefix(index, modality) + body
 
     async def process_mm_data_async(
         self,
@@ -433,19 +481,22 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         images = base.images or []
         videos = base.videos or []
 
+        profile = self._media_profile(request_obj)
+        pad_divisor = profile.pad_divisor
+
         # Image: one "frame" per image. Video: per-frame nesting kept so each
         # frame becomes its own ``<image>...</image>`` block in the expansion.
-        img_per_pv, img_per_ts, img_grids = self._preprocess_images(images)
-        vid_per_pv, vid_per_ts, vid_grids = self._preprocess_videos(videos)
+        img_per_pv, img_per_ts, img_grids = self._preprocess_images(images, profile)
+        vid_per_pv, vid_per_ts, vid_grids = self._preprocess_videos(videos, profile)
 
         prompt = self._splice_expansions(
             prompt,
             (
-                self._expand_media(i, [(ts, gd)])
+                self._expand_media(i, [(ts, gd)], Modality.IMAGE, pad_divisor)
                 for i, (ts, gd) in enumerate(zip(img_per_ts, img_grids))
             ),
             (
-                self._expand_media(i, list(zip(fts, fgd)))
+                self._expand_media(i, list(zip(fts, fgd)), Modality.VIDEO, pad_divisor)
                 for i, (fts, fgd) in enumerate(zip(vid_per_ts, vid_grids))
             ),
         )
@@ -464,6 +515,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
                 self.image_token_id,
                 _flatten_patches(img_per_pv, img_per_ts),
                 Modality.IMAGE,
+                profile,
             )
         )
         # Video: extra ``per-frame -> per-patch`` nesting; pre-flatten one
@@ -476,6 +528,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
                 self.video_token_id,
                 _flatten_patches(vid_pv_flat, vid_ts_flat),
                 Modality.VIDEO,
+                profile,
             )
         )
 
@@ -489,18 +542,20 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             slice_end_id=self.slice_end_id,
         )
 
-    def _preprocess_images(self, images):
+    def _preprocess_images(self, images, profile=None):
         if not images:
             return [], [], []
-        out = self.image_processor.preprocess(images)
+        profile = profile or self.default_media_profile
+        out = profile.image_processor.preprocess(images)
         return out["pixel_values"], out["tgt_sizes"], out["grids"]
 
-    def _preprocess_videos(self, videos):
+    def _preprocess_videos(self, videos, profile=None):
+        profile = profile or self.default_media_profile
         per_video_pv: List[List[List[torch.Tensor]]] = []
         per_video_ts: List[List[List[List[int]]]] = []
         per_video_grids: List[List[List[int]]] = []
         for frames in videos:
-            out = self.image_processor.preprocess(list(frames))
+            out = profile.image_processor.preprocess(list(frames))
             per_video_pv.append(out["pixel_values"])
             per_video_ts.append(out["tgt_sizes"])
             per_video_grids.append(out["grids"])
@@ -529,6 +584,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         pad_token_id: int,
         flat: Tuple[List[torch.Tensor], List[torch.Tensor]],
         modality: Modality,
+        profile: Optional[MiniCPMVMediaProfile] = None,
     ) -> List[MultimodalDataItem]:
         flat_pv, flat_ts = flat
         runs = self.get_mm_items_offset(input_ids, pad_token_id)
@@ -541,8 +597,12 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             MultimodalDataItem(
                 feature=[pv],
                 offsets=[run],
-                model_specific_data={"tgt_size": [ts]},
+                model_specific_data=self._item_specific_data(ts, profile),
                 modality=modality,
             )
             for run, pv, ts in zip(runs, flat_pv, flat_ts)
         ]
+
+    def _item_specific_data(self, tgt_size, profile) -> dict:
+        """Per-patch metadata handed to the model's vision tower."""
+        return {"tgt_size": [tgt_size]}
