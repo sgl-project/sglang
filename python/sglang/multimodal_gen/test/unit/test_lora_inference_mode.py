@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -49,3 +50,39 @@ def test_lora_merge_unmerge_handles_inference_base_weight():
     assert not layer.merged
     assert not layer.base_layer.weight.is_inference()
     assert torch.allclose(layer.base_layer.weight, base_weight)
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("with_offset", [False, True])
+def test_linear_lora_passthrough_preserves_eager_dispatch(merged, with_offset):
+    class EagerLinear(nn.Linear):
+        def forward(self, x):
+            # A compiled wrapper can choose a different GEMM or fuse the bias;
+            # disabling an adapter should preserve the base layer's dispatch.
+            output = super().forward(x)
+            # A value witness detects compiler dispatch even if Dynamo would
+            # otherwise graph-break around a Python assertion or a mock.
+            return output + 1 if torch.compiler.is_compiling() else output
+
+    base = EagerLinear(4, 3, bias=True)
+    layer = LinearWithLoRA(base, lora_rank=2, lora_alpha=2)
+    offset = torch.tensor([0.1, 0.2, 0.3]) if with_offset else None
+    if merged:
+        layer.set_lora_weights(
+            torch.ones(2, 4),
+            torch.full((3, 2), 0.5),
+            clear_existing=True,
+            merge_weights=True,
+            output_offset=offset,
+        )
+    elif with_offset:
+        layer.lora_output_offset = nn.Parameter(offset)
+        layer.has_lora_output_offset = True
+    x = torch.arange(8.0).view(2, 4)
+    for _ in range(2):
+        expected = base(x)
+        if merged and with_offset:
+            expected = expected + offset
+        torch.testing.assert_close(layer(x), expected, atol=0, rtol=0)
+        # Layerwise offload can rebind the weight between invocations.
+        base.weight = nn.Parameter(torch.randn_like(base.weight))
