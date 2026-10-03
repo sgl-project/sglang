@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import NamedTuple
@@ -561,13 +561,25 @@ def draft_model_build_scope():
         moe.in_speculative_scope = True
         # Boundaries capture this resolved preference while the draft builds.
         # Restoring it cannot change an already constructed target plan.
-        with get_exec().comm.override(
-            boundary_reduction=get_spec().speculative_boundary_reduction
+        with (
+            get_exec().comm.override(
+                boundary_reduction=get_spec().speculative_boundary_reduction
+            ),
+            _draft_w4a4_mxfp4_megamoe_override(),
         ):
             yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
+
+
+def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
+    # FusedMoE pins its MegaMoE MMA type at construction, so the draft's layers
+    # keep this value after the scope exits.
+    draft_w4a4 = get_spec().speculative_enable_w4a4_mxfp4_megamoe
+    if draft_w4a4 is None:
+        return nullcontext()
+    return get_exec().moe.override(enable_w4a4_mxfp4_megamoe=draft_w4a4)
 
 
 def install_shared_experts_fusion_decision(
