@@ -6,6 +6,7 @@ import pytest
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
+    _normalize_prefill_capture_num_tokens,
     capture_decode_graph,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
@@ -13,6 +14,26 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize(
+    ("buckets", "alignment", "max_tokens", "expected"),
+    [
+        ([4, 12, 20, 28], 8, 32, [8, 16, 24, 32]),
+        ([1, 7, 8], 8, 8, [8]),
+        ([4, 12, 20, 28], 8, 30, [8, 16, 24]),
+        ([4, 12, 20, 28], 1, 100, [4, 12, 20, 28]),
+    ],
+)
+def test_normalize_prefill_capture_num_tokens(buckets, alignment, max_tokens, expected):
+    assert (
+        _normalize_prefill_capture_num_tokens(
+            buckets,
+            alignment=alignment,
+            max_capture_tokens=max_tokens,
+        )
+        == expected
+    )
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
