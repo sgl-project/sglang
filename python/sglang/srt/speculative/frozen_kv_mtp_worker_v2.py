@@ -450,6 +450,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.device,
             )
 
         spec_info = batch.spec_info
