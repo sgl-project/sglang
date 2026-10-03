@@ -342,5 +342,24 @@ class TestResolution:
                 _resolve()
 
 
+class TestLoraMoeRunnerBackend:
+    def test_lora_backend_predicates_are_exclusive(self):
+        # LoRA vendors must not enter the plain vendor dispatch paths.
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        for backend in (MoeRunnerBackend.LORA_TRITON,):
+            assert backend.is_lora()
+        assert not MoeRunnerBackend.LORA_TRITON.is_triton()
+        assert not MoeRunnerBackend.DEEP_GEMM.is_lora()
+        assert not MoeRunnerBackend.TRITON.is_lora()
+
+    def test_backend_values_are_valid_cli_choices(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.server_args import MOE_RUNNER_BACKEND_CHOICES
+
+        for backend in (MoeRunnerBackend.LORA_TRITON,):
+            assert backend.value in MOE_RUNNER_BACKEND_CHOICES
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

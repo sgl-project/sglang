@@ -253,6 +253,89 @@ class TestSharedOuterFinalize(CustomTestCase):
                 workspace.tensor.assert_not_called()
                 self.assertEqual(self.calls.mock_calls, [])
 
+    def test_runner_delegates_both_shared_families_and_preserves_materialized(self):
+        # Compile the real method without importing the runner's GPU dependencies.
+        source = _function((LORA_MOE / "runner.py").read_text(), "_run_finalize")
+        namespace = {"FinalizeFamily": self.family, "torch": torch}
+        exec("from __future__ import annotations\n" + source, namespace)
+        run = namespace["_run_finalize"]
+        owner = SimpleNamespace(
+            workspace=self.workspace,
+            top_k=3,
+            hidden_size=5,
+            routed_scaling_factor=2.5,
+        )
+        batch = SimpleNamespace(down_lora_b=torch.empty((2, 1, 5, 2)))
+        topk = SimpleNamespace(
+            topk_ids=torch.zeros((3, 3), dtype=torch.int32),
+            topk_weights=self.args["topk_weights"],
+        )
+        delta = torch.empty((9, 5))
+        for family, into_base in (
+            (self.family.SHARED_ONE_PASS, False),
+            (self.family.SHARED_TOKEN_DELTA, False),
+            (self.family.MATERIALIZED, False),
+            (self.family.MATERIALIZED, True),
+        ):
+            with self.subTest(family=family, into_base=into_base):
+                provider = mock.Mock()
+                routes = SimpleNamespace(
+                    raw=mock.Mock(return_value=self.args["routing"]),
+                    shared_token=self.args["token_route"],
+                )
+                plan = SimpleNamespace(
+                    finalize=SimpleNamespace(family=family, is_shared_outer=True),
+                    down_b_into_base=into_base,
+                )
+                result = run(
+                    owner,
+                    plan,
+                    self.config,
+                    provider,
+                    routes,
+                    self.row_state,
+                    self.args["output"],
+                    self.args["down_rows"],
+                    self.args["bridge"],
+                    delta,
+                    topk,
+                    batch,
+                    3,
+                )
+                self.assertIs(result, self.args["output"])
+                if family is self.family.MATERIALIZED:
+                    provider.finalize.assert_called_once()
+                    provider.shared_outer_finalize.assert_not_called()
+                    routes.raw.assert_not_called()
+                    actual_delta = provider.finalize.call_args.kwargs["lora_delta"]
+                    if into_base:
+                        self.assertIsNone(actual_delta)
+                    else:
+                        self.assertEqual(actual_delta.shape, (3, 3, 5))
+                        self.assertEqual(actual_delta.data_ptr(), delta.data_ptr())
+                else:
+                    provider.finalize.assert_not_called()
+                    provider.shared_outer_finalize.assert_called_once()
+                    routes.raw.assert_called_once_with(True)
+                    call = provider.shared_outer_finalize.call_args
+                    self.assertIs(call.args[0], self.row_state)
+                    for name in (
+                        "down_rows",
+                        "bridge",
+                        "routing",
+                        "topk_weights",
+                        "output",
+                        "workspace",
+                        "launch_config",
+                        "token_route",
+                    ):
+                        self.assertIs(call.kwargs[name], self.args[name])
+                    self.assertIs(call.kwargs["family"], family)
+                    self.assertEqual(call.kwargs["b_down"].shape, (2, 5, 2))
+                    self.assertEqual(
+                        call.kwargs["b_down"].data_ptr(), batch.down_lora_b.data_ptr()
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
