@@ -127,7 +127,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
     double eps,
     int64_t head_dim,
     int64_t num_head);
-
+// pack qkv
+void pack_qkv_destination_major_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& output);
 // speculative decoding
 void verify_tree_greedy_cpu(
     at::Tensor predicts,
@@ -509,17 +511,23 @@ at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, c
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
-// shared mmeory all_reduce
-void shm_allreduce(at::Tensor& data, int64_t op);
+// group shared memory init
+int64_t shm_group_initialize(const std::string& group_name, int64_t group_size, int64_t group_rank);
+
+// shared memory all_reduce
+void shm_allreduce(at::Tensor& data, int64_t op, int64_t handle = -1);
 
 // shared memory all_gather
-at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
+at::Tensor shm_allgather(at::Tensor& data, int64_t dim, int64_t handle = -1);
+
+// group shared memory all_to_all
+void shm_alltoall(at::Tensor& output_tensor, at::Tensor& data, int64_t handle);
 
 // shared memory all_gather_into_tensor
-void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
+void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t handle = -1);
 
 // shared memory reduce_scatter_tensor
-void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
+void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -943,16 +951,31 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
   m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
-  // all reduce
+  // shared memory
   m.def("initialize(int size, int rank) -> ()");
-  m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
+
+  // all_reduce
+  m.def("shm_allreduce(Tensor(a!) data, int reduce_op, int handle=-1) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
-  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
+
+  // all_gather
+  m.def("shm_allgather(Tensor data, int dim, int handle=-1) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
-  m.def("shm_allgather_into_tensor(Tensor(a!) output_tensor, Tensor data) -> ()");
+
+  // all_gather_into_tensor
+  m.def("shm_allgather_into_tensor(Tensor(a!) output_tensor, Tensor data, int handle=-1) -> ()");
   m.impl("shm_allgather_into_tensor", torch::kCPU, &shm_allgather_into_tensor);
-  m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
+
+  // reduce_scatter_tensor
+  m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op, int handle=-1) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
+
+  // explicit group context initialization
+  m.def("shm_group_initialize(str group_name, int group_size, int group_rank) -> int");
+
+  // all_to_all
+  m.def("shm_alltoall(Tensor(a!) output_tensor, Tensor data, int handle) -> ()");
+  m.impl("shm_alltoall", torch::kCPU, &shm_alltoall);
 
   // rope
   m.def(
@@ -1023,11 +1046,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // raw base pointers), which schema-level alias annotations cannot express.
   m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
   m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
+  // pack qkv
+  m.def("pack_qkv_destination_major_cpu(Tensor q, Tensor k, Tensor v, int world_size, Tensor(a!) output) -> ()");
+  m.impl("pack_qkv_destination_major_cpu", torch::kCPU, &pack_qkv_destination_major_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
   m.impl("initialize", &initialize);
+  m.impl("shm_group_initialize", &shm_group_initialize);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -43,42 +43,42 @@ void initialize(int64_t size, int64_t rank) {
   }
 
   if (all_ranks_local_p) {
-    shm_initialize(size, rank, addr_string, port_string);
+    shm_default_initialize(size, rank, addr_string, port_string);
   }
 }
 
-void shm_allreduce(torch::Tensor& data, int64_t op) {
+void shm_allreduce(torch::Tensor& data, int64_t op, int64_t handle) {
   TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
 
   auto numel = data.numel();
   int data_size = numel * data.element_size();
-  all_reduce_outer_loop(data, numel, data_size);
 
-  return;
+  all_reduce_outer_loop(data, numel, data_size, handle);
 }
 
-torch::Tensor shm_allgather(torch::Tensor& data, int64_t dim) {
+torch::Tensor shm_allgather(torch::Tensor& data, int64_t dim, int64_t handle) {
   auto numel = data.numel();
   int data_size = numel * data.element_size();
   if (dim < 0) {
     dim += data.dim();
   }
+  int64_t group_size = handle == -1 ? world_size : shm_get_group_size(handle);
   std::vector<int64_t> result_shape = data.sizes().vec();
-  result_shape[dim] *= world_size;
+  result_shape[dim] *= group_size;
   torch::Tensor result_tensor = torch::empty(result_shape, data.options());
-  return all_gather<STATE_GROUP_ALL_GATHER>(result_tensor, data, dim, numel, data_size);
+  return all_gather<STATE_GROUP_ALL_GATHER>(result_tensor, data, dim, numel, data_size, handle);
 }
 
-void shm_allgather_into_tensor(torch::Tensor& output_tensor, torch::Tensor& data) {
+void shm_allgather_into_tensor(torch::Tensor& output_tensor, torch::Tensor& data, int64_t handle) {
   RECORD_FUNCTION("sgl-kernel::shm_allgather_into_tensor", std::vector<c10::IValue>({data}));
 
   auto numel = data.numel();
   int data_size = numel * data.element_size();
   int64_t dim = 0;
-  all_gather<STATE_GROUP_ALL_GATHER_INTO_TENSOR>(output_tensor, data, dim, numel, data_size);
+  all_gather<STATE_GROUP_ALL_GATHER_INTO_TENSOR>(output_tensor, data, dim, numel, data_size, handle);
 }
 
-void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op) {
+void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle) {
   RECORD_FUNCTION("sgl-kernel::shm_reduce_scatter_tensor", std::vector<c10::IValue>({data}));
 
   TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
@@ -86,7 +86,12 @@ void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
   auto numel = data.numel();
   int data_size = numel * data.element_size();
 
-  reduce_scatter_outer_loop(output_tensor, data, numel, data_size);
+  reduce_scatter_outer_loop(output_tensor, data, numel, data_size, handle);
+}
 
-  return;
+void shm_alltoall(torch::Tensor& output_tensor, torch::Tensor& input_tensor, int64_t handle) {
+  RECORD_FUNCTION("sgl_kernel::shm_alltoall", std::vector<c10::IValue>({input_tensor}));
+  size_t data_size = input_tensor.numel() * input_tensor.element_size();
+  all_to_all(
+      static_cast<char*>(output_tensor.data_ptr()), static_cast<char*>(input_tensor.data_ptr()), data_size, handle);
 }
