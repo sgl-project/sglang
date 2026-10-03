@@ -155,6 +155,29 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
 
+    def verify(self):
+        """Validate that all set fields conform to expected types."""
+        if self.id is not None and not isinstance(self.id, str):
+            raise ValueError(f"session id must be a string, got {type(self.id).__name__}.")
+        if self.rid is not None and not isinstance(self.rid, str):
+            raise ValueError(f"session rid must be a string, got {type(self.rid).__name__}.")
+        if self.offset is not None and (
+            not isinstance(self.offset, int) or isinstance(self.offset, bool)
+        ):
+            raise ValueError(
+                f"session offset must be an integer, got {type(self.offset).__name__}."
+            )
+        if self.replace is not None and not isinstance(self.replace, bool):
+            raise ValueError(
+                f"session replace must be a boolean, got {type(self.replace).__name__}."
+            )
+        if self.drop_previous_output is not None and not isinstance(
+            self.drop_previous_output, bool
+        ):
+            raise ValueError(
+                f"session drop_previous_output must be a boolean, got {type(self.drop_previous_output).__name__}."
+            )
+
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
@@ -465,6 +488,19 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
+        if self.session_params is not None:
+            if isinstance(self.session_params, dict):
+                pass
+            elif isinstance(self.session_params, list):
+                for item in self.session_params:
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            f"Each item in session_params must be a dictionary, got {type(item).__name__}."
+                        )
+            else:
+                raise ValueError(
+                    f"session_params must be a dictionary, list of dictionaries, or None, got {type(self.session_params).__name__}."
+                )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -562,6 +598,16 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if self.lora_id is not None and not isinstance(self.lora_id, str):
+            raise ValueError(
+                f"lora_id should be a string or None for a single request, got {type(self.lora_id).__name__}."
+            )
+        if self.positional_embed_overrides is not None and not isinstance(
+            self.positional_embed_overrides, PositionalEmbeds
+        ):
+            raise ValueError(
+                f"positional_embed_overrides must be an instance of PositionalEmbeds, got {type(self.positional_embed_overrides).__name__}."
+            )
         for field_name in ("extra_key", "cache_salt"):
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
@@ -589,6 +635,8 @@ class GenerateReqInput:
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_lora_ids(num)
+        self._normalize_positional_embed_overrides(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -630,6 +678,48 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_lora_ids(self, num):
+        """Normalize LoRA IDs for batch processing."""
+        if self.lora_id is not None:
+            if isinstance(self.lora_id, str):
+                self.lora_id = [self.lora_id] * num
+            elif isinstance(self.lora_id, list):
+                if len(self.lora_id) != self.batch_size:
+                    raise ValueError(
+                        f"The length of lora_id ({len(self.lora_id)}) must match batch size ({self.batch_size})."
+                    )
+                for item in self.lora_id:
+                    if item is not None and not isinstance(item, str):
+                        raise ValueError(
+                            f"Each lora_id in the list must be a string or None, got {type(item).__name__}."
+                        )
+                self.lora_id = self.lora_id * self.parallel_sample_num
+            else:
+                raise ValueError("lora_id should be a list or a string.")
+
+    def _normalize_positional_embed_overrides(self, num):
+        """Normalize positional embed overrides for batch processing."""
+        if self.positional_embed_overrides is not None:
+            if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+                self.positional_embed_overrides = [self.positional_embed_overrides] * num
+            elif isinstance(self.positional_embed_overrides, list):
+                if len(self.positional_embed_overrides) != self.batch_size:
+                    raise ValueError(
+                        f"The length of positional_embed_overrides ({len(self.positional_embed_overrides)}) must match batch size ({self.batch_size})."
+                    )
+                for item in self.positional_embed_overrides:
+                    if item is not None and not isinstance(item, PositionalEmbeds):
+                        raise ValueError(
+                            f"Each item in positional_embed_overrides must be an instance of PositionalEmbeds or None, got {type(item).__name__}."
+                        )
+                self.positional_embed_overrides = (
+                    self.positional_embed_overrides * self.parallel_sample_num
+                )
+            else:
+                raise ValueError(
+                    f"positional_embed_overrides must be an instance of PositionalEmbeds or a list, got {type(self.positional_embed_overrides).__name__}."
+                )
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -1308,6 +1398,16 @@ class EmbeddingReqInput:
             if self.sampling_params is None:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 0
+            if self.lora_id is not None and not isinstance(self.lora_id, str):
+                raise ValueError(
+                    f"lora_id should be a string or None for a single request, got {type(self.lora_id).__name__}."
+                )
+            if self.positional_embed_overrides is not None and not isinstance(
+                self.positional_embed_overrides, PositionalEmbeds
+            ):
+                raise ValueError(
+                    f"positional_embed_overrides must be an instance of PositionalEmbeds, got {type(self.positional_embed_overrides).__name__}."
+                )
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
@@ -1322,6 +1422,8 @@ class EmbeddingReqInput:
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
+            self._normalize_lora_ids(self.batch_size)
+            self._normalize_positional_embed_overrides(self.batch_size)
 
         self._validate_rid_uniqueness()
 
@@ -1337,6 +1439,44 @@ class EmbeddingReqInput:
                     )
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_lora_ids(self, num):
+        """Normalize LoRA IDs for batch processing."""
+        if self.lora_id is not None:
+            if isinstance(self.lora_id, str):
+                self.lora_id = [self.lora_id] * num
+            elif isinstance(self.lora_id, list):
+                if len(self.lora_id) != num:
+                    raise ValueError(
+                        f"lora_id list length ({len(self.lora_id)}) must match batch size ({num})"
+                    )
+                for item in self.lora_id:
+                    if item is not None and not isinstance(item, str):
+                        raise ValueError(
+                            f"Each lora_id in the list must be a string or None, got {type(item).__name__}."
+                        )
+            else:
+                raise ValueError("lora_id should be a list or a string.")
+
+    def _normalize_positional_embed_overrides(self, num):
+        """Normalize positional embed overrides for batch processing."""
+        if self.positional_embed_overrides is not None:
+            if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+                self.positional_embed_overrides = [self.positional_embed_overrides] * num
+            elif isinstance(self.positional_embed_overrides, list):
+                if len(self.positional_embed_overrides) != num:
+                    raise ValueError(
+                        f"positional_embed_overrides list length ({len(self.positional_embed_overrides)}) must match batch size ({num})"
+                    )
+                for item in self.positional_embed_overrides:
+                    if item is not None and not isinstance(item, PositionalEmbeds):
+                        raise ValueError(
+                            f"Each item in positional_embed_overrides must be an instance of PositionalEmbeds or None, got {type(item).__name__}."
+                        )
+            else:
+                raise ValueError(
+                    f"positional_embed_overrides must be an instance of PositionalEmbeds or a list, got {type(self.positional_embed_overrides).__name__}."
+                )
 
     def contains_mm_input(self) -> bool:
         return (
