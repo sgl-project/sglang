@@ -42,6 +42,9 @@ class BaseOffloader(ABC):
     def post_init(self):
         pass
 
+    def place_on_host(self, param: torch.nn.Parameter) -> bool:
+        return False
+
     @property
     def forbid_copy_engine_usage(self):
         return False
@@ -74,6 +77,20 @@ def create_offloader():
         assert get_exec().offload.cpu_offload_gb == 0, (
             "V2 offload does not support cpu_offload_gb yet"
         )
+        if get_exec().offload.offload_mode == "disk":
+            from sglang.srt.utils.disk_offloader import DiskOffloader
+
+            if isinstance(_instance, DiskOffloader):
+                return _instance
+            return DiskOffloader(
+                group_size=get_exec().offload.offload_group_size,
+                num_in_group=get_exec().offload.offload_num_in_group,
+                prefetch_step=get_exec().offload.offload_prefetch_step,
+                storage_dir=get_exec().offload.offload_disk_dir,
+                host_cache_bytes=int(
+                    get_exec().offload.offload_host_cache_gb * 1024**3
+                ),
+            )
         return OffloaderV2(
             group_size=get_exec().offload.offload_group_size,
             num_in_group=get_exec().offload.offload_num_in_group,

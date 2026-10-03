@@ -44,7 +44,10 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
-from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.memory_hook import (
+    handle_disk_offload,
+    handle_gpu_memory_settings,
+)
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -175,6 +178,12 @@ class TestPrepareServerArgs(CustomTestCase):
                     ple_offload_embedding=True,
                     **generic_offload,
                 ).resolve_once()
+
+    def test_disk_offload_disables_cuda_graph_and_overlap_schedule(self):
+        args = ServerArgs(model_path="dummy", offload_mode="disk", offload_group_size=1)
+        handle_disk_offload(args)
+        self.assertTrue(resolution_result(args, "disable_cuda_graph"))
+        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(

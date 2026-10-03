@@ -951,7 +951,22 @@ class ExecOffload(msgspec.Struct):
         int,
         "Steps to prefetch in offloading.",
     ] = 1
-    offload_mode: A[str, "Mode of offloading."] = "cpu"
+    offload_mode: A[
+        str,
+        "Mode of offloading. `disk` streams offloaded layers from pinned RAM "
+        "(up to --offload-host-cache-gb) and from files under --offload-disk-dir, "
+        "for models larger than GPU memory plus RAM.",
+    ] = "cpu"
+    offload_disk_dir: A[
+        str,
+        "Directory on a local SSD that holds the offloaded weights for "
+        "--offload-mode disk. Files are deleted when the server exits.",
+    ] = "/tmp/sglang-offload"
+    offload_host_cache_gb: A[
+        float,
+        "GiB of pinned RAM that keeps offloaded layers off the SSD for "
+        "--offload-mode disk.",
+    ] = 0.0
     ple_offload_embedding: A[
         Optional[bool],
         Arg(
