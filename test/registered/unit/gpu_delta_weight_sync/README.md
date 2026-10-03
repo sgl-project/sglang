@@ -33,7 +33,7 @@ python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
   --ignore=test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/manual/weight_sync/test_gpu_delta_codec.py
-python -m pytest -q test/manual/weight_sync/test_gpu_delta_host.py
+python -m pytest -q test/manual/weight_sync/test_gpu_delta_host_cuda.py
 ```
 
 Layout algebra, allocator admission, protocol and session tests run in the
