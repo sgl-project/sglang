@@ -747,6 +747,7 @@ class TestBeamLoading(CustomTestCase):
         try:
             torch.set_default_dtype(torch.bfloat16)
             with (
+                get_context().override_server_args(),
                 get_parallel().override(
                     moe_tp_size=1,
                     moe_ep_size=1,
@@ -847,11 +848,9 @@ class TestBeamDFlashCapture(CustomTestCase):
         norm = torch.nn.Linear(1, 1, bias=False)
         norm.weight.data.fill_(10)
         model = stub_beam_model([AddLayer(1), AddLayer(2), AddLayer(3)], norm, (0, 2))
-        for cpu_offload_gb in (0, 1):
-            with (
-                self.subTest(cpu_offload_gb=cpu_offload_gb),
-                get_context().override_server_args(cpu_offload_gb=cpu_offload_gb),
-            ):
+        for fuse_layers in (True, False):
+            with self.subTest(fuse_layers=fuse_layers):
+                model.fuse_layers = fuse_layers
                 hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
                 torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
                 torch.testing.assert_close(aux[0], torch.ones(2, 1))
@@ -861,8 +860,8 @@ class TestBeamDFlashCapture(CustomTestCase):
         norm = torch.nn.Linear(1, 1, bias=False)
         norm.weight.data.fill_(1)
         model = stub_beam_model([AddLayer(1)], norm, ())
-        with get_context().override_server_args(cpu_offload_gb=0):
-            hidden = model(torch.zeros(2, 1), torch.arange(2), None)
+        model.fuse_layers = True
+        hidden = model(torch.zeros(2, 1), torch.arange(2), None)
         torch.testing.assert_close(hidden, torch.ones(2, 1))
 
     def test_dflash_rejects_ambiguous_capture_order(self):

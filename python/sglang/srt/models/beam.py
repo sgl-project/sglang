@@ -220,12 +220,13 @@ class BeamMoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        # Offloading replaces parameters, but TopKConfig keeps an alias.
+        self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.float())
-            if get_exec().offload.cpu_offload_gb > 0:
-                # Offloading replaces parameters, but TopKConfig keeps an alias.
+            if self.refresh_correction_bias:
                 self.topk.topk_config.correction_bias = (
                     self.gate.e_score_correction_bias
                 )
@@ -509,6 +510,12 @@ class BeamModel(nn.Module):
         )
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
+        # Offload wrappers load weights through each layer's regular forward.
+        # Fusing across layer boundaries would bypass those wrappers.
+        self.fuse_layers = (
+            get_exec().offload.cpu_offload_gb <= 0
+            and get_exec().offload.offload_group_size <= 0
+        )
 
     def forward(
         self,
@@ -525,12 +532,7 @@ class BeamModel(nn.Module):
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
         aux_hidden_states = []
-        # Offload wrappers load weights through each layer's regular forward.
-        # Fusing across layer boundaries would bypass those wrappers.
-        if (
-            get_exec().offload.cpu_offload_gb <= 0
-            and get_exec().offload.offload_group_size <= 0
-        ):
+        if self.fuse_layers:
             return self._forward_fused(
                 positions, hidden_states, forward_batch, aux_hidden_states
             )
