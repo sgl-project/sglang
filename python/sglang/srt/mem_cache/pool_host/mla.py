@@ -261,15 +261,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             num_indexer_layers = getattr(self.device_pool, "num_indexer_layers", None)
             if num_indexer_layers is None:
                 num_indexer_layers = self.layer_num
+            index_k_dtype, index_scale_dtype = self._get_indexer_host_dtypes()
             size_per_token += (
                 self.device_pool.index_head_dim
-                * self.dtype.itemsize
+                * index_k_dtype.itemsize
                 * num_indexer_layers
             )
             if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                # FP32 quantization scale per token per indexer layer.
-                size_per_token += 4 * num_indexer_layers
+                # One quantization scale per token per indexer layer.
+                size_per_token += index_scale_dtype.itemsize * num_indexer_layers
         return size_per_token
+
+    def _get_indexer_host_dtypes(self):
+        return (
+            getattr(self.device_pool, "indexer_store_dtype", self.dtype),
+            getattr(self.device_pool, "indexer_scale_dtype", None) or torch.float32,
+        )
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -310,6 +317,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if num_indexer_layers is None:
                 num_indexer_layers = self.layer_num
             indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
+            index_k_dtype, index_scale_dtype = self._get_indexer_host_dtypes()
             alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
             if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
                 # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
@@ -335,12 +343,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         * self.page_size
                         * num_indexer_layers
                         * self.device_pool.index_head_dim
-                        * self.dtype.itemsize
+                        * index_k_dtype.itemsize
                     )
                 if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                    # FP32 scale mirror
                     total_bytes += (
-                        self.page_num * self.page_size * num_indexer_layers * 4
+                        self.page_num
+                        * self.page_size
+                        * num_indexer_layers
+                        * index_scale_dtype.itemsize
                     )
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
@@ -362,7 +372,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, self.device_pool.index_head_dim),
-                    dtype=self.dtype,
+                    dtype=index_k_dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -374,7 +384,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
                 self.index_k_scale_buffer = alloc_func(
                     (*indexer_dims, 1),
-                    dtype=torch.float32,
+                    dtype=index_scale_dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
