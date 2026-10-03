@@ -10547,6 +10547,9 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         cache._prefetch_occupied_span.side_effect = lambda key, indices: (
             UnifiedRadixCache._prefetch_occupied_span(cache, key, indices)
         )
+        cache._retire_ongoing_prefetch.side_effect = lambda *args: (
+            UnifiedRadixCache._retire_ongoing_prefetch(cache, *args)
+        )
         controller = cache.cache_controller
         controller.terminate_prefetch.return_value = (4, None)
         controller.prefetch_tokens_occupied = 12

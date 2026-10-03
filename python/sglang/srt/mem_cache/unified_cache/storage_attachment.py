@@ -384,26 +384,10 @@ class StorageAttachment:
                     cache.revoke_pending_prefetch(handle)
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
-                del cache.ongoing_prefetch[handle]
-                if info.anchor_lock_params is not None:
-                    cache.dec_host_lock_ref(
-                        info.anchor_node_id, info.anchor_lock_params
-                    )
-                if cache.buffer_pipeline is not None:
-                    cache.buffer_pipeline.pop_prefix_ctx(handle)
-                    cache.buffer_pipeline.release_anchor_lock(handle)
-                controller.append_host_mem_release(
-                    host_indices=info.host_indices[:completed_tokens],
-                    extra_pools=[
-                        x for xfers in info.comp_xfers.values() for x in xfers
-                    ],
-                )
-                controller.prefetch_tokens_occupied = max(
-                    0,
-                    controller.prefetch_tokens_occupied
-                    - cache._prefetch_occupied_span(
-                        info.prefetch_key, info.host_indices
-                    ),
+                cache._retire_ongoing_prefetch(
+                    handle,
+                    info.host_indices[:completed_tokens],
+                    [x for xfers in info.comp_xfers.values() for x in xfers],
                 )
             except Exception:
                 logger.exception("Failed to release pending prefetch %s", handle.rid)
