@@ -6,18 +6,25 @@ Torch byte transforms cover CuTe DSL NVFP4 expert layouts and BF16 dense storage
 the standalone MegaMoE transform helper does not admit an integrated MegaMoE
 runtime on this branch.
 
-Canonical names, shapes and dtypes are observed once at the common checkpoint
-loader boundary, before model-specific transforms. The observer retains no tensor
-values and invalidates the layout on later ordinary reloads, including failed or
-partial loads. Model classes need no delta hook; loaders that bypass this boundary
-are not admitted. Layout/backend support remains a separate check.
+Canonical names, shapes and dtypes come from the original immutable local
+safetensors checkpoint headers at first delta admission. The feature supports the
+standard checkpoint loader and its selected target/bundled-MTP files; custom,
+secondary or transformed sources are outside this contract. It does not wrap
+model methods or change ordinary checkpoint loading. Packed live parameters alone
+cannot recover the canonical source inventory.
 
-HTTP routes, tokenizer session coordination and scheduler control handlers live
-under `srt/weight_sync/gpu_delta_*`. Shared managers retain only registration and
-dispatch/pause/resume hooks; generation handlers and the shared communicator remain
-unchanged. Preparation takes no model-update writer lock. Error handling stays at
-the HTTP/IPC and asynchronous task boundaries, with partial writes poisoning the
-session instead of attempting recovery.
+One Miles coordinator exclusively owns these engines' model updates, pause/resume,
+memory residency and topology for the stream's lifetime. Mixing another weight
+updater or administrative mutation into the same engine is unsupported. Ordinary
+APIs retain their existing behavior; this feature does not intercept them to
+implement a server-wide ownership lock. A stream starts with fresh engines and
+never automatically replays an uncertain XOR update.
+
+HTTP routes, tokenizer coordination and scheduler control handlers live under
+`srt/weight_sync/gpu_delta_*`. Shared integration consists of route, IPC schema,
+communicator and scheduler-handler registration. Preparation takes no model-update
+writer lock. Partial mutation poisons the delta session instead of attempting
+recovery or falling back to a different update path.
 
 ```bash
 python -m pytest -q \
@@ -46,10 +53,23 @@ Preparation reserves the largest required encoded/decoded tensor arenas. During
 apply, each required matrix tensor is uploaded from pinned host memory, decoded and
 applied before reusing those arenas. There is no staging selector or full-publication
 HBM copy. Every retained changed matrix frame is Snappy, including inputs whose
-compressed representation expands; there is no raw-frame fallback. After every original rank is prepared, the coordinator retracts generation and waits for actual
-`QUIESCED` receipts. Only then does `update_weights_from_delta` mutate weights.
-All original engines must commit before any resumes. A failure after possible
-mutation poisons the session and requires a fresh engine; no rollback is promised.
+compressed representation expands; there is no raw-frame fallback. Once every original rank reports `PREPARED`, Miles fans out
+`update_weights_from_delta`. Each local handler closes generation admission,
+pauses scheduling, fences existing readers, retracts requests, flushes caches and
+applies the delta. It returns `APPLIED` only after GPU completion and decoder
+checks. Miles waits for all original ranks to apply, then sends
+`resume_weights_from_delta` with their compact apply receipts. Resume records the
+new version and reopens generation after successful local acknowledgments.
+
+There is no separate global quiesce or commit round. A participant may apply
+before another fails to pause; failed or uncertain activation never authorizes
+resume, rollback or automatic replay. The update becomes unabortable before the
+reader fence starts. A failed fence must not reclaim KV/cache. Preparation can be
+aborted before update dispatch, while serving continues on the old version.
+
+The admitted topology uses ordinary globally ordered control broadcast. Local
+control broadcast and elastic EP joiners are unsupported. Delta application itself
+has no distributed collectives, and shared IPC weight storage is excluded.
 
 `WEIGHT_DELTA_CODEC=snappy-zstd` is the sole contract and the default. The
 receiver freezes it at backend admission, advertises it in its participant plan,
@@ -99,9 +119,9 @@ checksum corruption, protocol mismatch, local-only preparation and buffer reuse.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent
-replay but do not prove weight equality. Unsupported layouts and previously
-mutated baselines are rejected, so a new stream starts with a freshly loaded
-engine.
+replay but do not prove weight equality. Unsupported layouts are rejected. The exclusive-controller contract requires
+a fresh baseline; pointer checks do not detect arbitrary same-buffer writes by
+another updater.
 
 Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
@@ -115,7 +135,7 @@ outside timed updates.
 Each original-rank receipt includes `scheduler_timing` on that process's
 `monotonic_ns` clock. `blocked_s` runs from the scheduler's pause flag, before
 the existing reader fence, until its resume clears that flag. It includes
-retraction, cache flush, cohort waits, apply and commit coordination; it excludes
+retraction, cache flush, apply and the wait for cohort apply acknowledgments; it excludes
 background preparation and post-resume cleanup. Open or failed intervals retain
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures

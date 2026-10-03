@@ -1863,8 +1863,6 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     # inference resumes, with no race against active streams. Set to
     # False to skip the empty_cache call.
     torch_empty_cache: bool = True
-    delta_session_id: Optional[str] = None
-    delta_commit_receipts: Optional[List[Dict[str, Any]]] = None
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
@@ -1926,7 +1924,6 @@ class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     plan_digest: str
     participants: List[Dict[str, Any]]
     cohort: List[Dict[str, Any]]
-    expected_engines: List[str]
 
 
 class GetWeightsDeltaStatusReqInput(BaseReq, kw_only=True):
@@ -1935,20 +1932,13 @@ class GetWeightsDeltaStatusReqInput(BaseReq, kw_only=True):
 
 class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
-    participants: List[Dict[str, Any]]
-    receipts: List[Dict[str, Any]]
-
-
-class CommitWeightsFromDeltaReqInput(BaseReq, kw_only=True):
-    session_id: str
-    receipts: List[Dict[str, Any]]
 
 
 class AbortWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class ContinueWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class ResumeWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
     receipts: List[Dict[str, Any]]
 

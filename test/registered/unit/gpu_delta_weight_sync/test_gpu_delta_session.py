@@ -8,7 +8,6 @@ import time
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.weight_sync import gpu_delta_session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -18,7 +17,6 @@ from sglang.srt.weight_sync.gpu_delta_session import (
     DeltaSession,
     GpuDeltaCommunicator,
     GpuDeltaSchedulerControl,
-    guard_tokenizer_dispatch,
 )
 
 
@@ -75,7 +73,6 @@ def request(participants, cohort=None):
         plan_digest="b" * 64,
         participants=participants,
         cohort=cohort,
-        expected_engines=sorted({item["engine_id"] for item in cohort}),
     )
 
 
@@ -113,29 +110,13 @@ def prepare_ready(session, backend, req=None):
 
 def applied(session, backend, req=None):
     prepare_ready(session, backend, req)
-    session.quiesce(lambda: None)
-    session.test_quiescence = [session.status("publication-1")]
-    return session.apply(
-        "publication-1",
-        (req or request([session.identity]))["participants"],
-        session.test_quiescence,
-        lambda: True,
-    )
+    return session.apply("publication-1", lambda: None, lambda: None, lambda: True)
 
 
 def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     session, backend = make_session()
-    returned = threading.Event()
-
-    def submit():
-        assert session.prepare(request([session.identity]))["state"] == "PREPARING"
-        returned.set()
-
-    caller = threading.Thread(target=submit)
-    caller.start()
+    assert session.prepare(request([session.identity]))["state"] == "PREPARING"
     assert backend.started.wait(2)
-    assert returned.wait(2), "submission waited for background I/O"
-    caller.join()
     assert session.status("publication-1")["state"] == "PREPARING"
     assert backend.payload.applications == 0
     session.abort("publication-1")
@@ -144,39 +125,141 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     assert session.status("publication-1")["state"] == "ABORTED"
 
 
-def test_bad_publication_never_quiesces_or_mutates(make_session):
+def test_bad_publication_never_mutates(make_session):
     session, backend = make_session()
     backend.error = ValueError("encoded checksum mismatch")
     session.prepare(request([session.identity]))
     backend.ready.set()
     assert "checksum" in wait_state(session, "FAILED")["message"]
-    with pytest.raises(ValueError, match="cannot pause"):
-        session.quiesce(lambda: pytest.fail("must not fence old-model generation"))
+    with pytest.raises(ValueError, match="requires PREPARED"):
+        session.apply(
+            "publication-1",
+            lambda: pytest.fail("must not fence"),
+            lambda: None,
+            lambda: True,
+        )
     assert backend.payload.applications == 0
     session.abort("publication-1")
     assert not session.leased
 
 
-def test_update_lost_ack_does_not_apply_xor_twice(make_session):
+def test_repeated_apply_or_prepare_never_replays_xor(make_session):
+    session, backend = make_session()
+    applied(session, backend)
+    with pytest.raises(ValueError, match="requires PREPARED"):
+        session.apply(
+            "publication-1",
+            lambda: pytest.fail("duplicate fence"),
+            lambda: None,
+            lambda: True,
+        )
+    assert backend.payload.applications == 1
+    for next_request in (
+        request([session.identity]),
+        request([session.identity]) | {"session_id": "new-id"},
+    ):
+        with pytest.raises(ValueError, match="already leased"):
+            session.prepare(next_request)
+
+
+def test_exact_original_applied_cohort_required_before_resume(make_session):
+    ids = [identity("a"), identity("b")]
+    sessions = [make_session(who) for who in ids]
+    first, backend = sessions[0]
+    first_receipt = applied(first, backend, request([ids[0]], ids))
+    second, backend = sessions[1]
+    prepare_ready(second, backend, request([ids[1]], ids))
+    with pytest.raises(ValueError, match="every original rank"):
+        first.resume(
+            "publication-1",
+            [first_receipt["certificate"]],
+            lambda _: pytest.fail("early resume"),
+        )
+    second_receipt = second.apply(
+        "publication-1", lambda: None, lambda: None, lambda: True
+    )
+    certificates = [first_receipt["certificate"], second_receipt["certificate"]]
+    assert "result" not in certificates[0] and "scheduler_timing" not in certificates[0]
+    for field, value, error in (
+        ("start_ticks", 43, "every original rank"),
+        ("manifest_sha256", "wrong", "manifest_sha256"),
+        ("state", "PREPARED", "requires APPLIED"),
+    ):
+        wrong = copy.deepcopy(certificates)
+        if field == "start_ticks":
+            wrong[1]["identity"][field] = value
+        else:
+            wrong[1][field] = value
+        with pytest.raises(ValueError, match=error):
+            first.resume(
+                "publication-1", wrong, lambda _: pytest.fail("bad certificate resumed")
+            )
+    resumed = []
+    for session, _ in sessions:
+        assert (
+            session.resume("publication-1", certificates, resumed.append)["state"]
+            == "RESUMED"
+        )
+        assert not session.leased and session.version == 1
+    assert resumed == [1, 1]
+
+
+@pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])
+def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
+    make_session, failure
+):
+    session, backend = make_session(backend=Backend(Payload(fail=failure == "apply")))
+    prepare_ready(session, backend)
+    events = []
+
+    def phase(name):
+        assert session.status("publication-1")["state"] == "APPLYING"
+        events.append(name)
+        if name == failure:
+            raise RuntimeError(name + " failed")
+        return True
+
+    with pytest.raises(RuntimeError):
+        session.apply(
+            "publication-1",
+            lambda: phase("fence"),
+            lambda: phase("retract"),
+            lambda: phase("flush"),
+        )
+    expected = ["fence", "retract", "flush"]
+    assert (
+        events == expected[: expected.index(failure) + 1]
+        if failure in expected
+        else events == expected
+    )
+    assert backend.payload.applications == (1 if failure == "apply" else 0)
+    status = session.status("publication-1")
+    assert (
+        status["state"] == "POISONED"
+        and status["scheduler_timing"]["blocked_s"] is None
+    )
+    with pytest.raises(ValueError, match="cannot abort POISONED"):
+        session.abort("publication-1")
+    with pytest.raises(ValueError, match="requires PREPARED"):
+        session.apply("publication-1", lambda: None, lambda: None, lambda: True)
+
+
+def test_resume_failure_retains_ownership(make_session):
     session, backend = make_session()
     receipt = applied(session, backend)
-    again = session.apply(
-        "publication-1",
-        [session.identity],
-        session.test_quiescence,
-        lambda: pytest.fail("duplicate apply flushed"),
-    )
-    assert receipt == again
-    assert backend.payload.applications == 1
-    with pytest.raises(ValueError, match="different publication"):
-        session.prepare(request([session.identity]) | {"manifest_sha256": "c" * 64})
-    with pytest.raises(ValueError, match="already leased"):
-        session.prepare(
-            request([session.identity]) | {"session_id": "retry-under-new-id"}
+    with pytest.raises(RuntimeError, match="resume failed"):
+        session.resume(
+            "publication-1",
+            [receipt["certificate"]],
+            lambda _: (_ for _ in ()).throw(RuntimeError("resume failed")),
         )
+    assert session.leased
+    with pytest.raises(ValueError, match="cannot abort RESUMING"):
+        session.abort("publication-1")
+    assert session.status("publication-1")["scheduler_timing"]["blocked_s"] is None
 
 
-def test_scheduler_blocked_timing_excludes_prepare_and_preserves_retry_boundaries(
+def test_scheduler_blocked_timing_excludes_background_prepare(
     make_session, monkeypatch
 ):
     now = [1_000_000_000]
@@ -191,26 +274,15 @@ def test_scheduler_blocked_timing_excludes_prepare_and_preserves_retry_boundarie
     now[0] = 10_000_000_000
 
     def fence():
-        timing = session.status("publication-1")["scheduler_timing"]
-        assert timing["pause_started_ns"] == 10_000_000_000
-        assert timing["reader_fence_completed_ns"] is None
+        assert (
+            session.status("publication-1")["scheduler_timing"]["pause_started_ns"]
+            == now[0]
+        )
         now[0] = 20_000_000_000
 
-    session.quiesce(fence)
-    quiesced = session.status("publication-1")
-    assert quiesced["scheduler_timing"]["blocked_s"] is None
-    now[0] = 30_000_000_000
-    session.quiesce(lambda: None)  # Repeated pause must not shorten the span.
-    assert session.status("publication-1") == quiesced
-    receipt = session.apply(
-        "publication-1", [session.identity], [quiesced], lambda: True
-    )
-    committed = session.commit("publication-1", [receipt])
-    assert committed["scheduler_timing"]["resumed_ns"] is None
-    assert committed["scheduler_timing"]["blocked_s"] is None
-    session.authorize_resume("publication-1", [committed])
+    receipt = session.apply("publication-1", fence, lambda: None, lambda: True)
     now[0] = 60_000_000_000
-    resumed = session.resumed("publication-1")
+    resumed = session.resume("publication-1", [receipt["certificate"]], lambda _: None)
     assert resumed["scheduler_timing"] == {
         "clock": "monotonic_ns",
         "pause_started_ns": 10_000_000_000,
@@ -218,116 +290,30 @@ def test_scheduler_blocked_timing_excludes_prepare_and_preserves_retry_boundarie
         "resumed_ns": 60_000_000_000,
         "blocked_s": 50.0,
     }
-    now[0] = 90_000_000_000
-    assert session.resumed("publication-1") == resumed
 
 
-def test_exact_rank_and_all_engine_commit_before_resume(make_session):
-    ids = [identity("a"), identity("b")]
-    sessions = [make_session(who) for who in ids]
-    for who, (session, backend) in zip(ids, sessions):
-        prepare_ready(session, backend, request([who], ids))
-        session.quiesce(lambda: None)
-    quiesced = [session.status("publication-1") for session, _ in sessions]
-    receipts = [
-        session.apply("publication-1", [who], quiesced, lambda: True)
-        for who, (session, _) in zip(ids, sessions)
-    ]
-    first = sessions[0][0]
-    with pytest.raises(ValueError, match="every original rank"):
-        first.commit("publication-1", receipts[:1])
-    recycled = copy.deepcopy(receipts)
-    recycled[1]["identity"]["start_ticks"] += 1
-    with pytest.raises(ValueError, match="every original rank"):
-        first.commit("publication-1", recycled)
-    committed_a = first.commit("publication-1", receipts)
-    with pytest.raises(ValueError, match="requires COMMITTED"):
-        first.authorize_resume("publication-1", [committed_a, receipts[1]])
-    committed_b = sessions[1][0].commit("publication-1", receipts)
-    first.authorize_resume("publication-1", [committed_a, committed_b])
-    assert first.resumed("publication-1")["state"] == "RESUMED"
-    assert not first.leased
-    assert first.version == 1
+@pytest.mark.parametrize("local_control,ep_joiner", [(True, False), (False, True)])
+def test_describe_rejects_unsynchronized_control_topologies(
+    monkeypatch, local_control, ep_joiner
+):
+    from sglang.srt import runtime_context
 
-
-def test_partial_write_poison_cannot_abort_commit_or_retry(make_session):
-    session, backend = make_session(backend=Backend(Payload(fail=True)))
-    prepare_ready(session, backend)
-    session.quiesce(lambda: None)
-    quiesced = [session.status("publication-1")]
-    with pytest.raises(RuntimeError, match="possible write"):
-        session.apply("publication-1", [session.identity], quiesced, lambda: True)
-    assert session.status("publication-1")["state"] == "POISONED"
-    timing = session.status("publication-1")["scheduler_timing"]
-    assert timing["pause_started_ns"] is not None
-    assert timing["resumed_ns"] is None
-    assert timing["blocked_s"] is None
-    with pytest.raises(ValueError, match="cannot abort POISONED"):
-        session.abort("publication-1")
-    with pytest.raises(ValueError, match="requires retract pause"):
-        session.apply("publication-1", [session.identity], quiesced, lambda: True)
-    assert session.leased
-    assert backend.payload.applications == 1
-
-
-def test_reader_fence_and_cache_flush_precede_first_write(make_session):
-    session, backend = make_session()
-    prepare_ready(session, backend)
-    with pytest.raises(ValueError, match="retract pause"):
-        session.apply(
-            "publication-1",
-            [session.identity],
-            [session.status("publication-1")],
-            lambda: True,
-        )
-    with pytest.raises(RuntimeError, match="reader"):
-        session.quiesce(
-            lambda: (_ for _ in ()).throw(RuntimeError("reader fence failed"))
-        )
-    assert session.status("publication-1")["state"] == "PREPARED"
-    session.quiesce(lambda: None)
-    with pytest.raises(ValueError, match="cache flush"):
-        session.apply(
-            "publication-1",
-            [session.identity],
-            [session.status("publication-1")],
-            lambda: False,
-        )
-    assert backend.payload.applications == 0
-    assert (
-        session.apply(
-            "publication-1",
-            [session.identity],
-            [session.status("publication-1")],
-            lambda: True,
-        )["state"]
-        == "APPLIED"
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            enable_dp_attention_local_control_broadcast=local_control
+        ),
     )
-
-
-def test_lease_blocks_competing_disk_update_but_not_generation_or_status():
-    manager = SimpleNamespace(session_id="leased")
-    for name in (
-        "UpdateWeightFromDiskReqInput",
-        "BeginWeightUpdateReqInput",
-        "ReleaseMemoryOccupationReqInput",
-        "PdRoleSwitchReqInput",
-    ):
-        with pytest.raises(ValueError, match="competing mutation"):
-            guard_tokenizer_dispatch(manager, type(name, (), {})())
-    for name in ("TokenizedGenerateReqInput", "GetWeightsDeltaStatusReqInput"):
-        guard_tokenizer_dispatch(manager, type(name, (), {})())
-    manager.session_id = None
-    guard_tokenizer_dispatch(manager, type("UpdateWeightFromDiskReqInput", (), {})())
-
-
-def test_other_update_path_invalidates_startup_baseline_before_first_prepare():
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=ep_joiner)),
+    )
     control = GpuDeltaSchedulerControl(SimpleNamespace())
-    disk_update = type("UpdateWeightFromDiskReqInput", (), {})()
-    assert control.reject_conflicting(disk_update) is None  # old API still runs
-    assert control.legacy_mutated
-    with pytest.raises(ValueError, match="fresh engine"):
+    with pytest.raises(ValueError, match="global control broadcast"):
         control._describe("engine-0")
+    assert control.session is None
 
 
 @pytest.mark.parametrize("cache", ["shared IPC", "derived HPC"])
@@ -337,11 +323,21 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
     from sglang.srt import runtime_context
 
     calls = []
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=False)),
+    )
 
     monkeypatch.setattr(
         runtime_context,
         "get_parallel",
-        lambda: SimpleNamespace(attn_tp_size=1, attn_cp_size=1, pp_size=1),
+        lambda: SimpleNamespace(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_dp_attention_local_control_broadcast=False,
+        ),
     )
 
     def check_shared(op):
@@ -381,25 +377,6 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
     )
 
 
-def test_apply_requires_whole_cohort_quiescence(make_session):
-    local = identity("a")
-    remote = identity("b")
-    session, backend = make_session(local)
-    prepare_ready(session, backend, request([local], [local, remote]))
-    session.quiesce(lambda: None)
-    local_receipt = session.status("publication-1")
-    with pytest.raises(ValueError, match="every original rank"):
-        session.apply("publication-1", [local], [local_receipt], lambda: True)
-    remote_receipt = copy.deepcopy(local_receipt)
-    remote_receipt["identity"] = remote
-    remote_receipt["state"] = "PREPARED"
-    with pytest.raises(ValueError, match="requires QUIESCED"):
-        session.apply(
-            "publication-1", [local], [local_receipt, remote_receipt], lambda: True
-        )
-    assert backend.payload.applications == 0
-
-
 def test_late_reply_after_cancellation_cannot_acknowledge_resume():
     async def scenario():
         sent = []
@@ -412,132 +389,10 @@ def test_late_reply_after_cancellation_cannot_acknowledge_resume():
             await old
         resume = asyncio.create_task(comm(SimpleNamespace(rid=None)))
         await asyncio.sleep(0)
-        comm.handle_recv(SimpleNamespace(rid=old_rid, state="COMMITTED"))
+        comm.handle_recv(SimpleNamespace(rid=old_rid, state="APPLIED"))
         await asyncio.sleep(0)
         assert not resume.done()
         comm.handle_recv(SimpleNamespace(rid=sent[-1].rid, state="RESUMED"))
         assert (await resume)[0].state == "RESUMED"
 
     asyncio.run(scenario())
-
-
-@pytest.mark.parametrize(
-    "request_type",
-    [
-        "UpdateWeightVersionReqInput",
-        "ReleaseMemoryOccupationReqInput",
-        "ResumeMemoryOccupationReqInput",
-    ],
-)
-def test_queued_legacy_request_checks_lease_at_actual_send(request_type):
-    from sglang.srt.managers.communicator import FanOutCommunicator
-
-    async def scenario():
-        manager = SimpleNamespace(session_id=None)
-        sent = []
-
-        def send(obj):
-            guard_tokenizer_dispatch(manager, obj)
-            sent.append(obj)
-
-        comm = FanOutCommunicator(send, 1)
-        request_class = type(request_type, (), {})
-        first = asyncio.create_task(comm(request_class()))
-        await asyncio.sleep(0)
-        queued = asyncio.create_task(comm(request_class()))
-        await asyncio.sleep(0)
-        assert len(sent) == 1
-        prepare = type("PrepareWeightsFromDeltaReqInput", (), {})()
-        prepare.session_id = "publication-1"
-        delta_comm = GpuDeltaCommunicator(send, 1)
-        preparing = asyncio.create_task(delta_comm(prepare))
-        await asyncio.sleep(0)
-        comm.handle_recv(SimpleNamespace())
-        await first
-        with pytest.raises(ValueError, match="competing mutation"):
-            await queued
-        assert len(sent) == 2 and sent[-1] is prepare
-        assert manager.session_id == "publication-1"
-        delta_comm.handle_recv(SimpleNamespace(rid=prepare.rid))
-        await preparing
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize(
-    "completion_type",
-    ["AbortWeightsFromDeltaReqInput", "ContinueWeightsFromDeltaReqInput"],
-)
-@pytest.mark.parametrize("next_id", ["publication-1", "publication-2"])
-def test_queued_prepare_acquires_lease_after_prior_completion(completion_type, next_id):
-    async def scenario():
-        manager = SimpleNamespace(session_id="publication-1")
-        sent = []
-
-        def send(obj):
-            guard_tokenizer_dispatch(manager, obj)
-            sent.append(obj)
-
-        comm = GpuDeltaCommunicator(send, 1)
-        previous = type(completion_type, (), {})()
-        previous.session_id = "publication-1"
-
-        async def complete_previous():
-            await comm(previous)
-            if manager.session_id == previous.session_id:
-                manager.session_id = None
-
-        completion = asyncio.create_task(complete_previous())
-        await asyncio.sleep(0)
-        prepare = type("PrepareWeightsFromDeltaReqInput", (), {})()
-        prepare.session_id = next_id
-        queued = asyncio.create_task(comm(prepare))
-        await asyncio.sleep(0)
-        assert sent == [previous]
-        assert manager.session_id == "publication-1"
-        comm.handle_recv(SimpleNamespace(rid=previous.rid))
-        await completion
-        await asyncio.sleep(0)
-        assert sent == [previous, prepare]
-        assert manager.session_id == next_id
-        comm.handle_recv(SimpleNamespace(rid=prepare.rid))
-        await queued
-        assert manager.session_id == next_id
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("failure", ["send", "cancel"])
-def test_prepare_lease_survives_ambiguous_send_or_ack(failure):
-    async def scenario():
-        manager = SimpleNamespace(session_id=None)
-
-        def send(obj):
-            guard_tokenizer_dispatch(manager, obj)
-            if failure == "send":
-                raise RuntimeError("send failed")
-
-        comm = GpuDeltaCommunicator(send, 1)
-        prepare_class = type("PrepareWeightsFromDeltaReqInput", (), {})
-        prepare = prepare_class()
-        prepare.session_id = "publication-1"
-        task = asyncio.create_task(comm(prepare))
-        await asyncio.sleep(0)
-        assert manager.session_id == "publication-1"
-        if failure == "cancel":
-            task.cancel()
-        with pytest.raises(
-            RuntimeError if failure == "send" else asyncio.CancelledError
-        ):
-            await task
-        assert manager.session_id == "publication-1"
-        replacement = prepare_class()
-        replacement.session_id = "publication-2"
-        with pytest.raises(ValueError, match="another delta session"):
-            await comm(replacement)
-
-    asyncio.run(scenario())
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))

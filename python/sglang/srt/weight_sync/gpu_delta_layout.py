@@ -350,16 +350,10 @@ class DerivedImage:
 class GpuDeltaLayout:
     """Frozen, fail-closed map from startup checkpoint names to live buffers."""
 
-    def __init__(self, model):
+    def __init__(self, model, inventory):
         self.model = model
-        self.generation = getattr(model, "_gpu_delta_load_generation", None)
-        inventory = getattr(model, "_gpu_delta_canonical_inventory", None)
-        if (
-            not inventory
-            or not getattr(model, "_gpu_delta_metadata_complete", False)
-            or getattr(model, "_gpu_delta_duplicate_source_names", False)
-        ):
-            raise ValueError("canonical startup metadata is unavailable or ambiguous")
+        if not inventory:
+            raise ValueError("canonical checkpoint metadata is unavailable")
         self.inventory = inventory
         self.bindings = []
         self.excluded = {}
@@ -404,8 +398,6 @@ class GpuDeltaLayout:
         )
 
     def check_identity(self):
-        if getattr(self.model, "_gpu_delta_load_generation", None) != self.generation:
-            raise RuntimeError("ordinary reload invalidated the GPU delta base")
         for module, name, tensor, expected in self._parameter_roots:
             if (
                 module._parameters.get(name) is not tensor
@@ -703,13 +695,17 @@ class GpuDeltaBackend:
 
     def __init__(self, model_runner, identity):
         from sglang.srt.runtime_context import get_exec
+        from sglang.srt.weight_sync.gpu_delta_checkpoint import (
+            read_canonical_checkpoint_inventory,
+        )
         from sglang.srt.weight_sync.gpu_delta_payload import configured_codec
 
         self.codec = configured_codec()
         _require_fixed_moe_topology(get_exec().moe)
         self.runner = model_runner
         self.identity = dict(identity)
-        self.layout = GpuDeltaLayout(model_runner.model)
+        inventory = read_canonical_checkpoint_inventory(model_runner)
+        self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("direct GPU deltas require an explicit CUDA device")

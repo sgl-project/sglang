@@ -1,10 +1,11 @@
-"""Tokenizer-side delta coordination, separate from ordinary control APIs."""
+"""Control plane for engines exclusively owned by the GPU-delta coordinator."""
+
+import json
 
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.weight_sync.gpu_delta_session import (
     GpuDeltaCommunicator,
     GpuDeltaConflict,
-    guard_tokenizer_dispatch,
 )
 
 
@@ -16,27 +17,58 @@ class GpuDeltaTokenizerControl:
         self.manager = manager
         self.session_id = None
         self.participants = None
-        self.communicator = GpuDeltaCommunicator(
-            manager._dispatch_to_scheduler, fan_out
-        )
+        self.communicator = GpuDeltaCommunicator(self._send, fan_out)
         manager._result_dispatcher += TypeBasedDispatcher(
             [(DeltaWeightsReqOutput, self.communicator.handle_recv)]
         )
 
-    def guard_dispatch(self, obj):
-        guard_tokenizer_dispatch(self, obj)
+    def _send(self, obj):
+        from sglang.srt.managers.io_struct import PrepareWeightsFromDeltaReqInput
+
+        if isinstance(obj, PrepareWeightsFromDeltaReqInput):
+            if self.session_id is not None:
+                raise GpuDeltaConflict("another delta session is active")
+            # Acquire only at the actual FIFO send; an uncertain send or reply
+            # must retain ownership. Ordinary requests never pass through here.
+            self.session_id = obj.session_id
+        self.manager._dispatch_to_scheduler(obj)
 
     async def request(self, obj, request=None):
-        """No model-update writer lock: preparation must overlap generation."""
-        self.manager.auto_create_handle_loop()
-        import json
+        from sglang.srt.managers.io_struct import (
+            ResumeWeightsFromDeltaReqInput,
+            UpdateWeightsFromDeltaReqInput,
+        )
 
+        if isinstance(
+            obj, (UpdateWeightsFromDeltaReqInput, ResumeWeightsFromDeltaReqInput)
+        ):
+            async with self.manager.is_pause_cond:
+                if isinstance(obj, UpdateWeightsFromDeltaReqInput):
+                    self.manager.is_pause = True
+                result = await self._request(obj)
+                if (
+                    isinstance(obj, ResumeWeightsFromDeltaReqInput)
+                    and result["success"]
+                ):
+                    self.manager._update_weight_version_if_provided(
+                        str(result["participants"][0]["target_version"])
+                    )
+                    if self.session_id == obj.session_id:
+                        self.session_id = None
+                    self.manager.is_pause = False
+                    self.manager.is_pause_cond.notify_all()
+                return result
+        # Preparation/status do not gate generation or acquire its writer lock.
+        return await self._request(obj)
+
+    async def _request(self, obj):
         from sglang.srt.managers.io_struct import (
             AbortWeightsFromDeltaReqInput,
             GetWeightsDeltaInfoReqInput,
             PrepareWeightsFromDeltaReqInput,
         )
 
+        self.manager.auto_create_handle_loop()
         if get_serving().tokenizer_worker_num != 1:
             return {
                 "success": False,
@@ -56,20 +88,18 @@ class GpuDeltaTokenizerControl:
         results = await self.communicator(obj)
         participants = [result.participant for result in results]
         identities = [item.get("identity") for item in participants]
-
         keys = [json.dumps(identity, sort_keys=True) for identity in identities]
         success = all(result.success for result in results)
         if len(set(keys)) != len(keys) or any(
             identity is None for identity in identities
         ):
             success = False
-        expected_identities = self.participants
         if (
             not isinstance(obj, GetWeightsDeltaInfoReqInput)
-            and expected_identities is not None
+            and self.participants is not None
         ):
             success &= set(keys) == {
-                json.dumps(item, sort_keys=True) for item in expected_identities
+                json.dumps(item, sort_keys=True) for item in self.participants
             }
         if hasattr(obj, "session_id"):
             success &= all(
@@ -77,9 +107,8 @@ class GpuDeltaTokenizerControl:
             )
         phase_states = {
             "GetWeightsDeltaInfoReqInput": {"IDLE"},
-            "UpdateWeightsFromDeltaReqInput": {"APPLIED", "COMMITTED", "RESUMED"},
-            "CommitWeightsFromDeltaReqInput": {"COMMITTED", "RESUMED"},
-            "ContinueWeightsFromDeltaReqInput": {"RESUMED"},
+            "UpdateWeightsFromDeltaReqInput": {"APPLIED"},
+            "ResumeWeightsFromDeltaReqInput": {"RESUMED"},
             "AbortWeightsFromDeltaReqInput": {"ABORTED"},
         }
         allowed = phase_states.get(type(obj).__name__)
@@ -90,7 +119,6 @@ class GpuDeltaTokenizerControl:
         if (
             isinstance(obj, AbortWeightsFromDeltaReqInput)
             and success
-            and all(item["state"] == "ABORTED" for item in participants)
             and self.session_id == obj.session_id
         ):
             self.session_id = None
@@ -101,49 +129,3 @@ class GpuDeltaTokenizerControl:
             ),
             "participants": participants,
         }
-
-    async def before_pause(self, obj):
-        if self.session_id:
-            from sglang.srt.managers.io_struct import GetWeightsDeltaStatusReqInput
-
-            if obj.mode != "retract":
-                raise GpuDeltaConflict("GPU delta requires retract pause")
-            result = await self.request(
-                GetWeightsDeltaStatusReqInput(
-                    session_id=self.session_id,
-                )
-            )
-            if not result["success"] or any(
-                item["state"] not in {"PREPARED", "QUIESCED"}
-                for item in result["participants"]
-            ):
-                raise GpuDeltaConflict(
-                    "all original ranks must be prepared before pause"
-                )
-
-    async def resume(self, obj):
-        if self.session_id and obj.delta_session_id is None:
-            raise GpuDeltaConflict(
-                "GPU delta session requires a global commit certificate before resume"
-            )
-        if obj.delta_session_id is not None:
-            from sglang.srt.managers.io_struct import ContinueWeightsFromDeltaReqInput
-
-            if not obj.delta_commit_receipts:
-                raise GpuDeltaConflict(
-                    "GPU delta resume requires every engine's committed receipts"
-                )
-            result = await self.request(
-                ContinueWeightsFromDeltaReqInput(
-                    session_id=obj.delta_session_id,
-                    receipts=obj.delta_commit_receipts,
-                )
-            )
-            if not result["success"]:
-                raise GpuDeltaConflict(result["message"] or "GPU delta resume rejected")
-            if self.session_id == obj.delta_session_id:
-                self.session_id = None
-            self.manager._update_weight_version_if_provided(
-                str(result["participants"][0]["target_version"])
-            )
-            return {"success": True, "participants": result["participants"]}

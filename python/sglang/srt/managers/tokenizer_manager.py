@@ -658,13 +658,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def _dispatch_to_scheduler(self, obj: Any) -> None:
-        self.gpu_delta.guard_dispatch(obj)
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         sock_send(self.send_to_scheduler, obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
-        self.gpu_delta.guard_dispatch(obj)
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
@@ -2234,7 +2232,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
-        await self.gpu_delta.before_pause(obj)
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
@@ -2251,12 +2248,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
-            result = await self.gpu_delta.resume(obj)
-            if result is None:
-                await self._async_dispatch_to_scheduler(obj)
             self.is_pause = False
+            await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
-            return result
 
     async def update_weights_from_disk(
         self,

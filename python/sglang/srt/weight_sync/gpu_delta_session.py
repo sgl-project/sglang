@@ -1,7 +1,9 @@
 """Fail-closed control plane for the opt-in GPU delta receiver.
 
-Preparation owns only immutable publication buffers. Model access and mutation stay
-on the scheduler thread after a retract pause and a reader-completion fence.
+One exclusive controller owns these engines from startup through disposal. Mixing
+ordinary weight, memory, topology, or pause controls is unsupported. Preparation
+owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
+scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
 """
 
 from __future__ import annotations
@@ -10,15 +12,15 @@ import asyncio
 import copy
 import hashlib
 import json
-import logging
 import os
 import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 
 class GpuDeltaConflict(ValueError):
@@ -59,43 +61,6 @@ class GpuDeltaCommunicator:
         self._fan_out = fan_out
 
 
-# GPU delta admits one Python tokenizer worker. It rejects competing mutations
-# before dispatch; the scheduler also enforces the lease before model access.
-_CONFLICTING_REQUESTS = {
-    "UpdateWeightFromDiskReqInput",
-    "PullWeightsReqInput",
-    "UpdateWeightsFromDistributedReqInput",
-    "UpdateWeightsFromTensorReqInput",
-    "UpdateWeightsFromIPCReqInput",
-    "BeginWeightUpdateReqInput",
-    "EndWeightUpdateReqInput",
-    "UpdateWeightVersionReqInput",
-    "ReleaseMemoryOccupationReqInput",
-    "ResumeMemoryOccupationReqInput",
-    "ScaleElasticEPReqInput",
-    "PdRoleSwitchReqInput",
-    "LoadLoRAAdapterReqInput",
-    "RegisterLoRAAdapterReqInput",
-    "UnloadLoRAAdapterReqInput",
-}
-
-
-def guard_tokenizer_dispatch(control, request):
-    active = control.session_id
-    name = type(request).__name__
-    if name == "PrepareWeightsFromDeltaReqInput":
-        if active is not None and active != request.session_id:
-            raise GpuDeltaConflict("another delta session is active")
-        # Acquire only at the FIFO communicator's actual send. An earlier
-        # abort/resume completion cannot clear a prepare still in its queue.
-        # Keep the lease if sending or receiving the acknowledgment fails.
-        control.session_id = request.session_id
-    elif active is not None and name in _CONFLICTING_REQUESTS:
-        raise GpuDeltaConflict(
-            "GPU delta session owns the model; competing mutation refused"
-        )
-
-
 def _identity_key(identity: dict) -> str:
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
@@ -114,7 +79,6 @@ class _Session:
     message: str = ""
     prepared: Any = None
     result: dict = field(default_factory=dict)
-    certificate: str | None = None
     pause_started_ns: int | None = None
     reader_fence_completed_ns: int | None = None
     resumed_ns: int | None = None
@@ -159,7 +123,7 @@ class DeltaSession:
         with self._lock:
             session = self._get(session_id)
             request = session.request
-            return {
+            receipt = {
                 "identity": copy.deepcopy(self.identity),
                 "state": session.state,
                 "cohort_digest": hashlib.sha256(
@@ -193,23 +157,33 @@ class DeltaSession:
                     ),
                 },
             }
+            if session.state == "APPLIED":
+                receipt["certificate"] = {
+                    key: copy.deepcopy(receipt[key])
+                    for key in (
+                        "identity",
+                        "state",
+                        "cohort_digest",
+                        "session_id",
+                        "manifest_sha256",
+                        "stream_id",
+                        "base_version",
+                        "target_version",
+                        "plan_digest",
+                    )
+                }
+            return receipt
 
     def prepare(self, request: dict) -> dict:
         request = copy.deepcopy(request)
         with self._lock:
             session_id = request["session_id"]
-            if self._session and self._session.request["session_id"] == session_id:
-                if self._session.request != request:
-                    raise ValueError(
-                        "session identity reused with different publication or cohort"
-                    )
-                return self.status(session_id)
             if self.leased or session_id in self._seen_ids:
                 raise ValueError(
                     "delta session already leased or session identity already consumed"
                 )
             local = _identities(request["participants"])
-            cohort = _identities(request["cohort"])
+            _identities(request["cohort"])
             engine_id = self.identity["engine_id"]
             cohort_local = _identities(
                 [item for item in request["cohort"] if item["engine_id"] == engine_id]
@@ -218,10 +192,6 @@ class DeltaSession:
                 raise ValueError(
                     "prepare does not bind this original engine's complete participants"
                 )
-            if not local <= cohort or set(request["expected_engines"]) != {
-                item["engine_id"] for item in request["cohort"]
-            }:
-                raise ValueError("cohort differs from expected engines")
             if (
                 request["base_version"] != self.version
                 or request["target_version"] <= self.version
@@ -257,61 +227,40 @@ class DeltaSession:
             if prepared is not None:
                 prepared.close()
 
-    def quiesce(self, fence: Callable[[], None]) -> None:
-        with self._lock:
-            session = self._session
-            if session is None or not self.leased:
-                return
-            if session.state not in {"PREPARED", "QUIESCED"}:
-                raise ValueError(f"cannot pause delta session in {session.state}")
-            # Scheduler has just set _engine_paused. Include the existing
-            # reader fence and subsequent retract, not background preparation.
-            if session.pause_started_ns is None:
-                session.pause_started_ns = time.monotonic_ns()
-        # Only the scheduler calls this. Finish readers before retract frees KV.
-        fence()
-        with self._lock:
-            if session.reader_fence_completed_ns is None:
-                session.reader_fence_completed_ns = time.monotonic_ns()
-            session.state = "QUIESCED"
-
     def apply(
         self,
         session_id: str,
-        participants: list[dict],
-        receipts: list[dict],
+        fence: Callable[[], None],
+        retract: Callable[[], None],
         flush: Callable[[], bool],
     ) -> dict:
         with self._lock:
             session = self._get(session_id)
-            if _identities(participants) != _identities(
-                session.request["participants"]
-            ):
-                raise ValueError("apply participant identity mismatch")
-            if session.state in {"APPLIED", "COMMITTED", "RESUMED"}:
-                self._certificate(session, receipts, "QUIESCED")
-                return self.status(session_id)
-            if session.state != "QUIESCED":
-                raise ValueError(f"apply requires retract pause, got {session.state}")
-            self._certificate(session, receipts, "QUIESCED")
+            if session.state != "PREPARED":
+                raise ValueError(f"apply requires PREPARED, got {session.state}")
+            # The scheduler has stopped new work. From this point a peer may
+            # already be mutating: even a failed fence cannot make this abortable.
+            session.state = "APPLYING"
+            session.pause_started_ns = time.monotonic_ns()
+        try:
+            fence()
+            session.reader_fence_completed_ns = time.monotonic_ns()
+            # Never reclaim KV after a failed reader fence.
+            retract()
             if not flush():
                 raise ValueError("cache flush failed before delta mutation")
-            session.state = "APPLYING"
-        try:
             result = session.prepared.apply()
         except Exception as exc:
             with self._lock:
                 session.state = "POISONED"
-                session.message = (
-                    f"apply may have changed live bytes: {exc}; reload/restart required"
-                )
+                session.message = f"update failed after pause: {exc}; restart required"
             raise
         with self._lock:
             session.result = result
             session.state = "APPLIED"
             return self.status(session_id)
 
-    def _certificate(self, session: _Session, receipts: list[dict], state: str) -> str:
+    def _validate_applied(self, session: _Session, receipts: list[dict]) -> None:
         expected = _identities(session.request["cohort"])
         actual = _identities([receipt["identity"] for receipt in receipts])
         if actual != expected:
@@ -324,8 +273,8 @@ class DeltaSession:
         for receipt in receipts:
             if receipt.get("cohort_digest") != cohort_digest:
                 raise ValueError("certificate cohort differs from the prepared cohort")
-            if receipt["state"] != state:
-                raise ValueError(f"certificate requires {state} on every rank")
+            if receipt["state"] != "APPLIED":
+                raise ValueError("certificate requires APPLIED on every rank")
             for key in (
                 "session_id",
                 "manifest_sha256",
@@ -338,46 +287,22 @@ class DeltaSession:
                     raise ValueError(
                         f"certificate {key} differs from prepared publication"
                     )
-        data = sorted(receipts, key=lambda receipt: _identity_key(receipt["identity"]))
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
-    def commit(self, session_id: str, receipts: list[dict]) -> dict:
+    def resume(
+        self, session_id: str, receipts: list[dict], resume: Callable[[int], None]
+    ) -> dict:
         with self._lock:
             session = self._get(session_id)
-            certificate = self._certificate(session, receipts, "APPLIED")
-            if session.state in {"COMMITTED", "RESUMED"}:
-                if certificate != session.certificate:
-                    raise ValueError("commit certificate changed")
-                return self.status(session_id)
             if session.state != "APPLIED":
-                raise ValueError(f"cannot commit {session.state}")
-            session.certificate = certificate
-            session.state = "COMMITTED"
+                raise ValueError(f"resume requires APPLIED, got {session.state}")
+            self._validate_applied(session, receipts)
             self.version = session.request["target_version"]
             self.stream_id = session.request["stream_id"]
-            return self.status(session_id)
-
-    def authorize_resume(self, session_id: str, receipts: list[dict]) -> dict:
-        with self._lock:
-            session = self._get(session_id)
-            self._certificate(session, receipts, "COMMITTED")
-            if session.state not in {"COMMITTED", "RESUMED"}:
-                raise ValueError(f"cannot resume {session.state}")
-            return self.status(session_id)
-
-    def resumed(self, session_id: str) -> dict:
-        with self._lock:
-            session = self._get(session_id)
-            if session.state == "RESUMED":
-                return self.status(session_id)
-            if session.state != "COMMITTED":
-                raise ValueError("resume requires committed session")
-            # Called immediately after scheduler.continue_generation clears
-            # _engine_paused; asynchronous payload cleanup is outside the span.
+            session.state = "RESUMING"
+            resume(self.version)
             session.resumed_ns = time.monotonic_ns()
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
-            # Cleanup can wait for upload events; never run it on the scheduler.
             self._executor.submit(prepared.close)
             return self.status(session_id)
 
@@ -405,58 +330,22 @@ class DeltaSession:
 
 
 def with_gpu_delta_controls(scheduler, dispatcher):
-    """Register control handlers without wrapping the generation hot path."""
+    """Register only delta requests; ordinary handlers remain unchanged."""
     from sglang.srt.managers import io_struct as io
     from sglang.utils import TypeBasedDispatcher
 
     control = GpuDeltaSchedulerControl(scheduler)
-
-    def mutation(request):
-        rejected = control.reject_conflicting(request)
-        return dispatcher(request) if rejected is None else rejected
-
-    def pause(request):
-        if control.leased:
-            # Stop new work before the reader fence; never reclaim caches if
-            # that fence fails. The ordinary pause implementation owns reclaim.
-            scheduler._engine_paused = True
-            try:
-                control.before_pause(request.mode)
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "GPU delta pause failed; engine remains paused"
-                )
-                return
-        return dispatcher(request)
-
-    def resume(request):
-        if control.leased:
-            # Only the certified delta handler may call the ordinary resume
-            # implementation while leased. An IPC session ID is not a proof.
-            logging.getLogger(__name__).error(
-                "Refusing resume while a GPU delta session owns the model"
-            )
-            return
-        return dispatcher(request)
-
-    wrapped = TypeBasedDispatcher(
+    dispatcher += TypeBasedDispatcher(
         [
             (io.GetWeightsDeltaInfoReqInput, control.handle),
             (io.PrepareWeightsFromDeltaReqInput, control.handle),
             (io.GetWeightsDeltaStatusReqInput, control.handle),
             (io.UpdateWeightsFromDeltaReqInput, control.handle),
-            (io.CommitWeightsFromDeltaReqInput, control.handle),
             (io.AbortWeightsFromDeltaReqInput, control.handle),
-            (io.ContinueWeightsFromDeltaReqInput, control.handle),
-            (io.PauseGenerationReqInput, pause),
-            (io.ContinueGenerationReqInput, resume),
-            *[(getattr(io, name), mutation) for name in _CONFLICTING_REQUESTS],
+            (io.ResumeWeightsFromDeltaReqInput, control.handle),
         ]
     )
-    # Feature controls take precedence. Ordinary requests retain their original
-    # handlers and the same single dictionary lookup, with no delta branch.
-    wrapped += dispatcher
-    return wrapped
+    return dispatcher
 
 
 class GpuDeltaSchedulerControl:
@@ -467,21 +356,19 @@ class GpuDeltaSchedulerControl:
         self.session: DeltaSession | None = None
         self.identity: dict | None = None
         self.backend = None
-        self.legacy_mutated = False
-
-    @property
-    def leased(self):
-        return self.session is not None and self.session.leased
 
     def _describe(self, engine_id: str) -> dict:
-        if self.legacy_mutated:
-            raise ValueError(
-                "GPU delta requires a fresh engine; another updater has touched the model"
-            )
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_exec, get_parallel
 
         scheduler = self.scheduler
         parallel = get_parallel()
+        if (
+            parallel.enable_dp_attention_local_control_broadcast
+            or get_exec().moe.is_ep_scale_joiner
+        ):
+            raise ValueError(
+                "GPU delta requires the global control broadcast without EP scale joiners"
+            )
         # The existing reply transport emits one reply per attention-DP rank.
         # Reject hidden TP/CP/PP followers rather than claiming full coverage.
         if (
@@ -543,10 +430,6 @@ class GpuDeltaSchedulerControl:
             if isinstance(request, io.GetWeightsDeltaInfoReqInput):
                 receipt = self._describe(request.engine_id)
             elif isinstance(request, io.PrepareWeightsFromDeltaReqInput):
-                if self.legacy_mutated:
-                    raise ValueError(
-                        "another updater invalidated this baseline; fresh engine required"
-                    )
                 if (
                     self.identity is not None
                     and request.engine_id != self.identity["engine_id"]
@@ -576,7 +459,6 @@ class GpuDeltaSchedulerControl:
                             "plan_digest",
                             "participants",
                             "cohort",
-                            "expected_engines",
                         )
                     }
                 )
@@ -585,28 +467,26 @@ class GpuDeltaSchedulerControl:
             elif isinstance(request, io.GetWeightsDeltaStatusReqInput):
                 receipt = self.session.status(request.session_id)
             elif isinstance(request, io.UpdateWeightsFromDeltaReqInput):
-                if not self.scheduler._engine_paused:
-                    raise ValueError("update requires an explicitly paused engine")
+                self.scheduler._engine_paused = True
                 receipt = self.session.apply(
                     request.session_id,
-                    request.participants,
-                    request.receipts,
+                    self.scheduler.device_module.synchronize,
+                    lambda: self.scheduler.pause_generation(
+                        io.PauseGenerationReqInput(mode="retract")
+                    ),
                     lambda: self.scheduler.flush_cache(empty_cache=False),
                 )
-            elif isinstance(request, io.CommitWeightsFromDeltaReqInput):
-                receipt = self.session.commit(request.session_id, request.receipts)
-                self.scheduler.record_weight_version_change(
-                    str(receipt["target_version"])
-                )
-            elif isinstance(request, io.ContinueWeightsFromDeltaReqInput):
-                self.session.authorize_resume(request.session_id, request.receipts)
-                self.scheduler.continue_generation(
-                    io.ContinueGenerationReqInput(
-                        torch_empty_cache=False,
-                        delta_session_id=request.session_id,
+            elif isinstance(request, io.ResumeWeightsFromDeltaReqInput):
+
+                def resume(version):
+                    self.scheduler.record_weight_version_change(str(version))
+                    self.scheduler.continue_generation(
+                        io.ContinueGenerationReqInput(torch_empty_cache=False)
                     )
+
+                receipt = self.session.resume(
+                    request.session_id, request.receipts, resume
                 )
-                receipt = self.session.resumed(request.session_id)
             elif isinstance(request, io.AbortWeightsFromDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
@@ -628,42 +508,3 @@ class GpuDeltaSchedulerControl:
             return io.DeltaWeightsReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )
-
-    def reject_conflicting(self, request):
-        if type(request).__name__ not in _CONFLICTING_REQUESTS:
-            return None
-        if not self.leased:
-            if (
-                type(request).__name__ == "UpdateWeightVersionReqInput"
-                and self.identity is not None
-                and self.session is not None
-                and not self.legacy_mutated
-                and request.new_version == str(self.session.version)
-            ):
-                # Declaring the admitted version changes bookkeeping only. Miles
-                # uses this to label its strict startup baseline before rollout.
-                return None
-            # No runtime full-weight hashes: the startup baseline cannot silently
-            # survive a different update path (including a failed partial write).
-            self.legacy_mutated = True
-            return None
-        from sglang.srt.managers import io_struct as io
-
-        name = type(request).__name__.replace("ReqInput", "ReqOutput")
-        cls = getattr(io, name)
-        if "success" not in cls.__struct_fields__:
-            # These existing APIs have empty ACKs. The admitted single Python
-            # tokenizer rejects conflicts before sending, so reaching here is
-            # an internal invariant violation, never a successful empty ACK.
-            raise RuntimeError(
-                "competing mutation bypassed the GPU delta dispatch guard"
-            )
-        if "error_message" in cls.__struct_fields__:
-            return cls(success=False, error_message="GPU delta session owns the model")
-        return cls(success=False, message="GPU delta session owns the model")
-
-    def before_pause(self, mode: str):
-        if self.leased:
-            if mode != "retract":
-                raise ValueError("GPU delta requires retract pause")
-            self.session.quiesce(self.scheduler.device_module.synchronize)

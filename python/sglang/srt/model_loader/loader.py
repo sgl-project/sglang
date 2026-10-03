@@ -1014,14 +1014,6 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_only(model, weights, target_device):
-        from sglang.srt.runtime_context import get_flags
-        from sglang.srt.weight_sync.gpu_delta_checkpoint import (
-            install_canonical_weight_observer,
-        )
-
-        install_canonical_weight_observer(
-            model, is_draft=get_flags().moe.in_speculative_scope
-        )
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()

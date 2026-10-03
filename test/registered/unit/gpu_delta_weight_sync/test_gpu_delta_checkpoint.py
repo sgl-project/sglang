@@ -1,15 +1,22 @@
-"""Common-loader checkpoint metadata capture; no device or serving imports."""
+"""CPU admission tests for immutable local checkpoint headers."""
 
 import ast
-import gc
+import fnmatch
 import importlib.util
+import json
+import logging
+import os
 import sys
+import tempfile
 import types
 import unittest
-import weakref
 from pathlib import Path
+from typing import Optional
 from unittest.mock import patch
 
+import torch
+from safetensors import SafetensorError, safe_open
+from safetensors.torch import save_file
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -22,282 +29,262 @@ checkpoint = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(checkpoint)
 
 
-class TensorMetadata:
-    def __init__(self, shape=(2, 3), dtype="torch.bfloat16"):
-        self.shape = shape
-        self.dtype = dtype
+class DefaultModelLoader:
+    pass
 
 
-class Model:
-    def load_weights(self, weights, is_nextn=False, *, token=None):
-        self.names = [name for name, _ in weights]
-        self.options = (is_nextn, token)
-        return token
+class ModelOptModelLoader(DefaultModelLoader):
+    pass
 
 
-def common_load_weights_only():
-    # Exercise the production boundary without importing unrelated CUDA loaders.
-    tree = ast.parse((_root / "model_loader/loader.py").read_text())
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "DefaultModelLoader"
+def selection_helpers():
+    # Exercise the exact production selection rules without importing unrelated
+    # quantization backends through weight_utils in this CPU-only test.
+    names = {"filter_duplicate_safetensors_files", "maybe_add_mtp_safetensors"}
+    tree = ast.parse((_root / "model_loader/weight_utils.py").read_text())
+    module = types.ModuleType("sglang.srt.model_loader.weight_utils")
+    module.__dict__.update(
+        os=os,
+        json=json,
+        fnmatch=fnmatch,
+        List=list,
+        Optional=Optional,
+        logger=logging.getLogger(__name__),
     )
-    method = next(
-        node for node in cls.body if getattr(node, "name", "") == "load_weights_only"
+    exec(  # noqa: S102 - exact local source, isolated from CUDA-only imports.
+        compile(
+            ast.Module(
+                body=[node for node in tree.body if getattr(node, "name", "") in names],
+                type_ignores=[],
+            ),
+            str(_root / "model_loader/weight_utils.py"),
+            "exec",
+        ),
+        module.__dict__,
     )
-    method.decorator_list = []
-    namespace = {"is_cuda_alike": lambda: False}
-    exec(
-        compile(ast.Module(body=[method], type_ignores=[]), "common_loader", "exec"),
-        namespace,
-    )
-    return namespace[method.name]
+    return module
 
 
-def layout_class():
-    name = "gpu_delta_checkpoint_layout_under_test"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            name, _root / "weight_sync/gpu_delta_layout.py"
+class TestCanonicalCheckpointHeaders(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        self.runner = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                quant_config=types.SimpleNamespace(
+                    is_checkpoint_nvfp4_serialized=True, is_nvfp4_online=False
+                )
+            ),
+            model_config=types.SimpleNamespace(
+                model_path=str(self.folder),
+                hf_config=types.SimpleNamespace(architectures=["Glm4MoeForCausalLM"]),
+                _is_already_quantized=lambda: True,
+            ),
+            load_config=types.SimpleNamespace(
+                load_format="safetensors",
+                draft_model_idx=None,
+                decryption_key_file=None,
+            ),
+            loader=DefaultModelLoader(),
+            is_draft_worker=False,
         )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name].GpuDeltaLayout
-
-
-class TestCanonicalWeightObserver(unittest.TestCase):
-    def test_source_metadata_precedes_conversion_and_preserves_arguments(self):
-        source = TensorMetadata()
-        seen = []
-
-        class ConvertingModel(Model):
-            def load_weights(self, weights, is_nextn=False, *, token=None):
-                for name, tensor in weights:
-                    seen.append(tensor)
-                    tensor.shape = (6,)
-                    tensor.dtype = "torch.float32"
-                self.options = (is_nextn, token)
-                return token
-
-        model = ConvertingModel()
-        checkpoint.install_canonical_weight_observer(model)
-        result = object()
-        self.assertIs(
-            model.load_weights([("source.alias", source)], False, token=result), result
-        )
-        self.assertEqual(model.options, (False, result))
-        self.assertIs(seen[0], source)
-        self.assertEqual(
-            model._gpu_delta_canonical_inventory,
-            {"source.alias": {"shape": [2, 3], "dtype": "BF16"}},
-        )
-        self.assertTrue(model._gpu_delta_metadata_complete)
-
-    def test_installation_and_iteration_are_lazy(self):
-        consumed = []
-
-        def weights():
-            consumed.append("first")
-            yield "first", TensorMetadata()
-            consumed.append("second")
-            yield "second", TensorMetadata()
-
-        class PartialModel(Model):
-            def load_weights(self, weights, **kwargs):
-                self.first = next(iter(weights))[0]
-                return "partial"
-
-        model = PartialModel()
-        checkpoint.install_canonical_weight_observer(model)
-        self.assertFalse(hasattr(model, "_gpu_delta_canonical_inventory"))
-        self.assertEqual(consumed, [])
-        self.assertEqual(model.load_weights(weights()), "partial")
-        self.assertEqual(consumed, ["first"])
-        self.assertFalse(model._gpu_delta_metadata_complete)
-
-    def test_installation_is_idempotent_and_direct_reload_invalidates_generation(self):
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        first_wrapper = model.load_weights
-        checkpoint.install_canonical_weight_observer(model)
-        self.assertIs(model.load_weights, first_wrapper)
-        model.load_weights([("first", TensorMetadata())])
-        first_inventory = model._gpu_delta_canonical_inventory
-        self.assertEqual(model._gpu_delta_load_generation, 1)
-        model.load_weights([("second", TensorMetadata((4,), "torch.uint8"))])
-        self.assertEqual(model._gpu_delta_load_generation, 2)
-        self.assertIsNot(model._gpu_delta_canonical_inventory, first_inventory)
-        self.assertEqual(set(first_inventory), {"first"})
-        self.assertEqual(set(model._gpu_delta_canonical_inventory), {"second"})
-
-    def test_failed_load_is_incomplete_even_after_exhausting_source(self):
-        class FailingModel(Model):
-            def load_weights(self, weights):
-                list(weights)
-                raise RuntimeError("post-load failure")
-
-        model = FailingModel()
-        checkpoint.install_canonical_weight_observer(model)
-        with self.assertRaisesRegex(RuntimeError, "post-load failure"):
-            model.load_weights([("weight", TensorMetadata())])
-        self.assertEqual(model._gpu_delta_load_generation, 1)
-        self.assertFalse(model._gpu_delta_metadata_complete)
-        self.assertEqual(set(model._gpu_delta_canonical_inventory), {"weight"})
-
-    def test_failure_before_consuming_source_still_invalidates_generation(self):
-        class FailingModel(Model):
-            def load_weights(self, weights):
-                raise RuntimeError("before iterator")
-
-        model = FailingModel()
-        model._gpu_delta_load_generation = 3
-        checkpoint.install_canonical_weight_observer(model)
-        with self.assertRaisesRegex(RuntimeError, "before iterator"):
-            model.load_weights([])
-        self.assertEqual(model._gpu_delta_load_generation, 4)
-        self.assertFalse(model._gpu_delta_metadata_complete)
-
-    def test_iterator_failure_remains_original_failure(self):
-        def weights():
-            yield "weight", TensorMetadata()
-            raise OSError("source read failed")
-
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        with self.assertRaisesRegex(OSError, "source read failed"):
-            model.load_weights(weights())
-        self.assertFalse(model._gpu_delta_metadata_complete)
-
-    def test_unsupported_dtype_and_duplicate_names_do_not_break_normal_load(self):
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights(
-            [
-                ("same", TensorMetadata(dtype="torch.float64")),
-                ("same", TensorMetadata(dtype="torch.float64")),
-            ]
-        )
-        self.assertEqual(model.names, ["same", "same"])
-        self.assertTrue(model._gpu_delta_duplicate_source_names)
-        self.assertTrue(model._gpu_delta_metadata_complete)
-        self.assertEqual(
-            model._gpu_delta_canonical_inventory["same"]["dtype"], "torch.float64"
-        )
-
-    def test_no_source_tensor_is_retained(self):
-        references = []
-
-        def weights():
-            tensor = TensorMetadata()
-            references.append(weakref.ref(tensor))
-            yield "weight", tensor
-
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights(weights())
-        gc.collect()
-        self.assertIsNone(references[0]())
-
-    def test_ignored_and_alias_source_names_remain_in_inventory(self):
-        names = [
-            "model.layers.0.self_attn.q_a_proj.weight",
-            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-            "model.layers.9.mtp.weight",
-            "model.layers.0.self_attn.rotary_emb.inv_freq",
-            "model.layers.0.mlp.experts.0.gate_proj.input_scale",
-        ]
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights((name, TensorMetadata()) for name in names)
-        self.assertEqual(list(model._gpu_delta_canonical_inventory), names)
-
-    def test_explicit_nextn_calls_leave_target_inventory_unchanged(self):
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights([("target", TensorMetadata())])
-        original_inventory = model._gpu_delta_canonical_inventory
-        for args, kwargs in [((True,), {}), ((), {"is_nextn": True})]:
-            model.load_weights([("draft", TensorMetadata())], *args, **kwargs)
-            self.assertIs(model._gpu_delta_canonical_inventory, original_inventory)
-            self.assertEqual(model._gpu_delta_load_generation, 1)
-            self.assertTrue(model.options[0])
-
-    def test_draft_exclusion_survives_leaving_build_scope(self):
-        model = Model()
-        original = model.load_weights
-        checkpoint.install_canonical_weight_observer(model, is_draft=True)
-        checkpoint.install_canonical_weight_observer(model, is_draft=False)
-        self.assertEqual(model.load_weights, original)
-        model.load_weights([("draft", TensorMetadata())])
-        self.assertFalse(hasattr(model, "_gpu_delta_canonical_inventory"))
-
-    def test_common_loader_installs_before_loading_and_skips_draft(self):
-        load = common_load_weights_only()
-        for is_draft in [False, True]:
-            runtime = types.ModuleType("sglang.srt.runtime_context")
-            runtime.get_flags = lambda: types.SimpleNamespace(
-                moe=types.SimpleNamespace(in_speculative_scope=is_draft)
-            )
-            model = Model()
-            with patch.dict(
+        loader = types.ModuleType("sglang.srt.model_loader.loader")
+        loader.DefaultModelLoader = DefaultModelLoader
+        loader.ModelOptModelLoader = ModelOptModelLoader
+        runai = types.ModuleType("sglang.srt.utils.runai_utils")
+        runai.is_runai_obj_uri = lambda path: False
+        runai.list_safetensors = lambda path: self.fail("unexpected remote source")
+        self.enterContext(
+            patch.dict(
                 sys.modules,
                 {
-                    runtime.__name__: runtime,
-                    "sglang.srt.weight_sync.gpu_delta_checkpoint": checkpoint,
+                    loader.__name__: loader,
+                    "sglang.srt.model_loader.weight_utils": selection_helpers(),
+                    runai.__name__: runai,
                 },
-            ):
-                load(model, [("raw", TensorMetadata())], None)
-            self.assertEqual(model.names, ["raw"])
-            self.assertEqual(
-                hasattr(model, "_gpu_delta_canonical_inventory"), not is_draft
             )
-
-    def test_layout_rejects_partial_or_failed_checkpoint_metadata(self):
-        class PartialModel(Model):
-            def load_weights(self, weights):
-                next(iter(weights))
-
-        model = PartialModel()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights([("weight", TensorMetadata())])
-        with self.assertRaisesRegex(ValueError, "canonical startup metadata"):
-            layout_class()(model)
-
-    def test_layout_rejects_metadata_without_completed_loader_observation(self):
-        model = Model()
-        model._gpu_delta_canonical_inventory = {
-            "weight": {"shape": [2, 3], "dtype": "BF16"}
-        }
-        with self.assertRaisesRegex(ValueError, "canonical startup metadata"):
-            layout_class()(model)
-
-    def test_captured_dtypes_match_the_physical_layout_contract(self):
-        cls = layout_class()
-        physical_dtypes = sys.modules[cls.__module__]._DTYPES
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        model.load_weights(
-            (str(dtype), TensorMetadata(dtype=dtype)) for dtype in physical_dtypes
         )
-        for dtype, expected in physical_dtypes.items():
-            self.assertEqual(
-                model._gpu_delta_canonical_inventory[str(dtype)]["dtype"], expected
-            )
 
-    def test_layout_detects_reload_even_without_tensor_pointer_change(self):
-        model = Model()
-        checkpoint.install_canonical_weight_observer(model)
-        tensor = TensorMetadata()
-        model.load_weights([("weight", tensor)])
-        cls = layout_class()
-        admitted = object.__new__(cls)
-        admitted.model = model
-        admitted.generation = model._gpu_delta_load_generation
-        model.load_weights([("weight", tensor)])
-        with self.assertRaisesRegex(RuntimeError, "ordinary reload invalidated"):
-            admitted.check_identity()
+    def save(self, name, tensors):
+        path = self.folder / name
+        save_file(tensors, str(path))
+        return path
+
+    def index(self, weight_map):
+        (self.folder / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+
+    def read(self):
+        return checkpoint.read_canonical_checkpoint_inventory(self.runner)
+
+    def test_reads_source_metadata_and_preserves_alias_and_skipped_names(self):
+        tensors = {
+            "model.layers.0.self_attn.q_a_proj.weight": torch.zeros(
+                2, 3, dtype=torch.bfloat16
+            ),
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": torch.zeros(
+                4, 3, dtype=torch.float16
+            ),
+            "model.layers.0.self_attn.indexer.k_norm.weight": torch.zeros(
+                3, dtype=torch.bfloat16
+            ),
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                2, 3, dtype=torch.uint8
+            ),
+            "model.layers.0.mlp.experts.0.gate_proj.weight_scale": torch.zeros(
+                2, 1, dtype=torch.float8_e4m3fn
+            ),
+            "model.layers.0.mlp.experts.0.gate_proj.input_scale": torch.zeros(
+                (), dtype=torch.float32
+            ),
+            "model.layers.9.mtp.weight": torch.zeros(2, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.rotary_emb.inv_freq": torch.zeros(2),
+        }
+        self.save("model.safetensors", tensors)
+
+        class MetadataOnly:
+            def __init__(self, *args, **kwargs):
+                self.source = safe_open(*args, **kwargs)
+
+            def __enter__(self):
+                self.source.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.source.__exit__(*args)
+
+            def keys(self):
+                return self.source.keys()
+
+            def get_slice(self, name):
+                return self.source.get_slice(name)
+
+            def get_tensor(self, name):
+                raise AssertionError("metadata admission must not materialize tensors")
+
+        with patch.object(checkpoint, "safe_open", MetadataOnly):
+            inventory = self.read()
+        self.assertEqual(set(inventory), set(tensors))
+        for name, tensor in tensors.items():
+            self.assertEqual(inventory[name]["shape"], list(tensor.shape))
+        self.assertEqual(
+            inventory["model.layers.0.self_attn.indexer.k_norm.weight"]["dtype"], "BF16"
+        )
+        self.assertEqual(
+            inventory["model.layers.0.mlp.experts.0.gate_proj.weight_scale"]["dtype"],
+            "F8_E4M3",
+        )
+        self.assertEqual(vars(self.runner.model).keys(), {"quant_config"})
+
+    def test_index_selects_shards_and_excludes_duplicate_consolidated_file(self):
+        self.save("shard.safetensors", {"weight": torch.zeros(2, 3)})
+        self.save(
+            "consolidated.safetensors",
+            {"weight": torch.zeros(7), "unused": torch.zeros(1)},
+        )
+        self.index({"weight": "shard.safetensors"})
+        self.assertEqual(self.read(), {"weight": {"shape": [2, 3], "dtype": "F32"}})
+
+    def test_unindexed_bundled_mtp_follows_existing_loader_rule(self):
+        self.save("shard.safetensors", {"target": torch.zeros(1)})
+        self.save("mtp.safetensors", {"model.layers.9.mtp.weight": torch.zeros(2)})
+        self.index({"target": "shard.safetensors"})
+        self.assertEqual(set(self.read()), {"target"})
+        self.runner.model_config.hf_config.num_nextn_predict_layers = 1
+        self.assertEqual(set(self.read()), {"target", "model.layers.9.mtp.weight"})
+
+    def test_missing_indexed_shard_and_ambiguous_sources_reject(self):
+        self.index({"weight": "missing.safetensors"})
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            self.read()
+        (self.folder / "model.safetensors.index.json").unlink()
+        for name in ("first.safetensors", "second.safetensors"):
+            self.save(name, {"weight": torch.zeros(1)})
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            self.read()
+
+    def test_empty_and_truncated_checkpoints_reject(self):
+        with self.assertRaisesRegex(ValueError, "no selected"):
+            self.read()
+        path = self.save("model.safetensors", {})
+        with self.assertRaisesRegex(ValueError, "empty"):
+            self.read()
+        path.write_bytes(b"truncated")
+        with self.assertRaises(SafetensorError):
+            self.read()
+
+    def test_accepts_standard_formats_and_prequantized_modelopt_delegation(self):
+        self.save("model.safetensors", {"weight": torch.zeros(1)})
+        for load_format in ("auto", "safetensors", "fastsafetensors"):
+            with self.subTest(load_format=load_format):
+                self.runner.load_config.load_format = load_format
+                self.assertEqual(set(self.read()), {"weight"})
+        self.runner.loader = ModelOptModelLoader()
+        self.assertEqual(set(self.read()), {"weight"})
+        self.runner.model_config._is_already_quantized = lambda: False
+        with self.assertRaisesRegex(ValueError, "conversion"):
+            self.read()
+
+    def test_rejects_custom_or_transformed_source_contracts_before_header_read(self):
+        class CustomLoader(DefaultModelLoader):
+            pass
+
+        cases = [
+            (self.runner, "loader", CustomLoader(), "standard local checkpoint loader"),
+            (self.runner, "is_draft_worker", True, "target model"),
+            (self.runner.load_config, "load_format", "pt", "safetensors load format"),
+            (
+                self.runner.load_config,
+                "load_format",
+                "presharded",
+                "safetensors load format",
+            ),
+            (self.runner.load_config, "draft_model_idx", 0, "target model"),
+            (self.runner.load_config, "decryption_key_file", "key", "encrypted"),
+            (
+                self.runner.model,
+                "secondary_weights",
+                [object()],
+                "secondary or remapped",
+            ),
+            (
+                self.runner.model,
+                "allow_patterns_overrides",
+                ["subdir/*.safetensors"],
+                "secondary or remapped",
+            ),
+            (
+                self.runner.model.quant_config,
+                "is_checkpoint_nvfp4_serialized",
+                False,
+                "serialized NVFP4",
+            ),
+            (
+                self.runner.model.quant_config,
+                "is_nvfp4_online",
+                True,
+                "serialized NVFP4",
+            ),
+            (
+                self.runner.model_config,
+                "model_path",
+                "remote/model",
+                "immutable local checkpoint",
+            ),
+        ]
+        for obj, key, value, message in cases:
+            with self.subTest(key=key, value=value), patch.object(
+                obj, key, value, create=True
+            ), patch.object(
+                checkpoint,
+                "safe_open",
+                side_effect=AssertionError("opened unsupported source"),
+            ), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                self.read()
 
 
 if __name__ == "__main__":

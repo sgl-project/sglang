@@ -1,138 +1,144 @@
-"""Resume admission and pause-state regressions at the real tokenizer boundary."""
+"""Admission remains paused until the dedicated delta acknowledgment succeeds."""
 
 import asyncio
 from types import SimpleNamespace
 
 import pytest
-
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.weight_sync.gpu_delta_tokenizer import (
-    GpuDeltaConflict,
-    GpuDeltaTokenizerControl,
-)
+from sglang.srt.managers import io_struct as io
+from sglang.srt.weight_sync import gpu_delta_tokenizer as tokenizer
+from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def make_manager():
-    manager = SimpleNamespace(is_pause=True, is_pause_cond=asyncio.Condition())
-    manager.gpu_delta = GpuDeltaTokenizerControl.__new__(GpuDeltaTokenizerControl)
-    manager.gpu_delta.manager = manager
-    manager.gpu_delta.session_id = None
-    return manager
+@pytest.fixture
+def control(monkeypatch):
+    monkeypatch.setattr(
+        tokenizer, "get_serving", lambda: SimpleNamespace(tokenizer_worker_num=1)
+    )
+    sent, versions = [], []
+    manager = SimpleNamespace(
+        is_pause=False,
+        is_pause_cond=asyncio.Condition(),
+        _dispatch_to_scheduler=sent.append,
+        auto_create_handle_loop=lambda: None,
+        _update_weight_version_if_provided=versions.append,
+    )
+    control = tokenizer.GpuDeltaTokenizerControl.__new__(
+        tokenizer.GpuDeltaTokenizerControl
+    )
+    control.manager = manager
+    control.session_id = "publication-1"
+    control.participants = [{"engine_id": "engine-0", "rank_id": "rank-0"}]
+    control.communicator = GpuDeltaCommunicator(control._send, 1)
+    return control, sent, versions
 
 
-def ordinary_continue():
-    return SimpleNamespace(delta_session_id=None, delta_commit_receipts=None)
+def reply(control, obj, state, success=True):
+    control.communicator.handle_recv(
+        io.DeltaWeightsReqOutput(
+            rid=obj.rid,
+            success=success,
+            message="" if success else "rejected",
+            participant={
+                "identity": control.participants[0],
+                "session_id": obj.session_id,
+                "state": state,
+                "target_version": 1,
+            },
+        )
+    )
 
 
-def test_queued_ordinary_resume_rechecks_delta_lease_under_pause_condition():
+def test_only_update_gates_admission_and_only_successful_resume_releases_it(control):
     async def run():
-        manager = make_manager()
-        dispatched = []
+        facade, sent, versions = control
+        status = io.GetWeightsDeltaStatusReqInput(session_id="publication-1")
+        task = asyncio.create_task(facade.request(status))
+        await asyncio.sleep(0)
+        assert not facade.manager.is_pause
+        reply(facade, status, "PREPARED")
+        assert (await task)["success"]
 
-        async def dispatch(request):
-            dispatched.append(request)
+        update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
+        task = asyncio.create_task(facade.request(update))
+        await asyncio.sleep(0)
+        assert sent[-1] is update and facade.manager.is_pause
+        reply(facade, update, "APPLIED")
+        assert (await task)["success"] and facade.manager.is_pause
 
-        manager._async_dispatch_to_scheduler = dispatch
-        async with manager.is_pause_cond:
-            task = asyncio.create_task(
-                TokenizerManager.continue_generation(manager, ordinary_continue())
-            )
-            await asyncio.sleep(0)
-            assert not task.done()
-            # Prepare acquires ownership while the ordinary resume is queued.
-            prepare = type(
-                "PrepareWeightsFromDeltaReqInput",
-                (),
-                {"session_id": "publication-1"},
-            )()
-            manager.gpu_delta.guard_dispatch(prepare)
+        resume = io.ResumeWeightsFromDeltaReqInput(
+            session_id="publication-1", receipts=[]
+        )
+        task = asyncio.create_task(facade.request(resume))
+        await asyncio.sleep(0)
+        reply(facade, resume, "APPLIED", success=False)
+        assert not (await task)["success"]
+        assert facade.manager.is_pause and facade.session_id == "publication-1"
+        assert versions == []
 
-        with pytest.raises(GpuDeltaConflict, match="global commit certificate"):
-            await task
-        assert manager.is_pause
-        assert manager.gpu_delta.session_id == "publication-1"
-        assert dispatched == []
+        resume = io.ResumeWeightsFromDeltaReqInput(
+            session_id="publication-1", receipts=[{"state": "APPLIED"}]
+        )
+        task = asyncio.create_task(facade.request(resume))
+        await asyncio.sleep(0)
+        assert facade.manager.is_pause and not task.done()
+        reply(facade, resume, "RESUMED")
+        assert (await task)["success"]
+        assert not facade.manager.is_pause and facade.session_id is None
+        assert versions == ["1"]
 
     asyncio.run(run())
 
 
-def test_resume_unpauses_only_after_successful_dispatch_or_delta_ack():
+@pytest.mark.parametrize("failure", ["send", "cancel"])
+def test_uncertain_update_keeps_admission_paused(control, failure):
     async def run():
-        manager = make_manager()
-        dispatched = []
-        fail_dispatch = True
+        facade, _, _ = control
+        if failure == "send":
 
-        async def dispatch(request):
-            assert manager.is_pause
-            dispatched.append(request)
-            if fail_dispatch:
+            def fail(_):
                 raise OSError("transport unavailable")
 
-        manager._async_dispatch_to_scheduler = dispatch
-        with pytest.raises(OSError, match="transport unavailable"):
-            await TokenizerManager.continue_generation(manager, ordinary_continue())
-        assert manager.is_pause
+            facade.manager._dispatch_to_scheduler = fail
+        update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
+        task = asyncio.create_task(facade.request(update))
+        await asyncio.sleep(0)
+        if failure == "cancel":
+            task.cancel()
+        with pytest.raises(OSError if failure == "send" else asyncio.CancelledError):
+            await task
+        assert facade.manager.is_pause and facade.session_id == "publication-1"
 
-        fail_dispatch = False
-        assert (
-            await TokenizerManager.continue_generation(manager, ordinary_continue())
-            is None
+    asyncio.run(run())
+
+
+def test_prepare_ownership_survives_failed_send(control):
+    async def run():
+        facade, _, _ = control
+        facade.session_id = None
+
+        def fail(_):
+            raise OSError("transport unavailable")
+
+        facade.manager._dispatch_to_scheduler = fail
+        prepare = io.PrepareWeightsFromDeltaReqInput(
+            session_id="publication-1",
+            engine_id="engine-0",
+            manifest_path="/manifest",
+            manifest_sha256="a" * 64,
+            stream_id="run",
+            base_version=0,
+            target_version=1,
+            plan_digest="b" * 64,
+            participants=facade.participants,
+            cohort=facade.participants,
         )
-        assert not manager.is_pause
-        assert len(dispatched) == 2
-
-        manager.is_pause = True
-        manager.gpu_delta.session_id = "publication-1"
-        requested = asyncio.Event()
-        acknowledgement = asyncio.get_running_loop().create_future()
-        receipts = [{"session_id": "publication-1", "state": "COMMITTED"}]
-        versions = []
-
-        async def delta_request(request):
-            assert request.session_id == "publication-1"
-            assert request.receipts == receipts
-            requested.set()
-            return await acknowledgement
-
-        def update_version(version):
-            assert manager.is_pause
-            versions.append(version)
-
-        manager.gpu_delta.request = delta_request
-        manager._update_weight_version_if_provided = update_version
-        task = asyncio.create_task(
-            TokenizerManager.continue_generation(
-                manager,
-                SimpleNamespace(
-                    delta_session_id="publication-1", delta_commit_receipts=receipts
-                ),
-            )
-        )
-        await asyncio.wait_for(requested.wait(), timeout=1)
-        assert manager.is_pause
-        assert manager.gpu_delta.session_id == "publication-1"
-        assert not task.done()
-        assert versions == []
-        assert len(dispatched) == 2
-
-        participants = [
-            {
-                "identity": {"engine_id": "engine-0", "rank_id": "rank-0"},
-                "session_id": "publication-1",
-                "state": "RESUMED",
-                "target_version": 7,
-            }
-        ]
-        acknowledgement.set_result(
-            {"success": True, "message": "", "participants": participants}
-        )
-        assert await task == {"success": True, "participants": participants}
-        assert not manager.is_pause
-        assert manager.gpu_delta.session_id is None
-        assert versions == ["7"]
-        assert len(dispatched) == 2
+        with pytest.raises(OSError):
+            await facade.request(prepare)
+        assert facade.session_id == "publication-1" and not facade.manager.is_pause
+        with pytest.raises(tokenizer.GpuDeltaConflict, match="another delta session"):
+            await facade.request(prepare)
 
     asyncio.run(run())

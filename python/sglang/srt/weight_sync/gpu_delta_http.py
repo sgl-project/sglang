@@ -8,10 +8,10 @@ from fastapi import Body, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 from sglang.srt.managers.io_struct import (
     AbortWeightsFromDeltaReqInput,
-    CommitWeightsFromDeltaReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
     PrepareWeightsFromDeltaReqInput,
+    ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
 from sglang.srt.utils.auth import AuthLevel, auth_level
@@ -65,10 +65,10 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     ):
         return await dispatch(obj, request)
 
-    @app.post("/commit_weights_from_delta")
+    @app.post("/resume_weights_from_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def commit_weights_from_delta(
-        obj: Annotated[CommitWeightsFromDeltaReqInput, Body()], request: Request
+    async def resume_weights_from_delta(
+        obj: Annotated[ResumeWeightsFromDeltaReqInput, Body()], request: Request
     ):
         return await dispatch(obj, request)
 

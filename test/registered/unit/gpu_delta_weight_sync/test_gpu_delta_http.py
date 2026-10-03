@@ -9,10 +9,10 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sglang.srt.managers.io_struct import (
     AbortWeightsFromDeltaReqInput,
-    CommitWeightsFromDeltaReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
     PrepareWeightsFromDeltaReqInput,
+    ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
@@ -70,18 +70,17 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "plan_digest": "b" * 64,
                 "participants": [],
                 "cohort": [],
-                "expected_engines": ["e0"],
             },
         ),
         ("get_weights_delta_status", GetWeightsDeltaStatusReqInput, session),
         (
             "update_weights_from_delta",
             UpdateWeightsFromDeltaReqInput,
-            session | {"participants": [], "receipts": []},
+            session,
         ),
         (
-            "commit_weights_from_delta",
-            CommitWeightsFromDeltaReqInput,
+            "resume_weights_from_delta",
+            ResumeWeightsFromDeltaReqInput,
             session | {"receipts": []},
         ),
         ("abort_weights_from_delta", AbortWeightsFromDeltaReqInput, session),

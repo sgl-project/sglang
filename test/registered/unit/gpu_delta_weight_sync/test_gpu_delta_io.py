@@ -6,18 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import TypeAdapter
-
 from sglang.srt.managers.io_struct import (
-    ContinueGenerationReqInput,
     PrepareWeightsFromDeltaReqInput,
-    UpdateWeightVersionReqInput,
+    ResumeWeightsFromDeltaReqInput,
     msgpack_decode,
     msgpack_encode,
 )
 from sglang.srt.weight_sync.gpu_delta_session import (
-    DeltaSession,
     GpuDeltaSchedulerControl,
-    guard_tokenizer_dispatch,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -115,31 +111,18 @@ def test_resume_certificate_survives_http_validation_and_ipc():
     receipts = [
         {
             "identity": {"engine_id": "engine-0", "rank_id": "original-rank-0"},
-            "state": "COMMITTED",
+            "state": "APPLIED",
             "session_id": "publication-1",
             "target_version": 1,
         }
     ]
-    request = TypeAdapter(ContinueGenerationReqInput).validate_python(
-        {
-            "torch_empty_cache": False,
-            "delta_session_id": "publication-1",
-            "delta_commit_receipts": receipts,
-        }
+    request = TypeAdapter(ResumeWeightsFromDeltaReqInput).validate_python(
+        {"session_id": "publication-1", "receipts": receipts}
     )
     received = msgpack_decode(msgpack_encode(request))
-    assert isinstance(received, ContinueGenerationReqInput)
-    assert received.delta_session_id == "publication-1"
-    assert received.delta_commit_receipts == receipts
-    assert received.torch_empty_cache is False
-
-
-def test_ordinary_resume_retains_defaults():
-    request = TypeAdapter(ContinueGenerationReqInput).validate_python({})
-    received = msgpack_decode(msgpack_encode(request))
-    assert received.delta_session_id is None
-    assert received.delta_commit_receipts is None
-    assert received.torch_empty_cache is True
+    assert isinstance(received, ResumeWeightsFromDeltaReqInput)
+    assert received.session_id == "publication-1"
+    assert received.receipts == receipts
 
 
 @pytest.mark.parametrize(
@@ -184,74 +167,9 @@ def test_prepare_uses_scheduler_updater_session_and_offload_state(
         plan_digest="b" * 64,
         participants=[who],
         cohort=[who],
-        expected_engines=[who["engine_id"]],
     )
     result = control.handle(request)
     assert result.success is not (legacy_session or offloaded)
     assert bool(prepared) is result.success
     if not result.success:
         assert "another weight update or memory offload" in result.message
-
-
-@pytest.mark.parametrize("version", [0, 3])
-def test_matching_version_bookkeeping_preserves_admitted_delta_baseline(version):
-    control = GpuDeltaSchedulerControl(SimpleNamespace())
-    control.identity = {"engine_id": "engine-0", "rank_id": "original-0"}
-    control.session = DeltaSession(control.identity, object(), initial_version=version)
-    try:
-        # Exercise the real HTTP/IPC field (`new_version`, not `weight_version`).
-        request = msgpack_decode(
-            msgpack_encode(
-                UpdateWeightVersionReqInput(
-                    new_version=str(version), abort_all_requests=False
-                )
-            )
-        )
-        assert control.reject_conflicting(request) is None
-        assert not control.legacy_mutated
-        assert control.session.version == version
-        # This exception cannot make an actual weight write metadata-only.
-        disk_write = type("UpdateWeightFromDiskReqInput", (), {})()
-        assert control.reject_conflicting(disk_write) is None
-        assert control.legacy_mutated
-        assert control.reject_conflicting(request) is None
-        assert control.legacy_mutated  # matching labels cannot restore a baseline
-    finally:
-        control.session._executor.shutdown(wait=True)
-
-
-@pytest.mark.parametrize("described,new_version", [(False, "0"), (True, "1")])
-def test_unadmitted_or_different_version_still_invalidates_baseline(
-    described, new_version
-):
-    control = GpuDeltaSchedulerControl(SimpleNamespace())
-    if described:
-        control.identity = {"engine_id": "engine-0", "rank_id": "original-0"}
-        control.session = DeltaSession(control.identity, object())
-    try:
-        assert (
-            control.reject_conflicting(
-                UpdateWeightVersionReqInput(new_version=new_version)
-            )
-            is None
-        )
-        assert control.legacy_mutated
-    finally:
-        if control.session is not None:
-            control.session._executor.shutdown(wait=True)
-
-
-def test_matching_version_is_still_rejected_during_delta_lease():
-    control = GpuDeltaSchedulerControl(SimpleNamespace())
-    control.identity = {"engine_id": "engine-0", "rank_id": "original-0"}
-    control.session = SimpleNamespace(leased=True, version=0)
-    request = UpdateWeightVersionReqInput(new_version="0", abort_all_requests=False)
-    reply = control.reject_conflicting(request)
-    assert not reply.success and "owns the model" in reply.message
-    assert not control.legacy_mutated
-    with pytest.raises(ValueError, match="competing mutation"):
-        guard_tokenizer_dispatch(SimpleNamespace(session_id="publication-1"), request)
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))

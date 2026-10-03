@@ -1796,10 +1796,11 @@ async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
     """Continue generation."""
-    result = await _global_state.tokenizer_manager.continue_generation(obj)
-    content = {"message": "Generation continued successfully.", "status": "ok"}
-    content.update(result or {})
-    return ORJSONResponse(content=content, status_code=200)
+    await _global_state.tokenizer_manager.continue_generation(obj)
+    return ORJSONResponse(
+        content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
 
 
 ##### OpenAI-compatible API endpoints #####

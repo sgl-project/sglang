@@ -177,16 +177,14 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         shared.down_proj.weight.input_dim = 1
         for module in (shared.gate_up_proj, shared.down_proj):
             module.tp_rank, module.tp_size = tp_rank, 8
-        root._gpu_delta_load_generation = 1
-        root._gpu_delta_metadata_complete = True
-        root._gpu_delta_canonical_inventory = {
+        inventory = {
             f"model.layers.0.mlp.shared_experts.{key}_proj.weight": {
                 "dtype": "BF16",
                 "shape": list(value.shape),
             }
             for key, value in before.items()
         }
-        plan = layout.GpuDeltaLayout(root)
+        plan = layout.GpuDeltaLayout(root, inventory)
         for binding in plan.bindings:
             key = binding.name.split(".")[-2].removesuffix("_proj")
             mask = layout._bytes(before[key]) ^ layout._bytes(after[key])
@@ -566,11 +564,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             patch.dict(sys.modules, {"sglang.srt.runtime_context": runtime}),
             patch.object(layout, "_require_fixed_moe_topology"),
             patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
+            patch(
+                "sglang.srt.weight_sync.gpu_delta_checkpoint.read_canonical_checkpoint_inventory",
+                return_value={"weight": {"shape": [1], "dtype": "U8"}},
+            ) as read_inventory,
             patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "snappy-zstd"}),
         ):
             backend = layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
             with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
                 self.assertEqual(backend.describe()["codec"], "snappy-zstd")
+                backend.describe()
+                read_inventory.assert_called_once()
                 with self.assertRaisesRegex(ValueError, "WEIGHT_DELTA_CODEC"):
                     layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
 
@@ -585,16 +589,14 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         layer.self_attn = torch.nn.Module()
         layer.self_attn.indexer = torch.nn.Module()
         norm = layer.self_attn.indexer.k_norm = torch.nn.LayerNorm(128)
-        root._gpu_delta_load_generation = 1
-        root._gpu_delta_metadata_complete = True
-        root._gpu_delta_canonical_inventory = {
+        inventory = {
             f"model.layers.0.self_attn.indexer.k_norm.{key}": {
                 "dtype": "BF16",
                 "shape": [128],
             }
             for key in ("weight", "bias")
         }
-        plan = layout.GpuDeltaLayout(root)
+        plan = layout.GpuDeltaLayout(root, inventory)
         values = torch.tensor(
             [0.0, -0.0, float("inf"), float("nan"), 1.25, -3.5, 0.125, -16],
             dtype=torch.bfloat16,

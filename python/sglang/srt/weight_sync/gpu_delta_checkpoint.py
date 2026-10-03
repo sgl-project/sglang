@@ -1,79 +1,86 @@
-"""Observe canonical checkpoint metadata without changing weight values.
+"""Canonical metadata for the GPU-delta receiver's immutable startup checkpoint.
 
-Installed at the common iterator-based loader boundary, not in model classes.
-This records source metadata only; GPU delta layout admission still decides
-which model, quantization, aliases, and physical buffers it can safely update.
+Read only at first delta admission. The exclusive controller must keep the
+original local checkpoint unchanged for the engine's lifetime; this is metadata
+discovery, not proof of the current model's weight values. Ordinary loaders and
+model methods are never modified.
 """
 
-from __future__ import annotations
+from pathlib import Path
 
-import inspect
-from functools import wraps
-
-_DTYPE_NAMES = {
-    "torch.bfloat16": "BF16",
-    "torch.float16": "F16",
-    "torch.float32": "F32",
-    "torch.float8_e4m3fn": "F8_E4M3",
-    "torch.uint8": "U8",
-    "torch.int8": "I8",
-    "torch.int32": "I32",
-    "torch.int64": "I64",
-}
+from safetensors import safe_open
 
 
-def install_canonical_weight_observer(model, *, is_draft: bool = False):
-    """Wrap one model's loader once, including its later direct reload calls.
+def read_canonical_checkpoint_inventory(model_runner):
+    """Read source names, shapes and dtypes without materializing any tensors.
 
-    Draft construction is excluded by the existing draft build scope. Explicit
-    ``is_nextn`` calls on a target retain the model loader's existing behavior.
-    The observer never reads tensor values, copies tensors, or synchronizes a
-    device. Unsupported dtypes and duplicate names are checked at delta
-    admission, not during ordinary loading of the ``(name, tensor)`` iterator.
+    Only the standard local, serialized NVFP4 source contract is supported. Runtime
+    layout admission separately checks the physical buffers and model mappings.
     """
-    if is_draft:
-        # Later reloads need not run inside the construction-only draft scope.
-        model._gpu_delta_metadata_is_draft = True
-    original = model.load_weights
-    if getattr(model, "_gpu_delta_metadata_is_draft", False) or getattr(
-        original, "_gpu_delta_metadata_observer", False
+    from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
+    from sglang.srt.model_loader.weight_utils import (
+        filter_duplicate_safetensors_files,
+        maybe_add_mtp_safetensors,
+    )
+
+    model = model_runner.model
+    config = model_runner.load_config
+    model_config = model_runner.model_config
+    loader = model_runner.loader
+    # ModelOpt's already-quantized branch delegates to DefaultModelLoader.
+    # Subclasses may override the iterator or transform its names and values.
+    if type(loader) not in (DefaultModelLoader, ModelOptModelLoader):
+        raise ValueError("GPU delta requires the standard local checkpoint loader")
+    if type(loader) is ModelOptModelLoader and not model_config._is_already_quantized():
+        raise ValueError("GPU delta does not support load-time ModelOpt conversion")
+    if config.load_format not in {"auto", "safetensors", "fastsafetensors"}:
+        raise ValueError("GPU delta requires a standard safetensors load format")
+    if model_runner.is_draft_worker or config.draft_model_idx is not None:
+        raise ValueError("GPU delta checkpoint admission requires the target model")
+    if (
+        getattr(model, "secondary_weights", ())
+        or getattr(model, "allow_patterns_overrides", None) is not None
     ):
-        return
-    signature = inspect.signature(original)
-    nextn = signature.parameters.get("is_nextn")
+        raise ValueError("GPU delta does not support secondary or remapped sources")
+    if config.decryption_key_file is not None:
+        raise ValueError("GPU delta does not support encrypted checkpoint sources")
+    quant_config = getattr(model, "quant_config", None)
+    if not getattr(quant_config, "is_checkpoint_nvfp4_serialized", False) or getattr(
+        quant_config, "is_nvfp4_online", False
+    ):
+        raise ValueError("GPU delta requires a serialized NVFP4 checkpoint")
 
-    @wraps(original)
-    def load_weights(weights, *args, **kwargs):
-        if nextn is not None:
-            arguments = signature.bind_partial(weights, *args, **kwargs).arguments
-            if arguments.get("is_nextn", nextn.default):
-                return original(weights, *args, **kwargs)
+    folder = Path(model_config.model_path)
+    if not folder.is_dir():
+        raise ValueError("GPU delta requires the original immutable local checkpoint")
+    # Match the default loader's primary source (empty prefix, no draft remap).
+    # Reuse its index filtering and bundled-MTP rules without invoking downloads,
+    # checksum verification, tensor loading, or checkpoint page-cache prefetch.
+    files = filter_duplicate_safetensors_files(
+        [str(path) for path in folder.glob("*.safetensors")],
+        str(folder),
+        "model.safetensors.index.json",
+    )
+    files = maybe_add_mtp_safetensors(
+        files, str(folder), "model.safetensors.index.json", model_config.hf_config
+    )
+    if not files:
+        raise ValueError("GPU delta checkpoint has no selected safetensors shards")
+    return _read_headers(files)
 
-        model._gpu_delta_load_generation = (
-            getattr(model, "_gpu_delta_load_generation", 0) + 1
-        )
-        inventory = {}
-        model._gpu_delta_canonical_inventory = inventory
-        model._gpu_delta_duplicate_source_names = False
-        model._gpu_delta_metadata_complete = False
-        exhausted = False
 
-        def observe():
-            nonlocal exhausted
-            for name, tensor in weights:
-                dtype = str(tensor.dtype)
+def _read_headers(files):
+    inventory = {}
+    for path in files:
+        with safe_open(path, framework="pt", device="cpu") as source:
+            for name in source.keys():  # noqa: SIM118 - safe_open is not iterable.
                 if name in inventory:
-                    model._gpu_delta_duplicate_source_names = True
+                    raise ValueError(f"ambiguous canonical checkpoint tensor: {name}")
+                tensor_slice = source.get_slice(name)
                 inventory[name] = {
-                    "shape": list(tensor.shape),
-                    "dtype": _DTYPE_NAMES.get(dtype, dtype),
+                    "shape": tensor_slice.get_shape(),
+                    "dtype": tensor_slice.get_dtype(),
                 }
-                yield name, tensor
-            exhausted = True
-
-        result = original(observe(), *args, **kwargs)
-        model._gpu_delta_metadata_complete = exhausted
-        return result
-
-    load_weights._gpu_delta_metadata_observer = True
-    model.load_weights = load_weights
+    if not inventory:
+        raise ValueError("canonical checkpoint metadata is empty")
+    return inventory
