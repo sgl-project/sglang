@@ -3118,14 +3118,18 @@ class ServerArgs(DisaggServerArgsMixin):
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
-        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
+        Normalizes localhost and IPv6 hosts to IPv4 loopback for internal ZMQ.
         """
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
         """Ingress endpoint of one DP replica's driver rank."""
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if (
+            scheduler_host is None
+            or scheduler_host == "localhost"
+            or is_valid_ipv6_address(scheduler_host)
+        ):
             scheduler_host = "127.0.0.1"
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]
