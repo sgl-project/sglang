@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import LlamaConfig
+from transformers import GenerationConfig, LlamaConfig
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
@@ -22,6 +22,39 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestEosTokenIds(CustomTestCase):
+    def test_model_and_generation_eos_token_ids(self):
+        """Scalar EOS token 0 must survive loading just like the list form."""
+        cases = (
+            (2, 0, {0, 2}),
+            (2, [0], {0, 2}),
+            (2, None, {2}),
+            (2, [], {2}),
+            (2, 3, {2, 3}),
+            (2, [2, 3], {2, 3}),
+            (0, None, {0}),
+            (None, 0, {0}),
+            (None, None, set()),
+        )
+        for model_eos, generation_eos, expected in cases:
+            with self.subTest(model_eos=model_eos, generation_eos=generation_eos):
+                with TemporaryDirectory() as checkpoint:
+                    LlamaConfig(
+                        architectures=["LlamaForCausalLM"],
+                        hidden_size=16,
+                        intermediate_size=32,
+                        num_attention_heads=2,
+                        num_hidden_layers=2,
+                        vocab_size=128,
+                        eos_token_id=model_eos,
+                    ).save_pretrained(checkpoint)
+                    GenerationConfig(eos_token_id=generation_eos).save_pretrained(
+                        checkpoint
+                    )
+                    config = ModelConfig(model_path=checkpoint)
+                self.assertEqual(config.hf_eos_token_id, expected)
 
 
 class TestHybridLayerIds(CustomTestCase):
