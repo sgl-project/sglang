@@ -278,16 +278,19 @@ impl ConfigValidator {
             });
         }
 
-        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+        if config.max_concurrent_requests > 0
+            && config.queue_size > 0
+            && config.queue_timeout_secs == 0
+        {
             return Err(ConfigError::InvalidValue {
                 field: "queue_timeout_secs".to_string(),
                 value: config.queue_timeout_secs.to_string(),
-                reason: "Must be > 0 when queue_size > 0".to_string(),
+                reason: "Must be > 0 when admission control and queuing are enabled".to_string(),
             });
         }
 
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
-            // Allow 0 for pure concurrency limiting (semaphore behavior)
+            // Allow 0 to disable the independent local QPS limiter.
             if tokens_per_second < 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "rate_limit_tokens_per_second".to_string(),
@@ -700,6 +703,35 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn queue_timeout_is_not_required_when_admission_control_is_disabled() {
+        for max_concurrent_requests in [-1, 0] {
+            let config = RouterConfig {
+                max_concurrent_requests,
+                queue_size: 4,
+                queue_timeout_secs: 0,
+                ..Default::default()
+            };
+
+            assert!(ConfigValidator::validate(&config).is_ok());
+        }
+    }
+
+    #[test]
+    fn queue_timeout_is_required_when_admission_queue_is_enabled() {
+        let config = RouterConfig {
+            max_concurrent_requests: 1,
+            queue_size: 1,
+            queue_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "queue_timeout_secs"
+        ));
     }
 
     #[test]
