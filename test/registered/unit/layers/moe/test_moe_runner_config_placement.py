@@ -1,8 +1,9 @@
-"""A MoE layer's placement lives on its `MoeRunnerConfig`, and the fused funcs
-read it from there."""
+"""A MoE layer owns its placement, and the fused funcs read it through the
+layer's `MoeRunnerConfig`."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
@@ -59,7 +60,14 @@ def _placement(obj):
     return (obj.moe_tp_size, obj.moe_tp_rank, obj.moe_ep_size, obj.moe_ep_rank)
 
 
-def test_the_config_carries_the_layer_placement(monkeypatch) -> None:
+def test_a_config_without_a_layer_has_no_placement() -> None:
+    config = MoeRunnerConfig()
+    for name in ("moe_tp_size", "moe_tp_rank", "moe_ep_size", "moe_ep_rank"):
+        with pytest.raises(AttributeError, match="has no layer"):
+            getattr(config, name)
+
+
+def test_the_config_reads_the_layer_placement(monkeypatch) -> None:
     layer = _layer(monkeypatch)
     assert _placement(layer) == (2, 1, 2, 1)
     assert _placement(layer.moe_runner_config) == _placement(layer)
@@ -102,7 +110,9 @@ def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
         w2_weight=torch.zeros(1),
     )
     runner_config = MoeRunnerConfig(
-        moe_tp_size=2, moe_tp_rank=1, moe_ep_size=4, moe_ep_rank=3
+        layer=SimpleNamespace(
+            moe_tp_size=2, moe_tp_rank=1, moe_ep_size=4, moe_ep_rank=3
+        )
     )
     flashinfer_cutlass._run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
