@@ -1,0 +1,145 @@
+---
+title: Laya
+description: Serve the Laya decision model, a non-generative ModernBERT encoder plus decision head, and read one calibrated answer distribution per request.
+---
+
+Laya ([`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)) is a
+non-autoregressive decision model: a bidirectional ModernBERT encoder (28 layers, hidden
+1024) followed by a small transformer decision head, 421M parameters in total. Every answer
+option is represented by a `[MASK]` marker token in the prompt; the head scores each marker
+and the softmax over those markers is the answer distribution. A second head predicts
+whether the agent should escalate to a human.
+
+Nothing is generated, so the model is served as an embedding model and one request returns
+one vector:
+
+```
+[p_0, ..., p_{K-1}, act_escalate, act_not_escalate]
+```
+
+`K` is the number of options in that request, so the vector length varies per request.
+
+## Preparing the checkpoint
+
+The published checkpoint ships `encoder/config.json` and `rl_agent_config.json` but **no
+root `config.json`**, which `AutoConfig` requires. Build a servable directory first:
+
+```bash Command
+python prepare_laya_config.py convaiinnovations-laya-snapshot /models/laya-sglang
+```
+
+That merges the encoder architecture with the decision-head fields (`head_layers`,
+`n_act`, `mask_token_id`, `type_token_ids`, `laya_temperature`,
+`temperature_by_options`) and points `architectures` at `LayaForDecision`.
+
+Note that the per-question-type temperatures are stored under `laya_temperature`, not
+`temperature`: `PretrainedConfig` consumes `temperature` (and `top_p`, ...) as generation
+defaults while building the config object, so a value stored under that name never reaches
+the model.
+
+## Launch command
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path /models/laya-sglang \
+  --tokenizer-path /models/laya-hf/tokenizer \
+  --is-embedding \
+  --host 127.0.0.1 --port 30000
+```
+
+The model needs no `--is-embedding` flag in principle (its architecture declares a pooling
+task and embedding mode is enabled automatically); passing it is harmless.
+
+Bidirectional encoders must attend to the whole prompt, so the server switches off the
+radix (prefix) cache and chunked prefill for this architecture. Reusing a cached prefix
+would feed the encoder a suffix-only sequence and silently change every answer.
+
+## Example request
+
+Prompts are built by the client. The layout is
+`[CLS] <type> question: <instructions> [SEP] [MASK] <option> ... [SEP] <state> [SEP]`, where
+`<type>` is `choice`, `score`, or `noul`. Send the raw token ids so the server does not
+re-tokenize or add anything:
+
+```python Example
+import requests
+from transformers import AutoTokenizer
+
+URL = "http://127.0.0.1:30000"
+tokenizer = AutoTokenizer.from_pretrained("/models/laya-hf/tokenizer")
+
+options = {"billing": "refunds or charges", "technical": "bugs or errors", "sales": "pricing"}
+ids = [tokenizer.cls_token_id]
+ids += tokenizer("choice question: What is the user asking for?", add_special_tokens=False)["input_ids"]
+ids += [tokenizer.sep_token_id]
+for name, description in options.items():
+    ids.append(tokenizer.mask_token_id)
+    ids += tokenizer(f" {name}: {description}", add_special_tokens=False)["input_ids"]
+ids.append(tokenizer.sep_token_id)
+ids += tokenizer("I was charged twice for the same order.", add_special_tokens=False)["input_ids"]
+ids.append(tokenizer.sep_token_id)
+
+response = requests.post(
+    f"{URL}/v1/embeddings",
+    json={"model": "laya", "input": ids},
+    timeout=60,
+).json()
+vector = response["data"][0]["embedding"]
+probs = vector[: len(options)]
+print(dict(zip(options, probs)), "escalate:", vector[-2])
+```
+
+The vector is returned as-is: it is not normalised and no extra softmax is applied, because
+the values are already calibrated probabilities.
+
+`/v1/classify` is not the right endpoint for this model. It applies a second softmax and
+needs a fixed `id2label`, neither of which fits a per-request answer space.
+
+## Accuracy
+
+Served this way, the English checkpoint reproduces its published score on the repository's
+own evaluation harness (`mteb/amazon_massive_intent`, `en`, `test`, 100 cases, 20 options):
+
+| | accuracy | macro F1 | ECE | mean confidence |
+| --- | --- | --- | --- | --- |
+| published baseline | 0.8200 | 0.7876 | 0.1382 | 0.9582 |
+| SGLang | 0.8200 | 0.7876 | 0.1371 | 0.9571 |
+
+Per-case the two implementations agree on the chosen option in 100 of 100 cases.
+
+## Attention backend and CUDA graph
+
+ModernBERT alternates full and sliding (local) attention. The local layers keep
+keys within `|i - j| <= local_attention / 2`, and this implementation computes
+that window itself rather than relying on the attention backend, because the
+windowed backend path is not implemented consistently across backends: some apply
+it only for causal attention, and the FlashAttention window does not reproduce the
+same mask. Routing this model through the backend instead gives measurably
+different probabilities. Set `SGLANG_LAYA_ATTENTION_BACKEND=1` to use the backend
+anyway, for comparison.
+
+Because the mask is built from device tensors that are refreshed on every step,
+and every loop bound comes from a shape, the encoder runs under a prefill CUDA
+graph with no extra flag: the server captures it automatically (`backend=breakable`).
+The decision head and the pooler stay eager, since they build one variable-length
+vector per request. On one A100-PCIE-40GB, with 177-197 token prompts, a
+single-request round trip is:
+
+| | p50 | mean |
+| --- | --- | --- |
+| CUDA graph | 12.96 ms | 13.46 ms |
+| no CUDA graph | 28.73 ms | 28.84 ms |
+
+Both configurations return the same values: per case the chosen option is
+identical in 100 of 100 evaluation cases and the probabilities agree to 0.0.
+
+## Limitations
+
+- The encoder computes its own attention, so the paged KV cache is not used.
+- The decision head and the pooler run eagerly; only the encoder is captured.
+- Tensor parallelism is not supported: the decision head pools per request and is not
+  sharded. Launch with `--tp-size 1`.
+- The `act` head carries little usable signal on the published checkpoint; the model card
+  recommends gating on the answer confidence instead.
+- Only the English root checkpoint is covered here. The `multilingual` and
+  `typed-decisions` subfolders use different encoders and need their own configuration.
