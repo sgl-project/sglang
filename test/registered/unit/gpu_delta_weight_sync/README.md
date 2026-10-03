@@ -107,11 +107,12 @@ registers each process's mapping for CUDA, then streams tensor Snappy bytes for
 hardware decoding and in-place apply.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
-`WEIGHT_DELTA_CPU_WORKERS` defaults to 4 (bounded to 1–32). The host cache creator
+`WEIGHT_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32). The host cache creator
 uses that many reusable CPU workers, each with its own Zstd context; other ranks
-attach to its completed arena. Thus 4 or 8 means total active decode workers per
-host publication, including two EP4 engines sharing the same cache. Workers touch
-only CPU buffers; CUDA setup remains on each rank's original preparation thread.
+attach to its completed arena. The count is total active decode workers per
+host publication, including two EP4 engines sharing the same cache, plus one
+independent SHA worker. Workers touch only CPU buffers; CUDA setup remains on each
+rank's original preparation thread.
 
 `WEIGHT_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
 must be a private, user-owned directory on tmpfs with enough space for the wrapped
@@ -123,14 +124,17 @@ Miles negotiates the canonical tensor-name union per cache ID and sends it in
 `host_tensor_names`. Each receiver requires its local names to be covered; foreign
 experts outside that union are not decoded.
 
-One creator copies owner files into retained tmpfs mappings and SHA-256 checks
-those exact bytes once per publication. CPU workers decode independent canonical
-tensors directly into one shared Snappy arena; raw targets are copied beside them.
+One creator copies owner files into retained tmpfs mappings and checks source
+identity/extent across the read. One dedicated worker SHA-256 checks those exact
+retained bytes while CPU workers decode independent canonical tensors directly
+into one shared Snappy arena; raw targets are copied beside them. No second
+payload read, full decoded temporary or per-rank Snappy copy is needed.
 Aliased bindings and a second engine reuse the same physical bytes. The namespace
 binds the original cohort, delta stream and host tensor union; publication metadata
 binds the canonical manifest path, digest, session and versions. READY is published
-only after every task and exact chunk/window/output check passes. Every submitted
-task is joined on failure before ownership is dropped.
+only after SHA verification, every decode task and exact chunk/window/output
+check passes. Hash and decode are both joined on failure before ownership is
+dropped; unverified bytes never become available for GPU use.
 
 Each backend retains its MAP_SHARED mapping and CUDA registration across updates.
 Cold and growth allocations reserve twice the needed decoded/encoded extent,
@@ -180,9 +184,18 @@ matrix/raw payload byte counts.
 `host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
 creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,
 `host_payload_hash_files` and `host_payload_hash_bytes` expose once-host read/hash;
-`host_payload_read_sha256_s` is their read-plus-hash sum. Followers report zero
-work for these counters. `host_shared_prepare_s` includes cache wait/attachment or
-construction; `host_payload_cache_wait_s` isolates the short-lock wait.
+`host_payload_read_sha256_s` is their work sum, not a sequential critical path.
+SHA overlaps decode: `host_payload_decode_hash_s` measures the combined wall span,
+and `host_payload_hash_wait_s` is the hash tail waited after decoding. Do not add
+SHA duration to decode wall time. Followers report zero work for these counters.
+`host_shared_prepare_s` includes cache wait/attachment or construction;
+`host_payload_cache_wait_s` isolates the build/attachment mutex wait.
+
+`host_plan_cache_reused` reports whether the canonical plan's static definitions
+were already qualified. Every publication still authenticates its manifest and
+checks names, shapes, dtypes, encodings, byte counts and rank views against the
+admitted plan, then validates all changing payload/frame extents. The cache holds
+only static tuples, not an old manifest or payload.
 
 Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
 (including raw copies). `host_outer_zstd_validate_s` and

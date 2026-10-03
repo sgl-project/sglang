@@ -235,7 +235,7 @@ def validate_zstd_frame(payload, expected_size):
 
 
 def configured_cpu_workers():
-    value = int(os.environ.get("WEIGHT_DELTA_CPU_WORKERS", "4"))
+    value = int(os.environ.get("WEIGHT_DELTA_CPU_WORKERS", "32"))
     if not 1 <= value <= 32:
         raise ValueError("WEIGHT_DELTA_CPU_WORKERS must be between 1 and 32")
     return value
@@ -248,6 +248,9 @@ class OuterZstdPool:
         self.workers = workers
         self.executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="gpu-delta-zstd"
+        )
+        self.hash_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gpu-delta-sha256"
         )
         self.local = threading.local()
 
@@ -286,3 +289,4 @@ class OuterZstdPool:
 
     def close(self):
         self.executor.shutdown(wait=True)
+        self.hash_executor.shutdown(wait=True)

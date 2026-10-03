@@ -160,6 +160,164 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.addCleanup(arena.close)
         return arena
 
+    def test_decode_overlaps_hash_but_ready_waits_for_verified_snapshot(self):
+        path, digest, manifest, expected = fixture(self.root)
+        arena, metrics = self.arena(), {}
+        hash_entered, decode_completed, release_hash, finished = [
+            threading.Event() for _ in range(4)
+        ]
+        snapshots, errors = [], []
+        original_hash, original_decode = host._hash_payloads, self.pool.decode
+
+        def delayed_hash(files, definitions):
+            hash_entered.set()
+            assert release_hash.wait(5)
+            return original_hash(files, definitions)
+
+        def decode(payload, chunks, destination):
+            assert hash_entered.wait(5)
+            result = original_decode(payload, chunks, destination)
+            decode_completed.set()
+            return result
+
+        def build():
+            try:
+                snapshots.append(
+                    arena.prepare(
+                        path,
+                        digest,
+                        manifest,
+                        sorted(expected),
+                        self.pool,
+                        metrics,
+                        metadata(),
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        with (
+            patch.object(host, "_hash_payloads", side_effect=delayed_hash),
+            patch.object(self.pool, "decode", side_effect=decode),
+        ):
+            builder = threading.Thread(target=build)
+            builder.start()
+            try:
+                self.assertTrue(decode_completed.wait(5))
+                self.assertFalse(finished.is_set())
+                state = json.loads(next(self.cache.glob("*/state.json")).read_text())
+                self.assertEqual(state["state"], "BUILDING")
+                # Both jobs consume the stable copied bytes, even if the source
+                # file changes after its read/fstat checks completed.
+                (self.root / "owner.bin").write_bytes(b"changed after snapshot")
+            finally:
+                release_hash.set()
+                builder.join(5)
+        self.assertFalse(builder.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(metrics["host_payload_hash_files"], 1)
+        snapshot = snapshots[0]
+        self.assertEqual(
+            {
+                name: bytes(
+                    arena.mapping[row["offset"] : row["offset"] + row["nbytes"]]
+                )
+                for name, row in snapshot.index["tensors"].items()
+            },
+            expected,
+        )
+        self.assertEqual(
+            json.loads((snapshot.directory / "state.json").read_text())["state"],
+            "READY",
+        )
+        snapshot.close()
+
+    def test_hash_and_decode_failures_drain_the_other_job_before_poison_return(self):
+        path, digest, manifest, expected = fixture(self.root)
+        original_hash, original_decode = host._hash_payloads, self.pool.decode
+        for failure in ("hash", "decode"):
+            with self.subTest(failure=failure):
+                arena = self.arena()
+                other_entered, failure_raised, release_other, finished = [
+                    threading.Event() for _ in range(4)
+                ]
+                errors = []
+                request = metadata() | {"stream_id": failure}
+                current = json.loads(json.dumps(manifest))
+                if failure == "hash":
+                    # Real hash rejection with valid Zstd bytes isolates integrity
+                    # failure from decoder failure.
+                    current["files"][0]["sha256"] = "0" * 64
+                current_path = self.root / f"manifest-{failure}.json"
+                content = json.dumps(current).encode()
+                current_path.write_bytes(content)
+                current_digest = hashlib.sha256(content).hexdigest()
+
+                def controlled_hash(files, definitions):
+                    if failure == "hash":
+                        assert other_entered.wait(5)
+                        failure_raised.set()
+                        return original_hash(files, definitions)
+                    other_entered.set()
+                    assert release_other.wait(5)
+                    return original_hash(files, definitions)
+
+                def controlled_decode(payload, chunks, destination):
+                    if failure == "decode":
+                        assert other_entered.wait(5)
+                        failure_raised.set()
+                        raise ValueError("injected decode failure")
+                    other_entered.set()
+                    assert release_other.wait(5)
+                    return original_decode(payload, chunks, destination)
+
+                def build():
+                    try:
+                        arena.prepare(
+                            current_path,
+                            current_digest,
+                            current,
+                            sorted(expected),
+                            self.pool,
+                            {},
+                            request,
+                        )
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        finished.set()
+
+                with (
+                    patch.object(host, "_hash_payloads", side_effect=controlled_hash),
+                    patch.object(self.pool, "decode", side_effect=controlled_decode),
+                ):
+                    builder = threading.Thread(target=build)
+                    builder.start()
+                    try:
+                        self.assertTrue(failure_raised.wait(5))
+                        self.assertFalse(finished.is_set())
+                    finally:
+                        release_other.set()
+                        builder.join(5)
+                self.assertFalse(builder.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIn(
+                    "SHA256" if failure == "hash" else "injected decode failure",
+                    str(errors[0]),
+                )
+                with self.assertRaisesRegex(ValueError, "failed or already released"):
+                    arena.prepare(
+                        current_path,
+                        current_digest,
+                        current,
+                        sorted(expected),
+                        self.pool,
+                        {},
+                        request,
+                    )
+
     def test_two_engine_processes_verify_once_and_never_reread_retained_bytes(self):
         path, digest, manifest, expected = fixture(self.root)
         context = multiprocessing.get_context("fork")

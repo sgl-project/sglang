@@ -115,7 +115,7 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
-def _read_verified(source, destination, expected):
+def _read_payload(source, destination, expected):
     started = time.perf_counter()
     with source.open("rb", buffering=0) as incoming:
         before = os.fstat(incoming.fileno())
@@ -127,19 +127,24 @@ def _read_verified(source, destination, expected):
             if not count:
                 raise ValueError("truncated delta payload")
             position += count
-        read_s = time.perf_counter() - started
-        started = time.perf_counter()
-        actual_sha = hashlib.sha256(destination).hexdigest()
-        hash_s = time.perf_counter() - started
         after = os.fstat(incoming.fileno())
-        if (
-            incoming.read(1)
-            or (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            or actual_sha != expected["sha256"]
-        ):
-            raise ValueError("delta payload SHA256/size mismatch or source changed")
-    return read_s, hash_s
+        if incoming.read(1) or (
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("delta payload size mismatch or source changed")
+    return time.perf_counter() - started
+
+
+def _hash_payloads(files, definitions):
+    """Hash the retained immutable copy, never reread publication files."""
+    started = time.perf_counter()
+    for name, payload in files.items():
+        if hashlib.sha256(payload).hexdigest() != definitions[name]["sha256"]:
+            raise ValueError("delta payload SHA256 mismatch")
+    return time.perf_counter() - started
 
 
 def _tensor_layout(entries):
@@ -264,6 +269,8 @@ class HostArena:
             for name in (
                 "host_payload_read_s",
                 "host_payload_sha256_s",
+                "host_payload_hash_wait_s",
+                "host_payload_decode_hash_s",
                 "host_payload_hash_bytes",
                 "host_payload_hash_files",
                 "host_payload_cache_created",
@@ -379,25 +386,46 @@ class HostArena:
                         if encoded_map is not None
                         else memoryview(b"")
                     )
-                    read_s, hash_s = _read_verified(source, view, record)
-                    metrics["host_payload_read_s"] += read_s
-                    metrics["host_payload_sha256_s"] += hash_s
-                    metrics["host_payload_hash_bytes"] += record["nbytes"]
-                    metrics["host_payload_hash_files"] += 1
+                    metrics["host_payload_read_s"] += _read_payload(
+                        source, view, record
+                    )
                     files[name] = view
                     position = end
                 with (directory / shared["file"]).open("r+b") as source:
                     decoded_map = mmap.mmap(source.fileno(), 0) if size else None
-                _decode_arena(
-                    memoryview(decoded_map)
-                    if decoded_map is not None
-                    else memoryview(b""),
-                    layout,
-                    files,
-                    entries,
-                    pool,
-                    metrics,
+                decode_hash_started = time.perf_counter()
+                hash_future = pool.hash_executor.submit(
+                    _hash_payloads, files, definitions
                 )
+                decode_error = None
+                try:
+                    _decode_arena(
+                        memoryview(decoded_map)
+                        if decoded_map is not None
+                        else memoryview(b""),
+                        layout,
+                        files,
+                        entries,
+                        pool,
+                        metrics,
+                    )
+                except BaseException as error:
+                    decode_error = error
+                # Decode drains all tensor tasks itself. Join the independent
+                # hash even after failure before views can disappear. A bad
+                # payload digest takes precedence over its decoder error.
+                hash_wait_started = time.perf_counter()
+                metrics["host_payload_sha256_s"] = hash_future.result()
+                metrics["host_payload_hash_wait_s"] = (
+                    time.perf_counter() - hash_wait_started
+                )
+                metrics["host_payload_decode_hash_s"] = (
+                    time.perf_counter() - decode_hash_started
+                )
+                metrics["host_payload_hash_bytes"] = encoded_size
+                metrics["host_payload_hash_files"] = len(definitions)
+                if decode_error is not None:
+                    raise decode_error
                 files.clear()
                 index.update(
                     cpu_workers=pool.workers,
