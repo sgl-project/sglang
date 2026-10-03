@@ -162,6 +162,9 @@ __all__ = [
     "per_token_group_quant",
 ]
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.quantization import cake as _cake  # noqa: E402, F401
+
 
 # Triton / CuTe DSL kernels migrated into this group from
 # srt/layers/quantization (RFC #29630, Phase 2.5); registered for inventory.
