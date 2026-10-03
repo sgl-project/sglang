@@ -2564,6 +2564,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[request]
+        if operation.terminal_outcome is None:
+            operation.terminal_outcome = "CANCELLED"
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self.revoke_pending_prefetch(request)
@@ -2725,6 +2727,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        if operation.terminal_outcome is None:
+            operation.terminal_outcome = "MISS"
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)
@@ -2958,6 +2962,8 @@ class UnifiedRadixCache(BasePrefixCache):
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
                 operation = ack.operation
+                if operation.terminal_ack_consumed:
+                    continue
                 info = self.ongoing_prefetch.get(operation.handle)
                 is_current = info is not None and info.operation is operation
                 if ack.completed_tokens is not None:
@@ -2971,11 +2977,27 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         operation.pool_transfers_done = True
                 if ack.completed_req:
-                    if is_current:
+                    operation.terminal_ack_consumed = True
+                    if operation.terminal_outcome is None:
+                        operation.terminal_outcome = (
+                            "FAILURE"
+                            if ack.failed
+                            else "SUCCESS"
+                            if operation.completed_tokens > 0
+                            else "MISS"
+                        )
+                    if is_current and ack.failed:
+                        # The backend has returned/raised: abort frees only
+                        # acknowledged pages; the terminal drain owns the tail.
+                        self.release_aborted_request(operation.handle)
+                    elif is_current:
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
-                    if operation.ack_releases_incomplete_host_indices:
+                    if (
+                        operation.host_indices is not None
+                        and operation.ack_releases_incomplete_host_indices
+                    ):
                         cc.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
                             (
