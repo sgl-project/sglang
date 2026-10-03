@@ -165,7 +165,6 @@ def kimi_k3_situ_fused_moe_workspace_size(
 ) -> int:
     """Bytes of the SiTU workspace for up to ``max_num_tokens`` (host metadata only)."""
     import torch
-
     from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
     from flashinfer.tllm_enums import ActivationType
 
@@ -230,7 +229,6 @@ def kimi_k3_situ_fused_moe(
     per-expert 4.0 / 25.0 defaults. ``enable_pdl`` must not be ``False``.
     """
     import torch
-
     from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer.tllm_enums import ActivationType
 

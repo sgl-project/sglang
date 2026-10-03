@@ -148,9 +148,9 @@ def _thd_inputs_ok(
 
 def _varlen_route_available(variant: str, device_index: int) -> bool:
     """FlashInfer registers the ``variant`` program for this exact arch."""
-    from sglang.kernels.cake_kernels._support import device_capability
-
     from flashinfer.experimental.minimax_h3_varlen_attention import cake_jit
+
+    from sglang.kernels.cake_kernels._support import device_capability
 
     arch = {SM100: "sm_100a", SM103: "sm_103a"}.get(device_capability(device_index))
     return arch is not None and cake_jit.route_available(variant, arch)

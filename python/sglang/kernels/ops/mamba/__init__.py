@@ -101,7 +101,6 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
 from sglang.kernels.ops.mamba import cake as _cake  # noqa: E402, F401
 
-
 # Vendored mamba_ssm-derived kernels relocated in Phase 2.5 (RFC #29630).
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),

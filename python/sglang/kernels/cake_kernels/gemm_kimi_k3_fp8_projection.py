@@ -231,9 +231,7 @@ def kimi_k3_fp8_projection(
 
     Allocates ``out`` and the workspace when omitted (not for graph capture).
     """
-    from flashinfer.gemm.kimi_k3_fp8_projection import (
-        kimi_k3_fp8_projection as run,
-    )
+    from flashinfer.gemm.kimi_k3_fp8_projection import kimi_k3_fp8_projection as run
 
     return run(x, prepared, out, workspace=workspace, backend="cake")
 

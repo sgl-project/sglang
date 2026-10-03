@@ -399,7 +399,6 @@ __all__ = [
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
 from sglang.kernels.ops.gemm import cake as _cake  # noqa: E402, F401
 
-
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
 # registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
