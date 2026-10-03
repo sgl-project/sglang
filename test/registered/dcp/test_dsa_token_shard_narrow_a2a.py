@@ -41,8 +41,12 @@ TOKEN_COUNTS = [1, 7, 16, 17, 33]
 
 
 def _absorb(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """[t, h, d] x [h, d, l] -> [t, h, l]: the per-head product the NPU op does."""
-    return torch.einsum("thd,hdl->thl", x, w)
+    """[t, h, d] x [h, d, l] -> [t, h, l]: the per-head product the NPU op does.
+
+    Not einsum: its BLAS path rounds a row differently depending on how many
+    rows share the call, and these tests pin the exchange algebra, not BLAS.
+    """
+    return (x.unsqueeze(-1) * w).sum(-2)
 
 
 class TestNarrowA2AIsExact(CustomTestCase):

@@ -72,7 +72,7 @@ def _fake_batch(prefix_lens, extend_lens):
 def _shard_for(prefix_lens, extend_lens, tp_size, tp_rank, num_tokens):
     batch = _fake_batch(prefix_lens, extend_lens)
     with get_parallel().override(attn_tp_size=tp_size, attn_tp_rank=tp_rank):
-        return _get_indexer_query_shard(batch, num_tokens, None)
+        return _get_indexer_query_shard(batch, num_tokens)
 
 
 class TestIndexerQueryShardPlan(CustomTestCase):

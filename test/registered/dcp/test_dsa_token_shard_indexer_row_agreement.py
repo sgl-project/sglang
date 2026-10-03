@@ -69,6 +69,21 @@ def _cumulative(values):
     return out
 
 
+def _num_local_tokens(plan):
+    """Real tokens in the slice: ``rows`` minus its padding, 0 past the tokens."""
+    return max(0, plan.local_end - plan.local_start)
+
+
+def _row_wise_linear(x, weight):
+    """``x @ weight.T`` with each row's sum order fixed by K alone.
+
+    CPU BLAS picks kernels by row count, so ``x[a:b] @ w.T`` is not bitwise
+    ``(x @ w.T)[a:b]`` for ragged counts (MKL: 17, 195, 1025 rows differ). These
+    tests pin the slice algebra, not a BLAS property.
+    """
+    return (x.unsqueeze(-2) * weight).sum(-1)
+
+
 class TestStageAAndDsaTokenShardAgree(CustomTestCase):
     def _check(self, prefix_lens, extend_lens, tp_size, label=""):
         seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
@@ -86,7 +101,7 @@ class TestStageAAndDsaTokenShardAgree(CustomTestCase):
             self.assertEqual(start, plan.local_start, f"{where} start")
             self.assertEqual(rows, plan.rows, f"{where} rows")
             self.assertEqual(
-                num_real, plan.num_local_tokens, f"{where} real token count"
+                num_real, _num_local_tokens(plan), f"{where} real token count"
             )
 
             # The per-request split. Stage A keeps it cumulative and the DSA token shard keeps
@@ -165,10 +180,14 @@ class TestStageAAndDsaTokenShardAgree(CustomTestCase):
                     plan_dsa_token_shard([total], [total], tp_size, r)
                     for r in range(tp_size)
                 ]
-                padded = [r for r, p in enumerate(plans) if p.num_local_tokens < p.rows]
+                padded = [
+                    r for r, p in enumerate(plans) if _num_local_tokens(p) < p.rows
+                ]
                 # Ranks that hold no real token at all are empty, not padded;
                 # both are "not full", and neither may precede a full rank.
-                full = [r for r, p in enumerate(plans) if p.num_local_tokens == p.rows]
+                full = [
+                    r for r, p in enumerate(plans) if _num_local_tokens(p) == p.rows
+                ]
                 if full and padded:
                     self.assertLess(
                         max(full),
@@ -346,8 +365,8 @@ class TestW3EarlySlice(CustomTestCase):
             for tp_rank in range(tp_size):
                 with self.subTest(total=total, tp=tp_size, rank=tp_rank):
                     shard = _shard_for([total], [0], tp_size, tp_rank)
-                    late = shard.take(x @ weight.T)
-                    early = shard.take(x) @ weight.T
+                    late = shard.take(_row_wise_linear(x, weight))
+                    early = _row_wise_linear(shard.take(x), weight)
                     self.assertTrue(
                         torch.equal(late, early),
                         "projecting this rank's rows differs from slicing the "
@@ -370,7 +389,8 @@ class TestW3EarlySlice(CustomTestCase):
             for r in range(tp_size)
             for shard in [_shard_for([total], [0], tp_size, r)]
             if not torch.equal(
-                shard.take(x @ weight.T + bias), shard.take(x) @ weight.T + bias
+                shard.take(_row_wise_linear(x, weight) + bias),
+                _row_wise_linear(shard.take(x), weight) + bias,
             )
         ]
         self.assertEqual(

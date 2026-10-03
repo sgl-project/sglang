@@ -130,8 +130,7 @@ class TestDsaTokenShardPlan(CustomTestCase):
         # the tokens get an empty slice rather than a negative one.
         plan = plan_dsa_token_shard([3], [103], 16, 9)
         self.assertEqual(plan.rows, 1)
-        self.assertEqual(plan.num_local_tokens, 0)
-        self.assertTrue(plan.is_empty())
+        self.assertEqual(max(0, plan.local_end - plan.local_start), 0)
         self.assertEqual(plan.query_lens, [0])
 
     def test_mismatched_metadata_raises_rather_than_guesses(self):
