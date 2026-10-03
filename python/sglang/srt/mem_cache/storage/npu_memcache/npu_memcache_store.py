@@ -339,6 +339,13 @@ class NpuMemcacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # DSV4 FULL is a logical anchor. It owns hashes/slots but no payload.
+        if self.mem_pool_host.kv_buffer is None:
+            self.gb_per_page = 0.0
+            logger.info(
+                "Ascend Memcache registered logical KV anchor without a buffer."
+            )
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -457,6 +464,16 @@ class NpuMemcacheStore(HiCacheStorage):
             # (k_ptr, v_ptr) order of get_page_buffer_meta.
             base_suffix = f"_{self.mha_suffix}"
             suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
+        elif name in (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        ):
+            suffixes = [f"_{self.mla_suffix}_{name}"]
         else:
             raise ValueError(f"Unsupported hybrid pool for batch v2 I/O: {name}")
         if not suffixes:
@@ -477,39 +494,48 @@ class NpuMemcacheStore(HiCacheStorage):
         kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        # Intersect valid endpoints: trailing pools may leave holes, and coarse
+        # pools can only restore prefixes ending at an object boundary.
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
+            coverage = transfer.logical_pages_per_object
+            object_keys = qkeys[coverage - 1 : kv_pages : coverage]
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                object_keys, transfer
             )
             ex = self._batch_exist(component_keys)
             page_exists = [
                 all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-                for i in range(kv_pages)
+                for i in range(len(object_keys))
             ]
             boundary = 0
+            pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
                     boundary = page_exists.index(False)
                 except ValueError:
-                    boundary = kv_pages
+                    boundary = len(object_keys)
+                pool_restorable = range(coverage, boundary * coverage + 1, coverage)
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
+                for prefix_len in range(len(object_keys), 0, -1):
                     if all(
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len * coverage)
+                        if boundary == 0:
+                            boundary = prefix_len
             if boundary:
                 hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -669,6 +695,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
@@ -694,6 +722,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         page_keys = self._tag_keys(keys)
 
@@ -863,6 +893,8 @@ class NpuMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return len(keys)
         page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
