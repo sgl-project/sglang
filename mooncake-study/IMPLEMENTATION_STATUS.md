@@ -28,6 +28,7 @@ it does not redefine the goal as the modules already implemented.
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
 | KV coverage validation | Token-endpoint sweep with disjoint active head intervals | Independent grid-oracle comparisons and 123 shared/Store tests pass; 32K metadata validation falls 69.4%, with 16 complete long-context post-exit snapshots and no established serving speedup |
+| Manifest capacity admission | Conservative global JSON bound before capture context/copies, with a dedicated rejection counter | 165 tests pass, including real oversized-request serving continuity, later small-sample publication and post-exit readback; conservative early-response exclusion and production workload acceptance remain explicit |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine and separate CUDA/Store shutdown barriers | Admission, expiry, retract, publication and real pending-CUDA shutdown fault tests pass; failed barriers retain resources for retry; traffic-scale stress remains open |
@@ -4840,6 +4841,36 @@ and [evidence](experiments/kv-coverage-sweep.json) record the 76-artifact archiv
 initial runs, corrected lint audit and live-process/GPU cleanup. The resident
 idle load has resumed and no extra GPU was allocated. Production Catalog,
 broader topology/workload acceptance and training integration remain open.
+
+## Manifest Capacity Admission
+
+Single-rank and cohort admission now estimate the complete manifest using the
+request's maximum response length, current provenance and all canonical owners.
+Sizing encodes one descriptor per layer/component/owner and bounds numeric field
+widths, chunk count, auxiliary tensors and the metadata envelope without payload
+allocation or per-chunk iteration. If the bound exceeds `manifest_buffer_bytes`,
+the request skips capture before context construction or copies; background
+retirement returns its slot/ticket. The `admission_manifest_budget` metric is
+separate from malformed requests and transport failures. Writer-side exact size
+and semantic checks remain mandatory. The bound can conservatively exclude an
+early-ending response that would have fit.
+
+All **164 regression methods** pass in **150.072s**, including 312 complete
+manifest comparisons, large-length constant-work checks, single-rank/cohort
+retirement and metric tests. A real H100 Qwen3-0.6B test passes in **86.021s**:
+a 16,734-byte long sample is captured under the normal budget, then excluded
+under a 12 KiB budget while inference returns its expected tokens. A subsequent
+8,469-byte small sample publishes in the same constrained process. Both accepted
+samples pass complete post-exit Store readback. The rejection adds no adaptive
+failure, quarantine, snapshot construction or payload write.
+
+The [runbook](experiments/MANIFEST_BUDGET.md) and
+[evidence](experiments/manifest-budget.json) bind 5,048 Python files and 24 archived
+artifacts. They retain an initial import failure caused by submitting before
+the source copy completed; the final frozen source was verified before retry.
+No new Ruff diagnostics were added. All jobs are terminal, no additional GPU
+was allocated, and the resident idle load has resumed. This adds single-rank
+eager TCP runtime evidence, not new multi-GPU/RDMA or production SLO acceptance.
 
 ## Next Implementation
 

@@ -581,6 +581,15 @@ Store: WRITTEN -> SAMPLE_READY -> LEASED/RETAINED -> GC_ELIGIBLE -> REMOVED
 
 配置限制: 最大采集比例、请求长度、inflight requests、GPU hold bytes、Host pinned bytes、未提交 bytes、Store retention bytes。准入可按最大长度保守预留，也可分块续租；续租失败时整个采集失败。
 
+manifest 的注册缓冲区由 `manifest_buffer_bytes` 配置，默认每个 auxiliary-owner
+槽位 1 MiB，计入总 Host 预算。请求准入按最大回复长度、当前 provenance 和全局
+canonical TP/PP 分片估算 JSON 大小上界；超预算时在创建采集 context、排入 KV/teacher
+拷贝前跳过采集，通过既有后台流程退还 reservation，推理继续。
+`admission_manifest_budget` 是逐 rank 的拒绝计数，不是独立样本总数。
+上界可能比最终提前结束的回复更大，因此会保守拒绝部分最终本可容纳的样本。
+可增加 manifest/Host 预算、降低采集长度上限或增大 storage chunk；最终 writer
+仍须精确检查 manifest 大小并校验完整内容，准入估算不能替代发布校验。
+
 单 rank producer 的 Catalog 配额在后台补充至有界 Host 槽位容量，每次成功申请
 之后重新检查租约、暂停与关闭状态，再继续申请。writer 归还槽位后唤醒补充线程；
 满池或暂停时保留 100ms 维护轮询，Catalog 申请失败另设至少 100ms 重试间隔，

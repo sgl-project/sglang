@@ -147,6 +147,38 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
         self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1])
 
+    def test_manifest_budget_rejects_before_context_and_reuses_reservation(self):
+        coordinator = self.coordinator
+        self.wait_until(lambda: len(coordinator.available) == 1)
+        record = coordinator.available[0]
+        req = self.request("oversized-metadata")
+        req.sampling_params.stop_strs = ["x" * (1 << 20)]
+        with patch(
+            "sglang.srt.training_capture.coordinator.RequestCaptureContext"
+        ) as context:
+            coordinator.before_forward([req])
+        context.assert_not_called()
+        self.assertTrue(req.training_capture_attempted)
+        self.assertIsNone(req.training_capture_context)
+        self.assertIsNone(req.training_capture_finalize)
+        self.wait_until(lambda: record.state == "done")
+        self.assertEqual(record.invalid_reason, "admission_manifest_budget")
+        self.assertEqual(
+            self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
+        )
+        self.assertFalse(self.sdk.data)
+        self.assertEqual(coordinator.pool.stats()["quarantined"], 0)
+        coordinator.metrics.update(coordinator.stats())
+        self.assertEqual(
+            self.metric("events_total", event="admission_manifest_budget"), 1
+        )
+        self.assertEqual(self.metric("events_total", event="admitted"), 0)
+        self.assertIsNone(coordinator.disabled_reason)
+        self.wait_until(lambda: len(coordinator.available) == 1)
+        fresh = self.request("fits-metadata")
+        coordinator.before_forward([fresh])
+        self.assertIsNotNone(fresh.training_capture_context)
+
     def test_operator_pause_drains_and_resume_does_not_admit_partial_requests(self):
         req, record = self.sealed_request("drain")
         self.coordinator.control("pause")

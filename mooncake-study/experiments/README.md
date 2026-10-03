@@ -52,6 +52,10 @@ forced collection between batches, and validates all READY samples after exit.
 from long-context metadata validation, with independent rectangle-grid checks
 and actual 32K serving/readback comparisons using an explicit manifest budget.
 
+[Manifest Capacity Admission](MANIFEST_BUDGET.md) checks a conservative global
+JSON bound before collecting a request, with slot/ticket reuse tests and real
+serving that excludes oversized metadata while preserving later small samples.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

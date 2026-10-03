@@ -144,6 +144,44 @@ class TestCohortCaptureCoordinator(CustomTestCase):
         self.assertEqual(coordinator.records, {})
         self.assertFalse(self.catalog.publications)
 
+    def test_manifest_budget_failure_drains_bound_ticket_before_context(self):
+        coordinator = self.coordinator
+        route = self.bound_route()
+        req = CaptureTestRequest("oversized-metadata")
+        req.sampling_params.stop_strs = ["x" * (1 << 20)]
+        with (
+            patch.object(coordinator.request_router, "bind", return_value=route),
+            patch(
+                "sglang.srt.training_capture.cohort_coordinator.RequestCaptureContext"
+            ) as context,
+        ):
+            coordinator.before_forward([req])
+        context.assert_not_called()
+        self.assertIsNone(req.training_capture_context)
+        self.assertIsNone(req.training_capture_finalize)
+        self.wait_until(lambda: route.handle.drained and not coordinator.records)
+        self.wait_until(
+            lambda: (
+                route.handle.cohort.lease.capture_id not in coordinator.service.records
+            )
+        )
+        self.assertTrue(route.handle.transfer_complete)
+        self.assertEqual(coordinator.counters["admission_manifest_budget"], 1)
+        self.assertEqual(coordinator.counters["admitted"], 0)
+        self.assertEqual(
+            self.catalog.captures[route.handle.cohort.lease.capture_id]["state"],
+            "FAILED",
+        )
+        self.assertFalse(self.catalog.publications)
+        self.assertEqual(coordinator.pool.stats()["quarantined"], 0)
+        self.wait_until(lambda: coordinator.stats()["states"]["available"] == 1)
+        fresh = CaptureTestRequest("fits-metadata")
+        with patch.object(
+            coordinator.request_router, "bind", return_value=self.bound_route()
+        ):
+            coordinator.before_forward([fresh])
+        self.assertIsNotNone(fresh.training_capture_context)
+
     def test_background_pressure_pauses_and_recovers_without_requests(self):
         coordinator = self.coordinator
         coordinator.admission = CaptureAdmission(

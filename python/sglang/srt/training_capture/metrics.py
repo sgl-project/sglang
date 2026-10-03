@@ -21,6 +21,7 @@ class CaptureMetrics:
         "excluded_length",
         "excluded_unsupported",
         "admission_backpressure",
+        "admission_manifest_budget",
         "admission_invalid_request",
         "admission_catalog_error",
         "lease_rejected",

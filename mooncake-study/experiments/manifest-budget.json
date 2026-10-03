@@ -1,0 +1,214 @@
+{
+  "status": "completed",
+  "scope": "Manifest capacity admission for SGLang snapshot capture; overall implementation remains active",
+  "base_commit": "9aba6416c",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/manifest-budget-20261003",
+  "jobs": {
+    "units": {
+      "job": "01791033547719325374-286e916fbc2d",
+      "result": {
+        "job_id": "01791033547719325374-286e916fbc2d",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791033554.2801588,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791033547719325374-286e916fbc2d.log"
+      },
+      "scope": "Import failure: submitted before source copy completed; not accepted test evidence",
+      "tests": null
+    },
+    "units_v2": {
+      "job": "01791033896756814589-c7b198e51f0d",
+      "result": {
+        "job_id": "01791033896756814589-c7b198e51f0d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791034060.4541602,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791033896756814589-c7b198e51f0d.log"
+      },
+      "scope": "Completed verification",
+      "tests": {
+        "methods": 164,
+        "seconds": 150.072
+      }
+    },
+    "runtime": {
+      "job": "01791034073203433968-041a9ca475a0",
+      "result": {
+        "job_id": "01791034073203433968-041a9ca475a0",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791034171.7237859,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791034073203433968-041a9ca475a0.log"
+      },
+      "scope": "Completed verification",
+      "tests": {
+        "methods": 1,
+        "seconds": 86.021
+      }
+    }
+  },
+  "runtime": {
+    "manifest_admission": {
+      "counters": {
+        "considered": 2,
+        "excluded_health_check": 1,
+        "admission_manifest_budget": 1,
+        "writer_started": 1
+      },
+      "disabled_reason": null,
+      "admission_paused": false,
+      "enable_overlap": false,
+      "reservations": 4,
+      "states": {
+        "available": 4
+      },
+      "queued": 0,
+      "occupied_fraction": 0,
+      "writer_age_seconds": 0,
+      "stage_timings": {
+        "queue_wait": {
+          "calls": 1,
+          "errors": 0,
+          "seconds": 0.00012763217091560364,
+          "max_seconds": 0.00012763217091560364
+        },
+        "copy_wait": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "snapshot_build": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "validation": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "catalog_register": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "store_payload": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "catalog_written": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "journal_save": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "catalog_seal": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "store_manifest": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "catalog_publish": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "journal_complete": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        },
+        "recovery_read": {
+          "calls": 0,
+          "errors": 0,
+          "seconds": 0,
+          "max_seconds": 0
+        }
+      },
+      "host_pool": {
+        "allocated_bytes": 13703168,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      },
+      "admission": {
+        "adaptive": false,
+        "configured_ratio": 1,
+        "target_ratio": 1,
+        "effective_ratio": 1,
+        "reason": "configured",
+        "cooldown_remaining_seconds": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "decreases": 0,
+        "recoveries": 0,
+        "failures": 0,
+        "pauses": 0,
+        "latency": null
+      }
+    },
+    "oversized_manifest_bytes": 16734,
+    "accepted_manifest_bytes": 8469,
+    "post_exit_snapshots": 2
+  },
+  "passing_test_methods": 165,
+  "source_audit": {
+    "files": 5048,
+    "sha256": "5c7ac7781e7d97f00d8533e7a7c5dd7edc8521df059b11692ddef77916f77193"
+  },
+  "artifacts": {
+    "count": 24,
+    "manifest_sha256": "9b40c6f8ef6395e349a4587016c0d7e6b3c256a5b2cf59ab27f2c9b928e86a5e"
+  },
+  "cleanup": {
+    "inspected": "2026-10-03T13:31:14.715Z",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791034273.7115514,
+      "idle_pid": 9055,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.49691295623779297
+    },
+    "live_processes": "  PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n 9055     1 Rsl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6\n 9159     0 Rs   ps -eo pid,ppid,stat,args\n",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB, 61 %\n",
+    "compute_processes": "15208, 1092 MiB\n"
+  },
+  "limitations": [
+    "Conservative bound may reject a request whose eventual early response would fit.",
+    "The size bound uses the already validated global capture layout and current request provenance; final writer checks remain mandatory.",
+    "Logical TP/PP sizing and cohort lifecycle units are not a new multi-GPU serving acceptance.",
+    "Real-model evidence is single-rank synchronous eager Qwen3-0.6B with local TCP Store and an HTTP test Catalog.",
+    "No production throughput, retention, trained quality or end-to-end SpecForge acceptance is claimed.",
+    "The first job failed to import the not-yet-copied source. The copy and overlay were completed and all Python hashes checked before resubmission."
+  ]
+}

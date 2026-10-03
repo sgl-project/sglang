@@ -228,6 +228,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         if route is None:
             return
         record = None
+        reason = "admission_invalid_request"
         try:
             cohort, invalid = self.service.status(route.handle)
             record = CaptureReservation(
@@ -244,6 +245,10 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 self.records[cohort.lease.capture_id] = record
             if invalid:
                 raise ContractError(invalid)
+            record.provenance = self._provenance(req, config_sha256=self.policy_sha256)
+            if not self._manifest_fits(req, record):
+                reason = "admission_manifest_budget"
+                raise ContractError(reason)
             record.context = RequestCaptureContext(
                 slot=cohort.slot,
                 prompt_ids=tuple(req.origin_input_ids),
@@ -251,13 +256,11 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 vocab_size=self.teacher.vocab_size,
                 partition=self.partition,
             )
-            record.provenance = self._provenance(req, config_sha256=self.policy_sha256)
             req.training_capture_context = record
             req.training_capture_finalize = self.on_release
             self.requests[cohort.lease.capture_id] = req
             self._count("admitted")
         except Exception:  # noqa: BLE001 - admission failure must not reject inference
-            reason = "admission_invalid_request"
             self.service.fail(route.handle, reason)
             if record is None:
                 # bind transferred ownership, but no context or DMA exists yet.
@@ -269,7 +272,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 if record.context is not None:
                     record.context.abort(reason)
                 self._detach(req, record)
-            self._count("admission_invalid_request")
+            self._count(reason)
 
     def _refresh(self, record):
         cohort, reason = self.service.status(record.cohort_handle)

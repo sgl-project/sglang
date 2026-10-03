@@ -27,8 +27,14 @@ from sglang.srt.training_capture.identity import (
     bind_rank_target_contract,
 )
 from sglang.srt.training_capture.mooncake_store import TransportError
-from sglang.srt.training_capture.protocol import OWNER, ContractError, Provenance
+from sglang.srt.training_capture.protocol import (
+    OWNER,
+    ContractError,
+    Provenance,
+    SequenceInfo,
+)
 from sglang.srt.training_capture.resources import CaptureResources
+from sglang.srt.training_capture.snapshot import SnapshotMetadata, manifest_size_bound
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 from sglang.srt.training_capture.startup import (
     coordinate_capture_activation,
@@ -40,6 +46,7 @@ from sglang.srt.training_capture.teacher import (
     capture_teacher,
     warmup_teacher_capture,
 )
+from sglang.srt.training_capture.topology import plan_capture_layout
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +272,9 @@ class CaptureCoordinator:
         autostart=True,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
+        self.layout = plan_capture_layout(
+            kv, tp_size=1, pp_layer_ranges=[(0, max(kv.selected_layer_ids) + 1)]
+        )
         self.capture_mode = capture_mode
         self.enable_overlap = enable_overlap
         self.resources = resources or CaptureResources.from_connected(
@@ -585,22 +595,50 @@ class CaptureCoordinator:
         if record is None:
             self._count("admission_backpressure")
             return
+        failure = "admission_invalid_request"
         try:
+            record.provenance = self._provenance(req)
+            if not self._manifest_fits(req, record):
+                failure = "admission_manifest_budget"
+                raise ContractError(failure)
             record.context = RequestCaptureContext(
                 slot=record.slot,
                 prompt_ids=tuple(req.origin_input_ids),
                 max_tokens=self.config.max_sample_tokens,
                 vocab_size=self.teacher.vocab_size,
             )
-            record.provenance = self._provenance(req)
             req.training_capture_context = record
             req.training_capture_finalize = self.on_release
             self.requests[record.lease.capture_id] = req
             self._count("admitted")
         except Exception:
-            record.invalid_reason = "admission_invalid_request"
+            record.invalid_reason = failure
             self._queue_record(record)
-            self._count("admission_invalid_request")
+            self._count(failure)
+
+    def _manifest_fits(self, req, record):
+        prompt = len(req.origin_input_ids)
+        response = req.sampling_params.max_new_tokens
+        metadata = SnapshotMetadata(
+            dataset_id=record.lease.dataset_id,
+            sample_id=record.lease.sample_id,
+            generation_id=record.lease.generation_id,
+            teacher=self.teacher,
+            sequence=SequenceInfo(
+                prompt_length=prompt,
+                response_length=response,
+                total_length=prompt + response,
+                stop_reason="length",
+            ),
+            kv=self.kv,
+            provenance=record.provenance,
+            contract_id=self.config.contract_id,
+            topology=self.layout.topology,
+        )
+        return (
+            manifest_size_bound(metadata, layout=self.layout)
+            <= self.config.manifest_buffer_bytes
+        )
 
     def _provenance(self, req, *, config_sha256=None):
         params = req.sampling_params

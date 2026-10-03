@@ -35,6 +35,19 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 }
 ```
 
+`manifest_buffer_bytes` defaults to 1 MiB per auxiliary-owner slot and counts
+toward `max_host_bytes`. Admission bounds the final JSON size using the request's
+maximum response length, current provenance, and all canonical TP/PP owners.
+If the bound exceeds that reservation, capture is skipped before constructing
+its request context or enqueueing KV/teacher copies. The reservation is retired
+through the existing background lifecycle; inference continues and smaller
+requests remain eligible. `events_total{event="admission_manifest_budget"}`
+counts these rank-local decisions. The bound is conservative, so a request
+whose eventual short response would fit can still be excluded. Increase the
+manifest reservation (and total Host budget as needed), reduce the capture
+length limit, or use larger storage chunks. Writer-side exact size checks remain
+mandatory; this check does not certify payload contents or replace publication.
+
 Synchronous and normal overlap scheduling are supported for ordinary AR and
 DSpark verification. Ordinary AR can use TP/PP with DP=1;
 the complete worker group must participate in capture startup. Real-model

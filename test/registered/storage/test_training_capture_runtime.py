@@ -414,6 +414,95 @@ class TestTrainingCaptureRuntime(CustomTestCase):
                 cuda_graph=cuda_graph,
             )
 
+    def test_manifest_budget_skips_capture_and_preserves_serving(self):
+        cls = type(self)
+        original_config = self.capture_path.read_text()
+        previous = len(self.catalog.publications)
+        long_prompt = [100, 200, 300, 400] * 60
+
+        def generate(prompt, length):
+            response = requests.post(
+                self.url + "/generate",
+                json={
+                    "input_ids": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": length,
+                        "ignore_eos": True,
+                        "logit_bias": {"100": 100.0},
+                    },
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+            result = response.json()
+            self.assertEqual(result["output_ids"], [100] * length)
+            return result
+
+        def stop_server():
+            if cls.server is not None:
+                kill_process_tree(cls.server.pid)
+                cls.server.wait(timeout=20)
+                cls.server = None
+
+        try:
+            if cls.server is None:
+                cls.launch_server(self.capture_path)
+            generate(long_prompt, 8)
+            baseline = self.catalog.wait_publications(previous + 1, timeout=45)[-1]
+            self.assertGreater(baseline["manifest_nbytes"], 12 << 10)
+            stop_server()
+            config = json.loads(original_config)
+            config["manifest_buffer_bytes"] = 12 << 10
+            self.capture_path.write_text(json.dumps(config))
+            cls.launch_server(self.capture_path)
+            generate(long_prompt, 8)
+            state_response = requests.get(self.url + "/server_info", timeout=10)
+            state_response.raise_for_status()
+            state = state_response.json()["internal_states"][0]["training_capture"]
+            self.assertEqual(
+                state["counters"].get("admission_manifest_budget"), 1, state
+            )
+            self.assertEqual(state["counters"].get("admitted", 0), 0, state)
+            self.assertEqual(state["counters"].get("copies_completed", 0), 0, state)
+            self.assertEqual(
+                state["counters"].get("writer_failed_ContractError", 0), 0, state
+            )
+            self.assertIsNone(state["disabled_reason"])
+            self.assertEqual(state["host_pool"]["quarantined"], 0)
+            short_prompt = [100, 200, 300, 400] * 2
+            generate(short_prompt, 2)
+            accepted = self.catalog.wait_publications(previous + 2, timeout=45)[-1]
+            self.assertLessEqual(accepted["manifest_nbytes"], 12 << 10)
+            stop_server()
+            for publication, prompt, response in (
+                (baseline, long_prompt, 8),
+                (accepted, short_prompt, 2),
+            ):
+                _, tensors = self.read_sample(publication)
+                self.assertEqual(
+                    tensors["token_ids"].tolist(), prompt + [100] * response
+                )
+                self.assertEqual(
+                    tensors["loss_mask"].tolist(), [0] * len(prompt) + [1] * response
+                )
+            self.assertEqual(len(self.catalog.publications), previous + 2)
+            self.assertFalse(self.catalog.errors)
+            print(
+                json.dumps(
+                    {
+                        "manifest_admission": state,
+                        "oversized_manifest_bytes": baseline["manifest_nbytes"],
+                        "accepted_manifest_bytes": accepted["manifest_nbytes"],
+                        "post_exit_snapshots": 2,
+                    }
+                ),
+                flush=True,
+            )
+        finally:
+            stop_server()
+            self.capture_path.write_text(original_config)
+
     def check_graph_replay(self, samples):
         type(self).url = f"http://127.0.0.1:{free_port()}"
         self.launch_server(self.capture_path, cuda_graph=True)

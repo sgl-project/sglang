@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
 import msgspec
 import torch
 from sglang.srt.training_capture.protocol import (
+    ELEMENT_BYTES,
     OWNER,
     ContractError,
     Digest,
@@ -52,6 +54,83 @@ class PreparedSnapshotPartition(msgspec.Struct, frozen=True, kw_only=True):
     token_ids_sha256: Digest
     valid_kv_tokens: int
     objects: tuple[TensorDescriptor, ...]
+
+
+def manifest_size_bound(metadata: SnapshotMetadata, *, layout: CaptureLayout) -> int:
+    """Bound the producer's JSON bytes at the request's maximum sequence length.
+
+    Use the already validated global layout, including all canonical owners.
+    Only one sizing descriptor per layer/component/owner is encoded, independent
+    of token chunk count. Payload tensors are neither allocated nor inspected.
+    """
+    n, r = metadata.sequence.total_length, metadata.sequence.response_length
+    kv = metadata.kv
+    prefix = f"draft-data/{metadata.dataset_id}/{metadata.sample_id}/{metadata.generation_id}/"
+    descriptor_bytes = object_count = total_tensor_bytes = 0
+
+    def count(name, dtype, shape, suffix, kind, owner, copies=1, **extra):
+        nonlocal descriptor_bytes, object_count
+        descriptor = TensorDescriptor(
+            object_id=suffix.replace("/", "-"),
+            name=name,
+            kind=kind,
+            key=prefix + suffix,
+            dtype=dtype,
+            shape=shape,
+            nbytes=math.prod(shape) * ELEMENT_BYTES[dtype],
+            sha256="0" * 64,
+            owner_id=owner,
+            byte_order="little",
+            contiguous=True,
+            **extra,
+        )
+        descriptor_bytes += copies * len(canonical_bytes(descriptor))
+        object_count += copies
+        return descriptor.nbytes
+
+    for name, (dtype, shape) in aux_specs(n, r).items():
+        total_tensor_bytes += count(
+            name, dtype, shape, "aux/" + name, "aux", layout.topology.aux_owner
+        )
+    chunks = (n + kv.storage_chunk_tokens - 1) // kv.storage_chunk_tokens
+    chunk_tokens = min(n, kv.storage_chunk_tokens)
+    geometry = {layer.layer_id: layer for layer in kv.layers}
+    for partition in layout.partitions:
+        for heads in partition.heads:
+            layer = geometry[heads.layer_id]
+            width = heads.end - heads.start
+            for component, dim in (
+                ("k", layer.key_head_dim),
+                ("v", layer.value_head_dim),
+            ):
+                # Independently maximize numeric field widths. This sizing-only
+                # descriptor need not describe a single valid token rectangle.
+                count(
+                    f"target_{component}.{layer.layer_id}",
+                    kv.dtype,
+                    [chunk_tokens, width, dim],
+                    f"kv/{layer.layer_id}/{partition.owner_id}/{chunks - 1}/{component}",
+                    "kv",
+                    partition.owner_id,
+                    copies=chunks,
+                    layer_id=layer.layer_id,
+                    component=component,
+                    token_range=(n - 1, n),
+                    head_range=(heads.start, heads.end),
+                )
+                total_tensor_bytes += n * width * dim * ELEMENT_BYTES[kv.dtype]
+    envelope = Manifest(
+        **{
+            name: getattr(metadata, name)
+            for name in metadata.__struct_fields__
+            if name != "sequence"
+        },
+        sequence=msgspec.structs.replace(metadata.sequence, stop_reason="stop_string"),
+        created_at="2000-01-01T00:00:00.000000+00:00",
+        objects=[],
+        total_tensor_bytes=total_tensor_bytes,
+    )
+    return len(canonical_bytes(envelope)) + descriptor_bytes + object_count - 1
 
 
 def build_snapshot(
