@@ -1078,9 +1078,8 @@ class DefaultModelLoader(BaseModelLoader):
                         yield n, w
 
                 weights = _filter_kv_scales(weights)
-        except Exception as e:
-            logger.debug("Failed to check KV cache scales: %s", e)
-
+        except ValueError:
+            pass
 
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
