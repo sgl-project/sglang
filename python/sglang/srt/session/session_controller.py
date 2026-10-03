@@ -287,6 +287,10 @@ class Session:
                     last_req, req, session_params
                 )
         else:
+            if req.input_embeds is not None:
+                # Match normal request handling: embedding requests need
+                # placeholder token IDs for session bookkeeping.
+                req.input_ids = array("q", [1]) * len(req.input_embeds)
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
@@ -303,6 +307,7 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
+            input_embeds=req.input_embeds,
             session=self,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
