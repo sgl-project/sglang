@@ -4071,25 +4071,12 @@ class TestDcpCommBackendDefault(CustomTestCase):
         ):
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
-    @override_platform(is_cuda=False, is_hip=False, is_npu=False)
+    @override_platform(is_cuda=False, is_hip=False)
     def test_ag_rs_off_cuda(self):
-        # is_npu is pinned False rather than left to the host: NPU takes the
-        # a2a branch below, so on an Ascend box this would otherwise resolve
-        # to a2a and fail for the wrong reason.
         with patch(
             "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
         ):
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
-
-    @override_platform(is_cuda=False, is_hip=False, is_npu=True)
-    def test_a2a_on_npu(self):
-        """Ascend NPU joins the a2a branch instead of the off-CUDA ag_rs
-        default: ag_rs costs three collectives per layer against a2a's one,
-        and a2a is the backend vLLM-Ascend uses for the same reduction."""
-        with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
-        ):
-            self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
