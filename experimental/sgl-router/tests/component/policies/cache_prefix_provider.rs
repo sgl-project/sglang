@@ -29,7 +29,7 @@ fn radix_tree_reports_contiguous_prefix_depth_per_worker() {
     );
 
     let signal = RadixTreePrefixProvider::new(tree, oracle)
-        .match_request_tokens(&tokens)
+        .match_request_tokens(&tokens, None)
         .expect("established local tree must produce a prefix signal");
     let PrefixOutcome::Matched {
         matches,

@@ -3,7 +3,8 @@
 
 use super::ExternalPrefixSignal;
 use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+    compute_block_hashes_bigram_with_salt, compute_block_hashes_with_salt, BlockSizeOracle,
+    HashTree,
 };
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
@@ -23,8 +24,12 @@ impl RadixTreePrefixProvider {
         }
     }
 
-    pub fn match_request_tokens(&self, tokens: &[u32]) -> Option<ExternalPrefixSignal> {
-        let hashes = self.block_hashes(tokens)?;
+    pub fn match_request_tokens(
+        &self,
+        tokens: &[u32],
+        cache_salt: Option<&str>,
+    ) -> Option<ExternalPrefixSignal> {
+        let hashes = self.block_hashes(tokens, cache_salt)?;
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
         for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
@@ -53,8 +58,13 @@ impl RadixTreePrefixProvider {
     }
 
     /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
-    pub fn rank_depths(&self, tokens: &[u32], worker_url: &str) -> Vec<(u32, usize)> {
-        let Some(hashes) = self.block_hashes(tokens) else {
+    pub fn rank_depths(
+        &self,
+        tokens: &[u32],
+        worker_url: &str,
+        cache_salt: Option<&str>,
+    ) -> Vec<(u32, usize)> {
+        let Some(hashes) = self.block_hashes(tokens, cache_salt) else {
             return Vec::new();
         };
         self.tree
@@ -65,12 +75,12 @@ impl RadixTreePrefixProvider {
             .collect()
     }
 
-    fn block_hashes(&self, tokens: &[u32]) -> Option<Vec<i64>> {
+    fn block_hashes(&self, tokens: &[u32], cache_salt: Option<&str>) -> Option<Vec<i64>> {
         let block_size = self.block_size_oracle.get()?;
         let hashes = if self.block_size_oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
+            compute_block_hashes_bigram_with_salt(tokens, block_size as usize, cache_salt)
         } else {
-            compute_block_hashes(tokens, block_size as usize)
+            compute_block_hashes_with_salt(tokens, block_size as usize, cache_salt)
         };
         (!hashes.is_empty()).then_some(hashes)
     }
