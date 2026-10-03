@@ -1815,6 +1815,9 @@ class Envs:
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
+    # Experimental gfx950 DSV4.1 TP4 shared-expert/router horizontal fusion.
+    # Unsupported shapes and modes keep the ordinary model path.
+    SGLANG_DSV41_SHARED_ROUTER_FUSION = EnvBool(False)
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
