@@ -22,6 +22,8 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 import triton
+from safetensors.torch import load_file
+from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -31,6 +33,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 # Configs
+from sglang.srt.configs.model_config import load_decision_config
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -60,7 +63,10 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
-from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
@@ -115,6 +121,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
+    get_model,
     get_parallel,
     get_stream,
 )
@@ -131,7 +138,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -1097,7 +1104,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                     )
                 ),
@@ -1109,13 +1116,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1132,7 +1139,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs", None),
+            capture_gathered=kwargs.get("captured_last_layer_outputs", None),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1303,7 +1310,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                     )
                 ),
@@ -1315,13 +1322,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1536,7 +1543,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1688,11 +1695,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 is_nextn=is_nextn,
             )
 
-        self.layers, self._start_layer, self._end_layer = make_layers(
+        self.layers, self._start_layer, self._end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1770,6 +1775,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1843,11 +1853,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
-        hidden_states = residual_batch.norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,
             self.norm,
-            handoff_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
             skip_empty=True,
         )
 
@@ -2327,11 +2337,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        bare_backbone = False
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
                 continue
+            if name.startswith("language_model."):
+                # A bare Qwen3_5Model save, which has no LM head of its own.
+                name = "model." + name
+                bare_backbone = True
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -2403,7 +2418,28 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
+        if bare_backbone and self.pp_group.is_last_rank:
+            self._load_decision_readout()
+            loaded_params.add("lm_head.weight")
         return loaded_params
+
+    def _load_decision_readout(self) -> None:
+        """Place the checkpoint's decision readout in the LM head rows of its codes."""
+        model = get_model()
+        config = load_decision_config(model.model_path, model.revision)
+        if config is None:
+            raise ValueError(
+                "This Qwen3_5Model checkpoint has no LM head and no "
+                "decision_config.json readout to serve in its place"
+            )
+        readout = load_file(
+            cached_file(
+                model.model_path, "readout.safetensors", revision=model.revision
+            )
+        )["weight"]
+        head = readout.new_zeros(self.lm_head.org_vocab_size, readout.shape[1])
+        head[config["token_ids"]] = readout
+        self.lm_head.weight_loader(self.lm_head.weight, head)
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):

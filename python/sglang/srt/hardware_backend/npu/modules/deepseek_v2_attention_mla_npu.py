@@ -4,6 +4,10 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+import sglang.srt.layers.dcp.comm as dcp_comm
+import sglang.srt.layers.dcp.layout as dcp_layout
+import sglang.srt.model_executor.forward_context as forward_context
+import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -28,6 +32,15 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
 
 
+def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
+    return (
+        runtime_context.get_parallel().dcp_enabled
+        and not forward_context.get_attn_backend().is_draft_worker
+        and not dsa_use_prefill_cp(forward_batch)
+        and not forward_batch.forward_mode.is_idle()
+    )
+
+
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -35,7 +48,7 @@ def forward_mha_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
-    input_on_attention_tp_slices: bool,
+    input_on_attn_tp_slices: bool,
 ):
     if m.q_lora_rank is not None:
         q, latent_cache = (
@@ -63,7 +76,7 @@ def forward_mha_prepare_npu(
 
         else:
             q = m.q_a_layernorm(q)
-            if _use_ag_after_qlora and input_on_attention_tp_slices:
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
                 q = scattered_to_tp_attn_full(q, forward_batch)
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
@@ -157,7 +170,7 @@ def forward_mla_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
-    input_on_attention_tp_slices: bool,
+    input_on_attn_tp_slices: bool,
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
@@ -190,7 +203,7 @@ def forward_mla_prepare_npu(
         q_lora = None
         if m.q_lora_rank is not None:
             qkv_latent = get_attn_tp_context().fetch_qkv_latent()
-            if _use_ag_after_qlora and input_on_attention_tp_slices:
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
                 q, latent_cache = qkv_latent.split(
                     [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
                     dim=-1,
@@ -362,7 +375,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
-    input_on_attention_tp_slices: bool,
+    input_on_attn_tp_slices: bool,
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
@@ -396,7 +409,7 @@ def forward_dsa_prepare_npu(
             )
             # overlap qk norm
             q = m.q_a_layernorm(q)
-            if _use_ag_after_qlora and input_on_attention_tp_slices:
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
                 q = scattered_to_tp_attn_full(q, forward_batch)
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             q_lora = q.clone()  # required for topk_indices
@@ -485,11 +498,25 @@ def forward_dsa_prepare_npu(
             positions,
             forward_batch,
             m.layer_id,
-            input_on_attention_tp_slices,
+            input_on_attn_tp_slices,
             dynamic_scale,
         )
+        # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
+        # only when a fresh global top-k is produced so shared-index layers do
+        # not repeat the same DCP partitioning work.
+        if _use_dsa_dcp_partial_attention(forward_batch):
+            parallel = runtime_context.get_parallel()
+            topk_indices = dcp_layout.remap_dcp_sparse_indices(
+                topk_indices,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+                interleave_size=forward_context.get_attn_backend().page_size,
+            )
     else:
         topk_indices = prev_topk_indices
+
+    if _use_dsa_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
@@ -522,7 +549,9 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
+    use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
+    attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
+    attn_output = attn(
         q_nope_out.contiguous(),
         k_nope.contiguous(),
         k_nope.contiguous(),
@@ -532,6 +561,16 @@ def forward_dsa_core_npu(
         k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
+    if use_dcp:
+        attn_output, lse = attn_output
+        attn_output = attn_output.view(
+            -1,
+            m.num_local_heads * runtime_context.get_parallel().attn_dcp_size,
+            m.kv_lora_rank,
+        )
+        attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, runtime_context.get_parallel().dcp_group
+        )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     if _is_npu_arch35 or (
