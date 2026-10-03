@@ -10368,6 +10368,31 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         cache.sanity_check()
 
 
+class TestStorageAttachmentPolicyValidation(CustomTestCase):
+    def test_buffer_only_rejects_write_back_before_attach_or_policy_update(self):
+        for storage_enabled in (False, True):
+            with self.subTest(storage_enabled=storage_enabled):
+                cache = mock.MagicMock()
+                cache.host_memory_mode = "buffer_only"
+                cache.enable_storage = storage_enabled
+                cache.prefetch_stop_policy = "best_effort"
+                cache.cache_controller.storage_backend_type = "file"
+                cache.cache_controller.write_policy = "write_through"
+
+                success, message = StorageAttachment(cache).attach(
+                    storage_backend="file",
+                    hicache_storage_prefetch_policy="timeout",
+                    hicache_write_policy="write_back",
+                )
+
+                self.assertFalse(success)
+                self.assertIn("buffer_only", message)
+                self.assertIn("write_back", message)
+                self.assertEqual(cache.prefetch_stop_policy, "best_effort")
+                self.assertEqual(cache.cache_controller.write_policy, "write_through")
+                cache.cache_controller.attach_storage_backend.assert_not_called()
+
+
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.
 
