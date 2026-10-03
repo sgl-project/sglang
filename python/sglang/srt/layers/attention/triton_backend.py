@@ -1633,9 +1633,9 @@ class TritonAttnBackend(AttentionBackend):
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
-                    # doesn't accept scale parameters. Clone to protect k from mutation
-                    # since it's used later in the attention kernel.
-                    k_scaled = k.clone().div_(layer.k_scale)
+                    # doesn't accept scale parameters. Out of place: k is still read
+                    # by the attention kernel below.
+                    k_scaled = k / layer.k_scale
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         loc_info,
@@ -1643,14 +1643,14 @@ class TritonAttnBackend(AttentionBackend):
                         v,
                     )
                 else:
+                    # Scale here rather than in the pool, which divides in place:
+                    # k and v are still read by the attention kernel below.
                     self._set_kv_buffer(
                         forward_batch,
                         layer,
                         loc_info,
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
-                        layer.k_scale,
-                        layer.v_scale,
+                        k / layer.k_scale,
+                        v / layer.v_scale,
                     )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
