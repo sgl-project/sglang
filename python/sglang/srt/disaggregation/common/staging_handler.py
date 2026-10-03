@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
 
+# Fallback cap when the decode receiver has not recorded expected page count.
+# Prefill chunk_idx is always in [0, total_pages); this keeps a missing
+# _staging_total_pages from growing chunk_staging_infos until OOM.
+MAX_STAGING_CHUNK_IDX = 1_048_576
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -799,6 +804,23 @@ def handle_staging_req(
             session_id,
         )
         return
+
+    # Bound attacker-controlled chunk_idx before growing chunk_staging_infos.
+    # Legitimate indices are in [0, total_pages); fall back to a finite cap
+    # if the receiver has not recorded the expected span.
+    total_pages = getattr(receiver, "_staging_total_pages", 0) or 0
+    bound = total_pages if total_pages > 0 else MAX_STAGING_CHUNK_IDX
+    if chunk_idx < 0 or chunk_num_pages <= 0 or chunk_idx >= bound:
+        logger.warning(
+            "STAGING_REQ rejected: invalid chunk room=%s chunk_idx=%s "
+            "chunk_num_pages=%s bound=%s",
+            room,
+            chunk_idx,
+            chunk_num_pages,
+            bound,
+        )
+        return
+
     infos = receiver.chunk_staging_infos
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
