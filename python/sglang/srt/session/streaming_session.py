@@ -182,8 +182,8 @@ class StreamingSession:
         )
 
     def try_cache_finished_req(self, req: Req) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
-        Returns True if handled; False means caller runs its raw path."""
+        """Hands a finished turn's row to the session slot. Returns False for
+        non-streaming requests and aborts, which the caller releases."""
         if not _is_streaming(req):
             return False
 
@@ -191,28 +191,19 @@ class StreamingSession:
 
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
-        is_first = slot is None
-
-        # Mid-processing abort: free all session KV and drop the slot; req_nodes
-        # still points at the last finished request, so the next turn re-prefills.
         if isinstance(req.finished_reason, FINISH_ABORT):
-            kv = req.detach_kv()
-            if slot is None:
-                # First turn: a throwaway slot lets release_session free the
-                # record (mamba refs included) and drop the tree lock.
-                slot = SessionSlot(
-                    kv=kv,
-                    last_node=req.last_node,
-                    lock_receipt=req.lock_receipt,
-                    swa_prefix_lock_released=req.swa_prefix_lock_released,
-                )
-                self.slots[session_id] = slot
-            else:
-                assert kv is slot.kv
-            self.release_session(session_id)
+            if slot is not None and slot.kv is req.kv:
+                # The turn ran on the slot's record, which the caller releases
+                # (row and mamba state): drop the slot with its tree lock. The
+                # session keeps its last finished request and re-prefills next turn.
+                del self.slots[session_id]
+                if slot.last_node is not None:
+                    skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+                    self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
             req.session.abort_req()
-            return True
+            return False
 
+        is_first = slot is None
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
