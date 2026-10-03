@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -59,8 +60,14 @@ def _reason_kind(detail: str) -> str:
     return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
 
 
-def _log_cake_route_once(site: str, event: str, detail: str) -> None:
-    key = (site, event, _reason_kind(detail) if event == "fallback" else "")
+def _log_cake_route_once(
+    site: str, event: str, detail: str, key_extra: str = ""
+) -> None:
+    key = (
+        site,
+        event,
+        _reason_kind(detail) if event == "fallback" else key_extra,
+    )
     if key in _cake_route_logged:
         return
     _cake_route_logged.add(key)
@@ -78,10 +85,30 @@ def _log_cake_route_once(site: str, event: str, detail: str) -> None:
 
 def reset_cake_route_state_for_tests() -> None:
     _cake_route_logged.clear()
+    _dsv4_ab_mode.cache_clear()
 
 
 def _is_capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+_DSV4_AB_ENV = "SGLANG_CAKE_DEBUG_DSV4_AB"
+
+
+@functools.lru_cache(maxsize=None)
+def _dsv4_ab_mode() -> str:
+    """Debug A/B of the SM100 Cake route against the stock kernel (eager only).
+
+    ``SGLANG_CAKE_DEBUG_DSV4_AB=log`` runs the stock kernel on the same tensors
+    after every Cake call, logs the difference and keeps the Cake output;
+    ``=stock`` logs the difference and returns the stock output (the model
+    stays on the default numerics).  Unset / ``0`` disables it.  Calls inside
+    CUDA-graph capture are never compared; use ``--disable-cuda-graph``.
+    """
+    value = os.environ.get(_DSV4_AB_ENV, "").strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return ""
+    return "stock" if value in ("stock", "2") else "log"
 
 
 def _tensor_summary(**tensors: Optional[torch.Tensor]) -> str:
@@ -151,6 +178,8 @@ class CakeDsv4TrtllmRoute:
         self._primed_workspaces: set = set()
         # (rows, heads, sparse_topk, dtype) -> required workspace bytes.
         self._workspace_bytes: Dict[tuple, int] = {}
+        # (sparse_topk, rows) -> number of debug A/B comparisons so far.
+        self._ab_counts: Dict[Tuple[int, int], int] = {}
 
     def _required_workspace_bytes(
         self,
@@ -257,8 +286,108 @@ class CakeDsv4TrtllmRoute:
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
         )
-        _log_cake_route_once(self.SITE, "taken", detail)
+        _log_cake_route_once(
+            self.SITE,
+            "taken",
+            detail,
+            key_extra=f"topk{int(sparse_indices.shape[1])}",
+        )
+        if _dsv4_ab_mode() and not _is_capturing():
+            out = self._debug_compare_with_stock(
+                out,
+                reset,
+                query=query,
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=sinks,
+                kv_layout=kv_layout,
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=max_q_len,
+            )
         return out
+
+    def _debug_compare_with_stock(
+        self,
+        cake_out: torch.Tensor,
+        reset: Callable[[torch.Tensor], None],
+        *,
+        query: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        compressed_kv_cache: torch.Tensor,
+        sparse_topk_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        sinks: torch.Tensor,
+        kv_layout: str,
+        cum_seq_lens_q: Optional[torch.Tensor],
+        max_q_len: Optional[int],
+    ) -> torch.Tensor:
+        """Run the stock kernel on the same tensors and log the difference.
+
+        Debug only (``SGLANG_CAKE_DEBUG_DSV4_AB``); synchronises the stream.
+        The stock kernel shares the workspace, so the Cake split-merge counters
+        are re-zeroed afterwards.
+        """
+        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4 as stock
+
+        ref = stock(
+            query=query,
+            swa_kv_cache=swa_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=compressed_kv_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            kv_layout=kv_layout,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+        )
+        reset(workspace_buffer)
+        rows = int(sparse_indices.shape[0])
+        heads = int(query.shape[-2])
+        a = cake_out.reshape(-1, heads, _DSV4_HEAD_DIM)[:rows].float()
+        b = ref.reshape(-1, heads, _DSV4_HEAD_DIM)[:rows].float()
+        diff = (a - b).abs()
+        bad = (diff > 0.1 + 0.1 * b.abs()) | ~torch.isfinite(a)
+        key = (int(sparse_indices.shape[1]), rows)
+        n = self._ab_counts.get(key, 0)
+        self._ab_counts[key] = n + 1
+        if n < 4 or n % 500 == 0:
+            lens = sparse_topk_lens[:rows]
+            sl = seq_lens[:rows]
+            logger.info(
+                "%s dsv4 A/B topk=%d rows=%d heads=%d call=%d: max|d|=%.4g "
+                "mean|d|=%.4g frac>fp8tol=%.4g nonfinite=%d ref_max=%.4g "
+                "lens[min,max]=(%d,%d) seq_lens[min,max]=(%d,%d) neg_idx=%d",
+                _CAKE_LOG_PREFIX,
+                key[0],
+                rows,
+                heads,
+                n,
+                float(diff.max()),
+                float(diff.mean()),
+                float(bad.float().mean()),
+                int((~torch.isfinite(a)).sum()),
+                float(b.abs().max()),
+                int(lens.min()),
+                int(lens.max()),
+                int(sl.min()),
+                int(sl.max()),
+                int((sparse_indices[:rows] < 0).sum()),
+            )
+        return ref if _dsv4_ab_mode() == "stock" else cake_out
 
 
 class CakeDsv41MixedDecodeRoute:
