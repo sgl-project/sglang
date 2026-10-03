@@ -125,13 +125,6 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -149,16 +142,30 @@ class TorchNativeAttnBackend(AttentionBackend):
             is_causal = causal
             if sliding_window_size is not None and sliding_window_size > -1:
                 attn_mask = self._make_sliding_window_mask(
-                    q_len=seq_len_kv,
+                    q_len=extend_seq_len_q,
                     kv_len=seq_len_kv,
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
+                    query_offset=prefill_seq_len_q,
                 )
                 is_causal = False
+            elif causal and prefill_seq_len_q > 0:
+                # SDPA's is_causal mask is upper-left aligned; prefix queries
+                # need their absolute positions in the full key sequence.
+                q_pos = torch.arange(
+                    prefill_seq_len_q,
+                    prefill_seq_len_q + extend_seq_len_q,
+                    device=per_req_query.device,
+                ).unsqueeze(1)
+                k_pos = torch.arange(seq_len_kv, device=per_req_query.device).unsqueeze(
+                    0
+                )
+                attn_mask = k_pos <= q_pos
+                is_causal = False
 
-            per_req_out_redudant = (
+            per_req_out = (
                 scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
                     attn_mask=attn_mask,
@@ -169,7 +176,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
         return output
 
