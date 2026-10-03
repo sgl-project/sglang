@@ -171,7 +171,7 @@ def _push_vec4(
     return mean, m2, cnt
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len", "n_rows"])
 def _layernorm_modulate_kernel(
     y_ptr,
     y_q_ptr,
@@ -353,7 +353,7 @@ def _qk_ln_head_one(
     tl.store(dst + row_base[:, None] + cols2[None, :], y, mask=out_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_rows"])
 def _qk_ln_head_kernel(
     q_out_ptr,
     k_out_ptr,
