@@ -491,6 +491,12 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_stream_interval(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.stream_interval <= 0:
+        raise ValueError("--stream-interval must be greater than 0")
+
+
 def default_unset_prefill_decode_interval(server_args: Any):
     """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
     from sglang.srt.arg_groups.overrides import declare_resolution

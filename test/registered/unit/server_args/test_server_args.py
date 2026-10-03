@@ -121,6 +121,38 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_stream_interval_must_be_positive(self):
+        """Reject unsafe streaming intervals even without a model to resolve."""
+        for model_path in ("dummy", "none"):
+            for stream_interval in (0, -1, -50, 1, 3, 50):
+                for from_cli in (False, True):
+                    with self.subTest(
+                        model_path=model_path,
+                        stream_interval=stream_interval,
+                        from_cli=from_cli,
+                    ):
+                        if from_cli:
+                            args = prepare_server_args(
+                                [
+                                    "--model-path",
+                                    model_path,
+                                    "--stream-interval",
+                                    str(stream_interval),
+                                ]
+                            )
+                        else:
+                            args = ServerArgs(
+                                model_path=model_path, stream_interval=stream_interval
+                            )
+                        if stream_interval <= 0:
+                            with self.assertRaisesRegex(
+                                ValueError, "--stream-interval must be greater than 0"
+                            ):
+                                args.resolve_once()
+                        else:
+                            args.resolve_once()
+                            self.assertEqual(args.stream_interval, stream_interval)
+
     def test_optimistic_prefill_allows_l2_write_through_only(self):
         for policy, expected in (
             ("write_back", 2),
