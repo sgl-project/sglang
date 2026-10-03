@@ -118,4 +118,27 @@ ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
 RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
+# Mooncake transfer engine for PD disaggregation, built with icpx (the XPU TUs
+# use -fsycl). TENT carries the XPU path and runs over TCP, so no RDMA NIC is
+# needed. WITH_STORE=OFF: the store does not build with icpx at this commit.
+ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
+ARG MOONCAKE_COMMIT=16b7ba3c7364eb8d36d04378bc7d28013bea1a1e
+RUN git clone ${MOONCAKE_REPO} /tmp/Mooncake && \
+    cd /tmp/Mooncake && \
+    git checkout ${MOONCAKE_COMMIT} && \
+    bash dependencies.sh -y && \
+    cmake -S . -B build \
+        -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+        -DUSE_XPU=ON -DUSE_TENT=ON \
+        -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF && \
+    cmake --build build -j "$(nproc)" && \
+    cmake --install build && \
+    cd / && rm -rf /tmp/Mooncake /usr/local/go && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python -c "import mooncake.engine"
+
+# The PD tests launch a sglang-router between the prefill and decode servers.
+RUN pip install --no-cache-dir sglang-router
+
 CMD ["bash"]

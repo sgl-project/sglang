@@ -32,7 +32,9 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
-    # Mori early-send: CUDA event to synchronize before RDMA (optional).
+    # Early-send: accelerator event the worker must synchronize before reading
+    # these pages, since the prior step's prefill forward may still be writing
+    # them. None whenever early-send is off or overlap scheduling is disabled.
     wait_event: Optional[object] = None
 
 

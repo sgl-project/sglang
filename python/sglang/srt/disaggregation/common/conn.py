@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
@@ -403,6 +404,7 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            device_type=get_device().device,
             include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens
@@ -1557,6 +1559,8 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
+        # Set by the scheduler's early-send path, consumed by the next send().
+        self._early_send_wait_event: Optional[object] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -1648,6 +1652,16 @@ class CommonKVSender(BaseKVSender):
             for component_indices in state_indices:
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+
+    def _take_early_send_wait_event(self) -> Optional[object]:
+        """Pop the event the early-send path recorded on the forward stream.
+
+        One-shot: it orders the prior step's prefill writes against the chunk
+        being enqueued now, so a later chunk must not wait on a stale event.
+        """
+        event = self._early_send_wait_event
+        self._early_send_wait_event = None
+        return event
 
     def _prepare_send_indices(
         self,
