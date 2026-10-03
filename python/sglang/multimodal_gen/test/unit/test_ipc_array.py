@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
 import tempfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -81,6 +83,39 @@ def test_local_endpoint_detection():
     assert is_local_endpoint("ipc:///tmp/sgl.sock")
     assert is_local_endpoint("inproc://scheduler")
     assert not is_local_endpoint("tcp://10.0.0.2:30000")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC needs a GPU")
+@pytest.mark.parametrize(
+    "scheduler_host, wire_type", [("127.0.0.1", "CudaIpcRef"), ("10.0.0.2", "Tensor")]
+)
+def test_reply_reaches_the_caller_as_a_tensor(scheduler_host, wire_type):
+    from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+    from sglang.multimodal_gen.runtime.scheduler_client import (
+        _materialize_local_cuda_refs,
+        _materialize_output_batch_file_refs,
+    )
+    from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
+
+    server_args = object.__new__(ServerArgs)
+    server_args.host = "172.18.0.2"
+    server_args.scheduler_host = scheduler_host
+    server_args.scheduler_port = 5555
+    server_args.scheduler_ports = None
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.server_args = server_args
+    scheduler.dp_replica = 0
+    scheduler.receiver = Mock()
+    output = torch.arange(24, device="cuda", dtype=torch.float32)
+
+    scheduler.return_result(OutputBatch(output=output.clone()), identity=b"client")
+    received = pickle.loads(scheduler.receiver.send_multipart.call_args.args[0][2])
+    assert type(received.output).__name__ == wire_type
+
+    _materialize_output_batch_file_refs(received)
+    _materialize_local_cuda_refs(server_args.scheduler_endpoint, received)
+    assert torch.equal(received.output, output)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.uint8])
