@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 from triton.language.extra import libdevice
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
@@ -313,6 +314,14 @@ class IQuestQ1Attention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        # The decoder boundary reduces partial attention outputs. Only a
+        # standalone attention that owns its TP reduction needs this guard.
+        if reduce_results:
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=attn_tp_size,
+                reduces_over_attn_tp=False,
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,

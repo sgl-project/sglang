@@ -76,6 +76,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -963,11 +964,7 @@ class ModelRunner:
             top_k=hisparse_top_k,
             device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
-            tp_group=(
-                get_parallel().attn_tp_group.cpu_group
-                if get_parallel().attn_dp_enabled
-                else get_parallel().tp_group.cpu_group
-            ),
+            tp_group=get_dp_tp_group().cpu_group,
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
@@ -1368,8 +1365,6 @@ class ModelRunner:
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=get_lora().lora_backend,
-            tp_size=get_parallel().tp_size,
-            tp_rank=get_parallel().tp_rank,
             max_lora_rank=get_lora().max_lora_rank,
             target_modules=get_lora().lora_target_modules,
             lora_paths=get_lora().lora_paths,
