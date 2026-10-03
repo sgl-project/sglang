@@ -275,7 +275,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                     scheduler.metrics_reporter.record_scheduler_idle.assert_called_once_with()
                     scheduler.metrics_reporter.record_scheduler_active.assert_not_called()
                 else:
-                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once_with()
+                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once()
                     scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
 
     def test_inplace_does_not_drain_overlap_queue(self):
