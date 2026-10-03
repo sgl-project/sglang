@@ -32,6 +32,23 @@ class TboAttnBackend(AttentionBackend):
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
+    @property
+    def full_cuda_graph_uses_chunked_prefix(self) -> bool:
+        return self.primary.full_cuda_graph_uses_chunked_prefix
+
+    def get_cuda_graph_variants(self, model_runner, forward_mode, captured_req_width):
+        return self.primary.get_cuda_graph_variants(
+            model_runner, forward_mode, captured_req_width
+        )
+
+    def can_run_prefill_cuda_graph(self, forward_batch):
+        return self.primary.can_run_prefill_cuda_graph(forward_batch)
+
+    def get_prefill_cuda_graph_max_query_len(self, num_tokens, max_requests):
+        return self.primary.get_prefill_cuda_graph_max_query_len(
+            num_tokens, max_requests
+        )
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(

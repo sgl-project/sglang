@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 from sglang.srt.arg_groups.overrides import _dllm_attention_backend, resolving_view
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise, _sample_denoiser
@@ -15,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -28,6 +30,31 @@ def _config(*, block_size=3, fdfo=False, **algorithm_config):
         max_running_requests=8,
         first_done_first_out_mode=fdfo,
         requires_separate_context_encoding=True,
+    )
+
+
+def _launch_args(backend="fa4", prefill=None, decode=None, graph=Backend.FULL):
+    hf_config = SimpleNamespace(
+        tie_word_embeddings=True,
+        text_config=SimpleNamespace(tie_word_embeddings=True),
+    )
+    return SimpleNamespace(
+        device="cuda",
+        _model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
+        model_path="diffusiongemma",
+        dllm_algorithm="Gemma4Renoise",
+        pp_size=1,
+        dcp_size=1,
+        attn_cp_size=1,
+        attention_backend=backend,
+        prefill_attention_backend=prefill,
+        decode_attention_backend=decode,
+        disable_radix_cache=False,
+        cuda_graph_config=CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=graph),
+        ),
+        chunked_prefill_size=128,
     )
 
 
@@ -97,7 +124,54 @@ class _FakeRunner:
         )
 
 
-class TestGemma4Renoise(unittest.TestCase):
+class TestGemma4Renoise(CustomTestCase):
+    def test_graph_inputs_reuse_buffer_and_refresh_self_conditioning(self):
+        config = _config(seed=17, max_denoising_steps=3)
+        config.capture_input_preparation = True
+        algorithm, runner = Gemma4Renoise(config), _FakeRunner()
+        batch = _batch(["a", "b"], 3)
+        states = self._initialize(algorithm, batch)
+        buffer = batch.input_preparation_state
+        signal = torch.ones(3, 3)
+        for conditioning in (signal, None):
+            states[0]["self_conditioning"] = conditioning
+            algorithm.prepare_inputs(runner, batch, states)
+            expected = torch.cat(
+                (
+                    signal if conditioning is not None else torch.zeros_like(signal),
+                    torch.zeros_like(signal),
+                )
+            )
+            self.assertIs(batch.input_preparation_state, buffer)
+            torch.testing.assert_close(buffer, expected)
+            torch.testing.assert_close(
+                batch.input_ids,
+                torch.stack([state["current"] for state in states]).flatten(),
+            )
+            actual = algorithm.prepare_graph_inputs(
+                runner.model, batch.input_ids, buffer
+            )
+            torch.testing.assert_close(
+                actual,
+                runner.prepare_dllm_input_embeds(batch.input_ids, expected),
+                atol=0,
+                rtol=0,
+            )
+
+    def test_temperature_table_preserves_rounding_and_mixed_steps(self):
+        algorithm = Gemma4Renoise(
+            _config(max_denoising_steps=48, t_min=0.13, t_max=0.87)
+        )
+        logits = torch.empty(1, dtype=torch.float32)
+        for steps in ([48], [1, 17, 48, 0]):
+            states = [{"step": step} for step in steps]
+            expected = logits.new_tensor(
+                [algorithm._temperature(step) for step in steps]
+            )
+            torch.testing.assert_close(
+                algorithm._temperatures(logits, states), expected, rtol=0, atol=0
+            )
+
     def _initialize(self, algorithm, batch, vocab_size=4, hidden_size=3):
         weight = torch.arange(vocab_size * hidden_size, dtype=torch.float32).view(
             vocab_size, hidden_size
@@ -191,37 +265,17 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertEqual(algorithm.step(batch, logits, states), [True])
 
     def test_launch_constraints_are_owned_by_algorithm(self):
-        hf_config = SimpleNamespace(
-            tie_word_embeddings=True,
-            text_config=SimpleNamespace(tie_word_embeddings=True),
-        )
-        server_args = SimpleNamespace(
-            device="cuda",
-            _model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
-            model_path="diffusiongemma",
-            pp_size=1,
-            dcp_size=1,
-            attn_cp_size=1,
-            attention_backend="flashinfer",
-            prefill_attention_backend="fa3",
-            decode_attention_backend=None,
-            disable_radix_cache=False,
-            cuda_graph_config=CudaGraphConfig(
-                decode=PhaseConfig(backend=Backend.FULL),
-                prefill=PhaseConfig(backend=Backend.FULL),
-            ),
-            chunked_prefill_size=128,
-        )
+        server_args = _launch_args(prefill="fa4")
 
         Gemma4Renoise.configure_server_args(server_args)
 
-        self.assertEqual(server_args.attention_backend, "flashinfer")
-        self.assertEqual(server_args.prefill_attention_backend, "fa3")
+        self.assertEqual(server_args.attention_backend, "fa4")
+        self.assertEqual(server_args.prefill_attention_backend, "fa4")
         self.assertIsNone(server_args.decode_attention_backend)
         resolved = resolving_view(server_args)
         self.assertTrue(resolved.disable_radix_cache)
         self.assertEqual(resolved.cuda_graph_config.decode.backend, Backend.FULL)
-        self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.FULL)
         self.assertEqual(resolved.chunked_prefill_size, -1)
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
@@ -229,6 +283,35 @@ class TestGemma4Renoise(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "GPU execution"):
             Gemma4Renoise.configure_server_args(SimpleNamespace(device="cpu"))
+
+    def test_full_prefill_uses_the_prefill_backend(self):
+        for backend, prefill, decode, supported in (
+            ("fa4", None, None, True),
+            ("triton", "fa4", "triton", True),
+            ("fa4", "triton", "fa4", False),
+        ):
+            with self.subTest(backend=backend, prefill=prefill, decode=decode):
+                args = _launch_args(backend, prefill, decode)
+                if supported:
+                    Gemma4Renoise.configure_server_args(args)
+                    self.assertEqual(
+                        resolving_view(args).cuda_graph_config.prefill.backend,
+                        Backend.FULL,
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "prefill backend 'fa4'"):
+                        Gemma4Renoise.configure_server_args(args)
+
+        args = _launch_args("triton", graph=Backend.DISABLED)
+        Gemma4Renoise.configure_server_args(args)
+        self.assertEqual(
+            resolving_view(args).cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_full_prefill_checks_the_resolved_dllm_backend(self):
+        args = _launch_args("fa4", "fa4", "fa3")
+        with self.assertRaisesRegex(ValueError, "got 'triton'"):
+            handle_dllm_inference(args)
 
     def test_required_attention_backend_uses_generic_override_pass(self):
         view = SimpleNamespace(
@@ -299,7 +382,9 @@ class TestGemma4Renoise(unittest.TestCase):
         repeat = algorithm.init_step_state(_batch(["other-a", "other-b"], 4))
         for first, second in zip(states, repeat):
             torch.testing.assert_close(first["current"], second["current"])
-            torch.testing.assert_close(first["rng_state"], second["rng_state"])
+            torch.testing.assert_close(
+                first["generator"].get_state(), second["generator"].get_state()
+            )
 
     def test_entropy_bound_and_state_progression(self):
         algorithm = Gemma4Renoise(
@@ -323,7 +408,7 @@ class TestGemma4Renoise(unittest.TestCase):
         log_probabilities = torch.log_softmax(processed, dim=-1)
         probabilities = log_probabilities.exp()
         generator = torch.Generator(device="cpu")
-        generator.set_state(state["rng_state"])
+        generator.set_state(state["generator"].get_state())
         sampled = torch.multinomial(
             probabilities, num_samples=1, generator=generator
         ).squeeze(-1)
@@ -386,8 +471,11 @@ class TestGemma4Renoise(unittest.TestCase):
         for rid in first_by_rid:
             left, right = first_by_rid[rid], second_by_rid[rid]
             self.assertEqual(left["step"], right["step"])
-            for key in ("current", "argmax", "self_conditioning", "rng_state"):
+            for key in ("current", "argmax", "self_conditioning"):
                 torch.testing.assert_close(left[key], right[key])
+            torch.testing.assert_close(
+                left["generator"].get_state(), right["generator"].get_state()
+            )
 
     def test_max_step_completion_is_idempotent(self):
         algorithm = Gemma4Renoise(

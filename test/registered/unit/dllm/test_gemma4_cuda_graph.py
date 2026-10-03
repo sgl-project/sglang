@@ -7,7 +7,14 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.flashattention_dense_backend import (
+    FlashAttentionDenseBackend,
+)
+from sglang.srt.layers.attention.graph_variants import (
+    DLLM_FULL_WINDOW,
+    DLLM_VARLEN,
+    DllmWindowGraphVariants,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -15,12 +22,14 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 )
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class _ReadStream:
     reads_are_translated = False
+    is_translating = False
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
@@ -35,6 +44,7 @@ class _ReadStream:
         out,
         kv_start_idx=None,
         sliding_window=False,
+        token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])
@@ -42,9 +52,27 @@ class _ReadStream:
         return False
 
 
-class TestGemma4GraphMetadata(unittest.TestCase):
+class TestGemma4GraphMetadata(CustomTestCase):
+    def test_full_window_variant_selection(self):
+        for canvas in (128, 256):
+            variants = DllmWindowGraphVariants(1023, canvas)
+            for prefixes, captured, expected in (
+                ([1022], 1, DLLM_VARLEN),
+                ([1023], 1, DLLM_FULL_WINDOW),
+                ([1023, 8192], 2, DLLM_FULL_WINDOW),
+                ([1023, 1022], 2, DLLM_VARLEN),
+                ([8192, 8192], 4, DLLM_VARLEN),
+            ):
+                batch = SimpleNamespace(
+                    batch_size=len(prefixes),
+                    input_ids=torch.zeros(len(prefixes) * canvas),
+                    forward_mode=ForwardMode.DLLM_EXTEND,
+                    seq_lens_cpu=torch.tensor(prefixes) + canvas,
+                )
+                self.assertEqual(variants.select(batch, captured), expected)
+
     def _backend(self):
-        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend = FlashAttentionDenseBackend.__new__(FlashAttentionDenseBackend)
         backend.device = "cpu"
         backend.dllm_block_size = 4
         backend.sliding_window_size = 6
@@ -55,7 +83,49 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.window_kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.cuda_graph_kv_indices = torch.zeros(64, dtype=torch.int64)
         backend.cuda_graph_window_kv_indices = torch.zeros(64, dtype=torch.int64)
+        backend._prefill_graph_metadata = {}
+        backend._decode_graph_metadata = {}
+        backend.use_sliding_window_kv_pool = False
         return backend
+
+    def test_context_replay_does_not_replace_denoise_buffers(self):
+        backend = self._backend()
+        batch = SimpleNamespace(
+            batch_size=2,
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.arange(8),
+            req_pool_indices=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([7, 15]),
+            encoder_lens=None,
+            spec_info=None,
+            forward_mode=ForwardMode.DLLM_EXTEND,
+        )
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        denoise = backend.forward_metadata
+        denoise_lengths = denoise.kv_indptr.clone()
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.max_seq_len_override = 16
+        batch.extend_prefix_lens = torch.tensor([3, 11])
+        batch.extend_seq_lens = torch.tensor([4, 4])
+        batch.extend_seq_lens_cpu = [4, 4]
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        context = backend.forward_metadata
+        self.assertEqual(context.max_extend_len, 4)
+        ptr = context.kv_indices.data_ptr()
+        self.assertNotEqual(ptr, denoise.kv_indices.data_ptr())
+        batch.extend_prefix_lens = torch.tensor([1, 8])
+        backend.init_forward_metadata_out_graph(batch)
+        self.assertEqual(ptr, backend.forward_metadata.kv_indices.data_ptr())
+        torch.testing.assert_close(
+            context.kv_indptr, torch.tensor([0, 1, 9], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            context.kv_indices[:9], torch.tensor([16, *range(32, 40)])
+        )
+        torch.testing.assert_close(denoise.kv_indptr, denoise_lengths)
+        batch.forward_mode = ForwardMode.DLLM_EXTEND
+        backend.init_forward_metadata_out_graph(batch)
+        self.assertIs(backend.forward_metadata, denoise)
 
     def test_graph_canvas_stays_bidirectional(self):
         backend = self._backend()
@@ -141,7 +211,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         )
 
 
-class TestGemma4GraphInputEmbeddings(unittest.TestCase):
+class TestGemma4GraphInputEmbeddings(CustomTestCase):
     def test_preplanned_replay_refreshes_self_conditioning(self):
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         runner.dllm_uses_input_embeds = True
@@ -178,8 +248,19 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prepared input embeddings"):
             runner.load_batch(batch)
 
+        runner.input_preparation = Gemma4Renoise.prepare_graph_inputs
+        state = torch.full((16, 7), -1.0)
+        runner.buffer_registry = Mock()
+        runner.buffer_registry.get_slot.return_value.buffer = state
+        batch.input_preparation_state = torch.ones(12, 7)
+        runner.load_batch(batch)
+        torch.testing.assert_close(state[:12], batch.input_preparation_state)
+        torch.testing.assert_close(runner.buffers.input_ids[:12], batch.input_ids)
+        self.assertEqual(torch.count_nonzero(state[12:]), 0)
+        self.assertEqual(torch.count_nonzero(runner.buffers.input_ids[12:]), 0)
 
-class TestGemma4VocabularyShards(unittest.TestCase):
+
+class TestGemma4VocabularyShards(CustomTestCase):
     def test_padded_shards_load_and_reconstruct_soft_embeddings(self):
         torch.manual_seed(123)
         config = SimpleNamespace(vocab_size=73, hidden_size=4)

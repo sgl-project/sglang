@@ -141,6 +141,7 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    requires_contiguous_current_kv = True
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -156,6 +157,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
+        self._decode_graph_metadata = {}
         from sglang.kernels.ops.attention.decode_attention import (
             _LEAN_BLOCK_M,
             _lean_decode_launch_params,
@@ -498,8 +500,10 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         kv_indices: torch.Tensor,
+        kv_indptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        kv_indptr = self.kv_indptr[: bs + 1]
+        if kv_indptr is None:
+            kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         self.kv_index_translator.fill_packed_read_stream(
             req_pool_indices=req_pool_indices[:bs],
@@ -734,6 +738,7 @@ class TritonAttnBackend(AttentionBackend):
                     lean_Op=self.cuda_graph_lean_Op,
                     lean_locks=self.cuda_graph_lean_locks,
                 )
+                self._decode_graph_metadata[bs] = self.forward_metadata
                 return
 
             self._apply_cuda_graph_metadata(
@@ -756,7 +761,9 @@ class TritonAttnBackend(AttentionBackend):
                 swa_out_cache_loc,
                 out_cache_loc_full_physical,
             )
+            self._decode_graph_metadata[bs] = self.forward_metadata
         else:
+            self.forward_metadata = self._decode_graph_metadata[bs]
             self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
@@ -1789,10 +1796,11 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
-        self.extend_attention_fwd(
+        self._forward_extend_kernel(
+            layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
+            k.contiguous() if self.requires_contiguous_current_kv else k,
+            v.contiguous() if self.requires_contiguous_current_kv else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1817,6 +1825,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
+
+    def _forward_extend_kernel(self, layer, *args, **kwargs):
+        return self.extend_attention_fwd(*args, **kwargs)
 
     def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):
         """Cumulative full sequence lengths addressing the one-shot K/V rows.
@@ -2589,6 +2600,11 @@ def update_sliding_window_buffer(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
     window_kv_start_idx = seq_lens - window_kv_lens
+    token_mapping = (
+        token_to_kv_pool.full_to_swa_index_mapping
+        if isinstance(token_to_kv_pool, SWAKVPool)
+        else None
+    )
     translated = translator.fill_packed_read_stream(
         req_pool_indices=req_pool_indices[:bs],
         seq_lens=window_kv_lens,
@@ -2597,6 +2613,7 @@ def update_sliding_window_buffer(
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
         sliding_window=translator.reads_are_translated,
+        token_mapping=token_mapping,
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]

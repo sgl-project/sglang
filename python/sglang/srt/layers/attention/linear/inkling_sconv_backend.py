@@ -665,6 +665,10 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.full_attn_backend.supports_full_cuda_graph_chunked_prefix
 
+    @property
+    def full_cuda_graph_uses_chunked_prefix(self) -> bool:
+        return self.full_attn_backend.full_cuda_graph_uses_chunked_prefix
+
     def prepare_full_cuda_graph_chunked_prefix(self, *args, **kwargs):
         return self.full_attn_backend.prepare_full_cuda_graph_chunked_prefix(
             *args, **kwargs

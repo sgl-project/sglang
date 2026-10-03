@@ -74,6 +74,61 @@ def _run_draft(kern_inputs, topk, steps, page_size, nb, kw):
 
 
 class TestSpecKvIndicesGrid(CustomTestCase):
+    def test_fused_swa_graph_replay(self):
+        from sglang.srt.layers.attention.triton_backend import (
+            update_sliding_window_buffer,
+        )
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        bs, width, window = 8, 8200, 1023
+        source = torch.arange(bs * width, device="cuda").reshape(bs, width)
+        source[:, 3] = -1
+        mapping = torch.arange(bs * width + 1, device="cuda").flip(0).contiguous()
+        mapping[-1] = -1
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator.is_translating = translator.defer_read_translate = False
+        translator.req_to_token = source
+        pool = SWAKVPool.__new__(SWAKVPool)
+        pool.full_to_swa_index_mapping = mapping
+        lengths = torch.tensor([0, 1, 511, 512, 513, 1023, 1024, 8193], device="cuda")
+        requests = torch.arange(bs, device="cuda")
+        indptr = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+        output = torch.full((bs * window + 16,), SENTINEL, device="cuda")
+
+        def call():
+            update_sliding_window_buffer(
+                indptr,
+                translator,
+                requests,
+                window,
+                lengths,
+                bs,
+                token_to_kv_pool=pool,
+                window_kv_indices=output,
+            )
+
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        for counts in ([1, 0, 4, 1024, 513, 7, 2048, 3], [0] * bs):
+            lengths.copy_(torch.tensor(counts, device="cuda"))
+            requests.copy_(requests.flip(0))
+            mapping[:-1].add_(5)
+            output.fill_(SENTINEL)
+            graph.replay()
+            expected = torch.cat(
+                [
+                    mapping[source[r, max(0, n - window) : n]]
+                    for r, n in zip(requests.tolist(), counts)
+                ]
+            )
+            torch.testing.assert_close(
+                output[: expected.numel()], expected, atol=0, rtol=0
+            )
+            self.assertTrue(torch.all(output[expected.numel() :] == SENTINEL))
+
     def test_draft_grid_equivalence(self):
         torch.manual_seed(0)
         for seqs in LENSETS:

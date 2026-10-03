@@ -253,6 +253,12 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
+    from sglang.srt.layers.attention.flashattention_dense_backend import (
+        FlashAttentionDenseBackend,
+    )
+
+    if FlashAttentionDenseBackend.supports_model(runner.model_config):
+        return FlashAttentionDenseBackend(runner)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )

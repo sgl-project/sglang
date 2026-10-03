@@ -76,6 +76,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.sliding_window_size = None
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
+    backend._decode_graph_metadata = {}
     return backend
 
 

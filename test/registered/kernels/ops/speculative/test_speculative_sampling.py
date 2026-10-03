@@ -4,6 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.speculative.row_argmax import div_argmax
+from sglang.srt.dllm.algorithm.gemma4_renoise import _sample_denoiser
 from sglang.test.ci.ci_register import register_cuda_ci
 
 if torch.version.cuda is not None:
@@ -215,6 +217,46 @@ def test_target_only_sampling_cdf_boundaries(
 
     assert predicts[0].item() == expected_token
     assert accept_token_num.item() == expected_accept_token_num
+
+
+@pytest.mark.parametrize("rows,width", [(1, 9), (13, 4097), (256, 262144)])
+@torch.inference_mode()
+def test_div_argmax_ties_nan_and_replay(rows, width):
+    torch.manual_seed(11)
+    x = torch.rand(rows, width + 3, device="cuda")[:, :width]
+    noise = torch.empty(rows, width + 7, device="cuda")[:, :width]
+    noise.exponential_()
+    x[0].zero_()
+    noise[0].fill_(1)
+    x[0, 0] = x[0, -1] = 1
+    if rows > 1:
+        x[1, 1] = x[1, -1] = float("nan")
+        x[2, 2] = x[2, -1] = float("inf")
+        x[3, 0] = noise[3, 0] = 0
+    expected = (x / noise).argmax(-1)
+    torch.testing.assert_close(div_argmax(x, noise), expected, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = div_argmax(x, noise)
+    x.fill_(-1)
+    noise.fill_(1)
+    x[:, -1] = 10
+    graph.replay()
+    torch.testing.assert_close(actual, (x / noise).argmax(-1), atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_sampling_preserves_generator_state():
+    probabilities = torch.rand(256, 262144, device="cuda").softmax(-1)
+    reference = torch.Generator(device="cuda").manual_seed(71)
+    candidate = torch.Generator(device="cuda").manual_seed(71)
+    noise = torch.empty_like(probabilities).exponential_(generator=reference)
+    expected = (probabilities / noise).argmax(-1)
+    actual = _sample_denoiser(probabilities, candidate)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        candidate.get_state(), reference.get_state(), atol=0, rtol=0
+    )
 
 
 if __name__ == "__main__":
