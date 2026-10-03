@@ -12,6 +12,7 @@ import torch
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
+    SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     msgpack_decode,
@@ -1351,6 +1352,47 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
+
+
+class TestSessionParamsValidation(CustomTestCase):
+    def test_session_params_valid(self):
+        # All None
+        SessionParams()
+        # Fully filled valid
+        SessionParams(
+            id="sid", rid="rid", offset=5, replace=True, drop_previous_output=False
+        )
+
+    def test_session_params_invalid_types(self):
+        cases = [
+            ({"id": [123]}, "session_params.id must be a string or None"),
+            ({"rid": {}}, "session_params.rid must be a string or None"),
+            ({"offset": True}, "session_params.offset must be an integer or None"),
+            ({"offset": "100"}, "session_params.offset must be an integer or None"),
+            ({"replace": 1}, "session_params.replace must be a bool or None"),
+            (
+                {"drop_previous_output": 0},
+                "session_params.drop_previous_output must be a bool or None",
+            ),
+        ]
+        for kwargs, err_msg in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(TypeError, err_msg):
+                    SessionParams(**kwargs)
+
+    def test_session_params_wraps_type_error_to_value_error(self):
+        """
+        Replicate the try-except logic inside tokenizer_manager.tokenize_generate_input
+        to verify TypeError from SessionParams construction is wrapped into ValueError.
+        """
+        from sglang.srt.managers.io_struct import SessionParams
+
+        bad_kwargs = {"id": 123}
+        with self.assertRaisesRegex(ValueError, "Invalid session_params"):
+            try:
+                session_params = SessionParams(**bad_kwargs)
+            except TypeError as e:
+                raise ValueError(f"Invalid session_params: {e}") from e
 
 
 if __name__ == "__main__":

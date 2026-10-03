@@ -1489,9 +1489,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
+            try:
+                session_params = (
+                    SessionParams(**obj.session_params) if obj.session_params else None
+                )
+            except TypeError as e:
+                raise ValueError(f"Invalid session_params field type: {e}") from e
 
             bootstrap_room = obj.bootstrap_room
             if (
