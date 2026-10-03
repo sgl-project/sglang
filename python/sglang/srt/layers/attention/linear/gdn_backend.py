@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention import gdn_fused_prefill_aiter
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -883,6 +884,90 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         return (core_attn_out, z) if return_z else core_attn_out
+
+    def try_fused_gdn_prefill(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        projected_qkvz: torch.Tensor,
+        projected_ba: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Fully-fused AITER GDN prefill, or None to fall through to the chain.
+
+        Returns the *post-norm* output and marks the model's output-norm stash
+        consumed, so the model skips its own gated RMSNorm. Falling short of the
+        contract falls back rather than raising -- a capability, not a mode. Only
+        the plain, fully-covered varlen prefill runs; MIS, target-verify,
+        tracked-conv and DP-padded batches decline.
+        """
+        stash = layer._gdn_onorm_args
+        if stash is None:
+            return None
+        if (
+            self.mis_metadata is not None
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return None
+        forward_metadata = self.forward_metadata
+        if forward_metadata.has_mamba_track_mask:
+            return None
+        # The fused kernel has no DP-padding trim; decline a padded batch so it
+        # never folds pad rows into the state or leaves the output tail unwritten.
+        if not gdn_fused_prefill_aiter.prefill_rows_match_real_tokens(
+            num_rows=projected_qkvz.shape[0],
+            global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ):
+            return None
+        norm_weight, norm_eps, conv_bias, dt_bias = stash
+
+        cache_indices = forward_metadata.mamba_cache_indices
+        cu_seqlens = forward_metadata.query_start_loc
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+        mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = mamba_cache.conv[0]
+        ssm_states = mamba_cache.temporal
+
+        ok, _ = gdn_fused_prefill_aiter.covered(
+            projected_qkvz,
+            projected_ba,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            cu_seqlens,
+            has_initial_state,
+            layer.conv_weights,
+            conv_bias,
+            layer.A_log,
+            dt_bias,
+            norm_weight,
+            layer.activation,
+            torch.float8_e4m3fn,
+        )
+        if not ok:
+            return None
+
+        normalized, _, _, quantized, scales = gdn_fused_prefill_aiter.run(
+            projected_qkvz=projected_qkvz,
+            projected_ba=projected_ba,
+            conv_state=conv_states,
+            delta_state=ssm_states,
+            cache_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            conv_weight=layer.conv_weights,
+            conv_bias=conv_bias,
+            A_log=layer.A_log,
+            dt_bias=dt_bias,
+            norm_weight=norm_weight,
+            scale=layer.head_k_dim**-0.5,
+            norm_eps=norm_eps,
+        )
+        layer._gdn_onorm_consumed = True
+        # Group-128 FP8 activations for a block-FP8 out_proj; the model uses these
+        # when its out_proj is block-FP8, else it re-quantizes the bf16 normalized.
+        layer._gdn_fp8_out = (quantized, scales)
+        return normalized
 
     def _convolve_prefill(
         self,
