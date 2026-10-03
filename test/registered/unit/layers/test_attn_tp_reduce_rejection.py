@@ -93,6 +93,8 @@ class TestAttnTpReduceRejection(CustomTestCase):
         for fields in (
             # The encoder instance forwards the tower instead.
             dict(language_only=True),
+            # Adaptive dispatch is off, so nothing is kept back for local work.
+            dict(language_only=True, enable_adaptive_dispatch_to_encoder=False),
             # Multimodal requests are rejected outright.
             dict(language_model_only=True),
             # A decode instance embeds nothing.
@@ -101,6 +103,35 @@ class TestAttnTpReduceRejection(CustomTestCase):
             with self.subTest(**fields):
                 self.publish(tp_size=4, attn_dp_size=2, **fields)
                 CLIPAttention(config)
+
+    def test_a_tower_kept_for_local_work_is_still_checked(self):
+        """Adaptive dispatch sends only some requests to the encoder instance
+        and forwards the tower for the rest, so the layout still has to hold."""
+        from sglang.srt.models.clip import CLIPAttention
+
+        config = SimpleNamespace(
+            hidden_size=16, num_attention_heads=4, attention_dropout=0.0
+        )
+        self.publish(
+            tp_size=4,
+            attn_dp_size=2,
+            language_only=True,
+            enable_adaptive_dispatch_to_encoder=True,
+        )
+        with self.assertRaisesRegex(ValueError, "CLIPAttention shards over"):
+            CLIPAttention(config)
+
+    def test_the_message_names_the_width_that_narrowed_the_group(self):
+        self.publish(tp_size=4, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, r"drop --attn-dp-size 2"):
+            reject_attn_tp_shard_with_tp_reduce(
+                "Layer", shard_tp_size=2, reduces_over_attn_tp=False
+            )
+        self.publish(tp_size=4, attn_cp_size=2)
+        with self.assertRaisesRegex(ValueError, r"drop --attn-cp-size 2"):
+            reject_attn_tp_shard_with_tp_reduce(
+                "Layer", shard_tp_size=2, reduces_over_attn_tp=False
+            )
 
     def test_a_text_layer_is_checked_on_every_worker(self):
         """The exemption belongs to towers that do not run, not to the worker:

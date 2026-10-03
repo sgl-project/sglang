@@ -472,12 +472,18 @@ def multimodal_encoder_runs_here() -> bool:
     language instance forwards it on the encoder instance, a language-model-only
     instance rejects multimodal requests, and a PD decode instance embeds nothing
     (`general_mm_embed_routine` skips decode and target-verify forwards).
+
+    Adaptive dispatch is the exception on the first of those: it keeps the
+    requests it does not send to the encoder, and forwards the tower for them.
     """
     from sglang.srt.runtime_context import get_disagg
 
     disagg = get_disagg()
+    offloaded_to_an_encoder_instance = (
+        disagg.language_only and not disagg.enable_adaptive_dispatch_to_encoder
+    )
     return not (
-        disagg.language_only
+        offloaded_to_an_encoder_instance
         or disagg.language_model_only
         or disagg.disaggregation_mode == "decode"
     )
@@ -503,12 +509,22 @@ def reject_attn_tp_shard_with_tp_reduce(
         return
     if multimodal_encoder and not multimodal_encoder_runs_here():
         return
+    # Name only the widths that are actually narrowing the group here, so the
+    # remedy is one the operator can apply.
+    parallel = get_parallel()
+    narrowed_by = []
+    if parallel.attn_dp_size > 1:
+        narrowed_by.append(f"--attn-dp-size {parallel.attn_dp_size}")
+    if parallel.attn_cp_size > 1:
+        narrowed_by.append(f"--attn-cp-size {parallel.attn_cp_size}")
+    remedy = " and ".join(f"drop {flag}" for flag in narrowed_by) or (
+        "widen the attention TP group"
+    )
     raise ValueError(
         f"{layer} shards over the attention TP group ({shard_tp_size} ranks) "
         f"but all-reduces over the full TP group ({tp_size} ranks), so it does "
-        "not support attention data parallelism or attention context "
-        "parallelism narrower than --tp-size yet. Use --attn-dp-size equal to "
-        f"--tp-size, or no attention context parallelism{hint}."
+        f"not support {' with '.join(narrowed_by) or 'this layout'} yet. "
+        f"Use --attn-dp-size equal to --tp-size, or {remedy}{hint}."
     )
 
 
