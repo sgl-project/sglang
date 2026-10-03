@@ -130,6 +130,71 @@ def _swa_alloc(allocator, need_size):
     return full_indices
 
 
+class TestSWADecodeCapacity(CustomTestCase):
+    def test_oom_preserves_capacity_and_can_retry(self):
+        for exhausted_pool in ("full", "swa"):
+            for need_sort in (False, True):
+                with self.subTest(exhausted_pool=exhausted_pool, need_sort=need_sort):
+                    allocator, _ = _build_swa_allocator(
+                        page_size=8, kv_size=24, kv_size_swa=24
+                    )
+                    prefix = _swa_alloc(allocator, 8)
+                    pools = (
+                        allocator.full_attn_allocator,
+                        allocator.swa_attn_allocator,
+                    )
+                    for pool in pools:
+                        pool.need_sort = need_sort
+                    exhausted = getattr(allocator, f"{exhausted_pool}_attn_allocator")
+                    reserved = exhausted.alloc(16)
+                    available_before = [pool.available_size() for pool in pools]
+                    mapping_before = allocator.full_to_swa_index_mapping.clone()
+                    seq_cpu = torch.tensor([9], dtype=torch.int64)
+                    seq = seq_cpu.to(allocator.device)
+
+                    for _ in range(3):
+                        self.assertIsNone(
+                            allocator.alloc_decode(seq, seq_cpu, prefix[-1:])
+                        )
+                        self.assertEqual(
+                            [pool.available_size() for pool in pools], available_before
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                allocator.full_to_swa_index_mapping, mapping_before
+                            )
+                        )
+
+                    # Releasing one page makes the same decode admissible,
+                    # including when that page is staged for a lazy merge.
+                    exhausted.free(reserved[:8])
+                    available_before = [pool.available_size() for pool in pools]
+                    decoded = allocator.alloc_decode(seq, seq_cpu, prefix[-1:])
+                    self.assertIsNotNone(decoded)
+                    self.assertEqual(decoded.tolist(), [16])
+                    self.assertEqual(
+                        allocator.translate_loc_from_full_to_swa(decoded).tolist(), [16]
+                    )
+                    self.assertEqual(
+                        [pool.available_size() for pool in pools],
+                        [size - 8 for size in available_before],
+                    )
+
+    def test_partial_page_decode_needs_no_free_pages(self):
+        allocator, _ = _build_swa_allocator(page_size=8, kv_size=8, kv_size_swa=8)
+        prefix = _swa_alloc(allocator, 8)
+        seq_cpu = torch.tensor([5], dtype=torch.int64)
+        decoded = allocator.alloc_decode(
+            seq_cpu.to(allocator.device), seq_cpu, prefix[3:4]
+        )
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.tolist(), [12])
+        self.assertEqual(
+            allocator.translate_loc_from_full_to_swa(decoded).tolist(), [12]
+        )
+        self.assertEqual(allocator.available_size(), 0)
+
+
 class TestSWA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

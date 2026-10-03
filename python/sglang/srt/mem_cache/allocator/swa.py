@@ -429,6 +429,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 seq_lens, seq_lens_cpu, last_loc
             )
 
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+        )
+        # Admit both pools before either allocator consumes pages.
+        if not self.new_pages_available(num_new_pages, num_new_pages):
+            return None
+
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
