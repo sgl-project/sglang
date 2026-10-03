@@ -17,6 +17,12 @@ from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
+try:
+    from aiter.ops.flydsl.kernels import vector
+except ImportError:
+    # Image pin acf8fdf has no kernels.vector. CombiningKind is on this dialect.
+    vector = mlir_vector
+
 _HEADS = 12
 _DIM = 128
 _LOG2E = math.log2(math.e)
@@ -26,8 +32,17 @@ _NUM_WARPS = 4
 _WARP_SIZE = 64
 _WARP_THREADS_K = 8
 _VALUES_PER_THREAD_K = 4
-_WARP_TILE_K = _WARP_THREADS_K * _VALUES_PER_THREAD_K
-_K_ITERS = _DIM // _WARP_TILE_K
+
+
+def _k_vector_tile(state_is_bf16: bool) -> tuple[int, int, int]:
+    """Per-lane K vector. BF16 SSM uses x8 so each load/store is 16 B, matching
+    gfx950 ``buffer_load/store_dwordx4`` and the FP32-pool x4 path.
+    """
+    values = 8 if state_is_bf16 else _VALUES_PER_THREAD_K
+    tile = _WARP_THREADS_K * values
+    return values, tile, _DIM // tile
+
+
 _WARP_THREADS_V = _WARP_SIZE // _WARP_THREADS_K
 _V_GROUP_TILE = _NUM_WARPS * _WARP_THREADS_V
 _V_ITERS = _DIM // _V_GROUP_TILE
@@ -35,8 +50,36 @@ _WAVES_PER_EU = 3
 
 
 @functools.cache
-def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
-    """Build the fixed gfx950 BF16 Kimi-K3 decode specialization."""
+def create_kimi_k3_kda_decode_kernel(
+    norm_eps: float,
+    lower_bound: float,
+    state_is_bf16: bool = False,
+):
+    """Build the gfx950 Kimi-K3 decode specialization.
+
+    Activations stay BF16. Recurrent math is FP32. ``state_is_bf16`` only
+    changes the SSM pool: load BF16 and ``extf`` to FP32, ``truncf`` RN on
+    store. FP32-pool kernels keep the original f32x4 transactions. BF16-pool
+    kernels use x8 K vectors so each SSM transaction is also 16 B.
+    """
+    kernel_name = (
+        "kimi_k3_kda_decode_ssmbf16_gfx950"
+        if state_is_bf16
+        else "kimi_k3_kda_decode_bf16_gfx950"
+    )
+    values_per_thread_k, warp_tile_k, k_iters = _k_vector_tile(state_is_bf16)
+
+    def _load_f32_k_vec(mem, offset):
+        # gfx950 buffer copies top out at 16 B, so FP32 x8 is two x4 loads.
+        if values_per_thread_k == 4:
+            return mem.vec_load((offset,), 4)
+        lo = mem.vec_load((offset,), 4)
+        hi = mem.vec_load((offset + fx.Int32(4),), 4)
+        return mlir_vector.ShuffleOp(
+            _to_raw(lo),
+            _to_raw(hi),
+            [0, 1, 2, 3, 4, 5, 6, 7],
+        ).result
 
     @fx.struct
     class SharedStorage:
@@ -47,7 +90,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         norm_partial: fx.Array[fx.Float32, 2, 16]
 
     @flyc.kernel(
-        name="kimi_k3_kda_decode_bf16_gfx950",
+        name=kernel_name,
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def kernel(
@@ -80,6 +123,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
     ):
         del batch_size
 
+        state_ty = T.bf16 if state_is_bf16 else T.f32
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         weight = GTensor(weight_mem, dtype=T.f32, shape=(-1,))
         conv_state = GTensor(conv_state_mem, dtype=T.bf16, shape=(-1,))
@@ -87,7 +131,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
-        state = GTensor(state_mem, dtype=T.f32, shape=(-1,))
+        state = GTensor(state_mem, dtype=state_ty, shape=(-1,))
         state_indices = GTensor(state_indices_mem, dtype=T.i32, shape=(-1,))
         output_gate = GTensor(output_gate_mem, dtype=T.bf16, shape=(-1,))
         norm_weight = GTensor(norm_weight_mem, dtype=T.bf16, shape=(-1,))
@@ -178,15 +222,16 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             fx.gpu.barrier()
 
             # Four waves split V into 32-row groups. Eight-lane subgroups
-            # reduce K; each lane issues one aligned f32x4 state transaction.
-            k_vec_start = lane_k * fx.Int32(_VALUES_PER_THREAD_K)
+            # reduce K; each lane issues one 16 B state transaction
+            # (f32x4, or bf16x8 + extf/truncf when the pool is BF16).
+            k_vec_start = lane_k * fx.Int32(values_per_thread_k)
             global_v_start = warp * fx.Int32(_WARP_THREADS_V) + lane // fx.Int32(
                 _WARP_THREADS_K
             )
-            vec_f32 = T.vec(_VALUES_PER_THREAD_K, T.f32)
-            vec_bf16 = T.vec(_VALUES_PER_THREAD_K, T.bf16)
+            vec_f32 = T.vec(values_per_thread_k, T.f32)
+            vec_bf16 = T.vec(values_per_thread_k, T.bf16)
             zero_vec = fx.full(
-                _VALUES_PER_THREAD_K,
+                values_per_thread_k,
                 0.0,
                 fx.Float32,
             )
@@ -198,8 +243,8 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             sum_k_partial = fx.Float32(0.0)
             a = fx.math.exp2(fx.Float32(A_log[head]) * fx.Float32(_LOG2E))
 
-            for ki in range_constexpr(_K_ITERS):
-                k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
+            for ki in range_constexpr(k_iters):
+                k_base = k_vec_start + fx.Int32(ki * warp_tile_k)
                 q_bf16 = fx.ptr_load(
                     q_lds + k_base,
                     result_type=vec_bf16,
@@ -233,13 +278,10 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
                 gate_bf16 = raw_g.vec_load(
                     (batch * stride_g_token + head * fx.Int32(_DIM) + k_base,),
-                    _VALUES_PER_THREAD_K,
+                    values_per_thread_k,
                 )
                 gate_f32 = gate_bf16.extf(vec_f32)
-                dt = dt_bias.vec_load(
-                    (head * fx.Int32(_DIM) + k_base,),
-                    _VALUES_PER_THREAD_K,
-                )
+                dt = _load_f32_k_vec(dt_bias, head * fx.Int32(_DIM) + k_base)
                 sigmoid_arg = (gate_f32 + dt) * a
                 gate = fx.Float32(lower_bound) / (
                     fx.Float32(1.0) + fx.math.exp2(-sigmoid_arg * fx.Float32(_LOG2E))
@@ -285,12 +327,12 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             inv_q = fx.math.rsqrt(fx.Float32(norm_q) + fx.Float32(1e-6))
             inv_k = fx.math.rsqrt(fx.Float32(norm_k) + fx.Float32(1e-6))
 
-            for ki in range_constexpr(_K_ITERS):
+            for ki in range_constexpr(k_iters):
                 q_vecs[ki] = q_vecs[ki] * fx.Float32(inv_q) * fx.Float32(_SCALE)
                 k_vecs[ki] = k_vecs[ki] * fx.Float32(inv_k)
 
             dot_kq_vec = zero_vec
-            for ki in range_constexpr(_K_ITERS):
+            for ki in range_constexpr(k_iters):
                 dot_kq_vec = mlir_vector.FMAOp(
                     k_vecs[ki],
                     q_vecs[ki],
@@ -323,22 +365,23 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             state_vecs = []
             for vi in range_constexpr(_V_ITERS):
                 global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
-                for ki in range_constexpr(_K_ITERS):
-                    k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
+                for ki in range_constexpr(k_iters):
+                    k_base = k_vec_start + fx.Int32(ki * warp_tile_k)
                     state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
-                    state_vecs.append(
-                        state.vec_load(
-                            (state_off,),
-                            _VALUES_PER_THREAD_K,
-                        )
+                    loaded = state.vec_load(
+                        (state_off,),
+                        values_per_thread_k,
                     )
+                    if state_is_bf16:
+                        loaded = loaded.extf(vec_f32)
+                    state_vecs.append(loaded)
 
             for vi in range_constexpr(_V_ITERS):
                 global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
                 sum_hk_vec = zero_vec
                 sum_hq_vec = zero_vec
-                for ki in range_constexpr(_K_ITERS):
-                    state_pos = vi * _K_ITERS + ki
+                for ki in range_constexpr(k_iters):
+                    state_pos = vi * k_iters + ki
                     decayed = state_vecs[state_pos] * decay_vecs[ki]
                     state_vecs[state_pos] = decayed
                     sum_hk_vec = mlir_vector.FMAOp(
@@ -398,19 +441,20 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                     _to_raw(v_new),
                 ).vector
 
-                for ki in range_constexpr(_K_ITERS):
-                    state_pos = vi * _K_ITERS + ki
+                for ki in range_constexpr(k_iters):
+                    state_pos = vi * k_iters + ki
                     updated = mlir_vector.FMAOp(
                         k_vecs[ki],
                         v_new_vec,
                         state_vecs[state_pos],
                     ).result
-                    k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
+                    k_base = k_vec_start + fx.Int32(ki * warp_tile_k)
                     state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
+                    stored = updated.truncf(vec_bf16) if state_is_bf16 else updated
                     state.vec_store(
                         (state_off,),
-                        updated,
-                        _VALUES_PER_THREAD_K,
+                        stored,
+                        values_per_thread_k,
                     )
 
                 if lane_k == fx.Int32(0):

@@ -1980,6 +1980,19 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 self._kda_hip_fused_decode_ready = True
+            # Fusion is opt-in. JIT unfused packed decode before graph capture.
+            from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+                warmup_packed_decode,
+            )
+
+            warmup_packed_decode(
+                num_v_heads=12,
+                head_dim=128,
+                lower_bound=(
+                    float(layer.lower_bound) if layer.lower_bound is not None else None
+                ),
+                device=f_b_weight.device,
+            )
             return
         layer = self.attn
         w = layer.conv_weights

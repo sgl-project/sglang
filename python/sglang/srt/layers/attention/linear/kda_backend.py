@@ -737,11 +737,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request.
-        if (
-            self.kernel_dispatcher.supports_packed_decode
-            and getattr(layer, "lower_bound", None) is None
-        ):
+        # Packed T=1 implements lower_bound. Do not fall through to varlen.
+        if self.kernel_dispatcher.supports_packed_decode:
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
