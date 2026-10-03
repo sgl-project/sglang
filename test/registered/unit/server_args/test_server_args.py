@@ -13,7 +13,12 @@ import msgspec
 import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
+from sglang.srt.arg_groups import (
+    parallel_hook,
+    pd_disaggregation_hook,
+    serving_hook,
+    validation_hook,
+)
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
@@ -21,6 +26,7 @@ from sglang.srt.arg_groups.attention_hook import (
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
+    finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
@@ -33,6 +39,8 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_kv4_compatibility,
+    handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -59,12 +67,14 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallel_compat,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -111,6 +121,44 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
+    def test_radix_eviction_policy_explicitness_is_preserved(self):
+        omitted = prepare_server_args(["--model-path", "dummy"])
+        separated = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
+        )
+        joined = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nradix-eviction-policy: lru\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        configured = prepare_server_args(["--config", config_path])
+
+        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
+        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
+        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
+        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -161,6 +209,105 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_megamoe_rejects_two_batch_overlap(self):
+        # The fused kernel has no dispatch/combine split for the TBO ops to call.
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                enable_two_batch_overlap=True,
+            )
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                args.resolve_once()
+
+    def test_megamoe_requires_sm90_or_sm100(self):
+        # is_hip is pinned as well: override_platform only replaces the facts it is
+        # given, so on a ROCm host these would otherwise describe a machine that is
+        # both CUDA and HIP, and megamoe's ROCm arm would answer instead.
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=False, is_hip=False
+        ):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM90"):
+                args.resolve_once()
+        with override_platform(
+            is_cuda=False, is_sm90=False, is_sm100=False, is_hip=False
+        ):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "CUDA"):
+                args.resolve_once()
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    def test_megamoe_token_budget_must_cover_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=16384,
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8192
+            ):
+                with self.assertRaisesRegex(ValueError, "required_per_rank=16384"):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                16384
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
+
+        for arch in (
+            "InternS2PreviewForConditionalGeneration",
+            "MellumForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "DeepseekV4ForCausalLM",
+        ):
+            self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
+        # MXFP4 DeepSeek-family models keep their runtime fallback.
+        self.assertFalse(mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, None))
+        # NVFP4 experts are repacked at load: every model is checked.
+        self.assertTrue(
+            mega_moe_needs_token_budget(
+                "DeepseekV3ForCausalLM", {"quant_algo": "NVFP4"}, None
+            )
+        )
+        self.assertTrue(
+            mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, "modelopt_fp4")
+        )
+
+    def test_megamoe_decode_tokens_per_rank_follows_graph_bs_and_draft_tokens(self):
+        # cuda_graph_config only exists on a GPU host; use a stand-in view.
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_decode_tokens_per_rank
+
+        def view(max_bs, algorithm=None, draft_tokens=None, cg=True):
+            return SimpleNamespace(
+                cuda_graph_config=(
+                    SimpleNamespace(decode=SimpleNamespace(max_bs=max_bs))
+                    if cg
+                    else None
+                ),
+                speculative_algorithm=algorithm,
+                speculative_num_draft_tokens=draft_tokens,
+            )
+
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, "EAGLE", 4)), 1024)
+        # Draft tokens only count under a speculative algorithm.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
+
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
@@ -185,6 +332,38 @@ class TestPrepareServerArgs(CustomTestCase):
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+
+    def test_sampling_mask_max_tokens(self):
+        self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
+        self.assertEqual(
+            ServerArgs(
+                model_path="dummy", sampling_mask_max_tokens=8192
+            ).sampling_mask_max_tokens,
+            8192,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "--sampling-mask-max-tokens must be positive"
+        ):
+            prepare_server_args(
+                ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
+            ).resolve_once()
+
+    def test_legacy_sampling_mask_env_requires_migration(self):
+        """Legacy configuration must not silently disable PD sampling masks."""
+        for value in ("0", "128", "invalid", ""):
+            for enabled in (False, True):
+                with (
+                    self.subTest(value=value, enabled=enabled),
+                    envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.override(value),
+                    envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.*"
+                        "Unset it.*SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1.*"
+                        "--sampling-mask-max-tokens.*prefill and decode",
+                    ),
+                ):
+                    ServerArgs(model_path="dummy").resolve_once()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -398,31 +577,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("4 tokenizer worker", output)
 
     @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
+    def test_cuda_ipc_rejects_multi_node(self):
+        """CUDA IPC handles are node-local, so an explicit cuda_ipc on a
+        multi-node layout must be refused at resolution rather than boot a
+        server whose second node can never open the pool."""
         server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
         )
 
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
+        with self.assertRaisesRegex(ValueError, "cuda_ipc only supports a single node"):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
@@ -635,14 +798,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
-    def test_cuda_vmm_rejects_rust_server(self):
+    def test_cuda_vmm_allows_rust_server(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with (
+            patch.dict(os.environ, {}, clear=False),
             envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
         ):
             handle_multimodal_feature_transport(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
+        )
 
     @override_platform(is_cuda=True)
     def test_cuda_vmm_rejects_pipeline_parallelism(self):
@@ -688,6 +855,233 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestKV4Compatibility(unittest.TestCase):
+    def setUp(self):
+        self._use_mla_backend_patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+            return_value=False,
+        )
+        self._use_mla_backend_patcher.start()
+        self.addCleanup(self._use_mla_backend_patcher.stop)
+
+    @staticmethod
+    def _make_nvfp4_args(**overrides):
+        return ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            attention_backend="trtllm_mha",
+            **overrides,
+        )
+
+    @staticmethod
+    def _make_unrouted_nvfp4_args(**overrides):
+        return ServerArgs(model_path="dummy", kv_cache_dtype="nvfp4", **overrides)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_selects_native_backends_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_selects_fp8_prefill_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="fp8_e4m3")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_auto_defaults_to_native_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "nvfp4"
+        )
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_auto_preserves_fp8_prefill_recipe(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="trtllm_mha",
+        )
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "fp8_e4m3"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dequant_dtype_auto_defaults_to_fp8_on_sm120(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "fp8_e4m3"
+        )
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dequant_dtype_rejects_native_prefill_off_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_rejects_conflicting_prefill_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dequant_dtype="nvfp4",
+            prefill_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "Remove the backend option"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_rejects_conflicting_decode_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dequant_dtype="fp8_e4m3",
+            decode_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "NVFP4 decode requires"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dequant_dtype_rejects_non_nvfp4_storage(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            prefill_kv_cache_dequant_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
+        for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+            for prefill_backend, decode_backend in (
+                (None, None),
+                ("flashinfer", "trtllm_mha"),
+            ):
+                for speculative_attention_mode in ("prefill", "decode"):
+                    with self.subTest(
+                        algorithm=algorithm,
+                        prefill_backend=prefill_backend,
+                        decode_backend=decode_backend,
+                        speculative_attention_mode=speculative_attention_mode,
+                    ):
+                        args = self._make_nvfp4_args(
+                            prefill_attention_backend=prefill_backend,
+                            decode_attention_backend=decode_backend,
+                            speculative_algorithm=algorithm,
+                            speculative_eagle_topk=1,
+                            speculative_attention_mode=speculative_attention_mode,
+                        )
+                        handle_kv4_compatibility(args)
+                        expected_mode = (
+                            "decode"
+                            if prefill_backend == "flashinfer"
+                            and speculative_attention_mode == "prefill"
+                            else speculative_attention_mode
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "speculative_attention_mode"),
+                            expected_mode,
+                        )
+                        self.assertEqual(
+                            resolution_result(
+                                args, "speculative_draft_attention_backend"
+                            ),
+                            "trtllm_mha",
+                        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_unvalidated_spec_algorithms(self):
+        for algorithm in ("STANDALONE", "FROZEN_KV_MTP", "CUSTOM_SPEC"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "supports EAGLE"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_non_native_draft_backend(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_draft_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "physical NVFP4 KV layout"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_ngram_needs_no_draft_backend(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=1,
+        )
+        handle_kv4_compatibility(args)
+        self.assertIsNone(
+            resolution_result(args, "speculative_draft_attention_backend")
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_branched_ngram(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=2,
+        )
+        with self.assertRaisesRegex(ValueError, "speculative-ngram-max-bfs-breadth=1"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_prefix_commit_spec_algorithms(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, algorithm):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_sm120_xqa_keeps_existing_speculative_support(self):
+        args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_allows_monolithic_non_speculative_inference(self):
+        args = self._make_nvfp4_args()
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_host_tiered_cache(self):
+        for option in ("enable_hierarchical_cache", "enable_lmcache"):
+            with self.subTest(option=option):
+                args = self._make_nvfp4_args(**{option: True})
+                with self.assertRaisesRegex(ValueError, "host pools"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_pd_disaggregation(self):
+        args = self._make_nvfp4_args(disaggregation_mode="decode")
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_nvfp4_rejects_unified_memory(self):
+        args = self._make_nvfp4_args(enable_unified_memory=True)
+        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            handle_kv4_compatibility(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -742,7 +1136,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+            ValueError, "mooncake, nixl, ascend, or fake for synthetic benchmarking"
         ):
             handle_pd_disaggregation(server_args)
 
@@ -753,28 +1147,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dcp_size=4,
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
-
-    def test_pd_decode_dcp_rejects_radix_cache(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
-            handle_pd_disaggregation(server_args)
-
-    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            enable_hierarchical_cache=True,
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
-            handle_pd_disaggregation(server_args)
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
@@ -1093,6 +1465,7 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
         server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v32"),
             is_multimodal=False,
         )
 
@@ -1150,8 +1523,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             moe_a2a_backend="flashinfer",
             moe_runner_backend=runner_backend,
             flashinfer_a2a_dispatch_type=dispatch_type,
-            enable_dp_attention=True,
-            dp_size=4,
+            attn_dp_size=4,
             tp_size=4,
         )
         server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
@@ -1305,8 +1677,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             quantization=quantization,
             moe_a2a_backend="flashinfer_megamoe",
             moe_runner_backend="flashinfer_megamoe",
-            enable_dp_attention=True,
-            dp_size=4,
+            attn_dp_size=4,
             tp_size=4,
         )
         server_args._model_config = SimpleNamespace(
@@ -1393,7 +1764,6 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
 
         port_args = PortArgs.init_new(server_args)
 
@@ -1408,7 +1778,6 @@ class TestPortArgs(unittest.TestCase):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         server_args.decoupled_spec_role = "verifier"
         server_args.decoupled_spec_bind_endpoint = "ipc:///tmp/v"
         server_args.decoupled_spec_connect_endpoints = ["ipc:///tmp/d"]
@@ -1431,7 +1800,6 @@ class TestPortArgs(unittest.TestCase):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         # decoupled_spec_role defaults to "null"
 
         port_args = PortArgs.init_new(server_args)
@@ -1441,7 +1809,6 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_decoupled_role_requires_endpoints(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         server_args.decoupled_spec_role = "drafter"
         # endpoints intentionally left as their None defaults
 
@@ -1453,7 +1820,7 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 1
         server_args.dist_init_addr = None
 
@@ -1470,7 +1837,7 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 4
         server_args.nnodes = 1
         server_args.dist_init_addr = "192.168.1.1:25000"
 
@@ -1488,7 +1855,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:25000"
 
@@ -1506,7 +1873,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1"
 
@@ -1520,7 +1887,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
 
@@ -1637,7 +2004,53 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
 
-class TestHiCacheArgs(unittest.TestCase):
+class TestHiCacheArgs(CustomTestCase):
+    def test_host_receive_speculative_uses_shared_retraction_pool(self):
+        """Speculation must still resolve host receive to the shared host pool."""
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_host_receive_threshold=0.8,
+                    speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(args)
+                self.assertEqual(
+                    resolution_result(args, "disaggregation_decode_retraction_backup"),
+                    "host_pool",
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
+
+    def test_linker_mla_dedup_requires_mooncake_linker(self):
+        for enabled, linker, backend in (
+            (False, False, "mooncake"),
+            (True, True, "mooncake"),
+            (True, False, "mooncake"),
+            (True, True, "mori"),
+        ):
+            with self.subTest(enabled=enabled, linker=linker, backend=backend):
+                args = self._make_args(
+                    enable_linker_mla_dedup=enabled,
+                    enable_unified_cache_external_linker=linker,
+                    unified_cache_external_linker_backend=backend,
+                )
+                if enabled and (not linker or backend != "mooncake"):
+                    with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
@@ -1675,6 +2088,48 @@ class TestHiCacheArgs(unittest.TestCase):
             )
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
+
+    def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
+        common = {
+            "enable_hierarchical_cache": True,
+            "disaggregation_mode": "prefill",
+            "optimistic_prefill_attempts": 3,
+        }
+        cases = [
+            ({"hicache_write_policy": "write_back"}, 3),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through",
+                },
+                3,
+            ),
+            ({"hicache_write_policy": "write_through"}, 3),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "cache",
+                    "hicache_write_policy": "write_through",
+                },
+                0,
+            ),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through_selective",
+                },
+                0,
+            ),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(model_path="dummy", **common, **overrides)
+                serving_hook.handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
@@ -2059,6 +2514,127 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestPipelineParallelCompat(CustomTestCase):
+    """Features supported with `pipeline-parallel-size > 1`."""
+
+    @staticmethod
+    def _cfg(**overrides):
+        cfg = dict(
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="prefill",
+            min_free_slots_delay=None,
+        )
+        cfg.update(overrides)
+        return SimpleNamespace(**cfg)
+
+    def test_overlap_schedule_must_be_off(self):
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_no_speculative_decoding_is_fine(self):
+        check_pipeline_parallel_compat(self._cfg())
+
+    def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+
+    def test_dspark_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DSPARK", disaggregation_mode=mode
+                        )
+                    )
+
+    def test_dspark_rejects_eagle_pp_relay(self):
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="DSPARK")
+                )
+
+    def test_eagle_is_allowed_on_prefill(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+
+    def test_eagle_is_rejected_outside_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(disaggregation_mode=mode):
+                with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="EAGLE", disaggregation_mode=mode
+                        )
+                    )
+
+    def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
+        cfg = self._cfg(
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="null",
+            speculative_adaptive=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
+        )
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            check_pipeline_parallel_compat(cfg)
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+
+    def test_nextn_resolves_to_eagle_and_is_allowed(self):
+        """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
+        validation hook runs, so the check only ever sees the resolved name."""
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="eagle"))
+
+    def test_non_eagle_speculative_algorithms_are_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
+
+    def test_multi_layer_eagle_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True)
+            )
+
+    def test_min_free_slots_delay_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "min-free-slots-delay"):
+            check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
+
+
+class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
+    @staticmethod
+    def _make_args(max_context_size, model_context_len=4096, page_size=64):
+        args = ServerArgs(
+            model_path="dummy",
+            page_size=page_size,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.BREAKABLE,
+                    max_context_size=max_context_size,
+                )
+            ),
+        )
+        args._model_config = SimpleNamespace(context_len=model_context_len)
+        return args
+
+    def test_rejects_invalid_values_during_resolution(self):
+        cases = (
+            (0, "positive integer"),
+            (-1, "positive integer"),
+            (4097, "model context length"),
+        )
+        for max_context_size, expected_error in cases:
+            with self.subTest(max_context_size=max_context_size):
+                args = self._make_args(max_context_size)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    finalize_cuda_graph_prefill_max_context(args)
+
+
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
         cases = (
@@ -2102,11 +2678,22 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
-                with patch(
-                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
-                    return_value=False,
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                        return_value=False,
+                    ),
+                    patch(
+                        # `handle_gpu_memory_settings` computes `gpu_mem` itself
+                        # now (`get_device_memory_capacity(cfg.device)`),
+                        # imported at module scope into `memory_hook` -- patch
+                        # the name where it is looked up, not its origin
+                        # module.
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=None,
+                    ),
                 ):
-                    handle_gpu_memory_settings(args, gpu_mem=None)
+                    handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
@@ -2471,15 +3058,14 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_deterministic_inference_rejected(self):
+    def test_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             enable_deterministic_inference=True,
         )
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
-    def test_rl_on_policy_deterministic_inference_rejected(self):
+    def test_rl_on_policy_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
@@ -2492,8 +3078,7 @@ class TestDeepEPv2Args(CustomTestCase):
             ),
         ):
             handle_deterministic_inference(args)
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
     def test_deterministic_inference_does_not_affect_legacy_deepep(self):
         args = self._args(
@@ -2659,8 +3244,7 @@ class TestDeepEPv2Args(CustomTestCase):
             disaggregation_mode="decode",
             max_running_requests=256,
             tp_size=8,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             validate_deepep_v2_dispatch_token_budget(args)
@@ -2671,7 +3255,6 @@ class TestDeepEPv2Args(CustomTestCase):
             max_running_requests=256,
             tp_size=8,
             dp_size=1,
-            enable_dp_attention=False,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             with self.assertRaisesRegex(ValueError, "decode CUDA graph"):
@@ -2692,8 +3275,7 @@ class TestDeepEPv2Args(CustomTestCase):
             speculative_algorithm="EAGLE",
             speculative_num_draft_tokens=8,
             max_running_requests=256,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             with self.assertRaisesRegex(ValueError, "tokens/request=8"):
@@ -2706,8 +3288,7 @@ class TestDeepEPv2Args(CustomTestCase):
             speculative_num_draft_tokens=4,
             speculative_adaptive=True,
             max_running_requests=128,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with patch(
             "sglang.srt.arg_groups.moe_hook.max_speculative_num_draft_tokens",
@@ -2911,6 +3492,14 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             handle_deprecated_args(sa)
 
+    def test_sidecar_rejects_rust_server_lifecycle(self):
+        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "does not run the Python sidecar"),
+        ):
+            handle_deprecated_args(sa)
+
     def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
         main = MagicMock()
 
@@ -2995,6 +3584,25 @@ class TestGrpcServerArgs(CustomTestCase):
             with self.assertRaises(ValueError):
                 handle_deprecated_args(sa)
 
+    def test_grpc_response_timeout(self):
+        parser = self._sidecar_parser()
+        for value in (300, 1800, 0, -1):
+            with self.subTest(timeout=value):
+                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                if value != 300:
+                    argv += ["--grpc-response-timeout-secs", str(value)]
+                sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+                if value <= 0:
+                    with self.assertRaisesRegex(
+                        ValueError, "grpc-response-timeout-secs"
+                    ):
+                        handle_deprecated_args(sa)
+                else:
+                    handle_deprecated_args(sa)
+                    self.assertEqual(
+                        resolution_result(sa, "grpc_response_timeout_secs"), value
+                    )
+
     def test_start_server_call_site_matches_native_signature(self):
         """Regression for the startup blocker: the native start_server binding
         only accepts (host, port, runtime_handle, worker_threads, ...). The
@@ -3006,7 +3614,10 @@ class TestGrpcServerArgs(CustomTestCase):
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
         override = get_context().override_server_args(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+            host="127.0.0.1",
+            grpc_port=50051,
+            grpc_worker_threads=4,
+            grpc_response_timeout_secs=1800,
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3031,9 +3642,17 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
@@ -3043,7 +3662,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
     is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
     all_gatherv / reduce_scatterv with the other ubatch's compute), which
-    requires --enable-dp-attention. This replaced the removed opt-in
+    requires attention DP (--attn-dp-size). This replaced the removed opt-in
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
@@ -3053,26 +3672,25 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         args.enable_two_batch_overlap = True
         args.moe_a2a_backend = "none"
-        args.enable_dp_attention = False
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
 
     def test_no_a2a_without_dp_attention_raises(self):
-        args = self._args(enable_dp_attention=False)
-        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+        args = self._args()
+        with self.assertRaisesRegex(ValueError, "attn-dp-size"):
             check_two_batch_overlap(args)
 
     def test_no_a2a_with_dp_attention_ok(self):
-        # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
+        # DP TBO path is valid: --attn-dp-size + --enable-two-batch-overlap
         # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
-        args = self._args(enable_dp_attention=True)
+        args = self._args(attn_dp_size=2)
         check_two_batch_overlap(args)
 
     def test_ep_a2a_backend_ok_without_dp_attention(self):
         # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
         # require dp-attention there.
-        args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
+        args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
 
 
@@ -3319,6 +3937,170 @@ class TestNoneMeansUnset(CustomTestCase):
             model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
         )
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
+
+
+class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
+    """The graph-captured TP LM-head all-to-all must not run with NCCL's
+    graph buffer registration: registered graph-pool temporaries deadlock the
+    exchange under DP-rank ramps."""
+
+    def _resolve(self, **kwargs):
+        # The handler reads the DP-adjusted prefill knobs the pipeline would
+        # have settled by then; the dummy-model pipeline itself returns early.
+        server_args = ServerArgs(
+            model_path="dummy",
+            attn_dp_size=2,
+            tp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+            **kwargs,
+        )
+        parallel_hook.handle_data_parallelism(server_args)
+        return server_args
+
+    def test_pure_dp_decode_node_disables_nccl_graph_register(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(disaggregation_mode="decode")
+            self.assertTrue(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_explicit_nccl_graph_register_is_kept(self):
+        with patch.dict(os.environ, {"NCCL_GRAPH_REGISTER": "1"}, clear=False):
+            with self.assertLogs(parallel_hook.logger, level="WARNING") as logs:
+                self._resolve(disaggregation_mode="decode")
+            self.assertEqual(os.environ["NCCL_GRAPH_REGISTER"], "1")
+            self.assertIn("NCCL_GRAPH_REGISTER=1", "\n".join(logs.output))
+
+    def test_without_all_to_all_env_is_untouched(self):
+        # Unified serving keeps the all-to-all off by default, and a decode
+        # node with the DP LM head never takes the all-to-all.
+        for kwargs in (
+            {},
+            {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
+        ):
+            with self.subTest(**kwargs), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NCCL_GRAPH_REGISTER", None)
+                server_args = self._resolve(**kwargs)
+                self.assertFalse(
+                    resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+                )
+                self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
+class TestDcpCommBackendDefault(CustomTestCase):
+    def _resolved(self, **fields):
+        args = ServerArgs(model_path="dummy", tp_size=8, **fields)
+        parallel_hook.handle_decode_context_parallelism(args)
+        return resolution_result(args, "dcp_comm_backend")
+
+    def test_no_dcp_is_ag_rs(self):
+        self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False)
+    def test_a5_npu_supports_dcp(self):
+        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_where_supported(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_a2a_on_cuda_without_mnnvl(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "a2a")
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_ag_rs_off_cuda(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_value_wins(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(
+                self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
+            )
+
+
+class TestParserChoices(CustomTestCase):
+    """The choices come from dependency-free name lists, but `cli/serve.py`
+    loads plugins before parsing, so a plugin's parser must still be accepted."""
+
+    def test_a_plugin_registered_parser_is_accepted(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        ReasoningParser.DetectorMap["plugin-reasoning"] = object
+        FunctionCallParser.ToolCallParserEnum["plugin-toolcall"] = object
+        try:
+            parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args = parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy-model",
+                    "--reasoning-parser",
+                    "plugin-reasoning",
+                    "--tool-call-parser",
+                    "plugin-toolcall",
+                ]
+            )
+        finally:
+            del ReasoningParser.DetectorMap["plugin-reasoning"]
+            del FunctionCallParser.ToolCallParserEnum["plugin-toolcall"]
+        self.assertEqual(args.reasoning_parser, "plugin-reasoning")
+        self.assertEqual(args.tool_call_parser, "plugin-toolcall")
+
+    def test_name_lists_are_used_when_the_registries_are_not_imported(self):
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        with patch.dict(server_args_module.sys.modules):
+            server_args_module.sys.modules.pop(
+                "sglang.srt.parser.reasoning_parser", None
+            )
+            server_args_module.sys.modules.pop(
+                "sglang.srt.function_call.function_call_parser", None
+            )
+            self.assertEqual(
+                server_args_module._reasoning_parser_choices(),
+                list(REASONING_PARSER_NAMES),
+            )
+            self.assertEqual(
+                server_args_module._tool_call_parser_choices(),
+                list(TOOL_CALL_PARSER_NAMES),
+            )
+
+
+class TestLazyReexports(CustomTestCase):
+    def test_the_names_that_lost_their_eager_import_are_still_attributes(self):
+        # Out-of-tree code reaches these through `sglang.srt.server_args`; they
+        # now resolve through the module __getattr__ instead of a top import.
+        from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        self.assertIs(server_args_module.FunctionCallParser, FunctionCallParser)
+        self.assertIs(server_args_module.ReasoningParser, ReasoningParser)
+        self.assertIs(server_args_module.RealKvHashMode, RealKvHashMode)
+
+    def test_an_unknown_attribute_still_raises(self):
+        with self.assertRaises(AttributeError):
+            server_args_module.NotAThing
 
 
 if __name__ == "__main__":

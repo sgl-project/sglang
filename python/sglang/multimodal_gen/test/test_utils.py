@@ -40,12 +40,12 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "4ce5eeb9606e378478b2d0964d83e960af4e88cf"
+SGL_TEST_FILES_CI_DATA_REVISION = "dbb70135da54b1f2b172886b28e813d2bcdd16c1"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "7df858ead07940ff4d9489230fa9f040dd186789"
+    SGL_TEST_FILES_CI_DATA_REVISION = "609c4cef31864d75dbd11fe3c26b8ae09469204d"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -80,6 +80,7 @@ CONSISTENCY_THRESHOLD_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "intel_xpu_b60": "intel_xpu_b60.json",
 }
 CONSISTENCY_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -91,6 +92,7 @@ CONSISTENCY_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "intelxpub60": "intel_xpu_b60",
 }
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
@@ -171,6 +173,7 @@ DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
 
 # Qwen image generation models
 DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
+DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2.1"
 DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
 DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
 DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"
@@ -903,6 +906,8 @@ def get_consistency_platform() -> str:
         return "5090"
     if current_platform.is_blackwell():
         return "b200"
+    if current_platform.is_xpu():
+        return "intel_xpu_b60"
     return "h100"
 
 

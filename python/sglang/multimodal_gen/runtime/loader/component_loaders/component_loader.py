@@ -397,6 +397,12 @@ class ComponentLoader(ABC):
             ComponentAttentionBackendNotAppliedError,
             ComponentCheckpointUnsupportedError,
             ComponentResidencyError,
+            # the native fallback answers "there is no customized implementation
+            # for this architecture"; a checkpoint that cannot be read is a
+            # different failure and the fallback cannot read it either, so let
+            # the original error name the file instead of reporting it as a
+            # missing implementation
+            OSError,
         ):
             raise
         except Exception as e:
@@ -933,7 +939,7 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    component_names = ["tokenizer", "text_tokenizer"]
+    component_names = ["tokenizer", "text_tokenizer", "t5_tokenizer"]
     expected_library = "transformers"
 
     def load_customized(
