@@ -3,7 +3,7 @@ from array import array
 from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from weakref import WeakKeyDictionary
 
 import torch
@@ -13,18 +13,21 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -697,6 +700,70 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_pd_decode_abort_held_rebootstrap_requests(self):
+        for abort_all in (False, True):
+            with self.subTest(abort_all=abort_all):
+                scheduler = self._new_scheduler()
+                scheduler.disaggregation_mode = DisaggregationMode.DECODE
+                scheduler._engine_paused = True
+                scheduler.mm_receiver = None
+                scheduler.dllm_config = None
+                scheduler.grammar_manager = MagicMock()
+                scheduler.beam_coordinator = MagicMock()
+                scheduler.ipc_channels = MagicMock()
+                scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+                prealloc = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                prealloc.queue = []
+                prealloc.retracted_queue = []
+                prealloc.held_rebootstrap_reqs = []
+                prealloc.add = MagicMock()
+                scheduler.disagg_decode_prealloc_queue = prealloc
+
+                # Held requests have already released their KV during retraction.
+                reqs = [self._make_req(rid) for rid in ("abort-0", "keep", "abort-1")]
+                for req in reqs:
+                    req.reset_for_retract()
+                    prealloc.hold_rebootstrap(req)
+                aborted = reqs if abort_all else [reqs[0], reqs[2]]
+                remaining = [] if abort_all else [reqs[1]]
+                reason = {"type": "abort", "message": "Cancelled while paused"}
+                abort_req = AbortReq(
+                    rid="abort-", abort_all=abort_all, finished_reason=reason
+                )
+
+                with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+                    scheduler.abort_request(abort_req)
+                    scheduler.abort_request(abort_req)
+
+                self.assertEqual(prealloc.held_rebootstrap_reqs, remaining)
+                release.assert_not_called()
+                self.assertEqual(
+                    scheduler.tree_cache.finish.call_args_list,
+                    [
+                        call(req.cache_request_handle, CacheRequestOutcome.ABORT)
+                        for req in aborted
+                    ],
+                )
+                self.assertEqual(
+                    scheduler.beam_coordinator.retire_group.call_args_list,
+                    [call(req) for req in aborted],
+                )
+                outputs = (
+                    scheduler.ipc_channels.send_to_tokenizer.send_output.call_args_list
+                )
+                self.assertEqual([output.args[1] for output in outputs], aborted)
+                for output in outputs:
+                    self.assertEqual(output.args[0].finished_reason, reason)
+
+                scheduler.continue_generation(
+                    ContinueGenerationReqInput(torch_empty_cache=False)
+                )
+                self.assertEqual(prealloc.held_rebootstrap_reqs, [])
+                self.assertEqual(
+                    prealloc.add.call_args_list,
+                    [call(req, is_rebootstrap=True) for req in remaining],
+                )
 
 
 if __name__ == "__main__":

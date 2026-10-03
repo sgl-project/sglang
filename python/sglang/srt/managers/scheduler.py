@@ -5376,6 +5376,21 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # A retract-mode pause has already released these requests' KV.
+            # Remove them before resume can enqueue another prefill bootstrap.
+            remaining_held = []
+            for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    self._release_aborted_request(req)
+                    self.beam_coordinator.retire_group(req)
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        _make_abort_req(req, finished_reason=recv_req.finished_reason),
+                        req,
+                    )
+                else:
+                    remaining_held.append(req)
+            self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = remaining_held
+
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
