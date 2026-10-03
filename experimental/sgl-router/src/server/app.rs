@@ -206,6 +206,24 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/v1/messages",
+            post(crate::server::routes::messages::messages)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413))
+                .layer(middleware::from_fn(
+                    crate::server::routes::messages::envelope_413,
+                )),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::server::routes::messages::count_tokens)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413))
+                .layer(middleware::from_fn(
+                    crate::server::routes::messages::envelope_413,
+                )),
+        )
+        .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
