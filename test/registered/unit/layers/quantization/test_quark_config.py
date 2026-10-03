@@ -399,6 +399,85 @@ class TestQuarkPerLayerBlockFp8(CustomTestCase):
         self.assertEqual(matched["weight"]["dtype"], "fp4")
 
 
+class TestDeepseekV4QuarkMapping(CustomTestCase):
+    """amd/DeepSeek-V4-*-MXFP4 layout: MXFP4 experts everywhere, but the MTP
+    block keeps FP8-block shared experts; specs are keyed by checkpoint names."""
+
+    _HF_CONFIG = SimpleNamespace(quantization_config={"quant_method": "quark"})
+
+    _FP8 = TestQuarkPerLayerBlockFp8._BLOCK_FP8_CONFIG
+    _MXFP4 = {
+        "weight": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": False,
+            "scale_format": "e8m0",
+        },
+        "input_tensors": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": True,
+            "scale_format": "e8m0",
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+    def _config_for(self, model_cls) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "layer_quant_config": {
+                "layers.0.attn.wq_a": deepcopy(self._FP8),
+                "layers.0.attn.wkv": deepcopy(self._FP8),
+                **{
+                    f"mtp.0.ffn.shared_experts.w{i}": deepcopy(self._FP8)
+                    for i in (1, 2, 3)
+                },
+                **{
+                    f"mtp.0.ffn.experts.{e}.w{i}": deepcopy(self._MXFP4)
+                    for e in range(2)
+                    for i in (1, 2, 3)
+                },
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": deepcopy(self._MXFP4),
+        }
+        config.exclude_layers = []
+        config.kv_cache_group = []
+        config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        config.excluded_fp8_config = None
+        config.is_prequantized = True
+        config.dequantization_config = None
+        config._online_quantized_layers = set()
+        config.apply_weight_name_mapper(
+            model_cls.get_hf_to_sglang_mapper(self._HF_CONFIG)
+        )
+        return config
+
+    def test_only_draft_vetoes_fusion_on_fp8_mtp_shared_experts(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
+
+        self.assertTrue(
+            self._config_for(DeepseekV4ForCausalLM).can_fuse_shared_expert()
+        )
+        self.assertFalse(
+            self._config_for(DeepseekV4ForCausalLMNextN).can_fuse_shared_expert()
+        )
+
+    def test_fused_wqkv_a_takes_the_wq_a_block_fp8_spec(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        config = self._config_for(DeepseekV4ForCausalLM)
+        layer = LinearBase.__new__(LinearBase)
+
+        method = config.get_quant_method(layer, "model.layers.0.self_attn.wqkv_a")
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+
+
 class _Runner:
     """Records the quant_info apply_weights() hands to the runner."""
 
