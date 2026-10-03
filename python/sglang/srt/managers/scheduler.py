@@ -2044,11 +2044,26 @@ class Scheduler(
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
+        # A MIXED step runs no verify(), so the grammar barrier never resolves the
+        # pending result for it, and spec batches do not delay their sampling
+        # (launch_batch_sample_if_needed is non-spec only). Its running requests'
+        # plain one-token decode would be masked by a grammar FSM one step behind:
+        # a JSON request that just emitted '{' may emit '{"' next, and
+        # accept_token then aborts it. Resolve the pending result first whenever
+        # a mixed step carries a grammar.
+        need_grammar_sync = need_grammar_sync or bool(
+            batch
+            and not batch.spec_algorithm.is_none()
+            and batch.has_grammar
+            and batch.forward_mode.is_mixed()
+            and len(self.result_queue) > 0
+        )
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
         # whatever result is still pending in the queue — including the
-        # extend->decode boundary — so no grammar-specific overlap disable is needed.
+        # extend->decode boundary — so decode steps need no grammar-specific overlap
+        # disable. Mixed steps, which run no verify(), are covered above.
         return disable_overlap_for_batch or need_grammar_sync
 
     def _advance_pending_grammar(self):
