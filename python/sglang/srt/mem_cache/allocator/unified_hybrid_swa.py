@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Hashable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -502,11 +502,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         The static composite allocates the two sides independently and records
         a full->swa index mapping. That is not representable here: the two
         sides SHARE one virtual id space (a virtual page names a full-physical
-        page and, if bound, a swa-physical one), which is why
-        `set_full_to_swa_mapping` is a no-op on this allocator and
-        `translate_loc_from_full_to_swa` derives the swa id from the virtual id
-        instead of a table. Running the static body would call `alloc_extend`
-        on the swa sub-allocator, which asserts it is not the id owner.
+        page and, if bound, a swa-physical one). Load-back installs that binding
+        through `set_full_to_swa_mapping`, and `translate_loc_from_full_to_swa`
+        resolves the SWA kernel-facing id from the shared virtual id. Running the
+        static body would call `alloc_extend` on the swa sub-allocator, which
+        asserts it is not the id owner.
 
         The tail is expressed by binding swa for the TAIL's virtual pages only.
         A new page left unbound has no swa-physical page, which reads as the
@@ -678,8 +678,12 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """Binding load-back rows already updates the shared SWA v2p mapping."""
-        return
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
@@ -796,6 +800,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 
     @abstractmethod
     def _ask_float_for_room(self, need_tokens: int) -> None: ...
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
 
 
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
@@ -1204,7 +1212,10 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
-            tree_cache.evict_for_alloc(
+            # The shared-byte plan returns cumulative eviction quotas.
+            # Per-component capacity targets can count the same shared bytes
+            # independently and stop before the joint allocation fits.
+            tree_cache.evict(
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.

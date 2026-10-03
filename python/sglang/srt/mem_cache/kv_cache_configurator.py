@@ -2173,6 +2173,7 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
+                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                 uses_unified_virtual_ids = isinstance(
                     swa_allocator, UnifiedSWAAllocatorBase
                 )
@@ -2193,7 +2194,6 @@ class KVCacheConfigurator:
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
                 elif not uses_unified_virtual_ids:
-                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
