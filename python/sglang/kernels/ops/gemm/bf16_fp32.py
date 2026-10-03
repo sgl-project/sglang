@@ -105,8 +105,35 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
+@functools.cache
+def _aiter_tuned_gemm():
+    try:
+        from aiter.tuned_gemm import get_GEMM_A16W16_config, tgemm
+    except ImportError:
+        return None
+    return get_GEMM_A16W16_config, tgemm
+
+
+def _linear_bf16_fp32_aiter(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
+    """ROCm: the aiter FlyDSL fp32-out GEMM for shapes aiter has tuned for it
+    (e.g. the DSv4 compressor wkv_gate at decode sizes); None otherwise."""
+    fns = _aiter_tuned_gemm()
+    if fns is None or x.dim() != 2:
+        return None
+    get_config, tgemm = fns
+    m, k = x.shape
+    config = get_config(m, y.shape[0], k, False, "torch.bfloat16", "torch.float32")
+    if config is None or config.get("libtype") != "flydsl":
+        return None
+    return tgemm.mm(x, y, otype=torch.float32)
+
+
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+        if torch.version.hip:
+            output = _linear_bf16_fp32_aiter(x, y)
+            if output is not None:
+                return output
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 
