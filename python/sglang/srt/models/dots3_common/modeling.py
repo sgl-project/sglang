@@ -129,7 +129,6 @@ from sglang.srt.utils import (
     ceil_div,
     get_bool_env_var,
     is_cuda,
-    is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_pp_layers,
 )
@@ -550,103 +549,6 @@ class Dots3MoE(nn.Module):
         else:
             return None
 
-    def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
-        ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
-        else:
-            state.shared_output = None
-
-    def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-    def op_dispatch_a(self, state):
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.moe_impl(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-            )
-
-    def op_output(self, state):
-        final_hidden_states = state.pop("hidden_states_after_combine")
-
-        if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        state.hidden_states_mlp_output = final_hidden_states
-
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token.
 # SGLang assumes exclusive.
@@ -1039,19 +941,6 @@ class Dots3AttentionMLA(nn.Module):
                     out_cache_loc
                 )
         return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
-
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
 
     def forward(
         self,
@@ -1627,71 +1516,6 @@ class Dots3DecoderLayer(nn.Module):
                 ffn_exit.mlp_reduce_scatter,
             )
         return ffn_exit.finish(hidden_states)
-
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        hidden_states = self.attn_boundary.finish(
-            state.pop("hidden_states_after_attn"), state.forward_batch
-        )
-        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
-        )
-
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        if not (
-            is_dense_ffn_fully_dp()
-            and (not self.is_layer_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            state.hidden_states_mlp_output = self.mlp(
-                hidden_states, state.forward_batch
-            )
-        else:
-            state.hidden_states_mlp_output = hidden_states
-
-    def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "zero_allocator",
-                "tbo_subbatch_index",
-            }
-        )
-        return output
 
 
 class Dots3Model(nn.Module):
