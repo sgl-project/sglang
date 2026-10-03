@@ -59,7 +59,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -94,7 +93,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_non_idle_and_non_empty,
     is_npu,
     log_info_on_rank0,
     make_pp_layers,
@@ -303,18 +301,6 @@ class Glm4MoeAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
-
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
 
     def forward_prepare(
         self,
@@ -620,7 +606,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -646,7 +631,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -707,82 +691,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             return self.shared_experts(hidden_states)
         else:
             return None
-
-    def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-    def op_dispatch_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.pop("topk_output"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        state.combine_input = self.experts.run_moe_core(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_output(self, state):
-        final_hidden_states = state.pop("hidden_states_after_combine")
-
-        if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        state.hidden_states_mlp_output = final_hidden_states
 
 
 class Glm4MoeDecoderLayer(nn.Module):
@@ -857,6 +765,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -961,54 +870,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         hidden_states = ffn_exit.finish(hidden_states)
 
         return hidden_states
-
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        hidden_states = self.attn_boundary.finish(
-            state.pop("hidden_states_after_attn"), state.forward_batch
-        )
-        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
-        )
-
-    def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            forward_batch=state.forward_batch,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-            }
-        )
-        return output
 
 
 class Glm4MoeModel(nn.Module):

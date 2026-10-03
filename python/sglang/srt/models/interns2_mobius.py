@@ -31,9 +31,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import (
-    reduce_moe_output,
-)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -422,7 +419,7 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return reduce_moe_output(routed + shared)
+        return routed + shared
 
     def _forward_after_attention(
         self,

@@ -36,20 +36,22 @@ class TestBoundaryIntegrations(unittest.TestCase):
         parallel = fixture.parallel_of(attn_dp=2, attn_tp=2)
         rows = fixture.comm.Layout(frozenset())
         produced = fixture.comm.OutputContract(
-            rows, group=SumGroup.ATTN_TP, may_defer_to_next=True
+            rows, group=SumGroup.ATTN_TP, may_defer_to_next=True, update=PLAIN_ADD
         )
         plan = SimpleNamespace(path_for=lambda _: SimpleNamespace(output=produced))
         boundary = exits.ExitPolicy(plan)
         boundary._sum_deferral_allowed = lambda _: True
+        summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
         with (
             fixture.planning(parallel),
             patch.object(exits, "is_dp_attention_enabled", return_value=True),
+            patch.object(exits, "sum_output", summed),
         ):
             stream = ResidualStream(torch.zeros(3, 4))
             result = exits.MixerExit(boundary, None, stream=stream)
-            self.assertFalse(result.skips_reduction)
             value = torch.ones(3, 4)
-            self.assertIs(result.finish(value), value)
+            torch.testing.assert_close(result.finish(value), value * 2)
+            self.assertEqual(summed.call_args.args[1], SumGroup.ATTN_TP)
             self.assertIsNone(stream.pending.owed)
 
     def test_pipeline_preserves_declared_sum_for_one_receiver_completion(self):

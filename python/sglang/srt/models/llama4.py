@@ -41,7 +41,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -147,8 +146,6 @@ class Llama4MoE(nn.Module):
         )
 
         out_aD = routed_out + shared_out
-
-        out_aD = reduce_moe_output(out_aD)
 
         return out_aD
 
@@ -418,6 +415,7 @@ class Llama4DecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

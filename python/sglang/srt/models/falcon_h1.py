@@ -214,6 +214,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             mlp_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

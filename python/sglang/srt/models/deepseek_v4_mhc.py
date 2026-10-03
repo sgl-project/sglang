@@ -680,6 +680,18 @@ def run_moe_post(
         _, updated = moe_finalize_all_reduce_mhc(*args, world_size=world_size)
         return HcState(updated, pre)
     if isinstance(out, MoEOutput):
-        out = out.get_all_reduce_merged()
+        from sglang.srt.layers.moe import post_experts_all_reduce
+        from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+
+        # The post boundary owns the sum; a replicated shared expert is added
+        # after the reduction so it is counted only once across TP ranks.
+        pieces = out
+        out = post_experts_all_reduce(pieces.get_merged())
+        if (
+            pieces.shared is not None
+            and pieces.shared_is_replicated
+            and should_add_replicated_moe_output()
+        ):
+            out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream)
     return _plain_post(hc, out, residual, coefficients, next=next)

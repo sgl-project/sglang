@@ -22,6 +22,8 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -47,12 +49,14 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
+    SumGroup,
     TokenAxis,
     _cp_shard_token_rows,
     moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+from sglang.srt.layers.moe.utils import sum_post_experts_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -171,6 +175,34 @@ def attn_tp_all_reduce(
     ):
         return attention_tensor_model_parallel_quant_all_reduce(hidden_states)
     return attention_tensor_model_parallel_all_reduce(hidden_states)
+
+
+def sum_output(
+    hidden_states: torch.Tensor,
+    group: SumGroup,
+    forward_batch: ForwardBatch,
+    *,
+    may_quantize: bool,
+) -> torch.Tensor:
+    """Complete the sum an output owes over ``group`` on the rows it is on."""
+    parallel = get_parallel()
+    if group is SumGroup.ATTN_TP:
+        if parallel.attn_tp_size == 1:
+            return hidden_states
+        return attn_tp_all_reduce(hidden_states, forward_batch, may_quantize)
+    if group is SumGroup.TP:
+        if parallel.tp_size == 1:
+            return hidden_states
+        if (
+            may_quantize
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and get_exec().comm.enable_quant_communications
+        ):
+            return tensor_model_parallel_quant_all_reduce(hidden_states)
+        return tensor_model_parallel_all_reduce(hidden_states)
+    if group is SumGroup.MOE_OUTPUT:
+        return sum_post_experts_output(hidden_states)
+    raise ValueError(f"unsupported output sum group: {group!r}")
 
 
 def dp_gather(

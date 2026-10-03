@@ -120,6 +120,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
@@ -127,6 +128,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     is_tbo_enabled,
     should_add_replicated_moe_output,
+    sum_post_experts_output,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -205,6 +207,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_platform,
@@ -282,10 +285,15 @@ class DeepseekV2MLP(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         swiglu_limit: Optional[float] = None,
+        allow_fused_down: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
+        # The fused down path calls deepgemm directly and runs no all-reduce.
+        self.allow_fused_down = (
+            not reduce_results if allow_fused_down is None else allow_fused_down
+        )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -382,7 +390,7 @@ class DeepseekV2MLP(nn.Module):
         # are fp8 (uint8 storage with weight_scale_inv).
         if (
             self.swiglu_limit is not None
-            and not self.down_proj.reduce_results
+            and self.allow_fused_down
             and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
@@ -610,18 +618,6 @@ class MoEOutput(NamedTuple):
             self.routed_scaling_factor,
         )
 
-    def get_all_reduce_merged(self) -> torch.Tensor:
-        """Merge and reduce the pieces into the rows the MoE block would have
-        returned."""
-        out = post_experts_all_reduce(self.get_merged())
-        if (
-            self.shared is not None
-            and self.shared_is_replicated
-            and should_add_replicated_moe_output()
-        ):
-            out += self.shared
-        return out
-
 
 class DeepseekV2MoE(nn.Module):
     def __init__(
@@ -635,8 +631,11 @@ class DeepseekV2MoE(nn.Module):
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
         vl_correction_bias: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
+        # False when a stage boundary completes this output's sum.
+        self.reduce_results = reduce_results
         self.tp_size = get_parallel().tp_size
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -833,6 +832,9 @@ class DeepseekV2MoE(nn.Module):
             # Flags must be set before weight load so
             # process_weights_after_loading sees them and builds the
             # [Up, Gate]-interleaved weight + scale.
+            from sglang.srt.layers.quantization.fp4_utils import (
+                get_fp4_gemm_runner_backend,
+            )
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
             )
@@ -840,11 +842,14 @@ class DeepseekV2MoE(nn.Module):
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
                 get_platform().is_sm100
+                # The fused kernel bypasses the LoRA wrappers.
+                and not (get_lora().enable_lora or get_lora().lora_paths)
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
                 )
                 and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
+                and get_fp4_gemm_runner_backend().supports_swiglu_fusion()
                 and isinstance(
                     self.shared_experts.down_proj.quant_method,
                     ModelOptFp4LinearMethod,
@@ -1190,7 +1195,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
-                reduce=post_experts_all_reduce,
+                reduce=sum_post_experts_output,
             )
 
         if return_moe_output:
@@ -1218,10 +1223,11 @@ class DeepseekV2MoE(nn.Module):
                 None if self._shared_expert_tp1 else shared_output,
                 self.routed_scaling_factor,
             )
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1 and should_add_replicated_moe_output():
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        # TP1 shared experts are replicated: add them after this block's
+        # all-reduce, or on TP rank 0 only when the stage boundary sums.
+        if self._shared_expert_tp1 and self._adds_replicated_output():
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -1385,16 +1391,23 @@ class DeepseekV2MoE(nn.Module):
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        # TP1 shared experts are replicated: add them after this block's
+        # all-reduce, or on TP rank 0 only when the stage boundary sums.
         if (
             shared_output is not None
             and self._shared_expert_tp1
-            and should_add_replicated_moe_output()
+            and self._adds_replicated_output()
         ):
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _adds_replicated_output(self) -> bool:
+        """Whether this rank adds the replicated TP1 shared-expert output."""
+        if self.reduce_results:
+            return should_add_replicated_moe_output()
+        return adds_replicated_output_to_partial()
 
     def forward_cpu(
         self,
@@ -1447,7 +1460,8 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -2601,6 +2615,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                reduce_results=False,
             )
         else:
             if is_dense_ffn_fully_dp():
@@ -2616,6 +2631,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
+                reduce_results=False,
+                allow_fused_down=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2816,7 +2833,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
+        hidden_states = self.ffn_boundary.complete_now(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 

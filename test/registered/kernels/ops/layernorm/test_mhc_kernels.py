@@ -416,6 +416,50 @@ def test_mhc_mix_stats_preserves_xpu_split_dispatch():
         torch.testing.assert_close(result, expected.squeeze(1), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "replicated,add_shared,has_shared,expected",
+    [
+        (False, False, True, 16.0),
+        (True, False, True, 2.0),
+        (True, True, True, 9.0),
+        (True, True, False, 2.0),
+    ],
+)
+def test_moe_post_reduces_before_adding_replicated_shared(
+    monkeypatch, replicated, add_shared, has_shared, expected
+):
+    from sglang.srt.layers import moe
+    from sglang.srt.layers.moe import utils as moe_utils
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+
+    routed = torch.ones(2, 3)
+    shared = torch.full((2, 3), 7.0) if has_shared else None
+    pieces = model_mhc.MoEOutput(routed, shared, None, 1.0, replicated)
+    partial = routed if replicated or shared is None else routed + shared
+    monkeypatch.setattr(model_mhc.MoEOutput, "get_merged", lambda self: partial)
+    monkeypatch.setattr(model_mhc, "is_deferred_finalize", lambda value: False)
+    monkeypatch.setattr(
+        moe_utils, "should_add_replicated_moe_output", lambda: add_shared
+    )
+    reduced_inputs = []
+
+    def reduce(value):
+        reduced_inputs.append(value.clone())
+        return value * 2
+
+    monkeypatch.setattr(moe, "post_experts_all_reduce", reduce)
+    monkeypatch.setattr(model_mhc, "_compute_triplet", lambda *args: None)
+    monkeypatch.setattr(
+        model_mhc, "_plain_post", lambda hc, value, residual, triplet, **kwargs: value
+    )
+    actual = model_mhc.run_moe_post(
+        None, pieces, None, stats_stream=None, next=None, world_size=2
+    )
+    assert len(reduced_inputs) == 1
+    torch.testing.assert_close(reduced_inputs[0], partial)
+    torch.testing.assert_close(actual, torch.full((2, 3), expected))
+
+
 if __name__ == "__main__":
     import sys
 
