@@ -916,6 +916,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    # Reject malformed request fields before starting an SSE response. The
+    # shared normalizer repeats this check for non-HTTP callers before IPC.
+    try:
+        obj.validate_input_types()
+    except ValueError as e:
+        return _create_error_response(e)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

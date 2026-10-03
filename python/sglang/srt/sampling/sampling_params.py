@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
@@ -38,11 +38,72 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+MAX_TOP_K = (1 << 31) - 1
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
 MAX_STOP_REGEX_COUNT = 32
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_sampling_input(get_value: Callable[[str], Any]) -> None:
+    # Constructors do not enforce msgspec annotations. Check raw values before
+    # normalization can hide malformed values (e.g. an empty grammar dictionary)
+    # or request batching uses n/beam_width.
+    for name in (
+        "max_new_tokens",
+        "min_new_tokens",
+        "top_k",
+        "n",
+        "beam_width",
+        "stream_interval",
+        "sampling_seed",
+    ):
+        value = get_value(name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            raise ValueError(f"{name} must be an integer or None.")
+
+    for name in (
+        "temperature",
+        "top_p",
+        "min_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+    ):
+        value = get_value(name)
+        if value is not None and (
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+        ):
+            raise ValueError(f"{name} must be a number or None.")
+
+    for name in ("json_schema", "regex", "ebnf", "structural_tag"):
+        value = get_value(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string or None.")
+
+    for name in (
+        "ignore_eos",
+        "skip_special_tokens",
+        "spaces_between_special_tokens",
+        "no_stop_trim",
+        "ebnf_full_assistant",
+    ):
+        value = get_value(name)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean or None.")
+
+    n = get_value("n")
+    if n is not None and n < 1:
+        raise ValueError(f"n must be at least 1, got {n}.")
+
+    # The scheduler materializes top_k as an int32 tensor. An out-of-range
+    # Python integer must not reach it, even when the transport accepts it.
+    top_k = get_value("top_k")
+    if top_k is not None and top_k > MAX_TOP_K:
+        raise ValueError(f"top_k must be at most {MAX_TOP_K}, got {top_k}.")
 
 
 # Private transport from the OpenAI request renderer to scheduler-side
@@ -161,6 +222,29 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     is_normalized: bool = False  # set by normalize()
     ebnf_full_assistant: bool = False
 
+    @staticmethod
+    def validate_input(params: Dict) -> None:
+        """Validate known raw fields without applying defaults or mutating input.
+
+        Request admission calls this before batching or starting an HTTP stream.
+        Model processors may consume extra fields (e.g. Whisper's language), so
+        unknown keys remain available until SamplingParams is constructed.
+        """
+        _validate_sampling_input(params.get)
+        # These fields are populated after construction and carried over IPC.
+        # Allowing the caller to set is_normalized would bypass null/default
+        # handling in __post_init__. Renderer-owned ebnf_full_assistant, unlike
+        # these normalization fields, is legitimately passed by the OpenAI API.
+        for name in (
+            "stop_strs",
+            "stop_regex_strs",
+            "stop_str_max_len",
+            "stop_regex_max_len",
+            "is_normalized",
+        ):
+            if name in params:
+                raise ValueError(f"{name} is an internal sampling parameter.")
+
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -169,6 +253,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         # has populated tokenizer-derived fields, avoid resetting them.
         if self.is_normalized:
             return
+
+        _validate_sampling_input(lambda name: getattr(self, name))
 
         self.stop_strs = self.stop
         if self.stop_token_ids:
@@ -206,6 +292,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+        self.ebnf_full_assistant = (
+            self.ebnf_full_assistant if self.ebnf_full_assistant is not None else False
+        )
 
         # An empty grammar constraint means "unset", not "constrain to nothing".
         self.json_schema = self.json_schema or None
@@ -222,6 +311,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        _validate_sampling_input(lambda name: getattr(self, name))
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:

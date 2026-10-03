@@ -66,7 +66,10 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
+from sglang.srt.utils.field_validators import (
+    normalize_lora_paths,
+    validate_optional_list_i64_1d_2d,
+)
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
@@ -154,6 +157,91 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
+
+    def __post_init__(self):
+        for name, expected_type in (
+            ("id", str),
+            ("rid", str),
+            ("offset", int),
+            ("replace", bool),
+            ("drop_previous_output", bool),
+        ):
+            value = getattr(self, name)
+            valid_type = (
+                type(value) is int
+                if expected_type is int
+                else isinstance(value, expected_type)
+            )
+            if value is not None and not valid_type:
+                raise ValueError(
+                    f"session_params.{name} must be {expected_type.__name__} or null, "
+                    f"got {type(value).__name__}."
+                )
+
+
+def _validate_sampling_params_input(params, *, is_single: bool, batch_size: int):
+    if params is None:
+        return
+    if isinstance(params, dict):
+        SamplingParams.validate_input(params)
+        return
+    if not isinstance(params, list) or is_single:
+        raise ValueError(
+            "sampling_params must be a dictionary for a single request, or a "
+            "list of dictionaries matching the batch size."
+        )
+    if len(params) != batch_size or not params:
+        raise ValueError("sampling_params list length must match batch size.")
+    for item in params:
+        if not isinstance(item, dict):
+            raise ValueError("sampling_params must contain only dictionaries.")
+        SamplingParams.validate_input(item)
+
+
+def _validate_request_overrides(obj, *, is_single: bool, batch_size: int):
+    # Validate without changing the request. HTTP calls this before creating an
+    # SSE response; Engine calls it again before normalization and fan-out.
+    normalize_lora_paths(obj.lora_path, batch_size, is_single=is_single)
+
+    if isinstance(obj.lora_id, list):
+        if is_single:
+            raise ValueError("lora_id must be a string or null for a single request.")
+        if len(obj.lora_id) != batch_size:
+            raise ValueError("lora_id list length must match batch size.")
+        lora_ids = obj.lora_id
+    else:
+        lora_ids = (obj.lora_id,)
+    if any(value is not None and not isinstance(value, str) for value in lora_ids):
+        raise ValueError("lora_id must contain only strings or null.")
+
+    overrides = obj.positional_embed_overrides
+    if isinstance(overrides, list):
+        if is_single:
+            raise ValueError(
+                "positional_embed_overrides must be a PositionalEmbeds or null "
+                "for a single request."
+            )
+        if len(overrides) != batch_size:
+            raise ValueError(
+                "positional_embed_overrides list length must match batch size."
+            )
+    else:
+        overrides = (overrides,)
+    for override in overrides:
+        if override is not None:
+            if not isinstance(override, PositionalEmbeds):
+                raise ValueError(
+                    "positional_embed_overrides must contain only PositionalEmbeds or null."
+                )
+            override.validate()
+
+
+def _normalize_lora_ids(value, batch_size: int, expansion_factor: int = 1):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value] * (batch_size * expansion_factor)
+    return value * expansion_factor
 
 
 # Type definitions for multimodal input data
@@ -399,6 +487,22 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
+    def validate_input_types(self):
+        """Validate native request values without tokenization or batch mutation."""
+        if self.session_params is not None:
+            if not isinstance(self.session_params, dict):
+                raise ValueError("session_params must be a dictionary or null.")
+            try:
+                SessionParams(**self.session_params)
+            except TypeError as exc:
+                raise ValueError(f"Invalid session_params: {exc}") from exc
+        self._validate_inputs()
+        is_single, batch_size = self._get_batch_shape()
+        _validate_sampling_params_input(
+            self.sampling_params, is_single=is_single, batch_size=batch_size
+        )
+        _validate_request_overrides(self, is_single=is_single, batch_size=batch_size)
+
     def normalize_batch_and_arguments(self):
         """
         Normalize the batch size and arguments for the request.
@@ -412,6 +516,7 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        self.validate_input_types()
         if self.data_parallel_rank is not None:
             import warnings
 
@@ -429,6 +534,12 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        self.lora_path = normalize_lora_paths(
+            self.lora_path,
+            self.batch_size,
+            is_single=self.is_single,
+            expansion_factor=self.parallel_sample_num,
+        )
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -468,14 +579,16 @@ class GenerateReqInput:
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
+        self.is_single, self.batch_size = self._get_batch_shape()
+        if self.text is not None or self.input_ids is not None:
+            self.input_embeds = None
+
+    def _get_batch_shape(self):
+        """Read the original prompt shape before any parallel-sampling expansion."""
         if self.text is not None:
             if isinstance(self.text, str):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.text)
-            self.input_embeds = None
+                return True, 1
+            return False, len(self.text)
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
                 # Session history may supply the entire prompt. The scheduler
@@ -487,22 +600,15 @@ class GenerateReqInput:
                 )
                 if not session_id:
                     raise ValueError("input_ids cannot be empty.")
-                self.is_single = True
-                self.batch_size = 1
+                return True, 1
             elif isinstance(self.input_ids[0], int):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_ids)
-            self.input_embeds = None
-        else:
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_embeds)
+                return True, 1
+            return False, len(self.input_ids)
+        if not self.input_embeds or not self.input_embeds[0]:
+            raise ValueError("input_embeds cannot be empty.")
+        if isinstance(self.input_embeds[0][0], float):
+            return True, 1
+        return False, len(self.input_embeds)
 
     def _sampling_params_beam_width(self) -> int:
         # 1 means not a beam request.
@@ -525,11 +631,11 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
             return
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = self.sampling_params.get("n") or 1
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = self.sampling_params[0].get("n") or 1
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != (sampling_params.get("n") or 1):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
@@ -588,7 +694,13 @@ class GenerateReqInput:
         # Expand input based on type
         self._expand_inputs(num)
         self._normalize_rid(num)
-        self._normalize_lora_paths(num)
+        self.lora_id = _normalize_lora_ids(
+            self.lora_id, self.batch_size, self.parallel_sample_num
+        )
+        if isinstance(self.positional_embed_overrides, list):
+            self.positional_embed_overrides = (
+                self.positional_embed_overrides * self.parallel_sample_num
+            )
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -620,16 +732,6 @@ class GenerateReqInput:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
-
-    def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
-        if self.lora_path is not None:
-            if isinstance(self.lora_path, str):
-                self.lora_path = [self.lora_path] * num
-            elif isinstance(self.lora_path, list):
-                self.lora_path = self.lora_path * self.parallel_sample_num
-            else:
-                raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -1270,7 +1372,30 @@ class EmbeddingReqInput:
                 f"Duplicate request IDs detected within the request: {duplicates}"
             )
 
+    def validate_input_types(self):
+        """Validate metadata without changing the input or invoking the model."""
+        is_single, batch_size = self._get_batch_shape()
+        _validate_sampling_params_input(
+            self.sampling_params, is_single=is_single, batch_size=batch_size
+        )
+        _validate_request_overrides(self, is_single=is_single, batch_size=batch_size)
+
+    def _get_batch_shape(self):
+        if self.text is not None:
+            return (False, len(self.text)) if isinstance(self.text, list) else (True, 1)
+        if self.input_ids is not None:
+            if not self.input_ids:
+                raise ValueError("input_ids cannot be empty.")
+            return (
+                (False, len(self.input_ids))
+                if isinstance(self.input_ids[0], list)
+                else (True, 1)
+            )
+        # Image-only embedding requests follow the existing scalar path.
+        return True, 0
+
     def normalize_batch_and_arguments(self):
+        self.validate_input_types()
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(
@@ -1282,24 +1407,10 @@ class EmbeddingReqInput:
             raise ValueError("text and input_ids cannot be provided at the same time")
 
         # Derive the batch size
-        self.batch_size = 0
-        self.is_single = True
-
-        # check the batch size of text
-        if self.text is not None:
-            if isinstance(self.text, list):
-                self.batch_size += len(self.text)
-                self.is_single = False
-            else:
-                self.batch_size += 1
-
-        # check the batch size of input_ids
-        if self.input_ids is not None:
-            if isinstance(self.input_ids[0], list):
-                self.batch_size += len(self.input_ids)
-                self.is_single = False
-            else:
-                self.batch_size += 1
+        self.is_single, self.batch_size = self._get_batch_shape()
+        self.lora_path = normalize_lora_paths(
+            self.lora_path, self.batch_size, is_single=self.is_single
+        )
 
         # Fill in default arguments
         if self.is_single:
@@ -1321,22 +1432,9 @@ class EmbeddingReqInput:
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
-            self._normalize_lora_paths(self.batch_size)
+            self.lora_id = _normalize_lora_ids(self.lora_id, self.batch_size)
 
         self._validate_rid_uniqueness()
-
-    def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
-        if self.lora_path is not None:
-            if isinstance(self.lora_path, str):
-                self.lora_path = [self.lora_path] * num
-            elif isinstance(self.lora_path, list):
-                if len(self.lora_path) != num:
-                    raise ValueError(
-                        f"lora_path list length ({len(self.lora_path)}) must match batch size ({num})"
-                    )
-            else:
-                raise ValueError("lora_path should be a list or a string.")
 
     def contains_mm_input(self) -> bool:
         return (

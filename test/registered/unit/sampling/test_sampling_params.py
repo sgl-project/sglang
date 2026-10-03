@@ -20,6 +20,7 @@ from sglang.srt.sampling.sampling_params import (
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
     MAX_STOP_REGEX_LEN,
+    MAX_TOP_K,
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
@@ -88,6 +89,150 @@ class TestSamplingParamsInit(CustomTestCase):
             with self.subTest(field=field):
                 sp = SamplingParams(**{field: ""})
                 self.assertIsNone(getattr(sp, field))
+
+
+class TestSamplingParamsInputValidation(CustomTestCase):
+    def test_reported_crash_inputs_are_rejected_before_normalization(self):
+        cases = (
+            {"max_new_tokens": 1.5},
+            {"beam_width": 1.5},
+            {"regex": [".*"]},
+            {"json_schema": {"type": "object"}},
+            {"ebnf": ['root ::= "a"']},
+            {"structural_tag": {"structures": [], "triggers": []}},
+            {"skip_special_tokens": 1.5},
+            {"top_k": 2**31},
+        )
+        for params in cases:
+            field = next(iter(params))
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams.validate_input(params)
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams(**params)
+
+    def test_empty_grammar_containers_are_not_treated_as_unset(self):
+        for field in ("json_schema", "regex", "ebnf", "structural_tag"):
+            for value in ([], {}, False, 0):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SamplingParams(**{field: value})
+
+    def test_integral_counts_reject_floats_strings_and_booleans(self):
+        for field in (
+            "max_new_tokens",
+            "min_new_tokens",
+            "n",
+            "beam_width",
+            "top_k",
+            "stream_interval",
+            "sampling_seed",
+        ):
+            for value in (1.0, "1", True, [], {}):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SamplingParams.validate_input({field: value})
+
+    def test_parallel_sample_count_is_positive_before_batch_expansion(self):
+        for n in (0, -1):
+            with self.subTest(n=n):
+                with self.assertRaisesRegex(ValueError, "n must be at least 1"):
+                    SamplingParams.validate_input({"n": n})
+        SamplingParams.validate_input({"n": None})
+        SamplingParams.validate_input({"n": 3})
+
+    def test_numerical_inputs_fail_with_value_error_before_arithmetic(self):
+        for field in (
+            "temperature",
+            "top_p",
+            "min_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ):
+            for value in ("0.5", True, [], {}):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SamplingParams(**{field: value})
+
+    def test_detokenizer_and_stop_flags_require_booleans(self):
+        for field in (
+            "ignore_eos",
+            "skip_special_tokens",
+            "spaces_between_special_tokens",
+            "no_stop_trim",
+        ):
+            for value in (0, 1, "false", []):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SamplingParams(**{field: value})
+
+    def test_top_k_int32_boundary_and_unrestricted_sentinels(self):
+        for top_k in (None, -1, 1, TOP_K_ALL, MAX_TOP_K):
+            with self.subTest(top_k=top_k):
+                SamplingParams.validate_input({"top_k": top_k})
+                SamplingParams(top_k=top_k).verify(32000)
+        # Greedy normalization must not silently hide an out-of-range input.
+        with self.assertRaisesRegex(ValueError, "top_k"):
+            SamplingParams(temperature=0, top_k=MAX_TOP_K + 1)
+
+    def test_preflight_preserves_nulls_empty_grammars_and_processor_fields(self):
+        params = {
+            "max_new_tokens": None,
+            "n": None,
+            "top_k": -1,
+            "skip_special_tokens": None,
+            "regex": "",
+            "language": "en",
+            "timestamp_granularities": ["segment"],
+            "_detect_language": True,
+        }
+        original = copy.deepcopy(params)
+        SamplingParams.validate_input(params)
+        self.assertEqual(params, original)
+
+    def test_preflight_does_not_trust_internal_normalized_flag(self):
+        with self.assertRaisesRegex(ValueError, "regex"):
+            SamplingParams.validate_input({"is_normalized": True, "regex": []})
+        # The normalized marker must not let an otherwise valid null input
+        # bypass defaulting and arrive at the detokenizer as None.
+        with self.assertRaisesRegex(ValueError, "is_normalized"):
+            SamplingParams.validate_input(
+                {"is_normalized": True, "skip_special_tokens": None}
+            )
+
+    def test_raw_requests_cannot_supply_normalization_state(self):
+        for field in (
+            "stop_strs",
+            "stop_regex_strs",
+            "stop_str_max_len",
+            "stop_regex_max_len",
+            "is_normalized",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams.validate_input({field: None})
+
+    def test_renderer_full_assistant_grammar_flag_is_preserved(self):
+        params = {"ebnf": 'root ::= "abc"', "ebnf_full_assistant": True}
+        SamplingParams.validate_input(params)
+        self.assertTrue(SamplingParams(**params).ebnf_full_assistant)
+        self.assertFalse(SamplingParams(ebnf_full_assistant=None).ebnf_full_assistant)
+        with self.assertRaisesRegex(ValueError, "ebnf_full_assistant"):
+            SamplingParams.validate_input({"ebnf_full_assistant": "true"})
+
+    def test_verify_rechecks_values_changed_after_construction(self):
+        for field, value in (
+            ("max_new_tokens", 1.5),
+            ("regex", [".*"]),
+            ("skip_special_tokens", 1),
+            ("top_k", MAX_TOP_K + 1),
+        ):
+            with self.subTest(field=field):
+                params = SamplingParams()
+                setattr(params, field, value)
+                with self.assertRaisesRegex(ValueError, field):
+                    params.verify(32000)
 
 
 class TestSamplingParamsVerify(CustomTestCase):
