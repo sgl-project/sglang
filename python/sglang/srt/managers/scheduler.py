@@ -5434,25 +5434,12 @@ class Scheduler(
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
-    def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract")
-        self._engine_paused = True
+    def _gather_pause_retract_reqs(self) -> List["Req"]:
+        """Requests whose generation is suspended by pause_generation.
 
-        if recv_req.mode == "in_place":
-            # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
-            return
-
-        if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
+        Shared by both pause modes so the ``num_paused_reqs`` gauge and the
+        actual retraction set use the same accounting.
+        """
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
             self.last_batch is not None
@@ -5472,6 +5459,35 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+        return retract_reqs
+
+    def pause_generation(self, recv_req: PauseGenerationReqInput):
+        assert recv_req.mode in ("in_place", "retract")
+        self._engine_paused = True
+
+        if recv_req.mode == "in_place":
+            # In-place pause: just set the flag and return immediately.
+            # All scheduler state (running_batch, last_batch, chunked_req,
+            # result_queue) is left untouched. On resume, the normal event
+            # loop (get_next_batch_to_run) handles last_batch merge,
+            # chunked_req cleanup, and overlap result processing through
+            # the standard code paths. This avoids duplicating batch
+            # manipulation logic and the accounting bugs that come with it.
+            self.metrics_reporter.num_paused_reqs = len(
+                self._gather_pause_retract_reqs()
+            )
+            return
+
+        if self.enable_overlap and self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
+        retract_reqs = self._gather_pause_retract_reqs()
+        # Level gauge: held while the engine stays paused; cleared on
+        # continue_generation. Mirrored into SchedulerStats by every stats
+        # publish, including the forced idle publish below.
+        self.metrics_reporter.num_paused_reqs = len(retract_reqs)
 
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -5546,6 +5562,7 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
+        self.metrics_reporter.num_paused_reqs = 0
         self._engine_paused = False
 
     def handle_scale_elastic_ep(
