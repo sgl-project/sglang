@@ -3311,6 +3311,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if is_wint4afp8_or_wint4a16_config(quant_config):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        if quant_config and quant_config.get_name() == "mixed_precision_w4":
+            return (
+                "Deepseek V3/R1 mixed_precision_w4 model uses different quant "
+                "method for routed experts and shared experts."
+            )
         return None
 
     def determine_num_fused_shared_experts(self):
