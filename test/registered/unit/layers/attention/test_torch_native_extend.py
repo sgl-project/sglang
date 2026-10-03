@@ -1,6 +1,7 @@
 """CPU numerical coverage for prefix-aware torch-native extend attention."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.attention import torch_native_backend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -32,10 +34,14 @@ class TestTorchNativeExtend(CustomTestCase):
         num_kv_heads=2,
         cache_dtype=torch.float32,
         public_forward=False,
+        cpu_metadata=False,
+        forward_mode=ForwardMode.EXTEND,
+        profile_metadata=False,
     ):
         generator = torch.Generator().manual_seed(42)
         batch_size = len(prefix_lens)
         seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        has_encoder = encoder_lens is not None
         encoder_lens = encoder_lens or [0] * batch_size
         cache_lens = [s + e for s, e in zip(seq_lens, encoder_lens)]
         num_heads, qk_dim, v_dim = 4, 8, 6
@@ -89,15 +95,35 @@ class TestTorchNativeExtend(CustomTestCase):
 
         backend = object.__new__(TorchNativeAttnBackend)
         output = torch.empty(sum(extend_lens), num_heads, v_dim)
-        batch = SimpleNamespace(
+        batch = ForwardBatch(
+            forward_mode=forward_mode,
+            batch_size=batch_size,
+            input_ids=torch.zeros(sum(extend_lens), dtype=torch.int64),
+            seq_lens_sum=sum(seq_lens),
             req_pool_indices=req_indices,
             seq_lens=torch.tensor(seq_lens),
             extend_prefix_lens=torch.tensor(prefix_lens),
             extend_seq_lens=torch.tensor(extend_lens),
-            encoder_lens=torch.tensor(encoder_lens),
+            encoder_lens=torch.tensor(encoder_lens) if has_encoder else None,
             out_cache_loc=None,
             encoder_out_cache_loc=None,
         )
+        if cpu_metadata:
+            batch.req_pool_indices_cpu = req_indices.clone()
+            batch.seq_lens_cpu = batch.seq_lens.clone()
+            batch.extend_prefix_lens_cpu = list(prefix_lens)
+            batch.extend_seq_lens_cpu = list(extend_lens)
+            batch.encoder_lens_cpu = list(encoder_lens) if has_encoder else None
+            if cpu_metadata == "partial":
+                batch.extend_prefix_lens_cpu = None
+            elif cpu_metadata == "unpadded_encoder":
+                batch.encoder_lens_cpu = list(encoder_lens[:-1])
+            elif cpu_metadata == "stale":
+                batch.req_pool_indices_cpu = torch.full_like(req_indices, 1000)
+                batch.seq_lens_cpu = torch.zeros_like(batch.seq_lens)
+                batch.extend_prefix_lens_cpu = [0] * batch_size
+                batch.extend_seq_lens_cpu = [0] * batch_size
+                batch.encoder_lens_cpu = [0] * batch_size
         with patch.object(
             torch_native_backend,
             "scaled_dot_product_attention",
@@ -119,14 +145,21 @@ class TestTorchNativeExtend(CustomTestCase):
                     attn_type=AttentionType.DECODER,
                     sliding_window_size=window,
                 )
-                output = backend.forward_extend(
-                    q=query.flatten(1),
-                    k=None,
-                    v=None,
-                    layer=layer,
-                    forward_batch=batch,
-                    save_kv_cache=False,
-                ).view_as(output)
+                with (
+                    torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU]
+                    )
+                    if profile_metadata
+                    else nullcontext()
+                ) as profiler:
+                    output = backend.forward_extend(
+                        q=query.flatten(1),
+                        k=None,
+                        v=None,
+                        layer=layer,
+                        forward_batch=batch,
+                        save_kv_cache=False,
+                    ).view_as(output)
             else:
                 backend._run_sdpa_forward_extend(
                     query=query,
@@ -152,6 +185,57 @@ class TestTorchNativeExtend(CustomTestCase):
             [call.args[0].shape[-2] for call in sdpa.call_args_list],
             list(extend_lens),
         )
+        if profile_metadata:
+            return sum(
+                event.count
+                for event in profiler.key_averages()
+                if event.key == "aten::_local_scalar_dense"
+            )
+
+    def test_cpu_metadata_avoids_scalar_reads(self):
+        """Existing host mirrors remove device scalar reads from public extend."""
+        options = dict(
+            prefix_lens=(0, 5, 8),
+            extend_lens=(3, 4, 1),
+            public_forward=True,
+            profile_metadata=True,
+        )
+        self.assertGreater(self._check_attention(**options), 0)
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    self._check_attention(
+                        **options, cpu_metadata=True, forward_mode=mode
+                    ),
+                    0,
+                )
+
+    def test_optional_cpu_metadata(self):
+        """Missing mirrors and an unpadded encoder mirror retain correct slicing."""
+        for mirrors in (True, "partial", "unpadded_encoder"):
+            for cross_attention in (False, True):
+                with self.subTest(mirrors=mirrors, cross_attention=cross_attention):
+                    self._check_attention(
+                        prefix_lens=(2, 5),
+                        extend_lens=(3, 1),
+                        encoder_lens=(7, 4),
+                        causal=not cross_attention,
+                        cross_attention=cross_attention,
+                        public_forward=True,
+                        cpu_metadata=mirrors,
+                    )
+
+    def test_speculative_modes_ignore_stale_cpu_metadata(self):
+        """Speculative device metadata can change independently of host mirrors."""
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            with self.subTest(mode=mode):
+                self._check_attention(
+                    prefix_lens=(2, 5),
+                    extend_lens=(3, 1),
+                    public_forward=True,
+                    cpu_metadata="stale",
+                    forward_mode=mode,
+                )
 
     def test_causal_prefix_and_ragged_batch(self):
         """A rectangular causal mask must align each query after its own prefix."""
