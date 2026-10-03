@@ -1234,6 +1234,9 @@ class EmbeddingReqInput:
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # "float" (default / None) returns lists; "tensor" returns detached CPU
+    # tensors at the model's output dtype (dense, in-process engine only).
+    encoding_format: Optional[str] = field(default=None, kw_only=True)
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1271,6 +1274,16 @@ class EmbeddingReqInput:
             )
 
     def normalize_batch_and_arguments(self):
+        if self.encoding_format is not None:
+            if not isinstance(
+                self.encoding_format, str
+            ) or self.encoding_format.lower() not in (
+                "float",
+                "tensor",
+            ):
+                raise ValueError("encoding_format must be 'float' or 'tensor'")
+            self.encoding_format = self.encoding_format.lower()
+
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(
@@ -1374,6 +1387,7 @@ class EmbeddingReqInput:
                 priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                encoding_format=self.encoding_format,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1406,6 +1420,7 @@ class EmbeddingReqInput:
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
                 dimensions=self.dimensions,
+                encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 external_trace_header=self.external_trace_header,
@@ -1445,6 +1460,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Encoding format for the returned embedding. See EmbeddingReqInput.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
@@ -1720,6 +1737,9 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
+    # Tensor-format embeddings use a separate typed field because msgspec does not
+    # allow a custom type such as torch.Tensor in a union with other value types.
+    tensor_embeddings: Optional[List[Optional[torch.Tensor]]] = None
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]

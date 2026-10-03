@@ -637,10 +637,17 @@ class Engine(EngineScoreMixin, EngineBase):
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        *,
+        encoding_format: Optional[str] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
+
+        For dense embeddings, encoding_format="tensor" returns a detached CPU
+        tensor at the model's output dtype instead of a Python float list.
+        None and "float" preserve the default response. Tensor format is only
+        supported by the in-process engine, not JSON HTTP endpoints.
         """
         obj = EmbeddingReqInput(
             text=prompt,
@@ -648,6 +655,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            encoding_format=encoding_format,
             lora_path=lora_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
@@ -670,9 +678,13 @@ class Engine(EngineScoreMixin, EngineBase):
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        *,
+        encoding_format: Optional[str] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
+
+        encoding_format="tensor" has the same dense CPU-tensor semantics as encode.
 
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
@@ -683,6 +695,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            encoding_format=encoding_format,
             lora_path=lora_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,

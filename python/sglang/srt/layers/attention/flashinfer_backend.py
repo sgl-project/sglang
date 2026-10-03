@@ -637,6 +637,12 @@ class FlashInferAttnBackend(AttentionBackend):
         if extend_seq_lens is None or len(extend_seq_lens) <= 1:
             extend_seq_lens = [forward_batch.input_ids.size(0)]
 
+        # The metadata tensors below are tiny (a few thousand elements at most)
+        # but get rebuilt every forward. MIS disables CUDA graphs, so doing this
+        # arithmetic on the GPU dispatches ~8 eager kernel launches per sequence
+        # on the single-threaded scheduler, which is its dominant cost under load.
+        # The delimiter indices already live on the host, so we keep the whole
+        # computation on the CPU and pay a single host->device copy per result.
         seq_start = 0
         for i, seq_len in enumerate(extend_seq_lens):
             seq_end = seq_start + seq_len
@@ -645,22 +651,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_start = seq_end
                 continue
 
-            first_delim = delimiter_indices_cpu[0].item()  # CPU .item(), no GPU sync
-            delimiter_indices = delimiter_indices_cpu.to(device, non_blocking=True)
+            first_delim = delimiter_indices_cpu[0].item()
             prefix_len = first_delim + (
-                prefix_cache_lens[i] if prefix_cache_lens is not None else 0
+                int(prefix_cache_lens[i]) if prefix_cache_lens is not None else 0
             )
             prefix_len_ptr.append(prefix_len)
 
-            # Compute relative positions within items using searchsorted (no GPU sync).
-            #   suffix_range      = [0, 1, 2, 3, 4, ...]
-            #   searchsorted      = bucket index for each position
-            #   last_delim        = delimiter offset at start of current bucket
-            #   pos_within_item   = suffix_range - last_delim
+            # Position within each item, restarting at every delimiter:
+            #   suffix_range    = [0, 1, 2, ...] over the post-prefix tokens
+            #   bucket_idx      = which item each token falls in (searchsorted)
+            #   last_delim      = delimiter offset at the start of that item
+            #   pos_within_item = suffix_range - last_delim
             suffix_len = seq_len - first_delim
-            relative_positions = delimiter_indices - first_delim
+            relative_positions = delimiter_indices_cpu - first_delim
 
-            suffix_range = torch.arange(suffix_len, dtype=torch.int64, device=device)
+            suffix_range = torch.arange(suffix_len, dtype=torch.int64)
             bucket_idx = torch.searchsorted(
                 relative_positions, suffix_range, right=True
             )
@@ -671,11 +676,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
             forward_batch.positions[seq_start + first_delim : seq_end] = (
                 prefix_len + pos_within_item - 1
-            )
+            ).to(device, non_blocking=True)
 
             seq_start = seq_end
 
-        # Pad token_pos_in_items_ptr for batch processing
+        # Pad token_pos_in_items_ptr to a common length for batch processing.
         if token_pos_in_items_ptr:
             token_pos_in_items_len = max(t.numel() for t in token_pos_in_items_ptr)
             token_pos_in_items_ptr = [
@@ -683,9 +688,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     [
                         t,
                         torch.zeros(
-                            token_pos_in_items_len - t.numel(),
-                            dtype=torch.uint16,
-                            device=device,
+                            token_pos_in_items_len - t.numel(), dtype=torch.uint16
                         ),
                     ]
                 )
@@ -695,19 +698,20 @@ class FlashInferAttnBackend(AttentionBackend):
         if not prefix_len_ptr or not token_pos_in_items_ptr:
             return MultiItemScoringParams()
 
+        # Build the result on the host, then move each tensor to the device once.
+        max_item_len_ptr = torch.stack(
+            [t.to(torch.int32).max().to(torch.uint16) for t in token_pos_in_items_ptr],
+            dim=0,
+        )
         return MultiItemScoringParams(
-            prefix_len_ptr=torch.tensor(
-                prefix_len_ptr, dtype=torch.uint32, device=device
+            prefix_len_ptr=torch.tensor(prefix_len_ptr, dtype=torch.uint32).to(
+                device, non_blocking=True
             ),
-            token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0),
+            token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0).to(
+                device, non_blocking=True
+            ),
             token_pos_in_items_len=token_pos_in_items_len & 0xFFFFFFFF,
-            max_item_len_ptr=torch.stack(
-                [
-                    t.to(torch.int32).max().to(torch.uint16)
-                    for t in token_pos_in_items_ptr
-                ],
-                dim=0,
-            ),
+            max_item_len_ptr=max_item_len_ptr.to(device, non_blocking=True),
         )
 
     def init_forward_metadata_out_graph(
