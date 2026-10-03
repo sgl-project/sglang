@@ -476,6 +476,10 @@ are no longer registered, and this API provides neither asynchronous H2D
 ownership nor a trainer receive pool. The SpecForge manifest/window loader
 remains a separate integration. See the
 [batch-read runbook](../../../../mooncake-study/experiments/BATCH_STORE_READS.md).
+The [remote RDMA runbook](../../../../mooncake-study/experiments/BATCH_STORE_RDMA.md)
+adds real native batch retries, partial-read ownership and 23 complete AR/DSpark
+snapshots read after serving exits. These are transport correctness checks;
+they do not establish serving throughput or production retention.
 
 ## Global Target Identity
 

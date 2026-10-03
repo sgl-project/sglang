@@ -700,6 +700,15 @@ manifest 仍单独最后写入；批量 RPC 本身不提供跨对象发布事务
 这不替代第 10 节的 SpecForge manifest/window loader；接口和传输验收见
 [批量读取记录](experiments/BATCH_STORE_READS.md)。
 
+原生批量接口已在跨物理节点 RDMA 上完成正确性验证。探针检查混合已存在/缺失
+对象的幂等写入、producer 关闭并覆写源内存后的独立读取，以及部分读取失败时
+仅隔离失败接收区。真实 Qwen3-0.6B 的 AR 与 target-KV DSpark eager/graph
+四组用例通过，最终独立进程使用 23 次 payload batch 读回 23 份快照、418 个
+tensor 对象，共 16,960,108 字节。每份快照另行读取 manifest；这不替代训练端
+按 anchor 选择 KV 页的 loader。复现和证据见
+[批量 RDMA 记录](experiments/BATCH_STORE_RDMA.md)。本次 P/D 交接仍使用 TCP，
+不据此声称吞吐提升、生产保留策略或训练质量已验收。
+
 ### 8.2 RDMA 路径
 
 ```text

@@ -30,7 +30,7 @@ it does not redefine the goal as the modules already implemented.
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
-| Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batch writes and reads pass TCP correctness/fault tests, including post-close publication recovery, without a measured serving speedup; batch RDMA and production retention remain open |
+| Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including native batches and complete reads after producer exit; TCP fault/recovery and RDMA partial-read ownership checks pass, without a measured serving speedup; production retention remains open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
@@ -4633,6 +4633,45 @@ reproduction. The 28-artifact archive at
 This is a transport API, not the SpecForge manifest/window loader or receive
 pool. TCP synthetic snapshots and test Catalogs do not certify batch RDMA,
 production retention, serving throughput or draft training quality.
+
+## Native Store Batches Over Remote RDMA
+
+The dedicated RDMA lane now validates native write retries and reads against
+the real SDK on separate physical nodes. `probe --batch` writes three views of
+one registered 4 MiB Host arena, verifies existing objects, writes only missing
+keys and checks hard pinning. The writer closes and its source is overwritten
+before a new client reads the payload. A mixed existing/missing read retains
+only the failed 256-byte destination; digest rejection retains no additional
+completed destinations. Bounded verification succeeds and normal lease-aware
+removal deletes only the probe's three keys.
+
+The online AR and static target-KV DSpark eager/graph cases now require one
+native payload read per snapshot in each independent post-producer reader.
+Existing online source comparisons and invalid-request exclusion remain active.
+
+- All four Qwen3-0.6B cases pass in 653.466 seconds, with zero quarantined
+  capture Host slots in every case. Cumulative post-exit reads cover 5, 10, 17
+  and 23 snapshots, including the draft seed.
+- A final fresh reader validates all 23 snapshots, 418 tensor objects and
+  16,960,108 payload bytes, issuing exactly 23 native payload read batches.
+  Successful reads leave no registered or quarantined receive buffers.
+- Producer node208 and Store node199 use explicit RDMA on `mlx5_00`, GID index
+  3, with local Store memcpy disabled. Only the remote Store mounts a segment;
+  all writer/reader clients have `global_segment_size=0`.
+- All 5,031 Python files match the frozen tested source. Every supervised
+  command exits zero. Store/Master and serving processes stop before deletion,
+  both temporary GPUs have no compute processes, and temporary pods are absent.
+  The resident worker and idle task remain live with an empty experiment queue.
+
+The [runbook](experiments/BATCH_STORE_RDMA.md) and
+[evidence JSON](experiments/batch-store-rdma.json) retain the transport probe,
+runtime commands and resource constraints. The 36-artifact archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/batch-rdma-20261003` has manifest SHA-256
+`a54754fc3881dd6da33564e1bca2a34bc37ce123ea7cd66c90c8f2ce1a02d844`.
+This run validates the remote Store path; P and D share one GPU and transfer
+their KV using TCP. It uses the HTTP test Catalog and an untrained draft, so
+production retention, training quality, saturated bandwidth and serving SLOs
+remain separate acceptance work.
 
 ## Next Implementation
 

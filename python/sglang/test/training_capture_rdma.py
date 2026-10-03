@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import msgspec
 import torch
@@ -20,7 +21,11 @@ from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
     TransportError,
 )
-from sglang.srt.training_capture.protocol import digest_bytes, tensor_bytes
+from sglang.srt.training_capture.protocol import (
+    ContractError,
+    digest_bytes,
+    tensor_bytes,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.pd_capture_runtime import PDCaptureRuntimeBase
 from sglang.test.training_capture_utils import read_snapshot
@@ -73,6 +78,7 @@ class RDMACaptureRuntimeBase(PDCaptureRuntimeBase):
                 str(publications),
                 "--output",
                 str(output),
+                "--batch",
             ],
             check=True,
             timeout=120,
@@ -87,6 +93,7 @@ class RDMACaptureRuntimeBase(PDCaptureRuntimeBase):
             },
         )
         self.assertTrue(all(row["tensor_bytes"] > 0 for row in snapshots))
+        self.assertTrue(all(row["native_read_batches"] == 1 for row in snapshots))
 
 
 def free_port(host):
@@ -162,6 +169,8 @@ def serve(args):
 
 def probe(args):
     setup = load_setup(args.setup)
+    if args.batch:
+        return batch_probe(setup)
     key = "rdma-probe/" + uuid.uuid4().hex
     source = torch.arange(1 << 20, dtype=torch.uint8).pin_memory()
     digest = digest_bytes(tensor_bytes(source))
@@ -194,14 +203,109 @@ def probe(args):
         reader.close()
 
 
+def batch_probe(setup):
+    prefix = "rdma-batch-probe/" + uuid.uuid4().hex
+    source = torch.arange(4 << 20, dtype=torch.uint8).pin_memory()
+    views = [source[: 1 << 20], source[1 << 20 : 3 << 20], source[3 << 20 :]]
+    objects = [
+        (f"{prefix}/{index}", tensor, digest_bytes(tensor_bytes(tensor)))
+        for index, tensor in enumerate(views)
+    ]
+    descriptors = [
+        (key, list(tensor.shape), tensor.dtype, digest)
+        for key, tensor, digest in objects
+    ]
+    writer = MooncakeSnapshotStore.connect(setup)
+    writer.client = MagicMock(wraps=writer.client)
+    try:
+        writer.register(source)
+        writer.put_registered_batch(objects[:1])
+        writer.put_registered_batch(objects)
+        writer.put_registered_batch(objects)
+        assert writer.client.batch_put_from.call_count == 2
+        assert writer.client.batch_get_into.call_count == 2
+        assert [
+            call.args[0] for call in writer.client.batch_put_from.call_args_list
+        ] == [[objects[0][0]], [objects[1][0], objects[2][0]]]
+        assert all(
+            call.args[3].with_hard_pin
+            for call in writer.client.batch_put_from.call_args_list
+        )
+        assert not writer.quarantined
+    finally:
+        writer.close()
+    source.zero_()
+    reader = MooncakeSnapshotStore.connect(setup)
+    reader.client = MagicMock(wraps=reader.client)
+    try:
+        outputs = reader.get_tensors(descriptors)
+        assert sum(out.nbytes for out in outputs) == source.nbytes
+        assert reader.client.batch_get_into.call_count == 1
+        assert not reader.registered and not reader.quarantined
+        # A missing key must not hide successful completions in the same RPC.
+        missing = (prefix + "/missing", [256], torch.uint8, digest_bytes(bytes(256)))
+        try:
+            reader.get_tensors([descriptors[0], missing, descriptors[2]])
+        except TransportError:
+            pass
+        else:
+            raise AssertionError("missing batch object was accepted")
+        assert len(reader.quarantined) == 1
+        assert set(reader.registered) == reader.quarantined
+        assert sum(tensor.nbytes for tensor in reader.registered.values()) == 256
+        retained = set(reader.quarantined)
+        wrong_digest = (*descriptors[0][:3], "0" * 64)
+        try:
+            reader.get_tensors([wrong_digest, descriptors[1]])
+        except ContractError:
+            pass
+        else:
+            raise AssertionError("incorrect batch digest was accepted")
+        assert set(reader.registered) == retained == reader.quarantined
+        reader.verify_tensors(descriptors)
+        assert reader.client.batch_get_into.call_count == 4
+        # Delete only this probe's keys after their normal server read leases end.
+        deadline = time.monotonic() + 15
+        for key, _, _, _ in descriptors:
+            while (rc := reader.client.remove(key, force=False)) == -706:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Batch probe read leases did not expire")
+                time.sleep(0.05)
+            if rc != 0:
+                raise TransportError(f"Batch probe cleanup failed: status={rc}")
+        result = {
+            "payload_bytes": source.nbytes,
+            "objects": len(objects),
+            "native_write_batches": writer.client.batch_put_from.call_count,
+            "immutable_retry_read_batches": writer.client.batch_get_into.call_count,
+            "reader_batches": reader.client.batch_get_into.call_count,
+            "partial_failure_quarantined_bytes": 256,
+            "source_closed_and_overwritten": True,
+            "keys_removed_without_force": len(objects),
+        }
+    finally:
+        reader.close()
+    assert not reader.registered and not reader.quarantined
+    print(json.dumps({"rdma_batch_probe": result}), flush=True)
+
+
 def read(args):
     setup = load_setup(args.setup)
     publications = json.loads(Path(args.publications).read_text())
     reader = MooncakeSnapshotStore.connect(setup)
+    if args.batch:
+        reader.client = MagicMock(wraps=reader.client)
     try:
         rows = []
         for publication in publications:
-            manifest, _ = read_snapshot(reader, publication)
+            before = reader.client.batch_get_into.call_count if args.batch else 0
+            manifest, _ = read_snapshot(reader, publication, batch=args.batch)
+            calls = (
+                reader.client.batch_get_into.call_count - before if args.batch else 0
+            )
+            if args.batch:
+                assert calls == 1
+                assert not reader.registered and not reader.quarantined
             rows.append(
                 {
                     "sample_id": manifest.sample_id,
@@ -209,6 +313,7 @@ def read(args):
                     "capture_mode": manifest.provenance.capture_mode,
                     "objects": len(manifest.objects),
                     "tensor_bytes": manifest.total_tensor_bytes,
+                    "native_read_batches": calls,
                 }
             )
         result = {"hostname": socket.gethostname(), "snapshots": rows}
@@ -229,10 +334,12 @@ def main():
     serving.add_argument("--lifetime", type=float, default=1800)
     probing = commands.add_parser("probe")
     probing.add_argument("--setup", required=True)
+    probing.add_argument("--batch", action="store_true")
     reading = commands.add_parser("read")
     reading.add_argument("--setup", required=True)
     reading.add_argument("--publications", required=True)
     reading.add_argument("--output", required=True)
+    reading.add_argument("--batch", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     {"serve": serve, "probe": probe, "read": read}[args.command](args)

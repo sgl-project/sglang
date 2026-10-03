@@ -59,7 +59,7 @@ class CaptureTestRequest(SimpleNamespace):
         return self.output_ids[: self.finished_len]
 
 
-def read_snapshot(store, publication):
+def read_snapshot(store, publication, *, batch=False):
     data = store.get_tensor(
         publication["manifest_key"],
         [publication["manifest_nbytes"]],
@@ -67,10 +67,21 @@ def read_snapshot(store, publication):
         publication["manifest_sha256"],
     )
     manifest = decode_manifest(bytes(tensor_bytes(data)))
-    tensors = {
-        obj.key: store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
-        for obj in manifest.objects
-    }
+    if batch:
+        payloads = store.get_tensors(
+            [
+                (obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+                for obj in manifest.objects
+            ]
+        )
+        tensors = dict(
+            zip((obj.key for obj in manifest.objects), payloads, strict=True)
+        )
+    else:
+        tensors = {
+            obj.key: store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+            for obj in manifest.objects
+        }
     validate_tensors(manifest, tensors)
     packed = {
         obj.name: tensors[obj.key] for obj in manifest.objects if obj.kind == "aux"

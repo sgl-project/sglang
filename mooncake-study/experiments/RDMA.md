@@ -66,11 +66,18 @@ Run the probe first on A. It writes a registered 1 MiB buffer, closes the writer
 then checks the digest using a new client. Cleanup waits for the normal Store
 read lease to expire and uses `remove(force=False)` on its own unique key.
 
+`probe --batch` instead writes three views of a registered 4 MiB arena. It
+requires native batch calls for a new write, a mixed existing/missing write and
+an identical retry. After closing the writer and clearing its source, a fresh
+reader checks native batch reads, a mixed successful/missing-key result, digest
+rejection and bounded verification. Only the missing key's 256-byte destination
+is retained, until reader close. Both probes delete only their unique keys.
+
 ```bash
 env MC_STORE_MEMCPY=0 MC_GID_INDEX=3 MC_TE_METRIC=1 \
   MC_TE_METRIC_INTERVAL_SECONDS=1 \
   python -m sglang.test.training_capture_rdma probe \
-  --setup /tmp/rdma-client.json
+  --setup /tmp/rdma-client.json --batch
 
 env MC_STORE_MEMCPY=0 MC_GID_INDEX=3 MC_TE_METRIC=1 \
   MC_TE_METRIC_INTERVAL_SECONDS=1 \
@@ -86,7 +93,15 @@ prefill, prefix reuse, one-token replies, real decode batches and cancellation.
 Missing/stale PD teacher handoffs must fail capture without failing generation.
 After each case, serving processes exit and a separate interpreter reads every
 published manifest and tensor through RDMA. It validates object hashes and
-coverage, so producer memory cannot provide the retrieved values.
+coverage, so producer memory cannot provide the retrieved values. This reader
+now passes `read --batch` and requires exactly one native payload read per
+snapshot, no leftover registrations and no quarantine. The manifest is read
+separately. Omitting `--batch` from the standalone reader retains the single-read
+mode. Batched snapshot reads require the complete sample to fit the receive
+budget; this correctness lane is not the trainer's selective prefix loader.
+
+The [batch RDMA experiment](BATCH_STORE_RDMA.md) records the native transport
+and post-producer validation against the current adapter.
 
 The CI registration is explicitly disabled in ordinary single-node runners;
 the environment variable enables this dedicated manual lane. Retain the test
