@@ -119,10 +119,38 @@ def test_adjust_embedding_length_crops_overlong_embedding():
     torch.testing.assert_close(result, embedding[-3:], rtol=0, atol=0)
 
 
-def test_adjust_embedding_length_rejects_short_embedding():
+def test_adjust_embedding_length_pads_short_embedding_by_default():
+    embedding = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    logger = Mock()
+
+    result = mm_utils._adjust_embedding_length(embedding, 5, logger)
+
+    assert result.shape == (5, 4)
+    torch.testing.assert_close(result[:2], embedding)
+    torch.testing.assert_close(result[2:], torch.zeros(3, 4, dtype=torch.float32))
+    logger.error.assert_called_once()
+    assert "Padding missing 3 tokens with zeros" in logger.error.call_args[0][0]
+
+
+def test_adjust_embedding_length_pads_short_3d_embedding():
+    embedding = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    logger = Mock()
+
+    result = mm_utils._adjust_embedding_length(embedding, 4, logger)
+
+    assert result.shape == (4, 3, 4)
+    torch.testing.assert_close(result[:2], embedding)
+    torch.testing.assert_close(result[2:], torch.zeros(2, 3, 4, dtype=torch.float32))
+    logger.error.assert_called_once()
+
+
+def test_adjust_embedding_length_rejects_short_embedding_when_disabled():
     embedding = torch.zeros(2, 4)
 
-    with pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"):
+    with (
+        envs.SGLANG_MM_PAD_SHORT_EMBEDDING.override(False),
+        pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"),
+    ):
         mm_utils._adjust_embedding_length(embedding, 3, Mock())
 
 
