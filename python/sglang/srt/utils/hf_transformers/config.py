@@ -165,6 +165,25 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_got_ocr2_config(model, revision: Optional[str], **kwargs):
+    """Recognize `stepfun-ai/GOT-OCR2_0` before `AutoConfig` sees its `auto_map`.
+
+    `AutoConfig` would resolve the map to `modeling_GOT.py` and reject it over a
+    statically-scanned `import verovio`, so match the raw config dict first and
+    build our own class. Runs before the failing `AutoConfig` path; leaves
+    `--trust-remote-code` usable for the checkpoint's tiktoken tokenizer.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("model_type") != "GOT":
+        return None
+
+    from sglang.srt.configs.got_ocr2 import GOTConfig
+
+    return GOTConfig.from_pretrained(model, revision=revision, **kwargs)
+
+
 def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     """Recognize the original state-spaces Mamba-1 checkpoints.
 
@@ -218,6 +237,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_got_ocr2_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,

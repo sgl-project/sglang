@@ -21,7 +21,7 @@ from typing import (
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessor
+from transformers import BaseImageProcessor, PreTrainedTokenizerBase
 
 from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
@@ -207,7 +207,13 @@ def _tokenizer_of(processor):
     ``_processor`` rather than one that wraps a tokenizer. Every path that
     resolves a tokenizer -- construction and per-worker processor clones alike --
     goes through here, so a clone cannot resolve differently from the original.
+
+    A tokenizer is returned as-is before the attribute is consulted: tiktoken
+    backed ones (GOT-OCR2_0's ``QWenTokenizer``) keep their ``Encoding`` in
+    ``.tokenizer``, which is not callable and would be picked up here.
     """
+    if isinstance(processor, PreTrainedTokenizerBase):
+        return processor
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
