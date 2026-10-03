@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Responses request → chat request. `Value`-based so unconsumed fields
-//! (sglang extensions) pass through; item merging follows dynamo.
+//! (sglang extensions) pass through.
 
 use std::collections::HashMap;
 
@@ -13,11 +13,10 @@ use serde_json::{json, Map, Value};
 pub struct EchoContext {
     pub model: String,
     pub fields: Map<String, Value>,
-    /// Chat function name → declared tool, for namespaced and custom tools only.
     pub tools: ToolMap,
 }
 
-/// A namespaced or `custom` tool, flattened to one chat function.
+/// A namespaced or `custom` tool, keyed in [`ToolMap`] by its chat function name.
 #[derive(Debug, Clone)]
 pub struct ToolRef {
     pub namespace: Option<String>,
@@ -86,7 +85,7 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         Some(_) => return Err("`model` must be a string".into()),
     };
 
-    reject_stateful(&req)?;
+    reject_unsupported(&req)?;
 
     let stream = match req.get("stream") {
         None | Some(Value::Null) => false,
@@ -167,8 +166,8 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     })
 }
 
-/// The router stores nothing, so stateful features are refused.
-fn reject_stateful(req: &Map<String, Value>) -> Result<(), String> {
+/// Refuses what the router cannot serve: stored state and logprobs.
+fn reject_unsupported(req: &Map<String, Value>) -> Result<(), String> {
     let set = |k: &str| req.get(k).is_some_and(|v| !v.is_null());
     if set("previous_response_id") {
         return Err(
@@ -189,6 +188,9 @@ fn reject_stateful(req: &Map<String, Value>) -> Result<(), String> {
     }
     if set("prompt") {
         return Err("`prompt` (stored prompt templates) is not supported".into());
+    }
+    if req.get("top_logprobs").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        return Err("`top_logprobs` is not supported".into());
     }
     Ok(())
 }
@@ -503,6 +505,15 @@ fn convert_tools(tools: &Value) -> Result<(Vec<Value>, ToolMap), String> {
             )?;
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    for name in out
+        .iter()
+        .filter_map(|t| t.pointer("/function/name")?.as_str())
+    {
+        if !seen.insert(name) {
+            return Err(format!("tools: more than one tool is named `{name}`"));
+        }
+    }
     Ok((out, map))
 }
 
@@ -631,23 +642,25 @@ fn convert_text_format(text: &Value) -> Result<Option<Value>, String> {
     }
 }
 
+/// Reasoning tiers the engine accepts, passed through unchanged.
+const EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 fn convert_reasoning_effort(reasoning: &Value) -> Result<Option<&'static str>, String> {
     let Value::Object(r) = reasoning else {
         return Err("`reasoning` must be an object".into());
     };
     match r.get("effort") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(e)) => match e.as_str() {
-            "none" => Ok(Some("none")),
-            "minimal" | "low" => Ok(Some("low")),
-            "medium" => Ok(Some("medium")),
-            "high" => Ok(Some("high")),
-            "xhigh" | "max" => Ok(Some("max")),
-            other => Err(format!(
-                "`reasoning.effort` `{other}` is invalid; expected one of none, minimal, low, \
-                 medium, high, xhigh"
-            )),
-        },
+        Some(Value::String(e)) => EFFORTS
+            .iter()
+            .find(|t| *t == e)
+            .map(|t| Some(*t))
+            .ok_or_else(|| {
+                format!(
+                    "`reasoning.effort` `{e}` is invalid; expected one of {}",
+                    EFFORTS.join(", ")
+                )
+            }),
         Some(_) => Err("`reasoning.effort` must be a string".into()),
     }
 }
@@ -845,7 +858,7 @@ mod tests {
             json!({"type": "json_schema", "json_schema": {"name": "s",
                    "schema": {"type": "object"}, "strict": true}})
         );
-        assert_eq!(c["reasoning_effort"], "max");
+        assert_eq!(c["reasoning_effort"], "xhigh");
         assert_eq!(c["max_completion_tokens"], 64);
         assert!(c.get("max_output_tokens").is_none());
         assert!(c.get("text").is_none());
@@ -903,6 +916,17 @@ mod tests {
             (
                 json!({"model": "m", "input": "x", "reasoning": {"effort": "huge"}}),
                 "invalid",
+            ),
+            (
+                json!({"model": "m", "input": "x", "top_logprobs": 2}),
+                "top_logprobs",
+            ),
+            (
+                json!({"model": "m", "input": "x", "tools": [
+                    {"type": "function", "name": "mcp__fs__read"},
+                    {"type": "namespace", "name": "mcp__fs__",
+                     "tools": [{"type": "function", "name": "read"}]}]}),
+                "more than one tool",
             ),
         ] {
             let err = to_chat(req.clone()).expect_err(&req.to_string());

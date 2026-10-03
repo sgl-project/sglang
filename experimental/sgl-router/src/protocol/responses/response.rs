@@ -6,8 +6,8 @@
 use serde_json::Value;
 
 use super::{
-    call_item, message_item, new_id, now_secs, reasoning_item, response_object,
-    set_incomplete_reason, usage_from_chat, EchoContext, Finish,
+    call_item, message_item, new_id, now_secs, reasoning_item, response_object, usage_from_chat,
+    EchoContext, Finish,
 };
 
 /// Output order: reasoning, message, function calls.
@@ -19,10 +19,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str),
     );
-    let item_status = match finish {
-        Finish::Completed => "completed",
-        Finish::Incomplete(_) => "incomplete",
-    };
+    let item_status = finish.item_status();
 
     let mut output = Vec::new();
     let str_field = |k: &str| {
@@ -83,7 +80,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
         output,
         usage_from_chat(chat.get("usage")),
     );
-    set_incomplete_reason(&mut resp, finish);
+    finish.annotate(&mut resp);
     resp
 }
 
@@ -197,5 +194,18 @@ mod tests {
         assert_eq!(out[1]["namespace"], "mcp__fs__");
         assert_eq!(out[2]["name"], "shell");
         assert!(out[2].get("namespace").is_none());
+    }
+
+    #[test]
+    fn engine_abort_is_failed() {
+        let r = chat_to_response(
+            &json!({"choices": [{"finish_reason": "abort", "message": {"role": "assistant",
+                    "content": "partial"}}]}),
+            &echo(),
+        );
+        assert_eq!(r["status"], "failed");
+        assert_eq!(r["error"]["code"], "server_error");
+        assert_eq!(r["output"][0]["status"], "incomplete");
+        assert!(r["completed_at"].is_null());
     }
 }

@@ -9,7 +9,7 @@ pub mod stream;
 
 use serde_json::{json, Map, Value};
 
-pub use request::{to_chat, Converted, EchoContext, ToolMap};
+pub(crate) use request::{to_chat, EchoContext, ToolMap};
 
 pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
@@ -48,10 +48,13 @@ pub(crate) fn usage_from_chat(usage: Option<&Value>) -> Value {
     })
 }
 
+/// How a finished generation ends the Response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Finish {
     Completed,
     Incomplete(&'static str),
+    /// The engine aborted the request (`finish_reason: "abort"`).
+    Aborted,
 }
 
 impl Finish {
@@ -59,6 +62,7 @@ impl Finish {
         match finish_reason {
             Some("length") => Finish::Incomplete("max_output_tokens"),
             Some("content_filter") => Finish::Incomplete("content_filter"),
+            Some("abort") => Finish::Aborted,
             _ => Finish::Completed,
         }
     }
@@ -67,8 +71,38 @@ impl Finish {
         match self {
             Finish::Completed => "completed",
             Finish::Incomplete(_) => "incomplete",
+            Finish::Aborted => "failed",
         }
     }
+
+    pub(crate) fn item_status(self) -> &'static str {
+        match self {
+            Finish::Completed => "completed",
+            _ => "incomplete",
+        }
+    }
+
+    /// The terminal stream event.
+    pub(crate) fn event(self) -> &'static str {
+        match self {
+            Finish::Completed => "response.completed",
+            Finish::Incomplete(_) => "response.incomplete",
+            Finish::Aborted => "response.failed",
+        }
+    }
+
+    /// Sets `incomplete_details` or `error` on a finished Response.
+    pub(crate) fn annotate(self, resp: &mut Value) {
+        match self {
+            Finish::Completed => {}
+            Finish::Incomplete(reason) => resp["incomplete_details"] = json!({ "reason": reason }),
+            Finish::Aborted => resp["error"] = failed_error("generation was aborted"),
+        }
+    }
+}
+
+pub(crate) fn failed_error(message: &str) -> Value {
+    json!({"code": "server_error", "message": message})
 }
 
 pub(crate) fn response_object(
@@ -93,13 +127,7 @@ pub(crate) fn response_object(
     );
     m.insert("status".into(), status.into());
     m.insert("error".into(), Value::Null);
-    m.insert(
-        "incomplete_details".into(),
-        match status {
-            "incomplete" => json!({"reason": "max_output_tokens"}),
-            _ => Value::Null,
-        },
-    );
+    m.insert("incomplete_details".into(), Value::Null);
     m.insert("model".into(), echo.model.clone().into());
     m.insert("output".into(), Value::Array(output));
     m.insert("usage".into(), usage);
@@ -107,12 +135,6 @@ pub(crate) fn response_object(
         m.insert(k.clone(), v.clone());
     }
     Value::Object(m)
-}
-
-pub(crate) fn set_incomplete_reason(resp: &mut Value, finish: Finish) {
-    if let Finish::Incomplete(reason) = finish {
-        resp["incomplete_details"] = json!({ "reason": reason });
-    }
 }
 
 pub(crate) fn reasoning_item(id: &str, text: &str, status: &str) -> Value {
@@ -176,7 +198,7 @@ pub(crate) fn custom_input(arguments: &str) -> String {
 }
 
 /// Re-wrap sglang's flat error body into `{"error": {...}}`; `None` = keep.
-pub fn wrap_error_body(body: &[u8], status: u16) -> Option<Vec<u8>> {
+pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Option<Vec<u8>> {
     let v: Value = serde_json::from_slice(body).ok()?;
     if v.get("error").is_some_and(Value::is_object) {
         return None;
@@ -185,14 +207,7 @@ pub fn wrap_error_body(body: &[u8], status: u16) -> Option<Vec<u8>> {
     let typ = v
         .get("type")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if (400..500).contains(&status) {
-                "invalid_request_error".into()
-            } else {
-                "server_error".into()
-            }
-        });
+        .unwrap_or_else(|| crate::server::error::openai_error_type(status));
     let code = v.get("code").cloned().unwrap_or(Value::Null);
     let param = v.get("param").cloned().unwrap_or(Value::Null);
     serde_json::to_vec(&json!({

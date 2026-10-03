@@ -9,17 +9,18 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Response};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 
 use crate::protocol::responses::{
     self, response::chat_to_response, stream::ResponsesStream, EchoContext,
 };
-use crate::protocol::transduce_body;
+use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::chat_completions;
 
-pub(super) const MAX_REPLY_BYTES: usize = crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
+const MAX_REPLY_BYTES: usize = crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 
 pub(crate) async fn responses(
     State(ctx): State<Arc<AppContext>>,
@@ -55,7 +56,10 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "responses: failed to read upstream reply");
-            return rebuild(parts, error_json(502, "failed to read the upstream reply"));
+            return ApiError::UpstreamStatus {
+                status: parts.status,
+            }
+            .into_response();
         }
     };
 
@@ -74,33 +78,19 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
         }
         Err(e) => {
             tracing::warn!(error = %e, "responses: upstream reply is not JSON");
-            let mut parts = parts;
-            parts.status = axum::http::StatusCode::BAD_GATEWAY;
-            rebuild(
-                parts,
-                error_json(502, "upstream reply is not a valid chat completion"),
-            )
+            ApiError::UpstreamStatus {
+                status: parts.status,
+            }
+            .into_response()
         }
     }
 }
 
-pub(super) fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {
+fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
     Response::from_parts(parts, Body::from(body))
-}
-
-fn error_json(status: u16, message: &str) -> Vec<u8> {
-    let typ = if (400..500).contains(&status) {
-        "invalid_request_error"
-    } else {
-        "server_error"
-    };
-    serde_json::to_vec(&serde_json::json!({
-        "error": {"message": message, "type": typ, "param": null, "code": status}
-    }))
-    .expect("serialize error")
 }

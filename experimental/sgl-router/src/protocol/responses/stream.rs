@@ -7,10 +7,10 @@
 use serde_json::{json, Value};
 
 use super::{
-    call_item, custom_input, message_item, new_id, now_secs, output_text_part, reasoning_item,
-    response_object, set_incomplete_reason, usage_from_chat, EchoContext, Finish,
+    call_item, custom_input, failed_error, message_item, new_id, now_secs, output_text_part,
+    reasoning_item, response_object, usage_from_chat, EchoContext, Finish,
 };
-use crate::protocol::{data_payload, write_event, LineBuffer, SseTransducer};
+use crate::protocol::sse::{data_payload, write_event, LineBuffer, SseTransducer};
 
 enum Open {
     Reasoning {
@@ -282,7 +282,7 @@ impl ResponsesStream {
                            "part": output_text_part(&text)}),
                     out,
                 );
-                (index, message_item(&id, &text, finish.status()))
+                (index, message_item(&id, &text, finish.item_status()))
             }
             Open::Function {
                 id,
@@ -323,7 +323,7 @@ impl ResponsesStream {
     fn emit_failed(&mut self, message: &str, out: &mut Vec<u8>) {
         self.ensure_started(out);
         let mut resp = self.response("failed");
-        resp["error"] = json!({"code": "server_error", "message": message});
+        resp["error"] = failed_error(message);
         self.emit("response.failed", json!({ "response": resp }), out);
         self.terminal = true;
     }
@@ -386,13 +386,9 @@ impl SseTransducer for ResponsesStream {
         }
         let finish = Finish::from_chat(self.finish_reason.as_deref());
         self.close_open(finish, &mut out);
-        let event = match finish {
-            Finish::Completed => "response.completed",
-            Finish::Incomplete(_) => "response.incomplete",
-        };
         let mut resp = self.response(finish.status());
-        set_incomplete_reason(&mut resp, finish);
-        self.emit(event, json!({ "response": resp }), &mut out);
+        finish.annotate(&mut resp);
+        self.emit(finish.event(), json!({ "response": resp }), &mut out);
         self.terminal = true;
         out
     }
@@ -622,5 +618,18 @@ mod tests {
         let item = &evs.last().unwrap().1["response"]["output"][0];
         assert_eq!(item["type"], "custom_tool_call");
         assert_eq!(item["input"], "*** P");
+    }
+
+    #[test]
+    fn engine_abort_ends_with_response_failed() {
+        let evs = run(&[
+            chunk(json!({"content": "part"}), None),
+            chunk(json!({}), Some("abort")),
+        ]);
+        assert_framing(&evs);
+        let (event, data) = evs.last().unwrap();
+        assert_eq!(event, "response.failed");
+        assert_eq!(data["response"]["status"], "failed");
+        assert_eq!(data["response"]["output"][0]["status"], "incomplete");
     }
 }
