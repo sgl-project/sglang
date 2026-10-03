@@ -68,7 +68,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
-        enable_dedup: bool = False,
     ) -> None:
         self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
@@ -80,7 +79,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
-        self._enable_dedup = enable_dedup
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -102,7 +100,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
-        self.begin_cuda_graph_capture(enable_dedup=self._enable_dedup)
+        self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
                 yield

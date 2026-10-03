@@ -19,7 +19,7 @@
 
 import os
 from collections.abc import Iterable
-from functools import partial
+from functools import lru_cache, partial
 
 import torch
 from torch import nn
@@ -62,7 +62,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -86,6 +90,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
+    is_sm120,
     make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -175,6 +180,58 @@ def _get_or_create_alt_stream(device_module):
         else:
             _alt_stream = device_module.Stream()
     return _alt_stream
+
+
+@lru_cache(maxsize=None)
+def _prefill_shared_expert_pool(device_index: int):
+    # Shared experts overlap the main graph, so their intermediates must use
+    # a separate pool. Calls on the shared stream are ordered across layers.
+    with torch.cuda.device(device_index):
+        return torch.cuda.graph_pool_handle()
+
+
+class _PrefillSharedExpertCall:
+    def __init__(self, stream):
+        self.graph = None
+        self.stream = stream
+        self.ready = torch.cuda.Event(external=True)
+        self.done = torch.cuda.Event(external=True)
+        self.output = None
+
+    def launch(self, module, hidden_states):
+        main_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self.stream):
+            if self.graph is None:
+                # BCG warmup follows the same dependencies, without capture.
+                self.ready.wait()
+                self.output = module(hidden_states)
+                self.done.record()
+                self.output.record_stream(main_stream)
+            else:
+                self.graph.replay()
+        return self.output
+
+
+def _capture_prefill_shared_expert(module, hidden_states, call):
+    call.graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(
+        call.graph,
+        pool=_prefill_shared_expert_pool(hidden_states.device.index),
+        stream=call.stream,
+    ):
+        call.ready.wait()
+        call.output = module(hidden_states)
+        call.done.record()
+    # The ready record belongs to the preceding main-stream graph. Do not
+    # replay here: that graph has only been captured, not launched yet.
+    return call.output
+
+
+@eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
+def _launch_prefill_shared_expert(module, hidden_states, call):
+    # BCG retains this call, its graph, events and output until graph cleanup.
+    # A replay launches on the same explicit stream for every layer.
+    return call.launch(module, hidden_states)
 
 
 def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
@@ -304,11 +361,25 @@ class NemotronHMoE(nn.Module):
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         import os
 
         if os.environ.get("SGLANG_NEMOTRON_DISABLE_MOE_OVERLAP", "0") == "1":
             return self._forward_core_normal(hidden_states)
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and hidden_states.shape == (1024, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and self.tp_size == self.ep_size == 1
+            and self.n_routed_experts == 512
+            and self.moe_hidden_size == 1024
+            and self.shared_experts is not None
+            and is_in_breakable_cuda_graph()
+            and is_sm120()
+        ):
+            return self._forward_core_prefill_overlap(hidden_states)
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
@@ -361,6 +432,27 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _forward_core_prefill_overlap(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # A multi-stream graph per hybrid segment creates one internal stream
+        # per executable. Keep each graph linear and launch shared experts on
+        # one explicit stream, preserving overlap with the routed experts.
+        call = _PrefillSharedExpertCall(_get_or_create_alt_stream(self.device_module))
+        call.ready.record()
+        shared_output = _launch_prefill_shared_expert(
+            self.shared_experts, hidden_states, call
+        )
+        router_logits = torch.mm(
+            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+        )
+        topk_output = self.topk(hidden_states, router_logits)
+        if self.use_latent_moe:
+            hidden_states = self._apply_fc1_latent_proj(hidden_states)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        call.done.wait()
+        return final_hidden_states, shared_output
+
     def _apply_latent_projection(
         self,
         final_hidden_states: torch.Tensor,
@@ -380,11 +472,14 @@ class NemotronHMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
         # MoE runner / topk), so final_hidden_states is already scaled.
-        final_hidden_states, shared_output = self._forward_core(hidden_states)
+        final_hidden_states, shared_output = self._forward_core(
+            hidden_states, forward_batch
+        )
 
         if self.use_latent_moe:
             final_hidden_states = self._apply_latent_projection(
@@ -406,6 +501,11 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
+    def _forward_mixer(self, hidden_states, forward_batch):
+        if isinstance(self.mixer, NemotronHMoE):
+            return self.mixer.forward(hidden_states, forward_batch)
+        return self.mixer.forward(hidden_states)
+
     def forward(
         self,
         *,
@@ -413,7 +513,7 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ):
         hidden_states = self.boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mixer.forward(hidden_states)
+        hidden_states = self._forward_mixer(hidden_states, forward_batch)
         return self.boundary.finish(hidden_states, forward_batch)
 
 
@@ -804,9 +904,7 @@ class NemotronHModel(nn.Module):
             and _l2_prefetch_stream is not None
             and forward_batch.forward_mode.is_decode()
         ):
-            torch.get_device_module().current_stream().wait_stream(
-                _l2_prefetch_stream
-            )
+            torch.get_device_module().current_stream().wait_stream(_l2_prefetch_stream)
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
