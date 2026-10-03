@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
-import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -15,11 +14,12 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import (
-    CommunicateContext,
-    CommunicateSummableTensorPairFn,
-    ScatterMode,
+from sglang.srt.layers.layer_boundary import (
+    Layout,
+    tbo_split_moves,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -693,20 +693,21 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        if batch.out_cache_loc_virtual is not None:
+            output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
+                start_token_index:end_token_index
+            ]
+        output_dict["out_cache_loc_is_physical"] = batch.out_cache_loc_is_physical
+
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
-        if _is_hip:
-            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-
-            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
-            n_tokens = end_token_index - start_token_index
-            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
             "req_pool_indices",
+            "req_pool_indices_cpu",
             "seq_lens",
             "seq_lens_cpu",
             "extend_seq_lens",
@@ -753,14 +754,18 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "dp_spec_prefill_coordination_applied",
             "return_logprob",
             "can_run_decode_cuda_graph",
+            "can_run_dp_draft_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
+            "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
@@ -811,6 +816,7 @@ class TboForwardBatchPreparer:
                 # The child runs the same forward, so it keeps the parent's
                 # sharding verdict; its counts above are already per-child.
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
+                encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -820,6 +826,9 @@ class TboForwardBatchPreparer:
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                # Children publish no per-rank list of their own; the parent
+                # published the gather sizes before it was split.
+                global_num_tokens_padded_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
@@ -832,6 +841,8 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
+                # The aux packer runs in the parent model forward, not per child.
+                aux_hidden_states_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.
@@ -922,73 +933,67 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 # -------------------------------- Execution ---------------------------------------
 
 
-def model_forward_maybe_tbo(
+def model_forward_stages(
     layers,
     enable_tbo: bool,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
-    input_data_scatter_mode: ScatterMode,
-    residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
 ):
+    """Run stage operations with an independent residual stream per microbatch."""
+    strategy = OperationsStrategy.init_new_tbo(
+        layers, forward_batch.global_forward_mode
+    )
     inputs = dict(
         positions=positions,
         hidden_states=hidden_states,
         forward_batch=forward_batch,
-        residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
-    operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
-    )
-    if enable_tbo:
-        return _model_forward_tbo(
-            inputs=inputs,
-            operations_strategy=operations_strategy,
-            input_data_scatter_mode=input_data_scatter_mode,
-            layer_input_scatter_mode=layer_input_scatter_mode,
-        )
-    else:
-        return _model_forward_non_tbo(inputs, operations_strategy)
+    if not enable_tbo:
+        return execute_operations(inputs, strategy.operations)["hidden_states"]
 
-
-def _model_forward_tbo(
-    inputs,
-    operations_strategy: OperationsStrategy,
-    input_data_scatter_mode: ScatterMode,
-    layer_input_scatter_mode: ScatterMode,
-):
-    inputs_arr = _model_forward_tbo_split_inputs(
+    stream = residual_batch.stream_of(forward_batch)
+    pending = stream.pending
+    hidden_states, residual = stream.export(hidden_states)
+    inputs["hidden_states"] = hidden_states
+    parts = _model_forward_tbo_split_inputs(
         **inputs,
-        input_data_scatter_mode=input_data_scatter_mode,
-        layer_input_scatter_mode=layer_input_scatter_mode,
+        residual=residual,
+        layer_input_rows=layers[0].attn_boundary.incoming_residual_rows,
     )
-    original_hidden_states_len = inputs["hidden_states"].shape[0]
-    del inputs
+    for part in parts:
+        part["hidden_states"], child_stream = ResidualStream.from_handoff(
+            part["hidden_states"],
+            part.pop("residual"),
+            pending.update if pending is not None else None,
+        )
+        part["forward_batch"].residual_stream = child_stream
+
+    original_len = hidden_states.shape[0]
+    forward_batch.residual_stream = None
+    del inputs, pending, stream, hidden_states, residual
 
     context = (
         empty_context()
         if _is_hip
-        else deep_gemm_wrapper.configure_deep_gemm_num_sms(
-            operations_strategy.deep_gemm_num_sms
-        )
+        else deep_gemm_wrapper.configure_deep_gemm_num_sms(strategy.deep_gemm_num_sms)
     )
-
     with context:
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        outputs = execute_overlapped_operations(
+            inputs_arr=parts,
+            operations_arr=[strategy.operations] * 2,
+            delta_stages=[0, strategy.tbo_delta_stages],
         )
-
-    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
-
-
-def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
-    outputs = execute_operations(inputs, operations_strategy.operations)
-    return outputs["hidden_states"], outputs["residual"]
+    for output in outputs:
+        output["residual"] = residual_batch.stream_of(output["forward_batch"])
+    hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(
+        *outputs, original_len
+    )
+    for output in outputs:
+        output["forward_batch"].residual_stream = None
+    return hidden_states
 
 
 def _model_forward_tbo_split_inputs(
@@ -997,20 +1002,14 @@ def _model_forward_tbo_split_inputs(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
-    input_data_scatter_mode: ScatterMode,
-    layer_input_scatter_mode: ScatterMode,
+    layer_input_rows: Layout,
 ) -> List[Dict]:
-    tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
-    context = CommunicateContext.init_new()
+    to_splitter, to_layer_input = tbo_split_moves(layer_input_rows)
 
-    hidden_states, residual = CommunicateSummableTensorPairFn.execute(
-        hidden_states_input_mode=input_data_scatter_mode,
-        residual_input_mode=input_data_scatter_mode,
-        output_mode=tbo_splitter_scatter_mode,
+    hidden_states, residual = to_splitter(
         hidden_states=hidden_states,
         residual=residual,
         forward_batch=forward_batch,
-        context=context,
     )
 
     inputs_arr = _model_forward_tbo_split_inputs_raw(
@@ -1022,14 +1021,10 @@ def _model_forward_tbo_split_inputs(
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
-        hidden_states, residual = CommunicateSummableTensorPairFn.execute(
-            hidden_states_input_mode=tbo_splitter_scatter_mode,
-            residual_input_mode=tbo_splitter_scatter_mode,
-            output_mode=layer_input_scatter_mode,
+        hidden_states, residual = to_layer_input(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            context=context,
         )
         return dict(
             hidden_states=hidden_states,
@@ -1104,6 +1099,18 @@ def _model_forward_filter_inputs(
 
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
+    stream_a, stream_b = output_a["residual"], output_b["residual"]
+    pending_a, pending_b = stream_a.pending, stream_b.pending
+    assert (pending_a is None) == (pending_b is None)
+    update = None
+    if pending_a is not None:
+        assert pending_a.update is pending_b.update
+        update = pending_a.update
+    for output in (output_a, output_b):
+        output["hidden_states"], output["residual"] = output["residual"].export(
+            output["hidden_states"]
+        )
+
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
@@ -1121,7 +1128,8 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
         res[slice(s1, t1)] = value_b[: t1 - s1]
         return res
 
-    return _handle_key("hidden_states"), _handle_key("residual")
+    hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
+    return ResidualStream.from_handoff(hidden, residual, update)
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------

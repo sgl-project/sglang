@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from typing import Optional
 
 import msgspec
@@ -19,7 +18,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -225,14 +223,17 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        self._num_token_non_padded = (
+            torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
+            if enable_num_token_non_padded()
+            else None
+        )
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
     def _base_logits_context(self):
-        if self._dp_moe_sync:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        return draft_tp_context(self._dp_moe_sync)
 
     def propose(
         self,
@@ -345,6 +346,7 @@ class DraftBlockProposer:
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
         idle_batch = ForwardBatch(
             forward_mode=ForwardMode.IDLE,
+            out_cache_loc_is_physical=True,
             batch_size=0,
             input_ids=empty_long,
             req_pool_indices=empty_long,
@@ -414,6 +416,7 @@ class DraftBlockProposer:
         draft_num_tokens = bs * query_token_num
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
@@ -473,18 +476,31 @@ class DraftBlockProposer:
         # The dense DSpark draft still reuses the target batch's graph tier.
         # Set graph eligibility before the DP-MoE-only metadata early return.
         forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+        forward_batch.is_extend_in_batch = batch.is_extend_in_batch
+        forward_batch.dp_spec_prefill_coordination_applied = (
+            batch.dp_spec_prefill_coordination_applied
+        )
+        device = self.draft_model_runner.device
+        num_tokens = forward_batch.input_ids.numel()
+        if self._num_token_non_padded is not None:
+            self._num_token_non_padded.fill_(num_tokens)
+            forward_batch.num_token_non_padded = self._num_token_non_padded
+        forward_batch.num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         # Graph bucket selection uses the raw per-rank request counts.  Keep
         # them separate from global_num_tokens_cpu below, which is scaled into
         # draft-token units for DP/MoE synchronization.
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
-        gnt, gnt_logprob = spec_scale_global_num_tokens(
-            self._draft_block_spec_info,
-            batch.global_num_tokens,
-            batch.global_num_tokens_for_logprob,
-        )
-        device = self.draft_model_runner.device
+        if batch.dp_spec_prefill_coordination_applied:
+            gnt = batch.global_num_tokens
+            gnt_logprob = batch.global_num_tokens_for_logprob
+        else:
+            gnt, gnt_logprob = spec_scale_global_num_tokens(
+                self._draft_block_spec_info,
+                batch.global_num_tokens,
+                batch.global_num_tokens_for_logprob,
+            )
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
         num_token_non_padded = _make_num_token_non_padded(num_tokens, device)

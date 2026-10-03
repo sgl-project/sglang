@@ -96,6 +96,7 @@ def test_prefill_stats_reports_each_request_once():
     adder = SimpleNamespace(
         can_run_list=[miss_req, clean_req],
         log_input_tokens=1,
+        log_replay_tokens=0,
         log_hit_tokens=2,
         reprocessed_log_input_tokens=0,
         reprocessed_log_hit_tokens=0,

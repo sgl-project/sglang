@@ -25,6 +25,7 @@
 
 import logging
 import re
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -38,7 +39,6 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import (
@@ -430,7 +430,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # Resource prepared for vit cuda graph
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.max_context_len = max_context_len
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 
@@ -499,7 +498,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        # The vision rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
         rotary_pos_emb_full = self.rotary_pos_emb(
             torch.arange(max_grid_size, device=self.device)
         )
@@ -721,7 +720,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -768,7 +767,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
