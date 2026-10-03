@@ -259,50 +259,68 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     ):
         """Allocate shared MoE routing buffers for decode or prefill captures.
 
-        max_bs counts tokens. Layers reuse these buffers sequentially.
+        max_bs counts tokens; layers reuse buffers sequentially. The LoRA MoE
+        runner owns its scratch and needs only metadata on the base device.
         """
-        base = moe_layer.base_layer
-        top_k = base.top_k
-        device = moe_layer._quant_info.w13_weight.device
-        num_experts = base.num_experts
-
-        block_size_m = 64
-        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
-        max_num_tokens_padded = (
-            (max_num_tokens_padded + block_size_m - 1) // block_size_m
-        ) * block_size_m
-        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
-
+        include_legacy_kernel_buffers = not moe_layer._lora_runner_backend.is_lora()
+        if include_legacy_kernel_buffers:
+            quant_info = moe_layer._quant_info
+            # Marlin quant info exposes packed weights as w13_qweight.
+            weight = getattr(quant_info, "w13_weight", None)
+            if weight is None:
+                weight = quant_info.w13_qweight
+            device = weight.device
+        else:
+            device = moe_layer.base_layer.w13_weight.device
         buffers = {
-            "sorted_token_ids_lora": torch.empty(
-                (max_loras * max_num_tokens_padded,),
-                device=device,
-                dtype=torch.int32,
-            ),
-            "expert_ids_lora": torch.empty(
-                (max_loras * max_num_m_blocks,),
-                device=device,
-                dtype=torch.int32,
-            ),
-            "num_tokens_post_padded_lora": torch.empty(
-                (max_loras,), device=device, dtype=torch.int32
-            ),
             "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
-            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
-            "cumsum_buffer": torch.zeros(
-                max_loras * (num_experts + 1),
-                dtype=torch.int32,
-                device=device,
-            ),
-            "token_mask": torch.empty(
-                (max_loras * max_bs * top_k,),
-                dtype=torch.int32,
-                device=device,
-            ),
             "token_lora_mapping": torch.full(
                 (max_bs,), -1, dtype=torch.int32, device=device
             ),
         }
+        if include_legacy_kernel_buffers:
+            base = moe_layer.base_layer
+            top_k = base.top_k
+            num_experts = base.num_experts
+
+            block_size_m = 64
+            max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
+            max_num_tokens_padded = (
+                (max_num_tokens_padded + block_size_m - 1) // block_size_m
+            ) * block_size_m
+            max_num_m_blocks = (
+                max_num_tokens_padded + block_size_m - 1
+            ) // block_size_m
+            buffers.update(
+                {
+                    "sorted_token_ids_lora": torch.empty(
+                        (max_loras * max_num_tokens_padded,),
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                    "expert_ids_lora": torch.empty(
+                        (max_loras * max_num_m_blocks,),
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                    "num_tokens_post_padded_lora": torch.empty(
+                        (max_loras,), device=device, dtype=torch.int32
+                    ),
+                    "lora_ids": torch.arange(
+                        max_loras, dtype=torch.int32, device=device
+                    ),
+                    "cumsum_buffer": torch.zeros(
+                        max_loras * (num_experts + 1),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    "token_mask": torch.empty(
+                        (max_loras * max_bs * top_k,),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                }
+            )
 
         if prefill:
             self.prefill_moe_cg_buffers = buffers

@@ -103,6 +103,9 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             get_lora().experts_shared_outer_loras
         )
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.moe_lora_runner_backend = get_moe_runner_backend()
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
@@ -965,9 +968,9 @@ class LoRAManager:
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
 
-    def set_lora_module(self, module_name, module):
+    def set_lora_module(self, module_name, module, **kwargs):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(module, self.lora_backend, **kwargs)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -1107,12 +1110,30 @@ class LoRAManager:
                     )
                     lora_module = module
                 else:
-                    lora_module = self.set_lora_module(module_name, module)
-                    lora_module.experts_shared_outer_loras = (
-                        self.experts_shared_outer_loras
+                    lora_module = self.set_lora_module(
+                        module_name,
+                        module,
+                        experts_shared_outer_loras=self.experts_shared_outer_loras,
+                        max_lora_rank=self.max_lora_rank,
                     )
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
+        # lora_* quant methods leave execution to the LoRA wrapper; reject
+        # target sets that leave every MoE layer without one.
+        backend = getattr(self, "moe_lora_runner_backend", None)
+        modules = list(self.base_model.modules())
+        if (
+            backend is not None
+            and backend.is_lora()
+            and any(isinstance(module, FusedMoE) for module in modules)
+            and not any(isinstance(module, FusedMoEWithLoRA) for module in modules)
+        ):
+            raise ValueError(
+                f"--moe-runner-backend {backend.value} requires "
+                "the LoRA target modules to include gate_up_proj and down_proj; "
+                "this adapter leaves the MoE experts without a runner"
+            )
 
 
 def init_lora_cuda_graph_moe_buffers(
@@ -1121,17 +1142,10 @@ def init_lora_cuda_graph_moe_buffers(
     lora_manager: LoRAManager,
     dtype: torch.dtype,
 ):
-    """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+    """Allocate shared MoE buffers before init_memory_pool() sizes the KV cache.
 
-    Must be called before init_memory_pool() so that memory profiling
-    sees the reduced available memory and sizes KV cache correctly.
-    All MoE LoRA layers share one set of buffers (managed by the
-    lora_backend) since they execute sequentially during forward.
-
-    Phase 2 (dense LoRA batch metadata) is handled later in
-    CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-    because it needs capture-time parameters (max_bs, num_tokens_per_req)
-    that are only available at that stage.
+    Sequential MoE layers reuse these buffers. Dense batch metadata is allocated
+    later by DecodeCudaGraphRunner, which owns the capture-time batch sizes.
     """
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
@@ -1143,11 +1157,17 @@ def init_lora_cuda_graph_moe_buffers(
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
+            # New engines share metadata but allocate their own kernel scratch.
+            include_legacy = not module._lora_runner_backend.is_lora()
             lora_manager.init_cuda_graph_moe_buffers(
-                max_tokens, max_loras, dtype, module
+                max_tokens,
+                max_loras,
+                dtype,
+                module,
             )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_tokens={max_tokens}, max_loras={max_loras})"
+                f"(max_tokens={max_tokens}, max_loras={max_loras}, "
+                f"legacy_kernel_buffers={include_legacy})"
             )
             break
