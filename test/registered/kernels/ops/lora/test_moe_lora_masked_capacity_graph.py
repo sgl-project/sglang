@@ -23,8 +23,8 @@ def _require_cuda():
 
 @pytest.fixture(
     scope="module",
-    params=(("bf16", False),),
-    ids=("bf16",),
+    params=(("bf16", False), ("fp8", False), ("fp8", True)),
+    ids=("bf16", "fp8", "fp8-separate-quant"),
 )
 def masked_provider(request):
     _require_cuda()

@@ -241,6 +241,8 @@ class TestEngineAdmission(CustomTestCase):
     def test_fp8_family_selects_its_vendors(self):
 
         for vendor, rows in (
+            ("cutedsl", "expert_major"),
+            ("cutedsl", "route_major"),
             ("triton", "route_major"),
             # No masked slab domain: decode plans run the route-major
             # provider, same as the Marlin nvfp4 vendor.
@@ -248,7 +250,7 @@ class TestEngineAdmission(CustomTestCase):
         ):
             assert select_provider_cls(rows, "fp8", vendor)
         # Unsupported FP8 vendor choices resolve to the FP8 family default.
-        for absent in ("cutedsl", "marlin", "deepgemm"):
+        for absent in ("marlin", "deepgemm"):
             assert select_provider_cls(
                 "expert_major", "fp8", absent
             ) is select_provider_cls("expert_major", "fp8")

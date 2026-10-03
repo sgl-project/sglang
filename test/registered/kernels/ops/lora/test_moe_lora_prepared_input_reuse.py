@@ -16,7 +16,7 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-
 _E, _H, _I, _K = 4, 128, 128, 2
 
 
-@pytest.mark.parametrize("family", ("bf16",))
+@pytest.mark.parametrize("family", ("bf16", "fp8"))
 @pytest.mark.parametrize("row_mode", ("expert_major", "route_major"))
 @pytest.mark.parametrize("input_buffer_reuse", (False, True))
 def test_down_output_reuses_workspace_rows(family, row_mode, input_buffer_reuse):
@@ -62,10 +62,16 @@ def test_down_output_reuses_workspace_rows(family, row_mode, input_buffer_reuse)
     params=(
         ("bf16", "expert_major", False),
         ("bf16", "route_major", False),
+        ("fp8", "expert_major", False),
+        ("fp8", "expert_major", True),
+        ("fp8", "route_major", False),
     ),
     ids=(
         "bf16-masked",
         "bf16-contiguous",
+        "fp8-masked-fused-quant",
+        "fp8-masked-separate-quant",
+        "fp8-contiguous",
     ),
 )
 def provider_case(request):
