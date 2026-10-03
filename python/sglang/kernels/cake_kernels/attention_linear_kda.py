@@ -16,9 +16,15 @@ FlashInfer entries (contract at ``46340689a5ab``):
   ``use_qk_l2norm_in_kernel`` and ``use_gate_in_kernel`` true, ``lower_bound``
   None or finite negative, packed mode B=1 with ``cu_seqlens``, optional int32
   ``ssm_state_indices`` into a BF16 or FP32 state pool (FP32 only when indexed),
-  BF16 checkpoints every multiple of 16 tokens with int64
-  ``checkpoint_cu_starts``. JIT modules ``flashinfer.jit.cake_kda_decode`` and
-  ``flashinfer.jit.cake_kda``.
+  BF16 checkpoints every ``checkpoint_every_n_tokens`` tokens -- zero or a
+  multiple of 32: every Cake serving binding checks ``% 32 == 0``
+  (``csrc/kda/cake_kda_binding_common.cuh::CheckServingCheckpointInputs``);
+  FlashInfer's Python gate accepts 16 only for its exact-N16 route, so the
+  adapter encodes 32 -- with int64 ``checkpoint_cu_starts [N+1]`` sized
+  ``ceil(n_i / every)`` rows per sequence (row ``starts[i]`` is the BF16
+  initial state, row ``starts[i] + k`` the state after token ``k * every`` for
+  ``k * every < n_i``; FlashInfer's own tests size the rows this way). JIT
+  modules ``flashinfer.jit.cake_kda_decode`` and ``flashinfer.jit.cake_kda``.
 * ``flashinfer.kda_decode.packed_kda_decode`` (E1-17, ``flashinfer.kda_kernels.
   run_packed_kda_decode(backend="cake")``): serving-native packed Kimi-K3 T=1
   decode locked to H=12, K=V=128, ``scale=1/sqrt(128)``, L2 eps 1e-6,
@@ -77,6 +83,9 @@ FI_JIT_MODULE_PACKED = "flashinfer.jit.cake_kda_packed_t1"
 FI_JIT_MODULE_FUSED = "flashinfer.jit.cake_fused_kda_decode"
 ARCHS = BLACKWELL_DATACENTER
 HEAD_DIM = 128
+# ``CheckServingCheckpointInputs`` (csrc/kda/cake_kda_binding_common.cuh) in every
+# Cake prefill binding: ``checkpoint_every_n_tokens`` is zero or a multiple of 32.
+CHECKPOINT_TOKEN_GRANULARITY = 32
 MAX_SEQUENCES = 65535
 PACKED_HEADS = 12
 PACKED_LOWER_BOUND = -5.0
@@ -273,7 +282,18 @@ def supports_kda_recurrent_prefill(
     num_spec_tokens: Optional[int] = None,
     disable_state_update: bool = False,
 ) -> bool:
-    """Admission mirroring FlashInfer's frozen FlashKDA prefill contract."""
+    """Admission mirroring FlashInfer's frozen FlashKDA prefill contract; never raises.
+
+    Checkpoints: ``checkpoint_every_n_tokens`` must be zero or a multiple of
+    ``CHECKPOINT_TOKEN_GRANULARITY`` (32) -- the rule every Cake binding
+    enforces in C++ (``cake_kda_binding_common.cuh``); FlashInfer's Python
+    eligibility gate still accepts 16, which only its exact-N16 route runs, so
+    an interval of 16 is refused here before it can raise inside FlashInfer.
+    ``state_checkpoints`` is BF16 ``[C, H, 128, 128]`` and
+    ``checkpoint_cu_starts`` int64 ``[N+1]`` with ``ceil(n_i / every)`` rows per
+    sequence (row ``starts[i]`` = BF16 initial state, row ``starts[i] + k`` =
+    state after token ``k * every``).
+    """
     import torch
 
     if not (
@@ -350,7 +370,7 @@ def supports_kda_recurrent_prefill(
     if (
         checkpoint_every_n_tokens < 0
         or checkpoint_every_n_tokens > 2**31 - 1
-        or checkpoint_every_n_tokens % 16
+        or checkpoint_every_n_tokens % CHECKPOINT_TOKEN_GRANULARITY
     ):
         return False
     if checkpoint_every_n_tokens:
@@ -412,6 +432,13 @@ def recurrent_kda(
     in-place update is identical to the CuTe path). Prefill graph capture needs
     an eagerly warmed ``prefill_workspace``
     (``flashinfer.RecurrentKDAPrefillWorkspace``) and a caller-owned ``output``.
+
+    Prefill checkpoints: ``checkpoint_every_n_tokens`` is zero or a multiple of
+    32 (``CHECKPOINT_TOKEN_GRANULARITY``; the Cake bindings raise otherwise),
+    ``checkpoint_cu_starts`` int64 ``[N+1]`` with ``ceil(n_i / every)`` BF16
+    rows per sequence (row ``starts[i]`` = initial state, ``starts[i] + k`` =
+    state after token ``k * every``). Gate with
+    :func:`supports_kda_recurrent_prefill`; this forwarder does not validate.
     """
     from flashinfer.kda import recurrent_kda as fi_recurrent_kda
 

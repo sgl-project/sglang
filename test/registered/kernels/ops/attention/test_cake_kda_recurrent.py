@@ -11,7 +11,9 @@ outside sm_100a / sm_103a.
 Decode covers the equal-head D128 unbounded-softplus route absorbed from PRs
 #34946 / #34299 (raw gate + ``A_log``/``dt_bias``, BF16 beta logits, indexed
 BF16 pool). Prefill covers the frozen FlashKDA packed route (B=1,
-``cu_seqlens``, indexed pool) and the BF16-checkpoint form (parity only).
+``cu_seqlens``, indexed pool) and the BF16-checkpoint form (interval a
+multiple of 32, ``ceil(n / every)`` rows per sequence; parity plus FlashInfer's
+initial-state row check).
 Graph capture of the Cake prefill needs an eagerly warmed
 ``flashinfer.RecurrentKDAPrefillWorkspace`` and a caller-owned output; the
 decode route is allocation-free when ``output`` is supplied.
@@ -227,18 +229,26 @@ def test_prefill_matches_flashinfer_and_reference(lengths):
 
 
 def test_prefill_with_bf16_checkpoints_matches_flashinfer():
-    """Parity-only: checkpoint rows (BF16, every 16 tokens, floor counts)."""
+    """Checkpoint rows: BF16, every 32 tokens (the Cake binding's granularity).
+
+    Rows per sequence follow FlashInfer's own tests (``tests/kda/
+    test_kda_prefill_trained_gate_distribution.py``): ``ceil(n / every)`` with
+    row ``starts[i]`` holding the BF16 initial state and ``starts[i] + k`` the
+    state after token ``k * every`` (``k * every < n``). Output, pool and
+    checkpoints are compared bitwise against the direct FlashInfer call and the
+    initial-state rows against the pool before the run; an interval of 16 is
+    refused by the adapter before FlashInfer's C++ check can raise.
+    """
     _skip_unless_supported()
     torch.manual_seed(2)
     device = torch.device("cuda")
-    lengths, heads, every = (40, 70), 4, 16
+    lengths, heads, every = (40, 70), 4, cake_kda.CHECKPOINT_TOKEN_GRANULARITY
     q, k, v, g, beta, A_log, dt_bias, pool, indices, cu_seqlens, _ = _prefill_case(
         lengths, heads, device
     )
-    counts = [n // every for n in lengths]
     starts = [0]
-    for c in counts:
-        starts.append(starts[-1] + c)
+    for n in lengths:
+        starts.append(starts[-1] + (n + every - 1) // every)
     checkpoint_cu_starts = torch.tensor(starts, device=device, dtype=torch.int64)
     checkpoints = torch.full(
         (starts[-1], heads, HEAD_DIM, HEAD_DIM),
@@ -247,6 +257,7 @@ def test_prefill_with_bf16_checkpoints_matches_flashinfer():
         dtype=torch.bfloat16,
     )
     checkpoints_fi = checkpoints.clone()
+    pool_before = pool.clone()
     pool_fi = pool.clone()
     kwargs = dict(
         A_log=A_log,
@@ -260,20 +271,21 @@ def test_prefill_with_bf16_checkpoints_matches_flashinfer():
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=every,
     )
-    assert cake_kda.supports_kda_recurrent_prefill(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        pool,
+    admission = dict(
         A_log=A_log,
         dt_bias=dt_bias,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=indices,
         state_checkpoints=checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=every,
+    )
+    assert cake_kda.supports_kda_recurrent_prefill(
+        q, k, v, g, beta, pool, checkpoint_every_n_tokens=every, **admission
+    )
+    # csrc/kda/cake_kda_binding_common.cuh: "checkpoint_every_n_tokens must be
+    # zero or a multiple of 32" -- the adapter must refuse 16 before the C++ check.
+    assert not cake_kda.supports_kda_recurrent_prefill(
+        q, k, v, g, beta, pool, checkpoint_every_n_tokens=every // 2, **admission
     )
     out, _ = cake_kda_recurrent(
         q, k, v, g, beta, initial_state=pool, state_checkpoints=checkpoints, **kwargs
@@ -296,6 +308,9 @@ def test_prefill_with_bf16_checkpoints_matches_flashinfer():
     assert torch.equal(pool, pool_fi)
     assert torch.isfinite(checkpoints).all()
     assert torch.equal(checkpoints, checkpoints_fi)
+    # FlashInfer's own check: row ``starts[i]`` is the sequence's BF16 initial state.
+    first_rows = checkpoints[checkpoint_cu_starts[:-1]]
+    assert torch.equal(first_rows, pool_before[indices.long()])
 
 
 if __name__ == "__main__":
