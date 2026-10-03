@@ -4,6 +4,7 @@ import itertools
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import test_declared_decoder_boundary as fixture
 import torch
@@ -20,9 +21,11 @@ from sglang.srt.layers.layer_boundary.ops import (
     moe_cp_gather,
     moe_cp_reduce_scatter_output,
 )
+from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL_OPS
 from sglang.srt.layers.layer_boundary.residual.mhc import MHCState
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.layers.moe.utils import post_experts_reduction_group
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -44,15 +47,15 @@ class RecordingGroup(fixture.Group):
         return super().all_gather_into_tensor(output, value)
 
 
-def parallel_of(**overrides):
+def parallel_of(*, attn_cp=2, **overrides):
     return fixture.parallel_of(
-        attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, **overrides
+        attn_dp=1, attn_tp=1, attn_cp=attn_cp, enable_prefill_cp=True, **overrides
     )
 
 
-def build(residual=PLAIN_RESIDUAL_OPS):
+def build(residual=PLAIN_RESIDUAL_OPS, *, output_transform=None, with_following=False):
     norm = fixture.Norm() if residual is PLAIN_RESIDUAL_OPS else None
-    return make_stages(
+    stages = (
         (declare_attn(read=residual.attn_readout, update=residual.attn_update), norm),
         (
             declare_ffn(
@@ -60,10 +63,19 @@ def build(residual=PLAIN_RESIDUAL_OPS):
                 gathers_cp_input=True,
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
+                output_transform=output_transform,
             ),
             norm,
         ),
     )
+    if with_following:
+        stages += (
+            (
+                declare_attn(read=residual.attn_readout, update=residual.attn_update),
+                norm,
+            ),
+        )
+    return make_stages(*stages)
 
 
 @contextmanager
@@ -94,6 +106,8 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 cp = ffn.plan.paths[BatchVariant.CONTEXT_PARALLEL]
                 ordinary = ffn.plan.paths[BatchVariant.ORDINARY]
                 self.assertIn(TokenAxis.ATTN_CP, cp.entry.input_rows.sharded)
+                self.assertTrue(cp.output.always_partial)
+                self.assertFalse(ordinary.output.always_partial)
                 self.assertEqual(
                     cp.output_move_completes_sum, policy in ("rs", "rs+rsv")
                 )
@@ -151,10 +165,45 @@ class TestComputeOwnedCpMoe(CustomTestCase):
         with planning(parallel, SimpleNamespace(ranks=[1, 0])):
             with self.assertRaisesRegex(NotImplementedError, "ordered"):
                 build()
+        with (
+            planning(parallel, parallel.tp_group),
+            patch_communicator(
+                "post_experts_reduction_group", lambda: SimpleNamespace(ranks=[1, 0])
+            ),
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "ordered"):
+                build()
 
-    def run_world(self, rows, policy, *, mhc=False, cp=True):
-        world = fixture.World(2)
-        group = RecordingGroup(world, "cp", range(2))
+    def run_world(
+        self,
+        rows,
+        policy,
+        *,
+        mhc=False,
+        cp=True,
+        moe_ep_size=1,
+        complete_output=False,
+        square_output=False,
+        with_following=False,
+    ):
+        world_size = len(rows)
+        moe_tp_size = world_size // moe_ep_size
+        world = fixture.World(world_size)
+        group = RecordingGroup(world, "cp", range(world_size))
+        ep_groups = [
+            RecordingGroup(
+                world, f"ep-{tp_rank}", range(tp_rank, world_size, moe_tp_size)
+            )
+            for tp_rank in range(moe_tp_size)
+        ]
+        tp_groups = [
+            RecordingGroup(
+                world,
+                f"moe-tp-{ep_rank}",
+                range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size),
+            )
+            for ep_rank in range(moe_ep_size)
+        ]
         states = [
             SimpleNamespace(
                 rank=rank,
@@ -162,13 +211,18 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 events=[],
                 flags=fixture.Flags(),
                 parallel=parallel_of(
+                    attn_cp=world_size,
                     tp_rank=rank,
                     attn_cp_rank=rank,
                     tp_group=group,
                     attn_cp_group=group,
+                    moe_ep_size=moe_ep_size,
+                    moe_tp_size=moe_tp_size,
+                    moe_ep_group=ep_groups[rank % moe_tp_size],
+                    moe_tp_group=tp_groups[rank // moe_tp_size],
                 ),
             )
-            for rank in range(2)
+            for rank in range(world_size)
         ]
 
         def run_rank(rank):
@@ -207,7 +261,16 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 residual_ops = PLAIN_RESIDUAL_OPS
                 expected_residual = residual + value
                 expected_input = 2 * expected_residual
-            attention, ffn = build(residual_ops)
+
+            def square(value):
+                state.events.append("transform")
+                return value.square()
+
+            attention, ffn, *following = build(
+                residual_ops,
+                output_transform=OutputTransform(square) if square_output else None,
+                with_following=with_following,
+            )
             fb = batch(rows, cp=cp)
             fb.residual_stream = ResidualStream(residual)
             value = attention.finish(value, fb)
@@ -216,20 +279,42 @@ class TestComputeOwnedCpMoe(CustomTestCase):
             torch.testing.assert_close(local, expected_input, rtol=0, atol=0)
             self.assertNotIn("gather", state.events, "routing must see local rows")
             state.events.append("route")
-            routing = local.sum(-1, keepdim=True)
+            expert_ids = torch.div(local[:, 0], 16, rounding_mode="floor").remainder(
+                moe_ep_size
+            )
+            routing = torch.stack((local.sum(-1), expert_ids), dim=-1)
             with ffn.exit(fb) as exit_:
                 skip = state.flags.mlp_reduce_scatter
                 if cp:
-                    gathered = moe_cp_gather(local, rows, 2)
-                    routed = moe_cp_gather(routing, rows, 2)
+                    gathered = moe_cp_gather(local, rows, world_size)
+                    routed = moe_cp_gather(routing, rows, world_size)
                 else:
                     gathered, routed = local, routing
-                output = (5 * gathered + routed) * fixture.WEIGHTS[2][rank]
-                if not skip:
+                # EP owns distinct experts; TP owns complementary shards of each
+                # expert. Both sums must complete over the same CP return group.
+                selected = routed[:, 1:2]
+                output = (5 * gathered + routed[:, :1]) * (selected + 1)
+                if not complete_output:
+                    output *= (selected == rank // moe_tp_size) * fixture.WEIGHTS[
+                        moe_tp_size
+                    ][rank % moe_tp_size]
+                if not cp and not skip:
                     output = group.all_reduce(output)
+                if cp:
+                    self.assertNotIn("all_reduce", state.events)
+                    self.assertNotIn("reduce_scatter", state.events)
+                state.events.append("compute_done")
             self.assertFalse(state.flags.mlp_reduce_scatter)
-            output = exit_.finish(output)
-            expected = 5 * expected_input + expected_input.sum(-1, keepdim=True)
+            output = (
+                ffn.finish_complete_output(output, fb)
+                if complete_output
+                else exit_.finish(output)
+            )
+            expected = (5 * expected_input + expected_input.sum(-1, keepdim=True)) * (
+                expert_ids[:, None] + 1
+            )
+            if square_output:
+                expected = expected.square()
             if mhc:
                 expected = expected_residual + 2 * expected[:, None, :]
                 self.assertIsNone(mhc_state.h_res)
@@ -240,16 +325,40 @@ class TestComputeOwnedCpMoe(CustomTestCase):
             else:
                 torch.testing.assert_close(stream.residual, expected_residual)
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
-            self.assertEqual(skip, cp and policy in ("rs", "rs+rsv"))
-            self.assertEqual(state.events.count("gather"), 2 if cp else 0)
-            self.assertEqual(state.events.count("all_reduce"), int(not skip))
             self.assertEqual(
-                state.events.count("reduce_scatter"), int(skip and max(rows) > 0)
+                skip, cp and policy in ("rs", "rs+rsv") and not square_output
             )
+            self.assertEqual(state.events.count("gather"), 2 if cp else 0)
+            self.assertEqual(
+                state.events.count("all_reduce"),
+                int(not skip and not complete_output and (not cp or max(rows) > 0)),
+            )
+            self.assertEqual(
+                state.events.count("reduce_scatter"),
+                int(skip and not complete_output and max(rows) > 0),
+            )
+            if square_output and not complete_output and (not cp or max(rows) > 0):
+                self.assertLess(
+                    state.events.index("all_reduce"), state.events.index("transform")
+                )
+            if following:
+                events = list(state.events)
+                next_input = following[0].prepare(output, fb)
+                torch.testing.assert_close(
+                    next_input, 2 * (expected_residual + expected), rtol=0, atol=0
+                )
+                self.assertEqual(
+                    state.events, events, "the exit already completed the sum"
+                )
 
         with ExitStack() as stack:
             stack.enter_context(
                 planning(lambda: world.state().parallel, group, policy=policy)
+            )
+            stack.enter_context(
+                patch.object(
+                    fixture.moe_utils, "get_parallel", lambda: world.state().parallel
+                )
             )
             for name, value in {
                 "get_forward": lambda: world.state().flags,
@@ -257,6 +366,7 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 "moe_cp_all_gather_into_tensor": group.all_gather_into_tensor,
                 "get_attn_tp_context": lambda: SimpleNamespace(input_scattered=False),
                 "is_dp_attention_enabled": lambda: False,
+                "post_experts_reduction_group": post_experts_reduction_group,
                 "post_experts_sum_is_one_all_reduce": lambda: True,
                 "use_symmetric_memory": lambda *a, **kw: nullcontext(),
                 "is_allocation_symmetric": lambda: False,
@@ -268,7 +378,7 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 error, fixture.threading.BrokenBarrierError
             ):
                 raise error
-        self.assertEqual(errors, [None, None])
+        self.assertEqual(errors, [None] * world_size)
 
     def test_rank_major_padded_output_and_local_residual(self):
         for rows, policy, mhc in itertools.product(
@@ -283,6 +393,29 @@ class TestComputeOwnedCpMoe(CustomTestCase):
         for policy, mhc in itertools.product(("ar", "rs+rsv"), (False, True)):
             with self.subTest(policy=policy, mhc=mhc):
                 self.run_world([2, 2], policy, mhc=mhc, cp=False)
+
+    def test_ep_and_mixed_ep_tp_return_local_rows(self):
+        for rows, policy in itertools.product(
+            ([3, 1], [0, 2], [0, 0], [3, 1, 0, 2], [0, 0, 0, 0]),
+            ("ar", "rs"),
+        ):
+            with self.subTest(rows=rows, policy=policy):
+                self.run_world(rows, policy, moe_ep_size=2)
+
+    def test_complete_output_skips_boundary_reduction(self):
+        for policy, mhc in itertools.product(("ar", "rs"), (False, True)):
+            with self.subTest(policy=policy, mhc=mhc):
+                self.run_world([3, 1], policy, mhc=mhc, complete_output=True)
+
+    def test_nonlinear_transform_follows_sum_before_mhc_update(self):
+        for policy, mhc in itertools.product(("ar", "rs"), (False, True)):
+            with self.subTest(policy=policy, mhc=mhc):
+                self.run_world([3, 1], policy, mhc=mhc, square_output=True)
+
+    def test_following_attention_does_not_reduce_again(self):
+        for policy in ("ar", "rs"):
+            with self.subTest(policy=policy):
+                self.run_world([3, 1], policy, with_following=True)
 
     def test_rejects_inconsistent_padded_row_metadata(self):
         parallel = parallel_of()

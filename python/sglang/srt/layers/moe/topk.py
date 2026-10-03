@@ -2460,7 +2460,21 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     dynamic_expert_bias: Optional[torch.Tensor] = None,
+    defer_postprocessing: bool = False,
 ) -> StandardTopKOutput:
+    """Select routes, optionally leaving them in logical-expert space.
+
+    Deferred outputs must pass through :func:`postprocess_topk_output` before
+    expert execution. This lets callers gather token shards before remapping,
+    padding masks, shared-expert layout updates, capture, and load recording.
+    Routing callbacks and overrides still run here; callers must preserve their
+    required token scope. Deferred selection does not emit packed routing IDs.
+    """
+    if defer_postprocessing:
+        # Remapping must precede padding masks: indexing a placement table with
+        # an already-masked -1 would select its last expert.
+        num_token_non_padded = None
+
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -2604,7 +2618,7 @@ def select_experts(
         ):
             _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
             _packed_kwargs = {}
-            if _fused_gate_emits_packed_ids(
+            if not defer_postprocessing and _fused_gate_emits_packed_ids(
                 scoring_func,
                 num_fused_shared_experts,
                 expert_location_dispatch_info,
@@ -2656,6 +2670,7 @@ def select_experts(
                 _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
             if (
                 _fused_topk_pack
+                and not defer_postprocessing
                 and _is_cuda
                 and not _use_aiter
                 and scoring_func == "softmax"
@@ -2734,27 +2749,76 @@ def select_experts(
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
-    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
+    if packed_topk is not None:
+        topk_output = StandardTopKOutputPacked(
+            topk_weights, topk_ids, router_logits, packed_topk
+        )
+    else:
+        topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+    if defer_postprocessing:
+        return topk_output
+    return postprocess_topk_output(
+        topk_output,
         topk_config=topk_config,
-        router_logits=router_logits,
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
     )
 
+
+def postprocess_topk_output(
+    topk_output: Union[StandardTopKOutput, StandardTopKOutputPacked],
+    topk_config: TopKConfig,
+    layer_id: Optional[int] = None,
+    *,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    padded_rows_masked: bool = False,
+    valid_token_mask: Optional[torch.Tensor] = None,
+) -> Union[StandardTopKOutput, StandardTopKOutputPacked]:
+    """Finalize logical routes in the token scope used for expert execution.
+
+    Capture sees logical IDs; the distribution recorder sees physical routed
+    IDs after remapping. Call exactly once for each selected route tensor.
+    ``router_logits`` may be None when no fused shared-expert layout needs its
+    shape. Packed input is for routers whose existing packing eligibility
+    guarantees that postprocessing leaves their packed values unchanged.
+    ``valid_token_mask`` marks real rows in a gathered buffer with padding
+    between rank blocks. Padding rows are excluded from load recording and
+    have zero routing weights; their IDs remain valid for expert dispatch.
+    """
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
+        topk_ids=topk_output.topk_ids,
+        topk_weights=topk_output.topk_weights,
+        topk_config=topk_config,
+        router_logits=topk_output.router_logits,
+        num_token_non_padded=num_token_non_padded,
+        layer_id=layer_id,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        padded_rows_masked=padded_rows_masked,
+    )
+
+    if valid_token_mask is not None:
+        valid_rows = valid_token_mask.reshape(-1, 1).bool()
+        if recorder_topk_ids is not None:
+            recorder_topk_ids = recorder_topk_ids.masked_fill(~valid_rows, -1)
+        topk_ids = topk_ids.masked_fill(~valid_rows, 0)
+        topk_weights = topk_weights.masked_fill(~valid_rows, 0)
+
     if recorder_topk_ids is not None:
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )
 
-    if packed_topk is not None:
+    if isinstance(topk_output, StandardTopKOutputPacked) and valid_token_mask is None:
         return StandardTopKOutputPacked(
-            topk_weights, topk_ids, router_logits, packed_topk
+            topk_weights,
+            topk_ids,
+            topk_output.router_logits,
+            topk_output.packed_topk_ids,
         )
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+    return StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits)
 
 
 def precomputed_topk_postprocess_is_noop(

@@ -165,6 +165,7 @@ def _resolve_ffn(
         else OutputContract(
             rows,
             group=group,
+            always_partial=compute_gathers_cp,
             may_defer_to_next=may_leave
             and not terminal
             and not update.applied_at_exit
@@ -216,7 +217,8 @@ class StageDeclaration:
             exit scope, or adds a replicated component after its own sum.
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
         gathers_cp_input: Whether a sparse FFN gathers CP-local input itself on
-            collocated rank-major prefill CP, after routing the local rows.
+            collocated rank-major prefill CP, after routing the local rows,
+            and leaves the full-row partial sum to its output boundary.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
@@ -350,9 +352,10 @@ def declare_ffn(
         exit_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
         gathers_cp_input: Sparse compute accepts CP-local normalized rows,
-            gathers its input and routing payload, and returns a full-row output
-            following the exit scope. Only collocated rank-major prefill CP is
-            supported; ordinary batches keep their existing input contract.
+            gathers its input and routing payload, and returns a full-row partial
+            sum. The boundary completes that sum and returns local rows. Only
+            collocated rank-major prefill CP is supported; ordinary batches keep
+            their existing input and reduction contracts.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -492,7 +495,12 @@ def _connect(producer, consumer, *, residual_from=None):
                         and before.reduction is ProducerReduction.EXIT_SCOPED
                     )
                     or resolve_exit_rows(before.exit_rows) is ExitRows.ATTENTION
-                ) and (decl.output.always_partial or decl.output.may_defer_to_next)
+                ) and (
+                    # An FFN's always-partial compute is completed by its own
+                    # exit. Only attention publishes a declared partial sum.
+                    (before.kind is StageKind.ATTENTION and decl.output.always_partial)
+                    or decl.output.may_defer_to_next
+                )
                 arrived = OutputContract(
                     returned,
                     group=decl.output.group

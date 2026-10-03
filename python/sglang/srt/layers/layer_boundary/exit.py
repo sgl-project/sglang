@@ -188,6 +188,11 @@ class ExitPolicy:
             dp_step=dp_step,
             steps=steps,
             output_move=steps.output_move,
+            reduce_group=(
+                self.ffn_reduction_group(steps)
+                if steps.output.always_partial and not mlp_reduce_scatter
+                else None
+            ),
         )
         defer_moe_finalize = (
             self.plan.fusions is not None
@@ -251,10 +256,15 @@ class ExitPolicy:
         dp_step: Optional[Callable],
         steps,
         output_move: Optional[Callable],
+        reduce_group: Optional[GroupCoordinator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's postprocess, run with the attention-DP step already
-        chosen: the move back to where the next layer reads the FFN output, then
-        the write-back into the residual for a layer that does it itself."""
+        chosen: finish a producer's unconditional partial sum unless the move
+        does it, move back to the next layer's rows, then write the residual."""
+        # These are gathered rows, so every contributor observes the same
+        # empty shape. Avoid launching an all-reduce kernel on zero elements.
+        if reduce_group is not None and hidden_states.numel():
+            hidden_states = reduce_group.all_reduce(hidden_states)
         if steps.output.transform is not None:
             hidden_states = steps.output.transform.apply(hidden_states)
         if steps.returns_over_dp:
