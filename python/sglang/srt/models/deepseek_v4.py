@@ -726,9 +726,9 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert (
-        output[:real_num_tokens].numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    assert output[:real_num_tokens].numel() == ret.numel(), (
+        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    )
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     output[real_num_tokens:].zero_()
@@ -817,16 +817,15 @@ class MqaAttentionBase(nn.Module):
             if compress_ratio is not None
             else config.compress_ratios[layer_id]
         )
-        assert (
-            self.compress_ratio
-            in (
-                0,
-                1,
-                2,
-                4,
-                128,
-            )
-        ), f"compress_ratio: expected one of (0, 1, 2, 4, 128), got {self.compress_ratio}"
+        assert self.compress_ratio in (
+            0,
+            1,
+            2,
+            4,
+            128,
+        ), (
+            f"compress_ratio: expected one of (0, 1, 2, 4, 128), got {self.compress_ratio}"
+        )
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -908,9 +907,9 @@ class MqaAttentionBase(nn.Module):
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
         if quantize_wo_a:
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+            assert hasattr(self.wo_a, "weight_scale_inv"), (
+                "FP8 quant_config must create weight_scale_inv"
+            )
         if self.use_npu_arch35_mxfp8_wo_a:
             # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
@@ -3899,9 +3898,9 @@ class DeepseekV4Model(nn.Module):
         # each request's last SWA_WINDOW extend tokens only.
         self.late_layer_start: Optional[int] = None
         if get_exec().features.enable_decoder_swa_bounded_replay:
-            assert (
-                config.kv_source_layer_ids
-            ), "decoder SWA bounded replay needs kv_source_layer_ids"
+            assert config.kv_source_layer_ids, (
+                "decoder SWA bounded replay needs kv_source_layer_ids"
+            )
             self.late_layer_start = max(config.kv_source_layer_ids) + 1
             late_ratios = set(
                 config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
@@ -5218,9 +5217,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = _clone_if_runai_streamed_tensor(
                                     loaded_weight
                                 )
@@ -5344,9 +5343,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert (
-        weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8_e4m3fn, got {weight.dtype}"
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn, got {weight.dtype}"
+    )
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,

@@ -230,8 +230,8 @@ def _hopper_mhc_layer(norm, w, scale, base):
         rms_norm_eps=1e-6,
         hc_eps=1e-6,
     )
-    layer._init_hyper_connections = (
-        lambda: DeepseekV4DecoderLayer._init_hyper_connections(layer)
+    layer._init_hyper_connections = lambda: (
+        DeepseekV4DecoderLayer._init_hyper_connections(layer)
     )
     return layer
 
