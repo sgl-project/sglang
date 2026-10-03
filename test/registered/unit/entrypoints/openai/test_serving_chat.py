@@ -17,6 +17,7 @@ import re
 import tempfile
 import unittest
 import uuid
+from collections import OrderedDict
 from http import HTTPStatus
 from pathlib import Path
 from typing import Optional
@@ -800,11 +801,42 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(check_schema.call_count, 2)
 
     def test_validate_request_rejects_an_invalid_tool_schema_every_time(self):
+        errors = []
         for _ in range(2):
-            request = self._tool_request({"type": "objekt"})
-            self.assertIn(
-                "invalid 'parameters' schema", self.chat._validate_request(request)
-            )
+            request = self._tool_request({"type": "not-a-json-type"})
+            errors.append(self.chat._validate_request(request))
+        self.assertIn("invalid 'parameters' schema", errors[0])
+        self.assertEqual(errors[0], errors[1])
+
+    def test_validate_request_forgets_the_least_recently_used_tool_schema(self):
+        module = "sglang.srt.entrypoints.openai.serving_chat"
+
+        def validate(marker):
+            request = self._tool_request({"type": "object", "description": marker})
+            self.assertIsNone(self.chat._validate_request(request))
+
+        with (
+            patch(f"{module}._VALID_TOOL_SCHEMAS", OrderedDict()),
+            patch(f"{module}._VALID_TOOL_SCHEMAS_MAX_SIZE", 2),
+            patch(f"{module}.Draft202012Validator.check_schema") as check_schema,
+        ):
+            for marker in ("a", "b", "a", "c"):
+                validate(marker)
+            self.assertEqual(check_schema.call_count, 3)
+            validate("a")  # still remembered: "b" was the least recently used
+            self.assertEqual(check_schema.call_count, 3)
+            validate("b")  # forgotten when "c" arrived
+            self.assertEqual(check_schema.call_count, 4)
+
+    def test_validate_request_checks_a_tool_schema_without_a_digest_every_time(self):
+        """A value that orjson cannot write, or writes as null, is never remembered."""
+        target = "sglang.srt.entrypoints.openai.serving_chat.Draft202012Validator.check_schema"
+        for value in (2**70, float("nan"), float("inf")):
+            with self.subTest(value=value), patch(target) as check_schema:
+                for _ in range(2):
+                    request = self._tool_request({"type": "number", "maximum": value})
+                    self.assertIsNone(self.chat._validate_request(request))
+                self.assertEqual(check_schema.call_count, 2)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
