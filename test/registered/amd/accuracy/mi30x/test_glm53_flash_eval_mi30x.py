@@ -1,49 +1,54 @@
-"""MI35x GLM-5.3-Flash GSM8K Accuracy Evaluation Test (8-GPU)
+"""MI30x GLM-5.3-Flash GSM8K Accuracy Evaluation Test (8-GPU)
 
-Tests zai-org/GLM-5.3-Flash on MI35x (gfx950) with the AMD FP8 recipe from the
+Tests zai-org/GLM-5.3-Flash on MI30x (gfx942) with the AMD FP8 recipe from the
 GLM-5.3-Flash cookbook refresh (#36712): TP8 + EP8, BF16 KV cache, TileLang DSA
-prefill+decode, Triton linear attention, AITER MoE runner, SGLANG_USE_AITER=1,
-full decode graphs at batch sizes 1 and 32.
+prefill+decode, Triton linear attention, SGLANG_USE_AITER=1, full decode graphs
+at batch sizes 1 and 32. Same eval and threshold as the gfx950 gate in
+test_glm53_flash_eval_mi35x.py.
 
-GLM-5.3-Flash is the first GLM checkpoint whose 45 text layers mix three
-attention kinds -- MLA, DSA sparse, and KDA linear -- behind mHC residuals, so
-it exercises engine paths no other AMD nightly covers. The KDA state pool is a
-second memory pool alongside the paged KV pool, and the mHC pre/post ops sit on
-every layer boundary. A single-arch gate would not be enough: gfx950 takes the
-AITER mHC pre/post kernels, while gfx942 falls back to the generic mHC path.
-This file gates the gfx950 half; the gfx942 half is
-test_glm53_flash_eval_mi30x.py.
+MoE runner: this deviates from the cookbook cell, which names the Triton runner
+for MI300X. On current main the Triton MoE runner makes this model generate
+without ever stopping on gfx942: every sequence runs to the token cap and
+scores zero. Measured in one job that ran three 64-question evals back to back
+on the same server image (run 36119287477, 2026-09-26): Triton MoE with the
+default fused sgl-kernel top-k scored 0/64 at 2048+ tokens per sequence,
+Triton MoE with #36607's portable Torch top-k also scored 0/64 at 2048+ tokens
+per sequence, and the AITER MoE runner scored 63/64 at 151 tokens per sequence.
+The DSA top-k backend makes no difference, so the fault is the Triton MoE
+runner itself, and the cookbook's MI300X MoE recommendation is stale.
 
-Measured on current main: 0.9750 (1286/1319) on the rocm10 image, HF snapshot
-eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, with a 312 s weight load, a 473 s
-eval and 1040 s of wall clock (run 36011039824). That is the full GSM8K split
-the cookbook's MI355X cell was still missing.
+gfx942 is not redundant with gfx950 for this model. It runs the generic mHC
+path, since AITER mHC is gfx95-only, and nothing else gives that path nightly
+coverage for this model. That path reaches gfx942 only with the HIP guard in
+#41136: without it, TileLang's HIP codegen cannot lower the tl.get_lane_idx in
+the fused mHC post/pre kernel and decode graph capture dies with "Unresolved
+call Op(tl.get_lane_idx)" (run 36079282524).
 
-Threshold: #36607 measured the full 1319-question GSM8K split at
-1288/1319 = 97.65% on MI355X (97.35% on MI300X). 0.92 follows this repo's
-`measured - 0.05` convention for sgl-eval gsm8k thresholds, which also leaves
-room for the sampling noise the checkpoint's own generation defaults introduce.
-It lands on the same 0.92 as the GLM-5.2-FP8 nightlies on both AMD and CUDA, so
-a red run here reads as "GLM-5.3-Flash on gfx950 regressed" rather than "this
-gate is stricter than its neighbours". The cookbook lists this exact MI355X
-command as having passed a runtime pilot with full GSM8K still pending, so this
-job is also that measurement.
+Measured on main plus both HIP fixes in #41136, which this test requires:
+0.9750 (1286/1319) on the rocm10 image, with a 2769 s weight load, a 1391 s
+eval and 4419 s of wall clock (run 36232707853). That is the same count the
+gfx950 gate in test_glm53_flash_eval_mi35x.py scored, so the gfx942 fallback
+paths are not costing accuracy relative to the gfx950 fast paths.
 
-This harness reproduced #36607's 97.65% to within 0.006 on the GLM-5.3-Flash
-support branch (0.9704 on rocm720, 0.9712 on rocm724, TP8 with graphs off), so
-the sgl-eval zero-shot/\\boxed{}/math_verify path and the checkpoint's sampling
-defaults are not costing accuracy relative to #36607's harness.
+Threshold: 0.92 follows this repo's `measured - 0.05` convention for sgl-eval
+gsm8k thresholds and matches the gfx950 gate, so the two arches stay directly
+comparable.
 
-Eval harness: sgl-eval's gsm8k (zero-shot chat, \\boxed{} extraction,
-math_verify grading) through run_sgl_eval, rather than the legacy few-shot
-scorer that run_combined_tests routes gsm8k to. GLM-5.3-Flash thinks by
-default, and the legacy scorer takes the last number in the response, which a
-reasoning trace makes meaningless. The parameters below are the accuracy
-command the cookbook publishes for this model: 64 threads, 32768 max tokens,
-temperature 1.0, top_p 0.95, thinking on. The seed pins the sampling so a
-failure is a regression rather than a reroll.
+Runtime: the 328 GB checkpoint has taken 2769-4650 s to load from this pool's
+shared cache, and the eval 1333-2374 s on top of that. In run 36678520753 the
+first launch on all three images was still loading at 5400 s and only the CI's
+online retry brought the server up, so the launch timeout below is 9000 s. The
+workflow allows 18000 s. If that ever proves tight, prefer raising it over
+trimming the eval: a full-split score is what makes this arch's number
+comparable to the gfx950 one.
 
-Registry: nightly-amd-8-gpu-mi35x-glm53-flash suite
+Eval harness: sgl-eval's gsm8k through run_sgl_eval, rather than the legacy
+few-shot scorer that run_combined_tests routes gsm8k to, because
+GLM-5.3-Flash thinks by default and the legacy scorer reads the last number
+in the response. The parameters below are the accuracy command the cookbook
+publishes for this model. See the MI35x file for the longer note.
+
+Registry: nightly-amd-accuracy-8-gpu-glm53-flash suite
 """
 
 import unittest
@@ -62,12 +67,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Register for AMD CI - MI35x GLM-5.3-Flash accuracy test. Measured 3322 s
-# on rocm720 and 2673 s on rocm724; 5400 s covers a cold-cache load of the
-# 328 GB checkpoint plus the eval.
+# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. The 9000 s launch
+# budget below plus the slowest full-split eval measured (2374 s).
 register_amd_ci(
-    est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-glm53-flash",
+    est_time=11400,
+    suite="nightly-amd-accuracy-8-gpu-glm53-flash",
     nightly=True,
 )
 
@@ -76,11 +80,12 @@ BASELINE_ACCURACY = 0.92
 
 # Fetching and loading a 328 GB checkpoint against a cold cache is what this
 # budget has to cover; the default launch timeout is nowhere near enough.
-SERVER_LAUNCH_TIMEOUT = 5400
+# Loads have measured up to 4650 s, and a first launch has run past 5400 s.
+SERVER_LAUNCH_TIMEOUT = 9000
 
 
-class TestGLM53FlashEvalMI35x(unittest.TestCase):
-    """GLM-5.3-Flash GSM8K Accuracy Evaluation Test for MI35x."""
+class TestGLM53FlashEvalMI30x(unittest.TestCase):
+    """GLM-5.3-Flash GSM8K Accuracy Evaluation Test for MI30x."""
 
     def test_glm_53_flash(self):
         """Run accuracy test for GLM-5.3-Flash."""
@@ -91,6 +96,7 @@ class TestGLM53FlashEvalMI35x(unittest.TestCase):
             "--dsa-decode-backend=tilelang",
             "--linear-attn-backend=triton",
             "--kv-cache-dtype=bfloat16",
+            # Not the cookbook's Triton runner; see the MoE runner note above.
             "--moe-runner-backend=aiter",
             "--cuda-graph-backend-decode=full",
             "--cuda-graph-backend-prefill=disabled",
@@ -105,6 +111,7 @@ class TestGLM53FlashEvalMI35x(unittest.TestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]
+
         model = ModelLaunchSettings(
             GLM_53_FLASH_MODEL_PATH,
             tp_size=8,
@@ -144,7 +151,7 @@ class TestGLM53FlashEvalMI35x(unittest.TestCase):
         score = metrics["score"]
         passed = score >= BASELINE_ACCURACY
         write_accuracy_github_summary(
-            "GLM-5.3-Flash (MI35x)",
+            "GLM-5.3-Flash (MI30x)",
             "gsm8k",
             [
                 AccuracyTestResult(
