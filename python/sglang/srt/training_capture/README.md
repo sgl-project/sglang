@@ -469,6 +469,14 @@ this path. Failed verification keeps the journal and cannot publish READY.
 Missing objects reported by native reads conservatively retain their receive
 buffers until client close, so repeated failures consume the quarantine budget.
 
+Full snapshot validation checks BF16/FP16/FP32 finiteness through the existing
+little-endian Host byte view in bounded integer chunks. All NaN and infinity
+encodings are rejected without floating conversion or mutation. This finite
+scan uses at most 1.25 MiB of temporary element storage; the bound excludes the
+rest of validation and retained payloads. Checksums and all semantic checks
+remain mandatory. See the
+[validation experiment](../../../../mooncake-study/experiments/BOUNDED_FINITE_VALIDATION.md).
+
 These synchronous transport methods run on the Store owner thread. Consumers
 still need a Catalog read lease and their own total prefetch/retained-tensor
 budget; producer recovery uses its fenced capture authority. Returned tensors

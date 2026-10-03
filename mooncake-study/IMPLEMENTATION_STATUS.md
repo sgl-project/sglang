@@ -26,6 +26,7 @@ it does not redefine the goal as the modules already implemented.
 | Area | Implemented | Evidence / Remaining Work |
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
+| Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
@@ -4673,6 +4674,46 @@ their KV using TCP. It uses the HTTP test Catalog and an untrained draft, so
 production retention, training quality, saturated bandwidth and serving SLOs
 remain separate acceptance work.
 
+## Bounded Host Finiteness Validation
+
+The mandatory tensor validator now scans BF16/FP16/FP32 exponent bits through
+the existing little-endian Host byte view. It rejects every infinity and NaN
+encoding without floating conversion or source mutation. At most 262,144
+elements are scanned together, bounding temporary element arrays to 1.25 MiB
+for FP32. This is a finite-scan bound, not a bound on all validation or retained
+payloads. SHA-256 and all existing semantic checks remain mandatory.
+
+- All 114 protocol, writer, coordinator and context methods pass in 56.490
+  seconds. New tests exhaust all BF16/FP16 encodings, check FP32 boundaries and
+  random patterns, test chunk tails, and reject nonfinite KV/teacher payloads
+  with otherwise valid checksums.
+- The real Qwen3 inference method passes in 534.308 seconds, including AR,
+  graph replay, overlap, four static target-KV DSpark combinations and their
+  memory-pressure cases, adaptive/latency admission and cache lifecycle checks.
+  Existing exact online source comparisons and post-exit Store reads stay active.
+- A synthetic full-validator CPU profile falls from 14.22 to 6.62 ms/call.
+  One actual serving baseline/candidate pair reduces mandatory writer validation
+  from 26.811 to 13.257 ms/sample, 50.56% lower. READY admission rises from 61/64
+  to 64/64 and sample throughput from 5.144 to 5.372 samples/s.
+- Request throughput is essentially unchanged, 5.397 versus 5.372 requests/s;
+  capture-on retains 75.24% versus 74.68% of its off bracket. No end-to-end
+  speedup or production SLO is established. All 125 measured snapshots pass
+  post-exit readback: 8,500 objects and 1,000,672,000 payload bytes. Both real
+  metrics scrapes pass, with no measured stage errors or Host quarantine.
+- All 5,031 Python files match the frozen tested tree. Ruff adds no diagnostics
+  beyond the protocol's two baseline findings; tests and formatting pass.
+  All six worker jobs are terminal. Serving/Store processes are stopped,
+  journals have no pending publications and the resident idle task is live.
+
+See the [runbook](experiments/BOUNDED_FINITE_VALIDATION.md) and
+[evidence JSON](experiments/bounded-finite-validation.json). The 63-artifact
+archive at `/gpfs/user/fuxuanwei/mooncake-lab-archive/finite-validation-20261003`
+has manifest SHA-256
+`bdaa3ca74db82b22b1457e925c3e4c86cfbb4a9ee0a801dfd90d670010422561`.
+The benchmark is one sequential pair with fixed-length traffic, local TCP Store
+and a test Catalog. Broader workloads, production retention, trained draft
+quality, long-duration memory and serving SLOs remain open.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4715,7 +4756,7 @@ remain separate acceptance work.
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing
-   teacher LSE and contiguous row-selection overhead, profile the remaining capture
+   teacher LSE, contiguous row-selection and Host finite-scan overhead, profile the remaining capture
    and control/durability costs. The new token-based timing and publication join
    reproduce off-phase TTFT/TPOT stalls and mixed-publication slow batches; locate
    their server operations without dropping publication checks. The deferred

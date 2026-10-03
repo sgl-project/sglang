@@ -765,6 +765,14 @@ writer 完成内容校验后，单 rank coordinator 再检查 context 仍为 SEA
 分布式 owner 准备与组装路径保持独立。`snapshot_built` 仅表示描述准备完成，
 不表示内容校验通过；阶段指标 `validation` 包含上述校验后状态检查。
 
+BF16/FP16/FP32 的有限性检查复用计算 SHA-256 的 little-endian Host 字节
+视图，以无符号整数检查全 1 指数位，拒绝所有 NaN 和正负无穷；不转换或修改
+浮点内容。每次扫描最多 262,144 个元素，位运算与比较的临时数组最多占用
+1.25 MiB，该上限不包括其他语义校验和保留的 payload。完整校验仍保留摘要、
+位置、mask、top-128 唯一性/排序与 LSE 归一化检查。真实服务测量中校验耗时
+下降约一半，但请求吞吐未提高；复现和适用边界见
+[有界有限性检查](experiments/BOUNDED_FINITE_VALIDATION.md)。
+
 ### 8.4 故障窗口
 
 | 中断位置 | 恢复方式 |

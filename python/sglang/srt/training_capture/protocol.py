@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Annotated, Literal, Mapping
 
 import msgspec
+import numpy as np
 import torch
 
 Identifier = Annotated[
@@ -42,6 +43,12 @@ ELEMENT_BYTES = {
     "float16": 2,
     "bfloat16": 2,
 }
+_FLOAT_EXPONENTS = {
+    "bfloat16": ("<u2", 0x7F80),
+    "float16": ("<u2", 0x7C00),
+    "float32": ("<u4", 0x7F800000),
+}
+_FINITE_CHUNK_ELEMENTS = 1 << 18
 OWNER = "dp0-pp0-tp0"
 
 
@@ -419,6 +426,18 @@ def decode_manifest(
     return manifest
 
 
+def _all_finite(data: memoryview, dtype: str) -> bool:
+    # All-ones exponents identify both infinities and every NaN encoding.
+    # Scan the existing little-endian Host view without floating conversions.
+    storage_dtype, exponent = _FLOAT_EXPONENTS[dtype]
+    bits = np.frombuffer(data, dtype=storage_dtype)
+    for start in range(0, bits.size, _FINITE_CHUNK_ELEMENTS):
+        chunk = bits[start : start + _FINITE_CHUNK_ELEMENTS]
+        if (np.bitwise_and(chunk, exponent) == exponent).any():
+            return False
+    return True
+
+
 def validate_tensors(
     manifest: Manifest,
     tensors: Mapping[str, torch.Tensor],
@@ -440,9 +459,10 @@ def validate_tensors(
         tensor = tensors[obj.key]
         if list(tensor.shape) != obj.shape or tensor.dtype != DTYPES[obj.dtype]:
             raise ContractError("received tensor shape/dtype mismatch")
-        if digest_bytes(tensor_bytes(tensor)) != obj.sha256:
+        data = tensor_bytes(tensor)
+        if digest_bytes(data) != obj.sha256:
             raise ContractError("tensor checksum mismatch")
-        if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+        if tensor.is_floating_point() and not _all_finite(data, obj.dtype):
             raise ContractError("nonfinite captured values")
         if obj.kind == "aux":
             aux[obj.name] = tensor
