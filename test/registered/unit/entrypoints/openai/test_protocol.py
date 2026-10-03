@@ -137,6 +137,35 @@ class TestChatCompletionRequest(unittest.TestCase):
                     {**base_request, "response_format": response_format}
                 )
 
+    def test_set_json_schema_does_not_mutate_caller_schema(self):
+        """A reused caller schema must survive repeated request construction."""
+
+        class Note(BaseModel):
+            title: str
+            strict: bool = True
+
+        schema = Note.model_json_schema()
+        response_format = {"type": "json_schema", "schema": schema}
+        response_format_before = json.loads(json.dumps(response_format))
+
+        def build():
+            return ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "Hello"}],
+                response_format={"type": "json_schema", "schema": schema},
+            )
+
+        first = build().response_format.json_schema.strict
+        second = build().response_format.json_schema.strict
+        # Both requests see the same strict value; the second must not be
+        # degraded by the first.
+        self.assertEqual(first, second)
+        self.assertTrue(first)
+        # The caller's dicts are left byte-for-byte unchanged.
+        self.assertEqual(schema, response_format_before["schema"])
+        self.assertIn("strict", schema["properties"])
+        self.assertEqual(response_format, response_format_before)
+
     def test_basic_chat_completion_request(self):
         """Test basic chat completion request"""
         messages = [{"role": "user", "content": "Hello"}]

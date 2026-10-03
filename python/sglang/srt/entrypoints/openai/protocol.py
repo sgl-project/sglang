@@ -1078,23 +1078,28 @@ class ChatCompletionRequest(PDRoutingFields):
         if response_format.get("type") != "json_schema":
             return values
 
-        schema = response_format.pop("schema", None)
+        schema = response_format.get("schema")
         json_schema = response_format.get("json_schema")
 
         if json_schema:
             return values
 
         if schema:
+            # Copy so a reused caller schema (e.g. cached model_json_schema())
+            # is never mutated by this transform.
+            schema = dict(schema)
+            properties = dict(schema.get("properties") or {})
+            schema["properties"] = properties
+
             name_ = schema.get("title", "Schema")
             strict_ = None
-            if "properties" in schema and "strict" in schema["properties"]:
-                item = schema["properties"].pop("strict", None)
+            if "strict" in properties:
+                item = properties.pop("strict", None)
                 strict_ = bool(item and item.get("default", False))
 
-            response_format["json_schema"] = {
-                "name": name_,
-                "schema": schema,
-                "strict": strict_,
+            values["response_format"] = {
+                **response_format,
+                "json_schema": {"name": name_, "schema": schema, "strict": strict_},
             }
 
         return values
