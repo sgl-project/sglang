@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Devices with a Triton backend for this kernel. "cuda" also covers ROCm.
+_SUPPORTED_DEVICE_TYPES = ("cuda", "xpu")
+
 
 @triton.jit
 def _pack_qkv_destination_major_kernel(
@@ -62,8 +65,11 @@ def pack_qkv_destination_major(
     """Pack matching ``[rows, global_heads, head_size]`` Q/K/V tensors."""
     if q.dim() != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, and v must have the same 3D shape")
-    if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        raise ValueError("q, k, and v must be CUDA tensors")
+    if not all(t.device.type in _SUPPORTED_DEVICE_TYPES for t in (q, k, v)):
+        raise ValueError(
+            f"q, k, and v must be on one of {_SUPPORTED_DEVICE_TYPES}, "
+            f"got {q.device.type}"
+        )
     if not (q.device == k.device == v.device and q.dtype == k.dtype == v.dtype):
         raise ValueError("q, k, and v must have the same device and dtype")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:

@@ -1,7 +1,8 @@
 """The packed Ulysses Q/K/V input exchange must be bit-identical to the
 unpacked path. The collective is emulated in-process with exact
 ``all_to_all_single`` chunk semantics (rank r's j-th chunk goes to rank j's
-r-th chunk); the pack kernel and unpack views run unmodified on CUDA."""
+r-th chunk); the pack kernel and unpack views run unmodified on the
+accelerator."""
 
 import math
 import unittest
@@ -15,7 +16,23 @@ from sglang.test.test_utils import CustomTestCase
 _USP = "sglang.multimodal_gen.runtime.layers.usp"
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+def _accelerator_device() -> torch.device | None:
+    """Accelerator these tests run on, or None when the host has neither.
+
+    CUDA is probed first so a CUDA host keeps its existing coverage unchanged.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if torch.xpu.is_available():
+        return torch.device("xpu", torch.xpu.current_device())
+    return None
+
+
+_DEVICE = _accelerator_device()
+_requires_accelerator = unittest.skipIf(_DEVICE is None, "requires CUDA or XPU")
+
+
+@_requires_accelerator
 class TestA2AStagingBuffer(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -26,7 +43,7 @@ class TestA2AStagingBuffer(CustomTestCase):
         super().tearDown()
 
     def test_cache_capacity_is_bounded_across_shapes(self):
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = _DEVICE
         role = "test_role"
         shapes = ((2, 3), (4, 5), (5, 4), (1, 7), (3, 11), (2, 4))
 
@@ -60,7 +77,7 @@ class TestA2AStagingBuffer(CustomTestCase):
         )
 
     def test_smaller_shape_reuses_larger_backing_buffer(self):
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = _DEVICE
 
         with torch.no_grad():
             large = usp_mod._a2a_staging_buffer(
@@ -74,7 +91,7 @@ class TestA2AStagingBuffer(CustomTestCase):
         self.assertEqual(small.shape, (2, 7))
 
     def test_role_and_dtype_are_separate_cache_keys(self):
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = _DEVICE
 
         with torch.no_grad():
             usp_mod._a2a_staging_buffer("input", (8,), torch.float16, device)
@@ -84,32 +101,36 @@ class TestA2AStagingBuffer(CustomTestCase):
         self.assertEqual(len(usp_mod._A2A_STAGING_BUFFERS), 3)
 
     def test_bypass_paths_do_not_replace_cached_storage(self):
-        cuda_device = torch.device("cuda", torch.cuda.current_device())
+        device = _DEVICE
 
         with torch.no_grad():
             cached = usp_mod._a2a_staging_buffer(
-                "test_role", (8,), torch.float16, cuda_device
+                "test_role", (8,), torch.float16, device
             )
-        key = ("test_role", torch.float16, cuda_device.index)
+        key = ("test_role", torch.float16, device.index)
         cached_storage = usp_mod._A2A_STAGING_BUFFERS[key]
 
         with torch.enable_grad():
             grad_buffer = usp_mod._a2a_staging_buffer(
-                "test_role", (16,), torch.float16, cuda_device
+                "test_role", (16,), torch.float16, device
             )
         with (
             torch.no_grad(),
             patch(f"{_USP}.torch.compiler.is_compiling", return_value=True),
         ):
             compile_buffer = usp_mod._a2a_staging_buffer(
-                "test_role", (16,), torch.float16, cuda_device
+                "test_role", (16,), torch.float16, device
             )
         with (
             torch.no_grad(),
-            patch(f"{_USP}.torch.cuda.is_current_stream_capturing", return_value=True),
+            patch.object(
+                torch.get_device_module(device),
+                "is_current_stream_capturing",
+                return_value=True,
+            ),
         ):
             capture_buffer = usp_mod._a2a_staging_buffer(
-                "test_role", (16,), torch.float16, cuda_device
+                "test_role", (16,), torch.float16, device
             )
         with torch.no_grad():
             cpu_buffer = usp_mod._a2a_staging_buffer(
@@ -119,13 +140,13 @@ class TestA2AStagingBuffer(CustomTestCase):
         self.assertEqual(list(usp_mod._A2A_STAGING_BUFFERS), [key])
         self.assertIs(usp_mod._A2A_STAGING_BUFFERS[key], cached_storage)
         self.assertEqual(cached.numel(), 8)
-        self.assertEqual(grad_buffer.device.type, "cuda")
-        self.assertEqual(compile_buffer.device.type, "cuda")
-        self.assertEqual(capture_buffer.device.type, "cuda")
+        self.assertEqual(grad_buffer.device.type, device.type)
+        self.assertEqual(compile_buffer.device.type, device.type)
+        self.assertEqual(capture_buffer.device.type, device.type)
         self.assertEqual(cpu_buffer.device.type, "cpu")
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@_requires_accelerator
 class TestPackedQKVInputA2A(CustomTestCase):
     def _run_all_ranks(self, fn, world):
         sends, recvs = [], None
@@ -154,7 +175,7 @@ class TestPackedQKVInputA2A(CustomTestCase):
             s_local, h_local = s_global // world, h_global // world
             full = [
                 torch.randn(
-                    b, s_global, h_global, d, dtype=torch.bfloat16, device="cuda"
+                    b, s_global, h_global, d, dtype=torch.bfloat16, device=_DEVICE
                 )
                 for _ in range(3)
             ]
@@ -172,6 +193,34 @@ class TestPackedQKVInputA2A(CustomTestCase):
                         torch.equal(packed[r][i], spec), f"rank{r} qkv[{i}]"
                     )
                     self.assertTrue(packed[r][i].is_contiguous())
+
+    def test_packed_path_issues_one_collective(self):
+        """The unpacked fallback is also bit-exact, so the equivalence test above
+        passes either way; only the collective count proves the packed path ran.
+        """
+        world, b, s_global, h_global, d = 4, 1, 128, 8, 64
+        shard = tuple(
+            torch.randn(
+                b, s_global // world, h_global, d, dtype=torch.bfloat16, device=_DEVICE
+            )
+            for _ in range(3)
+        )
+        collectives = 0
+
+        def counting_a2a(x, role=None):
+            nonlocal collectives
+            collectives += 1
+            return torch.empty_like(x)
+
+        with (
+            torch.no_grad(),
+            patch(f"{_USP}._usp_all_to_all_single", counting_a2a),
+            patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=world),
+        ):
+            self.assertTrue(usp_mod._can_use_packed_qkv_a2a_4d(*shard, world))
+            usp_mod._usp_input_all_to_all_qkv(*shard)
+
+        self.assertEqual(collectives, 1)
 
 
 if __name__ == "__main__":
