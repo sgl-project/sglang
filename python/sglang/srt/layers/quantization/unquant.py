@@ -223,6 +223,11 @@ def initialize_bf16_gemm_config() -> None:
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_gemv():
+        if get_exec().deterministic.enable_deterministic_inference:
+            raise ValueError(
+                "--bf16-gemm-backend gemv is batch-size dependent and cannot "
+                "be combined with --enable-deterministic-inference"
+            )
         if torch.cuda.get_device_capability()[0] != 9:
             raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
 
@@ -482,7 +487,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_cutedsl()
+            (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
