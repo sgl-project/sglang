@@ -3844,6 +3844,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
+        if _is_hip:
+            from sglang.kernels.ops.attention import kimi_attn_residual_gluon_hip
+
+            kimi_attn_residual_gluon_hip.install(self)
+
         # Post-load: merge the horizontally-fused decode weights (views of the
         # merged buffers, ~0 extra memory); must run before cuda graph capture.
         for layer in self.model.layers:
