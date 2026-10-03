@@ -415,19 +415,38 @@ class SchedulerWeightUpdaterManager:
                 if p is not None:
                     role_payloads.append((role, p))
             payload = _merge_checksum_payloads(role_payloads) if role_payloads else None
+            local_error = None
+        except Exception as e:
+            logger.warning(f"check_weights see error: {e}")
+            traceback.print_exc()
+            payload = None
+            local_error = str(e)
 
+        try:
             tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
+            rank_results = [(local_error, payload)]
+            if tp_size > 1:
+                rank_results = [None] * tp_size
                 torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
+                    rank_results, (local_error, payload), group=self.tp_cpu_group
                 )
-                payload = all_payloads
-            if payload is not None:
-                # Normalize to one ChecksumInfo per rank so the wire shape is a
-                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
-                per_rank = payload if isinstance(payload, list) else [payload]
-                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+            # Compare and snapshot return no payload. Gather their status too,
+            # so the HTTP result cannot precede a non-egress rank's failure.
+            errors = [
+                f"TP rank {rank}: {error}"
+                for rank, (error, _) in enumerate(rank_results)
+                if error is not None
+            ]
+            if errors:
+                return CheckWeightsReqOutput(success=False, message="; ".join(errors))
+
+            payloads = [rank_payload for _, rank_payload in rank_results]
+            if any(p is not None for p in payloads):
+                if any(p is None for p in payloads):
+                    raise ValueError("checksum payload missing from a TP rank")
+                payload = [msgspec.convert(p, ChecksumInfo) for p in payloads]
+            else:
+                payload = None
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
