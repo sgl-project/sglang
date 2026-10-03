@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod health;
 pub mod policies;
 pub mod policies_reorg;
+pub mod protocol;
 pub mod proxy;
 pub mod server;
 pub mod state;
