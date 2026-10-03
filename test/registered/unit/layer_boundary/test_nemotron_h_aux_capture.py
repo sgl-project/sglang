@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h as model
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -28,7 +27,7 @@ class _Norm(nn.Module):
 
 
 class _Mixer(nn.Module):
-    """Row-parallel stand-in: a TP partial, reduced unless the layer skips it."""
+    """Row-parallel stand-in: a TP partial, whose sum the stage boundary completes."""
 
     def __init__(self, scale, tp=1):
         super().__init__()
@@ -36,8 +35,7 @@ class _Mixer(nn.Module):
         self.tp = tp
 
     def forward(self, hidden_states, **kwargs):
-        partial = hidden_states * (self.scale / self.tp)
-        return partial if should_skip_mlp_all_reduce() else partial * self.tp
+        return hidden_states * (self.scale / self.tp)
 
 
 def _build(pattern, tp, capture):

@@ -41,7 +41,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
     def _make_checker(self):
         tree_cache = MagicMock()
-        tree_cache.is_tree_cache.return_value = True
+        tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.supports_swa.return_value = True
         return SchedulerInvariantChecker(
             is_hybrid_swa=True,

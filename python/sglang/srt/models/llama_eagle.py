@@ -25,6 +25,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.post_norm import PLAIN_READOUT
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -50,7 +52,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
+
+    def _attn_readout(self, layer_id: int):
+        if layer_id == 0:
+            return PLAIN_READOUT
+        return super()._attn_readout(layer_id)
 
 
 class LlamaModel(nn.Module):
@@ -98,16 +104,11 @@ class LlamaModel(nn.Module):
             torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
         )
 
-        residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
-        return hidden_states + residual
+        residual_batch.start(forward_batch)
+        for layer in self.layers:
+            hidden_states = layer(positions, hidden_states, forward_batch)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return residual_batch.take_output(hidden_states, forward_batch)
 
 
 class LlamaForCausalLMEagle(LlamaForCausalLM):
