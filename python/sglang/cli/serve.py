@@ -103,6 +103,8 @@ def _run_llm(request: ServeRequest) -> None:
 def _detect_diffusion(request: ServeRequest) -> ServeBackendDetection:
     if request.model_path is None:
         return ServeBackendDetection.UNKNOWN
+    if any(arg.split("=", 1)[0] == "--dllm-algorithm" for arg in request.argv):
+        return ServeBackendDetection.NO_MATCH
     if get_is_diffusion_model(request.model_path):
         return ServeBackendDetection.MATCH
     return ServeBackendDetection.NO_MATCH
