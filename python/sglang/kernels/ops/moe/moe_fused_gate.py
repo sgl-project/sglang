@@ -94,20 +94,22 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
+    scores_ptr,  # [M, N (+ SHARED_SINK)] raw logits, fp32/fp16/bf16 (upcast on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     bias_alt_ptr,
     input_ids_ptr,
     num_token_non_padded_ptr,
-    out_weights_ptr,  # [M, K] fp32
-    out_indices_ptr,  # [M, K] int32
-    out_packed_ptr,  # [M, K] int32 (HAS_PACKED)
+    out_weights_ptr,  # [M, K] fp32 (LOGSIGMOID_SINK: [M, K_ROUTED])
+    out_indices_ptr,  # [M, K] int32 (LOGSIGMOID_SINK: [M, K_ROUTED])
+    out_packed_ptr,  # [M, K] int32 (HAS_PACKED / LOGSIGMOID_SINK + RETURN_PACKED)
+    out_shared_ptr,  # [M, SHARED_SINK] fp32 (LOGSIGMOID_SINK only)
+    global_scale_ptr,  # [1] fp32 (HAS_GLOBAL_SCALE only)
     M,
     routed_scaling_factor,
     moe_softcapping,
     N: tl.constexpr,
-    K: tl.constexpr,  # total topk (includes fused shared experts)
-    K_ROUTED: tl.constexpr,  # K - num_fused_shared_experts
+    K: tl.constexpr,  # total topk (includes fused shared experts / sink columns)
+    K_ROUTED: tl.constexpr,  # K - num_fused_shared_experts - SHARED_SINK
     BLOCK_M: tl.constexpr,  # rows processed per program (row tiling)
     BLOCK_N: tl.constexpr,  # >= N, power of 2
     BLOCK_K: tl.constexpr,  # >= K, power of 2
@@ -138,6 +140,16 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    # Epilogue parameterization. EPILOGUE 0 (SUM_NORM) is the historical
+    # behaviour and the only one any pre-existing call site reaches. EPILOGUE 1
+    # (LOGSIGMOID_SINK) is Inkling's gate: the last SHARED_SINK columns of the
+    # row are shared-expert sink logits that take no bias and never enter the
+    # top-k, but do join the normalizer, and the quantity normalized is the
+    # winner's RAW logit rather than its activated score.
+    EPILOGUE: tl.constexpr = 0,
+    SHARED_SINK: tl.constexpr = 0,
+    HAS_GLOBAL_SCALE: tl.constexpr = False,
+    RETURN_PACKED: tl.constexpr = False,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -259,6 +271,16 @@ def _router_triton_kernel(
     selected_vals = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
     selected_idx = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.int32)
 
+    # The quantity carried out of the top-k loop is not the quantity it ranks on.
+    # SUM_NORM normalizes the activated score, so it carries `activated`.
+    # LOGSIGMOID_SINK normalizes the RAW logit, so it carries `scores` -- ranking
+    # still happens on `biased`. Two quantities per column is what makes a plain
+    # "top-k and keep the winning score" kernel unusable for Inkling.
+    if EPILOGUE == 1:
+        carried = scores
+    else:
+        carried = activated
+
     cur = biased  # [BLOCK_M, BLOCK_N]
     remaining = tl.broadcast_to(mask_n[None, :], (BLOCK_M, BLOCK_N))
     for k in tl.static_range(K_ROUTED):
@@ -266,60 +288,136 @@ def _router_triton_kernel(
         is_max = remaining & (cur == max_val)
         lane_id = tl.where(is_max, offs_n[None, :], N + 1)  # lowest expert id wins ties
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)  # [BLOCK_M, 1]
-        win_activated = tl.sum(
-            tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
+        win_carried = tl.sum(
+            tl.where(offs_n[None, :] == win_lane, carried, 0.0), axis=1
         )[:, None]  # [BLOCK_M, 1]
         slot = offs_k[None, :] == k  # [1, BLOCK_K]
-        selected_vals = tl.where(slot, win_activated, selected_vals)
+        selected_vals = tl.where(slot, win_carried, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
         remaining = remaining & (offs_n[None, :] != win_lane)
         cur = tl.where(remaining, cur, -float("inf"))
 
-    routed_sum = tl.sum(tl.where(mask_k_routed[None, :], selected_vals, 0.0), axis=1)[
-        :, None
-    ]  # [BLOCK_M, 1]
+    if EPILOGUE == 1:
+        # Sink columns N .. N + SHARED_SINK of the same row occupy slots
+        # K_ROUTED .. K. They take no bias (bias is [N], not [N + SHARED_SINK])
+        # and never enter the top-k, but they do join the normalizer.
+        offs_s = offs_k - K_ROUTED  # [BLOCK_K]
+        mask_s = (offs_s >= 0) & (offs_s < SHARED_SINK)
+        sink_raw = tl.load(
+            scores_ptr
+            + offs_m[:, None] * stride_sm
+            + (N + offs_s[None, :]) * stride_sn,
+            mask=mask_m[:, None] & mask_s[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        active = tl.where(mask_s[None, :], sink_raw, selected_vals)
 
-    # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
-    # id = num_experts + (slot - K_ROUTED).
-    if K_ROUTED < K:
-        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
-        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
-        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
-        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
-        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-    if RENORMALIZE:
-        if RENORMALIZE_EPSILON > 0.0:
-            norm = routed_sum + RENORMALIZE_EPSILON
-        else:
-            norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)  # [BLOCK_M, 1]
-        selected_vals = selected_vals / norm
-    if APPLY_SCALE:
-        selected_vals = selected_vals * routed_scaling_factor
-    if HAS_PADDING:
-        selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
-        selected_idx = tl.where(live_m[:, None], selected_idx, -1)
-
-    out_w_ptr = (
-        out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
-    )
-    out_i_ptr = (
-        out_indices_ptr + offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik
-    )
-    store_mask = mask_m[:, None] & mask_k_total[None, :]
-    tl.store(out_w_ptr, selected_vals, mask=store_mask)
-    tl.store(out_i_ptr, selected_idx, mask=store_mask)
-    if HAS_PACKED:
-        # Must stay bitwise identical to fused_pack_topk.
-        w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
-        packed = (selected_idx << 16) | (w_bits & 0xFFFF)
-        out_p_ptr = (
-            out_packed_ptr + offs_m[:, None] * stride_pm + offs_k[None, :] * stride_pk
+        # exp(logsigmoid(x) - logsumexp(logsigmoid(x))) over the K active slots.
+        # Algebraically sigmoid(x) / sum(sigmoid(x)), but fp32 sigmoid underflows
+        # to 0 below x ~ -104, so the explicit form divides 0/0 and returns NaN
+        # once every active logit is that negative.
+        # log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)), exact for large |x|.
+        lp = tl.minimum(active, 0.0) - tl.log(1.0 + tl.exp(-tl.abs(active)))
+        lp = tl.where(mask_k_total[None, :], lp, float("-inf"))
+        e = tl.where(
+            mask_k_total[None, :], tl.exp(lp - tl.max(lp, axis=1)[:, None]), 0.0
         )
-        tl.store(out_p_ptr, packed, mask=store_mask)
+        selected_vals = e / tl.sum(e, axis=1, keep_dims=True)
+        # route_scale, then the model's scalar global_scale. RENORMALIZE /
+        # APPLY_SCALE do not apply: this epilogue always renormalizes and always
+        # scales (the sum over routed + sink weights is route_scale*global_scale).
+        selected_vals = selected_vals * routed_scaling_factor
+        if HAS_GLOBAL_SCALE:
+            selected_vals = selected_vals * tl.load(global_scale_ptr)
+
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+
+        # Routed weights/ids are [M, K_ROUTED]; the sink gammas get their own
+        # [M, SHARED_SINK] output rather than trailing slots of the routed one.
+        store_mask = mask_m[:, None] & mask_k_routed[None, :]
+        if RETURN_PACKED:
+            # Must stay bitwise identical to fused_pack_topk.
+            w_bits = (
+                selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+            )
+            tl.store(
+                out_packed_ptr
+                + offs_m[:, None] * stride_pm
+                + offs_k[None, :] * stride_pk,
+                (selected_idx << 16) | (w_bits & 0xFFFF),
+                mask=store_mask,
+            )
+        else:
+            tl.store(
+                out_weights_ptr
+                + offs_m[:, None] * stride_wm
+                + offs_k[None, :] * stride_wk,
+                selected_vals,
+                mask=store_mask,
+            )
+            tl.store(
+                out_indices_ptr
+                + offs_m[:, None] * stride_im
+                + offs_k[None, :] * stride_ik,
+                selected_idx,
+                mask=store_mask,
+            )
+        tl.store(
+            out_shared_ptr + offs_m[:, None] * SHARED_SINK + offs_s[None, :],
+            selected_vals,
+            mask=mask_m[:, None] & mask_s[None, :],
+        )
+    else:
+        routed_sum = tl.sum(
+            tl.where(mask_k_routed[None, :], selected_vals, 0.0), axis=1
+        )[:, None]  # [BLOCK_M, 1]
+
+        # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
+        # id = num_experts + (slot - K_ROUTED).
+        if K_ROUTED < K:
+            is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
+            shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
+            shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
+            selected_vals = tl.where(is_shared, shared_weight, selected_vals)
+            selected_idx = tl.where(is_shared, shared_idx, selected_idx)
+
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+
+        if RENORMALIZE:
+            if RENORMALIZE_EPSILON > 0.0:
+                norm = routed_sum + RENORMALIZE_EPSILON
+            else:
+                norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)  # [BLOCK_M, 1]
+            selected_vals = selected_vals / norm
+        if APPLY_SCALE:
+            selected_vals = selected_vals * routed_scaling_factor
+        if HAS_PADDING:
+            selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
+            selected_idx = tl.where(live_m[:, None], selected_idx, -1)
+
+        out_w_ptr = (
+            out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
+        )
+        out_i_ptr = (
+            out_indices_ptr + offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik
+        )
+        store_mask = mask_m[:, None] & mask_k_total[None, :]
+        tl.store(out_w_ptr, selected_vals, mask=store_mask)
+        tl.store(out_i_ptr, selected_idx, mask=store_mask)
+        if HAS_PACKED:
+            # Must stay bitwise identical to fused_pack_topk.
+            w_bits = (
+                selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+            )
+            packed = (selected_idx << 16) | (w_bits & 0xFFFF)
+            out_p_ptr = (
+                out_packed_ptr
+                + offs_m[:, None] * stride_pm
+                + offs_k[None, :] * stride_pk
+            )
+            tl.store(out_p_ptr, packed, mask=store_mask)
 
 
 _DUMMY_I32: Dict[torch.device, torch.Tensor] = {}
@@ -354,7 +452,13 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    shared_sink: int = 0,
+    global_scale: Optional[torch.Tensor] = None,
+    return_packed: bool = False,
+) -> (
+    Tuple[torch.Tensor, torch.Tensor]
+    | Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor | None]
+):
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
     Mirrors :func:`moe_fused_gate_jit` (the CUDA JIT kernel) for the shared
@@ -369,6 +473,18 @@ def moe_fused_gate(
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
+
+    ``shared_sink > 0`` selects the Inkling gate epilogue: ``scores`` is
+    ``[M, num_experts + shared_sink]``, the trailing ``shared_sink`` columns are
+    shared-expert sink logits that take no bias and never enter the top-k but do
+    join the normalizer, the normalized quantity is the winner's RAW logit rather
+    than its activated score, and the weights are renormalized in log space (see
+    :mod:`sglang.kernels.ops.moe.sigmoid_gate_topk_renorm`). It returns a 4-tuple
+    ``(routed_weights, topk_indices, shared_weights, packed_topk)``; ``return_packed``
+    emits the packed form in place of the routed weights/ids.
+
+    At the default ``shared_sink == 0`` every code path, launch geometry and
+    output tensor is unchanged and the return value is the historical 2-tuple.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (
@@ -380,6 +496,7 @@ def moe_fused_gate(
         torch.bfloat16,
     ), "scores must be float32/float16/bfloat16"
     assert scores.ndim == 2, "scores must be 2D"
+    assert shared_sink >= 0, f"{shared_sink=} must be non-negative"
     if bias is None:
         assert scoring_func.lower() == "softmax", (
             "bias is required for non-softmax routing"
@@ -394,10 +511,25 @@ def moe_fused_gate(
             torch.bfloat16,
         ), "bias must be float32/float16/bfloat16"
         assert bias.ndim == 1, "bias must be 1D"
-        assert scores.size(1) == bias.size(0), (
-            "scores and bias must have same num_experts"
+        assert scores.size(1) == bias.size(0) + shared_sink, (
+            "scores must be [M, num_experts + shared_sink] and bias [num_experts]"
         )
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    if shared_sink > 0:
+        # The sink columns are read directly off the score row, so only
+        # column-stride-1 is required -- Inkling's gate logits are a [T, 258]
+        # slice of a padded [T, 264] fp32 GEMM output, i.e. not contiguous but
+        # column-contiguous, and need no copy.
+        assert scores.stride(1) == 1, f"{scores.stride()=} needs column stride 1"
+        assert num_fused_shared_experts == 0, "shared_sink and fused shared experts"
+        assert num_expert_group <= 1, "shared_sink does not support grouped routing"
+        assert scoring_func.lower() == "sigmoid", "shared_sink is sigmoid-gate only"
+        assert moe_softcapping == 0.0, "shared_sink does not support softcapping"
+        assert packed_out is None, "shared_sink uses return_packed, not packed_out"
+        assert num_token_non_padded is None, "shared_sink does not support padding"
+    else:
+        assert global_scale is None, "global_scale requires shared_sink > 0"
+        assert not return_packed, "return_packed requires shared_sink > 0"
     if input_ids is not None:
         assert bias_alt is not None and bias_alt_token_id is not None
         assert bias is not None and bias_alt.shape == bias.shape
@@ -426,6 +558,7 @@ def moe_fused_gate(
         and num_token_non_padded is None
         and renormalize_epsilon == 0.0
         and packed_out is None
+        and shared_sink == 0
         and bias.stride(0) == 1
     ):
         radix_args = (
@@ -439,19 +572,49 @@ def moe_fused_gate(
         if moe_route_radix.covered(scores, bias, topk):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
-    M, N = scores.shape
-    K = topk
-    K_routed = topk - num_fused_shared_experts
+    M = scores.shape[0]
+    # bias is [N] while the score row is [N + shared_sink], and bias may be None
+    # for plain softmax routing, so derive N from the row rather than the bias.
+    N = scores.shape[1] - shared_sink
+    if shared_sink > 0:
+        # Sink columns take slots K_routed .. K of the normalizer, so they widen
+        # K without widening the routed outputs.
+        K = topk + shared_sink
+        K_routed = topk
+    else:
+        K = topk
+        K_routed = topk - num_fused_shared_experts
     if num_expert_group > 1:
         assert N % num_expert_group == 0, "num_experts must be divisible by group count"
         assert 1 <= topk_group <= num_expert_group, "invalid topk_group"
     experts_per_group = N // num_expert_group
     BLOCK_G = triton.next_power_of_2(num_expert_group)
 
-    weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
-    indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
-    if M == 0:
-        return weights, indices
+    shared_weights = packed_topk = None
+    if shared_sink > 0:
+        shared_weights = torch.empty(
+            (M, shared_sink), dtype=torch.float32, device=scores.device
+        )
+        if return_packed:
+            # In packed mode the kernel writes only the packed tensor.
+            packed_topk = torch.empty(
+                (M, K_routed), dtype=torch.int32, device=scores.device
+            )
+            weights = indices = None
+        else:
+            weights = torch.empty(
+                (M, K_routed), dtype=torch.float32, device=scores.device
+            )
+            indices = torch.empty(
+                (M, K_routed), dtype=torch.int32, device=scores.device
+            )
+        if M == 0:
+            return weights, indices, shared_weights, packed_topk
+    else:
+        weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
+        indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+        if M == 0:
+            return weights, indices
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
@@ -476,15 +639,20 @@ def moe_fused_gate(
     # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
     # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
     _unused_i32 = _dummy_i32(scores.device)
+    # LOGSIGMOID_SINK writes either the routed pair or the packed tensor, never
+    # both, so the other one is an unused arg and takes the dummy too.
+    packed_arg = packed_topk if packed_topk is not None else packed_out
     _router_triton_kernel[grid](
         scores,
         bias if bias is not None else scores,
         bias_alt,
         input_ids,
         num_token_non_padded,
-        weights,
-        indices,
-        packed_out if packed_out is not None else _unused_i32,
+        weights if weights is not None else _unused_i32,
+        indices if indices is not None else _unused_i32,
+        packed_arg if packed_arg is not None else _unused_i32,
+        shared_weights if shared_weights is not None else _unused_i32,
+        global_scale if global_scale is not None else _unused_i32,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
@@ -515,13 +683,19 @@ def moe_fused_gate(
         stride_input_ids=input_ids.stride(0) if input_ids is not None else 0,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),
-        stride_wm=weights.stride(0),
-        stride_wk=weights.stride(1),
-        stride_im=indices.stride(0),
-        stride_ik=indices.stride(1),
-        stride_pm=packed_out.stride(0) if packed_out is not None else 0,
-        stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        stride_wm=weights.stride(0) if weights is not None else 0,
+        stride_wk=weights.stride(1) if weights is not None else 0,
+        stride_im=indices.stride(0) if indices is not None else 0,
+        stride_ik=indices.stride(1) if indices is not None else 0,
+        stride_pm=packed_arg.stride(0) if packed_arg is not None else 0,
+        stride_pk=packed_arg.stride(1) if packed_arg is not None else 0,
+        EPILOGUE=1 if shared_sink > 0 else 0,
+        SHARED_SINK=shared_sink,
+        HAS_GLOBAL_SCALE=global_scale is not None,
+        RETURN_PACKED=bool(return_packed),
         num_warps=num_warps,
         **extra,
     )
+    if shared_sink > 0:
+        return weights, indices, shared_weights, packed_topk
     return weights, indices
