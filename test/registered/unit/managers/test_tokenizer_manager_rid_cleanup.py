@@ -418,6 +418,25 @@ class TestAbortOutputPayload(CustomTestCase):
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
 
 
+class TestIndexerTopkMetaInfo(CustomTestCase):
+    def test_indexer_topk_arrives_with_its_layer_count(self):
+        """meta_info["indexer_topk"] is flat int32 bytes; clients cannot reshape it
+        unless the layer count arrives in the same chunk."""
+        tm = _make_tokenizer_manager(self)
+        rid = "indexer_topk_layers_rid"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        batch_output.indexer_topk = ["AAAA"]
+        batch_output.indexer_topk_num_layers = 7
+
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        meta_info = state.out_list[-1]["meta_info"]
+        self.assertEqual(meta_info["indexer_topk"], "AAAA")
+        self.assertEqual(meta_info["indexer_topk_num_layers"], 7)
+
+
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
 

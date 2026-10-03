@@ -400,6 +400,56 @@ _IPC_ROUND_TRIPS = {
 }
 
 
+class TestOutputStreamerIndexerTopk(unittest.TestCase):
+    def setUp(self):
+        for target, value in (
+            ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
+            (
+                "get_observability",
+                SimpleNamespace(enable_request_time_stats_logging=False),
+            ),
+            ("get_global_indexer_capturer", SimpleNamespace(num_indexer_layers=7)),
+        ):
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.output_streamer.{target}",
+                return_value=value,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
+
+    def test_payload_carries_the_capturer_layer_count(self):
+        """Clients reshape the flat indexer_topk bytes by this layer count, so it must
+        cross either IPC codec in the batch that carries indexer_topk."""
+
+        class Streamer(SchedulerOutputStreamer):
+            def get_cached_tokens_details(self, req):
+                return None
+
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                outputs = []
+                streamer = Streamer(
+                    send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+                    tree_cache=None,
+                    server_args=SimpleNamespace(),
+                    is_generation=True,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    disaggregation_mode=DisaggregationMode.NULL,
+                    enable_hicache_storage=lambda: False,
+                )
+                req = _FakeReq("r0", array("q", [10]), finished=True)
+                req.return_indexer_topk = True
+                req.indexer_topk = torch.zeros((1, 7, 4), dtype=torch.int32)
+
+                streamer._stream_output_generation([req], False)
+
+                self.assertEqual(round_trip(outputs[0]).indexer_topk_num_layers, 7)
+
+
 class TestOutputStreamerSamplingMasks(unittest.TestCase):
     def test_rows_stream_once_and_expand_to_response_lists(self):
         """Queued rows cross either IPC codec once, in batch order, as per-token lists;

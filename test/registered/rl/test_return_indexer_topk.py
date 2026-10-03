@@ -21,7 +21,7 @@ register_cuda_ci(est_time=306, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
-# V3.2 config — hardcoded for response decoding (mirrors test_return_routed_experts.py).
+# V3.2 config - expected response shape (mirrors test_return_routed_experts.py).
 NUM_INDEXER_LAYERS = 61
 INDEX_TOPK = 2048
 
@@ -132,10 +132,11 @@ class TestReturnIndexerTopk(CustomTestCase):
                 for text in cls.texts
             ]
             http_results = await asyncio.gather(*tasks)
-            # Reshape raw int32 bytes into (seqlen-1, num_indexer_layers, index_topk).
+            # Reshape raw int32 bytes into (seqlen-1, num_indexer_layers, index_topk)
+            # with the response's own layer count, which _check_shape_and_range verifies.
             return [
                 extract_indexer_topk_from_meta_info(res).reshape(
-                    -1, NUM_INDEXER_LAYERS, INDEX_TOPK
+                    -1, res["meta_info"]["indexer_topk_num_layers"], INDEX_TOPK
                 )
                 for res in http_results
             ]

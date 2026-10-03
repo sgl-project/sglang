@@ -1623,6 +1623,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Layer count of every indexer_topk tensor, which consumers need to reshape the
+    # flat int32 payload into (token, layer, topk). None unless indexer_topk is set.
+    indexer_topk_num_layers: Optional[int] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1713,6 +1717,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # See BatchTokenIDOutput.indexer_topk_num_layers.
+    indexer_topk_num_layers: Optional[int] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

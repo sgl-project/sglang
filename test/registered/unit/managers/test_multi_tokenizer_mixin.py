@@ -141,6 +141,17 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             chunk.to_lists(support_logprobs=True), ([[7, 8]], [[-0.5, -1.0]])
         )
 
+    def test_batch_str_output_keeps_indexer_topk_layer_count(self):
+        """The batch-wide layer count reaches every per-worker split."""
+        output = _make_batch_str_output()
+        output.indexer_topk = ["AAAA", "BBBB"]
+        output.indexer_topk_num_layers = 7
+
+        for i in range(2):
+            self.assertEqual(
+                _handle_output_by_index(output, i).indexer_topk_num_layers, 7
+            )
+
     def test_batch_str_output_without_weight_versions_stays_none(self):
         """An output from an older server without the field splits into None."""
         output = _make_batch_str_output()

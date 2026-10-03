@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel, get_serv
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -161,12 +162,20 @@ class SchedulerOutputStreamer:
         return_sampling_mask = any(
             req.return_sampling_mask for req in reqs if req is not skip_req
         )
+        indexer_capturer = (
+            get_global_indexer_capturer() if return_indexer_topk else None
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
+            indexer_topk_num_layers=(
+                None
+                if indexer_capturer is None
+                else indexer_capturer.num_indexer_layers
+            ),
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
@@ -317,6 +326,7 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
+    indexer_topk_num_layers: Optional[int] = None
     return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
@@ -739,6 +749,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            indexer_topk_num_layers=self.indexer_topk_num_layers,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),
