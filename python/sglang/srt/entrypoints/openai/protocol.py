@@ -393,6 +393,7 @@ class CompletionRequest(PDRoutingFields):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    draft_adapter: Optional[Union[List[Optional[str]], str]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
@@ -941,6 +942,7 @@ class ChatCompletionRequest(PDRoutingFields):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    draft_adapter: Optional[Union[List[Optional[str]], str]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
