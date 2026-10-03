@@ -422,6 +422,9 @@ async fn lookup_prefix_matches(
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                // The indexer's wire contract carries neither the storage
+                // tier nor reverse-index presence.
+                tree_view: None,
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.

@@ -99,8 +99,10 @@
 //! then prefills it cold. Ownership here is "any tier", which is what makes
 //! the prefix routable again. [`MatchResult::tiers`] reports which tier each
 //! owner holds it on so a policy can price a load-back against an in-place
-//! hit; no policy consumes it yet — the routing path reads
-//! [`HashTree::prefix_depths`], which is tier-blind by design.
+//! hit; no policy consumes it yet. The routing path reads
+//! [`HashTree::prefix_depths`], which reports the same tiers per worker at
+//! that worker's own depth — observability consumes them, selection does
+//! not.
 //!
 //! Untagged events keep their pre-tiering meaning: an untagged store is a
 //! device store, an untagged remove clears every tier. A store tagged with a
@@ -414,6 +416,46 @@ fn add_tiers(
             carriers.insert(worker.clone(), tiers);
             tiers
         }
+    }
+}
+
+/// One worker's answer from [`HashTree::prefix_depths`]: how much of the
+/// queried chain it holds, and on which tiers it holds the deepest block of
+/// that run.
+///
+/// The tiers are read at the worker's OWN frozen depth, so a worker that
+/// dropped off the chain early reports the tiers it held where it stopped —
+/// not the tiers of the fleet's deepest node, which it does not occupy.
+/// Routing still treats every tier as ownership ([`Tiers`]); this is for
+/// pricing and for `sgl_router_selected_owner_tier_total`, which reports the
+/// tier a hit was actually served from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixDepth {
+    /// Leading blocks of the queried chain this worker holds contiguously.
+    pub blocks: usize,
+    /// Tiers the worker holds the `blocks`-th block on. Never empty: the tree
+    /// drops a carrier the moment its last tier bit clears.
+    pub tiers: Tiers,
+}
+
+impl PrefixDepth {
+    /// Position of the cheapest tier held in [`Tiers::SLOTS`] — 0 is a device
+    /// copy served in place, higher is a dearer load-back. [`TIER_SLOT_COUNT`]
+    /// for the empty set, which the tree never produces; ordering by this
+    /// therefore ranks a real holder ahead of a phantom one.
+    pub fn best_tier_rank(&self) -> usize {
+        Tiers::SLOTS
+            .iter()
+            .position(|(tier, _)| self.tiers.contains(*tier))
+            .unwrap_or(TIER_SLOT_COUNT)
+    }
+
+    /// Label of the tier at [`Self::best_tier_rank`], or `None` for the empty
+    /// set.
+    pub fn best_tier_label(&self) -> Option<&'static str> {
+        Tiers::SLOTS
+            .get(self.best_tier_rank())
+            .map(|(_, label)| *label)
     }
 }
 
@@ -1029,11 +1071,15 @@ impl TreeState {
     /// `d` blocks" means present at each of levels `1..=d`. A worker is frozen
     /// at the first level that omits it, so a `remove`d interior node stops the
     /// count at the hole instead of counting past it.
+    ///
+    /// Each worker's [`PrefixDepth::tiers`] is read at that frozen level — the
+    /// deepest node the worker itself reached — not at the chain's deepest
+    /// node, which a shallower holder never occupies.
     fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
         block_hashes: &[i64],
-    ) -> HashMap<KvWorkerId, usize> {
+    ) -> HashMap<KvWorkerId, PrefixDepth> {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
@@ -1047,8 +1093,14 @@ impl TreeState {
             },
         };
         // Keys borrow the arena for the walk; ids are cloned once on the way out.
-        let mut depths: HashMap<&KvWorkerId, usize> = HashMap::new();
-        let mut alive: Vec<&KvWorkerId> = Vec::new();
+        let mut depths: HashMap<&KvWorkerId, PrefixDepth> = HashMap::new();
+        // Each live worker carries the tiers it held at the last level it
+        // survived, so freezing it is a move of a value already in hand. Going
+        // back to `child.workers` per level to build the entry instead would
+        // cost three `KvWorkerId` hashes per (level, live worker) where this
+        // costs one — on the synchronous routing path, under a read lock, for
+        // a field only observability reads.
+        let mut alive: Vec<(&KvWorkerId, Tiers)> = Vec::new();
         let mut current = start;
         let mut reached = 0usize;
         let now = now_millis();
@@ -1071,25 +1123,40 @@ impl TreeState {
                 // block 0 is reported as holding nothing. Presence is "on any
                 // tier" — a worker whose device copy was evicted but whose
                 // host backup remains still holds the level.
-                alive = child.workers.keys().collect();
+                alive = child.workers.iter().map(|(w, &tiers)| (w, tiers)).collect();
             } else {
-                let mut still = Vec::with_capacity(alive.len());
-                for w in alive {
-                    if child.workers.contains_key(w) {
-                        still.push(w);
-                    } else {
-                        depths.insert(w, reached - 1);
+                alive.retain_mut(|(worker, tiers)| match child.workers.get(*worker) {
+                    Some(&held) => {
+                        *tiers = held;
+                        true
                     }
-                }
-                alive = still;
+                    // Frozen one level up, on the tiers it held there — not
+                    // this node's, which it does not occupy.
+                    None => {
+                        depths.insert(
+                            *worker,
+                            PrefixDepth {
+                                blocks: reached - 1,
+                                tiers: *tiers,
+                            },
+                        );
+                        false
+                    }
+                });
             }
             if alive.is_empty() {
                 break;
             }
         }
         // Whoever is still tracked held every level the walk reached.
-        for w in alive {
-            depths.insert(w, reached);
+        for (worker, tiers) in alive {
+            depths.insert(
+                worker,
+                PrefixDepth {
+                    blocks: reached,
+                    tiers,
+                },
+            );
         }
         depths.into_iter().map(|(w, d)| (w.clone(), d)).collect()
     }
@@ -1504,19 +1571,63 @@ impl HashTree {
     }
 
     /// How many leading blocks of `block_hashes` each worker holds
-    /// contiguously, in one descent under one shard's read lock.
-    /// [`Self::match_prefix`] names only the deepest matched node's holders,
-    /// so it cannot answer this. Absent = none.
+    /// contiguously and on which tiers, in one descent under one shard's read
+    /// lock. [`Self::match_prefix`] names only the deepest matched node's
+    /// holders, so it cannot answer this. Absent = none.
     pub fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
         block_hashes: &[i64],
-    ) -> HashMap<KvWorkerId, usize> {
+    ) -> HashMap<KvWorkerId, PrefixDepth> {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
         self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
             shard.prefix_depths(parent, block_hashes)
+        })
+    }
+
+    /// Whether ANY worker holds `block_hash` on some node of the tree,
+    /// regardless of where that node sits on a chain or which shard holds it.
+    ///
+    /// The point is the difference from a failed [`Self::prefix_depths`] walk,
+    /// which is root-anchored. Present but unreachable is one specific fault:
+    /// the block was published and the router could not link it to a chain.
+    /// `matched_blocks == 0` alone cannot see that, so
+    /// `sgl_router_zero_match_block0_total` splits on this.
+    ///
+    /// Absent is NOT the complement of that fault, and does not by itself
+    /// implicate the engines. It has three causes and this predicate cannot
+    /// tell them apart:
+    ///
+    /// 1. nobody ever published the block — a worker that is routable but not
+    ///    publishing, so the tree has no way to learn it;
+    /// 2. it was published and later removed — a real eviction;
+    /// 3. an engine holds it and has no reason to announce it. Events fire on
+    ///    insertion, so a block that stays resident is never re-published. The
+    ///    root of a hot shared prefix is the extreme case: it is the block most
+    ///    likely to be held and the least likely to be announced, so a tree
+    ///    that missed the original insertion can accumulate suffix blocks
+    ///    indefinitely and still fail every walk at the first step.
+    ///
+    /// Case 3 is the default for a tree that starts after the fleet is already
+    /// warm, and no amount of traffic resolves it — only a fresh insertion
+    /// does. Read this metric against the tree's coverage of the engines' own
+    /// reported occupancy: low coverage while engine occupancy is flat means a
+    /// tree that never learned what the engines hold, not an engine fault.
+    ///
+    /// A continuation lands in its parent chain's shard, not
+    /// `shard_of(block_hash)`, so this asks every shard — one read lock at a
+    /// time, never all at once.
+    pub fn contains_hash(&self, block_hash: i64) -> bool {
+        // A present key is not enough: `prune` keeps a node whose last worker
+        // left while it still has children, so its key outlives every holder.
+        self.shards.iter().any(|s| {
+            let st = s.read();
+            st.by_hash.get(&block_hash).is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| st.nodes.get(id).is_some_and(|n| !n.workers.is_empty()))
+            })
         })
     }
 
@@ -1788,10 +1899,11 @@ mod tests {
         tree.remove(&holed, &chain[1..2]);
 
         let depths = tree.prefix_depths(None, &chain);
-        assert_eq!(depths.get(&deep), Some(&4), "holds the whole chain");
-        assert_eq!(depths.get(&shallow), Some(&2), "holds two of four");
-        assert_eq!(depths.get(&holed), Some(&1), "stops at the cleared block");
-        assert_eq!(depths.get(&worker("http://d", 0)), None, "holds nothing");
+        let blocks = |w: &KvWorkerId| depths.get(w).map(|d| d.blocks);
+        assert_eq!(blocks(&deep), Some(4), "holds the whole chain");
+        assert_eq!(blocks(&shallow), Some(2), "holds two of four");
+        assert_eq!(blocks(&holed), Some(1), "stops at the cleared block");
+        assert_eq!(blocks(&worker("http://d", 0)), None, "holds nothing");
 
         // Contiguity matters: `remove` left `holed` listed at the deepest node,
         // so `match_prefix` credits it with the full chain scored here at 1.
@@ -1867,8 +1979,11 @@ mod tests {
         tree.remove_tiered(&a, &[1, 2, 3], Tiers::for_remove(Some("GPU")));
         assert_eq!(
             tree.prefix_depths(None, &[1, 2, 3]).get(&a).copied(),
-            Some(3),
-            "host backup keeps every level attributed to the worker",
+            Some(PrefixDepth {
+                blocks: 3,
+                tiers: Tiers::HOST,
+            }),
+            "host backup keeps every level attributed to the worker, on host",
         );
 
         tree.remove_tiered(&a, &[1, 2, 3], Tiers::for_remove(None));
@@ -1877,6 +1992,108 @@ mod tests {
             None,
             "an untagged removal still clears every tier, host backup included",
         );
+    }
+
+    /// A shallower holder must report the tiers it holds at ITS OWN depth.
+    /// Reading the tiers off the chain's deepest node instead would attribute
+    /// the deep holder's tier to every shallow one, which is the difference
+    /// between "this hit was served in place" and "this hit cost a load-back".
+    #[test]
+    fn prefix_depths_report_tiers_at_each_workers_own_depth() {
+        let tree = HashTree::new();
+        let deep = worker("http://deep", 0);
+        let shallow = worker("http://shallow", 0);
+        tree.insert_tiered(&deep, None, &[1, 2, 3], Tiers::DEVICE);
+        // The shallow holder keeps only a host copy, and only of block 1.
+        tree.insert_tiered(&shallow, None, &[1], Tiers::HOST);
+
+        let depths = tree.prefix_depths(None, &[1, 2, 3]);
+        assert_eq!(
+            depths.get(&deep).copied(),
+            Some(PrefixDepth {
+                blocks: 3,
+                tiers: Tiers::DEVICE,
+            }),
+        );
+        assert_eq!(
+            depths.get(&shallow).copied(),
+            Some(PrefixDepth {
+                blocks: 1,
+                tiers: Tiers::HOST,
+            }),
+            "the shallow holder's own tier, not the deep holder's",
+        );
+        assert_eq!(depths[&deep].best_tier_label(), Some("device"));
+        assert_eq!(depths[&shallow].best_tier_label(), Some("host"));
+    }
+
+    /// `best_tier_label` ranks in `Tiers::SLOTS` order: a block held on both
+    /// device and host is served in place, so it reads `device`.
+    #[test]
+    fn best_tier_label_prefers_the_cheapest_tier_held() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert_tiered(&a, None, &[1], Tiers::HOST);
+        tree.insert_tiered(&a, None, &[1], Tiers::DEVICE);
+        assert_eq!(
+            tree.prefix_depths(None, &[1])[&a].best_tier_label(),
+            Some("device"),
+        );
+
+        tree.remove_tiered(&a, &[1], Tiers::for_remove(Some("GPU")));
+        assert_eq!(
+            tree.prefix_depths(None, &[1])[&a].best_tier_label(),
+            Some("host"),
+            "with device gone the hit is served by load-back",
+        );
+    }
+
+    /// `contains_hash` has to answer independently of the root-anchored walk:
+    /// a block published as a continuation whose parent chain the router never
+    /// saw is present in the tree and unreachable from the root. That gap is
+    /// exactly what `sgl_router_zero_match_block0_total` splits on.
+    #[test]
+    fn contains_hash_sees_a_block_the_root_walk_cannot_reach() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert(&a, None, &[1, 2]);
+        // Hangs off 2, so a walk that starts at hash 9 finds nothing.
+        tree.insert(&a, Some(2), &[9]);
+
+        assert!(tree.contains_hash(9));
+        assert_eq!(
+            tree.prefix_depths(None, &[9]).len(),
+            0,
+            "carried, but not reachable from the root",
+        );
+        assert!(!tree.contains_hash(404), "never published");
+
+        tree.clear_worker(&a);
+        assert!(
+            !tree.contains_hash(9),
+            "dropping the last carrier must drop the reverse-index key too",
+        );
+    }
+
+    /// An interior node survives its last worker while a child is still held,
+    /// and so does its reverse-index key. Counting that key would book a
+    /// warm-start miss — the root evicted, the continuation still resident —
+    /// as a router-side linkage fault.
+    #[test]
+    fn contains_hash_ignores_a_node_no_worker_holds() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, None, &[1, 2]);
+        tree.insert(&b, Some(2), &[3]);
+        tree.remove(&a, &[1, 2]);
+
+        assert!(tree.contains_hash(3), "b still holds the continuation");
+        assert!(
+            !tree.contains_hash(1),
+            "the node survives as b's ancestor, but nobody holds block 1",
+        );
+        assert!(tree.prefix_depths(None, &[1, 2, 3]).is_empty());
     }
 
     /// Untagged events keep the pre-tiering contract: a bare `BlockStored` is
@@ -2172,7 +2389,10 @@ mod tests {
         tree.insert_tiered(&a, Some(7), &[8], Tiers::DEVICE);
         assert_eq!(
             tree.prefix_depths(None, &[5, 7, 8]).get(&a).copied(),
-            Some(3),
+            Some(PrefixDepth {
+                blocks: 3,
+                tiers: Tiers::DEVICE,
+            }),
             "the continuation must attach under the host-only hold, not at root",
         );
     }
@@ -2607,8 +2827,8 @@ mod tests {
             shard.prefix_depths(parent, &chain)
         });
         assert_eq!(
-            depths.get(&a),
-            Some(&chain.len()),
+            depths.get(&a).map(|d| d.blocks),
+            Some(chain.len()),
             "`prefix_depths` shares the fall-back",
         );
     }
