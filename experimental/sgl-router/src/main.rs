@@ -59,10 +59,17 @@ async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
+    let print_profile = cli.model.print_profile;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
+    let profile = &config.model.profile;
+    if print_profile {
+        print!("{}", serde_yaml::to_string(profile)?);
+        return Ok(());
+    }
+    tracing::info!(name = %profile.name, origin = %profile.origin, "api profile loaded");
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;

@@ -53,6 +53,7 @@ fn config_for(_worker_url: &str) -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            profile: Default::default(),
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
