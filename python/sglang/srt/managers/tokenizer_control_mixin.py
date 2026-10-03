@@ -197,6 +197,10 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
+        from sglang.srt.weight_sync.gpu_delta_tokenizer import GpuDeltaTokenizerControl
+
+        self.gpu_delta = GpuDeltaTokenizerControl(self, get_parallel().dp_size)
+
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
             get_parallel().enable_dp_attention
@@ -213,6 +217,7 @@ class TokenizerControlMixin:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.gpu_delta.communicator.set_fan_out(worker_count)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput

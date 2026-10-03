@@ -1827,6 +1827,12 @@ class Scheduler(
             ]
         )
 
+        from sglang.srt.weight_sync.gpu_delta_session import with_gpu_delta_controls
+
+        self._request_dispatcher = with_gpu_delta_controls(
+            self, self._request_dispatcher
+        )
+
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
