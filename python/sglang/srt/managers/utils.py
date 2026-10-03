@@ -486,3 +486,13 @@ def compute_num_reserved_tokens() -> int:
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
     )
+
+
+def compute_spec_context_reserve(enable_overlap: bool) -> int:
+    """Context slots kept free past a request's length cap for spec lookahead.
+
+    A step can accept up to one draft window past the cap, and under overlap the
+    already-launched next batch verifies the finished request once more; both
+    windows must stay within context_len (FA3 page table, RoPE cache).
+    """
+    return compute_num_reserved_tokens() * (2 if enable_overlap else 1)
