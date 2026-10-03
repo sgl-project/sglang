@@ -6,7 +6,10 @@ from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
 )
-from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    RMSNorm,
+    rms_norm_gated,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
@@ -139,6 +142,16 @@ class TestGdnPrefillLayout(unittest.TestCase):
                         is_rms_norm=True,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                    norm = RMSNorm(
+                        self.HEAD_DIM,
+                        dtype=dtype,
+                        device="cuda",
+                        norm_before_gate=norm_before_gate,
+                    )
+                    norm.weight.data.copy_(weight)
+                    native = norm.forward_native(x, z)
+                    torch.testing.assert_close(native, actual, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
