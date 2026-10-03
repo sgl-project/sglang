@@ -565,16 +565,14 @@ class Step3p5DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if self.use_moe:
-            with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-                share_output = self.share_expert(hidden_states)
-                hidden_states = self.moe(
-                    hidden_states, forward_batch, shared_output=share_output
-                )
-            return ffn_exit.finish(hidden_states)
+            share_output = self.share_expert(hidden_states)
+            hidden_states = self.moe(
+                hidden_states, forward_batch, shared_output=share_output
+            )
+            return self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states)
-        return ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class Step3p5Model(nn.Module):

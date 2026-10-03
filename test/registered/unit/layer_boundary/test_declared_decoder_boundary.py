@@ -368,7 +368,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 max_len, communicator.ffn.plan.output.plan.path_for(max_len)
             )
             self.assertTrue(
-                communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                communicator.ffn.plan.output._sum_in_reduce_scatter(
                     communicator.ffn.plan.output.plan.path_for(max_len), step
                 )
             )
@@ -1124,7 +1124,7 @@ class TestPrefillCP(CustomTestCase):
                     patch_communicator("_batch_shards_over_cp", lambda fb: shards),
                 ):
                     self.assertIs(
-                        communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                        communicator.ffn.plan.output._sum_in_reduce_scatter(
                             communicator.ffn.plan.output.plan.path_for(
                                 SimpleNamespace(forward_mode=ForwardMode.DECODE)
                             ),
@@ -1590,7 +1590,6 @@ class Flags:
     """The per-forward flags an FFN exit publishes, one set per rank."""
 
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False

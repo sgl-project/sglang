@@ -532,9 +532,8 @@ class IQuestQ1DecoderLayer(nn.Module):
         attn_output = self.self_attn(positions, hidden_states, forward_batch)
         hidden_states = self.attn_boundary.finish(attn_output, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            mlp_output = self.mlp(hidden_states)
-        return ffn_exit.finish(mlp_output)
+        mlp_output = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(mlp_output, forward_batch)
 
 
 class IQuestQ1Model(nn.Module):

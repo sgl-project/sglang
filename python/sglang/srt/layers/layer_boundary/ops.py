@@ -428,10 +428,9 @@ def moe_cp_take_back_output(
 ):
     """Return a MoE output computed on the MoE-CP-gathered rows to this rank's attention rows.
 
-    After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-    mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
-    full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
-    CP-local portion.
+    Once the exit has completed the MoE output's sum, all ranks in the moe_cp
+    group hold the full MoE result for all cp_per_moe token chunks. We simply
+    slice out this rank's CP-local portion.
 
     If DP>1, further scatter back to the local DP slice.
     """

@@ -44,7 +44,6 @@ def layernorm(hidden_states, residual=None):
 
 class Flags:
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False

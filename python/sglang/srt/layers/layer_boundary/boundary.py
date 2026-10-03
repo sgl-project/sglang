@@ -115,9 +115,6 @@ class ExitMove(NamedTuple):
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
     returns_over_dp: bool = False
-    # When output_move completes the sum: the move of an output compute has
-    # already reduced onto the same rows.
-    complete_output_move: Optional[Callable] = None
 
 
 def input_rows(edge: EdgeContract) -> Layout:
@@ -599,9 +596,8 @@ def _select_exit_move(
 ) -> ExitMove:
     """How the FFN output reaches the rows the layer hands on: by undoing the
     attention-DP gather (the FFN exit and finish run that step), or else the
-    move that takes it there, None when there is none to choose here; whether
-    that move also completes the sum the FFN leaves, and if so the move for an
-    output compute already reduced."""
+    move that takes it there, None when there is none to choose here; and
+    whether that move also completes the sum the FFN leaves."""
 
     update = produced.update
     if produced.layout == residual:
@@ -634,12 +630,6 @@ def _select_exit_move(
                 update=update,
             ),
             output_move_completes_sum=True,
-            complete_output_move=partial(
-                residual_slice_output,
-                sums=False,
-                gathers_back=to != residual,
-                update=update,
-            ),
         )
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
@@ -655,11 +645,7 @@ def _select_exit_move(
             _sum_group(produced.group), cp_moves.reduce_scatter_group()
         ):
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
-        return ExitMove(
-            cp_moves.reduce_scatter,
-            output_move_completes_sum=True,
-            complete_output_move=cp_moves.take_back,
-        )
+        return ExitMove(cp_moves.reduce_scatter, output_move_completes_sum=True)
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
         return ExitMove(dp_cp_take_back_output)

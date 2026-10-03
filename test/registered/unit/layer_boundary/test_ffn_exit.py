@@ -89,9 +89,7 @@ def make_communicator(
         communicator.output._defers_sum = MagicMock(return_value=fuse)
     else:
         communicator.output._defers_sum = MagicMock(return_value=False)
-    communicator.output._skips_sum_for_reduce_scatter = MagicMock(
-        return_value=reduce_scatter
-    )
+    communicator.output._sum_in_reduce_scatter = MagicMock(return_value=reduce_scatter)
     communicator.terminal = False
     communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = None
     communicator.paths[BatchVariant.INPUT_SCATTERED] = None
@@ -109,10 +107,9 @@ def make_communicator(
 
 
 def published_flags():
-    """The skip flags the FFN sees; the boundary completes the sum, so the FFN
+    """The skip flag the FFN sees; the boundary completes the sum, so the FFN
     never leaves it out."""
-    forward = get_forward()
-    return forward.fuse_mlp_allreduce, forward.mlp_reduce_scatter
+    return (get_forward().mlp_reduce_scatter,)
 
 
 class TestFfnExit(CustomTestCase):
@@ -150,7 +147,7 @@ class TestFfnExit(CustomTestCase):
             scatters_to_local_tokens=True,
         )
         seen, (hidden_states, residual) = self.run_exit(communicator)
-        self.assertEqual(seen, (False, False))
+        self.assertEqual(seen, (False,))
         self.assertIsInstance(hidden_states, UnreducedOutput)
         bound = hidden_states.reduce_to_dp_local
         self.assertIs(bound.func, transport_ops.to_dp_local)
@@ -179,7 +176,7 @@ class TestFfnExit(CustomTestCase):
                     fuse=False, reduce_scatter=reduce_scatter
                 )
                 seen, (hidden_states, residual) = self.run_exit(communicator)
-                self.assertEqual(seen, (False, False))
+                self.assertEqual(seen, (False,))
                 self.assertNotIsInstance(hidden_states, UnreducedOutput)
                 communicator.output._complete_now.assert_called_once()
                 # A reduce-scatter on the way back completes the sum; otherwise
@@ -197,7 +194,7 @@ class TestFfnExit(CustomTestCase):
         )
         seen, (hidden_states, residual) = self.run_exit(communicator)
 
-        self.assertEqual(seen, (False, False))
+        self.assertEqual(seen, (False,))
         communicator.output._defers_sum.assert_not_called()
         communicator.output._complete_now.assert_called_once()
         torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
@@ -216,7 +213,7 @@ class TestFfnExit(CustomTestCase):
                     decide.return_value = not fuse
                     hidden_states = self.hidden_states * 2
                 hidden_states, _ = finish_exit(ffn_exit, hidden_states, self.residual)
-                self.assertEqual(seen, (False, False))
+                self.assertEqual(seen, (False,))
                 self.assertEqual(isinstance(hidden_states, UnreducedOutput), fuse)
                 self.assertEqual(communicator.output._complete_now.called, not fuse)
 
@@ -253,7 +250,7 @@ class TestFfnExit(CustomTestCase):
             self.forward_batch, stream=ResidualStream()
         ) as ffn_exit:
             seen = published_flags() + (get_forward().defer_moe_finalize,)
-        self.assertEqual(seen, (False, False, True))
+        self.assertEqual(seen, (False, True))
         self.assertEqual(
             finish_exit(ffn_exit, handoff, self.residual), (handoff, self.residual)
         )
@@ -354,8 +351,8 @@ class TestSelectFfnCompletion(CustomTestCase):
             returns_over_dp=scatters,
         )
         communicator.output._defers_sum = lambda forward_batch, steps, **_: fuse
-        communicator.output._skips_sum_for_reduce_scatter = (
-            lambda forward_batch, dp_step: not fuse
+        communicator.output._sum_in_reduce_scatter = lambda forward_batch, dp_step: (
+            not fuse
         )
         communicator.output._complete_now = lambda h, r, **_: ("now", r)
         self.group = make_group()

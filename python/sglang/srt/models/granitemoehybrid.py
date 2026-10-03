@@ -155,21 +155,20 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(output, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.shared_mlp is None:
-                if self.block_sparse_moe is not None:
-                    hidden_states = self.block_sparse_moe(hidden_states)
-                # else: skip
+        if self.shared_mlp is None:
+            if self.block_sparse_moe is not None:
+                hidden_states = self.block_sparse_moe(hidden_states)
+            # else: skip
+        else:
+            # create a copy since block_sparse_moe modifies in-place
+            if self.block_sparse_moe is not None:
+                moe_hidden_states = hidden_states.clone()
+                moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
+                hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
+                del moe_hidden_states
             else:
-                # create a copy since block_sparse_moe modifies in-place
-                if self.block_sparse_moe is not None:
-                    moe_hidden_states = hidden_states.clone()
-                    moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
-                    hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
-                    del moe_hidden_states
-                else:
-                    hidden_states = self.shared_mlp(hidden_states)
-        return ffn_exit.finish(hidden_states)
+                hidden_states = self.shared_mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class GraniteMoeHybridAttention(nn.Module):
@@ -339,21 +338,20 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.shared_mlp is None:
-                if self.block_sparse_moe is not None:
-                    hidden_states = self.block_sparse_moe(hidden_states)
-                # else: skip
+        if self.shared_mlp is None:
+            if self.block_sparse_moe is not None:
+                hidden_states = self.block_sparse_moe(hidden_states)
+            # else: skip
+        else:
+            # create a copy since block_sparse_moe modifies in-place
+            if self.block_sparse_moe is not None:
+                moe_hidden_states = hidden_states.clone()
+                moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
+                hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
+                del moe_hidden_states
             else:
-                # create a copy since block_sparse_moe modifies in-place
-                if self.block_sparse_moe is not None:
-                    moe_hidden_states = hidden_states.clone()
-                    moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
-                    hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
-                    del moe_hidden_states
-                else:
-                    hidden_states = self.shared_mlp(hidden_states)
-        return ffn_exit.finish(hidden_states)
+                hidden_states = self.shared_mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 ALL_DECODER_LAYER_TYPES = {

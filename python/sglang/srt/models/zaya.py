@@ -1397,11 +1397,10 @@ class ZayaDecoderMLPLayer(nn.Module):
         prev_router_hidden_states: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states, prev_router_hidden_states = self.zaya_block(
-                hidden_states, prev_router_hidden_states
-            )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states, prev_router_hidden_states = self.zaya_block(
+            hidden_states, prev_router_hidden_states
+        )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states, prev_router_hidden_states
 
 

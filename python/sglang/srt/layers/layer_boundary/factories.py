@@ -82,7 +82,6 @@ def _resolve_ffn(
     read=NORM_READOUT,
     update=PLAIN_ADD,
     dense_tp_size=None,
-    reduction=ProducerReduction.EXIT_SCOPED,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.tp_size):
@@ -169,8 +168,7 @@ def _resolve_ffn(
             and not terminal
             and not update.applied_at_exit
             and update.outlives_layer
-            and output_transform is None
-            and reduction is ProducerReduction.EXIT_SCOPED,
+            and output_transform is None,
             may_reduce_scatter=use_reduce_scatter and may_scatter,
             may_reduce_scatterv=use_reduce_scatterv and may_leave,
             update=update,
@@ -203,8 +201,8 @@ class StageDeclaration:
             residual update. An FFN's exit runs it under an explicit
             reduction-order contract; an attention's is run by the input of
             the stage that follows, once the attention's sum is complete.
-        reduction: Whether compute always leaves a partial sum, obeys the
-            exit scope, or adds a replicated component after its own sum.
+        reduction: Whether the next stage's input always completes the sum
+            (an attention's), or the exit decides (an FFN's or a mixer's).
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
@@ -282,9 +280,8 @@ def declare_attn(
         read: Input operation; defaults to normalization with quantization support.
         update: Operation that adds this stage's output to the residual.
         terminal: Whether this stage ends the model's layer stack.
-        reduction: ALWAYS_PARTIAL for an output projection that always skips reduction;
-            EXIT_SCOPED for a mixer that follows its exit scope's reduction decision.
-            TAIL_AFTER_SUM is rejected for attention stages.
+        reduction: ALWAYS_PARTIAL for an attention whose sum the next stage's
+            input always completes; EXIT_SCOPED for a mixer whose exit decides.
         gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
         output_transform: Optional operation on the output once its sum is
             complete, before the residual update (a sandwich norm). The next
@@ -294,8 +291,6 @@ def declare_attn(
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
-    if reduction is ProducerReduction.TAIL_AFTER_SUM:
-        raise ValueError("TAIL_AFTER_SUM is not supported for attention stages")
     if (
         output_transform is not None
         and reduction is not ProducerReduction.ALWAYS_PARTIAL
@@ -325,7 +320,6 @@ def declare_ffn(
     output_transform=None,
     next_layer_sparse=False,
     dense_tp_size=None,
-    reduction=ProducerReduction.EXIT_SCOPED,
     exit_rows=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
@@ -342,17 +336,12 @@ def declare_ffn(
             to derive the TBO exit rows when exit_rows is not supplied.
         dense_tp_size: Dense compute width: None for configuration, 1 for local
             compute, or the full TP size.
-        reduction: How compute cooperates with the exit's reduction decision:
-            EXIT_SCOPED (default) follows the exit scope; TAIL_AFTER_SUM marks a
-            replicated tail after the sum. ALWAYS_PARTIAL is rejected for FFN stages.
         exit_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
-    if reduction is ProducerReduction.ALWAYS_PARTIAL:
-        raise ValueError("ALWAYS_PARTIAL is not supported for ffn stages")
     return StageDeclaration(
         StageKind.FFN,
         read,
@@ -363,7 +352,6 @@ def declare_ffn(
         terminal=terminal,
         output_transform=output_transform,
         dense_tp_size=dense_tp_size,
-        reduction=reduction,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
     )
 
@@ -388,7 +376,6 @@ def _resolve_stage(stage, variant, following=None):
             read=stage.read,
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
-            reduction=stage.reduction,
         )
         if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
             returned = attention

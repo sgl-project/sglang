@@ -1,7 +1,6 @@
 """Numerical and interface coverage for boundary/graph integration regressions."""
 
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,7 +9,6 @@ import torch
 
 from sglang.srt.layers.layer_boundary import (
     PLAIN_ADD,
-    ProducerReduction,
     declare_attn,
     declare_ffn,
 )
@@ -200,12 +198,6 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         enabled and (lora or shared),
                     )
 
-    def test_unsupported_producer_contracts_fail_at_declaration(self):
-        with self.assertRaises(ValueError):
-            declare_ffn(reduction=ProducerReduction.ALWAYS_PARTIAL)
-        with self.assertRaises(ValueError):
-            declare_attn(reduction=ProducerReduction.TAIL_AFTER_SUM)
-
     def test_ffn_writing_the_next_stream_hands_on_a_complete_output(self):
         # It has each part's sum completed (sum_part) before building the
         # stream from the parts, so its exit owes no sum and never defers one.
@@ -261,14 +253,13 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     capture(hidden)
                 return hidden
 
-            output = SimpleNamespace(finish=lambda hidden: hidden)
             layer = SimpleNamespace(
                 attn_boundary=SimpleNamespace(
                     prepare=prepare, finish=lambda hidden, fb: hidden
                 ),
                 ffn_boundary=SimpleNamespace(
                     prepare=lambda hidden, fb, **kw: hidden,
-                    exit=lambda fb: nullcontext(output),
+                    finish=lambda hidden, fb: hidden,
                 ),
                 self_attn=lambda **kw: kw["hidden_states"],
                 mlp=lambda hidden, **kw: hidden,

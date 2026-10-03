@@ -213,9 +213,7 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
             ),
         ):
             for skip in (False, True):
-                with get_forward().scoped(
-                    fuse_mlp_allreduce=False, mlp_reduce_scatter=skip
-                ):
+                with get_forward().scoped(mlp_reduce_scatter=skip):
                     self.assertEqual(
                         moe_utils.should_skip_post_experts_all_reduce(is_tp_path=True),
                         skip,
