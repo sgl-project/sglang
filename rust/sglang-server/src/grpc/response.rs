@@ -136,7 +136,11 @@ fn grpc_meta_info(output: &FrontendOutput, public_id: &str) -> HashMap<String, S
 }
 
 pub(super) fn status(error: FrontendError) -> Status {
-    let code = match error.kind() {
+    status_from_kind(error.kind(), error.to_string())
+}
+
+pub(super) fn status_from_kind(kind: FrontendErrorKind, message: impl Into<String>) -> Status {
+    let code = match kind {
         FrontendErrorKind::InvalidArgument => Code::InvalidArgument,
         FrontendErrorKind::NotFound => Code::NotFound,
         FrontendErrorKind::FailedPrecondition => Code::FailedPrecondition,
@@ -146,7 +150,7 @@ pub(super) fn status(error: FrontendError) -> Status {
         FrontendErrorKind::Unavailable => Code::Unavailable,
         FrontendErrorKind::Internal => Code::Internal,
     };
-    Status::new(code, error.to_string())
+    Status::new(code, message.into())
 }
 
 #[cfg(test)]

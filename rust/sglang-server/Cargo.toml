@@ -37,6 +37,7 @@ uuid = { workspace = true }
 
 arc-swap = "1"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
+http = { workspace = true }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 core_affinity = "0.8"

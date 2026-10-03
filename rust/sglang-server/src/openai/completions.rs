@@ -1,30 +1,21 @@
 //! OpenAI legacy text-completion endpoint and wire shaping.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
-use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-    routing::post,
-};
+use super::{OpenAiResponse as Response, json_response};
 use dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use http::StatusCode;
 
+use super::frontend_error_status;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    MAX_OPENAI_CHOICES, OpenAiState, OpenAiStreamItem, collect_output, error_payload,
+    frontend_openai_error, indexed_decode_stream, openai_error, submit_generation,
+    unix_seconds_u32,
 };
-use crate::api_server::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
 };
@@ -33,10 +24,6 @@ use crate::message::ids::Rid;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
-
-pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/completions", post(completions))
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum PromptSpec {
@@ -58,16 +45,7 @@ pub(super) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
-async fn completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
-) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
-    };
+pub(crate) async fn completions(state: &OpenAiState, request: CreateCompletionRequest) -> Response {
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -159,7 +137,7 @@ async fn completions(
                 && sample_index == 0
                 && let Some(token_ids) = &input_ids
             {
-                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
+                prompt_echo = match decode_prompt_echo(state, token_ids.clone()).await {
                     Ok(echo) => echo,
                     Err(response) => return response,
                 };
@@ -180,7 +158,7 @@ async fn completions(
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
             };
-            let call = match submit_generation(&state, native, stream).await {
+            let call = match submit_generation(state, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
             };
@@ -213,9 +191,8 @@ async fn completions(
             want_logprobs,
             include_usage,
             continuous_usage,
-        )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        );
+        Response::Stream(s.boxed())
     } else {
         unary_completion(
             submitted,
@@ -233,30 +210,36 @@ async fn completions(
 /// detokenize operation through the shared frontend handle — the
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
-async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
+async fn decode_prompt_echo(state: &OpenAiState, token_ids: TokenIds) -> Result<String, Response> {
     match state.frontend.detokenize(token_ids).await {
         Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
-        Err(FrontendError::Unavailable) => Err(openai_error(
+        Err(error @ FrontendError::Unavailable) => Err(frontend_openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
+            error.kind(),
         )),
-        Err(FrontendError::InvalidArgument(message)) => {
-            Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
-        }
-        Err(FrontendError::InvalidResponse(message)) => Err(openai_error(
+        Err(FrontendError::InvalidArgument(message)) => Err(frontend_openai_error(
+            StatusCode::BAD_REQUEST,
+            &message,
+            false,
+            crate::frontend::FrontendErrorKind::InvalidArgument,
+        )),
+        Err(FrontendError::InvalidResponse(message)) => Err(frontend_openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             message,
             false,
+            crate::frontend::FrontendErrorKind::Internal,
         )),
         Err(error) => {
             let status = frontend_error_status(&error);
-            Err(openai_error(
+            Err(frontend_openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
                 false,
+                error.kind(),
             ))
         }
     }
@@ -355,8 +338,9 @@ pub(super) async fn unary_completion(
     for choice in submitted {
         let output = match collect_output(choice.call).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, &message, false);
+            Err(error) => {
+                let status = frontend_error_status(&error);
+                return frontend_openai_error(status, error.to_string(), false, error.kind());
             }
         };
 
@@ -388,7 +372,7 @@ pub(super) async fn unary_completion(
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
     );
 
-    Json(completion_response_value(
+    json_response(completion_response_value(
         CreateCompletionResponse {
             id: response_id,
             choices,
@@ -400,7 +384,6 @@ pub(super) async fn unary_completion(
         },
         &extensions,
     ))
-    .into_response()
 }
 
 fn completion_choice(
@@ -501,7 +484,7 @@ pub(super) fn completion_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     continuous_usage: bool,
-) -> impl futures::Stream<Item = String> {
+) -> impl futures::Stream<Item = OpenAiStreamItem> {
     async_stream::stream! {
         let count = submitted.len();
         let mut prompt_indexes = Vec::with_capacity(count);
@@ -523,7 +506,10 @@ pub(super) fn completion_event_stream(
             let output = match event {
                 FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
                 FrontendEvent::Failed(error) => {
-                    yield error_payload(frontend_error_status(&error), error.to_string()).to_string();
+                    yield OpenAiStreamItem::error(
+                        error_payload(frontend_error_status(&error), error.to_string()).to_string(),
+                        error.kind(),
+                    );
                     continue;
                 }
             };
@@ -561,7 +547,7 @@ pub(super) fn completion_event_stream(
                 object: "text_completion".into(),
                 usage: chunk_usage,
             };
-            yield completion_response_value(chunk, &[extension]).to_string();
+            yield OpenAiStreamItem::data(completion_response_value(chunk, &[extension]).to_string());
         }
 
         if include_usage {
@@ -584,9 +570,9 @@ pub(super) fn completion_event_stream(
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                 )),
             };
-            yield completion_response_value(final_chunk, &[]).to_string();
+            yield OpenAiStreamItem::data(completion_response_value(final_chunk, &[]).to_string());
         }
-        yield "[DONE]".to_string();
+        yield OpenAiStreamItem::data("[DONE]".to_string());
     }
 }
 
@@ -698,6 +684,7 @@ mod tests {
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
@@ -793,6 +780,7 @@ mod tests {
             false,
         )
         .await;
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -822,7 +810,7 @@ mod tests {
             false,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         assert_eq!(frames.len(), 4);
         let first: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();

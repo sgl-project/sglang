@@ -19,10 +19,33 @@ use futures::StreamExt;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::{indexed_decode_stream, openai_error, routes};
+use super::indexed_decode_stream;
+use crate::api_server::openai::{openai_error, routes};
 use crate::frontend::{FrontendCall, FrontendEvent, FrontendHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
+
+#[tokio::test]
+async fn unary_http_response_preserves_json_bytes_and_content_type() {
+    use axum::response::IntoResponse;
+
+    let value = json!({
+        "choices": [{"text": "héllo\n\"quoted\"", "logprobs": {"token_logprobs": [-0.25]}}],
+        "usage": {"completion_tokens": 1}
+    });
+    let expected = serde_json::to_vec(&value).unwrap();
+    let response = super::json_response(value).into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
 pub(super) fn frontend() -> FrontendHandle {
     FrontendHandle::new(
         flume::unbounded().0,
@@ -107,8 +130,8 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
     })
 }
 
-pub(super) fn app_state(frontend: FrontendHandle) -> Arc<super::AppState> {
-    Arc::new(super::AppState {
+pub(super) fn app_state(frontend: FrontendHandle) -> Arc<super::OpenAiState> {
+    Arc::new(super::OpenAiState {
         frontend,
         server_args: server_args(),
         chat_formatter: None,

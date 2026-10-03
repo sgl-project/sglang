@@ -1,19 +1,8 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
-use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-    routing::post,
-};
+use super::{OpenAiResponse as Response, json_response};
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
@@ -24,19 +13,21 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use http::StatusCode;
 use serde::Deserialize;
 
 use super::completions::completion_usage;
+use super::frontend_error_status;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    ChatFormatter, ChatTemplateKwargs, OpenAiState, OpenAiStreamItem, collect_output,
+    contains_media, error_payload, frontend_openai_error, indexed_decode_stream, openai_error,
+    submit_generation, unix_seconds_u32,
 };
-use crate::api_server::frontend_error_status;
 use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -44,30 +35,18 @@ use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
-pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
-}
-
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(crate) struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
-) -> Response {
+pub(crate) async fn chat_completions(state: &OpenAiState, request: ChatRequest) -> Response {
     let ChatRequest {
         request,
         chat_template_kwargs,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
-    };
+    } = request;
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -152,7 +131,7 @@ async fn chat_completions(
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+        match prepare_chat_request(state, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -218,7 +197,7 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(state, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -241,9 +220,8 @@ async fn chat_completions(
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
-        )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        );
+        Response::Stream(event_stream.boxed())
     } else {
         unary_chat(
             submitted,
@@ -266,7 +244,7 @@ async fn chat_completions(
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
 pub(super) async fn prepare_chat_request(
-    state: &AppState,
+    state: &OpenAiState,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
@@ -456,8 +434,9 @@ pub(super) async fn unary_chat(
     for (index, call) in submitted {
         let output = match collect_output(call).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, message, false);
+            Err(error) => {
+                let status = super::frontend_error_status(&error);
+                return frontend_openai_error(status, error.to_string(), false, error.kind());
             }
         };
 
@@ -503,7 +482,7 @@ pub(super) async fn unary_chat(
         });
     }
 
-    Json(CreateChatCompletionResponse {
+    json_response(CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -516,7 +495,6 @@ pub(super) async fn unary_chat(
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         )),
     })
-    .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -535,8 +513,13 @@ pub(super) fn chat_event_stream(
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
-) -> impl futures::Stream<Item = String> {
+) -> impl futures::Stream<Item = OpenAiStreamItem> {
     let count = submitted.len();
+    // The tool-call jail consumes `Annotated` values and passes error-only
+    // annotations through unchanged. Carry the frontend category beside that
+    // existing stream so HTTP can retain its legacy JSON code while gRPC uses
+    // the transport-neutral category. This channel is touched only on errors.
+    let (error_kind_tx, error_kind_rx) = std::sync::mpsc::channel();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
@@ -584,6 +567,7 @@ pub(super) fn chat_event_stream(
             let output = match event {
                 FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
                 FrontendEvent::Failed(error) => {
+                    let _ = error_kind_tx.send(error.kind());
                     yield Annotated {
                         data: None,
                         id: None,
@@ -755,12 +739,15 @@ pub(super) fn chat_event_stream(
                         }
                     }
                 }
-                yield serialize_chat_stream_response(response.clone());
+                yield OpenAiStreamItem::data(serialize_chat_stream_response(response.clone()));
             } else if let Some(error) = item.error {
-                yield error;
+                yield match error_kind_rx.try_recv() {
+                    Ok(kind) => OpenAiStreamItem::error(error, kind),
+                    Err(_) => OpenAiStreamItem::data(error),
+                };
             }
         }
-        yield "[DONE]".to_string();
+        yield OpenAiStreamItem::data("[DONE]".to_string());
     }
 }
 
@@ -837,8 +824,9 @@ mod tests {
         merge_template_stops, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
@@ -1028,6 +1016,7 @@ mod tests {
             None,
         )
         .await;
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -1064,6 +1053,7 @@ mod tests {
             None,
         )
         .await;
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -1105,7 +1095,7 @@ mod tests {
             None,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
         let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
@@ -1151,7 +1141,7 @@ mod tests {
             None,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         assert_eq!(frames.len(), 5);
         let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
@@ -1166,5 +1156,42 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_preserves_error_kind_through_tool_jail() {
+        let (choice, tx) = chat_submitted(0, "r0");
+        tx.send(ResponseItem::Error(crate::utils::error::Error::QueueFull))
+            .await
+            .unwrap();
+
+        let stream = chat_event_stream(
+            vec![choice],
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            Some("llama3_json".into()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        let error = frames
+            .iter()
+            .find(|item| item.error_kind.is_some())
+            .expect("runtime error frame");
+        assert_eq!(
+            error.error_kind,
+            Some(crate::frontend::FrontendErrorKind::ResourceExhausted)
+        );
+        let payload: serde_json::Value = serde_json::from_str(&error.data).unwrap();
+        assert_eq!(payload["error"]["code"], 503);
     }
 }
