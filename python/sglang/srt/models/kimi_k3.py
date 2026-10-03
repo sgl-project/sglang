@@ -3786,6 +3786,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             if _is_hip:
                 from sglang.kernels.ops.attention import (
+                    kimi_causal_gate_gluon_hip,
                     mla_kc_cache_gluon_hip,
                     mla_vc_gate_gluon_hip,
                 )
@@ -3804,6 +3805,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                         self_attn, get_parallel(), get_server_args()
                     )
                 )
+                self_attn._causal_gate_gluon_ready = (
+                    no_experimental_lora
+                    and kimi_causal_gate_gluon_hip.can_prepare(
+                        self_attn, get_parallel(), get_server_args()
+                    )
+                )
+                if self_attn._causal_gate_gluon_ready:
+                    kimi_causal_gate_gluon_hip.bind(self_attn)
 
         if (
             _is_hip
@@ -3826,6 +3835,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                 for layer in self.model.layers
             )
             rank0_log(f"K3 Gluon MLA key/cache enabled on {ready} layers.")
+
+        if (
+            _is_hip
+            and os.environ.get("SGLANG_ROCM_K3_CAUSAL_GATE_FUSED_BACKEND", "").lower()
+            == "gluon"
+        ):
+            ready = sum(
+                getattr(
+                    getattr(layer, "self_attn", None),
+                    "_causal_gate_gluon_ready",
+                    False,
+                )
+                for layer in self.model.layers
+            )
+            rank0_log(f"K3 Gluon causal attention/gate enabled on {ready} layers.")
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
