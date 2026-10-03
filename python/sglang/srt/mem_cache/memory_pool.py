@@ -567,7 +567,8 @@ class MambaPool:
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+            enable_linear_replayssm_spec
+            and (cache_params.is_kda or envs.SGLANG_ENABLE_GDN_REPLAYSSM_FOLD.get())
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
@@ -659,9 +660,13 @@ class MambaPool:
                 L = linear_replayssm_cache_len
                 # GDN speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
+                # Fold rings (KDA, and GDN under SGLANG_ENABLE_GDN_REPLAYSSM_FOLD)
+                # are indexed by mamba slot in both the verify and the fold.
                 num_slots = (
                     spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    if enable_linear_replayssm_spec
+                    and not cache_params.is_kda
+                    and not self.replayssm_spec_fold
                     else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
@@ -707,9 +712,12 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # KDA still uses raw-input fold-every-commit. GDN materializes
-                # its compact d/k/g history directly and needs no duplicate ring.
-                if enable_linear_replayssm_spec and cache_params.is_kda:
+                # Raw-input fold rings: KDA, and GDN under
+                # SGLANG_ENABLE_GDN_REPLAYSSM_FOLD. GDN's compact replay
+                # materializes d/k/g and needs no raw ring.
+                if enable_linear_replayssm_spec and (
+                    cache_params.is_kda or self.replayssm_spec_fold
+                ):
                     if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
