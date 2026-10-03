@@ -1711,8 +1711,10 @@ def main():
 
         github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
 
-        def _github_request(url: str) -> urllib.request.Request:
-            headers = {"Accept": "application/vnd.github.v3+json"}
+        def _github_request(
+            url: str, accept: str = "application/vnd.github.v3+json"
+        ) -> urllib.request.Request:
+            headers = {"Accept": accept}
             if github_token:
                 headers["Authorization"] = f"Bearer {github_token}"
             return urllib.request.Request(url, headers=headers)
@@ -1736,14 +1738,11 @@ def main():
                     req, timeout=30, context=ssl_context
                 ) as response:
                     pr_data = json.loads(response.read().decode())
-                    diff_url = pr_data.get("diff_url")
                     base_sha = pr_data.get("base", {}).get("sha")
 
-                if not diff_url:
-                    raise Exception("Cannot get diff URL")
-
-                # Download diff (use binary mode to avoid line ending conversion)
-                req = _github_request(diff_url)
+                # Fetch the diff through the API; the web .diff endpoint can
+                # return 503 even when the API serves the same diff successfully.
+                req = _github_request(pr_url, accept="application/vnd.github.v3.diff")
                 with urllib.request.urlopen(
                     req, timeout=60, context=ssl_context
                 ) as response:

@@ -1206,6 +1206,17 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # W4A4 experiment for the DeepGEMM compact grouped-GEMM MoE path:
+    # quantize activations to packed e2m1 with (1, 32) ue8m0 scales and run
+    # both grouped GEMMs with recipe_a=(1, 32) (weights are already MXF4).
+    # Requires fp4 experts.
+    SGLANG_USE_DEEPGEMM_W4A4 = EnvBool(False)
+    # Fold the bf16 -> mxfp4 activation quantization into the scatter (one read
+    # of each bf16 row instead of quantize-then-scatter): ep_scatter_quant_mxfp4
+    # on the compact layout, quant_scatter_mxfp4_masked on the masked one.
+    # Only read on the W4A4 path; =0 restores the
+    # quant_mxfp4_group32_v2 + fill/scatter two-step form.
+    SGLANG_USE_DEEPGEMM_W4A4_FUSED_SCATTER = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
