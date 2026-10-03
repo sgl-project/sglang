@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+hicache_trace = hicache_trace:install
