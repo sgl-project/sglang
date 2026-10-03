@@ -1041,9 +1041,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
-    # True in a subclass built without stage boundaries.
-    _ffn_sums_itself = False
-
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1076,7 +1073,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
-                reduce_results=self._ffn_sums_itself,
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1088,7 +1086,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-                reduce_results=self._ffn_sums_itself,
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
@@ -1173,9 +1172,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
-
-    # See Qwen3_5LinearDecoderLayer._ffn_sums_itself.
-    _ffn_sums_itself = False
 
     def __init__(
         self,
@@ -1279,7 +1275,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-                reduce_results=self._ffn_sums_itself,
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -1297,7 +1294,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
-                reduce_results=self._ffn_sums_itself,
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
