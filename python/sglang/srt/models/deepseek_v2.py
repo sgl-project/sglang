@@ -1106,6 +1106,9 @@ class DeepseekV2MoE(nn.Module):
         # The mHC post-split consumes the reduced row without an RMSNorm.
         use_fused_finalize_all_reduce = (
             self._fuse_finalize_all_reduce
+            # The kernel completes the tensor-parallel sum itself, so it is
+            # available only when this block is the one that owes that sum.
+            and self.reduce_results
             and has_shared_output
             and hidden_states.shape[-1] == 5120
             and not self._shared_expert_tp1

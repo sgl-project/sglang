@@ -16,13 +16,17 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# Calls that complete a TP / EP sum of a stage output in compute.
+# Calls that complete a TP / EP sum of a stage output in compute. A fused
+# kernel that carries the sum inside it counts: what matters is whether the
+# sum happens in compute, not whether it is spelled as a collective.
 _SUMS = {
     "reduce_moe_output",
     "post_experts_all_reduce",
     "tensor_model_parallel_all_reduce",
     "moe_expert_parallel_all_reduce",
     "moe_tensor_model_parallel_all_reduce",
+    "moe_finalize_all_reduce",
+    "moe_finalize_all_reduce_mhc",
 }
 _BUILDS_STAGES = (
     "make_stages(",
@@ -35,7 +39,9 @@ _BUILDS_STAGES = (
 
 # A vocabulary-parallel lookup leaves each rank holding only its own shard's
 # rows, so the class completes that sum itself. An embedding is never a decoder
-# stage, so its sum is never a stage output.
+# stage, so no sum inside one is a stage output and the whole class is exempt.
+# Matching the base by name fails closed: a subclass that reaches
+# VocabParallelEmbedding indirectly is reported rather than exempted.
 _VOCAB_PARALLEL_BASES = ("VocabParallelEmbedding", "ParallelLMHead")
 
 
@@ -46,9 +52,36 @@ def _is_vocab_parallel(node) -> bool:
     )
 
 
+def _test_names(test) -> set:
+    """Every identifier an ``if`` test reads, attributes included."""
+    return {
+        node.attr if isinstance(node, ast.Attribute) else node.id
+        for node in ast.walk(test)
+        if isinstance(node, (ast.Name, ast.Attribute))
+    }
+
+
 def _call_name(node: ast.Call):
     func = node.func
     return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+
+
+def _reduce_results_names(tree) -> set:
+    """Names bound to a condition that already consults ``reduce_results``.
+
+    A predicate computed once and branched on later guards its branch just as
+    the inline condition does, so the guard follows the binding rather than
+    requiring one spelling."""
+    names = {"reduce_results"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or "reduce_results" not in ast.unparse(
+            node.value
+        ):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
 
 
 def _unguarded_sums(source: str):
@@ -56,11 +89,14 @@ def _unguarded_sums(source: str):
     a shared class built without stage boundaries by another model. Sums inside
     a vocabulary-parallel embedding complete its lookup, not a stage output."""
     found = []
+    guards = _reduce_results_names(ast.parse(source))
 
     def visit(node, guarded):
         if _is_vocab_parallel(node):
             return
-        if isinstance(node, ast.If) and "reduce_results" in ast.unparse(node.test):
+        if isinstance(node, ast.If) and any(
+            name in guards for name in _test_names(node.test)
+        ):
             for child in node.body:
                 visit(child, True)
             for child in node.orelse:
