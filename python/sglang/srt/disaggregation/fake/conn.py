@@ -76,6 +76,9 @@ class FakeKVSender(BaseKVSender):
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
+    def poll_pp_consensus(self) -> KVPoll:
+        return self.poll()
+
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         # A send() that never comes must not pin the prefill inflight queue forever.
         # No deadline before init(): the request is still in the bootstrap queue.
