@@ -282,7 +282,6 @@ def ssd_combined(
     ``seq_idx``.
     """
     import torch
-
     from flashinfer.mamba import SSDCombined
 
     return SSDCombined(

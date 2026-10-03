@@ -222,6 +222,8 @@ def test_fp8_pre_attention_matches_flashinfer_and_reference():
     )
     from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention import (
         minimax_h3_fp8_pre_attention as fi_direct,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention import (
         quantize_minimax_h3_qkv_weight_fp8 as fi_quantize,
     )
 
@@ -274,6 +276,8 @@ def test_nvfp4_pre_attention_matches_flashinfer_and_reference():
     )
     from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention import (
         minimax_h3_nvfp4_pre_attention as fi_direct,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention import (
         quantize_minimax_h3_qkv_weight_nvfp4 as fi_quantize,
     )
 
@@ -324,7 +328,11 @@ def test_fc1_swiglu_fp8_matches_flashinfer_and_reference():
     _skip_unless(cake.ARCHS, cake.FI_FC1_MODULE, cake.FI_FC1_JIT_MODULE)
     from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu import (
         minimax_h3_fc1_swiglu_fp8 as fi_direct,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu import (
         prepare_minimax_h3_fc1_weight_fp8 as fi_prepare,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu import (
         prepare_minimax_h3_fc1_weight_nvfp4_sm120 as fi_prepare_nvfp4,
     )
 
@@ -407,6 +415,8 @@ def test_fp8_out_proj_matches_flashinfer_and_reference():
     _skip_unless(cake.ARCHS, cake.FI_OUT_PROJ_MODULE, cake.FI_OUT_PROJ_JIT_MODULE)
     from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj import (
         minimax_h3_fp8_out_proj as fi_direct,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj import (
         quantize_minimax_h3_o_weight_fp8 as fi_quantize,
     )
 
@@ -443,6 +453,8 @@ def test_nvfp4_out_proj_matches_flashinfer_and_reference():
     _skip_unless(cake.ARCHS, cake.FI_OUT_PROJ_MODULE, cake.FI_OUT_PROJ_JIT_MODULE)
     from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj import (
         minimax_h3_nvfp4_out_proj as fi_direct,
+    )
+    from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj import (
         quantize_minimax_h3_o_weight_nvfp4 as fi_quantize,
     )
 

@@ -13,7 +13,6 @@ __all__ = []
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
 from sglang.kernels.ops.communication import cake as _cake  # noqa: E402, F401
 
-
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn in [
     ("all_reduce_residual", "all_reduce_push_res"),
