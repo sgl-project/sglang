@@ -166,6 +166,16 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             .mamba_value
             .as_ref()
             .expect("mamba insert requires a donated mamba_value");
+        // The value was produced at mamba_value_seqlen; a leaf truncated to a
+        // shorter component boundary (e.g. the SWA branch) is not that
+        // position, and stamping it would attach a later state to an earlier
+        // key (sgl-project/sglang#38815).
+        if let Some(seqlen) = params.mamba_value_seqlen {
+            let key_token_len = params.key.atom_len() + K::IS_BIGRAM as usize;
+            if key_token_len != seqlen {
+                return;
+            }
+        }
         let slot_len = mamba_value.size()[0] as usize;
 
         if is_new_leaf {
