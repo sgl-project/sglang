@@ -105,6 +105,22 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
+    output_store_backend: A[
+        str,
+        Arg(
+            help="Object store for routed experts, indexer top-k, and sampling masks "
+            "of requests that set return_outputs_via_store; their responses carry "
+            "meta_info.output_store_ref instead of the arrays.",
+            choices=["none", "mooncake"],
+        ),
+    ] = "none"
+    output_store_backend_extra_config: A[
+        Optional[str],
+        "JSON object with the --output-store-backend connection: "
+        "master_server_address, local_hostname, local_buffer_size, key_prefix, and "
+        "optionally protocol, metadata_server, device_name, namespace, partition, "
+        "replica_num, chunk_bytes. Unset keys fall back to MOONCAKE_* env vars.",
+    ] = None
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
