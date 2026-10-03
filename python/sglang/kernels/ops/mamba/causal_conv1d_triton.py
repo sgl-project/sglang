@@ -11,8 +11,39 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_gfx95_supported
 
 PAD_SLOT_ID = -1
+_DEFAULT_PREFILL_CONFIG = {
+    "BLOCK_M": 8,
+    "BLOCK_N": 256,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+_GFX950_GLM53_PREFILL_CONFIG = {
+    "BLOCK_M": 16,
+    "BLOCK_N": 256,
+    "num_warps": 4,
+    "num_stages": 3,
+}
+
+
+def _causal_conv1d_prefill_config(
+    *,
+    dim: int,
+    width: int,
+    total_tokens: int,
+    dtype: torch.dtype,
+) -> dict:
+    if (
+        is_gfx95_supported()
+        and dtype == torch.bfloat16
+        and dim in (3072, 6144)
+        and width == 4
+        and total_tokens >= 8192
+    ):
+        return _GFX950_GLM53_PREFILL_CONFIG
+    return _DEFAULT_PREFILL_CONFIG
 
 
 @triton.jit()
@@ -514,6 +545,13 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
+    config = _causal_conv1d_prefill_config(
+        dim=dim,
+        width=width,
+        total_tokens=cu_seqlen,
+        dtype=x.dtype,
+    )
+
     def grid(META):
         max_seq_len = max(seq_lens_cpu)
         return (
@@ -559,10 +597,7 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        **config,
     )
     return out
 
