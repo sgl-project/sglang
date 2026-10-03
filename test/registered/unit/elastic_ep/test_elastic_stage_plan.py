@@ -13,11 +13,12 @@ LAUNCH = 4
 
 
 class TestElasticStagePlan(CustomTestCase):
-    def test_partial_regrow_below_the_launch_width_is_staged(self):
-        # Direct is what a reader expects and what MC17 measured failing: the joiner
-        # rebuilds its expert map against a width the survivors do not share.
-        self.assertEqual(elastic_stage_plan(2, LAUNCH, 3), [LAUNCH, 3])
-        self.assertEqual(elastic_stage_plan(1, LAUNCH, 2), [LAUNCH, 2])
+    def test_partial_regrow_below_the_launch_width_is_direct(self):
+        # Whether this needs an intermediate depends on the width of the joiner that
+        # happens to be waiting, which only the schedulers can see. So it is planned
+        # direct and a scheduler rejects with required_ep_size when it cannot serve it.
+        self.assertEqual(elastic_stage_plan(2, LAUNCH, 3), [3])
+        self.assertEqual(elastic_stage_plan(1, LAUNCH, 2), [2])
 
     def test_grow_back_to_the_launch_width_is_direct(self):
         self.assertEqual(elastic_stage_plan(2, LAUNCH, LAUNCH), [LAUNCH])
@@ -40,9 +41,19 @@ class TestElasticStagePlan(CustomTestCase):
     def test_noop_target_is_returned_as_itself(self):
         self.assertEqual(elastic_stage_plan(3, LAUNCH, 3), [3])
 
-    def test_a_descending_plan_is_legal(self):
-        """Stage 2 below stage 1: the partial regrow recovers, then retires again."""
-        self.assertEqual(elastic_stage_plan(2, LAUNCH, 3), [LAUNCH, 3])
+    def test_this_planner_never_descends(self):
+        """Every plan it stages ascends, because it only ever inserts the launch width.
+
+        A descending plan is still legal and still happens, but it is now built by
+        ``_scale_elastic_ep_locked`` when a scheduler rejects with ``required_ep_size``.
+        Pinned so that moving the descent out of here stays a deliberate choice.
+        """
+        for current in range(1, 9):
+            for target in range(1, 9):
+                with self.subTest(current=current, target=target):
+                    plan = elastic_stage_plan(current, LAUNCH, target)
+                    if len(plan) == 2:
+                        self.assertLess(plan[0], plan[1])
 
     def test_every_plan_ends_on_the_requested_target(self):
         for current in range(1, 9):
@@ -53,13 +64,14 @@ class TestElasticStagePlan(CustomTestCase):
                     self.assertEqual(plan[-1], target)
                     self.assertLessEqual(len(plan), 2)
 
-    def test_staging_happens_exactly_for_a_grow_starting_below_the_launch_width(self):
+    def test_staging_happens_exactly_for_a_grow_crossing_the_launch_width(self):
         for current in range(1, 9):
             for target in range(1, 9):
                 with self.subTest(current=current, target=target):
-                    # Any grow that starts below the launch width, except one landing
-                    # exactly on it, which needs no intermediate.
-                    staged = current < LAUNCH and current < target and target != LAUNCH
+                    # Only a grow that starts below the launch width and ends above it.
+                    # Landing on it needs no intermediate, and landing below it is left
+                    # to the schedulers, which know the waiting joiner's width.
+                    staged = current < LAUNCH and current < target and target > LAUNCH
                     plan = elastic_stage_plan(current, LAUNCH, target)
                     self.assertEqual(
                         len(plan) == 2,

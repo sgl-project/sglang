@@ -5688,12 +5688,18 @@ class Scheduler(
             max_ep_size,
         )
 
-        def _reject(message: str) -> ScaleElasticEPReqOutput:
+        def _reject(
+            message: str,
+            required_ep_size: Optional[int] = None,
+            retry_when_joiner_announces: bool = False,
+        ) -> ScaleElasticEPReqOutput:
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=message,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                required_ep_size=required_ep_size,
+                retry_when_joiner_announces=retry_when_joiner_announces,
             )
 
         # Mooncake-only shrink: splits upstream's `<= old_ep_size` reject three ways.
@@ -5795,6 +5801,29 @@ class Scheduler(
                     f"Mixed grow (recover {recover_slots} + scale {scale_slots}) "
                     "unsupported; grow into retired slots first, then append."
                 )
+            # A joiner sizes its expert map to the top of its own span, so a target
+            # short of that leaves the two disagreeing and the joiner dies in the
+            # expert map copy, 60s after the survivors have committed. Resolve it here,
+            # where a reject costs the caller a round trip instead. Only below the
+            # launch width: a joiner spans at most up to it, so landing there is safe.
+            if recover_slots and new_ep_size < launch_ep:
+                from sglang.srt.elastic_ep.elastic_ep import required_recover_width
+
+                required = required_recover_width(recover_slots)
+                if required is None:
+                    return _reject(
+                        f"No joiner has announced on slots {recover_slots} yet, so "
+                        f"the width to grow to is not known. Retry, or grow to "
+                        f"{launch_ep} and shrink back.",
+                        retry_when_joiner_announces=True,
+                    )
+                if required > new_ep_size:
+                    return _reject(
+                        f"Grow to {new_ep_size} cannot serve the joiner waiting on "
+                        f"slots {recover_slots}: it joins at width {required}. "
+                        f"Grow to {required} first, then shrink to {new_ep_size}.",
+                        required_ep_size=required,
+                    )
             pending_recover_ranks = recover_slots
 
         if not ElasticEPStateManager.request_scale(new_ep_size, pending_recover_ranks):

@@ -195,30 +195,31 @@ logger = logging.getLogger(__name__)
 # Poll interval while a staged grow waits out the previous stage's warmup window.
 _ELASTIC_STAGE_RETRY_S = 2.0
 
+# Budget for a grow below the launch width to learn the width its joiner joins at.
+# Covers a joiner process starting from scratch, which is dominated by interpreter and
+# torch import and so scales with host load: measured 32s on an idle node. Overshooting
+# costs nothing, since only this one grow shape waits and it used to spend a whole
+# extra stage unconditionally.
+_JOINER_ANNOUNCE_WAIT_S = 120.0
+_JOINER_ANNOUNCE_POLL_S = 0.5
+
 
 def elastic_stage_plan(current: int, launch_ep: int, target: int) -> List[int]:
     """Split a grow the schedulers cannot serve in one step into ordered stages.
 
-    Any grow off the launch width stops there first, including a partial regrow whose
-    target is below it. The cost is real and worth naming: 2 -> 3 direct would need one
-    joiner, while 2 -> 4 -> 3 needs one per retired slot.
-
-    The intermediate buys a width every rank agrees on. A recover joiner covers
+    A partial regrow is planned direct. A recover joiner covers
     ``[ep_join_rank_offset, ep_join_rank_offset + tp_size)`` and sizes its expert map to
-    that upper bound, so a target short of it leaves the joiner holding a wider map than
-    the cohort the survivors publish. It then fails in the expert map store copy, after
-    the survivors have already committed to the cohort, and what the caller sees is the
-    cohort barrier expiring 60s later and the server dying on "WORLD MLP sync
-    num_dp_ranks exceeds WORLD size". MC17 covers it.
+    that upper bound, so only a target short of it needs an intermediate, and only the
+    schedulers can see which joiner is waiting. One booted at exactly the target is
+    served in a single step, the case this used to spend a joiner per retired slot on.
 
-    So this is a limitation rather than a law. A joiner booted at exactly the target
-    width can be served directly; what is missing is any way to learn that width here,
-    since joiners announce themselves to the schedulers and this runs before the
-    request reaches them. Stage 2 can therefore be a shrink, which is why the driver
-    gates on target rather than intent. A grow that lands exactly on the launch width
-    needs no stage.
+    So that split is decided a step later, in ``_scale_elastic_ep_locked``, off a
+    scheduler reject. Growing past the launch width still splits here, since recover
+    and scale slots cannot mix in one request. Stage 2 can therefore be a shrink, which
+    is why the driver gates on target rather than intent, and a grow that lands exactly
+    on the launch width needs no stage.
     """
-    if current < launch_ep and current < target and target != launch_ep:
+    if current < launch_ep and current < target and target > launch_ep:
         return [launch_ep, target]
     return [target]
 
@@ -3667,9 +3668,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ),
         }
 
+    def _elastic_launch_ep(self) -> int:
+        return get_parallel().elastic_ep_initial_size or get_parallel().tp_size
+
     def _elastic_stage_plan(self, target: int) -> List[int]:
-        launch_ep = get_parallel().elastic_ep_initial_size or get_parallel().tp_size
-        return elastic_stage_plan(self.elastic_worker_count, launch_ep, target)
+        return elastic_stage_plan(
+            self.elastic_worker_count, self._elastic_launch_ep(), target
+        )
+
+    def _stage_through(
+        self, obj: ScaleElasticEPReqInput, width: int
+    ) -> ScaleElasticEPReqInput:
+        """Redirect this request through ``width``, leaving the target for stage two."""
+        self.elastic_staged_from = self.elastic_worker_count
+        self.elastic_pending_stages = [self.elastic_pending_ep_size]
+        return ScaleElasticEPReqInput(new_ep_size=width, operation_id=obj.operation_id)
 
     def _clear_staged_scale(self) -> None:
         """Drop staging state as one unit -- a stale origin width mislabels a phase."""
@@ -3777,6 +3790,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             responses: List[
                 ScaleElasticEPReqOutput
             ] = await self.scale_elastic_ep_communicator(obj)
+            # The joiner is a separate process launched alongside this request and
+            # cannot announce its width until it is up, measured 11s later. So the
+            # waiting lives here: the schedulers answer from one store read and never
+            # block their loop, and a resend is clean because they validate first. A
+            # reject for any other reason ends the wait rather than hiding behind it.
+            deadline = time.monotonic() + _JOINER_ANNOUNCE_WAIT_S
+            requested = obj.new_ep_size
+            while (rejects := [r for r in responses if not r.success]) and all(
+                r.retry_when_joiner_announces for r in rejects
+            ):
+                if time.monotonic() >= deadline:
+                    # Nothing announced in time. The launch width serves any joiner.
+                    obj = self._stage_through(obj, self._elastic_launch_ep())
+                    break
+                await asyncio.sleep(_JOINER_ANNOUNCE_POLL_S)
+                responses = await self.scale_elastic_ep_communicator(obj)
+            else:
+                # Reached when the loop stopped on its own, so a width is known, and
+                # skipped on the timeout break above. A reject naming required_ep_size
+                # means the joiner that announced is wider than this target, so the
+                # grow has to land at its width before it can narrow. Only reachable on
+                # the direct path: a plan that already staged sends the launch width,
+                # which no recover joiner can exceed.
+                required = max(
+                    (r.required_ep_size for r in rejects if r.required_ep_size),
+                    default=0,
+                )
+                if required > obj.new_ep_size:
+                    obj = self._stage_through(obj, required)
+            if obj.new_ep_size != requested:
+                logger.info(
+                    "[Elastic EP][scale] grow to %d staged through %d to serve the "
+                    "joiner waiting below the launch width",
+                    requested,
+                    obj.new_ep_size,
+                )
+                responses = await self.scale_elastic_ep_communicator(obj)
         # BaseException, not Exception: a disconnected client cancels this task, and
         # a skipped reopen blocks every later generate() on the shrink gate.
         except BaseException:

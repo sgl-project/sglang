@@ -39,6 +39,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     _lowest_survivor,
     clear_expert_map_inbox,
+    clear_recover_cohort,
     cohort_vote_via_store,
     get_healthy_expert_location_src_rank,
     get_scale_cohort,
@@ -47,6 +48,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     mooncake_world_settle_probe,
+    register_recover_cohort,
     register_scale_cohort,
     scale_ready_barrier_via_store,
     seed_barrier_epochs,
@@ -462,6 +464,8 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
+        self._announce_recover_join_width()
+
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -526,6 +530,25 @@ class ModelRunner:
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
 
+    def _announce_recover_join_width(self) -> None:
+        """Publish the cohort width a recover joiner will join at.
+
+        Called straight after init_torch_distributed, where the store first exists,
+        and not from _initialize_elastic_ep_joiner, which runs after the weights load
+        and so publishes long after the grow it has to inform. A scale joiner does
+        announce from there, because survivors poll for that one.
+        """
+        if (
+            get_exec().moe.elastic_ep_backend is None
+            or not get_exec().moe.is_ep_offset_joiner
+            or get_exec().moe.is_ep_scale_joiner
+        ):
+            return
+        parallel = get_parallel()
+        if parallel.tp_rank == 0:
+            offset = parallel.ep_join_rank_offset
+            register_recover_cohort(offset, offset + parallel.tp_size)
+
     def _initialize_elastic_ep_joiner(self) -> None:
         # Offset-0 recovery rejoins later; a second rendezvous here goes unanswered.
         if (
@@ -560,6 +583,11 @@ class ModelRunner:
             )
         else:
             join_process_groups()
+            # The survivors read the announce while planning the grow that unblocks
+            # the join above, so by here it has served its purpose. Drop it, or a
+            # later grow gets planned off a width this rank no longer represents.
+            if parallel.tp_rank == 0:
+                clear_recover_cohort(offset)
 
         global_ep_rank = parallel.tp_rank + offset
         # Snapshot what our weights were loaded against: the broadcast overwrites in place.
