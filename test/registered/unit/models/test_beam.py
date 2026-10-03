@@ -92,7 +92,9 @@ class AddLayer(torch.nn.Module):
     def forward(self, positions, hidden, batch):
         return hidden + self.amount
 
-    def forward_fused(self, positions, normed, residual, batch, next_weight):
+    def forward_fused(
+        self, positions, normed, residual, batch, next_weight, all_reduce_comm=None
+    ):
         hidden = self.forward(positions, residual, batch)
         return hidden * next_weight, hidden
 

@@ -56,7 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 
@@ -214,7 +214,11 @@ class BeamMoE(nn.Module):
         # Offloading replaces parameters, but TopKConfig keeps an alias.
         self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        defer_sum: bool = False,
+    ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.float())
             if self.refresh_correction_bias:
@@ -225,6 +229,23 @@ class BeamMoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
+            )
+        if defer_sum:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                fused_experts_impl,
+            )
+
+            return fused_experts_impl(
+                hidden_states,
+                self.experts.w13_weight,
+                self.experts.w2_weight,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                inplace=False,
+                filter_expert=False,
+                defer_sum=True,
+                routed_scaling_factor=self.config.routed_scaling_factor,
+                fuse_swiglu_interleaved=self.experts.quant_method.w13_swiglu_interleaved,
             )
         output = self.experts(hidden_states, topk_output)
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
@@ -432,6 +453,7 @@ class BeamDecoderLayer(nn.Module):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         next_norm_weight: Optional[torch.Tensor],
+        all_reduce_comm=None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Same arithmetic as `forward` with the two norm/residual transitions fused.
 
@@ -449,6 +471,27 @@ class BeamDecoderLayer(nn.Module):
             self.rms_norm_eps,
             self.attn_residual_scales,
         )
+        if (
+            all_reduce_comm is not None
+            and isinstance(self.mlp, BeamMoE)
+            and self.mlp.experts.quant_method.runner.runner_backend.is_triton()
+            and not self.mlp.experts._dwdp_bound
+        ):
+            from sglang.kernels.ops.communication.beam_all_reduce import (
+                beam_all_reduce_norm,
+            )
+
+            expert_outputs = self.mlp(normed, defer_sum=True)
+            return beam_all_reduce_norm(
+                all_reduce_comm,
+                expert_outputs,
+                residual,
+                self.post_feedforward_layernorm.weight,
+                next_norm_weight,
+                self.rms_norm_eps,
+                self.mlp_residual_scales,
+                routed_scale=self.mlp.config.routed_scaling_factor,
+            )
         mlp = self.mlp(normed)
         return self.sandwich_residual_norm(
             mlp,
@@ -501,6 +544,7 @@ class BeamModel(nn.Module):
         )
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
+        self.fuse_all_reduce = quant_config is None and config.num_experts_per_tok == 8
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
         # A custom PP partition can leave a stage with no layer to fuse from.
@@ -509,6 +553,57 @@ class BeamModel(nn.Module):
             and get_exec().offload.offload_group_size <= 0
             and self.start_layer < self.end_layer
         )
+
+    def _all_reduce_comm(self, hidden_states, forward_batch):
+        if not hidden_states.is_cuda or torch.version.hip is not None:
+            return None
+        execution = get_exec()
+        if execution.graph.enable_torch_compile or torch.compiler.is_compiling():
+            return None
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or hidden_states.data_ptr() % 16 != 0
+            or hidden_states.shape[1] != 5120
+            or not 0 < hidden_states.shape[0] <= 8
+            or not forward_batch.forward_mode.is_decode()
+            or not self.fuse_all_reduce
+        ):
+            return None
+        # The native TP communicator owns the storage and its lifecycle. Keep
+        # other parallel/reduction ownership arrangements on their old path.
+        from sglang.kernels.fused_op import get_fused_op_backend
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
+
+        parallel = get_parallel()
+        if (
+            # Only enable the measured small-batch TP8 configuration.
+            parallel.tp_size != 8
+            # Hopper's trained-checkpoint probe showed larger norm-order drift.
+            # Keep its existing boundary until that numerical delta is resolved.
+            or torch.cuda.get_device_capability(hidden_states.device)[0] < 10
+            or get_lora().enable_lora
+            or get_forward().sp_active
+            or should_skip_post_experts_all_reduce(is_tp_path=True)
+            or parallel.attn_tp_size != parallel.tp_size
+            or parallel.attn_cp_size != 1
+            or parallel.moe_ep_size != 1
+            or parallel.moe_tp_size != parallel.tp_size
+            or execution.deterministic.enable_deterministic_inference
+            or execution.comm.disable_custom_all_reduce
+            or get_fused_op_backend() is not None
+        ):
+            return None
+        comm = parallel.tp_group.ca_comm
+        if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
+            return None
+        if hidden_states.numel() * 2 > comm.max_push_size:
+            return None
+        if hidden_states.shape[0] > comm._push_counter.numel():
+            return None
+        return comm.obj
 
     def forward(
         self,
@@ -552,6 +647,7 @@ class BeamModel(nn.Module):
     ):
         # Each fused transition also produces the next layer's normalized input,
         # so the first norm of this stage is the only standalone one.
+        all_reduce_comm = self._all_reduce_comm(hidden_states, forward_batch)
         residual = hidden_states
         normed = self.layers[self.start_layer].input_layernorm(residual)
         for layer_id in range(self.start_layer, self.end_layer):
@@ -562,7 +658,12 @@ class BeamModel(nn.Module):
             else:
                 next_norm_weight = None
             normed, residual = self.layers[layer_id].forward_fused(
-                positions, normed, residual, forward_batch, next_norm_weight
+                positions,
+                normed,
+                residual,
+                forward_batch,
+                next_norm_weight,
+                all_reduce_comm,
             )
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(residual)
