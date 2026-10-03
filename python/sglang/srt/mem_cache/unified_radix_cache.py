@@ -1343,11 +1343,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(
-                    action.node_ids,
-                    replay_boundary=action.replay_boundary,
-                    include_prompt_boundary=action.include_prompt_boundary,
-                )
+                self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
         else:

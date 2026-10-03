@@ -156,8 +156,6 @@ class UnifiedTreeCoreInterface(ABC):
     enable_storage: bool
     enable_external_cache_linker: bool
     write_through_threshold: int
-    # Sparse external SWA retention exists only in the Python TreeCore; 0 is dense.
-    external_swa_retention_interval: int
     is_write_back: bool
     has_swa_host_pool: bool
     # Whether the host tier stages one node per FIFO backup intent.

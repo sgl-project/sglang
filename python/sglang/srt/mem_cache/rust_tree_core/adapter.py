@@ -388,8 +388,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self.device = torch.device("cpu")
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        # A positive interval selects the Python TreeCore via the registry fallback.
-        self.external_swa_retention_interval = 0
         has_mamba = ComponentType.MAMBA in self.tree_components
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
