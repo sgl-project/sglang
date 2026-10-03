@@ -293,6 +293,7 @@ def fit_profile(
     *,
     out: str,
     max_batch_tokens: Optional[int],
+    mbin_w: int = 64,
     self_check: bool,
     plot: bool,
 ) -> None:
@@ -309,7 +310,10 @@ def fit_profile(
     offdiag = any(summary.get("frac") is not None for summary in summaries)
 
     table = build_table_from_summaries(
-        summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
+        summaries=summaries,
+        max_batch_tokens=max_batch_tokens,
+        offdiag=offdiag,
+        mbin_w=mbin_w,
     )
     paths["table"].write_text(table.to_json(), encoding="utf-8")
     if offdiag:
@@ -344,6 +348,7 @@ def profile_all(
     settings: RoundSettings,
     out: str,
     max_batch_tokens: Optional[int],
+    mbin_w: int = 64,
     repeats: int,
     self_check: bool,
     local_tokenizer_path: Optional[str],
@@ -362,6 +367,7 @@ def profile_all(
     fit_profile(
         out=out,
         max_batch_tokens=max_batch_tokens,
+        mbin_w=mbin_w,
         self_check=self_check,
         plot=plot,
     )
@@ -388,11 +394,15 @@ def summaries_to_cells(*, summaries: list[dict]) -> list[dict]:
 
 
 def build_table_from_summaries(
-    *, summaries: list[dict], max_batch_tokens: Optional[int], offdiag: bool
+    *,
+    summaries: list[dict],
+    max_batch_tokens: Optional[int],
+    offdiag: bool,
+    mbin_w: int = 64,
 ):
     if offdiag:
         return build_additive_table_from_cells(
-            cells=summaries_to_cells(summaries=summaries)
+            cells=summaries_to_cells(summaries=summaries), mbin_w=mbin_w
         )
 
     by_batch_tokens: dict[int, list[float]] = {}
@@ -1142,12 +1152,16 @@ def plot_fit(*, cells: list[dict], table, plot_path: Path) -> None:
     logger.info("Wrote fit plot to %s", plot_path)
 
 
-def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTable:
+def build_additive_table_from_cells(
+    *, cells: list[dict], mbin_w: int = 64
+) -> SpsAdditiveCostTable:
     if len(cells) < 4:
         raise RuntimeError(
             f"Off-diagonal fit needs at least 4 cells, got {len(cells)}."
         )
-    bias, alpha, theta, _rel, _stats = ols_resid_backfit(cells)
+    if mbin_w <= 0:
+        raise ValueError(f"mbin_w must be positive, got {mbin_w}.")
+    bias, alpha, theta, _rel, _stats = ols_resid_backfit(cells, mbin_w=mbin_w)
     bs_probes = sorted(alpha)
     m_probes = sorted(theta)
     return SpsAdditiveCostTable(
@@ -1470,6 +1484,13 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
 
 def add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--mbin-w",
+        type=int,
+        default=64,
+        help="M-bin width for the off-diagonal additive SPS fit. Defaults to "
+        "64 to preserve the existing fit behavior.",
+    )
+    parser.add_argument(
         "--max-batch-tokens",
         type=int,
         default=None,
@@ -1554,6 +1575,7 @@ def cli_main() -> None:
         fit_profile(
             out=args.out,
             max_batch_tokens=args.max_batch_tokens,
+            mbin_w=args.mbin_w,
             self_check=args.self_check,
             plot=args.plot,
         )
@@ -1564,6 +1586,7 @@ def cli_main() -> None:
             settings=run_settings(args=args),
             out=args.out,
             max_batch_tokens=args.max_batch_tokens,
+            mbin_w=args.mbin_w,
             repeats=args.repeats,
             self_check=args.self_check,
             local_tokenizer_path=args.local_tokenizer_path,
