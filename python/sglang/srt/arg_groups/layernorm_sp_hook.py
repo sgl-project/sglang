@@ -38,12 +38,12 @@ def validate_layernorm_sp(
     speculative_algorithm: Optional[str],
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
-    from sglang.srt.layers.layernorm_sp import SP_SUPPORTED_ARCHITECTURES
+    from sglang.srt.layers.layernorm_sp import sp_supported_architectures
 
-    if architecture not in SP_SUPPORTED_ARCHITECTURES:
+    if architecture not in sp_supported_architectures():
         raise ValueError(
             "--enable-layernorm-sp is only supported for "
-            f"{sorted(SP_SUPPORTED_ARCHITECTURES)}; got {architecture}."
+            f"{sorted(sp_supported_architectures())}; got {architecture}."
         )
     if tp_size <= 1:
         raise ValueError(
