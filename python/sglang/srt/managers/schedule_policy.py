@@ -1188,19 +1188,13 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        dec_lock_params = None
+        # Replay the acquire's receipt (SWA boundary uuid, mamba flag) so the
+        # release takes back exactly what this temporary lock took.
+        dec_lock_params = self.tree_cache.inc_lock_ref(last_node).to_dec_params()
         try:
-            result = self.tree_cache.inc_lock_ref(last_node)
-            if self.tree_cache.is_tree_cache():
-                # Replay the acquire's receipt (SWA boundary uuid, mamba flag)
-                # so release takes back exactly what this temporary lock took.
-                dec_lock_params = result.to_dec_params()
             yield None
         finally:
-            if dec_lock_params is not None:
-                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
-            else:
-                self.tree_cache.dec_lock_ref(last_node)
+            self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
 
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
