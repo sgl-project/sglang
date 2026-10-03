@@ -503,9 +503,11 @@ class BeamModel(nn.Module):
         self.layers_to_capture = ()
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
+        # A custom PP partition can leave a stage with no layer to fuse from.
         self.fuse_layers = (
             get_exec().offload.cpu_offload_gb <= 0
             and get_exec().offload.offload_group_size <= 0
+            and self.start_layer < self.end_layer
         )
 
     def forward(

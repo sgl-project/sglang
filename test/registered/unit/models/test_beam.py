@@ -1,6 +1,7 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
 import math
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
@@ -883,6 +885,50 @@ class TestBeamDFlashCapture(CustomTestCase):
         model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=2))
         with self.assertRaisesRegex(ValueError, "PP=1"):
             model.set_dflash_layers_to_capture([0])
+
+
+class TestBeamPipelineStage(CustomTestCase):
+    def test_empty_stage_hands_on_its_stream(self):
+        """A custom PP partition can leave a stage with no layer to run or fuse from."""
+        config = tiny_config(layer_types=["full_attention"] * 4)
+        stream = torch.arange(2.0).unsqueeze(-1)
+        for partition, rank in (("0,4", 0), ("4,0", 1)):
+            with self.subTest(partition=partition):
+                pp_group = SimpleNamespace(
+                    is_first_rank=rank == 0,
+                    is_last_rank=rank == 1,
+                    rank_in_group=rank,
+                    world_size=2,
+                )
+                with (
+                    patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": partition}),
+                    get_context().override_server_args(),
+                    get_parallel().override(
+                        tp_size=1,
+                        tp_rank=0,
+                        attn_tp_size=1,
+                        attn_tp_rank=0,
+                        attn_dp_size=1,
+                        pp_size=2,
+                        pp_rank=rank,
+                        pp_group=pp_group,
+                    ),
+                ):
+                    model = BeamModel(config)
+                self.assertEqual(model.start_layer, model.end_layer)
+                if rank == 0:
+                    proxy = model(None, torch.arange(2), None, input_embeds=stream)
+                    torch.testing.assert_close(proxy["hidden_states"], stream)
+                else:
+                    model.norm = torch.nn.Linear(1, 1, bias=False)
+                    model.norm.weight.data.fill_(10)
+                    hidden = model(
+                        None,
+                        torch.arange(2),
+                        None,
+                        pp_proxy_tensors=PPProxyTensors({"hidden_states": stream}),
+                    )
+                    torch.testing.assert_close(hidden, stream * 10)
 
 
 if __name__ == "__main__":
