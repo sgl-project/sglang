@@ -74,6 +74,10 @@ class _FakeRunner:
     def flush_all_decode_kv(self):
         pass
 
+    def remove_request(self, rid, *, sync_kv=True):
+        self._known.discard(rid)
+        self._req_caches.pop(rid, None)
+
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
 
@@ -167,6 +171,7 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
+        self.retraction_count = 0
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
@@ -214,6 +219,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._mlx_active_reqs = {}
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -253,6 +259,45 @@ class TestMlxExtendRouting(CustomTestCase):
     def test_route_seen_and_in_decoding_reqs_is_decode(self):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
+
+    def test_retracted_request_restarts_prefill(self):
+        """Resuming a retracted request must not append its prompt to old native KV."""
+        worker = self._worker(known_rids={"r1"})
+        req = _FakeReq("r1")
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.DECODE, [req], [1])
+        )
+        # Prefill preparation clears is_retracted before reaching the worker;
+        # the lifetime retraction counter survives that transition.
+        req.retraction_count += 1
+        req.is_retracted = False
+        launch = worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [req], [1])
+        )
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"), ["decode_start", "prefill_start"]
+        )
+        self.assertEqual(len(launch.prefills), 1)
+        self.assertEqual(launch.extends, [])
+
+    def test_released_rid_starts_a_new_request(self):
+        """A released request must not retain state when a new request reuses its rid."""
+        worker = self._worker(known_rids={"r1"})
+        previous = _FakeReq("r1")
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.DECODE, [previous], [1])
+        )
+        previous.kv.req_pool_idx = None
+        previous.kv.mark_kv_released()
+        replacement = _FakeReq("r1")
+        launch = worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [replacement], [1])
+        )
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"), ["decode_start", "prefill_start"]
+        )
+        self.assertEqual(len(launch.prefills), 1)
+        self.assertEqual(launch.extends, [])
 
     # ---------- sync path: _forward_batch_generation_mlx ----------
 
