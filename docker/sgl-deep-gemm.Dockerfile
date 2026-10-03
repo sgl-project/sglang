@@ -15,7 +15,9 @@ ARG PYTORCH_MIRROR=download.pytorch.org
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=${PYTHON_ROOT_PATH}/bin:${PATH}
 
+# DeepJIT's exception handling requires elfutils/libdwfl.h and libelf headers.
 RUN yum install -y --nogpgcheck git wget tar gcc gcc-c++ make \
+    elfutils-devel elfutils-libelf-devel \
  && yum clean all && rm -rf /var/cache/yum
 
 RUN set -eux; \
@@ -27,8 +29,7 @@ RUN --mount=type=cache,id=sgl-deep-gemm-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
       13.0) CU_TAG=cu130 ;; \
-      12.9) CU_TAG=cu129 ;; \
-      *)    CU_TAG=cu130 ;; \
+      *) echo "Unsupported CUDA version: ${CUDA_VERSION}" && exit 1 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install --index-url ${PIP_DEFAULT_INDEX} \

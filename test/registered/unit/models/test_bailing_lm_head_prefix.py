@@ -30,7 +30,12 @@ class TestBailingLmHeadPrefix(CustomTestCase):
         config = SimpleNamespace(
             tie_word_embeddings=False, vocab_size=128, hidden_size=128
         )
-        parallel = SimpleNamespace(enable_dp_lm_head=False, tp_rank=0, tp_size=1)
+        parallel = SimpleNamespace(
+            enable_dp_lm_head=False,
+            tp_rank=0,
+            tp_size=1,
+            pp_group=SimpleNamespace(is_last_rank=True),
+        )
         quant_config = _RecordingQuantConfig()
 
         # Keep Bailing's real lm_head construction and quantization dispatch,
@@ -40,9 +45,6 @@ class TestBailingLmHeadPrefix(CustomTestCase):
                 bailing, "BailingMoELinearModel", return_value=torch.nn.Identity()
             ),
             patch.object(bailing, "LogitsProcessor", return_value=torch.nn.Identity()),
-            patch.object(
-                bailing, "get_pp_group", return_value=SimpleNamespace(is_last_rank=True)
-            ),
             patch.object(bailing, "get_parallel", return_value=parallel),
             patch.object(embedding, "get_parallel", return_value=parallel),
         ):

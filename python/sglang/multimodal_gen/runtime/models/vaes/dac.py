@@ -12,6 +12,7 @@ from einops import rearrange
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -506,6 +507,7 @@ class DAC(nn.Module, LayerwiseOffloadableModuleMixin):
 
         return audio_data
 
+    @cached_vae_encode
     def encode(
         self,
         audio_data: torch.Tensor,

@@ -56,7 +56,12 @@ class TestBailingLmHeadQuantization(CustomTestCase):
         config = SimpleNamespace(
             tie_word_embeddings=False, vocab_size=128, hidden_size=128
         )
-        parallel = SimpleNamespace(enable_dp_lm_head=False, tp_rank=0, tp_size=1)
+        parallel = SimpleNamespace(
+            enable_dp_lm_head=False,
+            tp_rank=0,
+            tp_size=1,
+            pp_group=SimpleNamespace(is_last_rank=True),
+        )
         # Keep the real model constructor, head, and quantization dispatch;
         # omit the transformer body and distributed process-group setup.
         with (
@@ -64,9 +69,6 @@ class TestBailingLmHeadQuantization(CustomTestCase):
                 bailing, "BailingMoELinearModel", return_value=torch.nn.Identity()
             ),
             patch.object(bailing, "LogitsProcessor", return_value=torch.nn.Identity()),
-            patch.object(
-                bailing, "get_pp_group", return_value=SimpleNamespace(is_last_rank=True)
-            ),
             patch.object(bailing, "get_parallel", return_value=parallel),
             patch.object(embedding, "get_parallel", return_value=parallel),
             torch.device("cuda"),

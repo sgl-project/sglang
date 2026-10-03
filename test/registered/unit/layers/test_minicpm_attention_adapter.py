@@ -24,7 +24,7 @@ with patch.dict(
         MiniCPMFlashInferAdapter,
     )
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _metadata(rows=1):

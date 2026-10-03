@@ -21,7 +21,7 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "--trust-remote-code",
         "--quantization",
         "fp8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--speculative-algorithm",
         "NEXTN",

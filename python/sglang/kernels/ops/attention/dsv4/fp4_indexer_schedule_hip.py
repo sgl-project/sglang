@@ -12,6 +12,10 @@ Everything the preamble computes is a reduction or a scan over the row count,
 so it collapses into a single kernel; the only real dependency is that
 ``_prefill_cta_info_kernel`` needs the finished prefix sums. That leaves two
 dispatches for the whole schedule.
+
+The decode schedule (AITER's ``compute_varctx_schedule``) is built the same way:
+AITER's single kernel holds [256, rows] tiles in registers and spills past a few
+thousand rows, so its scratch cannot be reserved once the KV pool owns the memory.
 """
 
 from __future__ import annotations
@@ -167,7 +171,9 @@ def _pad_page_table_kernel(
     )
 
 
-def padded_page_table_shape(page_table: torch.Tensor) -> Tuple[int, int, int]:
+def padded_page_table_shape(
+    page_table: torch.Tensor, page_table_bucket: int = 4
+) -> Tuple[int, int, int]:
     """Rows, logical width, and the 256-token-scheduling padded width.
 
     The padding rule is shared with the logits sizing in ``fp4_indexer_hip``;
@@ -176,7 +182,7 @@ def padded_page_table_shape(page_table: torch.Tensor) -> Tuple[int, int, int]:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import _guarded_pages
 
     rows, logical_width = page_table.shape
-    return rows, logical_width, _guarded_pages(logical_width)
+    return rows, logical_width, _guarded_pages(logical_width, page_table_bucket)
 
 
 def _as_int32_2d(page_table: torch.Tensor) -> torch.Tensor:
@@ -189,7 +195,9 @@ def _as_int32_2d(page_table: torch.Tensor) -> torch.Tensor:
 
 
 def pad_page_table(
-    page_table: torch.Tensor, out: Optional[torch.Tensor] = None
+    page_table: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    page_table_bucket: int = 4,
 ) -> Tuple[torch.Tensor, int]:
     """Pad a page table for 256-token scheduling in a single dispatch.
 
@@ -197,7 +205,9 @@ def pad_page_table(
     output element, so the destination never needs pre-zeroing.
     """
     page_table = _as_int32_2d(page_table)
-    rows, logical_width, padded_width = padded_page_table_shape(page_table)
+    rows, logical_width, padded_width = padded_page_table_shape(
+        page_table, page_table_bucket
+    )
     if out is None:
         out = page_table.new_empty((rows, padded_width + 4))
     else:
@@ -269,6 +279,7 @@ def build_prefill_schedule(
     block_k: int = 256,
     guarded_out: Optional[torch.Tensor] = None,
     buffers: Optional[PrefillScheduleBuffers] = None,
+    page_table_bucket: int = 4,
 ) -> Tuple[torch.Tensor, PrefillScheduleBuffers]:
     """Pad the page table and build the FP4 prefill schedule in two dispatches.
 
@@ -282,7 +293,9 @@ def build_prefill_schedule(
     )
 
     page_table = _as_int32_2d(page_table)
-    rows, logical_width, padded_width = padded_page_table_shape(page_table)
+    rows, logical_width, padded_width = padded_page_table_shape(
+        page_table, page_table_bucket
+    )
     total_rows = local_ends.shape[0]
     assert total_rows <= rows, (
         f"local_ends rows {total_rows} exceed the page table's {rows}; the "
@@ -363,3 +376,153 @@ def build_prefill_schedule(
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers
+
+
+# Rows per block of the decode prep kernel's loops: its registers stay fixed as the
+# batch grows, where AITER's varctx kernel holds every row in one tile.
+_DECODE_ROW_BLOCK = 1024
+# Slots per program of the decode cta_info kernel, as AITER's varctx kernel.
+_DECODE_SLOT_BLOCK = 256
+
+
+@triton.jit
+def _decode_schedule_prep_kernel(
+    ctx_ptr,  # [B] int32  c4 context lengths
+    incl_ptr,  # [B] int32  out, inclusive prefix sum of per-row CTA counts
+    scalars_ptr,  # [2] int32  out, [safe, total_splits]
+    B,
+    P,
+    block_k,
+    s_max,
+    ROW_BLOCK: tl.constexpr,
+):
+    """AITER varctx schedule preamble (next_n = 1): the split factor and the prefix sums."""
+    off = tl.arange(0, ROW_BLOCK)
+    zero = tl.sum(tl.zeros([ROW_BLOCK], tl.int32), axis=0)
+
+    max_chunks = zero + 1
+    any_total = zero
+    for start in range(0, B, ROW_BLOCK):
+        live = start + off < B
+        ctx = tl.load(ctx_ptr + start + off, mask=live, other=0)
+        chunks = tl.where(live, (ctx + block_k - 1) // block_k, 0)
+        max_chunks = tl.maximum(max_chunks, tl.max(chunks, axis=0))
+        any_total += tl.sum((chunks + s_max - 1) // s_max, axis=0)
+
+    # Smallest split factor s with sum_i ceil(chunks_i / s) <= P, as AITER's search.
+    lo = zero + 1
+    hi = zero + s_max
+    for _ in tl.static_range(32):
+        searching = lo < hi
+        mid = (lo + hi) // 2
+        total = zero
+        for start in range(0, B, ROW_BLOCK):
+            live = start + off < B
+            ctx = tl.load(ctx_ptr + start + off, mask=live, other=0)
+            chunks = tl.where(live, (ctx + block_k - 1) // block_k, 0)
+            total += tl.sum((chunks + mid - 1) // mid, axis=0)
+        fits = total <= P
+        hi = tl.where(searching & fits, mid, hi)
+        lo = tl.where(searching & (fits == 0), mid + 1, lo)
+    safe = tl.where(any_total <= P, lo, max_chunks)
+
+    carry = zero
+    for start in range(0, B, ROW_BLOCK):
+        live = start + off < B
+        ctx = tl.load(ctx_ptr + start + off, mask=live, other=0)
+        chunks = tl.where(live, (ctx + block_k - 1) // block_k, 0)
+        ctas = (chunks + safe - 1) // safe
+        tl.store(incl_ptr + start + off, tl.cumsum(ctas, axis=0) + carry, mask=live)
+        carry += tl.sum(ctas, axis=0)
+    tl.store(scalars_ptr, safe)
+    tl.store(scalars_ptr + 1, carry)
+
+
+@triton.jit
+def _decode_cta_info_kernel(
+    ctx_ptr,  # [B] int32  c4 context lengths
+    incl_ptr,  # [B] int32  inclusive prefix sum of per-row CTA counts
+    scalars_ptr,  # [2] int32  [safe, total_splits]
+    cta_info_ptr,  # [P, 4] int32  out, [batch, chunk_start, chunk_count, ctx_len]
+    B,
+    P,
+    block_k,
+    BLOCK_S: tl.constexpr,
+):
+    """AITER varctx cta_info rows (next_n = 1), each slot's row found by a binary search
+    over incl in global memory, as AITER's _prefill_cta_info_kernel does."""
+    safe = tl.load(scalars_ptr)
+    total_splits = tl.load(scalars_ptr + 1)
+    slot = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
+    smask = slot < P
+
+    # searchsorted(incl, slot, right=True) = count(incl <= slot)
+    lo = tl.zeros([BLOCK_S], tl.int32)
+    hi = tl.full([BLOCK_S], B, tl.int32)
+    for _ in tl.static_range(32):
+        mid = (lo + hi) // 2
+        incl_mid = tl.load(
+            incl_ptr + tl.minimum(mid, B - 1), mask=mid < B, other=2147483647
+        )
+        go_right = incl_mid <= slot
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    row = tl.minimum(lo, B - 1)
+
+    ctx = tl.load(ctx_ptr + row, mask=smask, other=0)
+    chunks = (ctx + block_k - 1) // block_k
+    excl = tl.load(incl_ptr + row, mask=smask, other=0) - (chunks + safe - 1) // safe
+
+    valid = slot < total_splits
+    vi = valid.to(tl.int32)
+    start = (slot - excl) * safe  # pre-mask (count uses this)
+    count = tl.maximum(tl.minimum(safe, chunks - start), 0)
+    base = slot * 4
+    tl.store(cta_info_ptr + base + 0, row * vi, mask=smask)
+    tl.store(cta_info_ptr + base + 1, start * vi, mask=smask)
+    tl.store(cta_info_ptr + base + 2, tl.where(valid, count, 1), mask=smask)
+    tl.store(cta_info_ptr + base + 3, ctx * vi, mask=smask)
+
+
+def build_decode_schedule(
+    context_lens: torch.Tensor,
+    *,
+    cta_info_out: torch.Tensor,
+    max_seq_len: int,
+    block_k: int = 256,
+) -> torch.Tensor:
+    """AITER's ``compute_varctx_schedule`` (next_n = 1) into ``cta_info_out`` [P, 4] in two
+    dispatches whose registers do not grow with the row count. Returns the scratch the
+    kernels read ([safe, total_splits] then the per-row prefix sums): a captured graph
+    must keep it alive."""
+    context_lens = context_lens.to(torch.int32)
+    rows = context_lens.shape[0]
+    ctas = cta_info_out.shape[0]
+    assert rows <= ctas, (
+        f"{rows} rows on {ctas} CTAs: the persistent grid must give every row a CTA"
+    )
+    scratch = torch.empty(rows + 2, dtype=torch.int32, device=context_lens.device)
+    if rows == 0:
+        return scratch
+    scalars, incl = scratch[:2], scratch[2:]
+    _decode_schedule_prep_kernel[(1,)](
+        context_lens,
+        incl,
+        scalars,
+        rows,
+        ctas,
+        block_k,
+        max(1, triton.cdiv(max_seq_len, block_k)),
+        ROW_BLOCK=_DECODE_ROW_BLOCK,
+    )
+    _decode_cta_info_kernel[(triton.cdiv(ctas, _DECODE_SLOT_BLOCK),)](
+        context_lens,
+        incl,
+        scalars,
+        cta_info_out,
+        rows,
+        ctas,
+        block_k,
+        BLOCK_S=_DECODE_SLOT_BLOCK,
+    )
+    return scratch
