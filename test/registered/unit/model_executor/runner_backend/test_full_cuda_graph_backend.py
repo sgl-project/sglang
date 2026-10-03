@@ -3,8 +3,8 @@
 These cover the changes from the "cuda graph profile traces" PR that wire the
 runner's torch profiler into the capture loop:
 
-  * When profiling is disabled, ``capture_one`` runs exactly two warmups + one
-    capture and never touches a profiler (behavior-identical to before the PR).
+  * When profiling is disabled, ``capture_one`` runs one warmup + one
+    capture and never touches a profiler.
   * When the runner exposes an active ``_profiler`` (per-bs capture profiling,
     ``--enable-profile-cuda-graph`` + ``SGLANG_GRAPH_BATCH_CAPTURE``),
     ``capture_one`` calls ``profiler.step()`` past the two warmups and once after
@@ -87,7 +87,7 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
 
 
 class TestCaptureOneNoProfiling(CustomTestCase):
-    def test_runs_two_warmups_and_capture_without_stepping(self):
+    def test_runs_one_warmup_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)
 
@@ -101,10 +101,10 @@ class TestCaptureOneNoProfiling(CustomTestCase):
                 shape_key, forward_fn, post_warmup_hook=post_warmup_hook
             )
 
-        # 2 warmups + 1 capture.
-        self.assertEqual(forward_fn.call_count, 3)
-        # post_warmup_hook only runs in the two warmup iterations.
-        self.assertEqual(post_warmup_hook.call_count, 2)
+        # 1 warmup + 1 capture.
+        self.assertEqual(forward_fn.call_count, 2)
+        # Reset attention state after the warmup.
+        self.assertEqual(post_warmup_hook.call_count, 1)
         # Graph + output are recorded against the shape key.
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
@@ -118,8 +118,6 @@ class TestCaptureOneNoProfiling(CustomTestCase):
             [
                 torch.ones((4, 2)),
                 torch.ones((4, 2)),
-                torch.ones((4, 2)),
-                torch.ones((2, 2)),
                 torch.ones((2, 2)),
                 torch.ones((2, 2)),
             ]
@@ -146,7 +144,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
             backend.capture_one(ShapeKey(size=2), forward_fn)
 
-        self.assertEqual(forward_fn.call_count, 3)
+        self.assertEqual(forward_fn.call_count, 2)
 
 
 class TestCaptureOneWithProfiling(CustomTestCase):
