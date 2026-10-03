@@ -31,6 +31,11 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
+# Combines between peer-state polls at a steady width. Large enough that the query's
+# cost and stall risk stay off the decode path, small enough that a peer that fails
+# without changing the connected set is still found in well under a second.
+_MASK_QUERY_STRIDE = 512
+
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
 NixlEPCombineInput = DeepEPLLCombineInput
 
@@ -92,6 +97,22 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def on_retire(cls, retiree_ranks: list) -> None:
+        """Survivor NIXL disconnect (drops peer QPs; contiguous tail assumed)."""
+        state = cls._state()
+        # Only retirees this rank connected to: connections are lazy, so a
+        # grow-shrink with no dispatch between never made them and the vendor
+        # asserts on an unknown peer. The next dispatch closes the gap.
+        connected = state.connected_ep_size or 0
+        tail = min(retiree_ranks)
+        stale = [r for r in retiree_ranks if r < connected]
+        if stale:
+            cls._disconnect_ranks(state, stale)
+        state.connected_ep_size = min(connected, tail)
+        state.scale_to = tail
+        state.dispatch_ep_size = tail
+
+    @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
         current_store = get_global_tcp_store()
         if current_store is not None:
@@ -106,9 +127,20 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _disconnect_ranks(cls, state, ranks: list) -> None:
+        current_store = get_global_tcp_store()
+        if current_store is not None:
+            state.buffer.set_tcp_store_group(current_store)
+        state.buffer.disconnect_ranks(ranks)
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
-        new_ranks = list(range(state.connected_ep_size, scale_to))
-        cls._connect_ranks(state, new_ranks, tag="update")
+        if scale_to > state.connected_ep_size:
+            cls._connect_ranks(
+                state, list(range(state.connected_ep_size, scale_to)), tag="update"
+            )
+        elif scale_to < state.connected_ep_size:
+            cls._disconnect_ranks(state, list(range(scale_to, state.connected_ep_size)))
         state.connected_ep_size = scale_to
 
     @classmethod
@@ -126,7 +158,7 @@ class NixlEPBuffer:
             if (
                 state.scale_to is not None
                 and state.connected_ep_size is not None
-                and state.scale_to > state.connected_ep_size
+                and state.scale_to != state.connected_ep_size
             ):
                 cls._update_connections(state, state.scale_to)
             return state.buffer
@@ -243,6 +275,14 @@ class _NixlEPDispatcherImplBase:
             if self.active_ranks is not None
             else None
         )
+        # Marks standing at the current width; see the rebase in combine.
+        self._mask_baseline = (
+            torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
+            if self.active_ranks is not None
+            else None
+        )
+        self._mask_baseline_width = None
+        self._combines_since_mask_query = 0
 
         self.handle = None
         self.quant_config = None
@@ -420,10 +460,42 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             return_recv_hook=self.return_recv_hook,
         )
         if self._mask_buffer is not None:
-            buffer.query_mask_buffer(self._mask_buffer)
-
+            connected = NixlEPBuffer._state().connected_ep_size
             n = ElasticEPStateManager.get_data_plane_ep_size()
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
+            # Poll on a stride rather than on connected-set drift: get_nixl_buffer
+            # reconciles connected_ep_size to the new width before the combine runs,
+            # so drift is false by the time we look and a peer that fails at a steady
+            # width is never surfaced.
+            #
+            # Never while a resize is in flight, in either direction. The query can
+            # leave work on the stream, and upstream's per-forward
+            # is_active_equal_last syncs on it, so a peer that has not finished
+            # arriving or leaving turns that sync into a scheduler watchdog timeout.
+            # Until commit the mask is the scale path's to maintain, and the width is
+            # still moving, so there is nothing here worth the risk.
+            self._combines_since_mask_query += 1
+            rebase = self._mask_baseline_width != (connected, n)
+            periodic = self._combines_since_mask_query >= _MASK_QUERY_STRIDE
+            if not ElasticEPStateManager.is_scale_pending() and (rebase or periodic):
+                self._combines_since_mask_query = 0
+                buffer.query_mask_buffer(self._mask_buffer)
+                if rebase:
+                    # The transport never clears the mark for a rank it disconnected,
+                    # and _update_connections reconnects on a regrow without resetting
+                    # it, so the raw mask still reports ranks that have long rejoined
+                    # as dead. Re-base on the marks standing at this width and treat
+                    # only a bit that sets afterwards as a fault. Without this, an
+                    # 8->4->8->6 run reports the slots retired by the first shrink as
+                    # faulted once they come back inside the width.
+                    self._mask_baseline.copy_(self._mask_buffer)
+                    self._mask_baseline_width = (connected, n)
+                faulted = (self._mask_buffer[:n] > self._mask_baseline[:n]).to(
+                    self.active_ranks.dtype
+                )
+                # Clear only, never copy_: re-admitting a rank is the scale path's
+                # decision, not a fault detector's, and dp_attention builds its
+                # collectives on this mask.
+                self.active_ranks[:n].mul_(1 - faulted)
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

@@ -2211,6 +2211,7 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     effective_ep_size: int
     slot_offset: int = 0
     slot_count: int = 0
+    direction: str = "grow"  # "grow" adds DPC routing slots; "shrink" removes them.
     error: Optional[str] = None
 
 
@@ -2218,6 +2219,8 @@ class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    # Opaque caller tag echoed back by /is_scaling_elastic_ep.
+    operation_id: Optional[str] = None
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
@@ -2227,6 +2230,13 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    # Set on a reject the caller can retry by staging: the cohort width a waiting
+    # recover joiner sized itself for, which the requested target falls short of.
+    required_ep_size: Optional[int] = None
+    # Set when no joiner has announced on the slots this grow targets, so the width
+    # it needs is not knowable yet. The caller resends until one does, since the
+    # joiner is a separate process that is still starting up.
+    retry_when_joiner_announces: bool = False
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):
