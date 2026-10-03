@@ -1651,6 +1651,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
+        if getattr(self, "clef_head", None) is not None:
+            from sglang.srt.layers.clef import forward_clef
+
+            decision_output = forward_clef(self, input_ids, hidden_states, forward_batch)
+            if decision_output is not None:
+                return decision_output
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(

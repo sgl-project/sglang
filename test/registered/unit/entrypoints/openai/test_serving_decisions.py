@@ -231,12 +231,34 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.addCleanup(restore_context, snapshot_context())
 
+    async def test_generic_input_and_choice_limits_are_checked_before_scoring(self):
+        manager = ScoringManager(self.tokenizer)
+        handler = _handler(manager)
+        for value in ("", " ", [], {}):
+            with self.subTest(input=value):
+                response = await handler.handle_request(
+                    _request(value, {"q": _question("yes_no")}), None
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    "input must not be blank",
+                    json.loads(response.body)["message"],
+                )
+        response = await handler.handle_request(
+            _request(
+                "s", {"q": _question("choice", {str(i): None for i in range(77)})}
+            ),
+            None,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most 26 options", json.loads(response.body)["message"])
+        self.assertEqual(manager.requests, [])
+
     def test_request_limits_follow_the_label_alphabets(self):
         options = {name: None for name in string.ascii_lowercase}
         rejected = {
             "unknown type": {"type": "rank", "question": "Q"},
             "one option": _question("choice", {"a": None}),
-            "27 options": _question("choice", {**options, "extra": None}),
             "blank option name": _question("choice", {"a": None, " ": None}),
             "repeated option name": _question("choice", {"a": None, " A": None}),
             "option name with a line break": _question(
@@ -258,8 +280,6 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         for payload in (
             {"input": "s", "questions": []},
             {"input": "s", "questions": question, "temperature": 0},
-            {"input": " ", "questions": question},
-            {"input": [], "questions": question},
             {"input": "s", "questions": question, "top_p": 0.5},
             {"input": "s", "questions": [{"id": " ", **_question("yes_no")}]},
             {"input": "s", "questions": question * 2},

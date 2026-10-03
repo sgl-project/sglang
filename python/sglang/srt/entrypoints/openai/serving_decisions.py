@@ -125,10 +125,27 @@ class OpenAIServingDecisions(OpenAIServingBase):
                     )
                     self.answers_open_reasoning = detector.reasoning_default == "always"
 
+    async def handle_request(self, request: Any, raw_request: Request) -> Any:
+        """Dispatch joint checkpoints before generic per-question scoring."""
+        if getattr(self.tokenizer_manager.model_config, "clef_config", None) is not None:
+            from sglang.srt.entrypoints.openai.serving_clef import handle_clef_request
+
+            try:
+                return await handle_clef_request(self, request, raw_request)
+            except ValueError as error:
+                return self.create_error_response(str(error))
+        return await super().handle_request(request, raw_request)
+
     def _request_id_prefix(self) -> str:
         return "decision-"
 
     def _validate_request(self, request: DecisionRequest) -> Optional[str]:
+        # Clef dispatches before this generic single-token scoring validation.
+        if is_blank_decision_text(request.input):
+            return "input must not be blank"
+        for question in request.questions:
+            if question.type == "choice" and len(question.options) > 26:
+                return f"question {question.id!r}: at most 26 options can be labeled A to Z"
         error = self._validate_server(request.model) or self._validate_images(
             request.images
         )
