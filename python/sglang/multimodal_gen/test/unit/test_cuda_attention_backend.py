@@ -199,6 +199,39 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
 
+    def test_sage_attention_falls_back_for_unsupported_head_size(self):
+        # A server-wide sage selection also reaches the Qwen3-VL vision tower
+        # (head size 72), which sageattn rejects; it must take the dense exact
+        # fallback there instead of failing every edit request at prefill.
+        sage_cls_str = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "sage_attn.SageAttentionBackend"
+        )
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        with (
+            patch.dict(sys.modules, {"sageattention": sageattention}),
+            patch.object(
+                _SageAttentionBackendResolver, "resolve", return_value=sage_cls_str
+            ),
+        ):
+            self.assertEqual(
+                FakeCudaPlatform.get_attn_backend_cls_str(
+                    selected_backend=AttentionBackendEnum.SAGE_ATTN,
+                    head_size=72,
+                    dtype=torch.float16,
+                ),
+                SDPA_BACKEND_CLS_STR,
+            )
+            self.assertEqual(
+                FakeCudaPlatform.get_attn_backend_cls_str(
+                    selected_backend=AttentionBackendEnum.SAGE_ATTN,
+                    head_size=128,
+                    dtype=torch.float16,
+                ),
+                sage_cls_str,
+            )
+
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True
         sageattention = types.ModuleType("sageattention")
