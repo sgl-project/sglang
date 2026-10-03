@@ -339,9 +339,6 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
-    # Render every tool into the chat template when tool_choice names a function,
-    # instead of only the named one. The prompt then keeps the prefix of earlier turns.
-    SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
@@ -757,6 +754,10 @@ class Envs:
     # Tool calling and native web search
     # ===================================================================
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Render every tool into the chat template when tool_choice names a function,
+    # instead of only the named one. The prompt then keeps the prefix of earlier
+    # turns. Applies only when the request has an output constraint for the tool.
+    SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS = EnvBool(False)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.
