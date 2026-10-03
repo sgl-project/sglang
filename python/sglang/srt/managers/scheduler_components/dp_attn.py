@@ -252,6 +252,17 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    # Preserve the raw scheduler gather independently of the representation
+    # consumed by the model forward below. PDMux uses this rank-invariant view
+    # to keep layer-split control flow aligned even on backends that do not
+    # require an MLP TP gather and therefore keep `global_num_tokens` local.
+    batch.scheduler_global_num_tokens = (
+        list(mlp_sync_info.global_num_tokens)
+        if mlp_sync_info.global_num_tokens is not None
+        else [mlp_sync_info.num_tokens]
+    )
+
+    # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]

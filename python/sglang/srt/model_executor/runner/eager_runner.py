@@ -18,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import torch
 
@@ -46,8 +46,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
+    has_forward_context,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -228,18 +230,63 @@ class EagerRunner(BaseRunner):
             return self._execute_extend(forward_batch, pp_proxy_tensors)
         raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
+    def _caller_published_attn_backend(self) -> Optional[Any]:
+        """The backend a caller bound for this forward, if it bound one.
+
+        `_forward_raw` publishes the runner's default `attn_backend` when no
+        ForwardContext is active, so an active context carrying any other
+        backend was chosen by the caller: the EAGLE multi-step draft binds
+        `draft_attn_backend.attn_backends[i]` per draft step and marks the
+        forward's metadata ready against it. Returns None when the active
+        context is the runner default, i.e. nobody chose.
+        """
+        if not has_forward_context():
+            return None
+        active = get_forward_context().attn_backend
+        if active is self.model_runner.attn_backend:
+            return None
+        return active
+
     def _resolve_decode_pdmux(
         self,
     ) -> Tuple[Any, contextlib.AbstractContextManager]:
         """Resolve the (attn_backend, forward_context) the eager decode forward
         runs under. PDmux selects a per-stream backend and publishes it via an
-        active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
+        active ForwardContext; non-pdmux uses attn_backend + the ambient ctx.
+
+        The standard lane makes one exception: a backend the caller already
+        published wins. Overriding it would hand the model a per-stream backend
+        that never planned this forward's metadata (the init is skipped because
+        the caller marked it ready), and would drop the per-step
+        `speculative_step_id` the multi-step draft backend carries.
+        """
         model_runner = self.model_runner
-        if self.enable_pdmux:
-            return model_runner.decode_attn_backend, forward_context(
-                ForwardContext(attn_backend=model_runner.decode_attn_backend)
-            )
-        return model_runner.attn_backend, contextlib.nullcontext()
+        if not self.enable_pdmux:
+            return model_runner.attn_backend, contextlib.nullcontext()
+        if self.pdmux_standard:
+            chosen = self._caller_published_attn_backend()
+            if chosen is not None:
+                return chosen, contextlib.nullcontext()
+        return model_runner.decode_attn_backend, forward_context(
+            ForwardContext(attn_backend=model_runner.decode_attn_backend)
+        )
+
+    def _resolve_extend_pdmux(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[Any, contextlib.AbstractContextManager]:
+        """Resolve the backend an eager EXTEND-family forward runs under.
+
+        TARGET_VERIFY is classified as an extend mode but belongs to the decode
+        lane: it runs between draft steps on the decode stream. On the standard
+        lane it must therefore use the decode lane's per-stream backend, not the
+        prefill instance -- both write `forward_metadata` and the same scratch
+        buffers in place, and a prefill can be in flight on the other stream. A
+        real prefill keeps the prefill backend and the ambient context, and so
+        does every forward under layer_split, which keeps its original routing.
+        """
+        if self.pdmux_standard and forward_batch.forward_mode.is_target_verify():
+            return self._resolve_decode_pdmux()
+        return self.model_runner.attn_backend, contextlib.nullcontext()
 
     def _execute_decode(
         self,
@@ -277,6 +324,7 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+        attn_backend, pdmux_ctx = self._resolve_extend_pdmux(forward_batch)
 
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -323,8 +371,8 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
+            attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch,
                 num_qo_tokens=len(forward_batch.input_ids),
             )
@@ -342,7 +390,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        with device_timer_ctx(model_runner.device_timer, category), pdmux_ctx:
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip

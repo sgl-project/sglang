@@ -448,6 +448,22 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
+        if (
+            node.component_data[self.component_type].value is None
+            and params.prev_prefix_len > total_prefix_len
+        ):
+            # The request's already-cached prefix ends inside this node (the
+            # match-time split boundary moved between match and insert), so
+            # value_slice below that point aliases the node's own FULL pages
+            # and the request has no SWA slots there. The recover branches
+            # adopt value_slice wholesale and free old_full wholesale: the
+            # aliased page would end up owned by both the node and the free
+            # list, and the rebuilt SWA span would count phantom zero slots
+            # -- the one-page-per-pool idle-invariant violation. Skip the
+            # recovery; the walk's dedup then frees only the fresh duplicate
+            # and the node simply stays tombstoned.
+            return prefix_len
+
         window_start = params.get_evicted_seqlen(self.component_type)
         if self._independent:
             window_start = max(window_start, params.prev_prefix_len)

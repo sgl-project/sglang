@@ -20,6 +20,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -117,6 +118,13 @@ class Sampler(nn.Module):
             # Single-shard drafts may have no context-parallel group.
             if get_parallel().attn_cp_size > 1:
                 self.cp_sync_group = get_parallel().attn_cp_group.device_group
+        # Under PDMux standard the TP group is lane-dependent: get_tp_group()
+        # returns the duplicate prefill communicator while the prefill lane is
+        # active. Resolve it per call so prefill and decode collectives never
+        # share the same communicator concurrently.
+        self._resolve_tp_sync_group_per_call = (
+            is_pdmux_standard_prefill() and not is_dp_attention_enabled()
+        )
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -689,10 +697,15 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
+            group = (
+                get_parallel().tp_group.device_group
+                if self._resolve_tp_sync_group_per_call
+                else self.tp_sync_group
+            )
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
+                group=group,
             )
 
     def compute_logprobs_only(

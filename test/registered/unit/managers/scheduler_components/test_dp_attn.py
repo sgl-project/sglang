@@ -83,6 +83,30 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             [[1, ForwardMode.DECODE.value]],
         )
 
+    def test_scheduler_keeps_global_counts_without_mlp_tp_gather(self):
+        batch = SimpleNamespace()
+        sync_info = SimpleNamespace(
+            num_tokens=4,
+            num_tokens_for_logprob=4,
+            global_num_tokens=[4, 0],
+            global_num_tokens_for_logprob=[4, 0],
+            is_extend_in_batch=False,
+            tbo_split_seq_index=None,
+            global_forward_mode=None,
+            can_run_decode_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+            prefill_cuda_graph_max_prefix_len=0,
+        )
+
+        dp_attn._update_gather_batch(
+            batch,
+            sync_info,
+            require_mlp_tp_gather=False,
+        )
+
+        self.assertEqual(batch.global_num_tokens, [4])
+        self.assertEqual(batch.scheduler_global_num_tokens, [4, 0])
+
 
 class TestDecodeToExtendConversionVote(CustomTestCase):
     """A decode batch votes for the prefill graph only when its 1-token extend

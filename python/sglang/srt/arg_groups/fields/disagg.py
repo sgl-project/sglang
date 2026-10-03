@@ -169,6 +169,15 @@ class Disagg(msgspec.Struct):
         Optional[str],
         "The path of the PD-Multiplexing config file.",
     ] = None
+    pdmux_prefill_mode: A[
+        str,
+        Arg(
+            help="How PD-Multiplexing submits a prefill. 'layer_split' walks "
+            "forward_split_prefill by layer interval; 'standard' submits the "
+            "whole prefill through the ordinary EXTEND worker path.",
+            choices=["layer_split", "standard"],
+        ),
+    ] = "layer_split"
     sm_group_num: A[int, "Number of sm partition groups."] = 8
     disaggregation_decode_host_receive_threshold: A[
         float,

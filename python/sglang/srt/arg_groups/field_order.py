@@ -443,6 +443,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_adaptive_dispatch_to_encoder",
     "enable_pdmux",
     "pdmux_config_path",
+    "pdmux_prefill_mode",
     "sm_group_num",
     "startup_weight_load_mode",
     "custom_weight_loader",

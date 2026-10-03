@@ -1028,6 +1028,19 @@ class DeepseekV2MoE(nn.Module):
             if use_flashinfer_trtllm_bypass
             else self._maybe_quant_moe_input_once(hidden_states)
         )
+        # An in-place routed runner (triton) writes its output into
+        # hidden_states, which the shared experts read concurrently on the alt
+        # stream -- the fork below orders the alt stream only after work
+        # enqueued so far, not against the routed write issued later. Hand the
+        # alt stream its own copy instead of forcing the routed path out of
+        # place: the clone costs ~0.2ms/step at decode shapes, while an
+        # out-of-place routed MoE broke the per-layer PDL fusion chain for
+        # ~7ms/step (measured, DSV4 TP8 decode bs~40).
+        shared_expert_input = (
+            hidden_states.clone()
+            if self.experts.moe_runner_config.inplace
+            else hidden_states
+        )
         self.alt_stream.wait_stream(current_stream)
         should_quant_routed_input_mxfp8 = (
             not use_flashinfer_trtllm_bypass
@@ -1141,7 +1154,7 @@ class DeepseekV2MoE(nn.Module):
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
-                hidden_states,
+                shared_expert_input,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )

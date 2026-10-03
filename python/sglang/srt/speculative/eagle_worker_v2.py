@@ -57,6 +57,10 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    decode_lane_attn_backend,
+    is_pdmux_standard_prefill,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -386,8 +390,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        needs_prefill_lane_backend = (
+            is_pdmux_standard_prefill() and self.draft_extend_attn_backend is not None
+        )
+        self.prefill_lane_draft_extend_attn_backend = (
+            draft_backend_factory.create_draft_extend_backend()
+            if needs_prefill_lane_backend
+            else None
+        )
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
+
+    @contextlib.contextmanager
+    def prefill_lane_draft_extend_backend(self):
+        """Temporarily bind the standard prefill lane's draft backend."""
+        backend = self.prefill_lane_draft_extend_attn_backend
+        if backend is None:
+            yield
+            return
+        previous_backend = self.draft_runner.attn_backend
+        self.draft_runner.attn_backend = backend
+        try:
+            yield
+        finally:
+            self.draft_runner.attn_backend = previous_backend
 
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
@@ -444,6 +470,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner_for_draft_extend = None
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            return
+
+        if is_pdmux_standard_prefill():
+            # These two runners hard-disable the pdmux capture path, so they
+            # would capture a single graph set on a plain stream and replay it
+            # on whichever green-context stream is current -- the graph's nodes
+            # keep the resource context they were captured with. Run the draft
+            # steps and the draft extend eagerly instead; the target's decode
+            # and verify graphs are captured per stream group and stay on.
+            logger.info(
+                "PD-Multiplexing standard prefill: skipping draft CUDA graph "
+                "capture (draft decode and draft extend run eagerly)."
+            )
             return
 
         if get_model().model_impl == "mindspore":
@@ -1490,6 +1529,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
+            self.draft_worker.prefill_lane_draft_extend_backend(),
         ):
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 batch,
@@ -1594,7 +1634,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
-        attn_backend = self._target_worker.model_runner.attn_backend
+        # Verify runs on the decode lane; `verify_mask.buffer` is filled in
+        # place, so take the backend the eager runner will resolve for it (the
+        # per-stream decode backend on the PDMux standard lane, the runner
+        # default everywhere else).
+        attn_backend = decode_lane_attn_backend(self._target_worker.model_runner)
         verify_mask = attn_backend.verify_mask
         # Every position in a 1-node tree is visible, so an all-True fill is
         # correct under either layout.

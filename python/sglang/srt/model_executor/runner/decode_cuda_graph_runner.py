@@ -230,6 +230,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    @staticmethod
+    def _get_post_warmup_hook(attn_backend):
+        return getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+
     def __init__(
         self,
         model_runner: ModelRunner,
