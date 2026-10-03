@@ -1639,12 +1639,17 @@ class KVCacheConfigurator:
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
         if get_memory().enable_hisparse:
-            PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            pool_kwargs["host_to_device_ratio"] = (
-                parse_hisparse_config().host_to_device_ratio
-            )
+            host_to_device_ratio = parse_hisparse_config().host_to_device_ratio
+            if self.is_draft_worker:
+                # The draft shares logical allocations, not target KV remapping.
+                # Its independent KV must stay resident when target slots move.
+                PoolCls = DSATokenToKVPool
+                max_total_num_tokens *= host_to_device_ratio
+            else:
+                PoolCls = HiSparseDSATokenToKVPool
+                pool_kwargs["host_to_device_ratio"] = host_to_device_ratio
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
