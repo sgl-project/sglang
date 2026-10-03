@@ -479,6 +479,71 @@ class TestEdgeCases:
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
+    def test_page_stride_int32_overflow(self):
+        """Test page addressing after a 32-bit page-stride product wraps."""
+        device = torch.device("cuda")
+        page_size = 64
+        index_head_dim = 128
+        buf_numel_per_page = page_size * (index_head_dim + 4)
+
+        # The production failure starts once page offsets cross 2^31. Use the
+        # first page past 2^32 here so the buggy int32 product wraps to a small
+        # positive in-buffer offset instead of causing an illegal CUDA access.
+        wrap_page = ((1 << 32) + buf_numel_per_page - 1) // buf_numel_per_page
+        wrapped_base_offset = (wrap_page * buf_numel_per_page) % (1 << 32)
+        assert wrap_page == 508401
+        assert wrapped_base_offset == 4352
+
+        required_bytes = (wrap_page + 1) * buf_numel_per_page
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < required_bytes + (512 << 20):
+            pytest.skip(
+                f"needs about 4.5 GiB free GPU memory, have {free_bytes >> 20} MiB"
+            )
+
+        try:
+            buf = torch.empty(
+                (wrap_page + 1, buf_numel_per_page),
+                dtype=torch.uint8,
+                device=device,
+            )
+        except torch.OutOfMemoryError:
+            pytest.skip("could not allocate the large index buffer")
+
+        pool = MockDSATokenToKVPool(
+            page_size=page_size, index_head_dim=index_head_dim, device=device
+        )
+        expected_k = torch.arange(
+            1, index_head_dim + 1, dtype=torch.uint8, device=device
+        )
+        expected_s = torch.tensor([17, 34, 51, 68], dtype=torch.uint8, device=device)
+
+        # Make every pre-fix wrapped read deterministic and different from the
+        # marker stored at the real high page.
+        flat_buf = buf.flatten()
+        flat_buf[
+            wrapped_base_offset : wrapped_base_offset + buf_numel_per_page
+        ].zero_()
+        buf[wrap_page, :index_head_dim].copy_(expected_k)
+        s_offset_in_page = page_size * index_head_dim
+        buf[wrap_page, s_offset_in_page : s_offset_in_page + 4].copy_(expected_s)
+
+        page_indices = torch.tensor([wrap_page], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([1], dtype=torch.int64, device=device)
+
+        k_torch = GetK.torch_fast(pool, buf, 1, page_indices)
+        s_torch = GetS.torch_fast(pool, buf, 1, page_indices)
+        k_triton = GetK.triton(pool, buf, 1, page_indices)
+        s_triton = GetS.triton(pool, buf, 1, page_indices)
+        k_fused, s_fused = GetKAndS.triton(
+            pool, buf, page_indices.unsqueeze(0), seq_lens, 1, 1
+        )
+
+        for actual_k in (k_torch, k_triton, k_fused):
+            torch.testing.assert_close(actual_k[0], expected_k, rtol=0, atol=0)
+        for actual_s in (s_torch, s_triton, s_fused):
+            torch.testing.assert_close(actual_s[0], expected_s, rtol=0, atol=0)
+
     def test_large_seq_len(self):
         """Test with large sequence length."""
         device = torch.device("cuda")
