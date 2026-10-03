@@ -33,6 +33,8 @@ class StreamChoice(msgspec.Struct):
     logprobs: Optional[dict] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
+    response_token_ids: Union[List[int], msgspec.UnsetType] = msgspec.UNSET
+    prompt_token_ids: Union[List[int], msgspec.UnsetType] = msgspec.UNSET
 
 
 class StreamChunk(msgspec.Struct, omit_defaults=True):
@@ -61,6 +63,8 @@ def build_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    response_token_ids: Optional[List[int]] = None,
+    prompt_token_ids: Optional[List[int]] = None,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -76,6 +80,8 @@ def build_sse_content(
         logprobs: Log probabilities if requested
         matched_stop: Stop token/string that was matched
         usage: Token usage statistics
+        response_token_ids: Output token ID delta for this choice
+        prompt_token_ids: Prompt token IDs, usually only on the first chunk
 
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
@@ -87,6 +93,12 @@ def build_sse_content(
         logprobs=logprobs,
         finish_reason=finish_reason,
         matched_stop=matched_stop,
+        response_token_ids=(
+            response_token_ids if response_token_ids is not None else msgspec.UNSET
+        ),
+        prompt_token_ids=(
+            prompt_token_ids if prompt_token_ids is not None else msgspec.UNSET
+        ),
     )
     chunk = StreamChunk(
         id=chunk_id,
