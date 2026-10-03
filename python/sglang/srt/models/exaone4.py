@@ -435,7 +435,7 @@ class Exaone4ForCausalLM(nn.Module):
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Exaone-4.0 32B set tie_word_embeddins to False
         # Exaone-4.0 1.2B set tie_word_embeddins to True
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings and self.pp_group.world_size == 1:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
@@ -575,6 +575,15 @@ class Exaone4ForCausalLM(nn.Module):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            if (
+                name == "model.embed_tokens.weight"
+                and self.config.tie_word_embeddings
+                and self.pp_group.world_size > 1
+            ):
+                if self.pp_group.is_last_rank:
+                    name = "lm_head.weight"
+                elif not self.pp_group.is_first_rank:
+                    continue
             # Handle FP8 kv-scale remapping
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)

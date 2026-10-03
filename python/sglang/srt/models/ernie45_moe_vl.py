@@ -25,7 +25,6 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -479,7 +478,6 @@ class Ernie4_5_VLMoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
