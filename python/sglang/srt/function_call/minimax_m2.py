@@ -521,3 +521,15 @@ class MinimaxM2Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def finish(self, tools):
+        normal = ""
+        if self._buf:
+            leftover = self._buf
+            if leftover.strip() == self.tool_call_end_token:
+                # A trailing closing tag is syntax residue, not user text.
+                self._buf = ""
+            else:
+                normal = leftover
+                self._buf = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
