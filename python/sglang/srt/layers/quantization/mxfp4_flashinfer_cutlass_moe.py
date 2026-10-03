@@ -87,6 +87,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         self.moe_runner_config = moe_runner_config
+        # The fused func reads the layer's MoE placement off the config.
+        if moe_runner_config.layer is None:
+            moe_runner_config.layer = layer
 
         E = layer.num_local_experts
         device = layer.w13_weight.device

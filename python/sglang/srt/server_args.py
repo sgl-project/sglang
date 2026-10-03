@@ -265,9 +265,12 @@ class ServerArgs:
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
 
-        One exception: the deprecated `enable_dp_attention` reports whether
-        attention DP runs, as it did before `--attn-dp-size`, for clients that
-        still read it from `/server_info`. Resolution leaves the field false.
+        One exception: the deprecated `enable_dp_attention` reports whether an
+        attention-DP width was configured, for clients that still read it from
+        `/server_info`. Resolution leaves the field false. It reports the width
+        rather than `attn_dp_enabled`, whose elastic scale-joiner arm is true at
+        width one: a dump carrying that would fold the joiner's replicas into
+        attention-DP groups when it is read back.
         """
 
         resolved = {
@@ -275,7 +278,7 @@ class ServerArgs:
             for field in record_fields(type(self))
         }
         # TODO: drop together with `--enable-dp-attention` after 2026-12-31.
-        resolved["enable_dp_attention"] = attn_dp_enabled_of(resolving_view(self))
+        resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
         return resolved
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (

@@ -135,6 +135,23 @@ class TestAttnDpSize(CustomTestCase):
                 )
                 self.assertEqual(self.layout(again), self.layout(server_args))
 
+    def test_the_readback_reports_the_width_not_the_joiner_arm(self):
+        """`attn_dp_enabled` is also true for an elastic scale joiner at width
+        one. The readback reports the configured width instead, so a joiner's
+        replicas are not folded into attention-DP groups when it is read back."""
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.runtime_context import attn_dp_enabled_of
+
+        joiner = ServerArgs(
+            model_path="dummy", tp_size=2, dp_size=2, ep_join_mode="scale"
+        )
+        joiner.resolve_once()
+        self.assertTrue(attn_dp_enabled_of(resolving_view(joiner)))
+        readback = joiner.resolved_dict()
+        self.assertFalse(readback["enable_dp_attention"])
+        self.assertEqual(readback["dp_size"], 2)
+        self.assertEqual(readback["attn_dp_size"], 1)
+
     def test_both_cli_spellings_parse(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
