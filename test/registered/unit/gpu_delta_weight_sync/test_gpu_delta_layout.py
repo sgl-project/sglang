@@ -119,6 +119,13 @@ class TestCanonicalPlanCache(unittest.TestCase):
             entry["frames"] = [{"new": "per-publication payload geometry"}]
         _, reused = layout._qualify_canonical_plan(backend, updated)
         self.assertTrue(reused)
+        # The normalized-order fast comparison and the reordered projection
+        # admit the same views; unrelated view metadata is not part of the plan.
+        reordered = copy.deepcopy(updated)
+        for entry in reordered["tensors"]:
+            entry["views"].reverse()
+            entry["views"][0]["description"] = "not a canonical field"
+        self.assertTrue(layout._qualify_canonical_plan(backend, reordered)[1])
         # Even a foreign expert's static definition is bound by the original
         # global plan. Reusing its digest cannot authorize a changed definition.
         mutations = {
@@ -132,6 +139,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
             "view_slice": lambda p: p["tensors"][1]["views"][0]["slices"][
                 0
             ].__setitem__(1, 1),
+            "missing_local": lambda p: p["tensors"].pop(0),
             "missing_foreign": lambda p: p["tensors"].pop(),
             "duplicate": lambda p: p["tensors"].append(p["tensors"][0]),
             "digest": lambda p: p.update(plan_digest="different"),
@@ -144,6 +152,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
                     layout._qualify_canonical_plan(backend, changed)
         # Mutating the original input cannot mutate the admitted cache itself.
         publication["tensors"][1]["views"][0]["slices"][0][1] = 1
+        publication["tensors"][0]["shape"][0] = 3
         with self.assertRaises(ValueError):
             layout._qualify_canonical_plan(backend, publication)
         self.assertTrue(layout._qualify_canonical_plan(backend, updated)[1])

@@ -27,6 +27,7 @@ import time
 import uuid
 from pathlib import Path
 
+import orjson
 from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 
 
@@ -121,7 +122,7 @@ def _reserve(directory, prefix, previous, size, metrics):
 
 def _write_record(directory, name, record):
     temporary = directory / (name + ".pending")
-    temporary.write_text(json.dumps(record, sort_keys=True))
+    temporary.write_bytes(orjson.dumps(record))
     temporary.replace(directory / (name + ".json"))
 
 
@@ -337,10 +338,10 @@ class HostArena:
             metrics["host_payload_cache_wait_s"] = time.perf_counter() - waiting
             index_path = directory / "index.json"
             previous = (
-                json.loads(index_path.read_bytes()) if index_path.exists() else None
+                orjson.loads(index_path.read_bytes()) if index_path.exists() else None
             )
             state = (
-                json.loads((directory / "state.json").read_bytes())
+                orjson.loads((directory / "state.json").read_bytes())
                 if previous
                 else None
             )
@@ -593,7 +594,7 @@ class HostDecodedSnapshot:
         # from the prior generation must never release newly prepared bytes.
         with (self.directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            state = json.loads((self.directory / "state.json").read_bytes())
+            state = orjson.loads((self.directory / "state.json").read_bytes())
             if state == {
                 "token": self.index["token"],
                 "state": "READY",

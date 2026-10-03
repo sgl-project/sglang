@@ -774,6 +774,16 @@ class _PreparedRawTensor:
     payload: torch.Tensor
 
 
+def _canonical_views(views):
+    return [
+        {"id": view_id, "slices": [list(pair) for pair in slices]}
+        for view_id, slices in sorted(
+            (view["id"], tuple(tuple(pair) for pair in view["slices"]))
+            for view in views
+        )
+    ]
+
+
 def _qualify_canonical_plan(backend, manifest):
     """Cache only qualified static definitions; payload geometry stays per-publication."""
     cached = getattr(backend, "_canonical_plan", None)
@@ -785,6 +795,21 @@ def _qualify_canonical_plan(backend, manifest):
         if name in entries:
             raise ValueError("duplicate canonical delta tensor")
         entries[name] = entry
+        if cached is not None:
+            definition = cached[1].get(name)
+            if definition is None or (
+                entry["dtype"] != definition[0]
+                or entry["shape"] != definition[1]
+                or entry["encoding"] != definition[2]
+                or entry["nbytes"] != definition[3]
+                or entry.get("byte_order") != definition[4]
+                or (
+                    entry["views"] != definition[5]
+                    and _canonical_views(entry["views"]) != definition[5]
+                )
+            ):
+                raise ValueError(f"canonical delta definition changed: {name}")
+            continue
         if name not in backend.layout.inventory or backend.layout.excluded.get(
             name
         ) not in {None, "expert owned by another EP rank"}:
@@ -802,36 +827,24 @@ def _qualify_canonical_plan(backend, manifest):
             "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
         ):
             raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
-        views = tuple(
-            sorted(
-                (view["id"], tuple(tuple(pair) for pair in view["slices"]))
-                for view in entry["views"]
-            )
-        )
         signature = (
             entry["dtype"],
-            tuple(entry["shape"]),
+            list(entry["shape"]),
             entry["encoding"],
             entry["nbytes"],
             entry["byte_order"],
-            views,
+            _canonical_views(entry["views"]),
         )
-        if cached is not None:
-            if cached[1].get(name) != signature:
-                raise ValueError(f"canonical delta definition changed: {name}")
-        else:
-            signatures[name] = signature
-            definitions.append(
-                {
-                    "name": name,
-                    "dtype": signature[0],
-                    "shape": signature[1],
-                    "encoding": signature[2],
-                    "views": [
-                        {"id": view_id, "slices": slices} for view_id, slices in views
-                    ],
-                }
-            )
+        signatures[name] = signature
+        definitions.append(
+            {
+                "name": name,
+                "dtype": signature[0],
+                "shape": signature[1],
+                "encoding": signature[2],
+                "views": signature[5],
+            }
+        )
     if not {binding.name for binding in backend.layout.bindings} <= entries.keys():
         raise ValueError("publication omits an admitted mutable tensor")
     if cached is not None:
@@ -845,7 +858,8 @@ def _qualify_canonical_plan(backend, manifest):
             raise ValueError(
                 "publication does not match its negotiated canonical view plan"
             )
-        # Tuples hold only static metadata, never old frames, payloads or the manifest.
+        # Detached static lists permit direct warm equality without rebuilding
+        # nested signatures. No frames, payloads or manifest objects are retained.
         backend._canonical_plan = manifest["plan_digest"], signatures
     return entries, cached is not None
 

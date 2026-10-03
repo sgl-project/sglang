@@ -130,6 +130,12 @@ Miles negotiates the canonical tensor-name union per cache ID and sends it in
 `host_tensor_names`. Each receiver requires its local names to be covered; foreign
 experts outside that union are not decoded.
 
+Each rank qualifies the canonical tensor/view plan once and retains only detached
+static definitions. Later publications compare every static field directly;
+reordered views use the same canonical normalization. Frames and payloads remain
+publication-specific. Private arena index/state records use `orjson`; atomic
+replacement and canonical namespace/publication digests are unchanged.
+
 One creator per engine-host validates all publication frame metadata, including
 foreign experts, then copies owner files into retained tmpfs mappings and checks source
 identity/extent across the read. One dedicated worker SHA-256 checks those exact
@@ -204,7 +210,7 @@ SHA duration to decode wall time. Followers report zero work for these counters.
 were already qualified. Every publication still authenticates its manifest and
 checks names, shapes, dtypes, encodings, byte counts and rank views against the
 admitted plan, then validates all changing payload/frame extents. The cache holds
-only static tuples, not an old manifest or payload.
+only detached static definitions, not an old manifest or payload.
 
 Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
 (including raw copies). `host_outer_zstd_validate_s` and
