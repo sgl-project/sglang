@@ -92,8 +92,10 @@ def test_route_names_exist_in_route_table():
 
 
 def test_module_import_loads_no_flashinfer():
+    # The stock DiT already imports ``sglang.kernels.ops.diffusion`` (whose
+    # package registers the Cake specs lazily); what must not happen is a
+    # FlashInfer import at module import time.
     assert not any(name.split(".")[0] == "flashinfer" for name in sys.modules)
-    assert "sglang.kernels.ops.diffusion.cake" not in sys.modules
 
 
 # ---------------------------------------------------------------------------

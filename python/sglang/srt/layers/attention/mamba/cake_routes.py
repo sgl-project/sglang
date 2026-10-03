@@ -11,8 +11,9 @@ take the Cake KernelSpecs registered in ``sglang.kernels.ops.mamba.cake``:
 Each dispatcher below receives the stock kernel and *exactly* the keyword
 arguments the mixer passes to it today.  With the route off, or when the
 adapter admission rejects the real tensors, the stock kernel is called with
-those arguments unchanged.  The first "taken" and the first "fallback" per
-route are logged so an e2e run can prove which kernel executed.
+those arguments unchanged.  The first "taken" and the first "fallback" of each
+distinct reason per route are logged so an e2e run can prove which kernel
+executed and why a batch did not take the Cake kernel.
 
 FlashInfer contract constraints that shape the wiring (see the adapter
 :mod:`sglang.kernels.cake_kernels.mamba` for the full list):
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from typing import Callable, Optional, Sequence
 
 import torch
@@ -64,8 +66,17 @@ SSD_HEADDIM = 64
 SSD_DSTATE = 128
 _CAKE_LOG_PREFIX = "[cake-route]"
 
-# (route, event) pairs already logged; keeps the per-call path free of I/O.
-_cake_route_logged: set[tuple[str, str]] = set()
+# (route, event, reason kind) triples already logged; keeps the per-call path
+# free of I/O while still naming every distinct fallback reason once.
+_cake_route_logged: set[tuple[str, str, str]] = set()
+
+
+def _reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
 # Shape keys FlashInfer rejected with NotImplementedError; skipped afterwards.
 _cake_route_rejected: set[tuple] = set()
 # SSU shape keys admitted (and run) eagerly; only these are routed under capture.
@@ -79,7 +90,7 @@ _zero_states: dict[tuple, torch.Tensor] = {}
 
 
 def _log_cake_route_once(route: str, event: str, detail: str) -> None:
-    key = (route, event)
+    key = (route, event, _reason_kind(detail) if event == "fallback" else "")
     if key in _cake_route_logged:
         return
     _cake_route_logged.add(key)

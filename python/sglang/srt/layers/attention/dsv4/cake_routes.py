@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -52,8 +53,14 @@ _DSV4_HEAD_DIM = 512
 _cake_route_logged: set = set()
 
 
+def _reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
 def _log_cake_route_once(site: str, event: str, detail: str) -> None:
-    key = (site, event)
+    key = (site, event, _reason_kind(detail) if event == "fallback" else "")
     if key in _cake_route_logged:
         return
     _cake_route_logged.add(key)
