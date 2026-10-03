@@ -8,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    _select_recurrent_launch_config,
+)
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
@@ -359,9 +362,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
+    BV, num_warps = _select_recurrent_launch_config(
+        n=B, h=H, hv=HV, k=K, v=V, is_kda=False, packed_decode=True
+    )
     num_stages = 3
-    num_warps = 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)

@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.offloader import get_offloader
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -226,6 +227,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     # Attached by quant methods for a quantized ParallelLMHead; see
     # LinearBase.scheme.
     scheme = None
+    host_weight_allowed = True
 
     def __init__(
         self,
@@ -342,6 +344,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+        if self.host_weight_allowed and self.tp_size == 1:
+            get_offloader().place_on_host(self.weight)
 
     @classmethod
     def _get_indices(
@@ -459,6 +463,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
+    def _embed_from_host(self, input_: torch.Tensor) -> torch.Tensor:
+        rows = torch.nn.functional.embedding(input_.long().cpu(), self.weight)
+        output = rows.to(input_.device)
+        if self.output_dtype is not None:
+            output = output.to(self.output_dtype)
+        return output
+
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
@@ -470,6 +481,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         symm_alloc = use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         )
+        if self.tp_size == 1 and self.weight.device != input_.device:
+            return self._embed_from_host(input_)
         if self.tp_size == 1:
             with symm_alloc:
                 output_parallel = self.quant_method.embedding(self, input_.long())
@@ -546,6 +559,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
     """
+
+    host_weight_allowed = False
 
     def __init__(
         self,
