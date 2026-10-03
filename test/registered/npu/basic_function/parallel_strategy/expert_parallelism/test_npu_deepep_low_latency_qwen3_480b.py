@@ -74,7 +74,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
 
     # MMLU Configs
     mmlu_num_examples = 8
-    accuracy_mmlu_threshold = 0.61  # MMLU accuracy ≥0.61
+    accuracy_mmlu = 0.61  # MMLU accuracy ≥0.61
 
     # GSM8K Configs
     accuracy = 0.91  # GSM8K accuracy ≥0.91
