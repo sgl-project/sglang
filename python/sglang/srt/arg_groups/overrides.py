@@ -71,6 +71,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_gfx1250_supported,
     xpu_has_xmx_support,
 )
 
@@ -1299,6 +1300,11 @@ def _page_size_default(view: Any) -> dict:
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
         return {"page_size": 64}
+    # gfx1250 decodes through aiter unified_attention, whose tile width equals
+    # the page size (wrong output at page_size=1); fp8 KV needs block_size >= 32.
+    if get_platform().is_hip and is_gfx1250_supported():
+        logger.info("Setting page_size=32 as default on gfx1250.")
+        return {"page_size": 32}
     if not get_platform().is_musa:
         return {"page_size": 1}
     return {"page_size": 64}
