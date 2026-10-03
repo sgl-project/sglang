@@ -127,7 +127,7 @@ class DeltaSession:
                 "identity": copy.deepcopy(self.identity),
                 "state": session.state,
                 "cohort_digest": hashlib.sha256(
-                    json.dumps(sorted(_identities(request["cohort"]))).encode()
+                    json.dumps(sorted(_identities(request["participants"]))).encode()
                 ).hexdigest(),
                 "message": session.message,
                 **{
@@ -183,12 +183,10 @@ class DeltaSession:
                     "delta session already leased or session identity already consumed"
                 )
             local = _identities(request["participants"])
-            _identities(request["cohort"])
             engine_id = self.identity["engine_id"]
-            cohort_local = _identities(
-                [item for item in request["cohort"] if item["engine_id"] == engine_id]
-            )
-            if _identity_key(self.identity) not in local or local != cohort_local:
+            if _identity_key(self.identity) not in local or any(
+                item["engine_id"] != engine_id for item in request["participants"]
+            ):
                 raise ValueError(
                     "prepare does not bind this original engine's complete participants"
                 )
@@ -261,7 +259,7 @@ class DeltaSession:
             return self.status(session_id)
 
     def _validate_applied(self, session: _Session, receipts: list[dict]) -> None:
-        expected = _identities(session.request["cohort"])
+        expected = _identities(session.request["participants"])
         actual = _identities([receipt["identity"] for receipt in receipts])
         if actual != expected:
             raise ValueError(
@@ -304,7 +302,7 @@ class DeltaSession:
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
-            # it before the next prepare. Only global APPLIED resume releases.
+            # it before the next prepare. Only this engine's APPLIED proof releases.
             self._executor.submit(prepared.release_and_close)
             return self.status(session_id)
 
@@ -322,7 +320,7 @@ class DeltaSession:
             session = self._get(session_id)
             if session.state not in {"PREPARING", "PREPARED", "FAILED", "ABORTED"}:
                 raise ValueError(
-                    f"cannot abort {session.state}; keep all engines paused"
+                    f"cannot abort {session.state}; keep this engine paused"
                 )
             session.state = "ABORTED"
             if session.prepared is not None:
@@ -407,7 +405,7 @@ class GpuDeltaSchedulerControl:
                 "engine_id": engine_id,
                 "rank_id": uuid.uuid4().hex,
                 "hostname": socket.gethostname(),
-                "host_cache_id": host_cache_id(),
+                "host_cache_id": host_cache_id(engine_id),
                 "pid": os.getpid(),
                 "start_ticks": start_ticks,
                 "tp_rank": parallel.tp_rank,
@@ -462,7 +460,6 @@ class GpuDeltaSchedulerControl:
                             "target_version",
                             "plan_digest",
                             "participants",
-                            "cohort",
                             "host_tensor_names",
                         )
                     }

@@ -62,9 +62,11 @@ original rank reports `PREPARED`, Miles fans out
 `update_weights_from_delta`. Each local handler closes generation admission,
 pauses scheduling, fences existing readers, retracts requests, flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
-checks. Miles waits for all original ranks to apply, then sends
-`resume_weights_from_delta` with their compact apply receipts. Resume records the
-new version and reopens generation after successful local acknowledgments.
+checks. Miles waits for each engine's original ranks to apply, then sends that
+engine `resume_weights_from_delta` with its compact apply receipts. Independent
+engines prepare, apply and resume separately; the trainer waits for all engines
+before advancing its update baseline. Resume records the new version and reopens
+generation after successful local acknowledgments.
 
 Layout admission caches physical scale destinations and BF16 MLA/FP32 scale source
 views. Aligned NVFP4 blockscales apply canonical bytes through strided destination
@@ -107,30 +109,36 @@ registers each process's mapping for CUDA, then streams tensor Snappy bytes for
 hardware decoding and in-place apply.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
-`WEIGHT_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32). The host cache creator
-uses that many reusable CPU workers, each with its own Zstd context; other ranks
-attach to its completed arena. The count is total active decode workers per
-host publication, including two EP4 engines sharing the same cache, plus one
-independent SHA worker. Workers touch only CPU buffers; CUDA setup remains on each
-rank's original preparation thread.
+`WEIGHT_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
+One creator uses that many reusable CPU workers, each with its own Zstd context;
+its other ranks attach to the completed arena. Natural tensors are grouped into
+at most four times as many tasks as workers, preserving strict per-frame checks
+and direct writes into the shared arena. Two EP4 engines therefore use two
+independent pools: up to 64 decode workers plus two SHA workers on that host.
+Workers touch only CPU buffers; CUDA setup remains on each rank's original
+preparation thread.
 
 `WEIGHT_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
 must be a private, user-owned directory on tmpfs with enough space for the wrapped
-payloads and expanded host arena during construction. Every engine on the same
-physical host must see the same directory and IPC/mount namespace; across
-containers, explicitly mount the same host tmpfs there. Container hostname is not
-used to infer sharing. A durable cache-root UUID is advertised as `host_cache_id`.
+payloads and expanded arenas during construction. Ranks of one engine on the
+same physical host must see the same directory and IPC/mount namespace; across
+containers, explicitly mount the same host tmpfs there. Engine IDs select separate
+subdirectories and advertised `host_cache_id` values. Independent engines
+deliberately duplicate CPU buffers and work; they share no build locks or release
+lifecycle. Container hostname is not used to infer sharing.
 Miles negotiates the canonical tensor-name union per cache ID and sends it in
 `host_tensor_names`. Each receiver requires its local names to be covered; foreign
 experts outside that union are not decoded.
 
-One creator copies owner files into retained tmpfs mappings and checks source
+One creator per engine-host validates all publication frame metadata, including
+foreign experts, then copies owner files into retained tmpfs mappings and checks source
 identity/extent across the read. One dedicated worker SHA-256 checks those exact
 retained bytes while CPU workers decode independent canonical tensors directly
 into one shared Snappy arena; raw targets are copied beside them. No second
 payload read, full decoded temporary or per-rank Snappy copy is needed.
-Aliased bindings and a second engine reuse the same physical bytes. The namespace
-binds the original cohort, delta stream and host tensor union; publication metadata
+Aliased bindings and ranks within that engine reuse the same physical bytes. The
+namespace and its build/release mutex bind the original engine participants, delta
+stream and host tensor union; publication metadata
 binds the canonical manifest path, digest, session and versions. READY is published
 only after SHA verification, every decode task and exact chunk/window/output
 check passes. Hash and decode are both joined on failure before ownership is
@@ -145,8 +153,9 @@ physical pages through its own VA; there is no full per-rank Snappy copy. CUDA
 registration/unregistration runs outside the host build mutex. Torch's pinned
 allocator does not own this external memory.
 
-Only successful resume with the complete original APPLIED certificate authorizes
-reuse: all original ranks have finished H2D and their update-stream fences. The
+Only successful resume with the complete original engine APPLIED certificate
+authorizes reuse: that engine's ranks have finished H2D and their update-stream
+fences. Another engine's state does not authorize or block this release. The
 session queues generation-specific release and view cleanup on its existing FIFO
 executor, off the scheduler thread and ahead of the next local prepare. Local
 apply, abort, failure and ordinary close cannot release a shared generation. A
@@ -236,7 +245,7 @@ Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
 The paired Miles feature contains `tests/manual/bench_gpu_delta.py`, which launches
-one EP8 engine and measures the snappy-zstd contract using persistent
+one EP8 or two EP4 engines and measures the snappy-zstd contract using persistent
 altered checkpoint and publications. `WEIGHT_DELTA_TIMING=1` enables
 phase events without synchronizing every tensor; correctness comparisons stay
 outside timed updates.
@@ -244,7 +253,8 @@ outside timed updates.
 Each original-rank receipt includes `scheduler_timing` on that process's
 `monotonic_ns` clock. `blocked_s` runs from the scheduler's pause flag, before
 the existing reader fence, until its resume clears that flag. It includes
-retraction, cache flush, apply and the wait for cohort apply acknowledgments; it excludes
+retraction, cache flush, apply and the wait for its own engine ranks to acknowledge
+apply; it excludes
 background preparation and post-resume cleanup. Open or failed intervals retain
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures

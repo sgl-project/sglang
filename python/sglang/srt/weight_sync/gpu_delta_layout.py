@@ -730,7 +730,7 @@ class GpuDeltaBackend:
         from sglang.srt.weight_sync.gpu_delta_host import HostArena
 
         self.outer_pool = OuterZstdPool(configured_cpu_workers())
-        self.host_arena = HostArena()
+        self.host_arena = HostArena(identity["engine_id"])
 
     def describe(self):
         self.layout.check_identity()
@@ -859,10 +859,7 @@ class PreparedDelta:
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
-        from sglang.srt.weight_sync.gpu_delta_payload import (
-            validate_codec,
-            validate_outer_entries,
-        )
+        from sglang.srt.weight_sync.gpu_delta_payload import validate_codec
 
         self.backend = backend
         self.device = backend.device
@@ -907,13 +904,6 @@ class PreparedDelta:
             raise ValueError(
                 "host tensor union does not cover the admitted local tensors"
             )
-        frames_started = time.perf_counter()
-        validate_outer_entries(
-            self._entries.values(),
-            {record["name"]: record["nbytes"] for record in manifest["files"]},
-            manifest["frame_bytes"],
-        )
-        self.timings["host_frames_validate_s"] = time.perf_counter() - frames_started
         payload_started = time.perf_counter()
         self.host_snapshot = backend.host_arena.prepare(
             path,
@@ -1176,7 +1166,7 @@ class PreparedDelta:
             binding.xor(torch.where(self.error == 0, unit.payload, 0))
 
     def release_and_close(self):
-        # Queued only after successful resume with every original APPLIED proof.
+        # Queued only after resume with every original engine rank's APPLIED proof.
         # Ordinary abort/error close must never authorize a shared overwrite.
         try:
             self.host_snapshot.mark_reusable()

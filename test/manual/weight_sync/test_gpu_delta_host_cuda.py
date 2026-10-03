@@ -1,4 +1,4 @@
-"""Two independent CUDA processes consume one host-shared decoded arena.
+"""Two engines each share one pinned arena between two independent CUDA ranks.
 
 Manual-only: Linux shared tmpfs, two CUDA GPUs, Torch and zstandard are required.
 The test barriers coordinate the oracle only; production preparation has no
@@ -37,7 +37,16 @@ def _publication(directory, version, repeat):
             "encoding": "raw_bytes" if name == "raw" else "xor_bytes",
             "nbytes": len(value),
             "changed_bytes": len(value),
-            "frames": [] if name == "raw" else [{}],
+            "frames": []
+            if name == "raw"
+            else [
+                {
+                    "encoded_offset": 0,
+                    "encoded_bytes": len(value),
+                    "decoded_offset": 0,
+                    "decoded_bytes": len(value),
+                }
+            ],
         }
         if name == "raw":
             entry["raw"] = {
@@ -63,6 +72,7 @@ def _publication(directory, version, repeat):
         entries.append(entry)
     (directory / "owner.bin").write_bytes(blob)
     manifest = {
+        "frame_bytes": 1 << 20,
         "files": [
             {
                 "name": "owner.bin",
@@ -77,7 +87,7 @@ def _publication(directory, version, repeat):
     return path, hashlib.sha256(path.read_bytes()).hexdigest(), expected
 
 
-def _consumer(rank, workers, publications, cache, barrier, output):
+def _consumer(rank, engine, workers, publications, cache, barrier, output):
     import torch
     from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
@@ -86,20 +96,23 @@ def _consumer(rank, workers, publications, cache, barrier, output):
     # Exercise the exact capacity-growth algorithm with small oracle tensors.
     # Production's coarser alignment is not a wire/codec requirement.
     host._CAPACITY_ALIGNMENT = 1 << 20
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
-    pool, arena = OuterZstdPool(workers), host.HostArena()
+    torch.cuda.set_device(rank % 2)
+    device = torch.device("cuda", rank % 2)
+    pool, arena = OuterZstdPool(workers), host.HostArena(engine)
     stream = torch.cuda.Stream(device=device)
     records = []
     try:
-        identity = host.host_cache_id()
+        identity = host.host_cache_id(engine)
         for version, (path, digest, expected) in enumerate(publications, 1):
             metadata = dict(
                 stream_id="native-shared-stream",
                 session_id=f"update-{version}",
                 base_version=version - 1,
                 target_version=version,
-                cohort=[{"engine_id": "a"}, {"engine_id": "b"}],
+                participants=[
+                    {"engine_id": engine, "rank": 0},
+                    {"engine_id": engine, "rank": 1},
+                ],
             )
             barrier.wait(timeout=90)
             metrics = {}
@@ -127,7 +140,7 @@ def _consumer(rank, workers, publications, cache, barrier, output):
                     record["offset"] : record["offset"] + record["nbytes"]
                 ]
                 assert bytes(actual.numpy()) == value
-            # Substitute the production all-original APPLIED certificate with
+            # Substitute the production all-original-engine-rank APPLIED certificate with
             # an explicit two-process completion barrier in this isolated oracle.
             barrier.wait(timeout=90)
             snapshot.mark_reusable()
@@ -147,7 +160,9 @@ def _consumer(rank, workers, publications, cache, barrier, output):
         stream.synchronize()
         arena.close()
         assert not arena.registered and arena.mapping is None
-        output.put(dict(rank=rank, updates=records, final_unregistered=True))
+        output.put(
+            dict(rank=rank, engine_id=engine, updates=records, final_unregistered=True)
+        )
     finally:
         stream.synchronize()
         arena.close()
@@ -167,20 +182,21 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
             version_dir.mkdir()
             path, digest, expected = _publication(version_dir, version, repeat)
             publications.append((str(path), digest, expected))
-        barrier, output = context.Barrier(2), context.Queue()
+        barriers, output = [context.Barrier(2), context.Barrier(2)], context.Queue()
         processes = [
             context.Process(
                 target=_consumer,
                 args=(
                     rank,
+                    f"engine-{rank // 2}",
                     workers,
                     publications,
                     str(root / "cache"),
-                    barrier,
+                    barriers[rank // 2],
                     output,
                 ),
             )
-            for rank in range(2)
+            for rank in range(4)
         ]
         try:
             for process in processes:
@@ -194,26 +210,45 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=15)
-        for version in range(3):
-            rows = [record["updates"][version] for record in records]
-            assert rows[0]["arena_identity"] == rows[1]["arena_identity"]
-            assert (
-                sum(row["metrics"]["host_payload_cache_created"] for row in rows) == 1
-            )
-            assert sum(row["metrics"]["host_payload_hash_files"] for row in rows) == 1
-            assert sum(row["metrics"]["host_outer_zstd_tensors"] for row in rows) == 8
-            assert sum(
-                row["metrics"]["host_shared_allocation_calls"] for row in rows
-            ) == (0 if version == 1 else 1)
-            assert all(
-                row["metrics"]["host_shared_register_calls"]
-                == (0 if version == 1 else 1)
-                for row in rows
-            )
-            assert all(
-                row["metrics"]["host_shared_registration_reused"] == int(version == 1)
-                for row in rows
-            )
+        for engine in ("engine-0", "engine-1"):
+            engine_records = [
+                record for record in records if record["engine_id"] == engine
+            ]
+            assert len(engine_records) == 2
+            for version in range(3):
+                rows = [record["updates"][version] for record in engine_records]
+                assert rows[0]["arena_identity"] == rows[1]["arena_identity"]
+                assert (
+                    sum(row["metrics"]["host_payload_cache_created"] for row in rows)
+                    == 1
+                )
+                assert (
+                    sum(row["metrics"]["host_payload_hash_files"] for row in rows) == 1
+                )
+                assert (
+                    sum(row["metrics"]["host_frames_validations"] for row in rows) == 1
+                )
+                assert (
+                    sum(row["metrics"]["host_outer_zstd_tensors"] for row in rows) == 8
+                )
+                assert sum(
+                    row["metrics"]["host_shared_allocation_calls"] for row in rows
+                ) == (0 if version == 1 else 1)
+                assert all(
+                    row["metrics"]["host_shared_register_calls"]
+                    == (0 if version == 1 else 1)
+                    for row in rows
+                )
+                assert all(
+                    row["metrics"]["host_shared_registration_reused"]
+                    == int(version == 1)
+                    for row in rows
+                )
+        assert len({record["updates"][0]["host_cache_id"] for record in records}) == 2
+        assert (
+            len({tuple(record["updates"][0]["arena_identity"]) for record in records})
+            == 2
+        )
         for record in records:
             a, b, c = record["updates"]
             assert a["arena_identity"] == b["arena_identity"] != c["arena_identity"]
@@ -235,6 +270,7 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
                     status="PASS",
                     cpu_workers=workers,
                     logical_engines=2,
+                    ranks_per_engine=2,
                     updates=3,
                     records=records,
                 ),

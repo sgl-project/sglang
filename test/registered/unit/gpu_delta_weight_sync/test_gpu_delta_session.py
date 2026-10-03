@@ -66,8 +66,7 @@ def identity(engine="a", rank=0):
     )
 
 
-def request(participants, cohort=None):
-    cohort = cohort or participants
+def request(participants):
     return dict(
         session_id="publication-1",
         manifest_path="/immutable/manifest.json",
@@ -77,7 +76,6 @@ def request(participants, cohort=None):
         target_version=1,
         plan_digest="b" * 64,
         participants=participants,
-        cohort=cohort,
     )
 
 
@@ -131,7 +129,7 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     assert not backend.payload.released.is_set()
 
 
-def test_global_release_runs_off_scheduler_and_before_next_prepare(make_session):
+def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session):
     session, backend = make_session()
     receipt = applied(session, backend)
     entered, release = threading.Event(), threading.Event()
@@ -203,12 +201,12 @@ def test_repeated_apply_or_prepare_never_replays_xor(make_session):
 
 
 def test_exact_original_applied_cohort_required_before_resume(make_session):
-    ids = [identity("a"), identity("b")]
+    ids = [identity("a", 0), identity("a", 1)]
     sessions = [make_session(who) for who in ids]
     first, backend = sessions[0]
-    first_receipt = applied(first, backend, request([ids[0]], ids))
+    first_receipt = applied(first, backend, request(ids))
     second, backend = sessions[1]
-    prepare_ready(second, backend, request([ids[1]], ids))
+    prepare_ready(second, backend, request(ids))
     with pytest.raises(ValueError, match="every original rank"):
         first.resume(
             "publication-1",
@@ -243,6 +241,24 @@ def test_exact_original_applied_cohort_required_before_resume(make_session):
         assert not session.leased and session.version == 1
     assert resumed == [1, 1]
     assert all(backend.payload.released.wait(2) for _, backend in sessions)
+
+
+def test_engine_resume_is_independent_and_cannot_bind_foreign_ranks(make_session):
+    first, first_backend = make_session(identity("a"))
+    second, second_backend = make_session(identity("b"))
+    with pytest.raises(ValueError, match="complete participants"):
+        first.prepare(request([first.identity, second.identity]))
+    assert not first_backend.started.is_set()
+    second.prepare(request([second.identity]))
+    assert second_backend.started.wait(2)
+    receipt = applied(first, first_backend)
+    assert (
+        first.resume("publication-1", [receipt["certificate"]], lambda _: None)["state"]
+        == "RESUMED"
+    )
+    assert first_backend.payload.released.wait(2)
+    assert second.status("publication-1")["state"] == "PREPARING"
+    assert second.leased and not second_backend.payload.released.is_set()
 
 
 @pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])

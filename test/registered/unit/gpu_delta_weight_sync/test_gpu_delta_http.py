@@ -69,7 +69,6 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "target_version": 1,
                 "plan_digest": "b" * 64,
                 "participants": [],
-                "cohort": [],
                 "host_tensor_names": {"host": []},
             },
         ),

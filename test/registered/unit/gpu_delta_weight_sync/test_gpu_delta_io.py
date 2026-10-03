@@ -171,7 +171,6 @@ def test_prepare_uses_scheduler_updater_session_and_offload_state(
         target_version=1,
         plan_digest="b" * 64,
         participants=[who],
-        cohort=[who],
         host_tensor_names={"host": []},
     )
     result = control.handle(request)

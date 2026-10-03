@@ -87,7 +87,6 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch, fail_fenc
                 target_version=1,
                 plan_digest="b" * 64,
                 participants=[who],
-                cohort=[who],
             )
         )
         deadline = time.monotonic() + 2

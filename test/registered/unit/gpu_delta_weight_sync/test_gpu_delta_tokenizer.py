@@ -133,7 +133,6 @@ def test_prepare_ownership_survives_failed_send(control):
             target_version=1,
             plan_digest="b" * 64,
             participants=facade.participants,
-            cohort=facade.participants,
             host_tensor_names={"host": []},
         )
         with pytest.raises(OSError):

@@ -39,13 +39,13 @@ def cpu_host_snapshot(backend, metadata, directory):
     from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 
-    backend.identity = {"host_cache_id": "cpu-host"}
+    backend.identity = {"engine_id": "cpu-engine", "host_cache_id": "cpu-host"}
     metadata["host_tensor_names"] = {
         "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
     }
     backend.outer_pool = OuterZstdPool(2)
-    backend.host_arena = host.HostArena()
-    metadata.update(session_id="cpu-1", cohort=[backend.identity])
+    backend.host_arena = host.HostArena("cpu-engine")
+    metadata.update(session_id="cpu-1", participants=[backend.identity])
     cache = Path(directory) / "cache"
     cache.mkdir()
 
@@ -58,7 +58,7 @@ def cpu_host_snapshot(backend, metadata, directory):
 
     try:
         with (
-            patch.object(host, "_cache_root", return_value=cache),
+            patch.object(host, "_cache_base", return_value=cache),
             patch.object(
                 os,
                 "posix_fallocate",
@@ -831,7 +831,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         ),
                     )
                     self.assertEqual(prepared.encoded.data_ptr(), pointer)
-                # A global-proof release permits the next immutable publication;
+                # An engine-proof release permits the next immutable publication;
                 # its corrupt payload must still fail before model writes.
                 prepared.host_snapshot.mark_reusable()
                 prepared.host_snapshot.close()
@@ -878,13 +878,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             ) as read_inventory,
             patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "snappy-zstd"}),
         ):
-            backend = layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
+            backend = layout.GpuDeltaBackend(
+                SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
+            )
             with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
                 self.assertEqual(backend.describe()["codec"], "snappy-zstd")
                 backend.describe()
                 read_inventory.assert_called_once()
                 with self.assertRaisesRegex(ValueError, "WEIGHT_DELTA_CODEC"):
-                    layout.GpuDeltaBackend(SimpleNamespace(model=fake_model), {})
+                    layout.GpuDeltaBackend(
+                        SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
+                    )
 
     def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
         root = torch.nn.Module()

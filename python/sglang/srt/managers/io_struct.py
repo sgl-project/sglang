@@ -1923,7 +1923,6 @@ class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     target_version: int
     plan_digest: str
     participants: List[Dict[str, Any]]
-    cohort: List[Dict[str, Any]]
     host_tensor_names: Dict[str, List[str]]
 
 

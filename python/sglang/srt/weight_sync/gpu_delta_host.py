@@ -11,10 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-local verified publication bytes with reusable CPU/CUDA-pinned capacity.
+"""Engine-local verified publication bytes with reusable CPU/CUDA-pinned capacity.
 
-All engines on a host must share this tmpfs directory. The namespace, rather than
-container hostname, defines sharing. No distributed or inference collectives run.
+Ranks of one engine on a host share a tmpfs arena. Separate engines use separate
+roots, locks and lifetimes; no distributed or inference collectives run.
 """
 
 import fcntl
@@ -27,8 +27,10 @@ import time
 import uuid
 from pathlib import Path
 
+from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 
-def _cache_root():
+
+def _cache_base():
     root = Path(
         os.environ.get(
             "WEIGHT_DELTA_HOST_CACHE_DIR", f"/dev/shm/sglang-gpu-delta-{os.getuid()}"
@@ -54,9 +56,17 @@ def _cache_root():
     return root
 
 
-def host_cache_id():
-    """A shared tmpfs root, not hostname, defines the physical sharing domain."""
-    root = _cache_root()
+def _cache_root(engine_id):
+    if not isinstance(engine_id, str) or not engine_id:
+        raise ValueError("GPU-delta host cache requires an engine identity")
+    root = _cache_base() / hashlib.sha256(engine_id.encode()).hexdigest()
+    root.mkdir(mode=0o700, exist_ok=True)
+    return root
+
+
+def host_cache_id(engine_id):
+    """An engine-scoped tmpfs root, not hostname, defines the sharing domain."""
+    root = _cache_root(engine_id)
     with (root / ".lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = root / ".host-id"
@@ -162,46 +172,68 @@ def _tensor_layout(entries):
     return layout, size
 
 
+_DECODE_METRICS = (
+    "host_outer_zstd_validate_s",
+    "host_outer_zstd_worker_decode_sum_s",
+    "host_outer_zstd_encoded_bytes",
+    "host_outer_zstd_decoded_bytes",
+    "host_outer_zstd_tensors",
+    "host_outer_zstd_frames",
+)
+
+
+def _decode_group(jobs, destination, files, pool):
+    metrics = {name: 0 for name in _DECODE_METRICS}
+    for entry, record in jobs:
+        outer = entry["outer"]
+        offset, length = outer["encoded_offset"], outer["encoded_bytes"]
+        start, count = record["offset"], record["nbytes"]
+        validate_s, decode_s = pool.decode(
+            files[outer["file"]][offset : offset + length],
+            outer["frames"],
+            destination[start : start + count],
+        )
+        metrics["host_outer_zstd_validate_s"] += validate_s
+        metrics["host_outer_zstd_worker_decode_sum_s"] += decode_s
+        metrics["host_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
+        metrics["host_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
+        metrics["host_outer_zstd_tensors"] += 1
+        metrics["host_outer_zstd_frames"] += len(outer["frames"])
+    return metrics
+
+
 def _decode_arena(destination, layout, files, entries, pool, metrics):
     started = time.perf_counter()
-    futures, error = [], None
+    jobs, futures, error = [], [], None
     try:
         for entry in entries:
             record = layout.get(entry["name"])
             if record is None:
                 continue
-            offset, count = record["offset"], record["nbytes"]
-            selected = destination[offset : offset + count]
             if entry["encoding"] == "raw_bytes":
                 raw = entry["raw"]
+                offset, count = record["offset"], record["nbytes"]
                 start = raw["encoded_offset"]
-                selected[:] = files[raw["file"]][start : start + count]
-                continue
-            outer = entry["outer"]
-            start, length = outer["encoded_offset"], outer["encoded_bytes"]
-            payload = files[outer["file"]][start : start + length]
+                destination[offset : offset + count] = files[raw["file"]][
+                    start : start + count
+                ]
+            else:
+                jobs.append((entry, record))
+        count = min(4 * pool.workers, len(jobs))
+        for index in range(count):
             futures.append(
-                (
-                    outer,
-                    pool.executor.submit(
-                        pool.decode, payload, outer["frames"], selected
-                    ),
+                pool.executor.submit(
+                    _decode_group, jobs[index::count], destination, files, pool
                 )
             )
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - drain submitted jobs before re-raise
         error = exc
-    # A failed task can retain mmap views in its traceback. Drain every task;
-    # keep the failed generation nonreusable rather than invalidating its views.
-    for outer, future in futures:
+    for future in futures:
         try:
-            validation_s, decode_s = future.result()
-            metrics["host_outer_zstd_validate_s"] += validation_s
-            metrics["host_outer_zstd_worker_decode_sum_s"] += decode_s
-            metrics["host_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
-            metrics["host_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
-            metrics["host_outer_zstd_tensors"] += 1
-            metrics["host_outer_zstd_frames"] += len(outer["frames"])
-        except BaseException as exc:
+            partial = future.result()
+            for key in _DECODE_METRICS:
+                metrics[key] += partial[key]
+        except BaseException as exc:  # noqa: BLE001 - drain peers before re-raise
             if error is None:
                 error = exc
     metrics["host_outer_zstd_decode_s"] = time.perf_counter() - started
@@ -212,12 +244,13 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
 class HostArena:
     """Backend-owned mapping and CUDA registration, retained across updates.
 
-    A namespace binds the original cohort, delta stream, and host tensor union.
-    Only a successful global-APPLIED resume releases a generation for overwrite.
+    A namespace binds the original engine ranks, delta stream and host tensor union.
+    Only a successful all-rank APPLIED resume releases a generation for overwrite.
     Abort/failure retains its bytes and cannot recycle the slot automatically.
     """
 
-    def __init__(self):
+    def __init__(self, engine_id):
+        self.engine_id = engine_id
         self.mapping = self.tensor = None
         self.registered = False
         self.identity = None
@@ -226,12 +259,13 @@ class HostArena:
     def prepare(
         self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
     ):
-        root = _cache_root()
+        root = _cache_root(self.engine_id)
         publication = Path(manifest_path).resolve(strict=True)
         namespace = {
             "stream_id": metadata["stream_id"],
-            "cohort": sorted(
-                metadata["cohort"], key=lambda value: json.dumps(value, sort_keys=True)
+            "participants": sorted(
+                metadata["participants"],
+                key=lambda value: json.dumps(value, sort_keys=True),
             ),
             "host_tensor_names": names,
         }
@@ -275,6 +309,8 @@ class HostArena:
                 "host_payload_hash_files",
                 "host_payload_cache_created",
                 "host_payload_cache_reused",
+                "host_frames_validate_s",
+                "host_frames_validations",
                 "host_outer_zstd_validate_s",
                 "host_outer_zstd_decode_s",
                 "host_outer_zstd_worker_decode_sum_s",
@@ -293,10 +329,12 @@ class HostArena:
         waiting = time.perf_counter()
         # The mutex covers CPU construction/attachment only. Per-process CUDA
         # registration and inference work never run while holding this mutex.
-        with (root / ".lock").open("a+b") as lock:
+        # Original participant identities also scope the lock: unrelated engine
+        # incarnations may reuse the same controller-assigned engine name.
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with (directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             metrics["host_payload_cache_wait_s"] = time.perf_counter() - waiting
-            directory.mkdir(mode=0o700, exist_ok=True)
             index_path = directory / "index.json"
             previous = (
                 json.loads(index_path.read_bytes()) if index_path.exists() else None
@@ -325,10 +363,21 @@ class HostArena:
                     != expected["base_version"]
                 ):
                     raise ValueError(
-                        "host arena requires prior global APPLIED release "
+                        "host arena requires prior engine APPLIED release "
                         "before overwrite"
                     )
                 build_started = time.perf_counter()
+                frames_started = time.perf_counter()
+                # READY certifies this exact immutable manifest for all local
+                # consumers. Validate every tensor, including foreign EP data,
+                # once before any arena sizing, allocation or payload access.
+                validate_outer_entries(
+                    manifest["tensors"],
+                    {name: record["nbytes"] for name, record in definitions.items()},
+                    manifest["frame_bytes"],
+                )
+                metrics["host_frames_validate_s"] = time.perf_counter() - frames_started
+                metrics["host_frames_validations"] = 1
                 entries_by_name = {
                     entry["name"]: entry for entry in manifest["tensors"]
                 }
@@ -475,7 +524,7 @@ class HostArena:
             host_outer_zstd_cpu_workers=index["cpu_workers"],
         )
         timings.update(metrics)
-        return HostDecodedSnapshot(self, root, index)
+        return HostDecodedSnapshot(self, index)
 
     def register(self, device, timings):
         import torch
@@ -531,8 +580,8 @@ class HostArena:
 class HostDecodedSnapshot:
     """One immutable publication's views over a backend-owned capacity arena."""
 
-    def __init__(self, arena, root, index):
-        self.arena, self.root, self.index = arena, root, index
+    def __init__(self, arena, index):
+        self.arena, self.index = arena, index
         self.directory = arena.directory
 
     def get(self, name):
@@ -540,9 +589,9 @@ class HostDecodedSnapshot:
         return self.arena.tensor[record["offset"] : record["offset"] + record["nbytes"]]
 
     def mark_reusable(self):
-        # Called only by queued successful global-resume cleanup. A late release
+        # Called only by queued successful engine-resume cleanup. A late release
         # from the prior generation must never release newly prepared bytes.
-        with (self.root / ".lock").open("a+b") as lock:
+        with (self.directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = json.loads((self.directory / "state.json").read_bytes())
             if state == {
