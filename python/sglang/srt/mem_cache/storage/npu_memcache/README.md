@@ -84,6 +84,10 @@ python -m sglang.launch_server \
   --hicache-storage-backend-extra-config '{"meta_service_url":"tcp://127.0.0.1:5000", "config_store_url":"tcp://127.0.0.1:6000", "log_level":"info", "world_size":256, "protocol": "device_sdma", "dram_size": "1GB"}'
 ```
 
+For DeepSeek-V4, use `--hicache-mem-layout page_first_direct` in the command above.
+Keep `--hicache-host-memory-mode cache` (the default); the C128 component does not
+support `buffer_only`.
+
 Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
 
 | Key | Type | Required | Default | Valid range | Description |

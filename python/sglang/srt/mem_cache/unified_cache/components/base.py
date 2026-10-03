@@ -688,6 +688,12 @@ class TreeComponent(ABC):
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
         return None
 
+    def align_storage_prefetch_length(
+        self, node_id: NodeId, prefetch_tokens: int
+    ) -> int:
+        """Align the prefetch span to this component's storage boundaries."""
+        return prefetch_tokens
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,

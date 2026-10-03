@@ -67,6 +67,21 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     }
 
 
+def prewarm_dsv4_aicpu(attn_backend, device) -> None:
+    # Run after the first HCCL collective and before MemFabric maps Host memory.
+    # Otherwise custom AiCPU startup can fail in halMemBindSibling.
+    # A single-token request initializes metadata without accessing KV pages.
+    attn_backend._kernel_metadata_from_parts(
+        bs=1,
+        actual_seq_lengths_q_pa=torch.arange(2, dtype=torch.int32, device=device),
+        actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32, device=device),
+        block_tables=None,
+        max_seqlen_q=1,
+        is_nextn=False,
+    )
+    torch.npu.synchronize(device)
+
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
