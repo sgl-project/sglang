@@ -643,6 +643,14 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.routed_quant_stream = routed_quant_stream
+        self._nccl_ep_serial_shared_experts = (
+            get_moe_a2a_backend().is_nccl_ep() and get_moe_runner_backend().is_triton()
+        )
+        if (
+            self._nccl_ep_serial_shared_experts
+            and envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+        ):
+            raise ValueError("NCCL EP Triton requires serial shared experts")
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
         self._fuse_finalize_all_reduce = (
@@ -782,6 +790,7 @@ class DeepseekV2MoE(nn.Module):
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_nccl_ep()
                 or get_moe_a2a_backend().is_pplx()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
@@ -910,6 +919,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_nccl_ep()
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
@@ -1010,6 +1020,9 @@ class DeepseekV2MoE(nn.Module):
                     use_vision_topk=use_vision_topk,
                 )
         else:
+            # NCCL EP: use forward_deepep (LL path) for both prefill and decode,
+            # matching DeepEP behavior. The LL dispatch/combine handles arbitrary
+            # batch sizes (bounded by num_max_dispatch_tokens_per_rank).
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
@@ -1536,6 +1549,10 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        # Disabling SBO alone does not disable this model's auxiliary stream.
+        # The NCCL EP Triton compatibility path keeps shared MLP and EP work
+        # ordered on the current stream, including full Graph capture.
+        shared_stream = None if self._nccl_ep_serial_shared_experts else self.alt_stream
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1548,12 +1565,12 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
+                if shared_stream is not None:
+                    shared_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(shared_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
+                        shared_output.record_stream(shared_stream)
+                        shared_event = shared_stream.record_event()
                     if is_in_breakable_cuda_graph():
                         # The MoE call below is an eager break, so record
                         # and wait must share one capture; joining here means
@@ -1618,7 +1635,12 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.clear_overlap_args()
                 post_combine_hook_handle.remove()
 
-            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+            assert isinstance(
+                self.experts.dispatcher,
+                (MaybeTboDeepEPDispatcher, NcclEpDispatcher),
+            )
             deepep_dispatch_hook_handle = (
                 self.experts.dispatcher.register_deepep_dispatch_hook(
                     _deepep_dispatch_hook
@@ -1740,7 +1762,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
+            and shared_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
