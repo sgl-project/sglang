@@ -382,9 +382,11 @@ class ExecMamba(msgspec.Struct):
     ] = None
     mamba_max_states_per_path: A[
         int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
+        "Maximum number of cached Mamba states, and of sliding-window (SWA) windows, "
+        "retained per root-to-tail path (-1 means unlimited). When enabled, after each "
+        "insert the shallowest eligible interior states beyond the cap are removed while "
+        "their full KV remains; fewer SWA windows also means fewer written to an "
+        "external cache. "
         "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
     ] = -1
     enable_mamba_cache_stochastic_rounding: A[

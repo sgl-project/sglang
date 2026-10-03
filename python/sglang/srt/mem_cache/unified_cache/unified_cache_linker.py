@@ -85,6 +85,20 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    # Backends whose objects can be evicted between lookup and load set this.
+    reserves_loads: bool = False
+
+    def reserve_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Keep the objects a load will read from being evicted until it runs.
+
+        Called before the tree publishes an external hit when ``reserves_loads``
+        is set. Returning False turns the hit into a miss on every rank.
+        """
+        return True
+
+    def release_load_reservation(self, rid: str) -> None:
+        """Drop the reservation made by ``reserve_load``, if any."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -316,6 +330,17 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
+        if self.cache_linker.reserves_loads and not self._reserve_load_on_all_ranks(
+            req.rid, [transfer for _, transfer in component_transfers]
+        ):
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            return empty_indices, req.last_node
+
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -393,10 +418,25 @@ class UnifiedCacheLinkerWrapper:
         )
         return canonical_tail, insert_result.last_device_node
 
+    def _reserve_load_on_all_ranks(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> bool:
+        # Lookup only checked existence and a published hit cannot be rolled back;
+        # pin the objects now, and every rank falls back to a miss if any rank cannot.
+        reserved = self.cache_linker.reserve_load(rid, transfers)
+        agreed = torch.tensor([int(reserved)], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(agreed, torch.distributed.ReduceOp.MIN)
+        if agreed.item():
+            return True
+        if reserved:
+            self.cache_linker.release_load_reservation(rid)
+        return False
+
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
     ) -> None:
         if not transfers:
+            self.cache_linker.release_load_reservation(rid)
             return
         assert rid not in self.pending_loads
         lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()
@@ -404,9 +444,11 @@ class UnifiedCacheLinkerWrapper:
             queued = self.cache_linker.load(rid, transfers)
         except BaseException:
             self.cache.dec_lock_ref(node_id, lock_params)
+            self.cache_linker.release_load_reservation(rid)
             raise
         if not queued:
             self.cache.dec_lock_ref(node_id, lock_params)
+            self.cache_linker.release_load_reservation(rid)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
         self.pending_loads[rid] = (node_id, lock_params)
 
@@ -558,6 +600,7 @@ class UnifiedCacheLinkerWrapper:
             for rid in self.cache_linker.pop_completed_load():
                 node_id, lock_params = self.pending_loads.pop(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
+                self.cache_linker.release_load_reservation(rid)
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)

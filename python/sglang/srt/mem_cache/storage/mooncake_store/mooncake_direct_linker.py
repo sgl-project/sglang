@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from concurrent.futures import Future
 from queue import Empty, Queue
 
@@ -92,7 +93,13 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+# Half of Mooncake's default 10 s KV lease; a get session reads only while it is live.
+_SESSION_RENEW_INTERVAL_S = 5.0
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    reserves_loads = True
+
     def __init__(
         self,
         server_args,
@@ -185,6 +192,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        # Objects pinned with a get session from reserve_load until the load
+        # that reads them completes; refcounted because prefixes are shared.
+        self.load_reservations: dict[str, list[str]] = {}
+        self.reserved_key_refs: dict[str, int] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -194,7 +205,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             Queue()
         )
         self.offload_results: Queue[bool] = Queue()
-        self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.stats = {
+            "lookup": 0,
+            "load": 0,
+            "offload": 0,
+            "reserve_miss": 0,
+            "lease_renewal": 0,
+        }
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -244,6 +261,61 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    def _component_keys(self, transfers: list[PoolTransfer]) -> list[str]:
+        keys = []
+        for transfer in transfers:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys.extend(self.storage._tag_keys(component_keys))
+        return list(dict.fromkeys(keys))
+
+    def _end_sessions(self, keys: list[str]) -> None:
+        if keys:
+            self.storage.store.batch_get_session_end(keys)
+
+    def reserve_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        if rid in self.load_reservations:
+            raise RuntimeError(f"Mooncake load for rid={rid} is already reserved.")
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        keys = self._component_keys(expanded)
+        new_keys = [key for key in keys if key not in self.reserved_key_refs]
+        if new_keys:
+            results = self.storage.store.batch_get_session_start(new_keys)
+            ok = (
+                [result == 0 for result in results]
+                if not isinstance(results, int) and len(results) == len(new_keys)
+                else [False] * len(new_keys)
+            )
+            if not all(ok):
+                self._end_sessions([key for key, good in zip(new_keys, ok) if good])
+                self.stats["reserve_miss"] += 1
+                logger.info(
+                    "Mooncake load reservation missed after lookup: rid=%s, "
+                    "keys=%d, failed=%d",
+                    rid,
+                    len(new_keys),
+                    ok.count(False),
+                )
+                return False
+        for key in keys:
+            self.reserved_key_refs[key] = self.reserved_key_refs.get(key, 0) + 1
+        self.load_reservations[rid] = keys
+        return True
+
+    def release_load_reservation(self, rid: str) -> None:
+        ending = []
+        for key in self.load_reservations.pop(rid, ()):
+            refs = self.reserved_key_refs[key] - 1
+            if refs:
+                self.reserved_key_refs[key] = refs
+            else:
+                del self.reserved_key_refs[key]
+                ending.append(key)
+        self._end_sessions(ending)
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
@@ -255,6 +327,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
+        # load_layer_wise reads without its own session; the reservation from
+        # reserve_load must cover every key.
+        if not set(self._component_keys(expanded)) <= set(
+            self.load_reservations.get(rid, ())
+        ):
+            raise RuntimeError(f"Mooncake load for rid={rid} is not reserved.")
         self.pending_loads[rid] = expanded
         return True
 
@@ -375,7 +453,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
-        started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
@@ -390,16 +467,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
-                started.append(keys)
-
+            session_keys = list(
+                dict.fromkeys(key for keys, _ in batches.values() for key in keys)
+            )
+            renewed_at = self._renew_sessions(session_keys)
             for layer in range(self.num_layers):
+                if time.monotonic() - renewed_at >= _SESSION_RENEW_INTERVAL_S:
+                    renewed_at = self._renew_sessions(session_keys)
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
@@ -428,13 +502,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
-        finally:
-            for keys in started:
-                try:
-                    self.storage.store.batch_get_session_end(keys)
-                except BaseException as error:
-                    self.layer_done_counter.fail(counter_index, error)
-                    logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _renew_sessions(self, keys: list[str]) -> float:
+        # Re-querying restarts each object's lease, so a long load cannot outlive it.
+        results = self.storage.store.batch_get_session_start(keys)
+        if isinstance(results, int) or list(results) != [0] * len(keys):
+            raise RuntimeError(
+                f"Mooncake get session renewal failed: keys={len(keys)}, "
+                f"results={results}"
+            )
+        self.stats["lease_renewal"] += 1
+        return time.monotonic()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
@@ -497,6 +575,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self._end_sessions(list(self.reserved_key_refs))
+        self.reserved_key_refs.clear()
+        self.load_reservations.clear()
 
     def close(self) -> None:
         self.reset()
