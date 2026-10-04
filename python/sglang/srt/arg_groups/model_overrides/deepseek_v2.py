@@ -77,11 +77,10 @@ def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
                 "are unsupported; use the dsa draft backend and inherit the "
                 "target KV dtype. Branching trees need cross-rank KV relocation."
             )
-    if cfg.dcp_replicate_q_proj:
+    if cfg.dcp_replicate_q_proj and cfg.enable_lora:
         raise ValueError(
-            "RoPE DSA DCP does not support --dcp-replicate-q-proj; use the "
-            "ordinary Q all-gather. Quantized Q projections cannot use this "
-            "optimization."
+            "RoPE DSA DCP cannot combine --dcp-replicate-q-proj with LoRA: the "
+            "replicated Q projection bypasses adapter weights."
         )
     attn_tp_size = derive_attn_tp_size(
         tp_size=cfg.tp_size,
@@ -118,6 +117,13 @@ def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
             # BF16 otherwise defaults to flashmla_sparse prefill, which has
             # no CUDA DCP path. Keep the ordinary non-DCP default unchanged.
             overrides[field] = "trtllm"
+    if (
+        cfg.dcp_replicate_q_proj is None
+        and cfg.dcp_comm_backend in ("a2a", "fi_a2a")
+        and not cfg.enable_lora
+    ):
+        # Removes the per-layer Q all-gather. Quantized Q projections keep it.
+        overrides["dcp_replicate_q_proj"] = True
     return overrides
 
 

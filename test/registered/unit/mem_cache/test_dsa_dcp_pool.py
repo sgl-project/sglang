@@ -184,6 +184,27 @@ class TestDSADCPPool(CustomTestCase):
                     bounded, dsa_dcp_runtime_reservation_bytes(_configurator())
                 )
 
+    def test_replicated_q_weights_are_reserved(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            dsa_dcp_replicated_q_weight_bytes,
+        )
+
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(q_lora_rank=2048, hidden_size=6144),
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            kv_lora_rank=512,
+            num_hidden_layers=78,
+        )
+        with _configuration(2):
+            self.assertEqual(dsa_dcp_replicated_q_weight_bytes(model_config, 32), 0)
+            with get_parallel().override(dcp_replicate_q_proj=True):
+                # GLM-5.3 at TP4/DCP2: 32 gathered heads of q_b_proj and w_kc.
+                self.assertEqual(
+                    dsa_dcp_replicated_q_weight_bytes(model_config, 32),
+                    78 * 32 * (256 * 2048 + 192 * 512) * 2,
+                )
+
     def test_attention_dp_row_bound_preserves_alignment(self):
         with _configuration(2, attn_dp_size=2, chunked_prefill_size=1):
             self.assertEqual(

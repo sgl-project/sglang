@@ -159,12 +159,31 @@ class TestDsaDcpArgs(CustomTestCase):
             ({"disaggregation_mode": "decode"}, "PD disaggregation"),
             ({"speculative_algorithm": "EAGLE3"}, "speculative decoding"),
             ({"speculative_algorithm": "DFLASH"}, "speculative decoding"),
-            ({"dcp_replicate_q_proj": True}, "--dcp-replicate-q-proj"),
+            (
+                {"dcp_replicate_q_proj": True, "enable_lora": True},
+                "--dcp-replicate-q-proj",
+            ),
             ({"kv_cache_dtype": "fp8_e5m2"}, "KV cache"),
         )
         for kwargs, message in cases:
             with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, message):
                 self._resolve(self._args(**kwargs))
+
+    def test_replicated_q_defaults_on_for_a2a_backends_only(self):
+        cases = (
+            ({"dcp_comm_backend": "fi_a2a"}, True),
+            ({"dcp_comm_backend": "a2a"}, True),
+            ({"dcp_comm_backend": "ag_rs"}, None),
+            ({"dcp_comm_backend": "fi_a2a", "enable_lora": True}, None),
+            ({"dcp_comm_backend": "fi_a2a", "dcp_replicate_q_proj": False}, False),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                args = self._args(**kwargs)
+                self._resolve(args)
+                self.assertEqual(
+                    resolution_result(args, "dcp_replicate_q_proj"), expected
+                )
 
     def test_chain_eagle_supported_and_other_shapes_rejected(self):
         supported = dict(

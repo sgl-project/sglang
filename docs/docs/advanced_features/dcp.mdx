@@ -73,7 +73,7 @@ GLM-5.3, GLM-5.2, and DeepSeek-V3.2 use a replicated sparse-attention indexer wi
 | Expert parallelism | Composes with the default MoE path |
 | Attention DP | Requires `attn_tp_size % dcp_size == 0` |
 | EAGLE/MTP | Checkpoint-native draft, single chain; flags below |
-| Replicated Q projection | Rejected at launch |
+| Replicated Q projection | Default with `a2a` / `fi_a2a` for BF16 Q projections; not available with LoRA |
 | HiSparse, prefill CP, HiCache/L3, PD disaggregation, unified memory | Rejected at launch |
 | Other CUDA sparse backends or GPU architectures | Rejected at launch |
 
@@ -92,9 +92,11 @@ sglang serve \
 
 Use `--dcp-size 4` for a larger logical KV capacity. The indexer cache remains replicated, so total capacity grows by less than the DCP factor. Pool sizing includes the replicated index keys and extra workspace. DCP can increase per-token latency; compare the communication backends on your workload. With `ag_rs`, also measure `--enable-symm-mem`.
 
+With `a2a` or `fi_a2a`, replicated Q projection is on by default and removes the per-layer query all-gather during decode. The gathered `q_b_proj` and `w_kc` copies take about 2.9 GiB per GPU at TP4/DCP2 and 5.8 GiB at TP4/DCP4 for GLM-5.3, which KV sizing reserves. Pass `--no-dcp-replicate-q-proj` to trade that latency back for KV capacity. Checkpoints with a quantized Q projection keep the all-gather.
+
 #### Choose between TP, attention DP, and DCP
 
-DCP raises KV capacity, not speed. Measured with GLM-5.3 NVFP4 on four B300 GPUs (FP8 KV, 1,024 output tokens per request, warm prefix cache, steady-state output tokens per second):
+DCP raises KV capacity, not speed. Measured with GLM-5.3 NVFP4 on four B300 GPUs with `--no-dcp-replicate-q-proj` (FP8 KV, 1,024 output tokens per request, warm prefix cache, steady-state output tokens per second):
 
 | Input tokens | Concurrency | TP4 | TP4 + attention DP4 | TP4 + DCP4 |
 | ---: | ---: | ---: | ---: | ---: |
@@ -110,7 +112,9 @@ DCP raises KV capacity, not speed. Measured with GLM-5.3 NVFP4 on four B300 GPUs
 - Use attention DP when you need throughput beyond that capacity. It requires a router that keeps a session on one DP rank to reuse the prefix cache.
 - Use DCP when you need the larger capacity at low concurrency, or one KV pool shared by all ranks. Its per-token latency sits between TP and attention DP at low concurrency and falls behind attention DP from about 64 concurrent requests.
 
-The replicated indexer cache bounds the capacity gain. For GLM-5.3 with FP8 KV, each token stores 44,928 bytes of sharded target KV and 2,772 bytes of replicated index keys, so equal memory gives 1.89x the TP capacity at DCP2, 3.41x at DCP4, and 5.69x at DCP8. The DCP workspace reservation lowers the measured values to 1.85x and 3.22x at DCP2 and DCP4.
+Replicated Q projection lowers DCP per-token latency at concurrency 1 by about 9% at DCP2 and 5% at DCP4 relative to this table.
+
+The replicated indexer cache bounds the capacity gain. For GLM-5.3 with FP8 KV, each token stores 44,928 bytes of sharded target KV and 2,772 bytes of replicated index keys, so equal memory gives 1.89x the TP capacity at DCP2, 3.41x at DCP4, and 5.69x at DCP8. The DCP workspace reservation lowers the measured values to 1.85x and 3.22x at DCP2 and DCP4, and the replicated Q weights to 1.80x and 3.07x.
 
 The current DCP launch policy disables prefill CUDA graphs. Decode graph capture remains enabled. FP8 partial attention can differ slightly from unsharded attention because each shard quantizes its softmax numerator using a local maximum; validate model accuracy alongside latency.
 

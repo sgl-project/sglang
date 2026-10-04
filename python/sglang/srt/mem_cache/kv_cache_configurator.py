@@ -268,7 +268,21 @@ def dsa_dcp_runtime_reservation_bytes(
         + counter_bytes
         + metadata_bytes
         + concat_bytes
+        + dsa_dcp_replicated_q_weight_bytes(kvc.model_config, heads * dcp_size)
     )
+
+
+def dsa_dcp_replicated_q_weight_bytes(model_config, num_dcp_q_heads: int) -> int:
+    """BF16 q_b_proj and w_kc copies gathered over the DCP group after KV sizing."""
+    if not get_parallel().dcp_replicate_q_proj:
+        return 0
+    qk_head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
+    q_in_dim = model_config.hf_config.q_lora_rank or model_config.hf_config.hidden_size
+    per_layer = num_dcp_q_heads * (
+        qk_head_dim * q_in_dim
+        + model_config.qk_nope_head_dim * model_config.kv_lora_rank
+    )
+    return model_config.num_hidden_layers * per_layer * 2
 
 
 _is_hip = is_hip()
