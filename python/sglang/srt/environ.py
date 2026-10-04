@@ -558,6 +558,9 @@ class Envs:
     # Argmax every draft row, sampling requests included, accepted as a one-hot
     # draft: no step logits kept, lower acceptance at high temperatures.
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
+    # BF16 LM head (target and DSpark draft) at <= 16 rows through a weight-streaming
+    # Triton kernel instead of cuBLAS; each row's result is independent of the batch.
+    SGLANG_ENABLE_BF16_SKINNY_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
