@@ -76,6 +76,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -560,7 +561,7 @@ class ModelRunner:
             custom_weight_loaders=get_model().custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
-            recapture_cuda_graph=self.init_decode_cuda_graph,
+            recapture_cuda_graph=self.recapture_decode_cuda_graph,
             get_model_runner=lambda: self,
         )
 
@@ -966,11 +967,7 @@ class ModelRunner:
             top_k=hisparse_top_k,
             device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
-            tp_group=(
-                get_parallel().attn_tp_group.cpu_group
-                if get_parallel().attn_dp_enabled
-                else get_parallel().tp_group.cpu_group
-            ),
+            tp_group=get_dp_tp_group().cpu_group,
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
@@ -1371,8 +1368,6 @@ class ModelRunner:
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=get_lora().lora_backend,
-            tp_size=get_parallel().tp_size,
-            tp_rank=get_parallel().tp_rank,
             max_lora_rank=get_lora().max_lora_rank,
             target_modules=get_lora().lora_target_modules,
             lora_paths=get_lora().lora_paths,
@@ -1540,6 +1535,19 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs = list(
             getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
         )
+
+    def recapture_decode_cuda_graph(self):
+        # A spec worker that captures its draft's graphs inside the draft
+        # placement scopes leaves the draft runner holding its eager runner in
+        # place of a decode graph. Recapturing here runs outside those scopes,
+        # and for a draft the capture raises after clearing the eager runner.
+        owns_no_decode_graph = (
+            self.decode_cuda_graph_runner is None
+            or self.decode_cuda_graph_runner is self.eager_runner
+        )
+        if self.is_draft_worker and owns_no_decode_graph:
+            return
+        self.init_decode_cuda_graph()
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
         """Idempotently capture decode CUDA graphs after startup.

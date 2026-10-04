@@ -77,6 +77,7 @@ impl CacheSource {
             Ok(outcome) => Ok(Some(Arc::new(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             }))),
             Err(PrefixIndexError::Rejected(code)) => Err(PickError::InvalidSignal(format!(
                 "KV Indexer rejected the query: {code}"
@@ -103,6 +104,15 @@ impl fmt::Debug for PrefixMemo {
 }
 
 impl PrefixMemo {
+    /// The local tree's answer, once a policy has looked it up.
+    pub fn local_signal(&self) -> Option<Arc<ExternalPrefixSignal>> {
+        let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
+        cells
+            .iter()
+            .filter(|(source, _)| matches!(**source, CacheSource::Local(_)))
+            .find_map(|(_, cell)| cell.get().cloned().flatten())
+    }
+
     fn cell(&self, source: &Arc<CacheSource>) -> Lookup {
         let mut cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
         match cells.iter().find(|(s, _)| Arc::ptr_eq(s, source)) {
@@ -181,6 +191,7 @@ impl CacheAwarePolicy {
         let Some(ExternalPrefixSignal {
             outcome: PrefixOutcome::Matched { matches, .. },
             query_blocks,
+            ..
         }) = signal.filter(|signal| signal.query_blocks > 0)
         else {
             return Vec::new();
