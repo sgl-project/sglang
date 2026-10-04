@@ -2313,26 +2313,25 @@ class CommonKVReceiver(BaseKVReceiver):
     def _poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
-        status = self._poll_room_status()
-        if self.conclude_state is not None:
-            return status
-        if status == KVPoll.Bootstrapping and self._prefill_wait_start is not None:
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+        elif status == KVPoll.Bootstrapping and self._prefill_wait_start is not None:
             if time.time() - self._prefill_wait_start >= self.kv_mgr.waiting_timeout:
                 self.abort()
                 self.kv_mgr.record_failure(
                     self.bootstrap_room, "Timed out waiting for prefill completion"
                 )
                 return KVPoll.Failed
-            return status
-        if status == KVPoll.WaitingForInput and self._prefill_wait_start is not None:
+        elif status == KVPoll.WaitingForInput:
             # Observe readiness before evaluating the old compute deadline.
             # send_metadata starts the transfer timeout using this same clock.
-            self._prefill_wait_start = None
-            self.init_time = time.time()
-        timeout_result = self._check_waiting_timeout()
-        if timeout_result is not None:
-            self.conclude_state = timeout_result
-            return timeout_result
+            if self._prefill_wait_start is not None:
+                self._prefill_wait_start = None
+                self.init_time = time.time()
+            timeout = self._check_waiting_timeout()
+            if timeout is not None:
+                return timeout
         return status
 
     def _setup_bootstrap_infos(self):
@@ -2573,7 +2572,12 @@ class CommonKVReceiver(BaseKVReceiver):
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
         **backend_kwargs,
     ):
-        if not self._can_send_metadata():
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
         if destination != KVTransferDestination.DEVICE:
             raise NotImplementedError("Host KV destinations are not supported")
@@ -2606,30 +2610,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 return
 
         self.init_time = time.time()
-
-    def _can_send_metadata(self) -> bool:
-        if self.conclude_state is not None:
-            return False
-        if self.bootstrap_infos is None:
-            self.kv_mgr.record_failure(
-                self.bootstrap_room,
-                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
-            )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-            self.conclude_state = KVPoll.Failed
-            return False
-        return True
-
-    def _poll_room_status(self) -> KVPoll:
-        status = self.kv_mgr.request_status.get(self.bootstrap_room)
-        if status is None:
-            self.kv_mgr.record_failure(
-                self.bootstrap_room, "KV receiver room is no longer tracked"
-            )
-            status = KVPoll.Failed
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-        return status
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
