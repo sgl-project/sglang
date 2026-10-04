@@ -75,13 +75,19 @@ and MMA images that alias receive one XOR, while independent consumer images eac
 receive it. Derived refresh uses a device predicate and writes into the existing
 destination without allocating a transformed source or replacement buffer.
 
-Preparation caches each local byte selection as a view of reusable decoded
-scratch, including strided TP column slices. It uploads all nvCOMP descriptors in
-one metadata slab and caches launch arguments and status/size views. The plans
-capture the session's stream; metadata upload, tensor upload, decode and apply
-remain ordered on that stream. These caches hold geometry and live storage views,
-not snapshots of values. Decoder status checks, scratch initialization and the
-reader/completion fences retain their existing behavior.
+Compressed tensors form one batch per target model layer, plus one standalone
+batch for embedding/head and other non-layer weights. Each batch must fit HBM;
+there is no intra-layer streaming. Preparation coalesces adjacent rank-owned
+ranges of the shared pinned Snappy arena into bulk transfers, without copying
+foreign experts or making a second per-rank host arena. GPU scratch fits the
+largest batch, and one nvCOMP call decodes all retained frames in that batch.
+
+Layer membership, layout groups and destination geometry are reusable. Fresh
+compressed lengths, frame lists and arena offsets are prepared for each update.
+Compatible byte layouts use batched in-place XOR; irregular padded scales retain
+their explicit transform. Decoder metadata and apply pointers upload before
+pause. Transfers, decode and apply remain ordered on the session's stream, with
+the existing reader/completion fences and device-side decoder failure gate.
 
 There is no separate global quiesce or commit round. A participant may apply
 before another fails to pause; failed or uncertain activation never authorizes
@@ -112,8 +118,9 @@ redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned Snappy arena. The sender computes both Snappy and outer Zstd
 on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
-registers each process's mapping for CUDA, then streams tensor Snappy bytes for
-hardware decoding and in-place apply.
+registers each process's mapping for CUDA, then transfers model-layer batches for
+hardware decoding and in-place apply. Natural tensor boundaries remain unchanged
+in the publication format.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
@@ -187,7 +194,8 @@ payload. Preparation packs changed local scalars/vectors into one aligned pinned
 arena, uploads it once and performs any BF16-to-FP32 norm conversion. During the
 pause, dtype-grouped `torch._foreach_copy_` updates existing buffers before matrix
 application; derived NVFP4 scales refresh afterward. Late decoder failure retains
-the same poisoned-session behavior. The matrix streaming path is unchanged.
+the same poisoned-session behavior. This small bypass remains one whole-model
+packed path rather than being split into layer batches.
 
 `raw_bytes` counts direct payload bytes; `raw_h2d_bytes` includes arena alignment.
 `host_raw_pack_s` is preparation CPU packing; direct H2D also occurs before pause.
@@ -202,6 +210,10 @@ worker durations must not be summed as wall time.
 `decoder_metadata_uploads` counts metadata slabs and
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
+`compressed_batches`, `compressed_h2d_spans` and `apply_groups` count layer
+decodes, bulk copies and uniform-layout XOR launches. `host_batch_plan_reused`
+reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
+workspace byte counts describe reserved working buffers, not peak HBM usage.
 
 `host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
 creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,

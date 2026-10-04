@@ -18,6 +18,72 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def _apply_prepared_masks(bindings, masks):
+    """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
+    from sglang.srt.weight_sync.gpu_delta_apply import plan_groups
+    from sglang.srt.weight_sync.gpu_delta_layout import PreparedDelta, _PreparedBatch
+
+    outputs, size = [], 0
+    for binding, mask in zip(bindings, masks):
+        offset = (size + 15) // 16 * 16
+        outputs.append((binding, offset, mask.numel()))
+        size = offset + mask.numel()
+    payload = torch.zeros(size, dtype=torch.uint8, device="cuda")
+    for (_, offset, length), mask in zip(outputs, masks):
+        payload[offset : offset + length].copy_(mask.reshape(-1))
+    prepared = PreparedDelta.__new__(PreparedDelta)
+    prepared.error = torch.zeros(1, dtype=torch.int32, device="cuda")
+    prepared.timing_enabled = False
+    decoded = torch.empty_like(payload)
+    groups, transformed = plan_groups(outputs)
+    saved = [
+        (value, value.clone()) for binding in bindings for value in binding.storage
+    ]
+    rows = []
+    for group in groups:
+        rows.extend(decoded.data_ptr() + offset for offset in group.sources)
+        rows.extend(group.targets)
+    metadata = torch.tensor(rows, dtype=torch.int64, device="cuda")
+    compiled, position = [], 0
+    for group in groups:
+        count = 2 * len(group.sources)
+        pointers = metadata[position : position + count]
+        group.compile(pointers, prepared.error)
+        compiled.append((group, pointers))
+        position += count
+    # Compilation and module loading must not execute against live weights.
+    for value, before in saved:
+        torch.testing.assert_close(
+            value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
+        )
+    decoder = SimpleNamespace(
+        enqueue=lambda: decoded.copy_(payload),
+        statuses=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        actual_sizes=torch.tensor([size], device="cuda"),
+        expected_sizes=torch.tensor([size], device="cuda"),
+    )
+    batch = _PreparedBatch(
+        [],
+        decoded,
+        decoder,
+        compiled,
+        [
+            (binding.xor, binding.selected_bytes(decoded[offset : offset + length]))
+            for binding, offset, length in transformed
+        ],
+    )
+    # An earlier decode error suppresses all mappings, including transformed
+    # padded scales. Reset only in this oracle, then exercise the successful XOR.
+    prepared.error.fill_(1)
+    prepared._apply_batch(batch)
+    for value, before in saved:
+        torch.testing.assert_close(
+            value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
+        )
+    prepared.error.zero_()
+    prepared._apply_batch(batch)
+
+
 def _reference_layer(values, independent_mma=False):
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
@@ -150,6 +216,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
         {f"wrapper.{i}": tensor for i, tensor in enumerate(live._cutedsl_scales)}
     )
     pointers = {name: tensor.data_ptr() for name, tensor in images.items()}
+    bindings, masks = [], []
     for (projection, suffix), before in old.items():
         after = new[projection, suffix]
         for local in range(2):
@@ -174,7 +241,39 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             if binding.encoding == "raw_bytes":
                 torch._foreach_copy_([binding.storage[0]], [after[local]])
             else:
-                binding.xor(mask)
+                bindings.append(binding)
+                masks.append(mask)
+    _apply_prepared_masks(bindings, masks)
+    from sglang.srt.weight_sync.gpu_delta_layout import _direct_binding
+
+    for dtype in (torch.uint8, torch.bfloat16, torch.float32):
+        width = torch.empty((), dtype=dtype).element_size()
+        canonical = torch.randint(
+            256, (12, 20 * width), dtype=torch.uint8, device="cuda"
+        )
+        live_tp = canonical.view(dtype)[2:10, 5:13].clone()
+        mask = torch.randint(256, canonical.shape, dtype=torch.uint8, device="cuda")
+        expected_tp = live_tp.view(torch.uint8) ^ mask.reshape(12, 20, width)[
+            2:10, 5:13
+        ].reshape(8, -1)
+        binding = _direct_binding(
+            "tp",
+            {
+                "dtype": {
+                    torch.uint8: "U8",
+                    torch.bfloat16: "BF16",
+                    torch.float32: "F32",
+                }[dtype],
+                "shape": [12, 20],
+            },
+            live_tp,
+            [[2, 10], [5, 13]],
+        )
+        _apply_prepared_masks([binding], [mask.reshape(-1)])
+        torch.testing.assert_close(
+            live_tp.view(torch.uint8), expected_tp, rtol=0, atol=0
+        )
+
     plan = GpuDeltaLayout.__new__(GpuDeltaLayout)
     plan.derived = []
     plan._add_moe_derived("model.layers.3.mlp.experts", live)
@@ -212,6 +311,35 @@ def test_feature_scale_permutation_matches_loader_padding():
         torch.testing.assert_close(
             swizzle_scale_bytes(values), expected, rtol=0, atol=0
         )
+        if len(shape) == 2:
+            from sglang.srt.weight_sync.gpu_delta_layout import _moe_binding
+
+            live = expected.clone().view(torch.float8_e4m3fn).unsqueeze(0)
+            layer = SimpleNamespace(
+                moe_tp_size=1,
+                use_presharded_weights=False,
+                quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+                moe_runner_config=SimpleNamespace(is_gated=True),
+                _map_global_expert_id_to_local_expert_id=lambda _: 0,
+                w2_blockscale_swizzled=live,
+                w2_weight_scale=live,
+            )
+            binding = _moe_binding(
+                "model.layers.0.mlp.experts.0.down_proj.weight_scale",
+                {"dtype": "F8_E4M3", "shape": list(shape)},
+                layer,
+                0,
+                "down",
+                "weight_scale",
+            )
+            mask = torch.randint(256, shape, dtype=torch.uint8, device="cuda")
+            _apply_prepared_masks([binding], [mask.reshape(-1)])
+            torch.testing.assert_close(
+                live[0].view(torch.uint8),
+                expected ^ swizzle_scale_bytes(mask),
+                rtol=0,
+                atol=0,
+            )
 
 
 def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():

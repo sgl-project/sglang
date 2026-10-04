@@ -146,12 +146,15 @@ class TensorBinding:
     xor: Callable[[torch.Tensor], None] | None
     storage: tuple[torch.Tensor, ...]
     encoding: str = "xor_bytes"
+    destinations: tuple[torch.Tensor, ...] = ()
 
     def __post_init__(self):
         # The admitted binding is immutable for the session. Keep dtype and
         # slicing metadata off the paused per-tensor application path.
         self.torch_dtype = _TORCH_DTYPES[self.dtype]
         self._selection = tuple(slice(start, stop) for start, stop in self.slices)
+        layer = re.search(r"(?:^|\.)layers\.(\d+)\.", self.name)
+        self.layer = int(layer[1]) if layer else None
 
     @cached_property
     def view_id(self):
@@ -213,6 +216,7 @@ def _direct_binding(name, meta, target, slices=None):
         xor,
         (target,),
         encoding="raw_bytes" if direct else "xor_bytes",
+        destinations=() if direct else (byte_target,),
     )
 
 
@@ -315,6 +319,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
             raise ValueError(f"unexpected scale padding geometry: {name}")
 
     group = 128 if projection == "down" else 64
+    destinations = []
     if (
         rows % group == 0
         and cols % 4 == 0
@@ -322,7 +327,6 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
     ):
         # Physical scale axes: row tile, column tile, row within 32,
         # row group within 128, column within 4. Gate/up own disjoint groups.
-        destinations = []
         for image in images:
             view = image.view(torch.uint8).view(rows // group, cols // 4, 32, 4, 4)
             if projection != "down":
@@ -356,6 +360,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         _full_slices(meta["shape"]),
         xor,
         tuple(images),
+        destinations=tuple(destinations),
     )
 
 
@@ -379,6 +384,8 @@ class GpuDeltaLayout:
     """Frozen, fail-closed map from startup checkpoint names to live buffers."""
 
     def __init__(self, model, inventory):
+        from sglang.srt.weight_sync.gpu_delta_host import _natural_key
+
         self.model = model
         if not inventory:
             raise ValueError("canonical checkpoint metadata is unavailable")
@@ -394,8 +401,8 @@ class GpuDeltaLayout:
             binding = self._bind(name, meta)
             if binding is not None:
                 self.bindings.append(binding)
-        # Layer order is the outer traversal. A complete canonical tensor is
-        # always the decode and integrity unit, including ordinary TP shards.
+        # Layer and expert order matches the shared host arena. Each canonical
+        # tensor still owns its full decoded byte extent, including TP shards.
         self.bindings.sort(key=lambda b: _natural_key(b.name))
         for prefix, layer in self._moe_layers.items():
             self._add_moe_derived(prefix, layer)
@@ -666,12 +673,6 @@ def _known_fused_pair(a, b):
     return False
 
 
-def _natural_key(name):
-    return tuple(
-        int(piece) if piece.isdigit() else piece for piece in re.split(r"(\d+)", name)
-    )
-
-
 def _tensor_identity(tensor):
     return (
         tensor.untyped_storage().data_ptr(),
@@ -719,6 +720,7 @@ class GpuDeltaBackend:
         _require_fixed_moe_topology(get_exec().moe)
         self.identity = dict(identity)
         self._canonical_plan = None
+        self.batch_plan = None
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
@@ -757,12 +759,67 @@ class GpuDeltaBackend:
 
 
 @dataclass
-class _PreparedTensor:
-    binding: TensorBinding
-    nbytes: int
-    pinned: torch.Tensor
+class _PreparedBatch:
+    copies: list[tuple[torch.Tensor, torch.Tensor]]
+    decoded: torch.Tensor
     decoder: object
-    payload: torch.Tensor
+    groups: list
+    transformed: list[tuple[Callable, torch.Tensor]]
+
+
+def _plan_layers(backend, bindings, entries):
+    """Cache membership, canonical offsets and apply geometry, never wire frames."""
+    key = tuple(binding.name for binding in bindings)
+    if backend.batch_plan is None or backend.batch_plan[0] != key:
+        if not bindings:
+            backend.batch_plan = (key, [])
+            return []
+        from sglang.srt.weight_sync.gpu_delta_apply import plan_groups
+
+        layers = {}
+        for binding in bindings:
+            layers.setdefault(binding.layer, []).append(binding)
+        plans = []
+        for group in layers.values():
+            outputs, size = [], 0
+            for binding in group:
+                offset = (size + 15) // 16 * 16
+                nbytes = entries[binding.name]["nbytes"]
+                outputs.append((binding, offset, nbytes))
+                size = offset + nbytes
+            apply, transformed = plan_groups(outputs)
+            plans.append((outputs, size, apply, transformed))
+        backend.batch_plan = (key, plans)
+    return backend.batch_plan[1]
+
+
+def _plan_batch(outputs, entries, records):
+    """Map adjacent registered host spans and canonical outputs for one layer."""
+    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame
+
+    frames, spans = [], []
+    encoded_size = 0
+    for binding, decoded_offset, _ in outputs:
+        entry, record = entries[binding.name], records[binding.name]
+        source, size = record["offset"], record["nbytes"]
+        if spans and source == (spans[-1][0] + spans[-1][2] + 15) // 16 * 16:
+            start, destination, _ = spans[-1]
+            encoded_offset = destination + source - start
+            spans[-1] = (start, destination, source + size - start)
+        else:
+            encoded_offset = (encoded_size + 15) // 16 * 16
+            spans.append((source, encoded_offset, size))
+        encoded_size = encoded_offset + size
+        frames.extend(
+            DecodeFrame(
+                encoded_offset + frame["encoded_offset"],
+                frame["encoded_bytes"],
+                decoded_offset + frame["decoded_offset"],
+                frame["decoded_bytes"],
+            )
+            for frame in entry["frames"]
+        )
+    return frames, spans, encoded_size
 
 
 def _canonical_views(views):
@@ -859,7 +916,7 @@ class PreparedDelta:
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
         self.stream = None
         self.host_snapshot = None
-        self.units = []
+        self.batches = []
         self.raw_copies = {}
 
         from pathlib import Path
@@ -868,7 +925,7 @@ class PreparedDelta:
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
         self.events = {}
         self.timings = {}
-        from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
+        from sglang.srt.weight_sync.gpu_delta_codec import NvcompDecoder
         from sglang.srt.weight_sync.gpu_delta_payload import validate_codec
 
         self.backend = backend
@@ -920,9 +977,7 @@ class PreparedDelta:
         backend.host_arena.register(self.device, self.timings)
 
         tensors_started = time.perf_counter()
-        prepared, direct = [], []
-        max_encoded, max_decoded = 0, 0
-        batches = []
+        compressed, direct = [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]
             matching = [v for v in entry["views"] if v["id"] == binding.view_id]
@@ -934,22 +989,20 @@ class PreparedDelta:
                 continue
             if not entry["frames"]:
                 continue  # Omitted XOR masks need no work.
-            pinned = self.host_snapshot.get(entry["name"])
-            # Admission already bounds every inner frame, including foreign EP
-            # tensors. One pinned tensor arena directly supplies one Snappy batch.
-            frames = [
-                DecodeFrame(
-                    frame["encoded_offset"],
-                    frame["encoded_bytes"],
-                    frame["decoded_offset"],
-                    frame["decoded_bytes"],
-                )
-                for frame in entry["frames"]
-            ]
-            batches.append(frames)
-            prepared.append((binding, entry["nbytes"], pinned))
-            max_encoded = max(max_encoded, pinned.numel())
-            max_decoded = max(max_decoded, entry["nbytes"])
+            compressed.append(binding)
+        previous_plan = backend.batch_plan
+        static_plans = _plan_layers(backend, compressed, entries)
+        self.timings["host_batch_plan_reused"] = int(
+            previous_plan is not None and backend.batch_plan is previous_plan
+        )
+        plans = [
+            _plan_batch(outputs, entries, self.host_snapshot.index["tensors"])
+            for outputs, _, _, _ in static_plans
+        ]
+        frames = [plan[0] for plan in plans]
+        max_encoded = max((plan[2] for plan in plans), default=0)
+        max_decoded = max((plan[1] for plan in static_plans), default=0)
+        self.matrix_tensor_count = len(compressed)
         # Rank-local tensor metadata; host-shared decompression is measured above.
         self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
         # Scalars and vectors are complete target values, never delta masks.
@@ -980,8 +1033,8 @@ class PreparedDelta:
             raw_h2d_bytes=raw_h2d_bytes,
         )
         decoder_started = time.perf_counter()
-        self.decoder = NvcompDecoder(self.device) if batches else None
-        self.workspace = self.decoder.allocate_workspace(batches) if batches else None
+        self.decoder = NvcompDecoder(self.device) if plans else None
+        self.workspace = self.decoder.allocate_workspace(frames) if plans else None
         with torch.cuda.stream(self.stream):
             self.raw_device = self.raw_pinned.to(self.device, non_blocking=True)
             for (binding, entry), position in zip(direct, raw_offsets):
@@ -1010,24 +1063,61 @@ class PreparedDelta:
             self.error = torch.zeros(1, dtype=torch.int32, device=self.device)
             decoders = (
                 self.decoder.prepare_batches(
-                    batches, self.encoded, self.decoded, self.workspace, self.stream
+                    frames, self.encoded, self.decoded, self.workspace, self.stream
                 )
-                if batches
+                if plans
                 else []
             )
-            for (binding, nbytes, pinned), decode in zip(prepared, decoders):
-                self.units.append(
-                    _PreparedTensor(
-                        binding,
-                        nbytes,
-                        pinned,
+            host = self.backend.host_arena.tensor
+            pointer_rows = []
+            for _, _, groups, _ in static_plans:
+                for group in groups:
+                    pointer_rows.extend(
+                        self.decoded.data_ptr() + offset for offset in group.sources
+                    )
+                    pointer_rows.extend(group.targets)
+            self.apply_host_metadata = torch.empty(
+                len(pointer_rows), dtype=torch.int64, pin_memory=True
+            )
+            self.apply_host_metadata.numpy()[:] = pointer_rows
+            self.apply_metadata = self.apply_host_metadata.to(
+                self.device, non_blocking=True
+            )
+            position = 0
+            for (_, spans, _), (_, decoded_size, groups, transformed), decode in zip(
+                plans, static_plans, decoders
+            ):
+                prepared_groups = []
+                for group in groups:
+                    count = 2 * len(group.sources)
+                    pointers = self.apply_metadata[position : position + count]
+                    group.compile(pointers, self.error)
+                    prepared_groups.append((group, pointers))
+                    position += count
+                self.batches.append(
+                    _PreparedBatch(
+                        [
+                            (
+                                self.encoded[target : target + size],
+                                host[source : source + size],
+                            )
+                            for source, target, size in spans
+                        ],
+                        self.decoded[:decoded_size],
                         decode,
-                        binding.selected_bytes(self.decoded[:nbytes]),
+                        prepared_groups,
+                        [
+                            (
+                                binding.xor,
+                                binding.selected_bytes(
+                                    self.decoded[offset : offset + size]
+                                ),
+                            )
+                            for binding, offset, size in transformed
+                        ],
                     )
                 )
-            changed_bindings = [unit.binding for unit in self.units] + [
-                binding for binding, _ in direct
-            ]
+            changed_bindings = compressed + [binding for binding, _ in direct]
             changed_storages = {
                 tensor.untyped_storage().data_ptr()
                 for binding in changed_bindings
@@ -1042,17 +1132,30 @@ class PreparedDelta:
             self.ready.record(self.stream)
         self.timings.update(
             host_decoder_prepare_s=time.perf_counter() - decoder_started,
-            decoder_metadata_uploads=int(bool(batches)),
-            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, batches)),
+            decoder_metadata_uploads=int(bool(plans)),
+            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frames)),
+            apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
+            apply_groups=sum(len(batch.groups) for batch in self.batches),
+            transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
+            compressed_batches=len(plans),
+            compressed_tensors=self.matrix_tensor_count,
+            compressed_h2d_spans=sum(len(batch.copies) for batch in self.batches),
+            encoded_scratch_bytes=max_encoded,
+            decoded_scratch_bytes=max_decoded,
+            decoder_workspace_bytes=(
+                self.workspace.temporary.numel() if self.workspace else 0
+            ),
         )
         # This constructor runs on the preparation worker. PREPARED means
         # immutable pinned inputs, reusable arenas and decoder metadata are ready.
-        # Encoded tensor bytes are uploaded only as each tensor is applied.
+        # Encoded bytes are uploaded only as each model layer is applied.
         ready_started = time.perf_counter()
         self.ready.synchronize()
         self.timings["host_ready_wait_s"] = time.perf_counter() - ready_started
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
-        self.h2d_bytes = raw_h2d_bytes + sum(unit.pinned.numel() for unit in self.units)
+        self.h2d_bytes = raw_h2d_bytes + sum(
+            source.numel() for batch in self.batches for _, source in batch.copies
+        )
 
     @contextmanager
     def _phase(self, name):
@@ -1090,8 +1193,8 @@ class PreparedDelta:
                         torch._foreach_copy_(targets, sources)
                 self.timings["host_raw_enqueue_s"] = time.perf_counter() - raw_started
                 matrices_started = time.perf_counter()
-                for unit in self.units:
-                    self._apply_tensor(unit)
+                for batch in self.batches:
+                    self._apply_batch(batch)
                 self.timings["host_matrix_enqueue_s"] = (
                     time.perf_counter() - matrices_started
                 )
@@ -1138,29 +1241,31 @@ class PreparedDelta:
             "applied": True,
             "verification": "artifact-sha256-and-decoder-status",
             "target_version": self.target_version,
-            "tensors": len(self.units) + self.raw_tensor_count,
+            "tensors": self.matrix_tensor_count + self.raw_tensor_count,
             "timing_enabled": self.timing_enabled,
             "timings": self.timings,
             "h2d_bytes": self.h2d_bytes,
         }
 
-    def _apply_tensor(self, unit):
-        binding = unit.binding
-        decoded = self.decoded[: unit.nbytes]
-        with self._phase("paused_tensor_h2d"):
-            self.encoded[: unit.pinned.numel()].copy_(unit.pinned, non_blocking=True)
+    def _apply_batch(self, batch):
+        with self._phase("paused_layer_h2d"):
+            for destination, source in batch.copies:
+                destination.copy_(source, non_blocking=True)
         with self._phase("decode"):
             # Raw targets have a separate prepared arena and foreach-copy
-            # pass. Every unit here is XOR; absent frames are zero deltas.
-            decoded.zero_()
-            unit.decoder.enqueue()
-            invalid = (unit.decoder.statuses != 0).any() | (
-                unit.decoder.actual_sizes != unit.decoder.expected_sizes
+            # pass. Every tensor here is XOR; absent frames are zero deltas.
+            batch.decoded.zero_()
+            batch.decoder.enqueue()
+            invalid = (batch.decoder.statuses != 0).any() | (
+                batch.decoder.actual_sizes != batch.decoder.expected_sizes
             ).any()
             self.error.bitwise_or_(invalid.to(torch.int32))
         # No gather of current weights, canonical reconstruction or weight hash.
         with self._phase("layout_apply"):
-            binding.xor(torch.where(self.error == 0, unit.payload, 0))
+            for group, pointers in batch.groups:
+                group.enqueue(pointers, self.error)
+            for apply, payload in batch.transformed:
+                apply(torch.where(self.error == 0, payload, 0))
 
     def release_and_close(self):
         # Miles queues resume only after every original engine rank applied.
@@ -1176,8 +1281,9 @@ class PreparedDelta:
         # drained; no device-wide synchronization is performed here.
         if self.stream is not None:
             self.stream.synchronize()
-        self.units.clear()
+        self.batches.clear()
         self.raw_copies.clear()
+        self.apply_metadata = self.apply_host_metadata = None
         if self.host_snapshot is not None:
             self.host_snapshot.close()
             self.host_snapshot = None

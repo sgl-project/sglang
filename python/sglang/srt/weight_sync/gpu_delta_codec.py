@@ -164,7 +164,7 @@ class NvcompDecoder:
     def allocate_workspace(
         self, batches: Sequence[Sequence[DecodeFrame]]
     ) -> DecodeWorkspace:
-        """Reserve one reusable arena for sequential tensor decoding during preparation."""
+        """Reserve reusable workspace for the largest layer batch before apply."""
         maximum_count = max((len(batch) for batch in batches), default=0)
         temporary = max((self.temporary_bytes(batch) for batch in batches), default=0)
         with torch.cuda.device(self.device):
@@ -182,7 +182,7 @@ class NvcompDecoder:
         workspace: DecodeWorkspace,
         stream: torch.cuda.Stream,
     ) -> list[PreparedDecode]:
-        """Upload all tensor plans in one metadata slab before the serving pause.
+        """Upload all layer plans in one metadata slab before the serving pause.
 
         Plans reuse encoded, decoded and workspace buffers sequentially on the
         captured stream. The caller owns that stream/device context and orders

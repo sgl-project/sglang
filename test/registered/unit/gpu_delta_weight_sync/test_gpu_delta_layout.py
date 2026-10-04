@@ -94,6 +94,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
         ]
         backend = SimpleNamespace(
             _canonical_plan=None,
+            batch_plan=None,
             layout=SimpleNamespace(
                 inventory={
                     name: {"dtype": "U8", "shape": [2, 4]}
@@ -260,24 +261,25 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     actual_sizes=torch.tensor([size]),
                     expected_sizes=torch.tensor([size]),
                 )
-                unit = layout._PreparedTensor(
-                    binding,
-                    size,
-                    torch.empty_like(canonical),
+                pinned = torch.empty_like(canonical)
+                batch = layout._PreparedBatch(
+                    [(prepared.encoded, pinned)],
+                    prepared.decoded,
                     decoder,
-                    payload,
+                    [],
+                    [(binding.xor, payload)],
                 )
                 expected = _bytes(target).clone()
                 pointer, stride = target.data_ptr(), target.stride()
                 # Two successful decodes observe new scratch values. An error
                 # then gates both that mask and every later mask in the batch.
                 for status in (0, 0, 1, 0):
-                    unit.pinned.random_(256)
+                    pinned.random_(256)
                     decoder.statuses.fill_(status)
                     if not status and not prepared.error.item():
-                        mask = unit.pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
+                        mask = pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
                         expected.bitwise_xor_(_bytes(mask))
-                    prepared._apply_tensor(unit)
+                    prepared._apply_batch(batch)
                     torch.testing.assert_close(_bytes(target), expected)
                     self.assertEqual(target.data_ptr(), pointer)
                     self.assertEqual(target.stride(), stride)
@@ -432,7 +434,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     )
                     prepared.ready = object()
                     prepared.timing_enabled = False
-                    prepared.raw_copies, prepared.units = {}, []
+                    prepared.raw_copies, prepared.batches = {}, []
+                    prepared.matrix_tensor_count = 0
                     prepared.raw_tensor_count = 0
                     prepared.derived = [
                         layout.DerivedImage("consumer", target, source),
@@ -564,12 +567,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
-    def test_snappy_streaming_unwraps_only_local_tensors_and_reuses_scratch(self):
+    def test_layer_batches_share_host_spans_and_reuse_decoder_scratch(self):
         import zstandard as zstd
 
-        targets = [torch.zeros(2, size, dtype=torch.uint8) for size in (4, 6)]
+        targets = [torch.zeros(2, size, dtype=torch.uint8) for size in (4, 6, 5, 3)]
+        names = [
+            "model.layers.0.a",
+            "model.layers.0.b",
+            "model.layers.1.a",
+            "standalone",
+        ]
         local = [
-            layout._direct_binding(str(i), {"dtype": "U8", "shape": list(t.shape)}, t)
+            layout._direct_binding(names[i], {"dtype": "U8", "shape": list(t.shape)}, t)
             for i, t in enumerate(targets)
         ]
         foreign = layout._direct_binding(
@@ -629,7 +638,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             stream_id="test",
             base_version=0,
             target_version=1,
-            plan_digest=layout._digest(definitions),
+            plan_digest=layout._digest(
+                sorted(definitions, key=lambda entry: entry["name"])
+            ),
         )
         manifest = dict(
             protocol_version=4,
@@ -641,10 +652,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         backend = SimpleNamespace(
             _canonical_plan=None,
+            batch_plan=None,
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
-                bindings=[local[0], local[0], local[1]],
+                bindings=local,
                 inventory={
                     b.name: {"dtype": b.dtype, "shape": list(b.shape)}
                     for b in (*local, foreign)
@@ -660,7 +672,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.device = device
 
             def allocate_workspace(self, batches):
-                return object()
+                return SimpleNamespace(temporary=torch.empty(0))
 
             def prepare_batches(self, batches, encoded, decoded, workspace, stream):
                 return [self._prepare(frames, encoded, decoded) for frames in batches]
@@ -715,34 +727,58 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     "sglang.srt.weight_sync.gpu_delta_codec.NvcompDecoder",
                     CpuLiteralDecoder,
                 ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
+                            plan_groups=lambda outputs: ([], outputs)
+                        )
+                    },
+                ),
             ):
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
                 self.assertEqual(prepared.timings["host_payload_cache_created"], 1)
-                self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 2)
-                self.assertEqual(prepared.timings["host_outer_zstd_frames"], 2)
-                self.assertEqual(
-                    prepared.units[0].pinned.data_ptr(),
-                    prepared.units[1].pinned.data_ptr(),
-                )
-                self.assertEqual(prepared.encoded.numel(), 14)
-                self.assertEqual(prepared.decoded.numel(), 12)
-                self.assertEqual(prepared.h2d_bytes, 34)
+                self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 4)
+                self.assertEqual(prepared.timings["host_outer_zstd_frames"], 4)
+                self.assertEqual(prepared.encoded.numel(), 30)
+                self.assertEqual(prepared.decoded.numel(), 28)
+                self.assertEqual(prepared.h2d_bytes, 50)
+                self.assertEqual(prepared.timings["compressed_batches"], 3)
+                self.assertEqual(prepared.timings["compressed_h2d_spans"], 3)
+                self.assertEqual(len(prepared.batches[0].decoder.statuses), 2)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
                 pointer = prepared.encoded.data_ptr()
-                for unit, target in [
-                    (prepared.units[0], targets[0]),
-                    (prepared.units[2], targets[1]),
-                ]:
-                    prepared._apply_tensor(unit)
+                for batch in prepared.batches:
+                    for _, source in batch.copies:
+                        self.assertEqual(
+                            source.untyped_storage().data_ptr(),
+                            backend.host_arena.tensor.untyped_storage().data_ptr(),
+                        )
+                    prepared._apply_batch(batch)
+                    self.assertEqual(prepared.encoded.data_ptr(), pointer)
+                for target in targets:
                     torch.testing.assert_close(
                         target,
                         torch.arange(target.numel(), dtype=torch.uint8).reshape(
                             target.shape
                         ),
                     )
-                    self.assertEqual(prepared.encoded.data_ptr(), pointer)
+                # Static geometry survives only while the active set matches;
+                # wire-frame coordinates are rebuilt independently each update.
+                previous = backend.batch_plan
+                self.assertIs(
+                    layout._plan_layers(
+                        backend, local, {e["name"]: e for e in entries}
+                    ),
+                    previous[1],
+                )
+                reduced = layout._plan_layers(
+                    backend, local[1:], {e["name"]: e for e in entries}
+                )
+                self.assertEqual(reduced[0][0][0][0].name, names[1])
+                self.assertIsNot(backend.batch_plan, previous)
                 # An engine-proof release permits the next immutable publication;
                 # its corrupt payload must still fail before model writes.
                 prepared.host_snapshot.mark_reusable()
@@ -757,8 +793,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 content = json.dumps(manifest).encode()
                 path.write_bytes(content)
                 targets[0].zero_()
-                path.with_name("0.bin").write_bytes(
-                    blobs["0"][:-1] + bytes([blobs["0"][-1] ^ 1])
+                path.with_name(names[0] + ".bin").write_bytes(
+                    blobs[names[0]][:-1] + bytes([blobs[names[0]][-1] ^ 1])
                 )
                 with self.assertRaisesRegex(ValueError, "SHA256"):
                     layout.PreparedDelta(
@@ -911,6 +947,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         backend = SimpleNamespace(
             _canonical_plan=None,
+            batch_plan=None,
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
@@ -950,7 +987,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
-            self.assertFalse(prepared.units)
+            self.assertFalse(prepared.batches)
             self.assertIsNone(prepared.decoder)
             self.assertEqual(prepared.timings["raw_tensors"], 4)
             self.assertEqual(prepared.timings["raw_bytes"], len(blob))

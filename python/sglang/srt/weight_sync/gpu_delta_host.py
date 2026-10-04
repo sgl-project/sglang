@@ -22,6 +22,7 @@ import hashlib
 import json
 import mmap
 import os
+import re
 import stat
 import time
 import uuid
@@ -159,6 +160,12 @@ def _hash_payloads(files, definitions):
     return time.perf_counter() - started
 
 
+def _natural_key(name):
+    return tuple(
+        int(piece) if piece.isdigit() else piece for piece in re.split(r"(\d+)", name)
+    )
+
+
 def _tensor_layout(entries):
     layout, size = {}, 0
     for entry in entries:
@@ -257,6 +264,7 @@ class HostArena:
         self.registered = False
         self.identity = None
         self.directory = None
+        self.tensor_order = None
 
     def prepare(
         self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
@@ -383,7 +391,18 @@ class HostArena:
                 entries_by_name = {
                     entry["name"]: entry for entry in manifest["tensors"]
                 }
-                entries = [entries_by_name[name] for name in names]
+                if self.tensor_order is None:
+                    # Keep each layer's compressed tensors adjacent, with expert
+                    # numbers in natural order. Raw targets use a separate pass.
+                    # The namespace fixes this inventory for the arena lifetime.
+                    self.tensor_order = sorted(
+                        names,
+                        key=lambda name: (
+                            entries_by_name[name]["encoding"] == "raw_bytes",
+                            _natural_key(name),
+                        ),
+                    )
+                entries = [entries_by_name[name] for name in self.tensor_order]
                 layout, size = _tensor_layout(entries)
                 encoded_size = sum(record["nbytes"] for record in definitions.values())
                 shared = _reserve(
