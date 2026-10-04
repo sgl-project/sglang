@@ -245,6 +245,21 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
+    if (
+        _is_hip
+        and pin_memory
+        and type(allocator) is HostTensorAllocator
+        and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
+    ):
+        # hipHostRegister always uses USERPTR, even when the runtime is asked
+        # to allocate non-USERPTR host memory. Use the HIP-owned allocation in
+        # that mode so CPU page migration cannot invalidate this entire pool.
+        # Storage-specific allocators must retain their own backing/lifetime.
+        buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+        # PyTorch owns hipHostFree. Do not cudaHostUnregister this allocation
+        # from HostKVCache.destroy(), including during partial startup failure.
+        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+        return buffer
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
