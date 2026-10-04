@@ -348,7 +348,11 @@ class TestLinearParallelGroups(CustomTestCase):
             ) as allocator,
         ):
             layer = RowParallelLinear(
-                8, 8, input_is_parallel=False, parallel_group="attn_tp"
+                8,
+                8,
+                input_is_parallel=False,
+                parallel_group="attn_tp",
+                use_dp_attention_reduce=True,
             )
             layer.weight.weight_loader(layer.weight, self.weight)
             layer.bias.weight_loader(layer.bias, bias)
@@ -368,45 +372,92 @@ class TestLinearParallelGroups(CustomTestCase):
                 layer.weight.weight_loader(layer.weight, self.weight + 1)
             torch.testing.assert_close(layer.weight, self.weight[:, 4:] + 1)
 
-    def test_allocation_override_preserves_replicated_math_and_padding_policy(self):
-        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
-        attn = SimpleNamespace(world_size=2, all_reduce=Mock())
-        for group in ("tp", "attn_tp"):
-            for symmetric in (False, True):
-                with self.subTest(group=group, symmetric=symmetric):
-                    with (
-                        get_parallel().override(tp_group=tp, attn_tp_group=attn),
-                        patch(
-                            "sglang.srt.layers.linear.is_allocation_symmetric",
-                            return_value=symmetric,
-                        ),
-                        patch(
-                            "sglang.srt.layers.linear.use_symmetric_memory",
-                            return_value=nullcontext(),
-                        ) as allocator,
-                    ):
-                        layer = RowParallelLinear(
-                            8,
-                            8,
-                            bias=False,
-                            input_is_parallel=False,
-                            parallel_group="replicated",
-                            allocation_group=group,
-                        )
-                        layer.weight.weight_loader(layer.weight, self.weight)
-                        torch.testing.assert_close(
-                            layer(self.x)[0], F.linear(self.x, self.weight)
-                        )
-                        if group == "tp":
-                            allocator.assert_called_once_with(
-                                tp, disabled=not symmetric
+    def test_row_partition_keeps_independent_reduction_and_allocation_policies(self):
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock(side_effect=lambda x: x * 2))
+        attn = SimpleNamespace(
+            world_size=2, all_reduce=Mock(side_effect=lambda x: x * 3)
+        )
+        for group, rank, size in (
+            ("tp", 3, 4),
+            ("attn_tp", 1, 2),
+            ("replicated", 0, 1),
+        ):
+            default = RowParallelLinear(8, 8, parallel_group=group)
+            self.assertFalse(default.use_dp_attention_reduce)
+            for attention_reduce in (False, True):
+                for reduce_results in (False, True):
+                    for symmetric in (False, True):
+                        with self.subTest(
+                            group=group,
+                            attention_reduce=attention_reduce,
+                            reduce_results=reduce_results,
+                            symmetric=symmetric,
+                        ):
+                            layer = RowParallelLinear(
+                                8,
+                                8,
+                                bias=False,
+                                input_is_parallel=False,
+                                parallel_group=group,
+                                use_dp_attention_reduce=attention_reduce,
+                                reduce_results=reduce_results,
                             )
-                        else:
-                            allocator.assert_called_once_with(attn)
-                    tp.all_reduce.assert_not_called()
-                    attn.all_reduce.assert_not_called()
-        with self.assertRaisesRegex(ValueError, "Unknown linear allocation_group"):
-            RowParallelLinear(8, 8, allocation_group="replicated")
+                            with get_parallel().override(
+                                tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                            ):
+                                layer.weight.weight_loader(layer.weight, self.weight)
+                            shard = self.weight.chunk(size, dim=1)[rank]
+                            partial = F.linear(self.x.chunk(size, dim=1)[rank], shard)
+                            with (
+                                get_parallel().override(
+                                    tp_group=tp, attn_tp_group=attn
+                                ),
+                                patch(
+                                    "sglang.srt.layers.linear.is_allocation_symmetric",
+                                    return_value=symmetric,
+                                ),
+                                patch(
+                                    "sglang.srt.layers.linear.use_symmetric_memory",
+                                    return_value=nullcontext(),
+                                ) as allocator,
+                            ):
+                                # Existing runtime writers may switch execution
+                                # policy without changing the stored partition.
+                                for policy in (attention_reduce, not attention_reduce):
+                                    layer.use_dp_attention_reduce = policy
+                                    tp.all_reduce.reset_mock()
+                                    attn.all_reduce.reset_mock()
+                                    allocator.reset_mock()
+                                    selected, other = (
+                                        (attn, tp) if policy else (tp, attn)
+                                    )
+                                    reduces = reduce_results and size > 1
+                                    expected = (
+                                        partial * (3 if policy else 2)
+                                        if reduces
+                                        else partial
+                                    )
+                                    torch.testing.assert_close(
+                                        layer(self.x)[0], expected
+                                    )
+                                    if reduces:
+                                        selected.all_reduce.assert_called_once()
+                                        torch.testing.assert_close(
+                                            selected.all_reduce.call_args.args[0],
+                                            partial,
+                                        )
+                                    else:
+                                        selected.all_reduce.assert_not_called()
+                                    other.all_reduce.assert_not_called()
+                                    if policy:
+                                        allocator.assert_called_once_with(attn)
+                                    else:
+                                        allocator.assert_called_once_with(
+                                            tp, disabled=not symmetric
+                                        )
+                                    self.assertEqual(
+                                        (layer.tp_rank, layer.tp_size), (rank, size)
+                                    )
 
     def test_replicated_model_mlps_keep_weights_and_tp_output_allocation(self):
         from sglang.srt.models.exaone_moe import ExaoneMoEMLP
@@ -516,13 +567,7 @@ class TestLinearParallelGroups(CustomTestCase):
         self.assertFalse(layer.share_expert.down_proj.reduce_results)
 
     def test_replicated_layers_need_no_group_handle(self):
-        with (
-            get_parallel().override(tp_group=None, attn_tp_group=None),
-            patch(
-                "sglang.srt.layers.linear.use_symmetric_memory",
-                side_effect=AssertionError("unexpected allocator"),
-            ),
-        ):
+        with get_parallel().override(tp_group=None, attn_tp_group=None):
             for cls, kwargs in (
                 (ColumnParallelLinear, dict(gather_output=True)),
                 (RowParallelLinear, dict(input_is_parallel=False)),
@@ -553,10 +598,11 @@ class TestLinearParallelGroups(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "Unknown linear parallel_group"):
                 build(parallel_group="unknown")
         for old_reduce in (False, True):
-            with self.assertRaisesRegex(ValueError, "use_dp_attention_reduce"):
-                RowParallelLinear(
-                    8, 8, parallel_group="attn_tp", use_dp_attention_reduce=old_reduce
-                )
+            layer = RowParallelLinear(
+                8, 8, parallel_group="attn_tp", use_dp_attention_reduce=old_reduce
+            )
+            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+            self.assertEqual(layer.use_dp_attention_reduce, old_reduce)
         legacy = RowParallelLinear(
             8, 8, tp_rank=1, tp_size=2, use_dp_attention_reduce=True
         )

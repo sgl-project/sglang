@@ -203,7 +203,6 @@ class Qwen2MoeMLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
             parallel_group=parallel_group,
-            allocation_group="tp" if parallel_group == "replicated" else None,
         )
         if hidden_act != "silu":
             raise ValueError(
