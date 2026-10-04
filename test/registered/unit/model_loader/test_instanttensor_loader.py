@@ -385,6 +385,9 @@ class TestInstantTensorHostResidentWeights(CustomTestCase):
         self.assertCountEqual([name for name, _ in result], self.expected)
         on_host = set()
         for name, tensor in result:
+            if isinstance(tensor, weight_utils.SafetensorsRowSource):
+                rows, tensor = tensor, torch.empty(tensor.shape, dtype=tensor.dtype)
+                rows.read_rows_into(tensor, 0)
             expected = self.expected[name]
             self.assertEqual(
                 (tensor.shape, tensor.dtype), (expected.shape, expected.dtype)
@@ -397,6 +400,15 @@ class TestInstantTensorHostResidentWeights(CustomTestCase):
 
     def test_engram_tables_stay_on_host(self):
         result = self._load(self._dsv4_source(host_table=True))
+        row_sources = {
+            name
+            for name, tensor in result
+            if isinstance(tensor, weight_utils.SafetensorsRowSource)
+        }
+        self.assertEqual(
+            row_sources,
+            {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"},
+        )
 
         self.assertEqual(self.instanttensor_calls, [[self.files[0], self.files[2]]])
         # The Engram file's other tensor is read on the host but placed on the

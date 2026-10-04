@@ -119,6 +119,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    host_resident_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
     instanttensor_weights_iterator,
@@ -457,8 +458,9 @@ class DefaultModelLoader(BaseModelLoader):
         host_resident_weight_patterns: Optional[Tuple[str, ...]] = None
         """Substrings of checkpoint tensor names the model keeps in host memory.
 
-        Device-direct loaders (InstantTensor) load the files containing them
-        through the CPU safetensors path instead."""
+        Device-direct loaders (InstantTensor) load the files containing them on
+        the host and yield matching tensors as ``SafetensorsRowSource``, which
+        the parameters' weight loaders must accept."""
 
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
@@ -700,13 +702,11 @@ class DefaultModelLoader(BaseModelLoader):
             if host_files:
                 logger.info(
                     "Loading %d checkpoint file(s) with host-resident weights "
-                    "through the safetensors path.",
+                    "through positioned reads.",
                     len(host_files),
                 )
-                host_weights = buffered_multi_thread_safetensors_weights_iterator(
-                    host_files,
-                    max_workers=self.DEFAULT_NUM_THREADS,
-                    disable_mmap=get_model().weight_loader_disable_mmap,
+                host_weights = host_resident_weights_iterator(
+                    host_files, source.host_resident_weight_patterns
                 )
                 weights_iterator = itertools.chain(
                     weights_iterator,
