@@ -2606,7 +2606,8 @@ def _mock_swa_write_back_io(case, backup="success"):
         host_pool.available_size.return_value = count
         return count
 
-    def write(node, full, transfers, sidecars):
+    def write(node_ids, full, transfers, sidecars):
+        (node,) = node_ids
         assert sidecars == []
         assert_resident(node, transfers)
         case.events.append(("write", node))
@@ -3484,7 +3485,8 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
     cache._build_backup_sidecar = Mock(return_value=[])
     submissions = []
 
-    def write(node, device, aux, sidecars):
+    def write(node_ids, device, aux, sidecars):
+        (node,) = node_ids
         submissions.append((node, device.numel()))
         for transfers in aux.values():
             for transfer in transfers:
@@ -3576,7 +3578,8 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
     cache._build_backup_sidecar = Mock(return_value=[])
     submissions = []
 
-    def write(node, full, aux, sidecars):
+    def write(node_ids, full, aux, sidecars):
+        (node,) = node_ids
         submissions.append((node, full.numel(), aux))
         for transfers in aux.values():
             for transfer in transfers:
@@ -3678,7 +3681,8 @@ def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
     submissions = []
     failed_node = None
 
-    def write(node, full, aux, sidecars):
+    def write(node_ids, full, aux, sidecars):
+        (node,) = node_ids
         submissions.append((node, full.numel(), aux))
         if node == failed_node:
             return None  # Full host allocation failed before submitting DMA.
@@ -4316,7 +4320,8 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
         host_pool.available_size.return_value = 1
         return 1
 
-    def write(node_id, values, transfers, sidecars):
+    def write(node_ids, values, transfers, sidecars):
+        (node_id,) = node_ids
         assert node_id == node and values.tolist() == [10] and sidecars == []
         assert_state_resident()
         events.append("write")
