@@ -169,7 +169,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   int sampled_id = temp_storage.sampled_id;
   if (sampled_id == d) {
     if (temp_storage.last_valid_id == -1) {
-      // Rejected candidates can exhaust the target support when its CDF rounds below the coin.
+      // Rejected candidates can exhaust target support when the rounded CDF is at or below the coin.
       sampled_id = last_rejected_token_id != -1 ? last_rejected_token_id : d - 1;
     } else {
       sampled_id = temp_storage.last_valid_id;
