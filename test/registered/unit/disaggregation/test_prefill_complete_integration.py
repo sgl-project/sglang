@@ -157,7 +157,7 @@ class TestAllocationIntegration(CustomTestCase):
                 )
 
     def sender(self, room=1):
-        return MooncakeKVSender(self.prefill, "prefill:8998", room, [0], 0)
+        return MooncakeKVSender(self.prefill, "prefill:8998", room)
 
     def receiver(self, room=1, policy="prefill_complete"):
         receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
@@ -386,7 +386,7 @@ class TestAllocationIntegration(CustomTestCase):
         duplicate.clear()
 
     def test_fake_warmup_sender_never_registers_deferred_bootstrap(self):
-        sender = FakeKVSender(self.prefill, "fake:0", 0, [0], 0)
+        sender = FakeKVSender(self.prefill, "fake:0", 0)
         sender.init(0)
         sender.mark_prefill_complete()
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)

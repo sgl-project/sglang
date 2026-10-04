@@ -2058,6 +2058,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2132,4 +2138,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor
