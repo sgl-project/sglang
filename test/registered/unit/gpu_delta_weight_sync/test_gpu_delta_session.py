@@ -82,7 +82,7 @@ def request(participants):
 def wait_state(session, state):
     until = time.monotonic() + 5
     while time.monotonic() < until:
-        receipt = session.status("publication-1")
+        receipt = session.status()
         if receipt["state"] == state:
             return receipt
         time.sleep(0.001)
@@ -113,7 +113,7 @@ def prepare_ready(session, backend, req=None):
 
 def applied(session, backend, req=None):
     prepare_ready(session, backend, req)
-    return session.apply("publication-1", lambda: None, lambda: None, lambda: True)
+    return session.apply(lambda: None, lambda: None, lambda: True)
 
 
 def test_prepare_and_status_do_not_wait_for_file_io(make_session):
@@ -122,18 +122,21 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     preparing = session.prepare(req)
     assert preparing["state"] == "PREPARING"
     assert backend.started.wait(2)
-    status = session.status("publication-1")
+    status = session.status()
     assert status["state"] == "PREPARING"
     assert backend.payload.applications == 0
     session.abort("publication-1")
     backend.ready.set()
     assert backend.payload.closed.wait(2)
-    assert session.status("publication-1")["state"] == "ABORTED"
+    assert session.status()["state"] == "ABORTED"
     assert not backend.payload.released.is_set()
 
 
 def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session):
     session, backend = make_session()
+    other, other_backend = make_session(identity("b"))
+    other.prepare(request([other.identity]))
+    assert other_backend.started.wait(2)
     applied(session, backend)
     entered, release = threading.Event(), threading.Event()
     caller = threading.get_ident()
@@ -147,8 +150,10 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
 
     backend.payload.release_and_close = cleanup
     try:
-        assert session.resume("publication-1", lambda _: None)["state"] == "RESUMED"
+        assert session.resume(lambda _: None)["state"] == "RESUMED"
         assert entered.wait(2)
+        assert other.status()["state"] == "PREPARING"
+        assert not other_backend.payload.released.is_set()
         backend.started.clear()
         req = request([session.identity]) | dict(
             session_id="publication-2", base_version=1, target_version=2
@@ -169,19 +174,7 @@ def test_bad_publication_never_mutates(make_session):
     assert "checksum" in wait_state(session, "FAILED")["message"]
     assert backend.payload.applications == 0
     session.abort("publication-1")
-    assert session.status("publication-1")["state"] == "ABORTED"
-
-
-def test_engine_resume_does_not_wait_for_another_engine(make_session):
-    first, first_backend = make_session(identity("a"))
-    second, second_backend = make_session(identity("b"))
-    second.prepare(request([second.identity]))
-    assert second_backend.started.wait(2)
-    applied(first, first_backend)
-    assert first.resume("publication-1", lambda _: None)["state"] == "RESUMED"
-    assert first_backend.payload.released.wait(2)
-    assert second.status("publication-1")["state"] == "PREPARING"
-    assert not second_backend.payload.released.is_set()
+    assert session.status()["state"] == "ABORTED"
 
 
 @pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])
@@ -193,7 +186,7 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
     events = []
 
     def phase(name):
-        assert session.status("publication-1")["state"] == "APPLYING"
+        assert session.status()["state"] == "APPLYING"
         events.append(name)
         if name == failure:
             raise RuntimeError(name + " failed")
@@ -201,7 +194,6 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
 
     with pytest.raises(RuntimeError):
         session.apply(
-            "publication-1",
             lambda: phase("fence"),
             lambda: phase("retract"),
             lambda: phase("flush"),
@@ -213,7 +205,7 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
         else events == expected
     )
     assert backend.payload.applications == (1 if failure == "apply" else 0)
-    status = session.status("publication-1")
+    status = session.status()
     assert (
         status["state"] == "POISONED"
         and status["scheduler_timing"]["blocked_s"] is None
@@ -226,12 +218,11 @@ def test_resume_failure_retains_ownership(make_session):
     applied(session, backend)
     with pytest.raises(RuntimeError, match="resume failed"):
         session.resume(
-            "publication-1",
             lambda _: (_ for _ in ()).throw(RuntimeError("resume failed")),
         )
-    assert session.status("publication-1")["state"] == "RESUMING"
+    assert session.status()["state"] == "RESUMING"
     assert not backend.payload.released.is_set()
-    assert session.status("publication-1")["scheduler_timing"]["blocked_s"] is None
+    assert session.status()["scheduler_timing"]["blocked_s"] is None
 
 
 def test_scheduler_blocked_timing_excludes_background_prepare(
@@ -243,21 +234,16 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
     )
     session, backend = make_session()
     prepare_ready(session, backend)
-    assert (
-        session.status("publication-1")["scheduler_timing"]["pause_started_ns"] is None
-    )
+    assert session.status()["scheduler_timing"]["pause_started_ns"] is None
     now[0] = 10_000_000_000
 
     def fence():
-        assert (
-            session.status("publication-1")["scheduler_timing"]["pause_started_ns"]
-            == now[0]
-        )
+        assert session.status()["scheduler_timing"]["pause_started_ns"] == now[0]
         now[0] = 20_000_000_000
 
-    receipt = session.apply("publication-1", fence, lambda: None, lambda: True)
+    receipt = session.apply(fence, lambda: None, lambda: True)
     now[0] = 60_000_000_000
-    resumed = session.resume("publication-1", lambda _: None)
+    resumed = session.resume(lambda _: None)
     assert resumed["scheduler_timing"] == {
         "clock": "monotonic_ns",
         "pause_started_ns": 10_000_000_000,
@@ -347,9 +333,7 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
     with pytest.raises((RuntimeError, ValueError), match=cache):
         control._describe("engine-0")
     assert calls == (["shared"] if cache == "shared IPC" else ["shared", "derived"])
-    assert (
-        control.identity is None and control.backend is None and control.session is None
-    )
+    assert control.session is None
 
 
 def test_late_reply_after_cancellation_cannot_acknowledge_resume():

@@ -21,7 +21,7 @@ class GpuDeltaTokenizerControl:
             [(DeltaWeightsReqOutput, self.communicator.handle_recv)]
         )
 
-    async def request(self, obj, request=None):
+    async def request(self, obj):
         if isinstance(
             obj, (UpdateWeightsFromDeltaReqInput, ResumeWeightsFromDeltaReqInput)
         ):

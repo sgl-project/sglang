@@ -85,7 +85,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
     prepared_batches = []
     with torch.cuda.device(device), torch.cuda.stream(stream):
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
-        for plan, size in zip(plans, output_sizes):
+        for plan, frames, size in zip(plans, batches, output_sizes):
             gaps = _decoded_gaps(
                 [(SimpleNamespace(name="weight"), 0, size)],
                 {
@@ -95,7 +95,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
                                 "decoded_offset": f.output_offset,
                                 "decoded_bytes": f.decoded_bytes,
                             }
-                            for f in plan.frames
+                            for f in frames
                         ]
                     }
                 },
@@ -104,7 +104,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
                 _PreparedBatch(
                     [],
                     plan,
-                    [],
+                    None,
                     [],
                     [decoded[offset : offset + length] for offset, length in gaps],
                     prepare_status_check(plan, prepared.error),

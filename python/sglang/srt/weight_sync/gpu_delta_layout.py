@@ -22,7 +22,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Callable
 
 import orjson
@@ -781,7 +781,7 @@ class GpuDeltaBackend:
 class _PreparedBatch:
     copies: list[tuple[torch.Tensor, torch.Tensor]]
     decoder: object
-    groups: list
+    apply: Callable[[], None] | None
     transformed: list[tuple[Callable, torch.Tensor]]
     zero_ranges: list[torch.Tensor]
     check_status: Callable[[], None]
@@ -794,7 +794,7 @@ def _plan_layers(backend, bindings, entries):
         if not bindings:
             backend.batch_plan = (key, [])
             return []
-        from sglang.srt.weight_sync.gpu_delta_apply import plan_groups
+        from sglang.srt.weight_sync.gpu_delta_apply import plan_apply
 
         layers = {}
         for binding in bindings:
@@ -807,7 +807,7 @@ def _plan_layers(backend, bindings, entries):
                 nbytes = entries[binding.name]["nbytes"]
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
-            apply, transformed = plan_groups(outputs)
+            apply, transformed = plan_apply(outputs)
             plans.append((outputs, size, apply, transformed))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
@@ -894,9 +894,9 @@ def _qualify_canonical_plan(backend, manifest):
             or entry.get("byte_order") != "little"
         ):
             raise ValueError(f"canonical tensor metadata mismatch: {name}")
-        if entry["nbytes"] != math.prod(entry["shape"]) * _itemsize(
+        if entry["nbytes"] != math.prod(entry["shape"]) * _ITEMSIZES[
             entry["dtype"]
-        ) or entry["encoding"] != (
+        ] or entry["encoding"] != (
             "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
         ):
             raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
@@ -960,7 +960,6 @@ class PreparedDelta:
         self.backend = backend
         self.device = backend.device
         self.stream = torch.cuda.Stream(device=self.device)
-        self.done = None
         manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
         content = path.read_bytes()
@@ -1128,17 +1127,19 @@ class PreparedDelta:
                 0,
                 0,
             )
-            for _, _, groups, _ in static_plans:
-                for group in groups:
-                    tuned, footprint, elapsed, reused, skipped = group.prepare(
-                        self.decoded, self.error
-                    )
-                    tuned_batches += tuned
-                    tune_bytes += footprint
-                    tune_s += elapsed
-                    tune_cache_hits += reused
-                    tune_skipped += skipped
-                    pointer_rows.extend(group.pointer_rows(self.decoded.data_ptr()))
+            apply_groups = [
+                group for _, _, group, _ in static_plans if group is not None
+            ]
+            for group in apply_groups:
+                tuned, footprint, elapsed, reused, skipped = group.prepare(
+                    self.decoded, self.error
+                )
+                tuned_batches += tuned
+                tune_bytes += footprint
+                tune_s += elapsed
+                tune_cache_hits += reused
+                tune_skipped += skipped
+                pointer_rows.extend(group.pointer_rows(self.decoded.data_ptr()))
             self.apply_host_metadata = torch.empty(
                 len(pointer_rows), dtype=torch.int64, pin_memory=True
             )
@@ -1149,15 +1150,15 @@ class PreparedDelta:
             position = 0
             for index, (
                 (_, spans, _),
-                (outputs, _, groups, transformed),
+                (outputs, _, group, transformed),
                 decode,
             ) in enumerate(zip(plans, static_plans, decoders)):
                 slot_offset = (index % self.h2d_stages) * self.encoded_slot_bytes
-                prepared_groups = []
-                for group in groups:
+                apply = None
+                if group is not None:
                     count = 2 * len(group.sources)
                     pointers = self.apply_metadata[position : position + count]
-                    prepared_groups.append((group, pointers))
+                    apply = partial(group.launch, pointers, self.error)
                     position += count
                 self.batches.append(
                     _PreparedBatch(
@@ -1171,7 +1172,7 @@ class PreparedDelta:
                             for source, target, size in spans
                         ],
                         decode,
-                        prepared_groups,
+                        apply,
                         [
                             (
                                 binding.xor,
@@ -1199,8 +1200,8 @@ class PreparedDelta:
                 for image in backend.layout.derived
                 if image.source.untyped_storage().data_ptr() in changed_storages
             ]
-            self.ready = torch.cuda.Event()
-            self.ready.record(self.stream)
+            ready = torch.cuda.Event()
+            ready.record(self.stream)
         self.timings.update(
             host_decoder_prepare_s=time.perf_counter() - decoder_started,
             host_apply_tune_s=tune_s,
@@ -1211,24 +1212,14 @@ class PreparedDelta:
             decoder_metadata_uploads=int(bool(plans)),
             decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frames)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
-            apply_groups=sum(len(batch.groups) for batch in self.batches),
-            apply_grid_ctas=sum(
-                group.grid[0] for batch in self.batches for group, _ in batch.groups
-            ),
+            apply_groups=len(apply_groups),
+            apply_grid_ctas=sum(group.grid[0] for group in apply_groups),
             apply_descriptor_h2d_bytes=0,
-            apply_contracts=sum(
-                len(group.contracts)
-                for batch in self.batches
-                for group, _ in batch.groups
-            ),
+            apply_contracts=sum(len(group.contracts) for group in apply_groups),
             apply_word32_contracts=sum(
-                group.word32_contracts
-                for batch in self.batches
-                for group, _ in batch.groups
+                group.word32_contracts for group in apply_groups
             ),
-            apply_static_groups=sum(
-                group.config[2] for batch in self.batches for group, _ in batch.groups
-            ),
+            apply_static_groups=sum(group.config[2] for group in apply_groups),
             transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
             compressed_batches=len(plans),
             compressed_tensors=self.matrix_tensor_count,
@@ -1249,7 +1240,7 @@ class PreparedDelta:
         # immutable pinned inputs, reusable arenas and decoder metadata are ready.
         # Encoded bytes are uploaded only as each model layer is applied.
         ready_started = time.perf_counter()
-        self.ready.synchronize()
+        ready.synchronize()
         self.timings["host_ready_wait_s"] = time.perf_counter() - ready_started
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
         self.h2d_bytes = raw_h2d_bytes + sum(
@@ -1281,7 +1272,6 @@ class PreparedDelta:
             torch.cuda.stream(self.stream),
             torch.no_grad(),
         ):
-            self.stream.wait_event(self.ready)
             self.stream.wait_stream(torch.cuda.default_stream(self.device))
             with self._phase("paused_gpu_total"):
                 raw_started = time.perf_counter()
@@ -1330,10 +1320,10 @@ class PreparedDelta:
                 self.timings["host_derived_enqueue_s"] = (
                     time.perf_counter() - derived_started
                 )
-            self.done = torch.cuda.Event()
-            self.done.record(self.stream)
+            done = torch.cuda.Event()
+            done.record(self.stream)
         completion_started = time.perf_counter()
-        self.done.synchronize()
+        done.synchronize()
         self.timings["host_apply_completion_wait_s"] = (
             time.perf_counter() - completion_started
         )
@@ -1380,8 +1370,8 @@ class PreparedDelta:
     def _apply_batch(self, batch):
         # No gather of current weights, canonical reconstruction or weight hash.
         with self._phase("layout_apply"):
-            for group, pointers in batch.groups:
-                group.enqueue(pointers, self.error)
+            if batch.apply is not None:
+                batch.apply()
             for apply, payload in batch.transformed:
                 apply(torch.where(self.error == 0, payload, 0))
 
@@ -1412,7 +1402,3 @@ class PreparedDelta:
             self.host_snapshot = None
         self.encoded = self.decoded = self.raw_device = self.raw_pinned = None
         self.workspace = self.decoder = None
-
-
-def _itemsize(dtype):
-    return _ITEMSIZES[dtype]

@@ -265,7 +265,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 batch = layout._PreparedBatch(
                     [(prepared.encoded, pinned)],
                     decoder,
-                    [],
+                    None,
                     [(binding.xor, payload)],
                     [],
                     lambda: prepared.error.bitwise_or_(
@@ -440,10 +440,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         layout=SimpleNamespace(check_identity=lambda: None)
                     )
                     prepared.device = torch.device("cpu")
-                    prepared.stream = SimpleNamespace(
-                        wait_event=lambda _: None, wait_stream=lambda _: None
-                    )
-                    prepared.ready = object()
+                    prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
                     prepared.timing_enabled = False
                     prepared.raw_copies, prepared.batches = {}, []
                     prepared.matrix_tensor_count = 0
@@ -742,7 +739,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     sys.modules,
                     {
                         "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
-                            plan_groups=lambda outputs: ([], outputs),
+                            plan_apply=lambda outputs: (None, outputs),
                             prepare_status_check=lambda decoder, error: lambda: None,
                         )
                     },
@@ -942,7 +939,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         ]
         blob, entries = bytearray(), []
         for binding, value in zip(bindings, values + [None]):
-            size = layout.math.prod(binding.shape) * layout._itemsize(binding.dtype)
+            size = layout.math.prod(binding.shape) * binding.torch_dtype.itemsize
             entry = binding.describe() | {
                 "byte_order": "little",
                 "nbytes": size,

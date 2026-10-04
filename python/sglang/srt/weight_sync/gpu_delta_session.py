@@ -86,11 +86,11 @@ class DeltaSession:
             max_workers=1, thread_name_prefix="gpu-delta"
         )
 
-    def status(self, session_id: str) -> dict:
+    def status(self) -> dict:
         with self._lock:
             session = self._session
             request = session.request
-            receipt = {
+            return {
                 "identity": self.identity,
                 "state": session.state,
                 "message": session.message,
@@ -121,11 +121,9 @@ class DeltaSession:
                     ),
                 },
             }
-            return receipt
 
     def prepare(self, request: dict) -> dict:
         with self._lock:
-            session_id = request["session_id"]
             if (
                 request["base_version"] != self.version
                 or request["target_version"] <= self.version
@@ -135,7 +133,7 @@ class DeltaSession:
                 )
             session = self._session = _Session(request=request)
             self._executor.submit(self._prepare, session)
-            return self.status(session_id)
+            return self.status()
 
     def _prepare(self, session: _Session) -> None:
         prepared = None
@@ -160,7 +158,6 @@ class DeltaSession:
 
     def apply(
         self,
-        session_id: str,
         fence: Callable[[], None],
         retract: Callable[[], None],
         flush: Callable[[], bool],
@@ -187,9 +184,9 @@ class DeltaSession:
         with self._lock:
             session.result = result
             session.state = "APPLIED"
-            return self.status(session_id)
+            return self.status()
 
-    def resume(self, session_id: str, resume: Callable[[int], None]) -> dict:
+    def resume(self, resume: Callable[[int], None]) -> dict:
         with self._lock:
             session = self._session
             self.version = session.request["target_version"]
@@ -201,7 +198,7 @@ class DeltaSession:
             # Keep host release I/O off the scheduler; this FIFO executor runs
             # it before the next prepare. Miles sends resume after every rank applied.
             self._executor.submit(prepared.release_and_close)
-            return self.status(session_id)
+            return self.status()
 
     def abort(self, session_id: str) -> dict:
         with self._lock:
@@ -216,7 +213,7 @@ class DeltaSession:
             if session.prepared is not None:
                 prepared, session.prepared = session.prepared, None
                 self._executor.submit(prepared.close)
-            return self.status(session_id)
+            return self.status()
 
 
 def with_gpu_delta_controls(scheduler, dispatcher):
@@ -243,8 +240,6 @@ class GpuDeltaSchedulerControl:
     def __init__(self, scheduler):
         self.scheduler = scheduler
         self.session: DeltaSession | None = None
-        self.identity: dict | None = None
-        self.backend = None
 
     def _describe(self, engine_id: str) -> dict:
         from sglang.srt.runtime_context import get_exec, get_parallel
@@ -283,7 +278,7 @@ class GpuDeltaSchedulerControl:
         error = _unsupported_derived_weight_cache_error(runner.model)
         if error is not None:
             raise ValueError(error)
-        if self.identity is None:
+        if self.session is None:
             from sglang.srt.weight_sync.gpu_delta_host import host_cache_id
             from sglang.srt.weight_sync.gpu_delta_layout import GpuDeltaBackend
 
@@ -302,14 +297,12 @@ class GpuDeltaSchedulerControl:
                 "pp_rank": parallel.pp_rank,
             }
             backend = GpuDeltaBackend(runner, identity)
-            self.identity = identity
-            self.backend = backend
             self.session = DeltaSession(identity, backend)
         return {
-            "identity": self.identity,
+            "identity": self.session.identity,
             "state": "IDLE",
             "version": self.session.version,
-            "plan": self.backend.describe(),
+            "plan": self.session.backend.describe(),
         }
 
     def handle(self, request):
@@ -333,11 +326,10 @@ class GpuDeltaSchedulerControl:
                     }
                 )
             elif isinstance(request, delta_io.GetWeightsDeltaStatusReqInput):
-                receipt = self.session.status(request.session_id)
+                receipt = self.session.status()
             elif isinstance(request, delta_io.UpdateWeightsFromDeltaReqInput):
                 self.scheduler._engine_paused = True
                 receipt = self.session.apply(
-                    request.session_id,
                     self.scheduler.device_module.synchronize,
                     lambda: self.scheduler.pause_generation(
                         io.PauseGenerationReqInput(mode="retract")
@@ -352,7 +344,7 @@ class GpuDeltaSchedulerControl:
                         io.ContinueGenerationReqInput(torch_empty_cache=False)
                     )
 
-                receipt = self.session.resume(request.session_id, resume)
+                receipt = self.session.resume(resume)
             elif isinstance(request, delta_io.AbortWeightsFromDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
@@ -365,11 +357,12 @@ class GpuDeltaSchedulerControl:
                 participant=receipt,
             )
         except Exception as exc:
-            receipt = {"identity": self.identity, "state": "REJECTED"}
+            receipt = {
+                "identity": self.session.identity if self.session else None,
+                "state": "REJECTED",
+            }
             if self.session is not None and self.session._session is not None:
-                receipt = self.session.status(
-                    self.session._session.request["session_id"]
-                )
+                receipt = self.session.status()
             return delta_io.DeltaWeightsReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )

@@ -56,7 +56,6 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
             )
         ),
     )
-    control.identity = who
     try:
         session.prepare(
             dict(
@@ -71,9 +70,7 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
             )
         )
         deadline = time.monotonic() + 2
-        while (
-            session.status("p")["state"] == "PREPARING" and time.monotonic() < deadline
-        ):
+        while session.status()["state"] == "PREPARING" and time.monotonic() < deadline:
             time.sleep(0.001)
         result = wrapped(
             io.UpdateWeightsFromDeltaReqInput(session_id="p", rid="apply-rid")

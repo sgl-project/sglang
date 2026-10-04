@@ -191,7 +191,6 @@ class NvcompDecoder:
         slot reuse after all previous consumers, including metadata upload.
         ``workspace`` must be allocated for these batches with ``allocate_workspace``.
         """
-        batches = [tuple(frames) for frames in batches]
         if not batches:
             return []
         for tensor in (encoded, decoded, workspace.temporary):
@@ -275,7 +274,6 @@ class NvcompDecoder:
             plans.append(
                 PreparedDecode(
                     self,
-                    frames,
                     encoded,
                     decoded,
                     workspace,
@@ -295,7 +293,6 @@ class NvcompDecoder:
 @dataclass
 class PreparedDecode:
     decoder: NvcompDecoder
-    frames: tuple[DecodeFrame, ...]
     encoded: torch.Tensor
     decoded: torch.Tensor
     workspace: DecodeWorkspace
@@ -314,6 +311,6 @@ class PreparedDecode:
         implicit synchronization in destruction; the session owns the final fence
         and enters the captured stream/device context around its apply loop.
         """
-        if not self.frames:
+        if not self.statuses.numel():
             return
         self.decoder._check(self.decoder._decode(*self._arguments))

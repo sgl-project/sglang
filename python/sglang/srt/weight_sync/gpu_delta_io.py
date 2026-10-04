@@ -11,7 +11,6 @@ class GetWeightsDeltaInfoReqInput(BaseReq, kw_only=True):
 
 class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
-    engine_id: str
     manifest_path: str
     manifest_sha256: str
     stream_id: str

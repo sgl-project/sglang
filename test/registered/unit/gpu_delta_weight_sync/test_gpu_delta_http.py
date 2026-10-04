@@ -43,8 +43,7 @@ def http_delta():
     calls = []
     reply = {"success": True, "message": "", "participants": []}
 
-    async def dispatch(obj, request):
-        assert request.app is app
+    async def dispatch(obj):
         calls.append(obj)
         return reply
 
@@ -74,7 +73,6 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
             PrepareWeightsFromDeltaReqInput,
             session
             | {
-                "engine_id": "e0",
                 "manifest_path": "/immutable/manifest.json",
                 "manifest_sha256": "a" * 64,
                 "stream_id": "run-1",
@@ -127,13 +125,11 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
     assert msgpack_decode(msgpack_encode(ordinary)) == ordinary
     assert len(calls) == len(cases)
 
-
-def test_delta_runtime_failure_returns_conflict(http_delta):
-    client, _, calls, reply, _ = http_delta
+    # A real scheduler failure retains the same typed HTTP route and response.
     reply.update(success=False, message="delta payload checksum failed")
     result = client.post("/get_weights_delta_status", json={"session_id": "p"})
     assert result.status_code == 409 and result.json() == reply
-    assert len(calls) == 1
+    assert len(calls) == len(cases) + 1
 
 
 if __name__ == "__main__":

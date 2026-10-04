@@ -7,6 +7,7 @@ as an independent oracle for the feature-owned byte-mask implementation.
 
 import math
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +28,7 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
         _grid,
         _parameters,
         _resident_ctas,
-        plan_groups,
+        plan_apply,
         prepare_status_check,
     )
     from sglang.srt.weight_sync.gpu_delta_layout import PreparedDelta, _PreparedBatch
@@ -46,33 +47,30 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
     decoded = torch.empty(
         size * (4 if all_configs else 1), dtype=torch.uint8, device="cuda"
     )
-    groups, transformed = plan_groups(outputs)
+    group, transformed = plan_apply(outputs)
     saved = [
         (value, value.clone()) for binding in bindings for value in binding.storage
     ]
-    rows = []
-    for group in groups:
+    apply = None
+    if group is not None:
         tuned, _, _, reused, skipped = group.prepare(decoded, prepared.error)
         if all_configs:
             assert tuned or reused
             assert not skipped
-        rows.extend(group.pointer_rows(decoded.data_ptr()))
-    metadata = torch.tensor(rows, dtype=torch.int64, device="cuda")
-    compiled, position = [], 0
-    for group in groups:
-        count = 2 * len(group.sources)
-        pointers = metadata[position : position + count]
-        compiled.append((group, pointers))
-        position += count
-    # A second plan with identical compiled geometry reuses the device query.
-    misses = _resident_ctas.cache_info().misses
-    repeated, _ = plan_groups(outputs)
-    for group, (original, pointers) in zip(repeated, compiled):
-        tuned, footprint, _, reused, skipped = group.prepare(decoded, prepared.error)
+        pointers = torch.tensor(
+            list(group.pointer_rows(decoded.data_ptr())),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        apply = partial(group.launch, pointers, prepared.error)
+        # A second plan with identical compiled geometry reuses the device query.
+        misses = _resident_ctas.cache_info().misses
+        repeated, _ = plan_apply(outputs)
+        tuned, footprint, _, reused, skipped = repeated.prepare(decoded, prepared.error)
         assert tuned == footprint == skipped == 0
         assert reused == 1
-        assert group.kernel is original.kernel
-    assert _resident_ctas.cache_info().misses == misses
+        assert repeated.kernel is group.kernel
+        assert _resident_ctas.cache_info().misses == misses
     # Compilation and module loading must not execute against live weights.
     for value, before in saved:
         torch.testing.assert_close(
@@ -87,7 +85,7 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
     batch = _PreparedBatch(
         [],
         decoder,
-        compiled,
+        apply,
         [
             (binding.xor, binding.selected_bytes(decoded[offset : offset + length]))
             for binding, offset, length in transformed
@@ -119,7 +117,7 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
             for value, before in saved:
                 value.copy_(before)
             prepared._decode_batch(batch)
-            for group, pointers in compiled:
+            if group is not None:
                 kernel = _compiled(
                     group.contracts, group.alignments, decoded.device.index, config
                 )
@@ -132,7 +130,7 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
                 torch.testing.assert_close(
                     value.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
                 )
-    return groups
+    return group
 
 
 def _reference_layer(values, independent_mma=False):
@@ -374,15 +372,14 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             ^ b.selected_bytes(mask).reshape(b.destinations[0].shape)
             for b, mask in zip(selected, masks)
         ]
-        groups = _apply_prepared_masks(selected, masks, all_configs=True)
-        assert sum(len(group.sources) for group in groups) == len(selected)
-        assert len(groups) == 1
-        assert groups[0].tiles == sum(
-            count * math.ceil(contract[0] / groups[0].config[0])
-            for contract, count in groups[0].contracts
+        group = _apply_prepared_masks(selected, masks, all_configs=True)
+        assert len(group.sources) == len(selected)
+        assert group.tiles == sum(
+            count * math.ceil(contract[0] / group.config[0])
+            for contract, count in group.contracts
         )
         if dense_subset is dense:
-            assert groups[0].word32_contracts > 0
+            assert group.word32_contracts > 0
         for b, expected_value in zip(selected, expected_values):
             torch.testing.assert_close(
                 b.destinations[0], expected_value, rtol=0, atol=0

@@ -382,11 +382,8 @@ class ByteApplyGroup:
         self.launch = self.kernel[self.grid]
         return tuned, footprint, elapsed, reused, skipped
 
-    def enqueue(self, pointers, error):
-        self.launch(pointers, error)
 
-
-def plan_groups(outputs):
+def plan_apply(outputs):
     """One affine batch with shared constexpr contracts, without model names."""
     groups, transformed = {}, []
     for binding, offset, size in outputs:
@@ -403,10 +400,10 @@ def plan_groups(outputs):
             sources.append(offset + source.storage_offset())
             targets.append(target.data_ptr())
     if not groups:
-        return [], transformed
+        return None, transformed
     sources, targets, contracts = [], [], []
     for contract, (group_sources, group_targets) in groups.items():
         contracts.append((contract, len(group_sources)))
         sources.extend(group_sources)
         targets.extend(group_targets)
-    return [ByteApplyGroup(sources, targets, tuple(contracts))], transformed
+    return ByteApplyGroup(sources, targets, tuple(contracts)), transformed
