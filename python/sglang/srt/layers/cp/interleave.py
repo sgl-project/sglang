@@ -45,23 +45,26 @@ from sglang.srt.layers.cp.base import (
 from sglang.srt.layers.cp.padding import pad_local_rows
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
-    get_local_dp_buffer,
     is_allocation_symmetric,
 )
 from sglang.srt.runtime_context import get_parallel
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
-    """Gather equal padded interleave shards in rank order, not token order."""
-    attn_dp_size = get_parallel().attn_dp_size
-    attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
-    hidden_states, local_hidden_states = (
-        get_local_dp_buffer(get_parallel().attn_cp_group),
-        hidden_states,
-    )
-    attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
-    return hidden_states
+    """Gather equal padded interleave shards in rank order, not token order.
+
+    Size from the actual shard: the DP scratch length can already describe a
+    shard when dense FFNs run over TP, and is not a CP collective's output size.
+    """
+    parallel = get_parallel()
+    with use_symmetric_memory(
+        parallel.attn_cp_group, disabled=not is_allocation_symmetric()
+    ):
+        gathered = hidden_states.new_empty(
+            (hidden_states.shape[0] * parallel.attn_cp_size, *hidden_states.shape[1:])
+        )
+    attn_cp_all_gather_into_tensor(gathered, hidden_states.contiguous())
+    return gathered
 
 
 @dataclass
@@ -72,11 +75,28 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     # Tail row -> packed all-gather slot; local tail metadata rows include padding.
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Mask physical CP padding before the dispatch/combine all-to-alls.
+
+        Attention-TP localization does not split the count over CP ranks.
+        Interleave's valid rows form a prefix of each padded local shard.
+        """
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():
