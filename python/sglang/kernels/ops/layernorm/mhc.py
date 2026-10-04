@@ -2333,11 +2333,16 @@ def _num_stages_for(m: int, k: int) -> int:
     return _HC_MIX_NUM_STAGES
 
 
-def _num_slices_for(k: int) -> int:
-    """Slice count depends only on K, never on batch size M."""
+def _num_slices_for(k: int, decode: bool = False) -> int:
+    """Slice count depends only on K, the device and the forward mode (decode),
+    never on batch size M."""
     blocks = k // _HC_MIX_BLOCK_K
     assert k % _HC_MIX_BLOCK_K == 0, k
-    for n in _HC_MIX_SLICE_CHOICES:
+    choices = _HC_MIX_SLICE_CHOICES
+    if decode and get_platform().device_sm == 120:
+        # More slices fill the SMs at decode batch sizes; prefill does not gain.
+        choices = (160,) + choices
+    for n in choices:
         if blocks % n == 0:
             return n
     return 1
@@ -2466,6 +2471,82 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+@triton.jit
+def _hc_mix_reduce_sinkhorn_vec_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """_hc_mix_reduce_sinkhorn_kernel with the slices loaded as one [slices, cols] tile
+    and summed by tl.sum instead of a serial loop. The tree depends only on NUM_SLICES,
+    so a row's result is still independent of the batch."""
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    s = tl.arange(0, SLICES_PAD)
+    s_ok = s < NUM_SLICES
+    j = tl.arange(0, HC)
+    c = tl.arange(0, HC * HC)
+    off = (s[:, None] * m + row) * MIX
+    mask = s_ok[:, None]
+    a_pre = tl.sum(tl.load(part_mix_ptr + off + j[None, :], mask=mask, other=0.0), 0)
+    a_post = tl.sum(
+        tl.load(part_mix_ptr + off + HC + j[None, :], mask=mask, other=0.0), 0
+    )
+    a_comb = tl.sum(
+        tl.load(part_mix_ptr + off + 2 * HC + c[None, :], mask=mask, other=0.0), 0
+    )
+    sq = tl.sum(tl.load(part_sq_ptr + s * m + row, mask=s_ok, other=0.0), 0)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + c)
+    comb = tl.reshape(comb, (HC, HC))
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + j[:, None] * HC + j[None, :], comb)
+
+
+def _hc_mix_reducer_for(num_slices: int, part_mix_residual=None):
+    """The slice reducer and its extra launch arguments. The vectorized kernel was
+    measured faster on SM120 only, and it has no part_mix_residual input, so a
+    residual-bearing reduce always takes the serial kernel."""
+    if part_mix_residual is not None:
+        return _hc_mix_reduce_sinkhorn_kernel, {
+            "part_mix_residual_ptr": part_mix_residual
+        }
+    if get_platform().device_sm == 120:
+        return _hc_mix_reduce_sinkhorn_vec_kernel, {
+            "SLICES_PAD": triton.next_power_of_2(num_slices)
+        }
+    return _hc_mix_reduce_sinkhorn_kernel, {}
+
+
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2475,11 +2556,14 @@ def hc_mix_stats_sinkhorn(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
+    decode: bool = False,
 ):
     """Fuse the reduce and sinkhorn stages of hc_mix_stats followed by hc_split_sinkhorn.
 
     The split-K kernel fixes the reduction order; sinkhorn uses the Triton port's
-    transcendental lowering, which differs from TileLang.
+    transcendental lowering, which differs from TileLang. ``decode`` (decode and
+    target-verify batches) may select a different K split than prefill; within a
+    mode the split never depends on M.
     """
     assert x_flat.dim() == 2 and hc_fn.dim() == 2
     assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
@@ -2494,7 +2578,7 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
+    num_slices = _num_slices_for(k, decode=decode)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
@@ -2535,7 +2619,8 @@ def hc_mix_stats_sinkhorn(
             hc_eps=hc_eps,
         )
         return pre, post, comb
-    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+    reduce_kernel, extra = _hc_mix_reducer_for(num_slices)
+    reduce_kernel[(m,)](
         part_mix,
         part_sq,
         hc_scale.float().contiguous(),
@@ -2552,6 +2637,7 @@ def hc_mix_stats_sinkhorn(
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
         num_warps=1,
+        **extra,
     )
     return pre, post, comb
 
@@ -2722,7 +2808,8 @@ def hc_mix_stats_sinkhorn_deepgemm(
     # sq depends only on x_flat, so the second projection recomputes the same
     # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
     tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
-    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+    reduce_kernel, extra = _hc_mix_reducer_for(slices, part_mix_residual=mix_lo)
+    reduce_kernel[(m,)](
         mix_hi,
         sq,
         hc_scale,
@@ -2738,8 +2825,8 @@ def hc_mix_stats_sinkhorn_deepgemm(
         NUM_SLICES=slices,
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
-        part_mix_residual_ptr=mix_lo,
         num_warps=1,
+        **extra,
     )
     return pre, post, comb
 

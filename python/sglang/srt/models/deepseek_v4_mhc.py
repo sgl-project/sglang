@@ -226,21 +226,28 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
 
 
 def mix_stats(
-    hc: HcSubLayer, x: torch.Tensor, stats_stream: Optional[torch.cuda.Stream] = None
+    hc: HcSubLayer,
+    x: torch.Tensor,
+    stats_stream: Optional[torch.cuda.Stream] = None,
+    *,
+    decode: bool = False,
 ) -> HcTriplet:
-    """Predict the triplet on the caller's stream or the stats stream."""
+    """Predict the triplet on the caller's stream or the stats stream. ``decode``
+    marks decode / target-verify forwards (the split-K slice count may differ)."""
     if stats_stream is None:
-        return _mix_stats_impl(hc, x)
+        return _mix_stats_impl(hc, x, decode=decode)
     main_stream = torch.cuda.current_stream()
     x.record_stream(stats_stream)
     with torch.cuda.stream(stats_stream):
-        coefficients = _mix_stats_impl(hc, x)
+        coefficients = _mix_stats_impl(hc, x, decode=decode)
     for coefficient in coefficients:
         coefficient.record_stream(main_stream)
     return coefficients
 
 
-def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+def _mix_stats_impl(
+    hc: HcSubLayer, x: torch.Tensor, *, decode: bool = False
+) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -319,6 +326,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                decode=decode,
             )
         return pre, post, comb
     if x.is_cuda and torch.version.cuda is not None:
@@ -550,10 +558,11 @@ def _compute_triplet(
     hc: HcSubLayer,
     residual: torch.Tensor,
     stats_stream: Optional[torch.cuda.Stream],
+    decode: bool = False,
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
-    coefficients = mix_stats(hc, residual, stats_stream)
+    coefficients = mix_stats(hc, residual, stats_stream, decode=decode)
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)
     return coefficients
@@ -607,6 +616,7 @@ def run_attn_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    decode: bool = False,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -617,7 +627,7 @@ def run_attn_post(
         )
 
         assert next is not None
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, decode)
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -629,7 +639,7 @@ def run_attn_post(
             world_size=world_size,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    coefficients = _compute_triplet(hc, residual, stats_stream)
+    coefficients = _compute_triplet(hc, residual, stats_stream, decode)
     return _post_fusion(hc, out, residual, coefficients, next)
 
 
@@ -641,6 +651,7 @@ def run_moe_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    decode: bool = False,
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
@@ -657,7 +668,7 @@ def run_moe_post(
         # [T x top_k (padded)] view and overstates the plane load by ~6x.
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, decode)
         args = (
             out.routed.gemm2_out,
             out.routed.expanded_idx_to_permuted_idx,
@@ -711,5 +722,5 @@ def run_moe_post(
             and should_add_replicated_moe_output()
         ):
             out += pieces.shared
-    coefficients = _compute_triplet(hc, residual, stats_stream)
+    coefficients = _compute_triplet(hc, residual, stats_stream, decode)
     return _post_fusion(hc, out, residual, coefficients, next)
