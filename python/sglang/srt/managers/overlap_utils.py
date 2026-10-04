@@ -199,6 +199,12 @@ class ConfidenceRelay(msgspec.Struct):
     def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
+        elif self.copy_done is not None and self.ring_pos > 0:
+            # The last ring copy reads confidence_buf on another stream.
+            last = (self.ring_pos - 1) % CONFIDENCE_RELAY_RING_DEPTH
+            torch.get_device_module(self.device).current_stream().wait_event(
+                self.copy_done[last]
+            )
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
@@ -235,8 +241,9 @@ class ConfidenceRelay(msgspec.Struct):
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
-        if not self.copy_done[slot].query():
-            return None
+        # Wait instead of skipping an unfinished copy: readiness is rank-local,
+        # and TP ranks must all derive the same verify budget from this.
+        self.copy_done[slot].synchronize()
 
         idx_cpu = batch.req_pool_indices_cpu
         return ResolvedConfidence(
