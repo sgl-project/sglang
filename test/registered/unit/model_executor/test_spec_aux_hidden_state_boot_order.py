@@ -32,6 +32,7 @@ import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state as _mod
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -46,6 +47,16 @@ def _function_named(tree, name):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     raise AssertionError(f"{name} not found in {_SRC}")
+
+
+def _config(*, num_nextn_predict_layers, num_hidden_layers=1):
+    return SimpleNamespace(
+        num_nextn_predict_layers=num_nextn_predict_layers,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_layers=num_hidden_layers,
+        is_hybrid_swa=False,
+        is_deepseek_v4_arch=False,
+    )
 
 
 def _spec_algorithm(*, eagle: bool, eagle3: bool = False):
@@ -89,36 +100,51 @@ class TestResolverTouchesNoParallelState(unittest.TestCase):
         }
         self.assertNotIn("get_parallel", imported)
 
-    def test_nextn_layers_come_from_a_draft_model_config(self):
-        """BUG REGRESSION. Every `num_nextn_predict_layers = 1`
-        assignment in model_config.py is guarded by `if is_draft_model`, so the
-        TARGET's own config always answers None. Reading it off the target made
-        the path-less-NEXTN geometry silently never resolve, and the draft fell
-        back to a private pool instead of fusing. The resolver must therefore
-        build a config with is_draft_model=True and read the field off THAT --
-        never off the target `model_config` parameter."""
-        tree = ast.parse(_SRC.read_text())
-        fn = _function_named(tree, "_resolve_eagle_aux_hidden_state")
-        target_reads = [
-            n
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Attribute)
-            and n.attr == "num_nextn_predict_layers"
-            and isinstance(n.value, ast.Name)
-            and n.value.id == "model_config"
-        ]
-        self.assertEqual(
-            target_reads,
-            [],
-            "_resolve_eagle_aux_hidden_state reads num_nextn_predict_layers off "
-            "the TARGET model_config, where it is always None (the field is "
-            "only filled under is_draft_model=True).",
+    def _resolve_with(self, *, draft_path, target, draft):
+        """Run the EAGLE resolver with the config factory stubbed: `draft`
+        answers the draft-mode read, `target` is the runner's own config."""
+        config = _mod.SpecAuxHiddenStateConfig()
+        spec = SimpleNamespace(
+            speculative_draft_model_path=draft_path,
+            speculative_draft_model_revision=None,
         )
-        self.assertIn(
-            "is_draft_model=True",
-            ast.unparse(fn),
-            "the resolver must build the draft config with is_draft_model=True",
-        )
+        with (
+            patch.object(_mod, "get_spec", return_value=spec),
+            patch.object(
+                _mod.ModelConfig, "from_server_args", return_value=draft
+            ) as factory,
+        ):
+            _mod._resolve_eagle_aux_hidden_state(
+                config=config,
+                server_args=None,
+                model_config=target,
+                spec_algorithm=_spec_algorithm(eagle=True),
+                is_draft_worker=False,
+            )
+        self.assertTrue(factory.call_args.kwargs["is_draft_model"])
+        return config
+
+    def test_path_less_nextn_fuses_without_resizing_the_private_pool(self):
+        """Every `num_nextn_predict_layers = 1` assignment in model_config.py
+        is guarded by `if is_draft_model`, so a path-less MTP target answers
+        None for it. The fused placement must read the draft-mode config, or a
+        path-less NEXTN head never fuses; the private-pool budget must keep
+        reading the target, or every path-less MTP deployment's token budget
+        changes."""
+        target = _config(num_nextn_predict_layers=None)
+        draft = _config(num_nextn_predict_layers=1)
+        config = self._resolve_with(draft_path=None, target=target, draft=draft)
+        self.assertIs(config.draft_model_config, draft)
+        self.assertEqual(config.draft_kv_num_layers, 1)
+        self.assertIsNone(config.eagle_draft_num_layers)
+
+    def test_draft_path_sizes_both_from_the_draft_checkpoint(self):
+        target = _config(num_nextn_predict_layers=None)
+        draft = _config(num_nextn_predict_layers=None, num_hidden_layers=2)
+        config = self._resolve_with(draft_path="/draft", target=target, draft=draft)
+        self.assertIs(config.draft_model_config, draft)
+        self.assertEqual(config.draft_kv_num_layers, 2)
+        self.assertEqual(config.eagle_draft_num_layers, 2)
 
     def test_the_draft_config_is_recorded_whole(self):
         """The aux config carries the draft `ModelConfig`, never a pre-divided

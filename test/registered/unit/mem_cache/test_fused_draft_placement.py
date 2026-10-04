@@ -195,6 +195,7 @@ class TestFusedDraftGate(CustomTestCase):
         cfg.kv_cache_dtype = _DTYPE
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
+            draft_kv_num_layers=1,
             draft_model_config=SimpleNamespace(
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,

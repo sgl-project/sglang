@@ -44,7 +44,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # The draft checkpoint read in draft mode, and its KV layer count: the
+    # fused-draft placement's input. `eagle_draft_num_layers` above keeps
+    # sizing a private draft pool exactly as before.
     draft_model_config: Optional[ModelConfig] = None
+    draft_kv_num_layers: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -87,25 +91,39 @@ def _resolve_eagle_aux_hidden_state(
         return
 
     draft_path = get_spec().speculative_draft_model_path
+    # The draft read in draft mode. A path-less NEXTN/MTP head is the TARGET
+    # checkpoint rewritten to its MTP form, which is where its
+    # `num_nextn_predict_layers` gets filled in.
     draft_model_config = ModelConfig.from_server_args(
         server_args,
         model_path=draft_path,
         model_revision=get_spec().speculative_draft_model_revision,
         is_draft_model=True,
     )
-    num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
-    if num_nextn_predict_layers is not None:
-        config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif draft_path is None:
-        return
-    else:
-        config.eagle_draft_num_layers = int(
+    if draft_model_config.num_nextn_predict_layers is not None:
+        config.draft_kv_num_layers = int(draft_model_config.num_nextn_predict_layers)
+    elif draft_path is not None:
+        config.draft_kv_num_layers = int(
             max(
                 draft_model_config.num_hidden_layers,
                 draft_model_config.num_attention_layers,
             )
         )
-    config.draft_model_config = draft_model_config
+    if config.draft_kv_num_layers is not None:
+        config.draft_model_config = draft_model_config
+
+    # The private draft pool's budget keeps its reading: a path-less run sizes
+    # the draft off the TARGET config. Reading the draft-mode config here would
+    # change the token budget of every path-less MTP deployment.
+    if not draft_path:
+        draft_model_config = model_config
+    num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+    if num_nextn_predict_layers is not None:
+        config.eagle_draft_num_layers = int(num_nextn_predict_layers)
+    elif draft_path:
+        config.eagle_draft_num_layers = config.draft_kv_num_layers
+    else:
+        return
 
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
         config.eagle_draft_swa_num_layers = len(

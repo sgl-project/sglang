@@ -943,14 +943,14 @@ class KVCacheConfigurator:
             and self.mambaish_config is None
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
-            and aux.eagle_draft_num_layers
+            and aux.draft_kv_num_layers
             and aux.draft_model_config is not None
             and mambaish_config(aux.draft_model_config) is None
         ):
             return FusedDraftDecision()
         profile = draft_kv_profile(
             aux.draft_model_config,
-            num_layers=int(aux.eagle_draft_num_layers),
+            num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=get_parallel().attn_tp_size,
         )
         num_runners = (
