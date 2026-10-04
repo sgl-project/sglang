@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
+    UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -327,7 +328,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
-        self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
+        self._zero_pages_on_alloc = isinstance(
+            kvcache, (UnifiedMHATokenToKVPool, UnifiedMLATokenToKVPool)
+        )
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -1005,9 +1008,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return phys_pages
 
     def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero the page ENVELOPES on hand-out (MLA full pool only): the MLA
-        kernels arithmetically mask the rows beyond seq_len, so never-written page
-        bytes must read as finite values.
+        """Zero the page ENVELOPES on hand-out (MHA and MLA pools): the MLA
+        kernels and trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole
+        pages and give the rows past seq_len a zero weight, so a NaN there still
+        reaches the output. Never-written bytes must read as finite values; a
+        mamba neighbour's fp32 state, read as bf16, may not.
         """
         if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
             return
@@ -2353,6 +2358,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         if phys_pages is None:
             return None
         self.bind(v_pages, phys_pages)
+        self._maybe_zero_pages(phys_pages)
         return phys_pages
 
     # -- free: hole-marking, boundary absorption, park-on-empty --

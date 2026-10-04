@@ -840,6 +840,18 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 self._page_bytes,
             )
 
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
+        # Same byte-0 envelope view as move_kv_cache.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
+        )
+
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
 
