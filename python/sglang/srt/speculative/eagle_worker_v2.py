@@ -208,6 +208,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
+        # Bind the target embed/lm_head into the draft *before* the scheduler
+        # profiles the KV pool. MTP draft classes allocate their own
+        # embedding + lm_head (for Qwen3.8 vocab=248K that is ~1.9 GB per GPU
+        # under TP2) which set_embed_and_head() frees via del + empty_cache
+        # once rebound to the target tensors. In stock ordering that rebinding
+        # happens at the tail of alloc_memory_pool(), i.e. AFTER
+        # init_target_memory_pool() has sized the pool against the
+        # shell-inflated footprint, so the KV pool collapses by ~1.9 GB/GPU
+        # even though the memory is reclaimable. Example: Qwen3.8-27B-NVFP4
+        # + NEXTN 2/1/3 on 2x16GB with kv-cache-dtype nvfp4: pool goes from
+        # 51,456 -> 195,968 tokens with this reordering alone.
+        # Idempotent: alloc_memory_pool() still calls init_token_map()/
+        # init_lm_head() unchanged; rebinding the same tensors is a no-op.
+        self.init_token_map()
+        self.init_lm_head()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.tree_mask_mode = default_tree_mask_mode()
