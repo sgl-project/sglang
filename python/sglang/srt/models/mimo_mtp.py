@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -19,7 +20,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -70,13 +70,14 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             )
         )
 
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        hidden_states = residual_batch.take_output(hidden_states, forward_batch)
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
@@ -90,7 +91,6 @@ class MiMoMTP(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoMultiTokenPredictorLayer(

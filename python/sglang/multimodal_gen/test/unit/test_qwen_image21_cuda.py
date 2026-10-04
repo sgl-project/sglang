@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
@@ -46,7 +47,10 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     ensure_distributed_env_defaults,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="requires NVIDIA CUDA fusions",
+)
 
 
 @pytest.fixture(scope="module")

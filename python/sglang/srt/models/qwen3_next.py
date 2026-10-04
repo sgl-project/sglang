@@ -479,15 +479,14 @@ def _apply_qwen3_next_mlp(
 ) -> torch.Tensor:
     hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
     hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
-    with layer.ffn_boundary.exit(forward_batch) as ffn_exit:
-        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = layer.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            hidden_states = layer.mlp(hidden_states)
-    hidden_states = ffn_exit.finish(hidden_states)
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+    else:
+        hidden_states = layer.mlp(hidden_states)
+    hidden_states = layer.ffn_boundary.finish(hidden_states, forward_batch)
 
     return hidden_states
 
@@ -524,6 +523,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -532,6 +532,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -542,12 +543,12 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -565,7 +566,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -688,6 +689,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -696,6 +698,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -710,12 +713,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -835,7 +838,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -945,7 +948,9 @@ class Qwen3NextModel(nn.Module):
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
