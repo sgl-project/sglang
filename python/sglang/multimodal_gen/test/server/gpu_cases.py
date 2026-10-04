@@ -1130,15 +1130,14 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.5-Diffusers",
             modality="video",
             ulysses_degree=2,
-            # Offload both the DiT and text encoder between stages to leave
-            # decoder headroom on 80 GB GPUs.
+            # Keep the DiT and text encoder resident: the runtime peak is 72.2 GB,
+            # and component-offloading the DiT made denoise randomly 1.4-1.9x slower.
             extras=[
                 "--load-diffusion-decoder",
                 "--warmup-resolutions 768x448",
                 "--warmup-num-frames 49",
                 """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
-                "--component-residency "
-                "transformer=component-offload,text_encoder=component-offload",
+                "--component-residency transformer=resident,text_encoder=resident",
             ],
         ),
         DiffusionSamplingParams(
