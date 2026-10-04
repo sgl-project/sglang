@@ -246,7 +246,12 @@ class _DeepEPv2Impl:
         self.use_fp8_dispatch = use_fp8_dispatch
         self._handle = None
         self._pad_empty_combine = False
-        self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
+        prefill_expand = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
+        if prefill_expand is None:
+            # Unset: expanded prefill is validated end to end only without
+            # UE8M0 scales (Hopper), so Blackwell keeps the non-expanded path.
+            prefill_expand = not scale_format.ue8m0
+        self._prefill_expand_enabled = prefill_expand
 
     def _destroy_handle(self) -> None:
         self._handle = None
