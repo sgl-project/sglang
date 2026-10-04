@@ -15,6 +15,99 @@ def transform_index_page_table_decode(**kwargs):
 
 
 @triton.jit
+def _remap_dcp_sparse_indices_kernel(
+    indices_ptr,
+    result_ptr,
+    counts_ptr,
+    row_stride: tl.constexpr,
+    col_stride: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    INTERLEAVE_SIZE: tl.constexpr,
+    REPEAT_ROWS: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    indices = tl.load(
+        indices_ptr + row * row_stride + offsets * col_stride,
+        mask=offsets < TOPK,
+        other=-1,
+    )
+    blocks = indices // INTERLEAVE_SIZE
+    owned = (indices >= 0) & (blocks % DCP_SIZE == DCP_RANK)
+    local_indices = blocks // DCP_SIZE * INTERLEAVE_SIZE + indices % INTERLEAVE_SIZE
+    packed_offsets = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    count = tl.sum(owned.to(tl.int32), axis=0)
+    # Head groups folded into the query batch share one owner scan. Repeat
+    # only the stores, preserving consecutive groups of each source row.
+    for repeat in tl.static_range(REPEAT_ROWS):
+        output_row = row * REPEAT_ROWS + repeat
+        tl.store(
+            result_ptr + output_row * TOPK + packed_offsets, local_indices, mask=owned
+        )
+        # Prefix and padding writes address disjoint elements, so no barrier or
+        # separate initialization launch is needed.
+        tl.store(
+            result_ptr + output_row * TOPK + count + offsets,
+            -1,
+            mask=offsets < TOPK - count,
+        )
+        tl.store(counts_ptr + output_row, count)
+
+
+def remap_dcp_sparse_indices_cuda(
+    topk_indices: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int = 1,
+    repeat_rows: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Owner-filter, localize and stably compact global KV slots in one launch.
+
+    Return the local indices and int32 per-row prefix lengths. ``repeat_rows``
+    repeats consecutive rows of a 2D input while preserving the index dtype.
+    Integer arithmetic preserves ownership even for slots above 2**24.
+    """
+    assert topk_indices.is_cuda
+    assert topk_indices.dtype in (torch.int32, torch.int64)
+    assert topk_indices.ndim >= 1
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size and interleave_size >= 1
+    assert repeat_rows >= 1 and (repeat_rows == 1 or topk_indices.ndim == 2)
+    topk = topk_indices.shape[-1]
+    output_shape = topk_indices.shape
+    if repeat_rows != 1:
+        output_shape = (topk_indices.shape[0] * repeat_rows, topk)
+    result = torch.empty(
+        output_shape, dtype=topk_indices.dtype, device=topk_indices.device
+    )
+    counts = torch.empty(
+        output_shape[:-1], dtype=torch.int32, device=topk_indices.device
+    )
+    if topk == 0:
+        counts.zero_()
+        return result, counts
+    rows = topk_indices.reshape(-1, topk)
+    if rows.shape[0]:
+        _remap_dcp_sparse_indices_kernel[(rows.shape[0],)](
+            rows,
+            result,
+            counts,
+            rows.stride(0),
+            rows.stride(1),
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            INTERLEAVE_SIZE=interleave_size,
+            REPEAT_ROWS=repeat_rows,
+            TOPK=topk,
+            BLOCK_TOPK=triton.next_power_of_2(topk),
+            num_warps=4 if topk <= 2048 else 8,
+        )
+    return result, counts
+
+
+@triton.jit
 def prepare_trtllm_nope_sparse_metadata_kernel(
     page_table_ptr: torch.Tensor,
     topk_lens_ptr: torch.Tensor,
