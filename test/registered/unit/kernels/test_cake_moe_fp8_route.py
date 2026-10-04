@@ -61,8 +61,13 @@ class _FakeRunner:
         self.name, self.log, self.bound = name, log, bound
         self.fill_padding, self.alignment = fill_padding, alignment
         self.launches = []
+        self.released = False
+
+    def release_prepared_operands(self):
+        self.released = True
 
     def launch(self, a=None, a_scale=None, m_indices=None, out=None):
+        assert self.released, "plan runners must release their prepared operands"
         rebound = dict(a=a, a_scale=a_scale, m_indices=m_indices, out=out)
         for key, tensor in rebound.items():
             prepared = self.bound[key]
@@ -594,6 +599,17 @@ def _fake_flashinfer(monkeypatch, *, new_contract):
     module = types.ModuleType("flashinfer.gemm.cake_grouped_fp8_gemm")
     module.prepare_group_gemm_fp8_nt_groupwise_contiguous = (
         prepare_new if new_contract else prepare_old
+    )
+
+    class _PreparedOld:
+        pass
+
+    class _PreparedNew:
+        def release_prepared_operands(self):
+            pass
+
+    module.PreparedGroupGemmFp8NtGroupwiseContiguous = (
+        _PreparedNew if new_contract else _PreparedOld
     )
     pkg_gemm = types.ModuleType("flashinfer.gemm")
     pkg = types.ModuleType("flashinfer")

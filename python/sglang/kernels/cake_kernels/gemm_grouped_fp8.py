@@ -115,16 +115,25 @@ def _programs_registered(device_index: int, fused: bool) -> bool:
 def block_scaled_contract_available() -> bool:
     """Whether the installed FlashInfer plain-GEMM prepare accepts the
     block-scaled contract (int32 UE8M0 scales, native ``-1`` rows, the
-    ``alignment`` / ``fill_padding`` keywords and ``launch(a=..., ...)``
-    rebinding).  Detected from the ``alignment`` keyword of
-    ``prepare_group_gemm_fp8_nt_groupwise_contiguous``; never raises."""
+    ``alignment`` / ``fill_padding`` keywords, ``launch(a=..., ...)``
+    rebinding and ``release_prepared_operands()``).  Detected from the
+    ``alignment`` keyword of ``prepare_group_gemm_fp8_nt_groupwise_contiguous``
+    and the release method of the prepared class; never raises."""
     try:
         from flashinfer.gemm.cake_grouped_fp8_gemm import (
             prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare,
         )
 
+        from flashinfer.gemm.cake_grouped_fp8_gemm import (
+            PreparedGroupGemmFp8NtGroupwiseContiguous as prepared_cls,
+        )
+
         params = inspect.signature(prepare).parameters
-        return "alignment" in params and "fill_padding" in params
+        return (
+            "alignment" in params
+            and "fill_padding" in params
+            and callable(getattr(prepared_cls, "release_prepared_operands", None))
+        )
     except Exception:
         return False
 

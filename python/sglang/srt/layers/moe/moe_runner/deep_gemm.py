@@ -547,6 +547,11 @@ class _CakeContigFp8Route:
             ops.out,
             **kwargs,
         )
+        # The plan outlives this call's tensors: drop the runners' references to
+        # the operands they were prepared on (every launch rebinds all of them),
+        # otherwise one full-size activation set per layer stays pinned.
+        gateup_runner.release_prepared_operands()
+        down_runner.release_prepared_operands()
         plan = _CakeContigPlan(
             gateup_runner=gateup_runner,
             down_runner=down_runner,
