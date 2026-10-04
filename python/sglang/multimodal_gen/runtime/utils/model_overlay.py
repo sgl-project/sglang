@@ -576,17 +576,20 @@ def materialize_overlay_model(
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     overlay_revision = str(overlay_spec.get("overlay_revision", "main"))
     overlay_fingerprint = _compute_overlay_fingerprint(overlay_dir)
+    source_revision = source_revision or _overlay_source_revision(
+        overlay_spec, manifest
+    )
+    cache_identity = {
+        "source_model_id": source_model_id,
+        "overlay_repo_id": overlay_repo_id,
+        "overlay_revision": overlay_revision,
+        "materializer_version": materializer_version,
+        "overlay_fingerprint": overlay_fingerprint,
+    }
+    if source_revision is not None:
+        cache_identity["source_revision"] = source_revision
     cache_key = hashlib.sha256(
-        json.dumps(
-            {
-                "source_model_id": source_model_id,
-                "overlay_repo_id": overlay_repo_id,
-                "overlay_revision": overlay_revision,
-                "materializer_version": materializer_version,
-                "overlay_fingerprint": overlay_fingerprint,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
+        json.dumps(cache_identity, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
     cache_root = os.path.join(get_diffusion_cache_root(), "materialized_models")
     _ensure_dir(cache_root)
