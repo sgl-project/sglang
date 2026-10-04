@@ -497,30 +497,27 @@ with open(sys.argv[2], "w") as f:
     f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
 PY
 
-# Drop IB devices that are absent or down on the node the server lands on.
+# Resolve a recipe's static ib_devices list against what the node actually has.
 #
-# A recipe names its HCAs statically (ib_devices: rdma0,rdma1,...), and on pit2
-# that list has drifted out of date in two different ways. A port whose link
-# dropped while the node was running stays named rdmaN but reports DOWN; a port
-# already dead at boot never gets the rdmaN name at all and keeps its PCI name
-# (rocep9s0 etc.). pit2-p03-g02 has lost tw-eth0..3 the second way, so every
-# rdma0..3 recipe named four devices that do not exist there and mori refused to
-# start with
-#   RuntimeError: no active RDMA device on this host
-# Checking port state covers both: an absent device reads as empty, a dead one
-# as DOWN. Done in the container, which has /dev/infiniband and the host ionic
-# userspace, so a test runs on whatever is up instead of failing outright.
+# On pit2 that list has gone stale in two ways: a port that dropped while the
+# node was up keeps its rdmaN name and reports DOWN, while a port already dead
+# at boot never gets that name and appears as rocepXXsY. Reading port state
+# covers both -- absent reads empty, dead reads DOWN. g02 lost tw-eth0..3 the
+# second way, so every rdma0..3 recipe named four devices that are not there and
+# mori failed with "no active RDMA device on this host".
+#
+# Slurm picks the node after these scripts are written, so the list is resolved
+# in the container at startup, not here.
 cat > "$WORKDIR/ib_filter.sh" <<'IBF_EOF'
 # Usage: IB_FILTERED=$(ib_filter "$IB")
 #
-# Treats the recipe's list as a preference, not a requirement: keeps the entries
-# that are present and ACTIVE, then tops the set back up to the requested COUNT
-# from whatever else on the node is ACTIVE. Holding the count fixed matters --
-# KV-transfer throughput scales with the number of HCAs, so silently running a
-# 4-NIC recipe on 2 would quietly rebase every number it reports.
+# The recipe's list is a preference, not a requirement: keep its ACTIVE entries,
+# then top back up to the requested count from other ACTIVE devices. The count
+# has to hold -- KV throughput scales with HCA count, so quietly running a 4-NIC
+# recipe on 2 would rebase every number it reports.
 #
-# Echoes the input unchanged when sysfs is unreadable, so a cluster without this
-# failure mode behaves exactly as before.
+# Echoes its input unchanged where sysfs is unreadable, so a cluster without
+# this failure mode behaves exactly as before.
 ib_filter() {
     local want="$1" keep="" extra="" n_want=0 n_keep=0 d state
     [ -d /sys/class/infiniband ] || { printf '%s' "$want"; return 0; }
@@ -1035,9 +1032,8 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
-# The recipe's ib_devices list is static; the node's may be short of it (see
-# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
-# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+# Keep NCCL on the same devices mori gets: NCCL_IB_HCA naming a device that
+# is not there hangs ncclCommInitRank.
 source "\$CIDIR/ib_filter.sh"
 IB_FILTERED=\$(ib_filter "$IB") || exit 1
 if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
@@ -1065,9 +1061,8 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
-# The recipe's ib_devices list is static; the node's may be short of it (see
-# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
-# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+# Keep NCCL on the same devices mori gets: NCCL_IB_HCA naming a device that
+# is not there hangs ncclCommInitRank.
 source "\$CIDIR/ib_filter.sh"
 IB_FILTERED=\$(ib_filter "$IB") || exit 1
 if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
@@ -1126,9 +1121,8 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
-# The recipe's ib_devices list is static; the node's may be short of it (see
-# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
-# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+# Keep NCCL on the same devices mori gets: NCCL_IB_HCA naming a device that
+# is not there hangs ncclCommInitRank.
 source "\$CIDIR/ib_filter.sh"
 IB_FILTERED=\$(ib_filter "$IB") || exit 1
 if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
@@ -1148,9 +1142,8 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
-# The recipe's ib_devices list is static; the node's may be short of it (see
-# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
-# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+# Keep NCCL on the same devices mori gets: NCCL_IB_HCA naming a device that
+# is not there hangs ncclCommInitRank.
 source "\$CIDIR/ib_filter.sh"
 IB_FILTERED=\$(ib_filter "$IB") || exit 1
 if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
@@ -1977,14 +1970,11 @@ set -e
 # is worth uploading -- and propagate the failure via the exit code at the end.
 #
 # drive_*.log comes first: when drive.sh fails before starting a server -- the
-# node-local staging check is the common case -- it is the only file with the
-# reason in it, and the others are empty or absent.
+# staging check being the common case -- it holds the only copy of the reason.
 #
-# A fixed tail is the wrong unit for a server log: a Python traceback runs well
-# past 30 lines, so the dump reliably cut off the one line naming the error. The
-# 10-03 nightly had 22 of 29 failures whose log contained no error at all for
-# that reason. Print from the first traceback or ERROR instead, and only fall
-# back to a tail when there is no such marker.
+# Print from the first traceback or ERROR rather than a fixed tail. A traceback
+# runs well past 30 lines, so the old tail -30 cut off the line naming the
+# error: 22 of 29 failures in the 10-03 nightly showed no error at all.
 dump_log() {
     local f="$1" start
     [[ -f "$f" ]] || return 0
