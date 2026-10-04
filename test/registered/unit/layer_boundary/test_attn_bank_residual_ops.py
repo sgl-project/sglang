@@ -5,10 +5,22 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import test_declared_decoder_boundary as fixture
 import torch
 
 from sglang.srt.layers import attn_residual
+from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
+    ExitRows,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    layer_stack,
+)
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
 from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
@@ -258,6 +270,57 @@ class TestAttnBankResidualOps(CustomTestCase):
         for readout in (ops.attn_readout, ops.ffn_readout):
             self.assertFalse(readout.is_plain_norm)
             self.assertTrue(readout.reads_before_dp_gather)
+
+
+class TestAttnBankSpMoeStages(CustomTestCase):
+    """A latent MoE dispatched over an a2a backend with attention TP runs on
+    this rank's shard of the rows: the FFN's entry reduce-scatters the
+    attention output and slices the residual, and each MoE layer's exit
+    gathers its stream back to every row, as the decoder did."""
+
+    def build(self, exit_rows):
+        holder = AttnBank()
+        with (
+            fixture.planning(
+                fixture.parallel_of(attn_dp=1, attn_tp=2),
+                a2a=True,
+                boundary_reduction="ar",
+            ),
+            layer_stack(),
+        ):
+            return [
+                append_stages(
+                    (
+                        declare_attn(read=ops.attn_readout, update=ops.attn_update),
+                        fixture.Norm(),
+                    ),
+                    (
+                        declare_ffn(
+                            read=ops.ffn_readout,
+                            update=REPLACE_AT_EXIT,
+                            sparse=True,
+                            next_layer_sparse=True,
+                            output_complete=True,
+                            exit_rows=exit_rows,
+                        ),
+                        fixture.Norm(),
+                    ),
+                )[1]
+                for ops in (LAYER_LIST[i].ops(holder) for i in range(3))
+            ]
+
+    def entry_step(self, ffn):
+        prepare = ffn.plan.paths[BatchVariant.ORDINARY].entry.prepare
+        return prepare.keywords["step"]
+
+    def test_each_moe_layer_returns_to_every_row(self):
+        for ffn in self.build(ExitRows.ATTENTION):
+            step = self.entry_step(ffn)
+            self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
+            self.assertTrue(step.keywords["scatters_residual"])
+            self.assertIs(step.keywords["read"], ffn.declaration.read)
+            move = ffn.plan.paths[BatchVariant.ORDINARY].output_move
+            self.assertIs(move.func, update_attn_tp_gather_output)
 
 
 if __name__ == "__main__":

@@ -343,7 +343,7 @@ def _update_read(
 
 def _attn_tp_reduce_scatter_update_read(
     hidden_states: torch.Tensor,
-    residual: torch.Tensor,
+    residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     norm: torch.nn.Module,
     *,
@@ -353,7 +353,7 @@ def _attn_tp_reduce_scatter_update_read(
     update: ResidualUpdate = PLAIN_ADD,
 ):
     hidden_states = attn_tp_reduce_scatter(hidden_states)
-    if scatters_residual:
+    if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)
     return read.update_and_read(update, hidden_states, residual, norm)
 
