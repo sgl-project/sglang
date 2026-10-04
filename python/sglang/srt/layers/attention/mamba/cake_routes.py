@@ -49,6 +49,7 @@ FlashInfer contract constraints that shape the wiring (see the adapter
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import re
 from typing import Callable, Optional, Sequence
@@ -146,18 +147,95 @@ def _tensor_summary(**tensors: Optional[torch.Tensor]) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _TrackStatesInPlace:
+    """Sentinel the SSD route returns in the ``track_states`` slot when the Cake
+    runner wrote the chunk-unaligned radix-cache track rows itself (selective
+    checkpoints straight into the state pool); the backend then skips its own
+    copy of those rows and only performs the chunk-aligned slot copies."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SSD_TRACK_STATES_IN_PLACE"
+
+
+SSD_TRACK_STATES_IN_PLACE = _TrackStatesInPlace()
+
+
+def cake_ssd_track_checkpoints(
+    track_mask: Sequence[bool],
+    track_lens: Sequence[int],
+    extend_lens: Sequence[int],
+    prefix_lens: Sequence[int],
+    state_chunk_size: int,
+    track_slots: torch.Tensor,
+    device: torch.device,
+) -> Optional[tuple[list[int], torch.Tensor, torch.Tensor]]:
+    """Map the engine's prefill track rows onto Cake selective checkpoints.
+
+    The radix cache snapshots each tracked sequence's SSM state at its last
+    ``state_chunk_size`` boundary (``build_prefill_track_plan``). The stock
+    kernel serves the chunk-unaligned rows from its chunk grid or a recompute
+    pass; the Cake runner instead writes one checkpoint per sequence at an
+    exclusive absolute token boundary, provided that boundary is a logical
+    chunk end of the chunk-128 metadata.  Returns ``(boundaries,
+    checkpoint_token_indices, checkpoint_state_slots)``: the absolute token
+    positions ``cake_ssd_chunk_metadata`` must expose, and the per-sequence
+    int32 pair on ``device`` (``-1`` where no checkpoint is wanted).
+    Chunk-aligned rows keep the engine's final-state slot copy.  ``None`` when
+    a tracked row wants the state before its first token (chunk index 0): the
+    stock kernel owns that case, so the batch stays on the stock path.
+    """
+    from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
+        build_prefill_track_plan,
+    )
+
+    plan = build_prefill_track_plan(
+        list(track_mask),
+        list(track_lens),
+        list(extend_lens),
+        list(prefix_lens),
+        state_chunk_size,
+        mamba2=True,
+    )
+    starts = list(itertools.accumulate(extend_lens, initial=0))
+    tokens = [-1] * len(extend_lens)
+    for row in plan.unaligned_rows:
+        chunk = plan.chunk_indices[row]
+        if chunk <= 0:
+            return None
+        tokens[row] = starts[row] + chunk * state_chunk_size
+    boundaries = [t for t in tokens if t >= 0]
+    token_indices = torch.tensor(tokens, dtype=torch.int32).to(
+        device, non_blocking=True
+    )
+    slots = torch.full((len(extend_lens),), -1, dtype=torch.int32, device=device)
+    if plan.unaligned_rows:
+        rows = torch.tensor(plan.unaligned_rows, dtype=torch.int64).to(
+            device, non_blocking=True
+        )
+        slots[rows] = track_slots.index_select(0, rows).to(torch.int32)
+    return boundaries, token_indices, slots
+
+
 def cake_ssd_chunk_metadata(
-    extend_seq_lens: Sequence[int], device: torch.device
+    extend_seq_lens: Sequence[int],
+    device: torch.device,
+    extra_boundaries: Sequence[int] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Logical-chunk metadata of a packed prefill batch for the Cake chunk size.
 
     Same semantics as ``Mamba2Metadata._query_start_loc_to_chunk_indices_offsets``
     (a logical chunk starts at every physical 128-token chunk start and at
     every sequence start) computed from the host-side sequence lengths, so
-    the metadata build does not synchronise the stream.  Returns int32
-    ``(chunk_indices, chunk_offsets)`` on ``device``.
+    the metadata build does not synchronise the stream.  ``extra_boundaries``
+    are further absolute token positions that must be logical chunk ends (the
+    radix-cache track positions the Cake runner checkpoints; see
+    :func:`cake_ssd_track_checkpoints`); one already on the 128 grid or at a
+    sequence start adds nothing.  Returns int32 ``(chunk_indices,
+    chunk_offsets)`` on ``device``.
     """
-    starts: set[int] = set()
+    starts: set[int] = {int(b) for b in extra_boundaries}
     start = 0
     for length in extend_seq_lens:
         starts.add(start)
@@ -211,13 +289,21 @@ def ssd_prefill(
     state_dtype: torch.dtype,
     cake_chunk_indices: Optional[torch.Tensor],
     cake_chunk_offsets: Optional[torch.Tensor],
+    track_states_out: Optional[torch.Tensor] = None,
+    cake_checkpoint_token_indices: Optional[torch.Tensor] = None,
+    cake_checkpoint_state_slots: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Run the prefill SSD scan; ``mamba_ssd_prefill`` may take the Cake kernel.
 
     Returns the stock ``(intermediate_states, varlen_state, track_states)``
     triple.  ``cake_chunk_indices`` / ``cake_chunk_offsets`` are the chunk-128
-    metadata prepared once per forward by :class:`Mamba2Metadata`; everything
-    else is the stock call's argument list.
+    metadata prepared once per forward by :class:`Mamba2Metadata`;
+    ``cake_checkpoint_token_indices`` / ``cake_checkpoint_state_slots`` the
+    radix-cache track rows mapped onto Cake checkpoints (same place) and
+    ``track_states_out`` the layer's SSM state pool they are written into.
+    When the Cake runner wrote those rows, ``track_states`` in the returned
+    triple is :data:`SSD_TRACK_STATES_IN_PLACE`.  Everything else is the stock
+    call's argument list.
     """
     stock_kwargs = dict(
         chunk_size=chunk_size,
@@ -257,6 +343,9 @@ def ssd_prefill(
         state_dtype=state_dtype,
         cake_chunk_indices=cake_chunk_indices,
         cake_chunk_offsets=cake_chunk_offsets,
+        track_states_out=track_states_out,
+        cake_checkpoint_token_indices=cake_checkpoint_token_indices,
+        cake_checkpoint_state_slots=cake_checkpoint_state_slots,
     )
     if result is None:
         return stock(x, dt, A, B, C, **stock_kwargs)
@@ -280,6 +369,9 @@ def _cake_ssd_prefill(
     state_dtype: torch.dtype,
     cake_chunk_indices: Optional[torch.Tensor],
     cake_chunk_offsets: Optional[torch.Tensor],
+    track_states_out: Optional[torch.Tensor] = None,
+    cake_checkpoint_token_indices: Optional[torch.Tensor] = None,
+    cake_checkpoint_state_slots: Optional[torch.Tensor] = None,
 ) -> Optional[tuple]:
     """``None`` means "use the stock call"."""
     route = CAKE_ROUTE_SSD_PREFILL
@@ -292,14 +384,39 @@ def _cake_ssd_prefill(
             route, "fallback", f"seqlen {seqlen} is not a multiple of 128: {detail}"
         )
         return None
-    if track_seq_idx is not None:
-        _log_cake_route_once(
-            route,
-            "fallback",
-            f"radix-cache track states requested (not mapped onto Cake "
-            f"checkpoints): {detail}",
+    # ``track_seq_idx`` is set for every forward of a radix-cache-tracked batch
+    # (even with no row to recompute); the mapped checkpoints decide whether
+    # the Cake runner can write the tracked rows itself.
+    tracking = track_seq_idx is not None
+    checkpoints: dict = {}
+    if tracking:
+        if cake_checkpoint_token_indices is None or cake_checkpoint_state_slots is None:
+            _log_cake_route_once(
+                route,
+                "fallback",
+                f"radix-cache track states requested but not mapped onto Cake "
+                f"checkpoints (host track plan unavailable, or a row wants its "
+                f"pre-first-token state): {detail}",
+            )
+            return None
+        if (
+            track_states_out is None
+            or track_states_out.dim() != 4
+            or not track_states_out.is_contiguous()
+            or track_states_out.dtype != state_dtype
+        ):
+            _log_cake_route_once(
+                route,
+                "fallback",
+                f"track-state pool is not a contiguous 4-D {state_dtype} tensor "
+                f"(checkpoint target): {detail}",
+            )
+            return None
+        checkpoints = dict(
+            checkpoint_token_indices=cake_checkpoint_token_indices,
+            checkpoint_state_slots=cake_checkpoint_state_slots,
+            checkpoint_states=track_states_out,
         )
-        return None
     if cake_chunk_indices is None or cake_chunk_offsets is None:
         _log_cake_route_once(
             route, "fallback", f"no chunk-128 metadata for this batch: {detail}"
@@ -312,7 +429,15 @@ def _cake_ssd_prefill(
             f"state dtype not BF16/FP16 (--mamba-ssm-dtype): {detail}",
         )
         return None
-    key = (seqlen, nheads, B.shape[2], x.dtype, state_dtype, initial_states is None)
+    key = (
+        seqlen,
+        nheads,
+        B.shape[2],
+        x.dtype,
+        state_dtype,
+        initial_states is None,
+        tracking,
+    )
     if key in _cake_route_rejected:
         return None
     supports, cake_fwd = _cake_ssd_kernels()
@@ -345,6 +470,7 @@ def _cake_ssd_prefill(
         chunk_offsets=cake_chunk_offsets,
         out=cake_out,
         chunk_size=SSD_CHUNK_SIZE,
+        **checkpoints,
     )
     if not admitted:
         _log_cake_route_once(route, "fallback", f"adapter admission rejected: {detail}")
@@ -367,6 +493,7 @@ def _cake_ssd_prefill(
             chunk_offsets=cake_chunk_offsets,
             out=cake_out,
             return_final_states=True,
+            **checkpoints,
         )
     except NotImplementedError as error:  # FlashInfer host-side refusal
         _cake_route_rejected.add(key)
@@ -382,7 +509,9 @@ def _cake_ssd_prefill(
     _log_cake_route_once(route, "taken", detail)
     # Stock contract: (intermediate_states, varlen_state, track_states); the
     # per-sequence final states are the varlen states the mixer scatters back.
-    return None, final_states, None
+    # With tracking, the unaligned track rows were checkpointed into the pool
+    # in-kernel; the sentinel tells the backend to skip its copy of them.
+    return None, final_states, (SSD_TRACK_STATES_IN_PLACE if tracking else None)
 
 
 # ---------------------------------------------------------------------------
