@@ -1885,7 +1885,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -2360,7 +2360,7 @@ fn insert_priority_floor_applies_along_the_path() {
 }
 
 #[test]
-fn insert_chunked_skips_the_hit_count() {
+fn insert_below_the_hit_watermark_skips_the_hit_count() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let a = tc
@@ -2372,7 +2372,7 @@ fn insert_chunked_skips_the_hit_count() {
         .hit_count;
     tc.insert(&InsertParams {
         rotation_base: None,
-        chunked: true,
+        inserted_len: 2,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
     assert_eq!(
@@ -2811,6 +2811,107 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
         /* write_back = */ true,
     );
     assert_eq!(action.node_ids, vec![c]);
+}
+
+// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
+// node and stamp every node its transfers cover with that node's ack.
+// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
+fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
+    for &node_id in &backup.node_ids {
+        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
+        if device_value.numel() == 0 && comp_xfers.is_empty() {
+            continue;
+        }
+        let mut publish_node_ids = Vec::new();
+        for transfer in comp_xfers.values_mut().flatten() {
+            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
+            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
+        }
+        if !publish_node_ids.contains(&node_id) {
+            publish_node_ids.push(node_id);
+        }
+        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
+            .expect("live test node");
+        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
+            .expect("live test nodes");
+    }
+}
+
+#[test]
+fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+    // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
+    //                  -> d(Full unbacked) -> t2(Full backed)
+    // Every node holds a device-only SWA value inside the window.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            swa_sliding_window_size: Some(8),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let (key_t1, key_t2) = (vec![1, 2, 3, 4], vec![1, 2, 5, 6]);
+    tc.insert(&insert_params(&key_t1, &[10, 11, 12, 13]));
+    tc.insert(&insert_params(&key_t2, &[10, 11, 14, 15]));
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2, 5], &[10, 11, 14]));
+    let child = |parent, page: &[i64]| {
+        tc.arena
+            .child_on_page(parent, /* extra_key = */ None, page)
+            .expect("child on page")
+    };
+    let c_idx = child(tc.arena.root(), &[1]);
+    let b_idx = child(c_idx, &[3]);
+    let t1_idx = child(b_idx, &[4]);
+    let d_idx = child(c_idx, &[5]);
+    let t2_idx = child(d_idx, &[6]);
+    let [c, b, t1, d, t2] = [c_idx, b_idx, t1_idx, d_idx, t2_idx].map(|idx| tc.arena.node(idx).id);
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        let full = tc.arena.node(idx).device_value(FULL).copy();
+        tc.set_component_device_value(tc.arena.node(idx).id, SWA, full.copy())
+            .expect("live test node");
+        if [b_idx, t1_idx, t2_idx].contains(&idx) {
+            tc.arena.set_host_value(idx, FULL, full);
+        }
+    }
+
+    // Two requests in one batch finish at t1 and t2; neither ack drains.
+    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+        let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
+        let backups: Vec<&BackupKV> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::BackupKV(backup) => Some(backup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].node_ids, vec![target]);
+        execute_backup_kv_for_test(&mut tc, backups[0]);
+    }
+
+    let pending = |node_id| {
+        tc.arena
+            .node(tc.arena.resolve(node_id).expect("live test node"))
+            .write_through_pending_id
+    };
+    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
+        assert_eq!(pending(node_id), Some(ack_id));
+    }
+    // Write-back defers the unbacked Full prefix to eviction.
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(c).expect("live test node"))
+            .backuped()
+    );
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(d).expect("live test node"))
+            .backuped()
+    );
 }
 
 #[test]
@@ -3333,7 +3434,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -6191,7 +6292,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 1);
     // The tree defaults keep the host tier off and the threshold at 256.
     assert!(!tc.enable_hicache);
@@ -6199,7 +6300,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
 }
 
 #[test]
-fn inc_hit_count_skips_evicted_or_chunked_nodes() {
+fn inc_hit_count_skips_evicted_nodes() {
     let mut tc = core();
     let root = tc.arena.root();
     let evicted = tc
@@ -6211,21 +6312,8 @@ fn inc_hit_count_skips_evicted_or_chunked_nodes() {
             /* extra_key = */ None,
         )
         .unwrap();
-    let chunked = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(chunked, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(evicted, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(evicted));
     assert_eq!(tc.arena.node(evicted).hit_count, 0);
-    assert!(!tc.inc_hit_count_and_check_(chunked, /* chunked = */ true));
-    assert_eq!(tc.arena.node(chunked).hit_count, 0);
 }
 
 #[test]
@@ -6247,7 +6335,7 @@ fn inc_hit_count_is_a_noop_in_write_back_mode() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 0);
 }
 
@@ -6268,12 +6356,12 @@ fn inc_hit_count_fires_the_write_through_check() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
-    assert!(tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
+    assert!(tc.inc_hit_count_and_check_(a));
     // A backuped node never re-fires.
     tc.arena
         .set_host_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 3);
 }
 
@@ -8751,7 +8839,7 @@ fn sequence_insert_params<'k>(
         prev_prefix_len,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,

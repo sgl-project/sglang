@@ -145,7 +145,7 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t, prompt_len=_PROMPT_LEN)
+        _assert_every_node_hit_once(t, prompt_len=_PROMPT_LEN)
 
     def test_nonchunked_prefill_radix_hit_count(self):
         self.server.execute_script(self._script_nonchunked_prefill_radix_hit_count)
@@ -156,10 +156,10 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t, prompt_len=prompt_len)
+        _assert_every_node_hit_once(t, prompt_len=prompt_len)
 
 
-def _assert_prefill_twice_decode_once(t: ScriptedContext, prompt_len: int) -> None:
+def _assert_every_node_hit_once(t: ScriptedContext, prompt_len: int) -> None:
     core = t.scheduler.tree_cache.tree_core
     prefill_hits: list[int] = []
     decode_hits: list[int] = []
@@ -178,8 +178,8 @@ def _assert_prefill_twice_decode_once(t: ScriptedContext, prompt_len: int) -> No
         f"expected both prefill and decode radix nodes; "
         f"prefill={prefill_hits}, decode={decode_hits}, prompt_len={prompt_len}"
     )
-    assert all(h == 2 for h in prefill_hits), (
-        f"each prefill node must be hit exactly twice; "
+    assert all(h == 1 for h in prefill_hits), (
+        f"each prefill node must be hit exactly once; "
         f"prefill={prefill_hits}, decode={decode_hits}"
     )
     assert all(h == 1 for h in decode_hits), (

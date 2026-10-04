@@ -339,6 +339,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
 
+        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+            make_indexer_cp,
+        )
+
+        self.indexer_cp = make_indexer_cp(self, runner, sparse_cfg)
+
         self._init_aiter_indexer(
             num_index_heads=max(
                 sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size,
@@ -618,9 +624,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if self.aiter_indexer is not None and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
+        if (
+            self.aiter_indexer is not None
+            and self.indexer_cp is None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
             query_len = (
                 self.speculative_num_draft_tokens
@@ -633,7 +643,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.aiter_indexer.prepare(
                 self.req_to_token, forward_batch.req_pool_indices, seq_lens, query_len
             )
-        elif self.aiter_prefill_indexer and forward_batch.forward_mode.is_extend():
+        elif (
+            self.aiter_prefill_indexer
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             q_lens = forward_batch.extend_seq_lens.to(torch.int32)
             cu_q = torch.cat([q_lens.new_zeros(1), q_lens.cumsum(0).to(torch.int32)])
             self.aiter_indexer.prepare_prefill(
@@ -1890,7 +1903,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         layer_id=layer.layer_id,
                     )
 
-            if self.aiter_indexer is not None and _cached_topk is None:
+            # Explicit CP selection takes precedence over the default AITER indexer.
+            if (
+                self.aiter_indexer is not None
+                and self.indexer_cp is None
+                and _cached_topk is None
+            ):
                 _cached_topk = self.aiter_indexer.forward(idx_q, idx_k_cache)
 
             idx_o, o = minimax_sparse_decode(
@@ -1927,6 +1945,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
                 hisparse_swap_in_fn=hisparse_swap_in_fn,
+                indexer_cp=self.indexer_cp,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

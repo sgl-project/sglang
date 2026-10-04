@@ -41,6 +41,7 @@ class TestMiniMaxAiterIndexer(unittest.TestCase):
             get_index_k_buffer=lambda _: cache,
         )
         backend.hisparse_coordinator = None
+        backend.indexer_cp = None
         backend.use_dense_sparse_decode = False
         backend.score_type = "max"
         backend.sparse_layer_ids = [0]
@@ -176,6 +177,94 @@ class TestMiniMaxAiterIndexer(unittest.TestCase):
 
     def test_long_context(self):
         self.exercise([4, 4], [1048576, 996579], max_context=1048576)
+
+    def test_decode_cp_takes_precedence_over_aiter(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        cache = torch.empty(256, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
+        backend = self.make_backend(cache)
+        backend.kv_pool.get_kv_buffer = lambda _: (cache, cache)
+        backend._is_sparse_kv_cached_by_fusion = Mock(return_value=True)
+        backend.is_hip = True
+        backend.is_npu = backend.fp8_attn_gemm = backend._use_msa_decode = False
+        backend.index_cache_enabled = True
+        backend.block_size_q = 1
+        backend._max_seqlen_k = 256
+        backend.req_to_token = torch.arange(256, device="cuda").unsqueeze(0)
+        q = torch.zeros(1, 1, 128, device="cuda", dtype=torch.bfloat16)
+        topk = torch.zeros(1, 1, 16, device="cuda", dtype=torch.int32)
+        backend._decode_topk_buf = {1: topk}
+        backend.aiter_indexer = Mock()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([256], device="cuda", dtype=torch.int32),
+            req_pool_indices=torch.zeros(1, device="cuda", dtype=torch.int64),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            q_scale_float=1.0,
+            k_scale_float=1.0,
+            v_scale_float=1.0,
+            idx_q_scale_float=1.0,
+            idx_k_scale_float=1.0,
+            idx_v_scale_float=1.0,
+        )
+        with patch(
+            "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse."
+            "minimax_sparse_decode",
+            return_value=(None, q),
+        ) as decode:
+            for cp in (None, object()):
+                backend.indexer_cp = cp
+                for reuse in (False, True):
+                    with self.subTest(cp_enabled=cp is not None, reuse=reuse):
+                        backend.aiter_indexer.reset_mock()
+                        backend._topk_is_source = {0: not reuse}
+                        backend.init_forward_metadata_in_graph(batch)
+                        backend.forward_decode(
+                            q, q, q, layer, batch, idx_q=q, idx_k=q, idx_v=None
+                        )
+                        self.assertEqual(
+                            backend.aiter_indexer.prepare.call_count, int(cp is None)
+                        )
+                        self.assertEqual(
+                            backend.aiter_indexer.forward.call_count,
+                            int(cp is None and not reuse),
+                        )
+                        expected = (
+                            topk
+                            if reuse
+                            else (
+                                backend.aiter_indexer.forward.return_value
+                                if cp is None
+                                else None
+                            )
+                        )
+                        self.assertIs(
+                            decode.call_args.kwargs["cached_topk_idx"], expected
+                        )
+                        self.assertIs(decode.call_args.kwargs["indexer_cp"], cp)
+                        self.assertIs(
+                            decode.call_args.kwargs["topk_out"], None if reuse else topk
+                        )
+
+    def test_cp_verify_skips_aiter_metadata(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        cache = torch.empty(256, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
+        backend = self.make_backend(cache)
+        backend.indexer_cp = object()
+        backend.is_hip = True
+        backend.is_npu = False
+        backend.aiter_indexer = Mock()
+        backend._init_rocm_linear_verify_metadata = Mock()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY, extend_seq_lens=None
+        )
+        backend.init_forward_metadata_in_graph(batch)
+        backend.aiter_indexer.prepare.assert_not_called()
+        backend.aiter_indexer.prepare_prefill.assert_not_called()
+        backend._init_rocm_linear_verify_metadata.assert_called_once_with(batch)
 
     def test_prefill_topk_reuse_is_scoped_to_batch(self):
         cache = torch.empty(256, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")

@@ -5,6 +5,7 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
+pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
@@ -41,6 +42,9 @@ pub struct RequestTokens {
 pub struct ExternalPrefixSignal {
     pub outcome: sgl_kv_indexer::PrefixOutcome,
     pub query_blocks: usize,
+    /// The query's block hashes when the local tree answered, so routing can
+    /// record the placement without rehashing.
+    pub block_hashes: Option<Arc<[i64]>>,
 }
 
 /// Whether the caller pre-tokenized the prompt (`input_ids` present and not
@@ -572,6 +576,13 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
+    /// Whether any registered policy reads request tokens; startup rejects this under `--no-tokenizer`.
+    pub fn needs_request_tokens(&self) -> bool {
+        self.by_model
+            .iter()
+            .any(|entry| entry.value().needs_request_tokens())
+    }
+
     /// Attaches metrics to each registered policy.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
@@ -616,7 +627,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -919,6 +930,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -962,6 +974,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -1011,6 +1024,7 @@ mod tests {
                 best_prefix_blocks: workers.len() as u32,
             },
             query_blocks: 64,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1067,6 +1081,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 4,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1118,6 +1133,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 8,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1157,6 +1173,7 @@ mod tests {
                 best_prefix_blocks: 3,
             },
             query_blocks: 8,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1188,6 +1205,7 @@ mod tests {
                 best_prefix_blocks: 2,
             },
             query_blocks: 4_125,
+            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)

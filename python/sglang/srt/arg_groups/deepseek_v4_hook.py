@@ -3,10 +3,15 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    context_parallel_attn_dp_size,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     model_config_of,
+    resolved_view,
     resolving_view,
     run_post_process_pass,
 )
@@ -119,17 +124,43 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
     if cfg.cp_strategy == "zigzag" and not is_npu():
         raise ValueError(
-            "DeepSeekV4 zigzag CP requires the NPU backend; the CUDA backend "
-            "reindexes with interleave order."
+            "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
+            "reindex with interleave order."
+        )
+    if get_platform().is_hip:
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
+            raise ValueError(
+                "DeepSeekV4 prefill CP on HIP requires the dsv4 attention "
+                f"backend for both phases, got prefill={prefill_backend!r}, "
+                f"decode={decode_backend!r}."
+            )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
         )
 
-    # DeepSeek-V4 CP runs data-parallel groups as attention DP.
-    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
-        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
-        "data-parallel replicas combined with attention data parallelism "
-        "are not supported."
-    )
-    attn_dp_size = cfg.attn_dp_size * cfg.dp_size
+        unsupported = (
+            ("multiple nodes", cfg.nnodes > 1),
+            (
+                "DeepSeek-V4.1",
+                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
+            ),
+            (
+                "--enable-decoder-swa-bounded-replay",
+                cfg.enable_decoder_swa_bounded_replay,
+            ),
+            ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
+            ("the fp8 unified_kv pool", is_unified_kv_fp8()),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
+                )
+
+    attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
