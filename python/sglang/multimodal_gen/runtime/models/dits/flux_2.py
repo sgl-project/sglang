@@ -428,7 +428,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
-        and x.is_cuda
+        and (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
         and x.dim() == 3
         and x.stride(-1) == 1
@@ -439,7 +439,11 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     )
     # Per-signature verification may compare tensors and synchronize.  Never
     # verify a new layout while a CUDA graph is being captured.
-    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+    if (
+        can_fuse
+        and not verified
+        and torch.get_device_module(x.device).is_current_stream_capturing()
+    ):
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
