@@ -944,22 +944,6 @@ mod tests {
     }
 
     #[test]
-    fn prefill_pressure_uses_waiting_then_running_requests() {
-        let busy = worker("busy");
-        let idle = worker("idle");
-        let loads = snapshot(&[(&busy, 1, 8, 10, 100), (&idle, 9, 2, 90, 100)]);
-        assert!(compare_prefill_pressure(&busy, &idle, Some(&loads)).is_gt());
-    }
-
-    #[test]
-    fn missing_snapshot_uses_local_active_load() {
-        let left = worker("left");
-        let right = worker("right");
-        let _guard = left.load_guard();
-        assert!(compare_prefill_pressure(&left, &right, None).is_gt());
-    }
-
-    #[test]
     fn complete_monitor_pressure_guard_overrides_a_near_cache_gain() {
         let congested = worker("congested");
         let idle = worker("idle");

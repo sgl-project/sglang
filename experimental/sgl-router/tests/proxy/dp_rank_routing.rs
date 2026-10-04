@@ -16,8 +16,9 @@ use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::RadixTreePrefixProvider;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
+use sgl_router::state::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use tower::ServiceExt;

@@ -634,9 +634,8 @@ async fn invalid_policy_signal_stops_bucket_iteration() {
 async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     use sgl_router::config::AffinityConfig;
     use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
-    use sgl_router::state::kv_events::RadixTreePrefixProvider;
     use sgl_router::state::kv_events::{
-        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
     };
     use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 

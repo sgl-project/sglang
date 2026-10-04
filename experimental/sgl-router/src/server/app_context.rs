@@ -10,8 +10,9 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::RadixTreePrefixProvider;
-use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
+use crate::state::kv_events::{
+    BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;

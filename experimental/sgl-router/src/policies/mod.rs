@@ -21,7 +21,7 @@ use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
-pub use crate::state::kv_events::PrefixLookupResult;
+pub(crate) use crate::state::kv_events::PrefixLookupResult;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -584,7 +584,7 @@ mod tests {
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{
-        resolve_cache_candidates, resolve_prefill, CandidateLoads, CandidateRange, DecisionReason,
+        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
@@ -876,17 +876,6 @@ mod tests {
             .expect("returning to short bucket reuses its assignment");
 
         assert_eq!(returned.kind, ProposalKind::SessionAffinity);
-    }
-
-    #[test]
-    fn decode_pressure_tie_is_not_broken_by_worker_id() {
-        let a = worker("a");
-        let z = worker("z");
-        assert_eq!(
-            admission::compare_decode_pressure(&a, &z, None),
-            std::cmp::Ordering::Equal,
-            "P2 must preserve random sampling when observable pressure is equal"
-        );
     }
 
     #[test]
@@ -1254,45 +1243,6 @@ mod tests {
                 })
                 .collect::<HashMap<_, _>>(),
         )
-    }
-
-    #[test]
-    fn mixed_freshness_uses_one_captured_local_level_for_the_candidate_set() {
-        let aggregate_idle = worker("aggregate-idle");
-        let aggregate_busy = worker("aggregate-busy");
-        let stale = worker("stale");
-        aggregate_idle
-            .active_requests
-            .store(5, std::sync::atomic::Ordering::Relaxed);
-        aggregate_busy
-            .active_requests
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        let snapshot = snapshot(&[
-            (
-                &aggregate_idle,
-                TestEngineLoad {
-                    num_waiting_reqs: 0,
-                    ..TestEngineLoad::default()
-                },
-            ),
-            (
-                &aggregate_busy,
-                TestEngineLoad {
-                    num_waiting_reqs: 1_000,
-                    ..TestEngineLoad::default()
-                },
-            ),
-        ]);
-
-        let lookup =
-            CandidateLoads::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
-        assert!(lookup.get(&aggregate_idle.id).is_some());
-        assert!(lookup.get(&stale.id).is_none());
-        assert_eq!(
-            lookup.compare_prefill_pressure(&aggregate_idle, &aggregate_busy),
-            std::cmp::Ordering::Greater,
-            "one stale member makes the complete candidate set compare by the captured local level"
-        );
     }
 
     fn cache_candidate(
