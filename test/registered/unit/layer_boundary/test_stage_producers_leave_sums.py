@@ -33,6 +33,20 @@ _BUILDS_STAGES = (
 )
 
 
+# A vocabulary-parallel lookup leaves each rank holding only its own shard's
+# rows, so the class completes that sum itself. An embedding is never a decoder
+# stage, so no sum inside one is a stage output and the whole class is exempt.
+# Only a class that names one of these bases directly is exempt.
+_VOCAB_PARALLEL_BASES = ("VocabParallelEmbedding", "ParallelLMHead")
+
+
+def _is_vocab_parallel(node) -> bool:
+    return isinstance(node, ast.ClassDef) and any(
+        base in _VOCAB_PARALLEL_BASES
+        for base in (ast.unparse(parent) for parent in node.bases)
+    )
+
+
 def _call_name(node: ast.Call):
     func = node.func
     return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
@@ -40,10 +54,13 @@ def _call_name(node: ast.Call):
 
 def _unguarded_sums(source: str):
     """Sum calls not under ``if ... self.reduce_results ...``: such a branch is
-    a shared class built without stage boundaries by another model."""
+    a shared class built without stage boundaries by another model. Sums inside
+    a vocabulary-parallel embedding complete its lookup, not a stage output."""
     found = []
 
     def visit(node, guarded):
+        if _is_vocab_parallel(node):
+            return
         if isinstance(node, ast.If) and "reduce_results" in ast.unparse(node.test):
             for child in node.body:
                 visit(child, True)
