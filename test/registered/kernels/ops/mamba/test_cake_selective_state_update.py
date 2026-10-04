@@ -294,9 +294,11 @@ def _make_hd64_raw(batch, nheads, ngroups, state_dtype, device, seed):
     t["x"] = xbc[:, : nheads * 64].view(batch, nheads, 64)
     t["B"] = xbc[:, nheads * 64 : nheads * 64 + ngroups * 128].view(batch, ngroups, 128)
     t["C"] = xbc[:, nheads * 64 + ngroups * 128 :].view(batch, ngroups, 128)
-    t["dt"] = t["dt"].bfloat16()
-    t["D"] = t["D"].bfloat16()
-    t["dt_bias"] = t["dt_bias"].bfloat16()
+    # Convert the per-head bases, then re-expand: the engine's coefficients are
+    # broadcast views (``dt.stride(1) == 1``, ``dt.stride(2) == 0``).
+    t["dt"] = t["dt"][:, :, 0].bfloat16()[:, :, None].expand(batch, nheads, 64)
+    t["D"] = t["D"][:, 0].bfloat16()[:, None].expand(nheads, 64)
+    t["dt_bias"] = t["dt_bias"][:, 0].bfloat16()[:, None].expand(nheads, 64)
     t["idx"] = t["idx"].to(torch.int32)
     t["out"] = torch.empty(batch, nheads, 64, dtype=torch.bfloat16, device=device)
     return t

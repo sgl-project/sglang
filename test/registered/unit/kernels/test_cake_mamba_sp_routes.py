@@ -737,10 +737,27 @@ def test_ssu_headdim64_decode_row_passes_the_engine_storage_without_copies(caplo
     assert kw["out"] is inputs["kwargs"]["out"]
     assert kw["cache_steps"] == 0 and kw["algorithm"] == "auto" and kw["z"] is None
     assert kw["dt_softplus"] is True and kw["disable_state_update"] is False
+    assert kw["pad_slot_id"] == -1  # the engine's padding slot value is forwarded
     s_args, s_kw = supports.call_args
+    assert s_kw["pad_slot_id"] == -1
     assert s_args[2] is inputs["dt"] and s_kw["state_batch_indices"].dtype == torch.int32
     assert torch.all(inputs["kwargs"]["out"] == 2.0)
     assert "[cake-route] mamba_ssu: Cake kernel selected" in caplog.text
+
+
+def test_ssu_decode_forwards_the_engine_pad_slot_id():
+    stock = mock.Mock(side_effect=_stock_ssu)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssu)
+    inputs = _ssu_decode_inputs()
+    inputs["kwargs"]["pad_slot_id"] = -7
+    with (
+        _routes(mamba_mod, "mamba_ssu"),
+        _not_capturing(),
+        mock.patch.object(mamba_mod, "_cake_ssu_kernels", lambda: (supports, cake)),
+    ):
+        _call_ssu(stock, inputs)
+    assert cake.call_args.kwargs["pad_slot_id"] == -7
+    assert supports.call_args.kwargs["pad_slot_id"] == -7
 
 
 def test_ssu_static_row_admits_both_decode_tiles_only():
