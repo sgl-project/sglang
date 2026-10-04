@@ -119,6 +119,11 @@ if _is_cuda:
 else:
     pick_dsl_expand = None
 
+from sglang.srt.layers.attention.dsa.cake_indexer_routes import (
+    cake_fp8_mqa_logits,
+    cake_fp8_paged_mqa_logits,
+)
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -1186,6 +1191,82 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _fp8_mqa_logits_cuda(
+        self,
+        q_fp8: torch.Tensor,
+        kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+    ) -> torch.Tensor:
+        """The ``fp8_mqa_logits`` call of the CUDA ragged path (``clean_logits=False``).
+
+        The Cake route (``SGLANG_CAKE_ROUTES=dsa_indexer``) runs first when it
+        admits the exact tensors; otherwise the stock DeepGEMM call runs
+        unchanged. Both receive DeepGEMM's current SM count (the
+        pipeline-parallel reservation of ``_with_real_sm_count``).
+        """
+        logits = cake_fp8_mqa_logits(
+            q_fp8, kv_fp8, weights, ks, ke, num_sms=deep_gemm.get_num_sms()
+        )
+        if logits is not None:
+            return logits
+        q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        return deep_gemm.fp8_mqa_logits(
+            q_padded,
+            kv_fp8,
+            w_padded,
+            ks,
+            ke,
+            clean_logits=False,
+        )
+
+    def _fp8_paged_mqa_logits_cuda(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        w: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_metadata,
+        max_len: int,
+        *,
+        block_kv: int,
+        clean_logits: bool = False,
+    ) -> torch.Tensor:
+        """One ``fp8_paged_mqa_logits`` call of the CUDA paged path.
+
+        ``schedule_metadata`` is the DeepGEMM schedule tensor or a zero-argument
+        callable producing it (chunks compute it lazily: the Cake route builds
+        its own metadata and never reads DeepGEMM's). The Cake route is tried
+        only for the DeepGEMM paged backend and ``clean_logits=False``.
+        """
+        if self.paged_mqa_logits_backend.is_deepgemm() and not clean_logits:
+            logits = cake_fp8_paged_mqa_logits(
+                q,
+                kv_cache,
+                w,
+                context_lens,
+                block_table,
+                max_len,
+                block_kv=block_kv,
+                num_sms=deep_gemm.get_num_sms(),
+            )
+            if logits is not None:
+                return logits
+        if callable(schedule_metadata):
+            schedule_metadata = schedule_metadata()
+        return deep_gemm.fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            w,
+            context_lens,
+            block_table,
+            schedule_metadata,
+            max_len,
+            clean_logits=clean_logits,
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1316,7 +1397,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
             if batch_size <= self.sm_count:
-                return deep_gemm.fp8_paged_mqa_logits(
+                return self._fp8_paged_mqa_logits_cuda(
                     q,
                     kv_cache,
                     w,
@@ -1324,17 +1405,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     block_table,
                     mqa_schedule_metadata,
                     max_len,
+                    block_kv=blocksize,
                     clean_logits=clean_logits,
                 )
             logits_chunks = []
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
-                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    chunk_context_lens, blocksize, self.sm_count
-                )
+
+                def chunk_schedule_metadata(chunk_context_lens=chunk_context_lens):
+                    return deep_gemm.get_paged_mqa_logits_metadata(
+                        chunk_context_lens, blocksize, self.sm_count
+                    )
+
                 logits_chunks.append(
-                    deep_gemm.fp8_paged_mqa_logits(
+                    self._fp8_paged_mqa_logits_cuda(
                         q[start:end],
                         kv_cache,
                         w[start * chunk_next_n : end * chunk_next_n],
@@ -1342,6 +1427,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         block_table[start:end],
                         chunk_schedule_metadata,
                         max_len,
+                        block_kv=blocksize,
                         clean_logits=clean_logits,
                     )
                 )
@@ -1572,16 +1658,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
-                    )
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_padded,
-                        kv_fp8,
-                        w_padded,
-                        ks,
-                        ke,
-                        clean_logits=False,
+                    logits = self._fp8_mqa_logits_cuda(
+                        q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -1637,16 +1715,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
-                    )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_padded,
+                    logits_chunk = self._fp8_mqa_logits_cuda(
+                        q_fp8[start:end],
                         kv_fp8,
-                        w_padded,
+                        weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        clean_logits=False,
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]

@@ -33,13 +33,15 @@ with `ops/kvcache/cake.py` is the canonical example.
 
 ## Inventory
 
-167 op ids: 162 at the FlashInfer baseline (main commit `46340689a5ab`, 2026-10-02) plus
-5 post-baseline entries read at main `e4f94f948` (noted `post-baseline` in the row). Columns:
+171 op ids: 162 at the FlashInfer baseline (main commit `46340689a5ab`, 2026-10-02) plus
+5 post-baseline entries read at main `e4f94f948` and 4 DeepSeek-V3.2 indexer entries with the
+DeepGEMM signatures (`fp8_mqa_logits`, paged metadata / logits; FlashInfer main `ac30bfabf` line,
+noted `post-baseline` in the row). Columns:
 op id without the group prefix, FlashInfer entry (module path after `flashinfer.`, then
 `:name`), admitted compute capabilities (inclusive `KernelSpec` range; `any CUDA` marks
 pure-torch or FlashInfer-quantizer weight preparation) and graph/prepare notes.
 
-### `attention` (52)
+### `attention` (56)
 
 Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 `ops/attention/cake_linear.py`.
@@ -79,6 +81,10 @@ Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 | `prepare_balanced_batch_decode_with_kv_cache` | `decode:prepare_balanced_batch_decode_with_kv_cache` | 10.0-10.3 | prepare once; on-device load balance |
 | `prepare_dense_mqa_logits` | `dense_mqa:prepare_dense_mqa_logits` | 10.0-10.3 | prepare once; pins 148/152 SMs |
 | `prepare_dsa_indexer_topk` | `experimental.cake_dsa_indexer.cake_backend:prepare_dsa_indexer_topk` | 10.0-10.7 | prepare once |
+| `fp8_mqa_logits` | `dense_mqa:fp8_mqa_logits` | 10.0-10.3 | post-baseline; one-shot DeepGEMM signature; shipped routes per `dense_route_available` |
+| `get_paged_mqa_logits_metadata` | `paged_mqa:get_paged_mqa_logits_metadata` | 10.0-10.3 | post-baseline; one-warp metadata program (not DeepGEMM's buffer) |
+| `fp8_paged_mqa_logits` | `paged_mqa:fp8_paged_mqa_logits` | 10.0-10.3 | post-baseline; one-shot DeepGEMM signature; routes per `paged_route_available` |
+| `prepare_paged_mqa_logits` | `paged_mqa:prepare_paged_mqa_logits` | 10.0-10.3 | post-baseline; prepare once (metadata + logits, graph replay) |
 | `prepare_kimi_k3_attn_res` | `kimi_k3_attn_res:prepare_kimi_k3_attn_res` | 10.0-10.3 | prepare once |
 | `prepare_kimi_k3_mla_fp8_paged_attention` | `mla:KimiK3MlaFp8PagedAttention` | 10.0-10.3 | prepare once (runner class) |
 | `prepare_minimax_h3_varlen_attention` | `experimental.minimax_h3_varlen_attention.cake_backend:prepare_minimax_h3_varlen_attention` | 10.0-10.3 | prepare once |

@@ -26,7 +26,7 @@ ROUTES = {
     "kimi_k3_mla": "Kimi-K3 FP8 MLA paged decode (attention.kimi_k3_mla_fp8_paged_attention)",
     # P1/P2 model routes (wiring + CPU route tests; model-level validation pending weights on a reachable route).
     "dsv3_grouped_routing": "DeepSeek-V3/R1/V3.2 grouped (node-limited) top-k routing (moe.fused_topk_deepseek)",
-    "dsa_indexer": "DeepSeek-V3.2 lightning indexer logits + top-k (attention.sparse_mqa_logits / dsa_indexer_topk)",
+    "dsa_indexer": "DeepSeek-V3.2 lightning indexer logits in dsa_indexer.Indexer: ragged prefill (attention.fp8_mqa_logits) and paged decode / verify (attention.get_paged_mqa_logits_metadata + fp8_paged_mqa_logits); the engine's +inf masking and top-k transform stay stock",
     "dsv4_sparse_mla_decode": "DeepSeek-V4/Flash sparse MLA decode (attention.trtllm_batch_decode_sparse_mla_dsv4 / SM120 NVFP4 variants)",
     "msa_nvfp4_sparse_decode": "MiniMax-M3 NVFP4 sparse MSA decode (attention.msa_nvfp4_sparse_decode)",
     "mamba_ssu": "Mamba2 / Nemotron-H / granite selective state update decode (mamba.selective_state_update)",

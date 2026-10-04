@@ -75,6 +75,24 @@ FlashInfer entries (all at FlashInfer ``46340689a5ab``):
   0``; FP32 ``output [Q, align(K + 256, 8)]`` with ``-inf`` outside the
   window. Exported routes: ``Q in {1, 16, 128} x K in {4096, 32768, 131072}``
   plus ``Q=16, K=1048576``.
+* ``flashinfer.dense_mqa.fp8_mqa_logits`` (same package; DeepGEMM
+  ``fp8_mqa_logits`` signature): e4m3 ``q [Q, H, 128]`` with ``H`` in the
+  catalog's head set (32; 64 once exported), ``kv = (e4m3 [K, 128], f32
+  scales [K])``, f32 ``weights [Q, H]``, int32 ``ks / ke [Q]``,
+  ``clean_logits`` accepted (no effect: every cell is written), ``max_seqlen_k``
+  must be 0 -> f32 ``[Q, K]`` view. The host helper
+  ``dense_route_available(H, Q, K)`` tells whether the shipped catalog serves
+  the point (today ``K % 256 == 0``, ``Q <= max_queries()``).
+* ``flashinfer.paged_mqa.get_paged_mqa_logits_metadata`` /
+  ``fp8_paged_mqa_logits`` / ``prepare_paged_mqa_logits`` (impl
+  ``flashinfer.experimental.deepgemm_dense_mqa.paged_mqa``; DeepGEMM paged
+  signatures): int32 ``context_lens [B, next_n]`` (2-D), ``block_kv`` 64,
+  ``num_sms`` -> int32 ``[num_sms + 1, 2]`` metadata; e4m3 ``q [B, next_n, H,
+  128]``, uint8 fused ``kv_cache [pages, 64, 1, 132]``, f32 ``weights [B *
+  next_n, H]``, int32 ``block_table [B, S]`` (unit column stride),
+  ``max_context_len``, ``clean_logits=False`` only -> f32 ``[B * next_n,
+  max_context_len]`` view (DeepGEMM mask semantics). Any batch size.
+  ``paged_route_available(H, 64, next_n)`` consults the shipped catalog.
 * ``flashinfer.sparse_mqa.prepare_sparse_mqa_metadata`` /
   ``prepare_sparse_mqa_logits`` (impl
   ``flashinfer.experimental.deepgemm_sparse_mqa``; same parts): sorted
@@ -136,6 +154,8 @@ FI_DSA_INDEXER_MODULE = "flashinfer.dsa_indexer"
 FI_DSA_INDEXER_BACKEND_MODULE = "flashinfer.experimental.cake_dsa_indexer.cake_backend"
 FI_DENSE_MQA_MODULE = "flashinfer.dense_mqa"
 FI_DENSE_MQA_BACKEND_MODULE = "flashinfer.experimental.deepgemm_dense_mqa.dense_mqa"
+FI_PAGED_MQA_MODULE = "flashinfer.paged_mqa"
+FI_PAGED_MQA_BACKEND_MODULE = "flashinfer.experimental.deepgemm_dense_mqa.paged_mqa"
 FI_SPARSE_MQA_MODULE = "flashinfer.sparse_mqa"
 FI_SPARSE_MQA_BACKEND_MODULE = "flashinfer.experimental.deepgemm_sparse_mqa.sparse_mqa"
 
@@ -167,6 +187,11 @@ DSA_INDEXER_MAX_TOP_K = 4096
 DENSE_MQA_HEADS = 32
 DENSE_MQA_K_MULTIPLE = 256
 SPARSE_MQA_HEADS = 32
+# DeepGEMM-signature indexer entries (DeepSeek-V3.2 engine contract).
+DSA_MQA_HEADS = (32, 64)
+DSA_MQA_HEAD_DIM = 128
+DSA_MQA_PAGE = 64
+DSA_MQA_FUSED_ROW_BYTES = DSA_MQA_HEAD_DIM + 4  # FP8 row + one FP32 scale
 
 
 # --------------------------------------------------------------------------
@@ -990,4 +1015,265 @@ def prepare_sparse_mqa_logits(
 
     return prepare_sparse_mqa_logits(
         q, sf_q, kv, sf_kv, weights, metadata_plan, output=output
+    )
+
+
+# --------------------------------------------------------------------------
+# DeepGEMM-signature indexer logits (DeepSeek-V3.2 engine contract)
+# --------------------------------------------------------------------------
+
+
+def _dsa_mqa_device_ok(*tensors) -> bool:
+    """Exact sm_100a / sm_103a parts; the FlashInfer runtime builds the programs
+    for the device's SM count (or the caller's CTA budget), so no SM-count pin."""
+    return archs_in(MQA_ARCHS, *tensors)
+
+
+def _fp8_mqa_logits_runtime():
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as runtime
+
+    return runtime
+
+
+def _fp8_paged_mqa_logits_runtime():
+    from flashinfer.experimental.deepgemm_dense_mqa import paged_mqa as runtime
+
+    return runtime
+
+
+def supports_fp8_mqa_logits(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+) -> bool:
+    """Admission for ``fp8_mqa_logits`` on the exact engine tensors; never raises.
+
+    Beyond the dtype / layout contract, the shipped FlashInfer catalog is
+    consulted (``dense_route_available``) so only points with exported programs
+    are admitted (32 heads, ``K % 256 == 0`` and ``Q <= max_queries()`` today;
+    the 64-head and KV-tail routes admit once exported).
+    """
+    try:
+        import torch
+
+        if not _dsa_mqa_device_ok(q, kv, kv_scales, weights, ks, ke):
+            return False
+        if not flashinfer_module_available(
+            FI_DENSE_MQA_MODULE, FI_DENSE_MQA_BACKEND_MODULE
+        ):
+            return False
+        if q.ndim != 3 or kv.ndim != 2:
+            return False
+        queries, heads, head_dim = (int(v) for v in q.shape)
+        keys = int(kv.shape[0])
+        if (
+            heads not in DSA_MQA_HEADS
+            or head_dim != DSA_MQA_HEAD_DIM
+            or int(kv.shape[1]) != DSA_MQA_HEAD_DIM
+            or queries < 1
+            or keys < 1
+        ):
+            return False
+        if not (
+            q.dtype == torch.float8_e4m3fn
+            and kv.dtype == torch.float8_e4m3fn
+            and kv_scales.dtype == torch.float32
+            and tuple(kv_scales.shape) == (keys,)
+            and weights.dtype == torch.float32
+            and tuple(weights.shape) == (queries, heads)
+            and ks.dtype == torch.int32
+            and ke.dtype == torch.int32
+            and tuple(ks.shape) == (queries,)
+            and tuple(ke.shape) == (queries,)
+            and q.is_contiguous()
+            and kv.is_contiguous()
+            and kv_scales.is_contiguous()
+            and weights.is_contiguous()
+            and ks.is_contiguous()
+            and ke.is_contiguous()
+        ):
+            return False
+        runtime = _fp8_mqa_logits_runtime()
+        if not hasattr(runtime, "dense_route_available"):
+            return False
+        return bool(runtime.dense_route_available(heads, queries, keys))
+    except Exception:
+        return False
+
+
+def fp8_mqa_logits(
+    q: torch.Tensor,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    clean_logits: bool = False,
+    max_seqlen_k: int = 0,
+    *,
+    sm_count: Optional[int] = None,
+) -> torch.Tensor:
+    """Forward to ``flashinfer.dense_mqa.fp8_mqa_logits`` (DeepGEMM signature).
+
+    Returns the f32 ``[Q, K]`` logits view; ``sm_count`` is the CTA budget the
+    engine would hand DeepGEMM (``deep_gemm.get_num_sms()``).
+    """
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    return fp8_mqa_logits(
+        q,
+        kv,
+        weights,
+        ks,
+        ke,
+        clean_logits=clean_logits,
+        max_seqlen_k=max_seqlen_k,
+        sm_count=sm_count,
+    )
+
+
+def supports_fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+) -> bool:
+    """Admission for the paged entries on the exact engine tensors; never raises.
+
+    ``q`` e4m3 ``[B, next_n, H, 128]`` (``H`` in {32, 64}), fused uint8
+    ``kv_cache [pages, 64, 1, 132]`` (page 64), f32 ``weights [B * next_n, H]``,
+    int32 2-D ``context_lens [B, next_n]``, int32 ``block_table [B, S]`` with
+    unit column stride; the shipped catalog must carry the ``(H, 64, next_n)``
+    program (``paged_route_available``).
+    """
+    try:
+        import torch
+
+        if not _dsa_mqa_device_ok(q, kv_cache, weights, context_lens, block_table):
+            return False
+        if not flashinfer_module_available(
+            FI_PAGED_MQA_MODULE, FI_PAGED_MQA_BACKEND_MODULE
+        ):
+            return False
+        if q.ndim != 4 or kv_cache.ndim != 4 or context_lens.ndim != 2:
+            return False
+        batch, next_n, heads, head_dim = (int(v) for v in q.shape)
+        if (
+            heads not in DSA_MQA_HEADS
+            or head_dim != DSA_MQA_HEAD_DIM
+            or batch < 1
+            or next_n < 1
+        ):
+            return False
+        page, kv_heads, row_bytes = (int(v) for v in kv_cache.shape[1:])
+        if (
+            page != DSA_MQA_PAGE
+            or kv_heads != 1
+            or row_bytes != DSA_MQA_FUSED_ROW_BYTES
+        ):
+            return False
+        if not (
+            q.dtype == torch.float8_e4m3fn
+            and q.is_contiguous()
+            and kv_cache.dtype == torch.uint8
+            and int(kv_cache.stride(3)) == 1
+            and int(kv_cache.stride(2)) == DSA_MQA_FUSED_ROW_BYTES
+            and int(kv_cache.stride(1)) == DSA_MQA_FUSED_ROW_BYTES
+            and weights.dtype == torch.float32
+            and tuple(weights.shape) == (batch * next_n, heads)
+            and weights.is_contiguous()
+            and context_lens.dtype == torch.int32
+            and tuple(context_lens.shape) == (batch, next_n)
+            and context_lens.is_contiguous()
+            and block_table.dtype == torch.int32
+            and block_table.ndim == 2
+            and int(block_table.shape[0]) == batch
+            and int(block_table.stride(1)) == 1
+        ):
+            return False
+        runtime = _fp8_paged_mqa_logits_runtime()
+        if not hasattr(runtime, "paged_route_available"):
+            return False
+        return bool(runtime.paged_route_available(heads, page, next_n))
+    except Exception:
+        return False
+
+
+def get_paged_mqa_logits_metadata(
+    context_lens: torch.Tensor,
+    block_kv: int,
+    num_sms: int,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Forward to ``flashinfer.paged_mqa.get_paged_mqa_logits_metadata``.
+
+    Returns int32 ``[num_sms + 1, 2]`` walk bounds for ``fp8_paged_mqa_logits``
+    (the Cake metadata program; not interchangeable with DeepGEMM's buffer).
+    """
+    from flashinfer.paged_mqa import get_paged_mqa_logits_metadata
+
+    return get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, out=out)
+
+
+def fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_meta: torch.Tensor,
+    max_context_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """Forward to ``flashinfer.paged_mqa.fp8_paged_mqa_logits`` (DeepGEMM signature).
+
+    Returns the f32 ``[B * next_n, max_context_len]`` logits view.
+    """
+    from flashinfer.paged_mqa import fp8_paged_mqa_logits
+
+    return fp8_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        clean_logits=clean_logits,
+    )
+
+
+def prepare_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_context_len: int,
+    *,
+    schedule_meta: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    sm_count: Optional[int] = None,
+):
+    """Forward to ``flashinfer.paged_mqa.prepare_paged_mqa_logits``.
+
+    Returns a ``PagedMqaPlan``; ``plan.run()`` submits the metadata and logits
+    programs without allocation (CUDA-graph replay with changed contents).
+    """
+    from flashinfer.paged_mqa import prepare_paged_mqa_logits
+
+    return prepare_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        max_context_len,
+        schedule_meta=schedule_meta,
+        output=output,
+        sm_count=sm_count,
     )

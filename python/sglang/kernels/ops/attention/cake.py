@@ -520,6 +520,61 @@ _reg(
     description="DeepGEMM-family dense MQA indexer logits (prepared) via FlashInfer.",
 )
 _reg(
+    "fp8_mqa_logits",
+    _SPARSE + "fp8_mqa_logits",
+    _BLACKWELL_DC,
+    dtypes=("float8_e4m3fn", "float32", "int32"),
+    contract=(
+        "DeepGEMM fp8_mqa_logits signature: e4m3 q [Q,H,128] (H in 32/64), kv = "
+        "(e4m3 [K,128], f32 scales [K]), f32 weights [Q,H], int32 ks/ke [Q], "
+        "clean_logits (no effect), max_seqlen_k == 0, sm_count= CTA budget -> "
+        "f32 logits view [Q,K]; shipped routes per dense_route_available(H,Q,K)"
+    ),
+    description=(
+        "DeepSeek-V3.2 ragged indexer logits with the DeepGEMM signature "
+        "(one-shot) via FlashInfer."
+    ),
+)
+_reg(
+    "get_paged_mqa_logits_metadata",
+    _SPARSE + "get_paged_mqa_logits_metadata",
+    _BLACKWELL_DC,
+    dtypes=("int32",),
+    contract=(
+        "DeepGEMM signature: int32 context_lens [B,next_n] (2-D), block_kv 64, "
+        "num_sms -> int32 [num_sms+1, 2] walk bounds for fp8_paged_mqa_logits"
+    ),
+    description="DeepSeek-V3.2 paged indexer schedule metadata via FlashInfer.",
+)
+_reg(
+    "fp8_paged_mqa_logits",
+    _SPARSE + "fp8_paged_mqa_logits",
+    _BLACKWELL_DC,
+    dtypes=("float8_e4m3fn", "uint8", "float32", "int32"),
+    contract=(
+        "DeepGEMM signature: e4m3 q [B,next_n,H,128] (H in 32/64), uint8 fused "
+        "kv_cache [pages,64,1,132], f32 weights [B*next_n,H], int32 context_lens "
+        "[B,next_n], int32 block_table [B,S] (unit column stride), schedule_meta, "
+        "max_context_len, clean_logits=False -> f32 logits view "
+        "[B*next_n,max_context_len]; any batch size"
+    ),
+    description=(
+        "DeepSeek-V3.2 paged indexer logits with the DeepGEMM signature "
+        "(one-shot) via FlashInfer."
+    ),
+)
+_reg(
+    "prepare_paged_mqa_logits",
+    _SPARSE + "prepare_paged_mqa_logits",
+    _BLACKWELL_DC,
+    dtypes=("float8_e4m3fn", "uint8", "float32", "int32"),
+    contract=(
+        "as fp8_paged_mqa_logits with caller-owned schedule_meta/output -> "
+        "plan.run() (metadata + logits, no allocation; graph replay)"
+    ),
+    description="DeepSeek-V3.2 paged indexer logits (prepared) via FlashInfer.",
+)
+_reg(
     "prepare_sparse_mqa_metadata",
     _SPARSE + "prepare_sparse_mqa_metadata",
     _BLACKWELL_DC,
