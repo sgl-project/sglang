@@ -563,7 +563,6 @@ class Dots3AttentionMLA(nn.Module):
     ) -> None:
         super().__init__()
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.layer_id = layer_id
@@ -642,8 +641,7 @@ class Dots3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("q_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -652,8 +650,7 @@ class Dots3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -663,8 +660,7 @@ class Dots3AttentionMLA(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.k_rope_only_layernorm = RMSNorm(

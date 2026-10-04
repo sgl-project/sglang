@@ -2015,7 +2015,6 @@ class DeepseekV2AttentionMLA(
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
         self.is_nextn = is_nextn
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
         self.num_heads = num_heads
@@ -2046,8 +2045,7 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2056,8 +2054,7 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -2115,8 +2112,7 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -2126,8 +2122,7 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 

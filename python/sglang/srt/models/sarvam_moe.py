@@ -424,7 +424,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.alt_stream = alt_stream
         self.quant_config = quant_config
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -452,8 +451,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -477,8 +475,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -495,8 +492,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -505,8 +501,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
 
