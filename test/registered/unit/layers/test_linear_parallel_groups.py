@@ -319,6 +319,148 @@ class TestLinearParallelGroups(CustomTestCase):
                 layer.weight.weight_loader(layer.weight, self.weight + 1)
             torch.testing.assert_close(layer.weight, self.weight[:, 4:] + 1)
 
+    def test_allocation_override_preserves_replicated_math_and_padding_policy(self):
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        attn = SimpleNamespace(world_size=2, all_reduce=Mock())
+        for group in ("tp", "attn_tp"):
+            for symmetric in (False, True):
+                with self.subTest(group=group, symmetric=symmetric):
+                    with (
+                        get_parallel().override(tp_group=tp, attn_tp_group=attn),
+                        patch(
+                            "sglang.srt.layers.linear.is_allocation_symmetric",
+                            return_value=symmetric,
+                        ),
+                        patch(
+                            "sglang.srt.layers.linear.use_symmetric_memory",
+                            return_value=nullcontext(),
+                        ) as allocator,
+                    ):
+                        layer = RowParallelLinear(
+                            8,
+                            8,
+                            bias=False,
+                            input_is_parallel=False,
+                            parallel_group="replicated",
+                            allocation_group=group,
+                        )
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                        torch.testing.assert_close(
+                            layer(self.x)[0], F.linear(self.x, self.weight)
+                        )
+                        if group == "tp":
+                            allocator.assert_called_once_with(
+                                tp, disabled=not symmetric
+                            )
+                        else:
+                            allocator.assert_called_once_with(attn)
+                    tp.all_reduce.assert_not_called()
+                    attn.all_reduce.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "Unknown linear allocation_group"):
+            RowParallelLinear(8, 8, allocation_group="replicated")
+
+    def test_replicated_model_mlps_keep_weights_and_tp_output_allocation(self):
+        from sglang.srt.models.exaone_moe import ExaoneMoEMLP
+        from sglang.srt.models.laguna import LagunaMLP
+        from sglang.srt.models.nemotron_h import NemotronHMLP
+        from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
+        from sglang.srt.models.step3p5 import Step3p5MLP
+
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        for cls in (
+            ExaoneMoEMLP,
+            LagunaMLP,
+            NemotronHMLP,
+            Qwen2MoeMLP,
+            Step3p5MLP,
+        ):
+            for group, rank, size in (("tp", 3, 4), ("replicated", 0, 1)):
+                with self.subTest(model=cls.__name__, group=group):
+                    options = dict(
+                        intermediate_size=8,
+                        reduce_results=False,
+                        parallel_group=group,
+                    )
+                    if cls is NemotronHMLP:
+                        options["config"] = SimpleNamespace(hidden_size=8)
+                    else:
+                        options["hidden_size"] = 8
+                        if cls is not Step3p5MLP:
+                            options["hidden_act"] = "silu"
+                    mlp = cls(**options)
+                    # Use native activation for CPU weight and layout checks.
+                    mlp.act_fn._forward_method = mlp.act_fn.forward_native
+                    up = getattr(mlp, "gate_up_proj", getattr(mlp, "up_proj", None))
+                    down = mlp.down_proj
+                    with get_parallel().override(
+                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                    ):
+                        if cls is NemotronHMLP:
+                            up.weight.weight_loader(up.weight, self.weight)
+                        else:
+                            up.weight.weight_loader(up.weight, self.weight, 0)
+                            up.weight.weight_loader(up.weight, self.weight + 1, 1)
+                        down.weight.weight_loader(down.weight, self.weight + 2)
+                    local_weight = self.weight.chunk(size)[rank]
+                    projected = F.linear(self.x, local_weight)
+                    if cls is NemotronHMLP:
+                        activated = projected.relu().square()
+                    else:
+                        activated = F.silu(projected) * F.linear(
+                            self.x, (self.weight + 1).chunk(size)[rank]
+                        )
+                    expected = F.linear(
+                        activated, (self.weight + 2).chunk(size, dim=1)[rank]
+                    )
+                    with (
+                        get_parallel().override(tp_group=tp),
+                        patch(
+                            "sglang.srt.layers.linear.is_allocation_symmetric",
+                            return_value=True,
+                        ),
+                        patch(
+                            "sglang.srt.layers.linear.use_symmetric_memory",
+                            return_value=nullcontext(),
+                        ) as allocator,
+                    ):
+                        torch.testing.assert_close(mlp(self.x), expected)
+                        allocator.assert_called_once_with(tp, disabled=False)
+                    tp.all_reduce.assert_not_called()
+                    self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
+                    self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
+
+    def test_step_shared_expert_constructs_a_replicated_mlp(self):
+        from sglang.srt.models import step3p5
+
+        config = SimpleNamespace(
+            hidden_size=8,
+            layer_types=["full_attention"],
+            yarn_only_types=[],
+            rope_theta=[10000],
+            max_position_embeddings=16,
+            head_dim=2,
+            moe_layers_enum="0",
+            num_attention_heads=4,
+            num_attention_groups=1,
+            num_hidden_layers=1,
+            swiglu_limits_shared=None,
+            partial_rotary_factors=[1.0],
+            rms_norm_eps=1e-6,
+            use_head_wise_attn_gate=False,
+            share_expert_dim=8,
+        )
+        backend = Mock()
+        backend.is_deepep.return_value = True
+        with (
+            patch.object(step3p5, "get_moe_a2a_backend", return_value=backend),
+            patch.object(step3p5, "Step3p5MoEMLP", return_value=torch.nn.Identity()),
+            patch.object(step3p5, "make_stages", return_value=(Mock(), Mock())),
+        ):
+            layer = step3p5.Step3p5DecoderLayer(config)
+        self.assertEqual(layer.share_expert.gate_up_proj.tp_size, 1)
+        self.assertEqual(layer.share_expert.down_proj.tp_size, 1)
+        self.assertFalse(layer.share_expert.down_proj.reduce_results)
+
     def test_replicated_layers_need_no_group_handle(self):
         with (
             get_parallel().override(tp_group=None, attn_tp_group=None),

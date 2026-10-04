@@ -1486,6 +1486,9 @@ class RowParallelLinear(LinearBase):
         parallel_group: Select one partition and its communication group.
                         Mutually exclusive with tp_rank, tp_size, and
                         use_dp_attention_reduce. Reduction policy is unchanged.
+        allocation_group: Override the symmetric-memory group independently of
+                          the weight partition and reduction. TP allocation still
+                          honors DP padding; None follows the existing policy.
     """
 
     def __init__(
@@ -1505,11 +1508,14 @@ class RowParallelLinear(LinearBase):
         use_dp_attention_reduce: Optional[bool] = None,
         *,
         parallel_group: Optional[LinearParallelGroup] = None,
+        allocation_group: Optional[Literal["tp", "attn_tp"]] = None,
     ):
         if parallel_group is not None and use_dp_attention_reduce is not None:
             raise ValueError(
                 "parallel_group cannot be combined with use_dp_attention_reduce"
             )
+        if allocation_group not in (None, "tp", "attn_tp"):
+            raise ValueError(f"Unknown linear allocation_group: {allocation_group!r}")
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -1519,6 +1525,7 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.parallel_group = parallel_group
+        self.allocation_group = allocation_group
         self.use_dp_attention_reduce = (
             parallel_group == "attn_tp"
             if parallel_group is not None
@@ -1694,14 +1701,19 @@ class RowParallelLinear(LinearBase):
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 
-        if self.parallel_group == "replicated" and not self.use_decode_attn_tp:
-            symm_ctx = nullcontext()
-        elif self.use_dp_attention_reduce:
+        allocation_group = self.allocation_group
+        if allocation_group is None and (
+            self.parallel_group != "replicated" or self.use_decode_attn_tp
+        ):
+            allocation_group = "attn_tp" if self.use_dp_attention_reduce else "tp"
+        if allocation_group == "attn_tp":
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
-        else:
+        elif allocation_group == "tp":
             symm_ctx = use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
+        else:
+            symm_ctx = nullcontext()
         with symm_ctx:
             if output_tensor is None:
                 output_parallel = self.quant_method.apply(
