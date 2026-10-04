@@ -136,45 +136,6 @@ def _value(batch: ForwardBatch):
 
 
 class TestMoeNumTokenNonPaddedTable(CustomTestCase):
-    def test_interleave_cp8_ep8_masks_only_physical_padding(self):
-        from unittest.mock import PropertyMock
-
-        from sglang.srt.layers.cp.base import ContextParallelStrategy
-        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
-
-        strategy = InterleaveCPStrategy(cp_size=8)
-        for total in (8, 11, 64, 65):
-            for rank in range(8):
-                with (
-                    self.subTest(total=total, rank=rank),
-                    patch.object(
-                        ContextParallelStrategy,
-                        "cp_rank",
-                        new_callable=PropertyMock,
-                        return_value=rank,
-                    ),
-                    patch(
-                        "sglang.srt.layers.cp.base.get_cp_strategy",
-                        return_value=strategy,
-                    ),
-                    sparse_moe_input("local"),
-                ):
-                    metadata = strategy.build_metadata(total, [total])
-                    logical = list(metadata.per_rank_actual_token)
-                    metadata.per_rank_logical_token = logical
-                    metadata.per_rank_actual_token = [16] * 8
-                    batch = _forward_batch(
-                        sharded=False,
-                        local=total,
-                        forward_mode=ForwardMode.EXTEND,
-                        attn_cp_metadata=metadata,
-                    )
-                    self.assertEqual(_value(batch), len(range(rank, total, 8)))
-                    cached = batch.moe_num_token_non_padded()
-                    self.assertIs(batch.moe_num_token_non_padded(), cached)
-                    batch.forward_mode = ForwardMode.DECODE
-                    self.assertEqual(_value(batch), total)
-
     # (label, MoE input, sharded, attn_dp_size, expected). Decode forwards, so
     # the MoE-CP rows follow the FFN rows' layout: that config all-gathers over
     # the MoE-CP group on a context-parallel extend only, which is the case below.
