@@ -575,7 +575,7 @@ def _ssu_static_row(
     """
     dim, dstate = int(state.shape[-2]), int(state.shape[-1])
     if x.ndim == 3:
-        if (dim, dstate) != (128, 128):
+        if (dim, dstate) not in ((128, 128), (64, 128)):
             return f"no promoted T=1 row for (dim, dstate)=({dim}, {dstate})"
         return None
     if x.ndim != 4:
@@ -627,6 +627,32 @@ def _int64(indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if indices is None or indices.dtype == torch.int64:
         return indices
     return indices.to(torch.int64)
+
+
+def _ssu_raw_abi_row(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: Optional[torch.Tensor],
+    indices: Optional[torch.Tensor],
+    dst_indices: Optional[torch.Tensor],
+) -> bool:
+    """``True`` when the call is the headdim-64 single-token decode row and the
+    engine's own storage (BF16 ``dt``/``D``/``dt_bias`` broadcasts, int32 slot
+    tables, fused-projection views) is the ABI the Cake programs read directly,
+    so no per-call conversion copies are needed."""
+    return (
+        x.ndim == 3
+        and tuple(state.shape[-2:]) == (64, 128)
+        and dt.dtype == torch.bfloat16
+        and D.dtype == torch.bfloat16
+        and dt_bias is not None
+        and dt_bias.dtype == torch.bfloat16
+        and indices is not None
+        and indices.dtype == torch.int32
+        and (dst_indices is None or dst_indices.dtype == torch.int32)
+    )
 
 
 def selective_state_update(
@@ -700,14 +726,24 @@ def _cake_selective_state_update(
         )
         return False
     supports, cake_ssu = _cake_ssu_kernels()
-    # Promoted rows take FP32 per-head broadcasts and int64 indices; the engine
-    # holds BF16 broadcasts of its parameters and int32 slot indices.
-    dt_fi = _fp32_broadcast(dt)
-    D_fi = _fp32_param_broadcast(D)
     dt_bias = kw.get("dt_bias")
-    dt_bias_fi = None if dt_bias is None else _fp32_param_broadcast(dt_bias)
-    indices_fi = _int64(kw.get("state_batch_indices"))
-    buffer_indices_fi = _int64(kw.get("intermediate_state_indices"))
+    if _ssu_raw_abi_row(
+        state, x, dt, D, dt_bias, kw.get("state_batch_indices"), kw.get("dst_state_batch_indices")
+    ):
+        # The headdim-64 decode programs read the engine's BF16 coefficient
+        # broadcasts, int32 slot tables and fused-projection views in place.
+        dt_fi, D_fi, dt_bias_fi = dt, D, dt_bias
+        indices_fi = kw.get("state_batch_indices")
+        buffer_indices_fi = kw.get("intermediate_state_indices")
+    else:
+        # The other promoted rows take FP32 per-head broadcasts and int64
+        # indices; the engine holds BF16 broadcasts of its parameters and
+        # int32 slot indices.
+        dt_fi = _fp32_broadcast(dt)
+        D_fi = _fp32_param_broadcast(D)
+        dt_bias_fi = None if dt_bias is None else _fp32_param_broadcast(dt_bias)
+        indices_fi = _int64(kw.get("state_batch_indices"))
+        buffer_indices_fi = _int64(kw.get("intermediate_state_indices"))
     cache_steps = kw.get("cache_steps")
     cache_steps = 0 if cache_steps is None else int(cache_steps)
     algorithm = "horizontal" if x.ndim == 4 and x.shape[0] >= 32 else "auto"
