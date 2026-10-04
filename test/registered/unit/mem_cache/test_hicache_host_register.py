@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -10,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import common as host_common
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -66,6 +68,94 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def test_hip_non_userptr_default_pool_uses_torch_owned_pinned_memory(self):
+        allocator = host_common.HostTensorAllocator()
+        buffer = _FakeBuffer(0x10000000, 4096)
+        cudart = _FakeCudart()
+        with (
+            mock.patch.object(host_common, "_is_hip", True),
+            mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
+            mock.patch.object(torch, "empty", return_value=buffer) as empty,
+            mock.patch.object(allocator, "allocate") as allocate,
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            got = host_common.alloc_with_host_register(
+                (4096,), torch.uint8, "cpu", True, allocator
+            )
+            self.assertIs(got, buffer)
+            empty.assert_called_once_with(
+                (4096,), dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            allocate.assert_not_called()
+            _cuda_host_unregister(got)
+            _cuda_host_unregister(got)
+        self.assertEqual(cudart.registrations, [])
+        self.assertEqual(cudart.unregistrations, [])
+
+    def test_non_userptr_path_preserves_other_allocators_and_platforms(self):
+        class StorageAllocator(host_common.HostTensorAllocator):
+            pass
+
+        for hip, userptr, custom in (
+            (False, "0", False),
+            (True, "1", False),
+            (True, "", False),
+            (True, "0", True),
+        ):
+            with self.subTest(hip=hip, userptr=userptr, custom=custom):
+                allocator = (
+                    StorageAllocator if custom else host_common.HostTensorAllocator
+                )()
+                buffer = _FakeBuffer(0x10000000, 4096)
+                with (
+                    mock.patch.object(host_common, "_is_hip", hip),
+                    mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": userptr}),
+                    mock.patch.object(
+                        allocator, "allocate", return_value=buffer
+                    ) as allocate,
+                    mock.patch.object(host_common, "_cuda_host_register") as register,
+                ):
+                    got = host_common.alloc_with_host_register(
+                        (4096,), torch.uint8, "cpu", True, allocator, 512
+                    )
+                    self.assertIs(got, buffer)
+                    allocate.assert_called_once_with(
+                        (4096,), dtype=torch.uint8, device="cpu"
+                    )
+                    register.assert_called_once_with(buffer, 512)
+
+    def test_non_userptr_unpinned_pool_preserves_allocator(self):
+        allocator = host_common.HostTensorAllocator()
+        with (
+            mock.patch.object(host_common, "_is_hip", True),
+            mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
+            mock.patch.object(allocator, "allocate") as allocate,
+            mock.patch.object(host_common, "_cuda_host_register") as register,
+        ):
+            self.assertIs(
+                host_common.alloc_with_host_register(
+                    (8,), torch.uint8, "cpu", False, allocator
+                ),
+                allocate.return_value,
+            )
+            register.assert_not_called()
+
+    def test_non_userptr_allocation_error_does_not_fall_back_to_userptr(self):
+        allocator = host_common.HostTensorAllocator()
+        with (
+            mock.patch.object(host_common, "_is_hip", True),
+            mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
+            mock.patch.object(
+                torch, "empty", side_effect=RuntimeError("allocation failed")
+            ),
+            mock.patch.object(allocator, "allocate") as allocate,
+            self.assertRaisesRegex(RuntimeError, "allocation failed"),
+        ):
+            host_common.alloc_with_host_register(
+                (8,), torch.uint8, "cpu", True, allocator
+            )
+        allocate.assert_not_called()
+
     def test_dsa_page_layouts_with_draft_use_page_registration_granularity(self):
         target_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
         draft_buffer = torch.empty(1, dtype=torch.uint8)
