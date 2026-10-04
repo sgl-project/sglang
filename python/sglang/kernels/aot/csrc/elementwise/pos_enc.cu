@@ -182,14 +182,14 @@ void rotary_embedding(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_FLOAT_TYPES(query.scalar_type(), "rotary_embedding", [&] {
-    DISPATCH_BOOL(cos_sin_cache.scalar_type() == at::kFloat, CACHE_FP32, [&] {
-      using cache_t = std::conditional_t<CACHE_FP32, float, scalar_t>;
+    auto launch = [&](auto* cache_ptr) {
+      using cache_t = std::remove_pointer_t<decltype(cache_ptr)>;
       if (is_neox) {
         rotary_embedding_kernel<scalar_t, cache_t, true><<<grid, block, 0, stream>>>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
             key.has_value() ? key->data_ptr<scalar_t>() : nullptr,
-            cos_sin_cache.data_ptr<cache_t>(),
+            cache_ptr,
             rot_dim,
             query_stride,
             key_stride,
@@ -202,7 +202,7 @@ void rotary_embedding(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
             key.has_value() ? key->data_ptr<scalar_t>() : nullptr,
-            cos_sin_cache.data_ptr<cache_t>(),
+            cache_ptr,
             rot_dim,
             query_stride,
             key_stride,
@@ -211,7 +211,11 @@ void rotary_embedding(
             num_kv_heads,
             head_size);
       }
-      return true;
-    });
+    };
+    if (cos_sin_cache.scalar_type() == at::kFloat) {
+      launch(cos_sin_cache.data_ptr<float>());
+    } else {
+      launch(cos_sin_cache.data_ptr<scalar_t>());
+    }
   });
 }
