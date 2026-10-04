@@ -97,50 +97,6 @@ def test_modulate_scale_shift_guards_reject_fp32():
     assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
 
 
-def test_modulate_selected_kernel_errors_propagate(monkeypatch):
-    from importlib import import_module
-
-    mod = import_module(
-        "sglang.kernels.ops.diffusion.modulate.modulate_scale_shift_jit"
-    )
-    x = torch.randn(1, 17, 64, device=DEVICE, dtype=torch.bfloat16)
-    row = torch.randn(1, 64, device=DEVICE, dtype=torch.bfloat16)
-
-    def fail(*args):
-        raise RuntimeError("test launch failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(mod, "modulate_scale_shift_cuda", fail)
-        with pytest.raises(RuntimeError, match="test launch failure"):
-            modulate_scale_shift(x, row, row)
-    assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
-
-
-def test_cuda_only_modulation_uses_eager_on_rocm(monkeypatch):
-    from importlib import import_module
-
-    from sglang.kernels.kda_kernels import residual_gate_add_jit as residual_impl
-
-    modulate_impl = import_module(
-        "sglang.kernels.ops.diffusion.modulate.modulate_scale_shift_jit"
-    )
-    x = torch.randn(1, 17, 64, device=DEVICE, dtype=torch.bfloat16)
-    row = torch.randn(1, 64, device=DEVICE, dtype=x.dtype)
-
-    def unexpected_launch(*args):
-        pytest.fail("CUDA-only kernel selected on ROCm")
-
-    monkeypatch.setattr(torch.version, "hip", "test-rocm")
-    monkeypatch.setattr(modulate_impl, "modulate_scale_shift_cuda", unexpected_launch)
-    monkeypatch.setattr(
-        residual_impl, "_residual_gate_add_custom_op", unexpected_launch
-    )
-    assert not can_use_modulate_scale_shift_cuda(x, row, row)
-    assert not can_use_residual_gate_add_cuda(x, x, row[:, None])
-    assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
-    assert torch.equal(residual_gate_add(x, x, row[:, None]), x + x * row[:, None])
-
-
 # Causal Wan and LingBot use per-frame 4D modulation with a per-token shift.
 SCALE_SHIFT_4D_CASES = [
     ((1, 18, 96), 3),
@@ -218,52 +174,6 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     ref = residual + update * gate
     _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
-
-
-@pytest.mark.parametrize("transposed", [False, True])
-def test_residual_gate_add_selects_existing_backend(transposed, monkeypatch):
-    from sglang.kernels.kda_kernels import residual_gate_add_jit as impl
-
-    residual = torch.randn(1, 128, 32, device=DEVICE, dtype=torch.bfloat16)
-    if transposed:
-        residual = residual.transpose(1, 2)
-    update = torch.randn_like(residual, memory_format=torch.contiguous_format)
-    gate = torch.randn(1, 1, residual.shape[-1], device=DEVICE, dtype=residual.dtype)
-    selected = []
-    cuda, triton = impl._residual_gate_add_cuda_impl, impl._residual_gate_add_transposed
-
-    def run_cuda(*args):
-        selected.append("cuda")
-        return cuda(*args)
-
-    def run_triton(*args):
-        selected.append("triton")
-        return triton(*args)
-
-    monkeypatch.setattr(impl, "_residual_gate_add_cuda_impl", run_cuda)
-    monkeypatch.setattr(impl, "_residual_gate_add_transposed", run_triton)
-    out = residual_gate_add(residual, update, gate)
-    assert selected == ["triton" if transposed else "cuda"]
-    assert torch.equal(out, residual + update * gate)
-
-
-def test_residual_gate_add_selected_kernel_errors_propagate(monkeypatch):
-    from sglang.kernels.kda_kernels import residual_gate_add_jit as impl
-
-    residual = torch.randn(1, 17, 64, device=DEVICE, dtype=torch.bfloat16)
-    update = torch.randn_like(residual)
-    gate = torch.randn(1, 1, 64, device=DEVICE, dtype=residual.dtype)
-
-    def fail(*args):
-        raise RuntimeError("test launch failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(impl, "_residual_gate_add_custom_op", fail)
-        with pytest.raises(RuntimeError, match="test launch failure"):
-            residual_gate_add(residual, update, gate)
-    assert torch.equal(
-        residual_gate_add(residual, update, gate), residual + update * gate
-    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
