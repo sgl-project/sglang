@@ -264,13 +264,16 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         for draft_backend in ("fa4", "trtllm_mha"):
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
-    def test_host_pool_retraction_refused_with_a_fused_draft(self):
-        """The host-pool retraction backup builds host pools off the draft's
-        device pool, and a fused draft view has no transfer surface. Without a
-        draft the backup is not this gate's to refuse."""
-        self.assertFalse(_accepts("EAGLE", retraction_backup="host_pool"))
-        self.assertFalse(_accepts("EAGLE3", retraction_backup="host_pool"))
-        self.assertTrue(_accepts(None, retraction_backup="host_pool"))
+    def test_hierarchical_cache_refused_with_an_eagle_draft(self):
+        """HiCache builds a draft host pool off the draft's device pool, and a
+        fused draft view has no transfer surface of its own: the page-envelope
+        host pool refuses per-layer draft loads. Without a draft, or with
+        DSPARK's private pool, HiCache is not this gate's to refuse."""
+        hicache = {"enable_hierarchical_cache": True}
+        for algorithm in ("EAGLE", "EAGLE3"):
+            self.assertFalse(_accepts(algorithm, fields=hicache))
+        self.assertTrue(_accepts(None, fields=hicache))
+        self.assertTrue(_accepts("DSPARK", fields=hicache))
 
     def test_pd_decode_refusals_raise_their_own_assertions(self):
         """The PD-decode branches screen the model with `mambaish_config`. A

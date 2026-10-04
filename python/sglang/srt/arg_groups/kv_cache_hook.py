@@ -647,12 +647,17 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
     assert not (
         cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
-        and cfg.disaggregation_decode_retraction_backup == "host_pool"
+        and (
+            cfg.enable_hierarchical_cache
+            or cfg.disaggregation_decode_retraction_backup == "host_pool"
+        )
     ), (
         "--enable-unified-memory + EAGLE/EAGLE3 does not support "
-        "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
-        "host pools off the draft's device pool, and a draft fused into the "
-        "target's entries has no transfer surface of its own."
+        "--enable-hierarchical-cache or "
+        "--disaggregation-decode-retraction-backup=host_pool: both build host "
+        "pools off the draft's device pool, and a draft fused into the "
+        "target's entries has no transfer surface of its own (the page "
+        "envelope host pool refuses per-layer draft loads)."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
