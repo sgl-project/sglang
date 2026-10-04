@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -3695,7 +3696,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
             _glm47_native_structural_tag_available.cache_clear()
 
 
-class TestGlm47FullAssistantGrammar(unittest.TestCase):
+class TestGlm47FullAssistantGrammar(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.compiler = xgr.GrammarCompiler(
@@ -3705,11 +3706,19 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
             max_threads=1,
         )
 
-    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
-        tools = [
-            Tool(type="function", function=Function(name=name, parameters=parameters))
-            for name in ("alpha", "beta")
-        ]
+    def _compile(
+        self, parameters=None, choice="auto", parallel=True, thinking=False, tools=True
+    ):
+        tools = (
+            [
+                Tool(
+                    type="function", function=Function(name=name, parameters=parameters)
+                )
+                for name in ("alpha", "beta")
+            ]
+            if tools
+            else []
+        )
         parser = FunctionCallParser(tools, "glm47")
         constraint = parser.get_structure_constraint(
             choice, parallel_tool_calls=parallel, thinking_mode=thinking
@@ -3739,6 +3748,15 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             self._accepts(grammar, prefix + "Hello"),
                             choice in ("auto", "none"),
                         )
+                        matcher = xgr.GrammarMatcher(grammar)
+                        self.assertEqual(
+                            matcher.accept_string(prefix + "Hello"),
+                            choice in ("auto", "none"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + "Hello" + alpha),
+                            choice == "auto",
+                        )
                         self.assertEqual(
                             self._accepts(grammar, prefix + alpha), choice != "none"
                         )
@@ -3750,6 +3768,16 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             self._accepts(grammar, prefix + alpha * 2),
                             parallel and choice != "none",
                         )
+
+    def test_no_tools_allows_text(self):
+        for thinking in (False, True):
+            with self.subTest(thinking=thinking):
+                grammar = self._compile(choice="auto", thinking=thinking, tools=False)
+                prefix = "analysis</think>" if thinking else ""
+                self.assertTrue(self._accepts(grammar, prefix + "Hello"))
+                self.assertFalse(
+                    self._accepts(grammar, prefix + "<tool_call>alpha</tool_call>")
+                )
 
     def test_enum_json_types_and_boolean_schemas(self):
         cases = [
