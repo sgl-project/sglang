@@ -161,25 +161,21 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         )
                     )
                     self._last_arguments += argument_diff
-                    self.streamed_args_for_tool[self.current_tool_id] += (
-                        argument_diff
-                    )
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
                 if _is_complete_json(func_args_raw):
                     try:
                         parsed_args = json.loads(func_args_raw)
-                        self.prev_tool_call_arr[self.current_tool_id][
-                            "arguments"
-                        ] = parsed_args
+                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                            parsed_args
+                        )
                     except json.JSONDecodeError:
                         pass
 
                     tool_call_end_pattern = (
                         r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
                     )
-                    match = re.search(
-                        tool_call_end_pattern, current_text, re.DOTALL
-                    )
+                    match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
                     if match:
                         self._buffer = current_text[match.end() :]
                     else:

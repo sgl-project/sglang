@@ -1575,9 +1575,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             for c in detector.parse_streaming_increment(chunk, self.tools).calls
         ]
         streamed_args = "".join(c.parameters for c in streamed)
-        parsed = DeepSeekV3Detector().detect_and_parse(
-            "".join(chunks), self.tools
-        )
+        parsed = DeepSeekV3Detector().detect_and_parse("".join(chunks), self.tools)
         self.assertEqual(
             streamed_args,
             parsed.calls[0].parameters,
