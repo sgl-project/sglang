@@ -217,6 +217,16 @@ class SchedulerInternalStateController:
         self._require_dspark_worker(key, "set_dspark_forced_budget_frac")
         if value is not None and not (0.0 < float(value) <= 1.0):
             raise UpdateRejected(f"{key} must be in (0, 1] or null, got {value}.")
+        simulate_acc_len = envs.SGLANG_SIMULATE_ACC_LEN.get()
+        if value is not None and simulate_acc_len > 0 and simulate_acc_len != 1.0:
+            # A trimmed verify budget breaks the cap-accept accounting of a
+            # constant simulated accept length, as the DSpark worker checks at
+            # startup for profiled SPS tables.
+            raise UpdateRejected(
+                f"{key} cannot be pinned with SGLANG_SIMULATE_ACC_LEN="
+                f"{simulate_acc_len}; only SGLANG_SIMULATE_ACC_LEN=1.0 stays "
+                "within every verify budget."
+            )
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
         # A worker command, not a server arg: keep it out of the override.
