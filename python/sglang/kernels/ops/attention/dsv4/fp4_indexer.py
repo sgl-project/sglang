@@ -647,12 +647,19 @@ def index_k_rope_pack(
 @triton.jit
 def _e2m1_decode(code):
     # code: uint 0..15 -> e2m1 value. exp = bits 2..1, mantissa = bit 0, sign = bit 3.
+    # |v| = 0, 0.5, 1, 1.5, 2, 3, 4, 6.
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
-    sub = m * 0.5
-    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
-    v = tl.where(e == 0, sub, nor)
+    pow2 = tl.where(e == 3, 4.0, tl.where(e == 2, 2.0, 1.0))
+    v = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * pow2)
     return tl.where((code >> 3) == 1, -v, v)
+
+
+@triton.jit
+def _e8m0_decode(code):
+    # code: uint 0..255 -> 2^(code - 127), written directly as the FP32 exponent
+    # field. Code 0 (never stored: the quantizer clamps to 1..254) gives 0.
+    return (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -698,7 +705,7 @@ def _fp4_index_logits_tile(
         mask=valid[:, None],
         other=127,
     )
-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    scale = _e8m0_decode(exps)
     k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
     k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
 
