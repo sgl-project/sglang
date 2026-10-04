@@ -193,6 +193,64 @@ class TestLinearParallelGroups(CustomTestCase):
                     tp.all_reduce.assert_not_called()
                     attn.all_reduce.assert_not_called()
 
+    def test_attention_rows_keep_their_existing_execution_policy(self):
+        from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+        from sglang.srt.models.nemotron_h import NemotronHAttention
+        from sglang.srt.models.qwen2_moe import Qwen2MoeAttention
+
+        initialize_dp_attention_flags(
+            ServerArgs(model_path="dummy", device="cpu", tp_size=4, attn_dp_size=2)
+        )
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        attn = SimpleNamespace(world_size=2, all_reduce=Mock())
+        for use_attention_allocation in (False, True):
+            with self.subTest(use_attention_allocation=use_attention_allocation):
+                if use_attention_allocation:
+                    attention = NemotronHAttention(
+                        config=SimpleNamespace(
+                            hidden_size=8,
+                            num_attention_heads=4,
+                            num_key_value_heads=1,
+                            head_dim=2,
+                            sliding_window=None,
+                        ),
+                        layer_idx=0,
+                    )
+                else:
+                    attention = Qwen2MoeAttention(
+                        hidden_size=8,
+                        num_heads=4,
+                        num_kv_heads=1,
+                        max_position_embeddings=16,
+                    )
+                row = attention.o_proj
+                with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+                    row.weight.weight_loader(row.weight, self.weight)
+                self.assertEqual((row.tp_rank, row.tp_size), (1, 2))
+                self.assertFalse(row.reduce_results)
+                self.assertEqual(row.use_dp_attention_reduce, use_attention_allocation)
+                with (
+                    get_parallel().override(tp_group=tp, attn_tp_group=attn),
+                    patch(
+                        "sglang.srt.layers.linear.is_allocation_symmetric",
+                        return_value=False,
+                    ),
+                    patch(
+                        "sglang.srt.layers.linear.use_symmetric_memory",
+                        return_value=nullcontext(),
+                    ) as allocation,
+                ):
+                    torch.testing.assert_close(
+                        row(self.x[:, 4:])[0],
+                        F.linear(self.x[:, 4:], self.weight[:, 4:]),
+                    )
+                    if use_attention_allocation:
+                        allocation.assert_called_once_with(attn)
+                    else:
+                        allocation.assert_called_once_with(tp, disabled=True)
+                tp.all_reduce.assert_not_called()
+                attn.all_reduce.assert_not_called()
+
     def test_model_gate_projections_reload_on_their_attention_shards(self):
         from sglang.srt.models.laguna import LagunaAttention
         from sglang.srt.models.step3p5 import Step3p5Attention
@@ -466,7 +524,9 @@ class TestLinearParallelGroups(CustomTestCase):
         from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
         from sglang.srt.models.step3p5 import Step3p5MLP
 
-        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        tp = SimpleNamespace(
+            world_size=4, all_reduce=Mock(side_effect=lambda tensor: tensor * 2)
+        )
         for cls in (
             ExaoneMoEMLP,
             LagunaMLP,
@@ -474,14 +534,14 @@ class TestLinearParallelGroups(CustomTestCase):
             Qwen2MoeMLP,
             Step3p5MLP,
         ):
-            groups = [("tp", 3, 4), ("replicated", 0, 1)]
-            if cls is ExaoneMoEMLP:
-                groups.insert(0, (None, 3, 4))
+            groups = [(None, 3, 4), ("tp", 3, 4), ("replicated", 0, 1)]
             for group, rank, size in groups:
                 with self.subTest(model=cls.__name__, group=group):
+                    tp.all_reduce.reset_mock()
+                    reduces = group is None
                     options = dict(
                         intermediate_size=8,
-                        reduce_results=False,
+                        reduce_results=reduces,
                         parallel_group=group,
                     )
                     if cls is NemotronHMLP:
@@ -517,6 +577,8 @@ class TestLinearParallelGroups(CustomTestCase):
                     expected = F.linear(
                         activated, (self.weight + 2).chunk(size, dim=1)[rank]
                     )
+                    if reduces:
+                        expected = expected * 2
                     with (
                         get_parallel().override(tp_group=tp),
                         patch(
@@ -530,7 +592,10 @@ class TestLinearParallelGroups(CustomTestCase):
                     ):
                         torch.testing.assert_close(mlp(self.x), expected)
                         allocator.assert_called_once_with(tp, disabled=False)
-                    tp.all_reduce.assert_not_called()
+                    if reduces:
+                        tp.all_reduce.assert_called_once()
+                    else:
+                        tp.all_reduce.assert_not_called()
                     self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
                     self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
 

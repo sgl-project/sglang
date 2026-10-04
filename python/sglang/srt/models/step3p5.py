@@ -69,7 +69,7 @@ class Step3p5MLP(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         *,
-        parallel_group: Optional[LinearParallelGroup] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -292,7 +292,6 @@ class Step3p5Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -331,8 +330,7 @@ class Step3p5Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )

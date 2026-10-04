@@ -651,8 +651,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 

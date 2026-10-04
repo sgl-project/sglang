@@ -512,7 +512,6 @@ class Qwen3MoeAttention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
@@ -552,8 +551,7 @@ class Qwen3MoeAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
