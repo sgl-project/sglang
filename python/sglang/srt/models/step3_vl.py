@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
@@ -41,7 +42,6 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -346,6 +346,7 @@ class Step3TextDecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             self.use_moe = True
@@ -397,7 +398,7 @@ class Step3TextDecoderLayer(nn.Module):
             hidden_states += self.share_expert(h)
         else:
             hidden_states = self.moe(hidden_states)
-        return reduce_moe_output(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -417,12 +418,11 @@ class Step3TextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.use_moe:
-                hidden_states = self.moe_mlp_forward(hidden_states)
-            else:
-                hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        if self.use_moe:
+            hidden_states = self.moe_mlp_forward(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -546,6 +546,15 @@ class Step3VisionMLP(nn.Module):
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=attn_tp_size,
+            reduces_over_attn_tp=False,
+            multimodal_encoder=True,
+        )
         self.fc2 = RowParallelLinear(
             intermediate_size,
             dim,

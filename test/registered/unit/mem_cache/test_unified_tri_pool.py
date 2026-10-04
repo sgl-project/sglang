@@ -34,81 +34,23 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
     init_unified_mamba_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    FakeUnifiedSWAKVPool,
+    tri_sub_pool_specs,
+)
 
 # Hermetic convention of this directory's pool tests: plain unittest.TestCase,
 # only ci_register imported (no heavy sglang.test.test_utils chain).
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _DEV = "cpu"
-
-
-class _FakeKVCache:
-    """buf[p] == virtual id stored at physical slot p (-1 free); moves copy it."""
-
-    def __init__(self, max_slots: int):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
-
-    def move_kv_cache(self, dst_loc: torch.Tensor, src_loc: torch.Tensor):
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-
-class _FakeUnifiedSWAKVPool:
-    class _SubKV(_FakeKVCache):
-        def __init__(self, max_slots):
-            super().__init__(max_slots)
-            self.allocator = None
-
-        def attach_allocator(self, allocator):
-            self.allocator = allocator
-
-    def __init__(self, shared_pool: UnifiedKVPool):
-        self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
-        self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
-        self._full_allocator = None
-        self._swa_allocator = None
-
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
-
-
-def _tri_specs(
-    full_layer_num=4, swa_layer_num=2, state_layer_num=2, head_num=2, head_dim=4
-):
-    full = MHASubPoolSpec(
-        name="full",
-        layer_num=full_layer_num,
-        head_num=head_num,
-        head_dim=head_dim,
-        store_dtype=torch.float16,
-        grow_direction="down",
-    )
-    swa = MHASubPoolSpec(
-        name="swa",
-        layer_num=swa_layer_num,
-        head_num=head_num,
-        head_dim=head_dim,
-        store_dtype=torch.float16,
-        grow_direction="float",
-    )
-    mamba = MambaSubPoolSpec(
-        name="mamba",
-        layer_num=state_layer_num,
-        conv_state_shapes=((3, 8),),
-        conv_dtype=torch.bfloat16,
-        temporal_state_shape=(0, 0, 0),  # Inkling: conv-only, no SSM state
-        temporal_dtype=torch.float32,
-        grow_direction="up",
-    )
-    return full, swa, mamba
 
 
 class TestUnifiedTriPool(unittest.TestCase):
@@ -120,7 +62,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         page_size=1,
         lazy_compaction=False,
     ):
-        full, swa, mamba = _tri_specs()
+        full, swa, mamba = tri_sub_pool_specs()
         total = (
             n_full * full.entry_bytes()
             + n_swa * swa.entry_bytes()
@@ -133,8 +75,8 @@ class TestUnifiedTriPool(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        kvcache = FakeUnifiedSWAKVPool(pool)
+        mamba_kv = FakeKVCache(pool.max_slots("mamba"))
         allocator = UnifiedMambaSWATokenToKVPoolAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
@@ -496,7 +438,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
     """
 
     def _build_paged(self, page_size=4, n_full=64, n_swa=32, n_state=8):
-        full, swa, mamba = _tri_specs()
+        full, swa, mamba = tri_sub_pool_specs()
         total = (
             n_full * full.entry_bytes()
             + n_swa * swa.entry_bytes()
@@ -509,8 +451,8 @@ class TestTriPagedFreeGroup(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        kvcache = FakeUnifiedSWAKVPool(pool)
+        mamba_kv = FakeKVCache(pool.max_slots("mamba"))
         allocator = UnifiedMambaSWATokenToKVPoolAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
@@ -1211,11 +1153,11 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
+        kvcache = FakeUnifiedSWAKVPool(pool)
         return pool, UnifiedMambaSWATokenToKVPoolAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -1231,7 +1173,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             for fl, sl, ml in ((4, 3, 1), (4, 2, 2), (6, 3, 1), (3, 5, 2)):
                 for n_full, n_swa, n_state in ((24, 16, 4), (32, 16, 8), (20, 12, 6)):
                     for lazy in (False, True):
-                        specs = _tri_specs(
+                        specs = tri_sub_pool_specs(
                             full_layer_num=fl,
                             swa_layer_num=sl,
                             state_layer_num=ml,
@@ -1277,7 +1219,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
         """Direct form: the joint answer, converted to float pages, must fit
         inside what `_region_bounds_pages` actually offers."""
         for page_size in (1, 4):
-            specs = _tri_specs(
+            specs = tri_sub_pool_specs(
                 full_layer_num=4,
                 swa_layer_num=3,
                 state_layer_num=1,
@@ -1315,7 +1257,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
     """
 
     def _tri(self, lazy=True):
-        full, swa, mamba = _tri_specs(head_num=1, head_dim=8)
+        full, swa, mamba = tri_sub_pool_specs(head_num=1, head_dim=8)
         total = (
             48 * full.entry_bytes() + 32 * swa.entry_bytes() + 8 * mamba.entry_bytes()
         )
@@ -1325,11 +1267,11 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
+        kvcache = FakeUnifiedSWAKVPool(pool)
         alloc = UnifiedMambaSWATokenToKVPoolAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,
@@ -1408,7 +1350,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
     """
 
     def _float(self):
-        full, swa, mamba = _tri_specs(head_num=1, head_dim=8)
+        full, swa, mamba = tri_sub_pool_specs(head_num=1, head_dim=8)
         total = (
             48 * full.entry_bytes() + 32 * swa.entry_bytes() + 8 * mamba.entry_bytes()
         )
@@ -1420,8 +1362,8 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         )
         alloc = UnifiedMambaSWATokenToKVPoolAllocator(
             unified_buffer=pool,
-            kvcache=_FakeUnifiedSWAKVPool(pool),
-            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            kvcache=FakeUnifiedSWAKVPool(pool),
+            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,
