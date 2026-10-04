@@ -84,8 +84,12 @@ def _staged_fixture(full_match=2):
     cc.storage_backend.batch_exists.return_value = 0
     cc.mem_pool_host = SimpleNamespace(
         free=Mock(),
+        anchor_entry=SimpleNamespace(host_pool=SimpleNamespace()),
         entry_map={
-            PoolName.SWA: SimpleNamespace(host_pool=SimpleNamespace(free=Mock()))
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(free=Mock()),
+                device_indices_from_anchor_fn=None,
+            )
         },
     )
     cache.cache_controller = cc
@@ -282,6 +286,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
                     operation.pool_transfers = [swa]
                     operation.host_indices = torch.arange(hit_tokens)
+                    operation.buffer_host_occupied_units = hit_tokens
                     cache.ongoing_prefetch[req.cache_request_handle] = info._replace(
                         host_indices=operation.host_indices, comp_xfers={"swa": [swa]}
                     )

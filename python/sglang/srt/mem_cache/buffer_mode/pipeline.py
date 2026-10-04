@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
@@ -75,6 +77,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _minimum_full_transfer_tokens(
+    host_pool: HostKVCache, prefetch_threshold: int
+) -> int:
+    page_size = host_pool.page_size
+    return max(page_size, -(-prefetch_threshold // page_size) * page_size)
+
+
 class _UnifiedBackupIntent(msgspec.Struct):
     """Buffer-mode backup intent, unpinned while queued.
 
@@ -99,6 +108,7 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     host_indices: torch.Tensor
     aux_xfers: list[PoolTransfer]
     lock_params: DecLockRefParams
+    occupied_units: int
 
 
 class _StagedPrefetch(msgspec.Struct):
@@ -172,6 +182,7 @@ def validate_buffer_only_stack(
     host_pool_group: HostPoolGroup,
     swa_component: Optional[SWAComponent],
     mamba_component: Optional[MambaComponent],
+    storage_prefetch_threshold: int = 256,
 ) -> None:
     """Post-assembly buffer-mode fences.
 
@@ -214,12 +225,40 @@ def validate_buffer_only_stack(
         # window), so every window-carrying intent would be dropped as
         # oversize and SWA storage coverage would silently be zero.
         window_tokens = swa.full_window_pages * swa._swa_kv_pool_host.page_size
-        if swa._swa_kv_pool_host.size < 2 * window_tokens:
+        shared_domain = (
+            swa._swa_kv_pool_host.shared_allocation_domain
+            if isinstance(swa._swa_kv_pool_host, HostKVCache)
+            else None
+        )
+        if shared_domain is not None:
+            full_host_pool = (
+                swa.cache.cache_controller.mem_pool_host.anchor_entry.host_pool
+            )
+            min_full_tokens = _minimum_full_transfer_tokens(
+                full_host_pool, storage_prefetch_threshold
+            )
+            one_transfer_bytes = (
+                window_tokens * swa._swa_kv_pool_host.size_per_token
+                + min_full_tokens * full_host_pool.size_per_token
+            )
+            one_transfer = [
+                (full_host_pool.pool_label, min_full_tokens),
+                (swa._swa_kv_pool_host.pool_label, window_tokens),
+            ]
+            enough_capacity = shared_domain.can_fit_many_then(
+                one_transfer, one_transfer, empty=True
+            )
+            capacity = f"{shared_domain.capacity_bytes} shared bytes"
+            requirement = f"{2 * one_transfer_bytes} shared bytes"
+        else:
+            enough_capacity = swa._swa_kv_pool_host.size >= 2 * window_tokens
+            capacity = f"{swa._swa_kv_pool_host.size} SWA tokens"
+            requirement = f"{2 * window_tokens} SWA tokens"
+        if not enough_capacity:
             raise ValueError(
-                "--hicache-host-memory-mode buffer_only requires an SWA "
-                f"host pool of at least two trailing windows "
-                f"({2 * window_tokens} tokens; got "
-                f"{swa._swa_kv_pool_host.size}): one staging a write "
+                "--hicache-host-memory-mode buffer_only requires a host arena "
+                "large enough for two minimum Full/SWA transfers "
+                f"({requirement}; got {capacity}): one staging a write "
                 "while one stays reserved for prefetch window allocs."
             )
     mamba = mamba_component
@@ -329,8 +368,89 @@ class BufferModePipeline:
         self.anchor_locked_tokens_ = 0
         self._anchor_lock_cap_skips = 0
 
+    def _shared_host_domain(self):
+        cc = self._cache.cache_controller
+        anchor = cc.mem_pool_host.anchor_entry.host_pool
+        if not isinstance(anchor, HostKVCache):
+            return None
+        return anchor.shared_allocation_domain
+
+    def _transfer_tokens(self, transfer: PoolTransfer) -> int:
+        if transfer.host_indices is not None:
+            return len(transfer.host_indices)
+        if transfer.keys is None:
+            return 0
+        entry = self._cache.cache_controller.mem_pool_host.entry_map.get(transfer.name)
+        return 0 if entry is None else len(transfer.keys) * entry.host_pool.page_size
+
+    def host_allocation_units(
+        self,
+        host_indices: Optional[torch.Tensor],
+        aux_xfers: Optional[list[PoolTransfer]],
+    ) -> int:
+        """Host usage expressed in anchor-token units for scheduler accounting."""
+        if host_indices is None:
+            return 0
+        return self._host_request_units(len(host_indices), aux_xfers)
+
+    def _shared_host_requests(
+        self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
+    ) -> Optional[list[tuple[str, int]]]:
+        if self._shared_host_domain() is None:
+            return None
+        return [
+            (pool.pool_label, tokens)
+            for pool, tokens in self._host_staging_sizes(kv_tokens, aux_xfers)
+        ]
+
+    def _host_staging_sizes(self, kv_tokens, aux_xfers):
+        cc = self._cache.cache_controller
+        yield cc.mem_pool_host.anchor_entry.host_pool, kv_tokens
+        for transfer in aux_xfers or ():
+            if transfer.indices_from_pool is not None:
+                continue
+            entry = cc.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None:
+                yield entry.host_pool, self._transfer_tokens(transfer)
+
+    def _host_request_units(
+        self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
+    ) -> int:
+        """Host staging in anchor-token accounting units."""
+        cc = self._cache.cache_controller
+        anchor = cc.mem_pool_host.anchor_entry.host_pool
+        if self._shared_host_domain() is None:
+            return kv_tokens
+        num_bytes = sum(
+            tokens * pool.size_per_token
+            for pool, tokens in self._host_staging_sizes(kv_tokens, aux_xfers)
+        )
+        return (num_bytes + anchor.size_per_token - 1) // anchor.size_per_token
+
+    def _shared_backup_fits(self, requests, *, empty: bool = False) -> bool:
+        return self._shared_host_domain().can_fit_many_then(
+            requests, self._shared_load_reserve_requests(), empty=empty
+        )
+
+    def _shared_load_reserve_requests(self) -> list[tuple[str, int]]:
+        cc = self._cache.cache_controller
+        anchor = cc.mem_pool_host.anchor_entry.host_pool
+        swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
+        min_full_tokens = _minimum_full_transfer_tokens(
+            anchor, self._cache.prefetch_threshold
+        )
+        requests = [(anchor.pool_label, min_full_tokens)]
+        if swa_entry is not None and self._swa_window_pages:
+            requests.append(
+                (
+                    swa_entry.host_pool.pool_label,
+                    self._swa_window_pages * swa_entry.host_pool.page_size,
+                )
+            )
+        return requests
+
     def is_idle(self) -> bool:
-        """No pending or in-flight buffer-mode transfer work."""
+        """No queued, staged, or in-flight buffer-mode work or anchor pins."""
         return not (
             self.pending_hit_allocs
             or self.staged_prefetches
@@ -339,6 +459,7 @@ class BufferModePipeline:
             or self.inflight_backup_node_ids
             or self.ongoing_write_through
             or self.ongoing_backup
+            or self.anchor_locks
         )
 
     def swa_transient_size(self) -> int:
@@ -495,11 +616,18 @@ class BufferModePipeline:
         capacity (total for KV, total minus the loads-priority margin for aux
         pools — matching ``_aux_budget_blocked``'s admission ceiling): such an
         intent could never stage and would wedge the FIFO head."""
-        cc = self._cache.cache_controller
-        if intent_tokens > cc.mem_pool_host.size:
-            return True
         if aux_xfers is None:
             aux_xfers = self._build_aux_staging_transfers(node_id, hash_values)
+        cc = self._cache.cache_controller
+        shared_requests = self._shared_host_requests(intent_tokens, aux_xfers)
+        if shared_requests is not None:
+            pool_tokens = cc.mem_pool_host.size
+            max_write_units = pool_tokens - pool_tokens // 10
+            if self._host_request_units(intent_tokens, aux_xfers) > max_write_units:
+                return True
+            return not self._shared_backup_fits(shared_requests, empty=True)
+        if intent_tokens > cc.mem_pool_host.size:
+            return True
         for t in aux_xfers or ():
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is not None and (
@@ -588,7 +716,7 @@ class BufferModePipeline:
                 self._log_backup_dropped(intent_tokens)
                 continue
             if self.write_staged_tokens_ >= live_cap:
-                # Yield to live fetch demand; retry next round.
+                # Wait for current copies to free staging before rebuilding the head.
                 break
             device_value, comp_xfers = self._cache.tree_core.build_backup_spec(
                 snapshot.node_id
@@ -608,6 +736,17 @@ class BufferModePipeline:
                 self.write_backlog_tokens_ -= intent_tokens
                 self._log_backup_dropped(intent_tokens)
                 continue
+            shared_domain = self._shared_host_domain()
+            staging_at_limit = (
+                self.write_staged_tokens_
+                + self._host_request_units(intent_tokens, sizing_xfers)
+                > live_cap
+                if shared_domain is not None
+                else self.write_staged_tokens_ >= live_cap
+            )
+            if staging_at_limit:
+                # Yield to live fetch demand; retry next round.
+                break
             if self._aux_budget_blocked(intent, sizing_xfers):
                 # An aux pool lacks staging headroom: yield at the gate
                 # instead of failing the alloc inside cc.write; acks free
@@ -657,13 +796,15 @@ class BufferModePipeline:
         # NOTE: no commit_backup — the node must never appear
         # host-resident in buffer mode; staging slots live in the entry.
         lock_params = cache.inc_lock_ref(snapshot.node_id).to_dec_params()
+        occupied_units = self.host_allocation_units(host_indices, aux_xfers)
         self.ongoing_write_through[snapshot.node_id] = _UnifiedBufferBackupEntry(
             intent=intent,
             host_indices=host_indices,
             aux_xfers=aux_xfers,
             lock_params=lock_params,
+            occupied_units=occupied_units,
         )
-        self.write_staged_tokens_ += len(host_indices)
+        self.write_staged_tokens_ += occupied_units
         self.write_backlog_tokens_ -= len(snapshot.hash_values) * cache.page_size
         return True
 
@@ -684,9 +825,14 @@ class BufferModePipeline:
             aux = self._build_aux_staging_transfers(
                 snapshot.node_id, snapshot.hash_values
             )
+        cc = self._cache.cache_controller
+        shared_requests = self._shared_host_requests(
+            len(snapshot.hash_values) * self._cache.page_size, aux
+        )
+        if shared_requests is not None:
+            return not self._shared_backup_fits(shared_requests)
         if not aux:
             return False
-        cc = self._cache.cache_controller
         for t in aux:
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is None:
@@ -788,7 +934,7 @@ class BufferModePipeline:
         snapshot = intent.snapshot
         self._cache.storage_existence_cache.add(PoolName.KV, snapshot.hash_values)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
-        self.write_staged_tokens_ -= len(entry.host_indices)
+        self.write_staged_tokens_ -= entry.occupied_units
         self.inflight_backup_node_ids.discard(snapshot.node_id)
         _untrack_content_refs(self.inflight_backup_hashes, snapshot.hash_values)
 
@@ -1033,12 +1179,6 @@ class BufferModePipeline:
             f.request.rid, f.matched_len + f.num_tokens
         )
 
-    @staticmethod
-    def _occupied_span(host_indices) -> int:
-        """Occupancy units a buffer-mode prefetch holds: granted at
-        hit-alloc, sized to the allocation (0 while still querying)."""
-        return len(host_indices) if host_indices is not None else 0
-
     def stage_completed_prefetch(
         self,
         request: CacheRequestHandle,
@@ -1066,6 +1206,9 @@ class BufferModePipeline:
             for transfer in operation.pool_transfers or ()
             if transfer.indices_from_pool is not None
         )
+        occupied_tokens = operation.buffer_host_occupied_units
+        if occupied_tokens is None:
+            occupied_tokens = self.host_allocation_units(host_indices, aux_xfers)
 
         has_aux = any(
             t.host_indices is not None and t.host_indices.numel() > 0 for t in aux_xfers
@@ -1077,7 +1220,7 @@ class BufferModePipeline:
             cc.append_host_mem_release(
                 host_indices[:num_tokens], extra_pools=aux_xfers or None
             )
-            cc.prefetch_tokens_occupied -= self._occupied_span(host_indices)
+            cc.prefetch_tokens_occupied -= occupied_tokens
             cache.prefetch_loaded_tokens_by_reqid[request] = 0
             cache.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             return True
@@ -1089,8 +1232,6 @@ class BufferModePipeline:
         # itself is the evidence, so feeding is sound even if this staged
         # prefetch is later dropped unconsumed.
         cache.storage_existence_cache.add(PoolName.KV, list(staged_hashes))
-        occupied_tokens = self._occupied_span(host_indices)
-
         self.staged_prefetches[request] = _StagedPrefetch(
             request=request,
             key_tokens=array(
@@ -1280,6 +1421,52 @@ class BufferModePipeline:
             # Not staging (its host slots are the node copy's), so it stays
             # out of the aux_xfers the ack frees.
             load_xfers.append(handoff.request_copy)
+        swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
+        binds_swa_to_full = (
+            swa_entry is not None
+            and swa_entry.device_indices_from_anchor_fn is not None
+        )
+        repair_ranges = []
+        if binds_swa_to_full and staged_swa:
+            window_start = span_end - staged_swa
+            repair_end = min(splice_base, span_end)
+            if window_start < repair_end:
+                repair_ranges = cache.tree_core.swa_tombstone_ranges(
+                    key, window_start, repair_end
+                )
+            # Only missing SWA rows belong to this load. Existing bindings may
+            # be in use by another request and must survive allocation rollback.
+            anchor_parts = []
+            host_parts = []
+            for repair_start, repair_end_ in repair_ranges:
+                anchor_parts.append(req.prefix_indices[repair_start:repair_end_])
+                host_parts.append(
+                    slice(repair_start - window_start, repair_end_ - window_start)
+                )
+            tail_start = max(splice_base, window_start)
+            if tail_start < span_end:
+                anchor_parts.append(
+                    slice(tail_start - splice_base, span_end - splice_base)
+                )
+                host_parts.append(
+                    slice(tail_start - window_start, span_end - window_start)
+                )
+            for i, transfer in enumerate(load_xfers):
+                if transfer.name != PoolName.SWA:
+                    continue
+                # Keep the original complete host bounce for ack/drop release.
+                load_xfers[i] = replace(
+                    transfer,
+                    host_indices=(
+                        torch.cat([transfer.host_indices[part] for part in host_parts])
+                        if host_parts
+                        else transfer.host_indices[:0]
+                    ),
+                    anchor_index_parts=anchor_parts,
+                )
+            if not anchor_parts:
+                load_xfers = [t for t in load_xfers if t.name != PoolName.SWA]
+
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
@@ -1311,7 +1498,18 @@ class BufferModePipeline:
             None,
         )
         aux_device_releases: list[tuple[PoolName, torch.Tensor]] = []
-        if swa_dev is not None:
+        if swa_dev is not None and binds_swa_to_full:
+            # Binding already updated the allocator's virtual-to-physical table.
+            # The tree owns virtual FULL rows, not the H2D kernel-facing IDs.
+            for repair_start, repair_end_ in repair_ranges:
+                for action in cache.tree_core.attach_swa_window(
+                    key,
+                    repair_start,
+                    repair_end_,
+                    req.prefix_indices[repair_start:repair_end_],
+                ):
+                    cache._apply_cache_action(action)
+        elif swa_dev is not None:
             # Register the window's FULL->SWA translation now (attention reads
             # through it). Keep SWA slots another request may still hold; their
             # redundant H2D destinations are reclaimed at the transfer ack.
@@ -1319,7 +1517,7 @@ class BufferModePipeline:
                 -len(swa_dev) :
             ]
             allocator = cache.token_to_kv_pool_allocator
-            old_swa = allocator.full_to_swa_index_mapping[full_window.to(torch.int64)]
+            old_swa = allocator.translate_swa_indices_for_transfer(full_window)
             missing = old_swa <= 0
             window_start = span_end - len(swa_dev)
             repair_end = min(splice_base, span_end)
@@ -1431,8 +1629,19 @@ class BufferModePipeline:
         self._free_staging_now(f.host_indices, f.aux_xfers)
         for pool_name, device_indices in f.aux_device_releases:
             entry = cc.mem_pool_host.entry_map[pool_name]
-            free_fn = entry.device_free_fn or entry.device_pool.free
-            free_fn(device_indices)
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
+            )
+
+            allocator = cache.token_to_kv_pool_allocator
+            if pool_name == PoolName.SWA and isinstance(
+                allocator, UnifiedSWAAllocatorBase
+            ):
+                # H2D has completed; these redundant slots are no longer pending.
+                allocator.swa_attn_allocator.free_physical(device_indices)
+            else:
+                free_fn = entry.device_free_fn or entry.device_pool.free
+                free_fn(device_indices)
 
         cc.prefetch_tokens_occupied -= f.occupied_tokens
         logger.info(

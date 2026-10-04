@@ -57,6 +57,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
