@@ -48,14 +48,6 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-# torch.cuda.is_available() is also True under ROCm, but the CUDA Q/K norm + RoPE
-# and KV-pack kernels refuse HIP tensors, and the zero-tolerance comparisons
-# assume NVIDIA kernel selection, so gate those tests on the platform itself.
-requires_nvidia = pytest.mark.skipif(
-    torch.version.hip is not None,
-    reason="bit-exact CUDA fusion paths need NVIDIA CUDA",
-)
-
 
 @pytest.fixture(scope="module")
 def model():
@@ -200,7 +192,6 @@ def test_bf16_qk_norm_matches_reference(model):
         torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
 
 
-@requires_nvidia
 @pytest.mark.parametrize("merge_mode", ["dynamic", "merge"])
 @torch.no_grad()
 def test_diffusers_lora_matches_weight_delta_and_restores_base(
@@ -310,7 +301,6 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
         runner.reset()
 
 
-@requires_nvidia
 @pytest.mark.parametrize("edit", [False, True])
 @torch.no_grad()
 def test_bf16_fusions_match_eager_prefill_and_cached_steps(
@@ -432,7 +422,6 @@ def inputs_hd128(seed, edit):
     return kwargs
 
 
-@requires_nvidia
 @pytest.mark.parametrize("edit", [False, True])
 @torch.no_grad()
 def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
@@ -501,7 +490,6 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
         runner.reset()
 
 
-@requires_nvidia
 @torch.no_grad()
 def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch):
     # A kernel that disagrees with the reference must disable itself and leave

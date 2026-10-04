@@ -2,7 +2,6 @@ from dataclasses import replace
 
 import pytest
 
-from sglang.multimodal_gen.test.server import test_server_utils
 from sglang.multimodal_gen.test.server.test_server_utils import PerformanceValidator
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BaselineConfig,
@@ -73,8 +72,6 @@ def test_runner_baseline_enforces_e2e_boundary(monkeypatch, runner):
     monkeypatch.setenv("RUNNER_NAME", runner)
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.delenv("SGLANG_E2E_TOLERANCE", raising=False)
-    # AMD relaxes perf checks to warnings; this test covers the strict path
-    monkeypatch.setattr(test_server_utils.current_platform, "is_hip", lambda: False)
     config = BaselineConfig.load(get_perf_baseline_path("b200"))
     for name in ("flux1_modelopt_nvfp4_t2i", "qwen_image_2512_modelopt_nvfp4_t2i"):
         scenario = config.scenarios[name]
