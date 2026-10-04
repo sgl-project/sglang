@@ -2708,8 +2708,11 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if self.mtp_enabled and logical_forward_mode.is_idle():
+        if logical_forward_mode.is_idle():
             self.online_c128_mtp.clear()
+            self.forward_metadata = None
+            self.tail_forward_metadata = None
+            self.encoder_replay = False
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
@@ -3948,7 +3951,7 @@ class DeepseekV4AttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        if _get_logical_forward_mode(forward_batch).is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
                 dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,

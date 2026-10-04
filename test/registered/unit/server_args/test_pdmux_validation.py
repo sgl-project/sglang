@@ -33,9 +33,9 @@ class TestPDMuxValidation(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "worker adapter"):
             validate(speculative_algorithm="EAGLE")
 
-    def test_core_rejects_attention_dp(self):
-        with self.assertRaisesRegex(AssertionError, "rank-aligned"):
-            validate(enable_dp_attention=True, tp_size=8, attn_dp_size=2)
+    def test_attention_dp_is_supported(self):
+        for size in (2, 8):
+            validate(enable_dp_attention=True, tp_size=8, attn_dp_size=size)
 
     def test_mixed_chunks_are_rejected(self):
         with self.assertRaisesRegex(AssertionError, "mixed prefill/decode"):
