@@ -422,10 +422,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
         if self.pending_remote_kv_layer_id == layer_id:

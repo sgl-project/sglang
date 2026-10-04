@@ -347,9 +347,8 @@ class TestSparDAPrefetcher(CustomTestCase):
 
     def test_lmcache_overlay_restores_authoritative_pages_across_layers(self):
         try:
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
@@ -382,10 +381,12 @@ class TestSparDAPrefetcher(CustomTestCase):
 
         class _Connector:
             num_layers = 4
-            _mq_timeout = 1.0
+            chunk_size = 2
 
-            def chunk_size(self):
-                return 2
+            def sparse_prefetch_available(self):
+                return True
+
+            _mq_timeout = 1.0
 
             def create_sparse_object_keys(
                 self, token_ids, chunk_indices, cache_salt, **kwargs
@@ -418,8 +419,8 @@ class TestSparDAPrefetcher(CustomTestCase):
             def free(self, pages):
                 freed.append(pages.clone())
 
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
         cache.page_size = 1
         cache.req_to_token_pool = authoritative
         cache.token_to_kv_pool_allocator = _Allocator()
@@ -508,76 +509,55 @@ class TestSparDAPrefetcher(CustomTestCase):
         )
 
     def test_lmcache_store_uses_radix_mapping_after_request_row_reuse(self):
-        try:
-            from sglang.srt.mem_cache.radix_cache import RadixCache
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
-            )
-        except RuntimeError as exc:
-            self.skipTest(str(exc))
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         request_row = torch.tensor([[7, 8, 9, 10]], dtype=torch.int64)
         authoritative = torch.tensor([41, 42, 43, 44], dtype=torch.int64)
-        node = SimpleNamespace()
-        match_result = SimpleNamespace(
-            last_device_node=node,
-            device_indices=authoritative,
+        node = object()
+        lock_params = object()
+        operation = SimpleNamespace(request_id="request")
+        connector = SimpleNamespace(
+            chunk_size=4,
+            parallel_all_reduce=Mock(),
+            get_store_start=Mock(return_value=0),
+            device_indices_by_group=lambda slots, **kwargs: [slots],
+            build_cache_salt=Mock(return_value=""),
+            submit_store=Mock(return_value=operation),
         )
-
-        class _Connector:
-            def __init__(self):
-                self.store_kv = Mock()
-                self.end_session = Mock()
-
-        connector = _Connector()
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
-        cache._mp_load_back_markers = {}
-        cache.req_to_token_pool = SimpleNamespace(req_to_token=request_row)
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
+        cache.page_size = 1
+        cache.tree_core = SimpleNamespace(is_eagle=False, page_size=1)
+        cache._mamba_component = None
+        cache._pending_stores = []
+        cache._pending_store_counts = {}
         cache.lmcache_connector = connector
-        cache.restore_sparda_request = lambda _request: True
-        cache.inc_lock_ref = Mock()
-        cache.dec_lock_ref = Mock()
-
-        request = SimpleNamespace(
-            rid="request",
-            origin_input_ids=[1, 2, 3, 4],
-            output_ids=[],
-            extra_key=None,
-            cache_salt=None,
-            kv=SimpleNamespace(req_pool_idx=0, kv_committed_len=4),
+        cache.inc_lock_ref = Mock(
+            return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
         )
+        cache.dec_lock_ref = Mock()
+        matched = SimpleNamespace(device_indices=authoritative, last_device_node=node)
+        request = SimpleNamespace(rid="request", extra_key=None, cache_salt=None)
+        # The request row has already been recycled. Store must use the tree.
+        request_row.fill_(-1)
+        with patch.object(UnifiedRadixCache, "match_prefix", return_value=matched):
+            cache._submit_store(request, [1, 2, 3, 4])
 
-        def fake_cache_finished_req(
-            _self, _request, *, is_insert=True, kv_len_to_handle
-        ):
-            del is_insert, kv_len_to_handle
-            # Model allocator reuse can clear the request row here.
-            request_row.fill_(-1)
-
-        with (
-            patch.object(RadixCache, "cache_finished_req", new=fake_cache_finished_req),
-            patch.object(RadixCache, "match_prefix", return_value=match_result),
-            patch(
-                "sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache.get_spec",
-                return_value=SimpleNamespace(speculative_eagle_topk=None),
-            ),
-        ):
-            cache.cache_finished_req(request, kv_len_to_handle=4)
-
-        store_md = connector.store_kv.call_args.args[0]
-        self.assertEqual(store_md.kv_indices.tolist(), authoritative.tolist())
-        self.assertEqual(store_md.token_ids, [1, 2, 3, 4])
+        args = connector.submit_store.call_args.args
+        self.assertEqual(args[:2], ("request", [1, 2, 3, 4]))
+        self.assertEqual(args[2][0].tolist(), authoritative.tolist())
         self.assertEqual(request_row.tolist(), [[-1, -1, -1, -1]])
-        connector.end_session.assert_called_once_with("request")
-        cache.dec_lock_ref.assert_called_once_with(node)
+        self.assertIs(cache._pending_stores[0].operation, operation)
+        self.assertIs(cache._pending_stores[0].lock_params, lock_params)
+        cache.dec_lock_ref.assert_not_called()
 
     def test_lmcache_host_resident_prefetch_targets_authoritative_pages(self):
         try:
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
@@ -594,10 +574,12 @@ class TestSparDAPrefetcher(CustomTestCase):
 
         class _Connector:
             num_layers = 2
-            _mq_timeout = 1.0
+            chunk_size = 2
 
-            def chunk_size(self):
-                return 2
+            def sparse_prefetch_available(self):
+                return True
+
+            _mq_timeout = 1.0
 
             def create_sparse_object_keys(self, token_ids, chunk_indices, **kwargs):
                 del token_ids, kwargs
@@ -631,8 +613,8 @@ class TestSparDAPrefetcher(CustomTestCase):
                 self.freed.append(pages)
 
         page_table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
         cache.page_size = 1
         cache.req_to_token_pool = SimpleNamespace(req_to_token=page_table.clone())
         cache.token_to_kv_pool_allocator = _Allocator()
@@ -674,17 +656,17 @@ class TestSparDAPrefetcher(CustomTestCase):
 
     def test_lmcache_sparse_prefetch_requires_cleanup_hooks(self):
         try:
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
 
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
         cache.page_size = 1
         cache.lmcache_connector = SimpleNamespace(
+            sparse_prefetch_available=lambda: True,
             sparse_prefetch=lambda: None,
             sparse_retrieve=lambda: None,
             create_sparse_object_keys=lambda: None,
@@ -695,10 +677,8 @@ class TestSparDAPrefetcher(CustomTestCase):
     def test_lmcache_host_resident_admission_requires_resolver(self):
         try:
             from sglang.srt.mem_cache.radix_cache import RadixKey
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
-                _LMCacheLoadBackMarker,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
@@ -706,17 +686,21 @@ class TestSparDAPrefetcher(CustomTestCase):
         request = SimpleNamespace(
             full_untruncated_fill_ids=list(range(8)),
         )
-        marker = _LMCacheLoadBackMarker(
+        marker = SimpleNamespace(
             key=RadixKey(list(range(8)), None, cache_salt=None),
-            value_numel=0,
+            local_hit_tokens=0,
+            total_hit=8,
+            load=None,
+            lookup=SimpleNamespace(lock_start=0),
         )
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
         cache.page_size = 1
         cache._sparda_host_resident_enabled = True
         cache.sparda_prefetcher = None
         cache._sparda_index_available = Mock(return_value=True)
         cache.lmcache_connector = SimpleNamespace(
+            sparse_prefetch_available=lambda: True,
             sparse_prefetch=lambda: None,
             sparse_retrieve=lambda: None,
             create_sparse_object_keys=lambda: None,
@@ -730,10 +714,8 @@ class TestSparDAPrefetcher(CustomTestCase):
     def test_lmcache_host_resident_admission_skips_full_retrieve(self):
         try:
             from sglang.srt.mem_cache.radix_cache import RadixKey
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
-                _LMCacheLoadBackMarker,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
@@ -753,24 +735,28 @@ class TestSparDAPrefetcher(CustomTestCase):
             kv=SimpleNamespace(req_pool_idx=0),
             full_untruncated_fill_ids=list(range(9)),
         )
-        marker = _LMCacheLoadBackMarker(
+        marker = SimpleNamespace(
             key=RadixKey(list(range(8)), None, cache_salt=None),
-            value_numel=0,
+            local_hit_tokens=0,
+            total_hit=8,
+            load=None,
+            lookup=SimpleNamespace(lock_start=0),
         )
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
         cache.page_size = 1
-        cache.device = torch.device("cpu")
-        cache._mp_load_back_markers = {request.rid: marker}
+        cache.tree_core.device = torch.device("cpu")
+        cache._external_flows = {request.rid: marker}
         cache._sparda_host_resident_enabled = True
         cache.sparda_prefetcher = object()
         cache._sparda_index_available = Mock(return_value=True)
-        cache._load_back = Mock(
+        cache._start_external_load = Mock(
             side_effect=AssertionError("host-resident admission did a full load")
         )
         cache.token_to_kv_pool_allocator = _Allocator()
         cache.lmcache_connector = SimpleNamespace(
-            chunk_size=lambda: 4,
+            chunk_size=4,
+            sparse_prefetch_available=lambda: True,
             sparse_prefetch=lambda: None,
             sparse_retrieve=lambda: None,
             create_sparse_object_keys=lambda: None,
@@ -779,7 +765,8 @@ class TestSparDAPrefetcher(CustomTestCase):
             retrieve_kv=Mock(
                 side_effect=AssertionError("host-resident admission retrieved KV")
             ),
-            release_pending=Mock(),
+            free_lookup_locks=Mock(),
+            parallel_all_reduce=Mock(),
         )
 
         result = cache.init_load_back(
@@ -794,32 +781,34 @@ class TestSparDAPrefetcher(CustomTestCase):
         self.assertIs(result[1], result[1])
         self.assertTrue(request._sparda_host_resident)
         self.assertEqual(request._sparda_host_prefix_len, 8)
-        cache._load_back.assert_not_called()
+        cache._start_external_load.assert_not_called()
         cache.lmcache_connector.retrieve_kv.assert_not_called()
 
     def test_lmcache_host_resident_index_miss_uses_full_load_fallback(self):
         try:
             from sglang.srt.mem_cache.radix_cache import RadixKey
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
-                _LMCacheLoadBackMarker,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
 
         request = SimpleNamespace(rid="request")
-        marker = _LMCacheLoadBackMarker(
+        marker = SimpleNamespace(
             key=RadixKey(list(range(8)), None, cache_salt=None),
-            value_numel=0,
+            local_hit_tokens=0,
+            total_hit=8,
+            load=None,
+            lookup=SimpleNamespace(lock_start=0),
         )
-        expected = (torch.tensor([7, 8]), SimpleNamespace())
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
-        cache._mp_load_back_markers = {request.rid: marker}
+        expected_slots = torch.tensor([7, 8])
+        node = SimpleNamespace()
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache._external_flows = {request.rid: marker}
         cache._sparda_host_resident_enabled = True
         cache._sparda_index_available = Mock(return_value=False)
-        cache._load_back = Mock(return_value=expected)
+        cache._start_external_load = Mock(return_value=expected_slots)
+        cache._sparda_can_admit_host_resident = Mock(return_value=False)
 
         result = cache.init_load_back(
             SimpleNamespace(
@@ -829,71 +818,132 @@ class TestSparDAPrefetcher(CustomTestCase):
             )
         )
 
-        self.assertIs(result, expected)
-        cache._load_back.assert_called_once()
+        self.assertIs(result[0], expected_slots)
+        cache._start_external_load.assert_called_once()
         self.assertFalse(getattr(request, "_sparda_host_resident", False))
 
     def test_host_resident_finish_discards_partial_pages_without_full_restore(self):
-        try:
-            from sglang.srt.mem_cache.radix_cache import RadixCache
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCacheMode,
-                LMCRadixCache,
-            )
-        except RuntimeError as exc:
-            self.skipTest(str(exc))
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
 
         request = SimpleNamespace(
             rid="request",
-            origin_input_ids=[1, 2, 3, 4],
-            output_ids=[5],
-            kv=SimpleNamespace(cache_protected_len=0, req_pool_idx=0),
+            finished=lambda: True,
             _sparda_host_resident=True,
             _sparda_host_marker=object(),
             _sparda_host_prefix_len=4,
             _sparda_host_prefix_start=0,
             _sparda_host_lookup_released=True,
-            last_node=None,
         )
-        connector = SimpleNamespace(end_session=Mock())
-        cache = LMCRadixCache.__new__(LMCRadixCache)
-        cache._mode = LMCacheMode.MP
-        cache._mp_load_back_markers = {request.rid: object()}
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
         cache.sparda_prefetcher = SimpleNamespace(
             cleanup_request=Mock(return_value=True)
         )
-        cache.lmcache_connector = connector
+        cache._retire_loaded_flow = Mock()
+        cache._request_session_finish = Mock()
         cache._materialize_sparda_host_request = Mock(
-            side_effect=AssertionError("host-resident completion restored full KV")
+            side_effect=AssertionError("completion restored full KV")
         )
-
-        with patch.object(RadixCache, "cache_finished_req") as base_finish:
-            cache.cache_finished_req(request, kv_len_to_handle=5)
-
-        cache._materialize_sparda_host_request.assert_not_called()
-        cache.sparda_prefetcher.cleanup_request.assert_called_once_with("request")
-        base_finish.assert_called_once_with(
-            request, is_insert=False, kv_len_to_handle=5
-        )
-        connector.end_session.assert_called_once_with("request")
+        self.assertFalse(cache.claim_kv_row(request))
+        self.assertTrue(request.skip_radix_cache_insert)
         self.assertFalse(request._sparda_host_resident)
-        self.assertIsNone(request._sparda_host_marker)
-        self.assertFalse(request._sparda_host_lookup_released)
+        cache.sparda_prefetcher.cleanup_request.assert_called_once_with("request")
+        cache._materialize_sparda_host_request.assert_not_called()
+        cache._retire_loaded_flow.assert_called_once_with("request")
+        cache._request_session_finish.assert_called_once_with("request")
+
+    def test_host_restore_timeout_retains_writer_for_retry(self):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+
+        lookup = SimpleNamespace(total_hit_tokens=4, lock_start=0)
+        operation = SimpleNamespace(
+            future=SimpleNamespace(result=Mock(side_effect=[TimeoutError(), True]))
+        )
+        connector = SimpleNamespace(
+            operation_timeout=1.0,
+            submit_lookup=Mock(return_value=lookup),
+            poll_lookup=Mock(return_value=4),
+            device_indices_by_group=lambda slots: [slots],
+            submit_load=Mock(return_value=operation),
+            prepare_load_on_stream=Mock(return_value=True),
+            complete_load=Mock(return_value=True),
+        )
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(device=torch.device("cpu"))
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[10, 11, 12, 13]])
+        )
+        cache._forward_stream = object()
+        cache.lmcache_connector = connector
+        request = SimpleNamespace(
+            rid="request",
+            kv=SimpleNamespace(req_pool_idx=0),
+            _sparda_host_resident=True,
+            _sparda_host_marker=SimpleNamespace(key=RadixKey([1, 2, 3, 4])),
+            _sparda_host_prefix_start=0,
+            _sparda_host_prefix_len=4,
+        )
+
+        self.assertFalse(cache._materialize_sparda_host_request(request))
+        self.assertTrue(request._sparda_host_resident)
+        self.assertIs(request._sparda_restore_load, operation)
+        connector.complete_load.assert_not_called()
+        self.assertTrue(cache._materialize_sparda_host_request(request))
+        connector.submit_lookup.assert_called_once()
+        connector.submit_load.assert_called_once()
+        self.assertEqual(
+            connector.submit_load.call_args.kwargs["owned_device_indices"].tolist(),
+            [10, 11, 12, 13],
+        )
+        self.assertFalse(request._sparda_host_resident)
+        self.assertIsNone(request._sparda_restore_load)
+
+    def test_host_discard_keeps_pending_writer_until_it_can_be_drained(self):
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+
+        operation = SimpleNamespace(
+            future=SimpleNamespace(result=Mock(side_effect=[TimeoutError(), False]))
+        )
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
+        cache.sparda_prefetcher = None
+        cache.lmcache_connector = SimpleNamespace(
+            operation_timeout=1.0, complete_load=Mock(return_value=False)
+        )
+        request = SimpleNamespace(
+            rid="request",
+            _sparda_host_resident=True,
+            _sparda_restore_load=operation,
+        )
+        self.assertFalse(cache._discard_sparda_host_request(request))
+        self.assertTrue(request._sparda_host_resident)
+        self.assertIs(request._sparda_restore_load, operation)
+        cache.lmcache_connector.complete_load.assert_not_called()
+        self.assertTrue(cache._discard_sparda_host_request(request))
+        cache.lmcache_connector.complete_load.assert_called_once_with(operation)
+        self.assertFalse(request._sparda_host_resident)
+        self.assertIsNone(request._sparda_restore_load)
 
     def test_gpu_reset_keeps_host_compressed_index(self):
         try:
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCRadixCache,
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+                LMCacheUnifiedRadixCache,
             )
         except RuntimeError as exc:
             self.skipTest(str(exc))
 
-        cache = LMCRadixCache.__new__(LMCRadixCache)
+        cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
         cache._sparda_compressed_indices = {("request", None): {0: (1, 2)}}
         cache._sparda_compressed_index_order = [("request", None)]
         cache._sparda_metrics = {"index_hit": 1}
+        cache.lmcache_connector = None
 
-        with patch.object(LMCRadixCache.__mro__[1], "reset"):
+        with patch.object(LMCacheUnifiedRadixCache.__mro__[1], "reset"):
             cache.reset()
 
         self.assertEqual(

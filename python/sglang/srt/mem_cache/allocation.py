@@ -201,6 +201,8 @@ def alloc_paged_token_slots_extend(
         )
         extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
@@ -253,7 +255,7 @@ def _kv_shard_rotation_bases(
     The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
 
     - Read through ``req.last_node`` at alloc time, never a value cached on
-      the request: ``cache_unfinished_req`` can rebind a chunked request onto
+      the request: a ``checkpoint`` can rebind a chunked request onto
       another chain's canonical locs between chunks, changing the base. The
       read goes through ``tree_cache.rotation_base_of`` because the node
       handle is tree-specific (a NodeId on the unified tree).
@@ -549,6 +551,10 @@ def alloc_paged_token_slots_decode(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(
+            (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
+        )
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req C128 table for the last_loc lookup.
         if batch is not None:

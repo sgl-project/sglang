@@ -15,8 +15,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
-from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
-from lmcache.integration.sglang.sglang_adapter import StoreMetadata
+from lmcache.integration.sglang.unified_lmcache_mp_connector import (
+    UnifiedLMCacheMPConnector,
+)
+
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 
 def _future_result(future, timeout: float = 30.0):
@@ -49,7 +53,7 @@ def main() -> None:
         torch.empty((capacity, num_heads, head_dim), dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-    source_slots = torch.arange(token_count, dtype=torch.int64, device=device)
+    source_slots = torch.arange(1, token_count + 1, dtype=torch.int64, device=device)
     source_k = []
     source_v = []
     for layer_id in range(num_layers):
@@ -66,42 +70,56 @@ def main() -> None:
         source_v.append(layer_v.clone())
     torch.cuda.synchronize()
 
-    connector = LMCacheMPConnector(
-        sgl_config=SimpleNamespace(model_path="sparda-gpu-contract"),
+    os.environ.setdefault("LMCACHE_MP_HOST", "127.0.0.1")
+    os.environ.setdefault("LMCACHE_MP_PORT", str(lmcache_port))
+    pool = SimpleNamespace(k_buffer=k_pool, v_buffer=v_pool)
+    connector = UnifiedLMCacheMPConnector(
+        config_file=os.environ.get("LMCACHE_CONFIG_FILE"),
+        model_config=SimpleNamespace(
+            model_path="sparda-gpu-contract",
+            attention_arch=AttentionArch.MHA,
+            hf_config=SimpleNamespace(),
+        ),
         tp_size=1,
-        rank=0,
+        tp_rank=0,
+        tp_group=None,
         page_size=page_size,
-        host="127.0.0.1",
-        port=lmcache_port,
-        k_pool=k_pool,
-        v_pool=v_pool,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
+        req_to_token_pool=SimpleNamespace(),
+        tree_components=(ComponentType.FULL,),
+        mamba_component=None,
+        sliding_window_size=None,
     )
     atexit.register(connector.close)
+    if connector.chunk_size != chunk_size or not connector.sparse_prefetch_available():
+        raise RuntimeError("contract check requires sparse MHA and chunk_size=256")
 
     first_token_ids = list(range(token_base, token_base + chunk_size))
     second_token_ids = list(range(token_base + chunk_size, token_base + token_count))
     store_suffix = str(token_base)
-    first_store_result = _future_result(
-        connector.store_kv_async(
-            StoreMetadata(
-                last_node=None,
-                token_ids=first_token_ids,
-                kv_indices=source_slots[:chunk_size],
-                offset=0,
-                request_id=f"sparda-gpu-contract-store-first-{store_suffix}",
-            )
+
+    def store_chunk(token_ids, slots, request_id):
+        operation = connector.submit_store(
+            request_id,
+            token_ids,
+            slots,
+            device_indices_start=0,
+            cache_salt="",
         )
+        if operation is None:
+            raise RuntimeError("deterministic KV store was not submitted")
+        _future_result(operation.future)
+        return connector.complete_store(operation)
+
+    first_store_result = store_chunk(
+        first_token_ids,
+        source_slots[:chunk_size],
+        f"sparda-gpu-contract-store-first-{store_suffix}",
     )
-    second_store_result = _future_result(
-        connector.store_kv_async(
-            StoreMetadata(
-                last_node=None,
-                token_ids=second_token_ids,
-                kv_indices=source_slots[chunk_size:],
-                offset=0,
-                request_id=f"sparda-gpu-contract-store-second-{store_suffix}",
-            )
-        )
+    second_store_result = store_chunk(
+        second_token_ids,
+        source_slots[chunk_size:],
+        f"sparda-gpu-contract-store-second-{store_suffix}",
     )
     if not first_store_result or not second_store_result:
         raise RuntimeError("deterministic KV store did not complete")
@@ -150,7 +168,7 @@ def main() -> None:
                     v_pool[0][full_destination], first_source_v
                 ),
                 "full_first_value": float(k_pool[0][full_destination][0, 0, 0]),
-                "source_first_value": float(source_k[0][0, 0, 0]),
+                "source_first_value": float(first_source_k[0, 0, 0]),
             }
         )
         _future_result(connector.sparse_cancel_prefetch(full_request, 0, 0))
@@ -380,33 +398,36 @@ def main() -> None:
     if not consumer_equal:
         raise AssertionError("consumer did not observe the staged KV pages")
 
-    print(
-        {
-            "store": bool(first_store_result and second_store_result),
-            "full_hit": bool(full_equal and release_full),
-            "partial_hit": bool(partial_equal and release_partial),
-            "cancel": bool(cancel_safe),
-            "request_reuse": bool(
-                reuse_equal
-                and release_reuse
-                and reuse_generation_two_equal
-                and release_reuse_generation_two
-            ),
-            "release_retry": bool(
-                retry_retrieve == (True, [0])
-                and retry_release_failed is False
-                and retry_handle_retained
-                and retry_release_succeeded
-                and retry_clean
-            ),
-            "late_completion_cleanup": bool(
-                (late_cancel_result or late_release_result) and late_destination_safe
-            ),
-            "retrieve_mapping_failure_cleanup": bool(failure_clean),
-            "consumer_read": bool(consumer_equal),
-            "active_sparse_handles": len(connector._sparse_handles),
-        }
-    )
+    results = {
+        "store": bool(first_store_result and second_store_result),
+        "full_hit": bool(full_equal and release_full),
+        "partial_hit": bool(partial_equal and release_partial),
+        "cancel": bool(cancel_safe),
+        "request_reuse": bool(
+            reuse_equal
+            and release_reuse
+            and reuse_generation_two_equal
+            and release_reuse_generation_two
+        ),
+        "release_retry": bool(
+            retry_retrieve == (True, [0])
+            and retry_release_failed is False
+            and retry_handle_retained
+            and retry_release_succeeded
+            and retry_clean
+        ),
+        "late_completion_cleanup": bool(
+            (late_cancel_result or late_release_result) and late_destination_safe
+        ),
+        "retrieve_mapping_failure_cleanup": bool(failure_clean),
+        "consumer_read": bool(consumer_equal),
+        "active_sparse_handles": len(connector._sparse_handles),
+    }
+    print(results)
+    if results["active_sparse_handles"] or not all(
+        value for name, value in results.items() if name != "active_sparse_handles"
+    ):
+        raise AssertionError("sparse GPU contract failed; see results above")
 
 
 if __name__ == "__main__":

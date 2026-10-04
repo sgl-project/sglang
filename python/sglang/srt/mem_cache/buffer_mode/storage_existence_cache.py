@@ -30,12 +30,11 @@ anywhere else.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Container, Iterable, Sequence
+from collections.abc import Container, Iterable, Sequence
 
-# ~131K entries; at ~150-250 B/entry this is <= ~30 MB and covers roughly
-# 8M KV tokens at page size 64 (aux-pool entries included). Coverage per MB
-# scales with page size — small-page configs simply remember fewer tokens.
-HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 128 * 1024
+# ~524K entries; at ~150-250 B/entry this is <= ~125 MiB and covers roughly
+# 32M tokens at page size 64 across all pools.
+HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 512 * 1024
 
 
 class StorageExistenceCache:
@@ -48,21 +47,33 @@ class StorageExistenceCache:
 
     def add(self, pool: str, hashes: Iterable[str]) -> None:
         entries = self._entries
+        move_to_end = entries.move_to_end
         for h in hashes:
-            entries[(pool, h)] = None
-            entries.move_to_end((pool, h))
-        while len(entries) > self.max_entries:
-            entries.popitem(last=False)
+            key = (pool, h)
+            entries[key] = None
+            move_to_end(key)
+        pop_oldest = entries.popitem
+        for _ in range(len(entries) - self.max_entries):
+            pop_oldest(last=False)
 
     def contains(self, pool: str, page_hash: str) -> bool:
         entries = self._entries
-        if (pool, page_hash) not in entries:
+        key = (pool, page_hash)
+        if key not in entries:
             return False
-        entries.move_to_end((pool, page_hash))
+        entries.move_to_end(key)
         return True
 
     def contains_all(self, pool: str, hashes: Iterable[str]) -> bool:
-        return all(self.contains(pool, h) for h in hashes)
+        entries = self._entries
+        move_to_end = entries.move_to_end
+        for h in hashes:
+            key = (pool, h)
+            try:
+                move_to_end(key)
+            except KeyError:
+                return False
+        return True
 
     def covers_all(
         self,
@@ -73,7 +84,17 @@ class StorageExistenceCache:
         """True when every page is believed stored or sits in
         ``extra_cover`` (e.g. content past its D2H launch, which always
         reaches its storage-ack). LRU-touches the believed entries."""
-        return all(self.contains(pool, h) or h in extra_cover for h in hashes)
+        entries = self._entries
+        move_to_end = entries.move_to_end
+        if extra_cover:
+            for h in hashes:
+                key = (pool, h)
+                if key in entries:
+                    move_to_end(key)
+                elif h not in extra_cover:
+                    return False
+            return True
+        return self.contains_all(pool, hashes)
 
     def invalidate_beyond(
         self, pool: str, hashes: Sequence[str], keep_pages: int
@@ -82,8 +103,9 @@ class StorageExistenceCache:
         beyond the leading ``keep_pages`` of a hash chain (the folded
         usable cut). The next insert re-writes the discarded span, closing
         stale positives and aux holes at the cut."""
+        pop = self._entries.pop
         for h in hashes[keep_pages:]:
-            self._entries.pop((pool, h), None)
+            pop((pool, h), None)
 
     def clear(self) -> None:
         self._entries.clear()
