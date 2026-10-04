@@ -104,6 +104,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm120,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -936,6 +937,72 @@ class Fp8LinearMethod(LinearMethodBase):
         # the swizzled copy is stored separately.
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
         layer.block_fp8_mxfp8_ready = True
+        self._prepare_mxfp8_skinny(layer)
+
+    def _prepare_mxfp8_skinny(self, layer: Module) -> None:
+        """On SM120, decode-sized rows of a tuned shape run a small-M MXFP8 GEMM
+        that reads the 32x32 block scales directly."""
+        layer.mxfp8_skinny_scale = None
+        layer.mxfp8_skinny_counters = None
+        if not (is_sm120() and envs.SGLANG_ENABLE_SM120_MXFP8_SKINNY_GEMM.get()):
+            return
+        if list(self.weight_block_size) != [32, 32] or not layer.weight.is_contiguous():
+            return
+        from sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm import tuned_config
+        from sglang.srt.runtime_context import get_exec
+
+        n, k = layer.weight.shape
+        config = tuned_config(n, k)
+        if config is None:
+            return
+        if get_exec().deterministic.enable_deterministic_inference:
+            # The two kernels reduce in different orders, so a row's result
+            # would depend on which side of MAX_M its batch falls.
+            return
+        layer.mxfp8_skinny_scale = layer.weight_scale_inv.data.float().contiguous()
+        bn, split, _ = config
+        if split > 1:
+            layer.mxfp8_skinny_counters = torch.zeros(
+                (n + bn - 1) // bn, dtype=torch.int32, device=layer.weight.device
+            )
+
+    @staticmethod
+    def _apply_mxfp8_skinny(layer: Module, x) -> Optional[torch.Tensor]:
+        scale = getattr(layer, "mxfp8_skinny_scale", None)
+        if scale is None:
+            return None
+        from sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm import (
+            MAX_M,
+            mxfp8_skinny_gemm,
+        )
+
+        if isinstance(x, Mxfp8SwizzledInput):
+            data, a_sf = x.data, x.scales
+            if data.dim() != 2:
+                return None
+        elif isinstance(x, torch.Tensor) and x.dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            data, a_sf = x, None
+        else:
+            return None
+        if data.stride(-1) != 1:
+            return None
+        k = data.shape[-1]
+        rows = data.numel() // k
+        if rows == 0 or rows > MAX_M:
+            return None
+        out = mxfp8_skinny_gemm(
+            data.reshape(rows, k),
+            layer.weight,
+            scale,
+            layer.mxfp8_skinny_counters,
+            a_sf=a_sf,
+            out_dtype=data.dtype if a_sf is None else torch.bfloat16,
+        )
+        return out.view(*data.shape[:-1], out.shape[-1])
 
     def _process_mxfp8_linear_weight_scale(
         self, layer: Module, scale_u8: Optional[torch.Tensor] = None
@@ -1238,6 +1305,10 @@ class Fp8LinearMethod(LinearMethodBase):
         elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
             # A legacy (q, scale) block-fp8 pair keeps the block kernel.
             mxfp8_view = False
+        if mxfp8_view and bias is None:
+            out = self._apply_mxfp8_skinny(layer, x)
+            if out is not None:
+                return out
         if mxfp8_view:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
