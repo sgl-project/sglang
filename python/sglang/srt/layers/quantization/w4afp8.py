@@ -383,6 +383,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         return output
 
+    def apply_nccl_ep_rank_major(self, layer, dispatch_output) -> torch.Tensor:
+        """Run the shared masked W4AFP8 GEMM on NCCL EP RM's packed view."""
+        return self.apply_deepep_ll(layer, dispatch_output)
+
     def apply_deepep_normal(
         self,
         layer: DeepEPMoE,

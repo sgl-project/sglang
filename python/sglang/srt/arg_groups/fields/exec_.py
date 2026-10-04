@@ -734,6 +734,7 @@ class ExecMoe(msgspec.Struct):
             "ascend_tp",
             "pplx",
             "flashinfer_megamoe",
+            "nccl_ep",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -750,6 +751,7 @@ class ExecMoe(msgspec.Struct):
                 "pplx",
                 "ascend_tp",
                 "flashinfer_megamoe",
+                "nccl_ep",
             ],
             resolvable=True,
         ),
@@ -835,6 +837,22 @@ class ExecMoe(msgspec.Struct):
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
     ] = None
+    nccl_ep_mode: A[
+        Literal["low_latency", "auto"],
+        "NCCL EP dispatch algorithm. Only `low_latency` is implemented; `auto` resolves to it. The high-throughput (prefill) path is a follow-up.",
+    ] = "low_latency"
+    enable_nccl_ep_cuda_graph: A[
+        bool,
+        "Enable serialized full decode CUDA Graphs with persistent NCCL EP LL resources.",
+    ] = False
+    nccl_ep_layout: A[
+        Literal["expert_major", "rank_major"],
+        "NCCL EP low-latency layout. `expert_major` is the established default. `rank_major` transports BF16 source-rank slots and packs them locally for W4AFP8 expert compute.",
+    ] = "expert_major"
+    nccl_ep_num_max_dispatch_tokens_per_rank: A[
+        int,
+        "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024).",
+    ] = 0
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
         Arg(

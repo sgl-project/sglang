@@ -545,6 +545,9 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    nccl_ep_mode: Any = None  # NcclEpMode | None (typed Any to avoid import cycle)
+    nccl_ep_layout: Any = None  # NcclEpLayout | None (typed Any to avoid import cycle)
+    nccl_ep_num_max_dispatch_tokens_per_rank: int = 0
     # The shared-experts-fusion decision, per runner — the runner_backend /
     # speculative_runner_backend shape. Both leaves are seeded from the config
     # intent by ``initialize_moe_config``; each MoE model's gate
