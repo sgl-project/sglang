@@ -1051,8 +1051,8 @@ class MambaPool:
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
-        comply: COW copies radix checkpoints; a checkpoint ``insert_req`` copies an
-        active slot only during prefill (ring empty); ``insert_req``
+        comply: COW copies radix checkpoints; a ``checkpoint`` copies an
+        active slot only during prefill (ring empty); ``checkpoint``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
@@ -1562,6 +1562,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        # Read once per forward, BEFORE the decoder-layer loop, so unlike
+        # short_conv_layer_cache it has no per-layer barrier of its own. The
+        # host tier restores side state on the first Mamba layer's transfer, so
+        # wait for that layer before reading the history.
+        if (
+            self.layer_transfer_counter is not None
+            and self.layer_transfer_counter.consumer_index >= 0
+            and self.mamba_map
+        ):
+            first_mamba_layer = min(self.mamba_map)
+            self.layer_transfer_counter.wait_until(first_mamba_layer - self.start_layer)
         return self.ngram_pool.get_context(ngram_indices)
 
     def set_ngram_context(
