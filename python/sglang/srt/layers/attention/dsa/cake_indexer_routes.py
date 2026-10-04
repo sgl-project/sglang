@@ -224,11 +224,13 @@ def cake_fp8_paged_mqa_logits(
     summary = _tensor_summary(
         q=q, kv_cache=kv_cache, w=weights, ctx=context_lens, bt=block_table
     )
-    if block_kv != 64 or not supports(q, kv_cache, weights, context_lens, block_table):
+    if block_kv != 64 or not supports(
+        q, kv_cache, weights, context_lens, block_table, int(max_context_len)
+    ):
         _log_cake_route_once(
             SITE_PAGED,
             "fallback",
-            f"adapter admission rejected: page {block_kv} {summary}",
+            f"adapter admission rejected: page {block_kv} max_context_len {int(max_context_len)} {summary}",
         )
         return None
     signature = (tuple(q.shape), int(max_context_len), num_sms)

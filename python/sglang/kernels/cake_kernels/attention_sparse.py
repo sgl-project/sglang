@@ -1140,6 +1140,7 @@ def supports_fp8_paged_mqa_logits(
     weights: torch.Tensor,
     context_lens: torch.Tensor,
     block_table: torch.Tensor,
+    max_context_len: Optional[int] = None,
 ) -> bool:
     """Admission for the paged entries on the exact engine tensors; never raises.
 
@@ -1147,7 +1148,11 @@ def supports_fp8_paged_mqa_logits(
     ``kv_cache [pages, 64, 1, 132]`` (page 64), f32 ``weights [B * next_n, H]``,
     int32 2-D ``context_lens [B, next_n]``, int32 ``block_table [B, S]`` with
     unit column stride; the shipped catalog must carry the ``(H, 64, next_n)``
-    program (``paged_route_available``).
+    program (``paged_route_available``) and admit it on this device's
+    architecture up to ``max_context_len`` (the catalog's per-architecture
+    ``policy.paged.max_context_len`` bound; a withheld (arch, route, context)
+    falls back to stock DeepGEMM). Without ``max_context_len`` the block table's
+    capacity ``S * 64`` is the conservative stand-in.
     """
     try:
         import torch
@@ -1197,7 +1202,14 @@ def supports_fp8_paged_mqa_logits(
         runtime = _fp8_paged_mqa_logits_runtime()
         if not hasattr(runtime, "paged_route_available"):
             return False
-        return bool(runtime.paged_route_available(heads, page, next_n))
+        arch = _fp8_mqa_logits_runtime().device_arch(q.device)
+        if max_context_len is None:
+            max_context_len = int(block_table.shape[1]) * page
+        return bool(
+            runtime.paged_route_available(
+                heads, page, next_n, arch=arch, max_context_len=int(max_context_len)
+            )
+        )
     except Exception:
         return False
 

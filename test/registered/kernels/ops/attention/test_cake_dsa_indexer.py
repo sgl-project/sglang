@@ -411,6 +411,86 @@ def test_paged_admission_rules():
     assert not cake.supports_fp8_paged_mqa_logits(
         q, kv_cache, weights.to(torch.bfloat16), ctx_2d, block_table
     )
+    # Per-architecture context bound of the shipped catalog (policy.paged.max_context_len):
+    # admitted at the bound, refused above it, the block table's capacity when no length is given.
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    arch = dense_mqa.device_arch(device)
+    route = runtime.paged_route_name(64, 64, 2)
+    bound = runtime.paged_context_bound(arch, route)
+    wide = torch.zeros(4, (1 << 20) // 64, device=device, dtype=torch.int32)
+    wide[:, : block_table.shape[1]] = block_table
+    if bound is None:
+        assert cake.supports_fp8_paged_mqa_logits(
+            q, kv_cache, weights, ctx_2d, wide, 1 << 20
+        ) == bool(runtime.paged_route_available(64, 64, 2))
+    else:
+        assert cake.supports_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, wide, bound)
+        assert not cake.supports_fp8_paged_mqa_logits(
+            q, kv_cache, weights, ctx_2d, wide, bound + 1
+        )
+        assert not cake.supports_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, wide)
+
+
+@pytest.mark.parametrize("next_n,avg_ctx", [(2, 4096), (2, 40000), (4, 4096), (4, 12000)])
+def test_paged_route_honours_the_arch_context_bound(next_n, avg_ctx):
+    """The engine route helper takes the Cake path where the catalog admits the
+    (arch, route, max_context_len) and falls back (``None``) where the shipped
+    policy withholds it (sm_100a long-context n2/n4 tiers); the taken path
+    matches DeepGEMM inside every row's length."""
+    _skip_unless_device(cake.FI_PAGED_MQA_MODULE, cake.FI_PAGED_MQA_BACKEND_MODULE)
+    deep_gemm = _deep_gemm()
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+    from flashinfer.experimental.deepgemm_dense_mqa import paged_mqa as runtime
+    from sglang.srt.layers.attention.dsa import cake_indexer_routes
+
+    device = torch.device("cuda")
+    if not runtime.paged_route_available(64, 64, next_n):
+        pytest.skip(f"installed FlashInfer catalog does not serve H=64, page 64, next_n={next_n}")
+    q, kv_cache, weights, ctx_2d, block_table, max_len = _paged_inputs(
+        2, next_n, 64, avg_ctx, device
+    )
+    bound = runtime.paged_context_bound(
+        dense_mqa.device_arch(device), runtime.paged_route_name(64, 64, next_n)
+    )
+    admitted = bound is None or max_len <= bound
+    num_sms = deep_gemm.get_num_sms()
+    with _route_on():
+        got = cake_indexer_routes.cake_fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            weights,
+            ctx_2d,
+            block_table,
+            max_len,
+            block_kv=cake.DSA_MQA_PAGE,
+            num_sms=num_sms,
+        )
+        torch.cuda.synchronize()
+    cake_indexer_routes.reset_cake_route_state_for_tests()
+    if not admitted:
+        assert got is None, f"route taken above the {bound} bound (max_context_len {max_len})"
+        with pytest.raises(ValueError, match="admitted on"):
+            cake_fp8_paged_mqa_logits(
+                q,
+                kv_cache,
+                weights,
+                ctx_2d,
+                block_table,
+                cake_get_paged_mqa_logits_metadata(ctx_2d, 64, num_sms),
+                max_len,
+                clean_logits=False,
+            )
+        return
+    assert got is not None, "route fell back on an admitted (arch, route, context)"
+    meta = deep_gemm.get_paged_mqa_logits_metadata(ctx_2d, 64, num_sms)
+    ref = deep_gemm.fp8_paged_mqa_logits(
+        q, kv_cache, weights, ctx_2d, block_table, meta, max_len, clean_logits=False
+    )
+    inside = torch.arange(max_len, device=device)[None, :] < ctx_2d.reshape(-1)[:, None]
+    _assert_logits_close(
+        got.masked_fill(~inside, float("-inf")), ref.masked_fill(~inside, float("-inf"))
+    )
 
 
 # ---------------------------------------------------------------------------
