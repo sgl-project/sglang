@@ -1,17 +1,14 @@
 """Parity coverage for the fused DSA k-pool top-k / pool-expansion / tail JIT kernel.
 
-``fast_kpool_topk_transform_fused`` is the only implementation for the pooled
-group budgets GLM-5.3-Flash uses (``index_topk=2048`` over ``index_kpool=4``
-gives ``group_topk=512``); ``kpool_fp8_index`` has no Python fallback in that
-range, so a build or numerical break here takes the model down rather than
-making it slower.
+The legacy kernel covers ROCm, disabled top-k v2, non-power-of-two pools,
+and prefill row windows or page-table row indirection.
 
 The radix selector does not specify an output order and DSA attention is
 permutation-invariant over the selected set, so the pooled columns are compared
 as a set. The tail columns are positional and are compared exactly.
 
-The overfull-bin rescan is shared by CUDA and ROCm, so the tie and graph-replay
-cases run on both.
+The legacy overfull-bin rescan is shared by CUDA and ROCm, so the tie and
+graph-replay cases run on both. CUDA v2 coverage is in ``test_kpool_topk_v2.py``.
 """
 
 import unittest

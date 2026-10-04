@@ -9,9 +9,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
+    build_kpool_topk_v2_plan,
     build_pooled_page_table_64,
     kpool_build_ragged_layout,
     kpool_max_closed_pools,
+    refresh_kpool_topk_v2_plan,
     update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
@@ -115,6 +117,8 @@ class KPoolWritePlan:
     seqlens_per_q: Optional[torch.Tensor] = None
     pool_schedule_metadata: Optional[torch.Tensor] = None
     effective_n_per_batch: Optional[torch.Tensor] = None
+    # Top-k v2 plan over pool_seqlens_per_q, refreshed with it.
+    pool_topk_v2_plan: Optional[torch.Tensor] = None
 
 
 def _is_kpool_layout_enabled(pool_size: int, real_page_size: int) -> bool:
@@ -608,6 +612,7 @@ def init_pooled_paged_mqa_metadata(
         pooled_cache_seqlens_int32=pool_seqlens,
         pooled_real_page_table=pooled_page_table,
         pooled_paged_mqa_schedule_metadata=schedule,
+        pooled_topk_v2_plan=build_kpool_topk_v2_plan(pool_seqlens),
     )
 
 
@@ -656,6 +661,12 @@ def update_pooled_paged_mqa_metadata(
         )
         if new_schedule is not None:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
+
+    if metadata.pooled_topk_v2_plan is not None:
+        refresh_kpool_topk_v2_plan(
+            plan=metadata.pooled_topk_v2_plan,
+            pool_lens=metadata.pooled_cache_seqlens_int32,
+        )
 
 
 def _alloc_kpool_write_plan_buffers(
@@ -721,6 +732,10 @@ def init_kpool_write_plan_capture(
             slots_per_page=slots_per_page,
         )
         plan = dataclasses.replace(plan, pool_schedule_metadata=schedule)
+    if is_verify:
+        plan = dataclasses.replace(
+            plan, pool_topk_v2_plan=build_kpool_topk_v2_plan(plan.pool_seqlens_per_q)
+        )
     return dataclasses.replace(metadata, kpool_write_plan=plan)
 
 
@@ -780,6 +795,11 @@ def update_kpool_write_plan(
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
+
+    if plan.pool_topk_v2_plan is not None:
+        refresh_kpool_topk_v2_plan(
+            plan=plan.pool_topk_v2_plan, pool_lens=plan.pool_seqlens_per_q
+        )
 
 
 def init_kpool_write_plan(
