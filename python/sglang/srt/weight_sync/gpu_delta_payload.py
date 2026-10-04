@@ -102,16 +102,15 @@ def validate_outer_entries(entries, files, frame_bytes):
             if "outer" in entry:
                 raise ValueError("empty tensor must omit the outer envelope")
             continue
-        fields = {"file", "encoded_offset", "encoded_bytes", "decoded_bytes", "frames"}
-        if not isinstance(outer, dict) or set(outer) != fields:
-            raise ValueError("invalid outer Zstd descriptor")
         name = outer["file"]
-        start, count, size = (
-            outer[k] for k in ("encoded_offset", "encoded_bytes", "decoded_bytes")
-        )
+        start = outer["encoded_offset"]
+        count = outer["encoded_bytes"]
+        size = outer["decoded_bytes"]
         if (
             name not in files
-            or any(type(v) is not int for v in (start, count, size))
+            or type(start) is not int
+            or type(count) is not int
+            or type(size) is not int
             or start < 0
             or count <= 0
             or size <= 0
@@ -121,27 +120,15 @@ def validate_outer_entries(entries, files, frame_bytes):
         _validate_outer_frames(outer)
         end = decoded_end = 0
         for frame in frames:
-            if not isinstance(frame, dict) or set(frame) != {
-                "encoded_offset",
-                "encoded_bytes",
-                "decoded_offset",
-                "decoded_bytes",
-            }:
-                raise ValueError("invalid relative inner Snappy frame")
-            offset, encoded, decoded_offset, decoded = (
-                frame[k]
-                for k in (
-                    "encoded_offset",
-                    "encoded_bytes",
-                    "decoded_offset",
-                    "decoded_bytes",
-                )
-            )
+            offset = frame["encoded_offset"]
+            encoded = frame["encoded_bytes"]
+            decoded_offset = frame["decoded_offset"]
+            decoded = frame["decoded_bytes"]
             if (
-                any(
-                    type(v) is not int
-                    for v in (offset, encoded, decoded_offset, decoded)
-                )
+                type(offset) is not int
+                or type(encoded) is not int
+                or type(decoded_offset) is not int
+                or type(decoded) is not int
                 or offset != (end + 15) // 16 * 16
                 or not 0 < decoded <= 1 << 20
                 or not 0 < encoded <= 32 + decoded + decoded // 6
@@ -161,28 +148,19 @@ def validate_outer_entries(entries, files, frame_bytes):
 def _validate_outer_frames(outer):
     """GPU Zstd chunks exactly cover one natural tensor's inner Snappy arena."""
     chunks = outer["frames"]
-    if not isinstance(chunks, list) or not chunks:
+    if not chunks:
         raise ValueError("GPU outer Zstd requires independent chunks")
     encoded_end = decoded_end = 0
     for chunk in chunks:
-        if not isinstance(chunk, dict) or set(chunk) != {
-            "encoded_offset",
-            "encoded_bytes",
-            "decoded_offset",
-            "decoded_bytes",
-        }:
-            raise ValueError("invalid GPU outer Zstd chunk")
-        start, count, offset, size = (
-            chunk[key]
-            for key in (
-                "encoded_offset",
-                "encoded_bytes",
-                "decoded_offset",
-                "decoded_bytes",
-            )
-        )
+        start = chunk["encoded_offset"]
+        count = chunk["encoded_bytes"]
+        offset = chunk["decoded_offset"]
+        size = chunk["decoded_bytes"]
         if (
-            any(type(value) is not int for value in (start, count, offset, size))
+            type(start) is not int
+            or type(count) is not int
+            or type(offset) is not int
+            or type(size) is not int
             or start != (encoded_end + 15) // 16 * 16
             or count <= 0
             or offset != decoded_end

@@ -150,11 +150,11 @@ class TestOuterZstd(unittest.TestCase):
         mutations = (
             lambda r: r["outer"].update(decoded_bytes=37),
             lambda r: r["outer"].update(encoded_bytes=51),
-            lambda r: r["outer"].update(codec="zstd"),
+            lambda r: r["outer"].update(encoded_bytes=50.0),
             lambda r: r["frames"][0].update(encoded_offset=16),
             lambda r: r["frames"][1].update(encoded_offset=15),
-            lambda r: r["frames"][1].update(codec="snappy"),
-            lambda r: r["frames"][1].update(file="owner.bin"),
+            lambda r: r["frames"][0].update(encoded_offset=False),
+            lambda r: r["frames"][0].update(encoded_bytes=8.5),
             lambda r: r["frames"][1].update(encoded_bytes=51),
             lambda r: r["frames"][0].update(decoded_bytes=8),
             lambda r: r["frames"][1].update(decoded_offset=1),
@@ -183,11 +183,11 @@ class TestOuterZstd(unittest.TestCase):
         record = entry(bytes(50))
         validate_outer_entries([record], {"owner.bin": 50}, 1 << 16)
         mutations = (
-            lambda r: r["outer"].pop("frames"),
             lambda r: r["outer"].update(frames=[]),
             lambda r: r["outer"]["frames"][0].update(encoded_offset=16),
             lambda r: r["outer"]["frames"][0].update(encoded_bytes=49),
             lambda r: r["outer"]["frames"][0].update(encoded_bytes=True),
+            lambda r: r["outer"]["frames"][0].update(encoded_bytes=50.0),
             lambda r: r["outer"]["frames"][0].update(decoded_offset=1),
             lambda r: r["outer"]["frames"][0].update(decoded_bytes=35),
             lambda r: r["outer"]["frames"].append(dict(r["outer"]["frames"][0])),

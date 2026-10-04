@@ -157,6 +157,10 @@ class TensorBinding:
         self.layer = int(layer[1]) if layer else None
 
     @cached_property
+    def storage_pointers(self):
+        return tuple(tensor.untyped_storage().data_ptr() for tensor in self.storage)
+
+    @cached_property
     def view_id(self):
         return _digest({"name": self.name, "slices": self.slices})
 
@@ -378,6 +382,10 @@ class DerivedImage:
             or self.source.dtype != self.destination.dtype
         ):
             raise ValueError(f"unsupported derived delta buffer geometry: {self.name}")
+
+    @cached_property
+    def source_pointer(self):
+        return self.source.untyped_storage().data_ptr()
 
 
 class GpuDeltaLayout:
@@ -832,7 +840,7 @@ def _plan_batch(outputs, entries, records):
     """Map adjacent registered host spans and canonical outputs for one batch."""
     ranges, spans = [], []
     encoded_size = 0
-    for binding, decoded_offset, _ in outputs:
+    for binding, decoded_offset, decoded_size in outputs:
         entry, record = entries[binding.name], records[binding.name]
         source, size = record["offset"], record["nbytes"]
         if spans and source == (spans[-1][0] + spans[-1][2] + 15) // 16 * 16:
@@ -843,23 +851,33 @@ def _plan_batch(outputs, entries, records):
             encoded_offset = (encoded_size + 15) // 16 * 16
             spans.append((source, encoded_offset, size))
         encoded_size = encoded_offset + size
-        ranges.append((entry["frames"], encoded_offset, decoded_offset))
+        ranges.append((entry["frames"], encoded_offset, decoded_offset, decoded_size))
     return ranges, spans, encoded_size
 
 
-def _decoded_gaps(outputs, entries):
-    """Publication-specific omitted bytes; alignment padding is never consumed."""
-    gaps = []
-    for binding, offset, size in outputs:
+def _plan_decode(ranges, slot_offset):
+    """Remap fresh frames and collect omitted bytes in the same publication pass."""
+    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame
+
+    frames, gaps = [], []
+    for source_frames, encoded_offset, decoded_offset, size in ranges:
         cursor = 0
-        for frame in entries[binding.name]["frames"]:
-            start = frame["decoded_offset"]
+        for frame in source_frames:
+            start, count = frame["decoded_offset"], frame["decoded_bytes"]
             if cursor < start:
-                gaps.append((offset + cursor, start - cursor))
-            cursor = start + frame["decoded_bytes"]
+                gaps.append((decoded_offset + cursor, start - cursor))
+            frames.append(
+                DecodeFrame(
+                    slot_offset + encoded_offset + frame["encoded_offset"],
+                    frame["encoded_bytes"],
+                    decoded_offset + start,
+                    count,
+                )
+            )
+            cursor = start + count
         if cursor < size:
-            gaps.append((offset + cursor, size - cursor))
-    return gaps
+            gaps.append((decoded_offset + cursor, size - cursor))
+    return frames, gaps
 
 
 def _canonical_views(views):
@@ -933,12 +951,19 @@ def _qualify_canonical_plan(backend, manifest):
                 "views": signature[5],
             }
         )
-    if not {binding.name for binding in backend.layout.bindings} <= entries.keys():
-        raise ValueError("publication omits an admitted mutable tensor")
     if cached is not None:
         if entries.keys() != cached[1].keys():
             raise ValueError("publication omits a negotiated canonical tensor")
     else:
+        # Warm equality above authenticates these full static view definitions.
+        # Seal local admission only after every binding and digest has passed.
+        for binding in backend.layout.bindings:
+            if binding.name not in entries:
+                raise ValueError("publication omits an admitted mutable tensor")
+            views = entries[binding.name]["views"]
+            matching = [view for view in views if view["id"] == binding.view_id]
+            if len(matching) != 1 or matching[0]["slices"] != binding.slices:
+                raise ValueError(f"missing or conflicting rank view for {binding.name}")
         if (
             _digest(sorted(definitions, key=lambda entry: entry["name"]))
             != manifest["plan_digest"]
@@ -972,7 +997,7 @@ class PreparedDelta:
             raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
         self.events = {}
         self.timings = {}
-        from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
+        from sglang.srt.weight_sync.gpu_delta_codec import NvcompDecoder
         from sglang.srt.weight_sync.gpu_delta_payload import validate_codec
 
         self.backend = backend
@@ -1026,9 +1051,6 @@ class PreparedDelta:
         compressed, direct = [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]
-            matching = [v for v in entry["views"] if v["id"] == binding.view_id]
-            if len(matching) != 1 or matching[0]["slices"] != binding.slices:
-                raise ValueError(f"missing or conflicting rank view for {binding.name}")
             if binding.encoding == "raw_bytes":
                 if entry["changed_bytes"]:
                     direct.append((binding, entry))
@@ -1047,21 +1069,13 @@ class PreparedDelta:
         ]
         max_encoded = max((plan[2] for plan in plans), default=0)
         self.encoded_slot_bytes = (max_encoded + 15) // 16 * 16
-        frames = [
-            [
-                DecodeFrame(
-                    (index % self.h2d_stages) * self.encoded_slot_bytes
-                    + encoded_offset
-                    + frame["encoded_offset"],
-                    frame["encoded_bytes"],
-                    decoded_offset + frame["decoded_offset"],
-                    frame["decoded_bytes"],
-                )
-                for ranges, encoded_offset, decoded_offset in plan[0]
-                for frame in ranges
-            ]
-            for index, plan in enumerate(plans)
-        ]
+        frames, gaps = [], []
+        for index, plan in enumerate(plans):
+            batch_frames, batch_gaps = _plan_decode(
+                plan[0], (index % self.h2d_stages) * self.encoded_slot_bytes
+            )
+            frames.append(batch_frames)
+            gaps.append(batch_gaps)
         if plans:
             self.copy_stream = torch.cuda.Stream(device=self.device)
             self.copy_ready = [torch.cuda.Event() for _ in range(self.h2d_stages)]
@@ -1168,7 +1182,7 @@ class PreparedDelta:
             position = 0
             for index, (
                 (_, spans, _),
-                (outputs, _, group, transformed),
+                (_, _, group, transformed),
                 decode,
             ) in enumerate(zip(plans, static_plans, decoders)):
                 slot_offset = (index % self.h2d_stages) * self.encoded_slot_bytes
@@ -1202,21 +1216,21 @@ class PreparedDelta:
                         ],
                         [
                             self.decoded[offset : offset + size]
-                            for offset, size in _decoded_gaps(outputs, entries)
+                            for offset, size in gaps[index]
                         ],
                         prepare_status_check(decode, self.error),
                     )
                 )
             changed_bindings = compressed + [binding for binding, _ in direct]
             changed_storages = {
-                tensor.untyped_storage().data_ptr()
+                pointer
                 for binding in changed_bindings
-                for tensor in binding.storage
+                for pointer in binding.storage_pointers
             }
             self.derived = [
                 image
                 for image in backend.layout.derived
-                if image.source.untyped_storage().data_ptr() in changed_storages
+                if image.source_pointer in changed_storages
             ]
             ready = torch.cuda.Event()
             ready.record(self.stream)

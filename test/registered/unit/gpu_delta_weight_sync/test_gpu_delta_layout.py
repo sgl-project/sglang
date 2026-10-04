@@ -101,7 +101,9 @@ class TestCanonicalPlanCache(unittest.TestCase):
                     for name in ("local", "foreign")
                 },
                 excluded={"foreign": "expert owned by another EP rank"},
-                bindings=[SimpleNamespace(name="local")],
+                bindings=[
+                    SimpleNamespace(name="local", view_id="a", slices=[[0, 2], [0, 2]])
+                ],
             ),
         )
         definitions = [
@@ -142,6 +144,9 @@ class TestCanonicalPlanCache(unittest.TestCase):
             "view_slice": lambda p: p["tensors"][1]["views"][0]["slices"][
                 0
             ].__setitem__(1, 1),
+            "local_view": lambda p: p["tensors"][0]["views"][1]["slices"][
+                0
+            ].__setitem__(1, 1),
             "missing_local": lambda p: p["tensors"].pop(0),
             "missing_foreign": lambda p: p["tensors"].pop(),
             "duplicate": lambda p: p["tensors"].append(p["tensors"][0]),
@@ -160,12 +165,19 @@ class TestCanonicalPlanCache(unittest.TestCase):
             layout._qualify_canonical_plan(backend, publication)
         self.assertTrue(layout._qualify_canonical_plan(backend, updated)[1])
 
-    def test_failed_first_digest_does_not_admit_a_cache(self):
+    def test_failed_cold_qualification_does_not_admit_a_cache(self):
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
         invalid["plan_digest"] = "invalid"
         with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
             layout._qualify_canonical_plan(backend, invalid)
+        self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
+        backend, publication = self.publication()
+        invalid = copy.deepcopy(publication)
+        invalid["tensors"][0]["views"][1]["slices"][0][1] = 1
+        with self.assertRaisesRegex(ValueError, "conflicting rank view"):
+            layout._qualify_canonical_plan(backend, invalid)
+        self.assertIsNone(backend._canonical_plan)
         self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
         backend, publication = self.publication()
         backend.layout.excluded["local"] = "static W4A16 activation calibration"

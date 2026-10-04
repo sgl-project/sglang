@@ -16,7 +16,7 @@ from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
 from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
 from sglang.srt.weight_sync.gpu_delta_layout import (
     PreparedDelta,
-    _decoded_gaps,
+    _plan_decode,
     _PreparedBatch,
 )
 
@@ -86,20 +86,26 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
     with torch.cuda.device(device), torch.cuda.stream(stream):
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
         for plan, frames, size in zip(plans, batches, output_sizes):
-            gaps = _decoded_gaps(
-                [(SimpleNamespace(name="weight"), 0, size)],
-                {
-                    "weight": {
-                        "frames": [
+            mapped, gaps = _plan_decode(
+                [
+                    (
+                        [
                             {
+                                "encoded_offset": f.input_offset,
+                                "encoded_bytes": f.encoded_bytes,
                                 "decoded_offset": f.output_offset,
                                 "decoded_bytes": f.decoded_bytes,
                             }
                             for f in frames
-                        ]
-                    }
-                },
+                        ],
+                        0,
+                        0,
+                        size,
+                    )
+                ],
+                0,
             )
+            assert mapped == frames
             prepared_batches.append(
                 _PreparedBatch(
                     [],

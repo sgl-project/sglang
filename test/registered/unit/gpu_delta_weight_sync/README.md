@@ -190,9 +190,12 @@ Miles negotiates the canonical tensor-name union per cache ID and sends it in
 `host_tensor_names`. This negotiated union covers each receiver's local names; foreign
 experts outside that union are not decoded.
 
-Each rank qualifies the canonical tensor/view plan once and retains only detached
-static definitions. Later publications compare every static field directly;
-reordered views use the same canonical normalization. Frames and payloads remain
+Each rank qualifies its local views while admitting the canonical tensor/view
+plan and retains only detached static definitions. Later publications compare
+every static field directly, without repeating local view matching; reordered
+views use the same canonical normalization. Immutable binding and derived-image
+storage keys are cached, while each publication remaps its fresh frame offsets
+and omitted-byte ranges in one pass. Frames and payloads remain
 publication-specific. Private arena index/state records use `orjson`; atomic
 replacement and canonical namespace/publication digests are unchanged.
 
