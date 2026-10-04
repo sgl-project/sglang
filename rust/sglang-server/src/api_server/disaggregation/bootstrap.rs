@@ -1,7 +1,8 @@
 //! PD KV bootstrap registry — rust port of Python `CommonKVBootstrapServer` (shared by all
 //! transfer backends): prefill ranks PUT `/route`, decode ranks GET routes and the `-1`-sentinel
 //! topology, the PD router tracks per-room dp ranks; the wire format is Python-owned parity.
-//! Mounted on the prefill api listener (bootstrap port = api port) before `init_disaggregation`.
+//! Mounted on the prefill api listener and, when `disaggregation_bootstrap_port` differs from the
+//! api port, also on its own listener.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -446,6 +447,7 @@ mod tests {
         ServerArgs {
             skip_tokenizer_init: true,
             disaggregation_mode,
+            disaggregation_bootstrap_port: Some(30000),
             ..Default::default()
         }
     }
@@ -459,10 +461,14 @@ mod tests {
         start_runtime(test_server_args(DisaggregationMode::Prefill))
     }
 
-    fn start_runtime(server_args: ServerArgs) -> (Runtime, SocketAddr) {
+    fn start_runtime(mut server_args: ServerArgs) -> (Runtime, SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
+        if server_args.disaggregation_bootstrap_port == Some(server_args.port) {
+            server_args.disaggregation_bootstrap_port = Some(addr.port());
+        }
+        server_args.port = addr.port();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
@@ -650,5 +656,79 @@ mod tests {
             Some(&put_route(serde_json::json!({}))),
         );
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn separate_bootstrap_listener_shares_api_registry_and_fails_on_port_conflict() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bootstrap_addr = reserved.local_addr().unwrap();
+        let args = ServerArgs {
+            disaggregation_bootstrap_port: Some(bootstrap_addr.port()),
+            ..test_server_args(DisaggregationMode::Prefill)
+        };
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: api_addr,
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(ServerArgs {
+                port: api_addr.port(),
+                ..args.clone()
+            }),
+        };
+        let error = crate::runtime::start(cfg)
+            .err()
+            .expect("occupied bootstrap port");
+        assert!(error.contains("binding PD bootstrap listener"), "{error}");
+        // A failed second bind must release the first port as well.
+        drop(std::net::TcpListener::bind(api_addr).unwrap());
+        drop(reserved);
+
+        let (runtime, addr) = start_runtime(args);
+        assert_ne!(addr, bootstrap_addr);
+        assert_eq!(request(bootstrap_addr, "GET", "/health", None).0, 200);
+        assert_eq!(request(bootstrap_addr, "GET", SENTINEL, None).0, 503);
+        assert_eq!(
+            request(
+                bootstrap_addr,
+                "PUT",
+                "/route",
+                Some(&put_route(serde_json::json!({})))
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            request(addr, "GET", SENTINEL, None),
+            request(bootstrap_addr, "GET", SENTINEL, None)
+        );
+        assert_eq!(
+            request(
+                addr,
+                "POST",
+                "/register_dp_rank",
+                Some(&serde_json::json!({"bootstrap_room": 19, "dp_rank": 0}))
+            )
+            .0,
+            200
+        );
+        let (status, body) = request(
+            bootstrap_addr,
+            "POST",
+            "/query_dp_ranks",
+            Some(&serde_json::json!({"bootstrap_rooms": [19]})),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"19": 0})
+        );
+        runtime.request_shutdown();
+        assert!(std::net::TcpStream::connect(bootstrap_addr).is_err());
+        assert!(std::net::TcpStream::connect(addr).is_err());
     }
 }

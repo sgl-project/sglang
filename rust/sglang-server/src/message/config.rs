@@ -134,6 +134,8 @@ pub struct ServerArgs {
     /// PD-disaggregation role. (On prefill, the KV bootstrap registry is mounted
     /// on the api router — see [`Self::enable_pd_bootstrap`].)
     pub disaggregation_mode: DisaggregationMode,
+    /// PD KV bootstrap port, set on prefill servers only.
+    pub disaggregation_bootstrap_port: Option<u16>,
     /// The resolved Python `ModelConfig`, attached at handoff time.
     pub model_config: ModelConfig,
     /// Launch-time sampling defaults merged beneath per-request values and
@@ -184,6 +186,7 @@ impl ServerArgs {
         skip_server_warmup,
         incremental_streaming_output,
         disaggregation_mode,
+        disaggregation_bootstrap_port,
         model_config,
         preferred_sampling_params,
         limit_mm_data_per_request,
@@ -217,6 +220,7 @@ impl ServerArgs {
         skip_server_warmup: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
+        disaggregation_bootstrap_port: Option<u16>,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
         limit_mm_data_per_request: BTreeMap<String, usize>,
@@ -248,6 +252,7 @@ impl ServerArgs {
             skip_server_warmup,
             incremental_streaming_output,
             disaggregation_mode,
+            disaggregation_bootstrap_port,
             model_config,
             preferred_sampling_params,
             limit_mm_data_per_request,
@@ -287,6 +292,7 @@ impl Default for ServerArgs {
             skip_server_warmup: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
+            disaggregation_bootstrap_port: None,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
             limit_mm_data_per_request: BTreeMap::new(),
@@ -571,6 +577,17 @@ impl ServerArgs {
                 ));
             }
         }
+        if let Some(bootstrap_port) = self.disaggregation_bootstrap_port {
+            if bootstrap_port == 0 {
+                return Err("'disaggregation_bootstrap_port' must be between 1 and 65535".into());
+            }
+            if Some(bootstrap_port) == self.grpc_port {
+                return Err(format!(
+                    "'disaggregation_bootstrap_port' ({bootstrap_port}) must differ from \
+                     'grpc_port'"
+                ));
+            }
+        }
         if let Some(preferred) = &self.preferred_sampling_params {
             super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
                 .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
@@ -583,12 +600,9 @@ impl ServerArgs {
         self.disaggregation_mode != DisaggregationMode::Null
     }
 
-    /// Serve the PD KV bootstrap registry on the api listener: every prefill
-    /// rust server hosts it, unconditionally — no extra topology gating. KV
-    /// managers and decode nodes reach the registry at the resolved
-    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
-    /// api port, so whichever prefill server that port names is the one that
-    /// receives the registrations.
+    /// Serve the PD KV bootstrap registry: every prefill rust server hosts it on
+    /// the api listener, and also on `disaggregation_bootstrap_port` when that
+    /// differs from the api port (see `runtime::start`).
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == DisaggregationMode::Prefill
     }
@@ -666,6 +680,24 @@ mod tests {
         assert!(decode.is_disaggregation());
         assert!(!decode.enable_pd_bootstrap());
         assert!(!ServerArgs::default().is_disaggregation());
+    }
+
+    #[test]
+    fn bootstrap_port_rejects_zero_and_the_grpc_port() {
+        let base = ServerArgs {
+            served_model_name: "m".into(),
+            disaggregation_mode: DisaggregationMode::Prefill,
+            grpc_port: Some(31001),
+            ..Default::default()
+        };
+        // Sharing the HTTP port is a supported layout.
+        for (port, ok) in [(base.port, true), (0, false), (31001, false)] {
+            let sa = ServerArgs {
+                disaggregation_bootstrap_port: Some(port),
+                ..base.clone()
+            };
+            assert_eq!(sa.validate().is_ok(), ok, "port {port}");
+        }
     }
 
     #[test]
