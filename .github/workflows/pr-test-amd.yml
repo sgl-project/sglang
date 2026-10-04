@@ -866,46 +866,25 @@ jobs:
           echo "=== Post-test System Memory Status ==="
           free -h
 
-      # The mm_gen `unit` suite is portable CPU-style tests that finish in a
-      # few minutes, which does not justify a job of its own: on mi300 the
-      # container pull plus dependency install costs ~2h before any test runs.
-      # Ride along on the shard that is already warm. Runs after the diffusion
-      # tests, and on failure too, so a diffusion regression cannot hide it.
-      # Deselected on AMD; all of these still run in the CUDA diffusion unit lane:
-      # - CUDA-only assertions: the ltx2_vae_channels_last memory format, and
-      #   the qwen_image21 bit-exact fusion tests (the CUDA Q/K norm + RoPE and
-      #   KV-pack kernels refuse HIP tensors).
-      # - Strict perf-policy tests: on HIP the PerformanceValidator downgrades
-      #   violations to warnings, so tests expecting an AssertionError fail.
-      # - survives_real_pytest_runner: its 9 cases each re-import sglang 7
-      #   times, ~20 min on mi300.
+      # Split unit files across the four existing containers to stay within
+      # the step timeout without repeating image pulls and dependency installs.
+      # Run after failed server tests too, so a regression cannot hide them.
+      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion, and
+      # survives_real_pytest_runner: its 9 cases each re-import sglang 7 times,
+      # ~20 min on mi300, which pushes its shard to ~25 of the 30 min. Both
+      # still run in the CUDA diffusion unit lane.
       - name: Run diffusion unit tests
-        if: matrix.part == 0 && (success() || failure())
+        if: success() || failure()
         timeout-minutes: 30
         run: |
-          AMD_DESELECT=(
-            ltx2_vae_channels_last
-            diffusers_lora_matches_weight_delta_and_restores_base
-            bf16_fusions_match_eager_prefill_and_cached_steps
-            cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps
-            cuda_kv_pack_mismatch_restores_reference
-            fast_inference_cannot_hide_loading_regression
-            fast_loading_cannot_hide_inference_regression
-            slow_loading_fails_even_when_inference_passes
-            runner_baseline_enforces_e2e_boundary
-            each_request_failure_fails_case
-            load_guard_is_terminal_without_stage_checks
-            request_after_warmup_still_enforces_e2e
-            survives_real_pytest_runner
-          )
-          printf -v AMD_K '%s or ' "${AMD_DESELECT[@]}"
-          AMD_K="not (${AMD_K% or })"
           docker exec \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite unit \
-              -k "$AMD_K" \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 4 \
+              -k "not ltx2_vae_channels_last and not survives_real_pytest_runner" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - name: Upload diffusion failure artifacts

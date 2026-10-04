@@ -273,6 +273,13 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
+    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+
+    if isinstance(allocator, MultiEndedAllocator):
+        return dict(
+            device_alloc_fn=allocator.alloc_physical,
+            device_free_fn=allocator.cancel_physical_reservation,
+        )
     if bind is not None:
         assert free_bound is not None
         return dict(
@@ -300,7 +307,9 @@ def _uses_unified_page_envelope_host(
             for pool in (full_kv_pool, swa_kv_pool)
         )
         and {full_kv_pool.grow_direction, swa_kv_pool.grow_direction} == {"up", "down"}
-        and get_memory().hicache_host_memory_mode != "buffer_only"
+        and HybridCacheController.supports_page_envelope_host(
+            get_memory().hicache_storage_backend
+        )
     )
 
 

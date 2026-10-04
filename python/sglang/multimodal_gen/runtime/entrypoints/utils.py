@@ -363,6 +363,7 @@ def _try_save_cuda_video_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
@@ -433,7 +434,7 @@ def _try_save_cuda_video_direct(
             "-vcodec",
             "libx264",
             "-preset",
-            X264_PRESET,
+            x264_preset or X264_PRESET,
             "-pix_fmt",
             "yuv420p",
             "-crf",
@@ -541,6 +542,7 @@ def _try_save_cuda_videos_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
     if len(samples) < 2 or len(samples) != len(save_file_paths):
@@ -601,6 +603,7 @@ def _try_save_cuda_videos_direct(
             fps=fps,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
         )
 
     try:
@@ -712,6 +715,7 @@ def _try_save_video_with_audio(
     audio_sample_rate: Optional[int],
     output_format: str,
     quality: float,
+    x264_preset: Optional[str] = None,
 ) -> bool:
     """Encode video and audio in one ffmpeg pass when audio is available."""
     audio_np = _normalize_audio_to_numpy(audio)
@@ -742,7 +746,7 @@ def _try_save_video_with_audio(
             quality=quality,
             audio_path=tmp_wav_path,
             audio_codec="aac",
-            output_params=["-preset", X264_PRESET],
+            output_params=["-preset", x264_preset or X264_PRESET],
         )
         return True
     except Exception as e:
@@ -948,6 +952,7 @@ def save_materialized_output(
     save_output: bool = True,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
 ) -> None:
     if not save_output:
         return
@@ -967,6 +972,7 @@ def save_materialized_output(
             audio_sample_rate=audio_sample_rate,
             output_format=output_format,
             quality=quality,
+            x264_preset=x264_preset,
         )
         if not saved_with_audio:
             imageio.mimsave(
@@ -976,7 +982,7 @@ def save_materialized_output(
                 format=output_format,
                 codec="libx264",
                 quality=quality,
-                output_params=["-preset", X264_PRESET],
+                output_params=["-preset", x264_preset or X264_PRESET],
             )
 
             _maybe_mux_audio_into_mp4(
@@ -1031,6 +1037,7 @@ def save_outputs(
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
     output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
@@ -1066,6 +1073,7 @@ def save_outputs(
             fps=fps,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
         )
 
     for idx, (sample, save_file_path) in enumerate(zip(samples, save_file_paths)):
@@ -1101,6 +1109,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
+                        x264_preset=x264_preset,
                     )
                 if direct_saved:
                     if samples_out is not None:
@@ -1119,6 +1128,7 @@ def save_outputs(
             save_file_path,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
@@ -1156,6 +1166,7 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    x264_preset: Optional[str] = None,
 ) -> list[Any]:
     """materialize frames and save outputs (optional)"""
     if data_type == DataType.ACTION:
@@ -1180,5 +1191,6 @@ def post_process_sample(
         save_output=save_output,
         audio_sample_rate=audio_sample_rate,
         output_compression=output_compression,
+        x264_preset=x264_preset,
     )
     return materialized.frames
