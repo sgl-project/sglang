@@ -74,12 +74,7 @@ jobs:
 
   multimodal-gen-test-1-gpu:
     needs: compute-diffusion-partitions
-    if: |
-      always() &&
-      needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
@@ -147,9 +142,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-1-5090:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: 1-gpu-5090
     timeout-minutes: 180
     steps:
@@ -212,9 +205,7 @@ jobs:
           artifact-suffix: 1-gpu-5090
 
   bcg-diffusion:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 90
     steps:
@@ -267,18 +258,14 @@ jobs:
           artifact-suffix: bcg-diffusion
 
   multimodal-gen-test-2-gpu:
-    needs: compute-diffusion-partitions
-    if: |
-      always() &&
-      needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    # DEBUG ltx_2_5 validation: three runners, fixed matrix.
+    if: inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
+      matrix:
+        part: [0, 1, 2]
     steps:
       - name: Record retry deadline
         run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
@@ -287,8 +274,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -305,40 +290,52 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run diffusion server tests
-        timeout-minutes: 45
+      - name: Validate ltx_2_5 resident config
+        timeout-minutes: 35
+        # No -e: a failing launch must not stop the remaining launches.
+        shell: bash --noprofile --norc {0}
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
-          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
-          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
-          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
-          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          OUT: ${{ github.workspace }}/ltx25-validate
+          PATCH_B64: ZGlmZiAtLWdpdCBhL3B5dGhvbi9zZ2xhbmcvbXVsdGltb2RhbF9nZW4vdGVzdC9zZXJ2ZXIvZ3B1X2Nhc2VzLnB5IGIvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9ncHVfY2FzZXMucHkKaW5kZXggODNjNjJkY2QzNi4uMjNjZTc2YmEzYiAxMDA2NDQKLS0tIGEvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9ncHVfY2FzZXMucHkKKysrIGIvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9ncHVfY2FzZXMucHkKQEAgLTExMzAsMTUgKzExMzAsMTQgQEAgVFdPX0dQVV9DQVNFUyA9IFsKICAgICAgICAgICAgIG1vZGVsX3BhdGg9IkxpZ2h0cmlja3MvTFRYLTIuNS1EaWZmdXNlcnMiLAogICAgICAgICAgICAgbW9kYWxpdHk9InZpZGVvIiwKICAgICAgICAgICAgIHVseXNzZXNfZGVncmVlPTIsCi0gICAgICAgICAgICAjIE9mZmxvYWQgYm90aCB0aGUgRGlUIGFuZCB0ZXh0IGVuY29kZXIgYmV0d2VlbiBzdGFnZXMgdG8gbGVhdmUKLSAgICAgICAgICAgICMgZGVjb2RlciBoZWFkcm9vbSBvbiA4MCBHQiBHUFVzLgorICAgICAgICAgICAgIyBLZWVwIHRoZSBEaVQgYW5kIHRleHQgZW5jb2RlciByZXNpZGVudDogdGhlIHJ1bnRpbWUgcGVhayBpcyA3Mi4yIEdCLAorICAgICAgICAgICAgIyBhbmQgY29tcG9uZW50LW9mZmxvYWRpbmcgdGhlIERpVCBtYWRlIGRlbm9pc2UgcmFuZG9tbHkgMS40LTEuOXggc2xvd2VyLgogICAgICAgICAgICAgZXh0cmFzPVsKICAgICAgICAgICAgICAgICAiLS1sb2FkLWRpZmZ1c2lvbi1kZWNvZGVyIiwKICAgICAgICAgICAgICAgICAiLS13YXJtdXAtcmVzb2x1dGlvbnMgNzY4eDQ0OCIsCiAgICAgICAgICAgICAgICAgIi0td2FybXVwLW51bS1mcmFtZXMgNDkiLAogICAgICAgICAgICAgICAgICIiIi0td2FybXVwLXNhbXBsaW5nLXBhcmFtcyAneyJ1c2VfZGlmZnVzaW9uX2RlY29kZXIiOnRydWV9JyIiIiwKLSAgICAgICAgICAgICAgICAiLS1jb21wb25lbnQtcmVzaWRlbmN5ICIKLSAgICAgICAgICAgICAgICAidHJhbnNmb3JtZXI9Y29tcG9uZW50LW9mZmxvYWQsdGV4dF9lbmNvZGVyPWNvbXBvbmVudC1vZmZsb2FkIiwKKyAgICAgICAgICAgICAgICAiLS1jb21wb25lbnQtcmVzaWRlbmN5IHRyYW5zZm9ybWVyPXJlc2lkZW50LHRleHRfZW5jb2Rlcj1yZXNpZGVudCIsCiAgICAgICAgICAgICBdLAogICAgICAgICApLAogICAgICAgICBEaWZmdXNpb25TYW1wbGluZ1BhcmFtcygKZGlmZiAtLWdpdCBhL3B5dGhvbi9zZ2xhbmcvbXVsdGltb2RhbF9nZW4vdGVzdC9zZXJ2ZXIvcGVyZl9iYXNlbGluZXMvaDEwMC5qc29uIGIvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9wZXJmX2Jhc2VsaW5lcy9oMTAwLmpzb24KaW5kZXggNmUyMzY3ODRmOS4uYWZkYjlkZTdhNiAxMDA2NDQKLS0tIGEvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9wZXJmX2Jhc2VsaW5lcy9oMTAwLmpzb24KKysrIGIvcHl0aG9uL3NnbGFuZy9tdWx0aW1vZGFsX2dlbi90ZXN0L3NlcnZlci9wZXJmX2Jhc2VsaW5lcy9oMTAwLmpzb24KQEAgLTExMTcsNyArMTExNyw3IEBACiAgICAgICAgICAgICAgICAgIjciOiAzMC44NSwKICAgICAgICAgICAgICAgICAiOCI6IDYuMzgsCiAgICAgICAgICAgICAgICAgIjkiOiAxOTMuMjcsCi0gICAgICAgICAgICAgICAgIjEwIjogNDguNywKKyAgICAgICAgICAgICAgICAiMTAiOiA2NC41OCwKICAgICAgICAgICAgICAgICAiMTEiOiA2LjI5LAogICAgICAgICAgICAgICAgICIxMiI6IDYuMSwKICAgICAgICAgICAgICAgICAiMTMiOiAxOTQuNDEsCkBAIC0xMTU2LDcgKzExNTYsNyBAQAogICAgICAgICAgICAgICAgICI0NiI6IDU4LjQ1LAogICAgICAgICAgICAgICAgICI0NyI6IDYuMzQsCiAgICAgICAgICAgICAgICAgIjQ4IjogMjAwLjQzLAotICAgICAgICAgICAgICAgICI0OSI6IDQ1LjExCisgICAgICAgICAgICAgICAgIjQ5IjogNjYuMzgKICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAiZXhwZWN0ZWRfZTJlX21zIjogNDUzMS43LAogICAgICAgICAgICAgImV4cGVjdGVkX2F2Z19kZW5vaXNlX21zIjogODQuMDYsCkBAIC0yOTkwLDM3ICsyOTkwLDM3IEBACiAgICAgICAgICAgICAiZXN0aW1hdGVkX2Z1bGxfdGVzdF90aW1lX3MiOiAxODYuMAogICAgICAgICB9LAogICAgICAgICAibHR4XzJfNV9kaWZmdXNpb25fZGVjb2Rlcl8yZ3B1cyI6IHsKLSAgICAgICAgICAgICJleHBlY3RlZF9sb2FkX21zIjogMjgxMzMuMjQsCisgICAgICAgICAgICAiZXhwZWN0ZWRfbG9hZF9tcyI6IDQ4NzYwLjk2LAogICAgICAgICAgICAgInN0YWdlc19tcyI6IHsKLSAgICAgICAgICAgICAgICAiSW5wdXRWYWxpZGF0aW9uU3RhZ2UiOiAwLjA1LAotICAgICAgICAgICAgICAgICJUZXh0RW5jb2RpbmdTdGFnZSI6IDYzNC4xMywKLSAgICAgICAgICAgICAgICAiTFRYMlRleHRDb25uZWN0b3JTdGFnZSI6IDMxNy40MywKKyAgICAgICAgICAgICAgICAiSW5wdXRWYWxpZGF0aW9uU3RhZ2UiOiAwLjA0LAorICAgICAgICAgICAgICAgICJUZXh0RW5jb2RpbmdTdGFnZSI6IDg5LjUyLAorICAgICAgICAgICAgICAgICJMVFgyVGV4dENvbm5lY3RvclN0YWdlIjogMjM3LjY0LAogICAgICAgICAgICAgICAgICJMVFgyRHVyYXRpb25TdGFnZSI6IDAuMDEsCi0gICAgICAgICAgICAgICAgIkxUWDJTaWdtYVByZXBhcmF0aW9uU3RhZ2UiOiAwLjAzLAotICAgICAgICAgICAgICAgICJUaW1lc3RlcFByZXBhcmF0aW9uU3RhZ2UiOiAyNDYuMTEsCi0gICAgICAgICAgICAgICAgIkxUWDJBVkxhdGVudFByZXBhcmF0aW9uU3RhZ2UiOiAwLjMxLAorICAgICAgICAgICAgICAgICJMVFgyU2lnbWFQcmVwYXJhdGlvblN0YWdlIjogMC4wMiwKKyAgICAgICAgICAgICAgICAiVGltZXN0ZXBQcmVwYXJhdGlvblN0YWdlIjogMjE4LjkyLAorICAgICAgICAgICAgICAgICJMVFgyQVZMYXRlbnRQcmVwYXJhdGlvblN0YWdlIjogMC4yMywKICAgICAgICAgICAgICAgICAiTFRYMkltYWdlRW5jb2RpbmdTdGFnZSI6IDAuMDIsCi0gICAgICAgICAgICAgICAgIkxUWDJBVkRlbm9pc2luZ1N0YWdlIjogMzc1MC43LAotICAgICAgICAgICAgICAgICJMVFgyQVZEZWNvZGluZ1N0YWdlIjogMzM4Mi4zMworICAgICAgICAgICAgICAgICJMVFgyQVZEZW5vaXNpbmdTdGFnZSI6IDIwMzMuNTQsCisgICAgICAgICAgICAgICAgIkxUWDJBVkRlY29kaW5nU3RhZ2UiOiAzNDgwLjUyCiAgICAgICAgICAgICB9LAogICAgICAgICAgICAgImRlbm9pc2Vfc3RlcF9tcyI6IHsKLSAgICAgICAgICAgICAgICAiMCI6IDI5Mi42NSwKLSAgICAgICAgICAgICAgICAiMSI6IDI1OS45NCwKLSAgICAgICAgICAgICAgICAiMiI6IDI1Ni40NywKLSAgICAgICAgICAgICAgICAiMyI6IDI1Ni4yNiwKLSAgICAgICAgICAgICAgICAiNCI6IDI1OS42MiwKLSAgICAgICAgICAgICAgICAiNSI6IDI1NS40NCwKLSAgICAgICAgICAgICAgICAiNiI6IDI1OC4wMiwKLSAgICAgICAgICAgICAgICAiNyI6IDI1NS45MQotICAgICAgICAgICAgfSwKLSAgICAgICAgICAgICJleHBlY3RlZF9lMmVfbXMiOiAxMDE0MS42LAotICAgICAgICAgICAgImV4cGVjdGVkX2F2Z19kZW5vaXNlX21zIjogMjYxLjc5LAotICAgICAgICAgICAgImV4cGVjdGVkX21lZGlhbl9kZW5vaXNlX21zIjogMjU3LjI1LAotICAgICAgICAgICAgImxvYWRfcGVha192cmFtX21iIjogMTkwNiwKLSAgICAgICAgICAgICJydW50aW1lX3BlYWtfdnJhbV9tYiI6IDY5NTQ2LAotICAgICAgICAgICAgIndhcm11cF9wZWFrX3ZyYW1fbWIiOiAyODM5NiwKLSAgICAgICAgICAgICJsb2FkX3BlYWtfYWxsb2NhdGVkX21iIjogMTg3Ni4xNCwKLSAgICAgICAgICAgICJydW50aW1lX3BlYWtfYWxsb2NhdGVkX21iIjogNDgzOTksCisgICAgICAgICAgICAgICAgIjAiOiAyNjMuMTQsCisgICAgICAgICAgICAgICAgIjEiOiAyNTEuNjcsCisgICAgICAgICAgICAgICAgIjIiOiAyNTEuNDQsCisgICAgICAgICAgICAgICAgIjMiOiAyNTIuMzMsCisgICAgICAgICAgICAgICAgIjQiOiAyNTIuMjUsCisgICAgICAgICAgICAgICAgIjUiOiAyNTIuMTQsCisgICAgICAgICAgICAgICAgIjYiOiAyNTUuNDgsCisgICAgICAgICAgICAgICAgIjciOiAyNTEuMTUKKyAgICAgICAgICAgIH0sCisgICAgICAgICAgICAiZXhwZWN0ZWRfZTJlX21zIjogNjA4NC40LAorICAgICAgICAgICAgImV4cGVjdGVkX2F2Z19kZW5vaXNlX21zIjogMjUzLjksCisgICAgICAgICAgICAiZXhwZWN0ZWRfbWVkaWFuX2Rlbm9pc2VfbXMiOiAyNTIuOCwKKyAgICAgICAgICAgICJsb2FkX3BlYWtfdnJhbV9tYiI6IDYxMjM2LAorICAgICAgICAgICAgInJ1bnRpbWVfcGVha192cmFtX21iIjogNzIxODYsCisgICAgICAgICAgICAid2FybXVwX3BlYWtfdnJhbV9tYiI6IDcyMTgyLAorICAgICAgICAgICAgImxvYWRfcGVha19hbGxvY2F0ZWRfbWIiOiA2MDk3OC44NSwKKyAgICAgICAgICAgICJydW50aW1lX3BlYWtfYWxsb2NhdGVkX21iIjogNjg3MDkuMTIsCiAgICAgICAgICAgICAiZXN0aW1hdGVkX2Z1bGxfdGVzdF90aW1lX3MiOiA1NDUuMQogICAgICAgICB9LAogICAgICAgICAibHR4XzJfM190d29fc3RhZ2VfdGkydl8yZ3B1cyI6IHsK
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-2-gpu-h100 \
-            --timeout-per-file 14400
+          set -u
+          mkdir -p "$OUT"
+          # Apply exactly the reviewed change (gpu_cases.py + h100.json) to this job's checkout.
+          echo "$PATCH_B64" | base64 -d > "$OUT/change.patch"
+          sha256sum "$OUT/change.patch"
+          git apply "$OUT/change.patch" || { echo "patch failed to apply"; exit 1; }
+          git diff --stat
+          { echo "runner=${RUNNER_NAME:-} host=$(hostname)"; free -g; cat /proc/loadavg; nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv; } > "$OUT/host.txt" 2>&1
+          cat "$OUT/host.txt"
+          cleanup() { git checkout -- . ; pkill -f "sglang serve" 2>/dev/null || true; sleep 5; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; }
+          trap cleanup EXIT
+          printf "launch\trc\twall_s\tfirst_failure\tconsistency\n" > "$OUT/summary.tsv"
+          for i in 1 2 3 4 5; do
+            rm -f /tmp/sgl_server_*LTX-2.5*.log python/diffusion-results.json
+            echo "::group::launch $i"
+            t0=$(date +%s)
+            (cd python && timeout 600 python3 -m pytest -q -s sglang/multimodal_gen/test/server/test_server_2_gpu.py -k ltx_2_5_diffusion_decoder_2gpus) > "$OUT/launch_${i}.log" 2>&1
+            rc=$?
+            wall=$(( $(date +%s) - t0 ))
+            cp /tmp/sgl_server_*LTX-2.5*.log "$OUT/server_${i}.log" 2>/dev/null || true
+            cp python/diffusion-results.json "$OUT/results_${i}.json" 2>/dev/null || true
+            ff=$(grep -m1 -o "Validation failed for '[^']*'" "$OUT/launch_${i}.log" | sed "s/Validation failed for //")
+            cc=$(grep -m1 -o "Consistency Check\] ltx_2_5_diffusion_decoder_2gpus: [A-Z]*" "$OUT/launch_${i}.log" | awk '{print $NF}')
+            printf "%s\t%s\t%s\t%s\t%s\n" "$i" "$rc" "$wall" "${ff:-none}" "${cc:-not_run}" | tee -a "$OUT/summary.tsv"
+            echo "::endgroup::"
+          done
+          echo "=== summary (runner ${RUNNER_NAME:-}) ==="; cat "$OUT/summary.tsv"
+          exit 0
 
-      - name: Upload execution report
+      - name: Upload validation artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-report-2gpu-${{ matrix.part }}
-          path: |
-            python/sglang/multimodal_gen/test/execution_report_*.json
-            python/diffusion-results.json
-          retention-days: 7
-
-      - name: Upload diffusion failure artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diffusion-failures-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
-          path: diffusion-failures/
-          if-no-files-found: ignore
+          name: ltx25-validate-${{ matrix.part }}
+          path: ltx25-validate/
           retention-days: 7
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -347,9 +344,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-component-accuracy:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     steps:
@@ -392,9 +387,7 @@ jobs:
           artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -457,9 +450,7 @@ jobs:
         if: failure()
 
   multimodal-gen-unit-test:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
@@ -495,15 +486,7 @@ jobs:
 
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
-    if: |
-      always() &&
-      inputs.multimodal_gen == 'true' &&
-      (
-        needs.multimodal-gen-test-1-gpu.result == 'success' ||
-        needs.multimodal-gen-test-1-gpu.result == 'failure' ||
-        needs.multimodal-gen-test-2-gpu.result == 'success' ||
-        needs.multimodal-gen-test-2-gpu.result == 'failure'
-      )
+    if: false  # DEBUG ltx_2_5 validation: only the 2-GPU job runs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
