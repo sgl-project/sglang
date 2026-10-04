@@ -58,6 +58,7 @@ fn config() -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -101,7 +102,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             url: url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
