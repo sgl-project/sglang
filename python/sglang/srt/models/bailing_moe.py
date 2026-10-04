@@ -31,15 +31,20 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-    reduce_output,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -50,7 +55,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -78,7 +82,12 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    make_pp_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -280,6 +289,7 @@ class BailingMoESparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
@@ -323,9 +333,6 @@ class BailingMoESparseMoeBlock(nn.Module):
             )
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().tp_size
-
             self.deepep_dispatcher = DeepEPDispatcher(
                 group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
@@ -452,7 +459,6 @@ class BailingMoESparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward_deepep(
@@ -503,7 +509,6 @@ class BailingMoEAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        self.dp_size = get_parallel().attn_dp_size
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -646,7 +651,6 @@ class BailingMoEBlock(nn.Module):
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.dp_size = get_parallel().attn_dp_size
         self.attention = BailingMoEAttention(
             config,
             layer_id,
@@ -656,8 +660,6 @@ class BailingMoEBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id, is_nextn=is_nextn
@@ -669,15 +671,6 @@ class BailingMoEBlock(nn.Module):
             config, layer_id=layer_id + 1, is_nextn=False
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            # A NextN draft is a one-layer model.
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
                 layer_id=layer_id,
@@ -687,7 +680,7 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -698,15 +691,26 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _is_layer_sparse(
@@ -721,16 +725,14 @@ class BailingMoEBlock(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        capture_output=None,
     ) -> torch.Tensor:
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
+            capture=capture_output,
         )
 
         if hidden_states.shape[0] != 0:
@@ -740,17 +742,16 @@ class BailingMoEBlock(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
         )
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class BailingMoEModel(nn.Module):
@@ -782,7 +783,7 @@ class BailingMoEModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BailingMoEBlock(
                 layer_id=idx,
@@ -791,8 +792,6 @@ class BailingMoEModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -815,49 +814,36 @@ class BailingMoEModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_states.append(
-                        hidden_states if residual is None else hidden_states + residual
-                    )
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    captured_last_layer_outputs=aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

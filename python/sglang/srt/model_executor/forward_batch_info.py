@@ -43,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -73,6 +74,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -188,6 +190,21 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def _localize_npu_dcp_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    *,
+    interleave_size: int,
+) -> torch.Tensor:
+    """Map allocator-global NPU DCP slots to this target rank."""
+    parallel = get_parallel()
+    return localize_dcp_indices(
+        out_cache_loc,
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        interleave_size,
+    )
 
 
 class ForwardMode(IntEnum):
@@ -504,6 +521,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Allocator-global output slots before NPU DCP localizes ``out_cache_loc``.
+    # DSA's replicated indexer cache uses the global slot identity.
+    origin_out_cache_loc: Optional[torch.Tensor] = None
+
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
     # they are cloned/relayed into FB-owned copies at the boundary, move them out of
@@ -511,12 +532,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `rebind_write_loc` replaced it with kernel-facing
+    # The write loc before `rebind_write_loc` replaced it with physical
     # ids; a backend re-derives from it into its capture-stable buffer.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
+    # Whether `out_cache_loc` holds physical ids: set by
+    # KVIndexTranslator.rebind_write_loc; capture-time batches declare it.
+    out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -558,9 +582,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     dp_spec_prefill_coordination_applied: bool = False
     can_run_decode_cuda_graph: bool = False
+    # Draft-only companion to the generic DP decode graph vote.
+    can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+
+    # Current layer-stack invocation; each TBO child owns a separate stream.
+    residual_stream: Optional[ResidualStream] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -674,6 +703,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Decode-graph-owned destination for AuxHiddenStatePacker; None when eager.
+    aux_hidden_states_buffer: Optional[torch.Tensor] = None
 
     # Prefill body-CUDA-graph context limit. Attention backends that allocate
     # context-shaped metadata use this fixed maximum instead of deriving a
@@ -835,16 +867,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self,
+        batch: ScheduleBatch,
+        device: Union[str, torch.device],
+        *,
+        is_draft_worker: bool = False,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
         self.dp_spec_prefill_coordination_applied = (
             batch.dp_spec_prefill_coordination_applied
         )
-        if batch.global_num_tokens is None:
+        global_num_tokens_source = batch.global_num_tokens
+        global_num_tokens_for_logprob_source = batch.global_num_tokens_for_logprob
+        # A DP spec/prefill coordination plan already wrote this phase's counts.
+        if (
+            is_draft_worker
+            and batch.draft_global_num_tokens is not None
+            and not batch.dp_spec_prefill_coordination_applied
+        ):
+            global_num_tokens_source = batch.draft_global_num_tokens
+            global_num_tokens_for_logprob_source = (
+                batch.draft_global_num_tokens_for_logprob
+            )
+
+        if global_num_tokens_source is None:
             return
 
-        assert batch.global_num_tokens_for_logprob is not None
+        assert global_num_tokens_for_logprob_source is not None
         if (
             self.spec_info is not None
             and not batch.dp_spec_prefill_coordination_applied
@@ -854,15 +903,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens, global_num_tokens_for_logprob = (
                 spec_scale_global_num_tokens(
                     self.spec_info,
-                    batch.global_num_tokens,
-                    batch.global_num_tokens_for_logprob,
+                    global_num_tokens_source,
+                    global_num_tokens_for_logprob_source,
                 )
             )
         else:
-            global_num_tokens = batch.global_num_tokens
-            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+            global_num_tokens = global_num_tokens_source
+            global_num_tokens_for_logprob = global_num_tokens_for_logprob_source
 
-        self.original_global_num_tokens_cpu = batch.global_num_tokens
+        self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
@@ -875,6 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             pin_memory=pin_memory,
         ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+        self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
     @classmethod
     def init_new(
@@ -884,6 +934,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        extend_position_info=None,
+        spec_mrope_positions: Optional[torch.Tensor] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -976,6 +1028,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
+            can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
@@ -997,6 +1050,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        # ScheduleBatch and req_to_token keep allocator-global slot identities.
+        # Preserve that view before exposing rank-local NPU DCP write slots.
+        if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
+            ret.origin_out_cache_loc = ret.out_cache_loc
+            if ret.out_cache_loc is not None:
+                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
+                    ret.out_cache_loc,
+                    interleave_size=model_runner.page_size,
+                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -1045,7 +1107,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(
+            batch, device, is_draft_worker=model_runner.is_draft_worker
+        )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1095,12 +1159,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.prefill_attention_backend_str,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
-            )
+            if extend_position_info is None:
+                positions, ret.extend_start_loc = compute_position(
+                    model_runner.prefill_attention_backend_str,
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
+            else:
+                positions, ret.extend_start_loc, _ = extend_position_info
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
@@ -1109,7 +1176,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret._init_ngram_embedding_info(batch, device)
 
         if model_runner.model_config.model_is_mrope:
-            if (
+            if spec_mrope_positions is not None:
+                ret.mrope_positions = spec_mrope_positions
+            elif (
+                extend_position_info is not None and extend_position_info[2] is not None
+            ):
+                ret.mrope_positions = extend_position_info[2]
+            elif (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
@@ -1127,7 +1200,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init lora information
         if (
             model_runner.lora_manager is not None
-            and not model_runner.lora_manager.enable_dp_attention
+            and not model_runner.lora_manager.attn_dp_enabled
         ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
@@ -1136,13 +1209,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if (
-            model_runner.attn_dcp_size > 1
-            and ret.out_cache_loc is not None
-            and is_hip()
-        ):
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1 and ret.out_cache_loc is not None and is_hip():
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.attn_dcp_size == model_runner.attn_dcp_rank
+                ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
 
         return ret
@@ -1230,19 +1300,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
-        from sglang.srt.layers.communicator import ScatterMode, sparse_mlp_scatter_mode
+        from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
+        from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+
+        if (
+            is_moe_input_scattered_across_dp_ranks()
+            and self.attn_cp_metadata is not None
+            and self.forward_mode.is_context_parallel_extend()
+        ):
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            strategy = get_cp_strategy()
+            if strategy is not None:
+                return strategy.moe_num_token_non_padded(self)
 
         if self.num_token_non_padded is None:
             return None
 
-        mode = sparse_mlp_scatter_mode()
-        if mode == ScatterMode.SCATTERED:
+        if is_moe_input_scattered_across_dp_ranks():
             # a2a dispatch, FP4 all-gather and dwdp all route the local shard.
             return self.num_token_non_padded
-        if mode == ScatterMode.MOE_FULL and self._moe_input_gathered_across_moe_cp():
+        if batch_gathers_over_moe_cp(self):
             return None
-        # DSA / MLA CP take the FULL mode but all-gather across CP on a prefill,
-        # which leaves the real rows zigzag-permuted rather than in a prefix.
+        # DSA / MLA CP all-gather across attention CP on a prefill, which leaves
+        # the real rows zigzag-permuted rather than in a prefix.
         if get_parallel().attn_cp_size > 1 and self._moe_input_gathered_across_cp():
             return None
         if get_parallel().attn_dp_size != 1:
@@ -1254,16 +1335,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return self.num_token_non_padded
         # None under cuda-graph replay: its static batch carries no GLOBAL count.
         return self.global_num_token_non_padded
-
-    def _moe_input_gathered_across_moe_cp(self) -> bool:
-        from sglang.srt.layers.dp_attention import get_moe_cp_size
-
-        # Mirrors the communicator's MOE_FULL gather guard: decode stays FULL.
-        return (
-            self.forward_mode.is_context_parallel_extend()
-            and self.attn_cp_metadata is not None
-            and get_moe_cp_size() > 1
-        )
 
     def _moe_input_gathered_across_cp(self) -> bool:
         from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
@@ -1351,9 +1422,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            self.mrope_positions = (
+                seq_positions.to(torch.int64).flatten().unsqueeze(0).repeat(3, 1)
             )
+            return
         else:
             mrope_deltas = [
                 (
@@ -1800,6 +1872,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.origin_out_cache_loc is not None:
+            self.origin_out_cache_loc = self._pad_tensor_to_size(
+                self.origin_out_cache_loc, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -1899,7 +1975,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return self.input_ids.shape[0]
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         # Pure TP+SP has no MLP-sync pass, so stamp the decision here.
         self.attn_tp_sequence_sharded = model_runner.attn_tp_sequence_sharded(
@@ -1989,6 +2065,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.forward_mode.is_idle():
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
@@ -2060,6 +2142,7 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
