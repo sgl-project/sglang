@@ -762,9 +762,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_cell_size
         )
 
+    def _unified_full_bytes_per_token(self) -> int:
+        """Bytes one full-side token takes in the unified pool: the fused
+        entry (host + draft + pad) when the draft lives in it, else the
+        target's own rows. A private draft pool is priced separately."""
+        if self._fused_full_entry is not None:
+            return self._fused_full_entry
+        return self._full_per_token * self._full_layers_num
+
     def _unified_pool_bytes(self, full_tokens: int, swa_tokens: int) -> int:
         return (
-            full_tokens * self._full_per_token * self._full_layers_num
+            full_tokens * self._unified_full_bytes_per_token()
             + swa_tokens * self._swa_per_token * self._swa_layers_num
         )
 
@@ -776,7 +784,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         """Find the largest page-aligned full capacity whose allocations fit."""
         draft_bytes_per_token = self._draft_pool_bytes_per_token()
-        target_full_bytes_per_token = self._full_per_token * self._full_layers_num
+        target_full_bytes_per_token = self._unified_full_bytes_per_token()
         assert target_full_bytes_per_token > 0
 
         def allocation_bytes(full_pages: int) -> int:
