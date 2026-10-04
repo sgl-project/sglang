@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import zstandard as zstd
+
 from sglang.srt.weight_sync.gpu_delta_payload import (
     OuterZstdPool,
     configured_codec,
@@ -274,18 +275,8 @@ class TestRawPayload(unittest.TestCase):
                 validate_outer_entries([bad], {"owner.bin": 8}, 1 << 16)
         with self.assertRaisesRegex(ValueError, "overlapping"):
             validate_outer_entries([raw, copy.deepcopy(raw)], {"owner.bin": 8}, 1 << 16)
-
-    def test_raw_ranges_cannot_overlap_compressed_tensor_payloads(self):
-        raw = {
-            "encoding": "raw_bytes",
-            "nbytes": 4,
-            "changed_bytes": 1,
-            "frames": [],
-            "raw": {"file": "owner.bin", "encoded_offset": 4, "encoded_bytes": 4},
-        }
-        wrapped = entry(bytes(8))
         with self.assertRaisesRegex(ValueError, "overlapping"):
-            validate_outer_entries([raw, wrapped], {"owner.bin": 32}, 1 << 16)
+            validate_outer_entries([raw, entry(bytes(8))], {"owner.bin": 32}, 1 << 16)
 
 
 if __name__ == "__main__":

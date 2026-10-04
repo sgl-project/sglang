@@ -28,6 +28,7 @@ import uuid
 from pathlib import Path
 
 import orjson
+
 from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 
 
@@ -447,7 +448,6 @@ class HostArena:
                 hash_future = pool.hash_executor.submit(
                     _hash_payloads, files, definitions
                 )
-                decode_error = None
                 try:
                     _decode_arena(
                         memoryview(decoded_map)
@@ -459,23 +459,19 @@ class HostArena:
                         pool,
                         metrics,
                     )
-                except BaseException as error:
-                    decode_error = error
-                # Decode drains all tensor tasks itself. Join the independent
-                # hash even after failure before views can disappear. A bad
-                # payload digest takes precedence over its decoder error.
-                hash_wait_started = time.perf_counter()
-                metrics["host_payload_sha256_s"] = hash_future.result()
-                metrics["host_payload_hash_wait_s"] = (
-                    time.perf_counter() - hash_wait_started
-                )
-                metrics["host_payload_decode_hash_s"] = (
-                    time.perf_counter() - decode_hash_started
-                )
-                metrics["host_payload_hash_bytes"] = encoded_size
-                metrics["host_payload_hash_files"] = len(definitions)
-                if decode_error is not None:
-                    raise decode_error
+                finally:
+                    # Decode drains its tasks. Always join the independent hash
+                    # before releasing views; hash failure takes precedence.
+                    hash_wait_started = time.perf_counter()
+                    metrics["host_payload_sha256_s"] = hash_future.result()
+                    metrics["host_payload_hash_wait_s"] = (
+                        time.perf_counter() - hash_wait_started
+                    )
+                    metrics["host_payload_decode_hash_s"] = (
+                        time.perf_counter() - decode_hash_started
+                    )
+                    metrics["host_payload_hash_bytes"] = encoded_size
+                    metrics["host_payload_hash_files"] = len(definitions)
                 files.clear()
                 index.update(
                     cpu_workers=pool.workers,

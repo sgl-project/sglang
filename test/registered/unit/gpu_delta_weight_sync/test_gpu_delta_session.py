@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.srt.weight_sync import gpu_delta_session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 

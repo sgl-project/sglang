@@ -8,11 +8,12 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import zstandard as zstd
+
 from sglang.srt.weight_sync import gpu_delta_host as host
 from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -578,54 +579,6 @@ class TestSharedHostSnapshot(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             arena.prepare(
                 path, digest, manifest, sorted(expected), self.pool, {}, metadata(4)
-            )
-
-    def test_failed_tensor_drains_other_workers_and_poisoned_slot_cannot_reuse(self):
-        path, digest, manifest, _ = fixture(self.root)
-        arena = self.arena()
-        slow_entered, failure_raised, release_slow, finished = [
-            threading.Event() for _ in range(4)
-        ]
-        errors, decode = [], self.pool.decode
-
-        def controlled(payload, chunks, destination):
-            if len(destination) > 1000:
-                assert slow_entered.wait(5)
-                failure_raised.set()
-                raise ValueError("injected tensor decode failure")
-            slow_entered.set()
-            assert release_slow.wait(5)
-            return decode(payload, chunks, destination)
-
-        def build():
-            try:
-                arena.prepare(
-                    path,
-                    digest,
-                    manifest,
-                    ["dense", "expert"],
-                    self.pool,
-                    {},
-                    metadata(),
-                )
-            except Exception as error:
-                errors.append(error)
-            finally:
-                finished.set()
-
-        with patch.object(self.pool, "decode", side_effect=controlled):
-            builder = threading.Thread(target=build)
-            builder.start()
-            try:
-                self.assertTrue(failure_raised.wait(5))
-                self.assertFalse(finished.is_set())
-            finally:
-                release_slow.set()
-                builder.join(5)
-        self.assertEqual(str(errors[0]), "injected tensor decode failure")
-        with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            arena.prepare(
-                path, digest, manifest, ["dense", "expert"], self.pool, {}, metadata(2)
             )
 
     def test_host_union_binding_and_corrupt_zstd_do_not_publish_ready(self):

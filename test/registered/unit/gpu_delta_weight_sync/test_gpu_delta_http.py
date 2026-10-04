@@ -7,6 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+
 from sglang.srt.managers.io_struct import (
     AbortWeightsFromDeltaReqInput,
     GetWeightsDeltaInfoReqInput,
@@ -14,6 +15,8 @@ from sglang.srt.managers.io_struct import (
     PrepareWeightsFromDeltaReqInput,
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
+    msgpack_decode,
+    msgpack_encode,
 )
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta_http import register_gpu_delta_routes
@@ -54,6 +57,14 @@ def http_delta():
 def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delta):
     client, app, calls, reply, route_class = http_delta
     session = {"session_id": "publication-1"}
+    receipts = [
+        {
+            "identity": {"engine_id": "e0", "rank_id": "original"},
+            "state": "APPLIED",
+            "session_id": "publication-1",
+            "target_version": 1,
+        }
+    ]
     cases = [
         ("get_weights_delta_info", GetWeightsDeltaInfoReqInput, {"engine_id": "e0"}),
         (
@@ -81,7 +92,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         (
             "resume_weights_from_delta",
             ResumeWeightsFromDeltaReqInput,
-            session | {"receipts": []},
+            session | {"receipts": receipts},
         ),
         ("abort_weights_from_delta", AbortWeightsFromDeltaReqInput, session),
     ]
@@ -99,6 +110,11 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         result = client.post(route.path, json=payload)
         assert result.status_code == 200 and result.json() == reply
         assert isinstance(calls[-1], request_type)
+        if request_type is ResumeWeightsFromDeltaReqInput:
+            received = msgpack_decode(msgpack_encode(calls[-1]))
+            assert isinstance(received, request_type)
+            assert received.session_id == session["session_id"]
+            assert received.receipts == receipts
     assert len(calls) == len(cases)
 
 

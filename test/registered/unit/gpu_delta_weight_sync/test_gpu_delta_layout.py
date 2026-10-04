@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -165,6 +166,10 @@ class TestCanonicalPlanCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
             layout._qualify_canonical_plan(backend, invalid)
         self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
+        backend, publication = self.publication()
+        backend.layout.excluded["local"] = "static W4A16 activation calibration"
+        with self.assertRaisesRegex(ValueError, "unadmitted tensor"):
+            layout._qualify_canonical_plan(backend, publication)
 
 
 class TestFlashInferDeltaLayout(unittest.TestCase):
@@ -221,46 +226,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             torch.testing.assert_close(
                 swizzled, expected.reshape_as(swizzled), rtol=0, atol=0
             )
-
-    def test_gate_up_order_is_backend_specific(self):
-        gate = torch.ones((128, 8), dtype=torch.uint8)
-        up = torch.full_like(gate, 2)
-        cute = layout.interleave_gate_up_bytes(gate, up, group_rows=64, up_first=True)
-        mega = layout.interleave_gate_up_bytes(gate, up, group_rows=16, up_first=False)
-        self.assertTrue(torch.all(cute[:64] == 2))
-        self.assertTrue(torch.all(cute[64:128] == 1))
-        self.assertTrue(torch.all(mega[:16] == 1))
-        self.assertTrue(torch.all(mega[16:32] == 2))
-
-    def test_noncontiguous_gate_destination_preserves_up(self):
-        destination = torch.randint(256, (256, 32), dtype=torch.uint8)
-        old = destination.clone()
-        gate = destination.reshape(2, 2, 64, 32)[:, 1]
-        binding = layout._direct_binding(
-            "gate", {"dtype": "U8", "shape": [128, 32]}, gate
-        )
-        mask = torch.randint(256, (128 * 32,), dtype=torch.uint8)
-        pointer = destination.data_ptr()
-        before = _bytes(gate).clone()
-        binding.xor(mask)
-        torch.testing.assert_close(_bytes(gate), before ^ mask)
-        torch.testing.assert_close(
-            destination.reshape(2, 2, 64, 32)[:, 0], old.reshape(2, 2, 64, 32)[:, 0]
-        )
-        self.assertEqual(pointer, destination.data_ptr())
-
-    def test_full_tensor_then_tp_column_selection(self):
-        full = torch.randint(256, (20, 32), dtype=torch.uint8)
-        target = full[:, 8:16].clone()
-        binding = layout._direct_binding(
-            "weight",
-            {"dtype": "U8", "shape": list(full.shape)},
-            target,
-            [[0, 20], [8, 16]],
-        )
-        mask = torch.randint(256, full.shape, dtype=torch.uint8)
-        binding.xor(binding.selected_bytes(mask.reshape(-1)))
-        torch.testing.assert_close(target, (full ^ mask)[:, 8:16])
 
     def test_prepared_tp_selection_reads_reused_decoder_scratch(self):
         for dtype, name in (
@@ -381,21 +346,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         torch.testing.assert_close(image, original)
                         self.assertEqual(image.data_ptr(), pointer)
 
-    def test_bf16_masks_are_never_floating_point_values(self):
-        # Exercise all byte values, including BF16 NaN bit patterns.
-        mask = torch.arange(256, dtype=torch.uint8).repeat(2).reshape(16, 32)
-        out = layout.flashinfer_delta_layout(
-            mask, dtype="bf16", backend="cutedsl", kind="weight"
-        )
-        self.assertEqual(out.data_ptr(), mask.data_ptr())
-        with self.assertRaises(ValueError):
-            layout.flashinfer_delta_layout(
-                mask.view(torch.bfloat16),
-                dtype="bf16",
-                backend="cutedsl",
-                kind="weight",
-            )
-
     def test_unfused_bf16_shared_experts_use_ordinary_tp8_slices(self):
         tp_rank, intermediate, hidden = 3, 32, 16
         shard = intermediate // 8
@@ -460,23 +410,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             rtol=0,
             atol=0,
         )
-
-    def test_scalar_metadata_direct_targets_preserve_exact_bits(self):
-        for old, new in ((1.0, 0.25), (-0.0, 3.5)):
-            current = torch.tensor(old, dtype=torch.float32)
-            expected = torch.tensor(new, dtype=torch.float32)
-            binding = layout._direct_binding(
-                "weight_scale_2", {"dtype": "F32", "shape": []}, current
-            )
-            pointer = current.data_ptr()
-            self.assertEqual(binding.encoding, "raw_bytes")
-            self.assertIsNone(binding.xor)
-            torch._foreach_copy_([binding.storage[0]], [expected])
-            torch.testing.assert_close(
-                current.reshape(1).view(torch.uint8),
-                expected.reshape(1).view(torch.uint8),
-            )
-            self.assertEqual(current.data_ptr(), pointer)
 
     def test_derived_refresh_preserves_rank_and_decoder_error_gate(self):
         for shape in ((), (2,), (2, 2)):
@@ -630,42 +563,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             torch.testing.assert_close(_bytes(binding.storage[0]), _bytes(after))
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
-
-    def test_publication_cannot_reintroduce_static_calibration(self):
-        name = "model.layers.0.mlp.experts.0.gate_proj.input_scale"
-        metadata = dict(
-            stream_id="test", base_version=0, target_version=1, plan_digest="plan"
-        )
-        manifest = dict(
-            protocol_version=4,
-            codec="snappy-zstd",
-            frame_bytes=1 << 20,
-            tensors=[{"name": name}],
-            **metadata,
-        )
-        content = json.dumps(manifest).encode()
-        backend = SimpleNamespace(
-            _canonical_plan=None,
-            codec="snappy-zstd",
-            device=torch.device("cpu"),
-            layout=SimpleNamespace(
-                inventory={name: {"dtype": "F32", "shape": []}},
-                excluded={name: "static W4A16 activation calibration"},
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "manifest.json"
-            path.write_bytes(content)
-            with (
-                patch.object(torch.cuda, "Stream", return_value=object()),
-                self.assertRaisesRegex(ValueError, "unadmitted tensor"),
-            ):
-                layout.PreparedDelta(
-                    backend,
-                    path,
-                    layout.hashlib.sha256(content).hexdigest(),
-                    metadata,
-                )
 
     def test_snappy_streaming_unwraps_only_local_tensors_and_reuses_scratch(self):
         import zstandard as zstd

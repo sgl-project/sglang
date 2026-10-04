@@ -933,8 +933,6 @@ class PreparedDelta:
         batches = []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]
-            if entry["encoding"] != binding.encoding:
-                raise ValueError(f"canonical tensor encoding mismatch: {binding.name}")
             matching = [v for v in entry["views"] if v["id"] == binding.view_id]
             if len(matching) != 1 or matching[0]["slices"] != binding.slices:
                 raise ValueError(f"missing or conflicting rank view for {binding.name}")

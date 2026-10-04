@@ -89,6 +89,7 @@ def _publication(directory, version, repeat):
 
 def _consumer(rank, engine, workers, publications, cache, barrier, output):
     import torch
+
     from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 

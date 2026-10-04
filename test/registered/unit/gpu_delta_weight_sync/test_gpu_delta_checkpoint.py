@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch
 from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -279,14 +280,15 @@ class TestCanonicalCheckpointHeaders(unittest.TestCase):
             ),
         ]
         for obj, key, value, message in cases:
-            with self.subTest(key=key, value=value), patch.object(
-                obj, key, value, create=True
-            ), patch.object(
-                checkpoint,
-                "safe_open",
-                side_effect=AssertionError("opened unsupported source"),
-            ), self.assertRaisesRegex(
-                ValueError, message
+            with (
+                self.subTest(key=key, value=value),
+                patch.object(obj, key, value, create=True),
+                patch.object(
+                    checkpoint,
+                    "safe_open",
+                    side_effect=AssertionError("opened unsupported source"),
+                ),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 self.read()
 

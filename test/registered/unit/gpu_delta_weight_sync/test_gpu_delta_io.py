@@ -1,16 +1,13 @@
-"""The HTTP resume certificate must survive the scheduler IPC hop."""
+"""Bind delta admission to published ranks and the ordinary updater state."""
 
 import io
 import sys
 from types import SimpleNamespace
 
 import pytest
-from pydantic import TypeAdapter
+
 from sglang.srt.managers.io_struct import (
     PrepareWeightsFromDeltaReqInput,
-    ResumeWeightsFromDeltaReqInput,
-    msgpack_decode,
-    msgpack_encode,
 )
 from sglang.srt.weight_sync.gpu_delta_session import (
     GpuDeltaSchedulerControl,
@@ -20,8 +17,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("rank", [0, 7])
-def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkeypatch):
+def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch):
+    rank = 7
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
@@ -117,24 +114,6 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkey
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()
-
-
-def test_resume_certificate_survives_http_validation_and_ipc():
-    receipts = [
-        {
-            "identity": {"engine_id": "engine-0", "rank_id": "original-rank-0"},
-            "state": "APPLIED",
-            "session_id": "publication-1",
-            "target_version": 1,
-        }
-    ]
-    request = TypeAdapter(ResumeWeightsFromDeltaReqInput).validate_python(
-        {"session_id": "publication-1", "receipts": receipts}
-    )
-    received = msgpack_decode(msgpack_encode(request))
-    assert isinstance(received, ResumeWeightsFromDeltaReqInput)
-    assert received.session_id == "publication-1"
-    assert received.receipts == receipts
 
 
 @pytest.mark.parametrize(

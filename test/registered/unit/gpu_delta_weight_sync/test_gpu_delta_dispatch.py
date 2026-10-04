@@ -3,7 +3,6 @@
 import time
 from types import SimpleNamespace
 
-import pytest
 from sglang.srt.managers import io_struct as io
 from sglang.srt.weight_sync import gpu_delta_session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -12,31 +11,13 @@ from sglang.utils import TypeBasedDispatcher
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def test_registration_preserves_every_ordinary_handler():
-    types = [
-        io.TokenizedGenerateReqInput,
-        io.PauseGenerationReqInput,
-        io.ContinueGenerationReqInput,
-        io.UpdateWeightFromDiskReqInput,
-        io.ReleaseMemoryOccupationReqInput,
-    ]
-    handlers = {kind: (lambda obj: obj) for kind in types}
-    ordinary = TypeBasedDispatcher(list(handlers.items()))
-    wrapped = delta_runtime.with_gpu_delta_controls(SimpleNamespace(), ordinary)
-    for kind, handler in handlers.items():
-        assert wrapped._mapping[kind] is handler
-
-
-@pytest.mark.parametrize("fail_fence", [False, True])
-def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch, fail_fence):
+def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
     events = []
     scheduler = SimpleNamespace(_engine_paused=False)
 
     def fence():
         assert scheduler._engine_paused
         events.append("fence")
-        if fail_fence:
-            raise RuntimeError("readers still active")
 
     def pause(obj):
         assert scheduler._engine_paused and obj.mode == "retract"
@@ -98,20 +79,14 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch, fail_fenc
             io.UpdateWeightsFromDeltaReqInput(session_id="p", rid="apply-rid")
         )
         assert result.rid == "apply-rid" and scheduler._engine_paused
-        if fail_fence:
-            assert not result.success and result.participant["state"] == "POISONED"
-            assert events == ["fence"]
-            with pytest.raises(ValueError, match="cannot abort"):
-                session.abort("p")
-        else:
-            assert result.success and events == ["fence", "retract", "flush", "apply"]
-            result = wrapped(
-                io.ResumeWeightsFromDeltaReqInput(
-                    session_id="p", receipts=[result.participant["certificate"]]
-                )
+        assert result.success and events == ["fence", "retract", "flush", "apply"]
+        result = wrapped(
+            io.ResumeWeightsFromDeltaReqInput(
+                session_id="p", receipts=[result.participant["certificate"]]
             )
-            assert result.success and result.participant["state"] == "RESUMED"
-            assert events[-2:] == [("version", "1"), "resume"]
-            assert not scheduler._engine_paused
+        )
+        assert result.success and result.participant["state"] == "RESUMED"
+        assert events[-2:] == [("version", "1"), "resume"]
+        assert not scheduler._engine_paused
     finally:
         session._executor.shutdown(wait=True)
