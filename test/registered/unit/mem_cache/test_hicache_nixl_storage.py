@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
+import ctypes
 import os
 import shutil
 import socket
@@ -74,6 +75,45 @@ class MockHybridPool:
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         return True
+
+
+class MockBytePagePool:
+    """Like MambaPoolHost: bf16 storage whose flat data pages are uint8 bytes."""
+
+    def __init__(self, num_pages: int = 4, page_elems: int = 37):
+        self.page_size = 1
+        self.dtype = torch.bfloat16
+        self.device = "cpu"
+        self.pin_memory = False
+        self.buffer = torch.randn((num_pages, page_elems), dtype=torch.bfloat16)
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(self.buffer[0].nbytes, dtype=torch.uint8)
+
+    def get_data_page(self, index, flat=True):
+        return self.buffer[index].view(torch.uint8).reshape(-1)
+
+    def set_from_flat_data_page(self, index, data_page):
+        self.buffer[index].view(torch.uint8).copy_(data_page)
+
+
+def _assert_byte_page_round_trip(test, hicache):
+    pool = MockBytePagePool(page_elems=2056)  # 4112 bytes: 16 past an OS page
+    hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+    test.assertFalse(hicache._hybrid_pool_ctx[PoolName.MAMBA].is_zero_copy)
+    expected = pool.buffer.clone()
+    transfer = PoolTransfer(
+        name=PoolName.MAMBA,
+        keys=["p0", "p1", "p2"],
+        host_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+    )
+
+    test.assertEqual(hicache.batch_set_v2([transfer])[PoolName.MAMBA], [True] * 3)
+    pool.buffer.zero_()
+    test.assertEqual(hicache.batch_get_v2([transfer])[PoolName.MAMBA], [True] * 3)
+    test.assertTrue(
+        torch.equal(pool.buffer[:3].view(torch.int16), expected[:3].view(torch.int16))
+    )
 
 
 class MockMemPoolHost:
@@ -619,6 +659,9 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(len(captured["host_buffers"]), 4)
         self.assertEqual(captured["direction"], "WRITE")
 
+    def test_bounce_round_trip_keeps_bytes_of_wider_storage_dtype(self):
+        _assert_byte_page_round_trip(self, self.hicache)
+
     def test_batch_get_v2_uses_bounce_buffer_for_non_zero_copy_pool(self):
         pool = MockHybridPool(expose_zero_copy=False)
         self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
@@ -753,6 +796,24 @@ class TestNixlDirectIO(CustomTestCase):
         """File-based backend + use_direct_io=True must set needs_page_alignment."""
         hicache = self._make_direct_io_hicache()
         self.assertTrue(hicache.needs_page_alignment)
+
+    def test_odirect_bounce_round_trip_pads_unaligned_page(self):
+        hicache = self._make_direct_io_hicache()
+        stored = {}
+
+        def aligned_batch_xfer(keys, key_strs, host_buffers, direction):
+            # O_DIRECT rejects any I/O whose address or length is not page aligned.
+            for key, (addr, size) in zip(key_strs, host_buffers):
+                self.assertEqual(addr % 4096, 0)
+                self.assertEqual(size % 4096, 0)
+                if direction == "WRITE":
+                    stored[key] = ctypes.string_at(addr, size)
+                else:
+                    ctypes.memmove(addr, stored[key], size)
+            return [True] * len(key_strs)
+
+        hicache._batch_xfer = aligned_batch_xfer
+        _assert_byte_page_round_trip(self, hicache)
 
     def test_odirect_unaligned_pool_falls_back_to_copy(self):
         """O_DIRECT with non-aligned pool strides falls back to copy mode."""
