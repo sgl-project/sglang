@@ -1109,6 +1109,27 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )
 
+    def test_rust_multi_rank_pd_prefill_cannot_follow_bootstrap_room(self):
+        with envs.SGLANG_RUST_SERVER.override(True):
+            for attn_dp_size, expected in (
+                (1, "follow_bootstrap_room"),
+                (2, "round_robin"),
+            ):
+                with self.subTest(attn_dp_size=attn_dp_size):
+                    server_args = self._load_balance_args(
+                        disaggregation_mode="prefill", attn_dp_size=attn_dp_size
+                    )
+                    self.assertEqual(
+                        resolution_result(server_args, "load_balance_method"),
+                        expected,
+                    )
+            with self.assertRaisesRegex(ValueError, "router picks the rank"):
+                self._load_balance_args(
+                    disaggregation_mode="prefill",
+                    attn_dp_size=2,
+                    load_balance_method="follow_bootstrap_room",
+                )
+
     def test_pd_prefill_dcp_warns_about_performance(self):
         server_args = ServerArgs(
             model_path="dummy",

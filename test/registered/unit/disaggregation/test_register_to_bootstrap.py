@@ -79,6 +79,33 @@ class TestRegisterToBootstrap(CustomTestCase):
                         4, KVPoll.Failed if conflict else KVPoll.Bootstrapping
                     )
 
+    def test_prefill_sender_registers_at_request_bootstrap_port(self):
+        # Decode looks the DP rank up at the request's bootstrap address. With
+        # the Rust server, that is the port of the DP listener the router chose,
+        # not the server's base bootstrap port.
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+        from sglang.srt.disaggregation.utils import TransferBackend
+
+        queue = MagicMock(spec=PrefillBootstrapQueue)
+        queue._check_if_req_exceed_kv_capacity.return_value = False
+        queue.transfer_backend = TransferBackend.MOONCAKE
+        queue.kv_manager = MagicMock()
+        req = MagicMock(
+            bootstrap_host="10.0.0.2",
+            bootstrap_port=30001,
+            bootstrap_room=7,
+            disagg_prefill_dp_rank=None,
+        )
+        with patch("sglang.srt.disaggregation.prefill.get_kv_class") as get_kv_class:
+            self.assertTrue(PrefillBootstrapQueue.create_sender(queue, req, 8))
+
+        get_kv_class.return_value.assert_called_once_with(
+            mgr=queue.kv_manager,
+            bootstrap_addr="10.0.0.2:30001",
+            bootstrap_room=7,
+            req_has_disagg_prefill_dp_rank=False,
+        )
+
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_succeeds_on_first_attempt(self, mock_put, mock_time):
