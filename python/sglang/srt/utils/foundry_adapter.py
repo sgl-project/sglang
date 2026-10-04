@@ -1,9 +1,9 @@
 """Adapter for Foundry CUDA graph persistence (``--cuda-graph-persistence``).
 
-Foundry (https://github.com/foundry-org/foundry, optional dependency
-``sglang[foundry]``) saves the captured CUDA graphs and the memory layout they
-reference on a first start (``save``) and rebuilds them from that archive on
-later starts (``load``) instead of capturing. It runs a CUDA driver hook in
+Foundry (https://github.com/foundry-org/foundry, PyPI ``foundry-core``,
+optional dependency ``sglang[foundry]``) saves the captured CUDA graphs and
+the memory layout they reference on a first start (``save``) and rebuilds
+them from that archive on later starts (``load``) instead of capturing. It runs a CUDA driver hook in
 the scheduler processes (``LD_PRELOAD``, set by ``configure_subprocess()``
 around their spawn) and is called from the call sites below; the methods of
 the no-op adapter do nothing, so the call sites stay unconditional.
@@ -18,6 +18,14 @@ decode / prefill runners' ``capture``, ``FullCudaGraphBackend.capture_one`` and
 
 Foundry is imported only when the flag is set: importing it loads its CUDA
 extension, which a server without the flag must not pay for.
+
+Process contract: a process is persistence-enabled from its first
+``activate_foundry`` or never. Activation preloads Foundry's CUDA driver hook
+into the children, reserves the allocation region and pins environment
+variables, none of which can be undone in a live process (resetting the
+adapter would not clear them), so a later record without
+``--cuda-graph-persistence`` in an enabled process is an error, not a
+fallback to the no-op adapter.
 """
 
 import logging
@@ -26,14 +34,16 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Major version of foundry.integration.sglang.api this adapter calls.
+# Version of foundry.integration.sglang.api this adapter calls: same major,
+# at least this minor.
 FOUNDRY_INTEGRATION_API_MAJOR = 1
-# Distribution name and minimum version, checked when the flag is set.
-FOUNDRY_PACKAGE = "foundry"
-FOUNDRY_MIN_VERSION = "0.0.3"
+FOUNDRY_INTEGRATION_API_MIN_MINOR = 1
+# Distribution name (import name ``foundry``) and minimum version, checked
+# when the flag is set.
+FOUNDRY_PACKAGE = "foundry-core"
+FOUNDRY_MIN_VERSION = "0.1.0"
 FOUNDRY_INSTALL_HINT = (
-    'Install it with `pip install --no-build-isolation "sglang[foundry]"` (its CUDA '
-    "extension is built against the installed torch; see "
+    'Install it with `pip install "sglang[foundry]"` (package foundry-core; see '
     "docs/advanced_features/cuda_graph_persistence)."
 )
 
@@ -97,7 +107,16 @@ class FoundryAdapter:
     def capture_scope(self, runner: Any):
         yield
 
-    def capture_one(self, backend: Any, shape_key: Any, forward_fn) -> None:
+    def capture_one(
+        self,
+        shape_key: Any,
+        forward_fn,
+        *,
+        pool: Any,
+        stream: Any,
+        prefill_req_slots: Optional[int] = None,
+    ):
+        """Returns ``(graph, output)`` for the backend to store."""
         raise RuntimeError("capture_one is only called when Foundry is enabled")
 
     def shared_read_ends_override(self, runner, attn_backend, forward_mode):
@@ -151,8 +170,16 @@ class _FoundryAdapterReal(FoundryAdapter):
     def capture_scope(self, runner):
         return self._api.capture_scope(runner)
 
-    def capture_one(self, backend, shape_key, forward_fn):
-        self._api.capture_one(backend, shape_key, forward_fn)
+    def capture_one(
+        self, shape_key, forward_fn, *, pool, stream, prefill_req_slots=None
+    ):
+        return self._api.capture_one(
+            shape_key,
+            forward_fn,
+            pool=pool,
+            stream=stream,
+            prefill_req_slots=prefill_req_slots,
+        )
 
     def shared_read_ends_override(self, runner, attn_backend, forward_mode):
         return self._api.shared_read_ends_override(runner, attn_backend, forward_mode)
@@ -171,10 +198,15 @@ def _import_foundry_api():
 
     assert_pkg_version(FOUNDRY_PACKAGE, FOUNDRY_MIN_VERSION, FOUNDRY_INSTALL_HINT)
     found = getattr(api, "INTEGRATION_API_VERSION", None)
-    if found is None or found[0] != FOUNDRY_INTEGRATION_API_MAJOR:
+    if (
+        found is None
+        or found[0] != FOUNDRY_INTEGRATION_API_MAJOR
+        or found[1] < FOUNDRY_INTEGRATION_API_MIN_MINOR
+    ):
         raise RuntimeError(
             f"Foundry integration API {found} is not supported by this SGLang, which "
-            f"needs major version {FOUNDRY_INTEGRATION_API_MAJOR}. {FOUNDRY_INSTALL_HINT}"
+            f"needs {FOUNDRY_INTEGRATION_API_MAJOR}.x with x >= "
+            f"{FOUNDRY_INTEGRATION_API_MIN_MINOR}. {FOUNDRY_INSTALL_HINT}"
         )
     return api
 
@@ -190,15 +222,27 @@ def get_foundry_adapter() -> FoundryAdapter:
 
 
 def activate_foundry(server_args: Any) -> FoundryAdapter:
-    """Create this process's adapter from the raw ``--cuda-graph-persistence``
-    and ``--cuda-graph-persistence-config`` of ``server_args``. Idempotent;
-    run by the first resolution step in the launcher and at the top of the
-    scheduler and data-parallel-controller processes."""
+    """This process's adapter for ``server_args``, from its raw
+    ``--cuda-graph-persistence`` and ``--cuda-graph-persistence-config``.
+
+    Without the flag: the no-op adapter, and an error if this process already
+    activated Foundry (see the process contract in the module docstring).
+    With it: activates Foundry on the first call; later calls must name the
+    same mode and config. Run by the first resolution step in the launcher and
+    at the top of the scheduler and data-parallel-controller processes."""
     global _active
-    mode = getattr(server_args, "cuda_graph_persistence", None)
+    mode = server_args.cuda_graph_persistence
     if mode is None:
-        return _active
-    config_path = getattr(server_args, "cuda_graph_persistence_config", None)
+        if _active.enabled:
+            raise RuntimeError(
+                "Foundry CUDA graph persistence is active in this process "
+                f"(--cuda-graph-persistence {_active.mode}), and a server_args "
+                "without it cannot run here: Foundry's CUDA hook, allocation region "
+                "and environment pins cannot be undone in a live process. Use a "
+                "separate process for engines without --cuda-graph-persistence."
+            )
+        return _NOOP
+    config_path = server_args.cuda_graph_persistence_config
     if _active.enabled:
         # A second record in the same process must name the same archive.
         _active._api.activate(mode=mode, config_path=config_path)

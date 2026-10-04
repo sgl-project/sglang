@@ -114,6 +114,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    def _prefill_req_slots(self) -> Optional[int]:
+        """The prefill runner's fixed request-slot count, None under a
+        decode runner."""
+        # Local import: the prefill runner module imports this one.
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
+        )
+
+        runner = self._cuda_graph_runner
+        if isinstance(runner, PrefillCudaGraphRunner):
+            return runner._capture_req_slots
+        return None
+
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -126,7 +139,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             # CUDA graph persistence: SAVE captures and archives this shape
             # (without the warmup forwards, whose allocations LOAD could not
             # reproduce); LOAD restores the archived graph instead.
-            foundry.capture_one(self, shape_key, forward_fn)
+            self._graphs[shape_key], self._outputs[shape_key] = foundry.capture_one(
+                shape_key,
+                forward_fn,
+                pool=self._pool,
+                stream=self._capture_stream,
+                prefill_req_slots=self._prefill_req_slots(),
+            )
             return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled

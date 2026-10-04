@@ -92,11 +92,11 @@ _READ = [
      {"get_parallel", "get_device", "get_flags", "get_context"}),
 ]  # fmt: skip
 
-# Attributes Foundry reads or writes on the objects it is handed.
+# Attributes Foundry reads on the runners it is handed (capture scope, decode
+# runner checks). The backend's fields are not among them: capture_one gets
+# the pool, stream and prefill request slots as arguments and SGLang stores the
+# returned graph and output.
 _ATTRIBUTES = [
-    ("model_executor/runner_backend/full_cuda_graph_backend.py",
-     "FullCudaGraphBackend.__init__",
-     {"_pool", "_capture_stream", "_graphs", "_outputs", "_cuda_graph_runner"}),
     (_PREFILL, "PrefillCudaGraphRunner.__init__",
      {"_capture_req_slots", "_is_full_backend", "prefill_backend_name"}),
     (_DECODE, "DecodeCudaGraphRunner.__init__", {"backend", "in_graph_metadata_prep_done"}),
@@ -179,6 +179,39 @@ class TestFoundryCallSites(CustomTestCase):
                     other = _name_lines(fn, where.split(":", 1)[1])
                     self.assertTrue(other, where)
                     self.assertGreater(lines[-1], other[-1])
+
+    def test_capture_one_passes_arguments_and_stores_the_result(self):
+        """Foundry gets what it needs as arguments and SGLang assigns the
+        returned graph and output into its own backend fields."""
+        fn = _find(
+            "model_executor/runner_backend/full_cuda_graph_backend.py",
+            "FullCudaGraphBackend.capture_one",
+        )
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "foundry.capture_one"
+        )
+        self.assertEqual(
+            [ast.unparse(a) for a in call.args], ["shape_key", "forward_fn"]
+        )
+        self.assertEqual(
+            {k.arg: ast.unparse(k.value) for k in call.keywords},
+            {
+                "pool": "self._pool",
+                "stream": "self._capture_stream",
+                "prefill_req_slots": "self._prefill_req_slots()",
+            },
+        )
+        assign = next(
+            n for n in ast.walk(fn) if isinstance(n, ast.Assign) and n.value is call
+        )
+        self.assertEqual(
+            [ast.unparse(t) for t in assign.targets[0].elts],
+            ["self._graphs[shape_key]", "self._outputs[shape_key]"],
+        )
+        # Nothing hands Foundry the backend itself.
+        self.assertNotIn("self", [ast.unparse(a) for a in call.args])
 
     def test_capture_scope_wraps_the_whole_capture_loop(self):
         """Foundry's scope must bracket warmup and every shape: the runner's
