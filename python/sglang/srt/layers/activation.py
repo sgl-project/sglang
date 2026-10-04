@@ -207,7 +207,7 @@ class SituAndMul(BaseFusedOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+        from sglang.kernels.ops.activation import situ_and_mul
 
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
@@ -481,8 +481,7 @@ def get_act_fn(
     if quant_config is not None and act_fn_name in quant_config.get_scaled_act_names():
         if intermediate_size is None:
             raise ValueError(
-                "intermediate_size must be specified for scaled "
-                "activation functions."
+                "intermediate_size must be specified for scaled activation functions."
             )
         return ScaledActivation(
             act_fn, intermediate_size, input_is_parallel, params_dtype
@@ -495,7 +494,6 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         hasattr(config, "sbert_ce_default_activation_function")
         and config.sbert_ce_default_activation_function is not None
     ):
-
         function_name = config.sbert_ce_default_activation_function
         assert function_name.startswith("torch.nn.modules."), (
             "Loading of activation functions is restricted to "

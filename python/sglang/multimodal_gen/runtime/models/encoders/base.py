@@ -13,11 +13,13 @@ from sglang.multimodal_gen.configs.models.encoders import (
     ImageEncoderConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -158,9 +160,12 @@ class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
+    checkpoint_quantization_backend = "diffusion"
+    packed_modules_mapping: dict[str, list[str]] = {}
+
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
 
     @classmethod
     def configure_component_paths(
@@ -175,10 +180,20 @@ class EncoderTensorParallelMixin:
 
     def __call__(self, *args, **kwargs):
         tp_group = self._encoder_tp_group
+        forward = super().__call__
+        cache_group = tp_group
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+
+        def run():
+            return cached_encoder_call(
+                self, args, kwargs, lambda: forward(*args, **kwargs), cache_group
+            )
+
         if tp_group is None:
-            return super().__call__(*args, **kwargs)
+            return run()
         with use_tensor_parallel_group(tp_group):
-            return super().__call__(*args, **kwargs)
+            return run()
 
 
 class TextEncoder(
@@ -190,9 +205,6 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",

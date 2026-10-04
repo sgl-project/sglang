@@ -51,7 +51,7 @@ export const config = {
   --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
