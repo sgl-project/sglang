@@ -144,6 +144,80 @@ class TestLinearParallelGroups(CustomTestCase):
                     self.assertEqual(attention.q_size, shards["q"].shape[0])
                     self.assertEqual(attention.kv_size, shards["k"].shape[0])
 
+    def test_model_gate_projections_reload_on_their_attention_shards(self):
+        from sglang.srt.models.laguna import LagunaAttention
+        from sglang.srt.models.step3p5 import Step3p5Attention
+
+        for model, mode in (
+            ("laguna", "disabled"),
+            ("laguna", "per-head"),
+            ("laguna", "per-element"),
+            ("step3p5", False),
+            ("step3p5", True),
+        ):
+            for kv_heads in (1, 4):
+                with self.subTest(model=model, mode=mode, kv_heads=kv_heads):
+                    options = dict(
+                        hidden_size=8,
+                        num_heads=4,
+                        num_kv_heads=kv_heads,
+                        head_dim=2,
+                        layer_id=0,
+                        rms_norm_eps=1e-6,
+                        rope_theta=10000,
+                        rope_scaling=None,
+                        partial_rotary_factor=1.0,
+                        max_position_embeddings=16,
+                    )
+                    if model == "laguna":
+                        attention = LagunaAttention(
+                            **options,
+                            attention_bias=True,
+                            sliding_window_size=-1,
+                            layer_type="full_attention",
+                            gating=mode,
+                        )
+                    else:
+                        attention = Step3p5Attention(
+                            **options, use_head_wise_attn_gate=mode
+                        )
+                    qkv = attention.qkv_proj
+                    weights = {
+                        "q": self.weight,
+                        "k": self.weight[: kv_heads * 2] + 2,
+                        "v": self.weight[: kv_heads * 2] + 4,
+                    }
+                    with get_parallel().override(
+                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                    ):
+                        for name, weight in weights.items():
+                            qkv.weight.weight_loader(qkv.weight, weight, name)
+                            if qkv.bias is not None:
+                                qkv.bias.weight_loader(
+                                    qkv.bias, torch.zeros(weight.shape[0]), name
+                                )
+                    shards = [
+                        weight.chunk(2)[1] if name == "q" or kv_heads >= 2 else weight
+                        for name, weight in weights.items()
+                    ]
+                    torch.testing.assert_close(
+                        qkv(self.x)[0], F.linear(self.x, torch.cat(shards))
+                    )
+                    gate = getattr(attention, "g_proj", None)
+                    if mode in (False, "disabled"):
+                        self.assertIsNone(gate)
+                        continue
+                    gate_weight = (
+                        self.weight if mode == "per-element" else self.weight[:4]
+                    )
+                    with get_parallel().override(
+                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                    ):
+                        gate.weight.weight_loader(gate.weight, gate_weight)
+                    torch.testing.assert_close(
+                        gate(self.x)[0], F.linear(self.x, gate_weight.chunk(2)[1])
+                    )
+
     def test_v2_loaders_keep_their_partition_during_reload(self):
         column = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
         row = RowParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
