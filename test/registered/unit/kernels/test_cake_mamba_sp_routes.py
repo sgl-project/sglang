@@ -830,14 +830,17 @@ def _sp_kernels(*, prepare_ok=True, ag_ok=True, prepare_raises=False):
     )
     launchers = []
 
-    def _prepare(inp, w, group):
+    def _prepare(inp, w, group, *, max_rows=None):
         if prepare_raises:
-            raise NotImplementedError("no packed-QKV row")
-        launcher = mock.Mock(
-            side_effect=lambda x: torch.full(
-                (x.shape[0] * TP, w.shape[1]), 2.0, dtype=x.dtype
-            )
-        )
+            raise NotImplementedError("unsupported operands")
+        capacity = inp.shape[0] if max_rows is None else max_rows
+
+        def _launch(x):
+            assert x.shape[0] <= capacity, "launcher called above its capacity"
+            return torch.full((x.shape[0] * TP, w.shape[1]), 2.0, dtype=x.dtype)
+
+        launcher = mock.Mock(side_effect=_launch)
+        launcher.max_rows = capacity
         launchers.append(launcher)
         return launcher
 
@@ -878,15 +881,17 @@ def test_sp_route_on_prepared_launcher_is_prepared_once_and_reused(sp_env, caplo
     prepare.assert_called_once()
     p_inp, p_w, p_group = prepare.call_args.args
     assert p_inp is inp and p_group is sp_env.group
-    # K-major contiguous weight copy (FI contract), equal to weight.T.
-    assert tuple(p_w.shape) == (K, N) and p_w.is_contiguous()
+    # The engine's [N, K] parameter is passed through its [K, N] view: no copy.
+    assert tuple(p_w.shape) == (K, N) and not p_w.is_contiguous()
+    assert p_w.data_ptr() == linear.weight.data_ptr()
     assert torch.equal(p_w, linear.weight.detach().t())
-    # Admission runs on the real tensors of every call; the launcher is prepared
-    # once and reused.
-    assert supports_prepare.call_count == 2
-    s_inp, s_w = supports_prepare.call_args_list[0].args
-    assert s_inp is inp and s_w is p_w
-    assert supports_prepare.call_args.kwargs == {"world_size": TP}
+    # Without a resolved schedule the capacity is the shard at hand; the
+    # launcher is prepared once and reused (no admission call on the reuse).
+    assert prepare.call_args.kwargs == {"max_rows": ROWS}
+    supports_prepare.assert_called_once()
+    s_inp, s_w = supports_prepare.call_args.args
+    assert s_inp is inp and s_w.data_ptr() == linear.weight.data_ptr()
+    assert supports_prepare.call_args.kwargs == {"world_size": TP, "max_rows": ROWS}
     assert len(launchers) == 1 and launchers[0].call_count == 2
     assert tuple(out.shape) == (NUM_TOKENS, N) and torch.all(out == 2.0)
     assert torch.all(out2 == 2.0)
@@ -904,8 +909,8 @@ def test_sp_route_on_functional_kernel_when_prepared_not_admitted(sp_env):
     ag.assert_called_once()
     a_inp, a_w, a_group = ag.call_args.args
     assert a_inp is inp and a_group is sp_env.group
-    assert tuple(a_w.shape) == (K, N) and a_w.is_contiguous()
-    assert supports_ag.call_args.args[1] is a_w
+    assert tuple(a_w.shape) == (K, N) and a_w.data_ptr() == linear.weight.data_ptr()
+    assert supports_ag.call_args.args[1].data_ptr() == a_w.data_ptr()
     linear.quant_method.apply.assert_not_called()
     assert torch.all(out == 3.0) and tuple(out.shape) == (NUM_TOKENS, N)
 
@@ -950,7 +955,7 @@ def test_sp_route_static_fallbacks_skip_adapter(sp_env, case):
         fn.assert_not_called()
 
 
-def test_sp_weight_reload_reprepares_copy_and_launcher(sp_env):
+def test_sp_weight_reload_reprepares_the_launcher(sp_env):
     kernels, launchers = _sp_kernels()
     prepare = kernels[3]
     linear = _linear(sp_env)
@@ -962,6 +967,61 @@ def test_sp_weight_reload_reprepares_copy_and_launcher(sp_env):
         sp_mod.column_parallel_g_matmul(linear, inp, None)
     assert prepare.call_count == 2 and len(launchers) == 2
     assert torch.equal(prepare.call_args.args[1], linear.weight.detach().t())
+
+
+def test_sp_launcher_capacity_serves_smaller_shards_and_grows_once(sp_env):
+    """One launcher per participant: smaller shards reuse it, a larger shard
+    re-prepares it at the larger capacity (every rank sees the same rows)."""
+    kernels, launchers = _sp_kernels()
+    supports_prepare, prepare = kernels[1], kernels[3]
+    linear = _linear(sp_env)
+    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
+        out_big = sp_mod.column_parallel_g_matmul(
+            linear, torch.randn(4 * ROWS, K).bfloat16(), None
+        )
+        out_small = sp_mod.column_parallel_g_matmul(
+            linear, torch.randn(ROWS, K).bfloat16(), None
+        )
+        out_tail = sp_mod.column_parallel_g_matmul(
+            linear, torch.randn(3 * ROWS - 1, K).bfloat16(), None
+        )
+        out_grow = sp_mod.column_parallel_g_matmul(
+            linear, torch.randn(8 * ROWS, K).bfloat16(), None
+        )
+    assert prepare.call_count == 2 and len(launchers) == 2
+    assert [launcher.max_rows for launcher in launchers] == [4 * ROWS, 8 * ROWS]
+    assert launchers[0].call_count == 3 and launchers[1].call_count == 1
+    assert supports_prepare.call_count == 2
+    assert torch.all(out_big == 2.0) and torch.all(out_small == 2.0)
+    assert torch.all(out_tail == 2.0) and torch.all(out_grow == 2.0)
+    assert tuple(out_grow.shape) == (NUM_TOKENS, N)
+
+
+def test_sp_launcher_capacity_comes_from_the_prefill_chunk_cap(sp_env):
+    """With a resolved schedule the launcher is sized once for the chunked-prefill
+    cap spread over the TP ranks, so no prefill shard re-prepares it."""
+    kernels, launchers = _sp_kernels()
+    prepare = kernels[3]
+    linear = _linear(sp_env)
+    schedule = SimpleNamespace(chunked_prefill_size=16384, max_prefill_tokens=32768)
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        mock.patch("sglang.srt.runtime_context.get_schedule", lambda: schedule),
+    ):
+        sp_mod.column_parallel_g_matmul(linear, torch.randn(ROWS, K).bfloat16(), None)
+        sp_mod.column_parallel_g_matmul(
+            linear, torch.randn(16384 // TP, K).bfloat16(), None
+        )
+    assert prepare.call_count == 1 and launchers[0].max_rows == 16384 // TP
+    assert launchers[0].call_count == 2
+    # A disabled chunked prefill falls back to max_prefill_tokens; nothing
+    # resolved means the shard at hand.
+    assert sp_mod._cake_sp_capacity_rows(ROWS, TP) == ROWS
+    schedule.chunked_prefill_size = -1
+    with mock.patch("sglang.srt.runtime_context.get_schedule", lambda: schedule):
+        assert sp_mod._cake_sp_capacity_rows(ROWS, TP) == 32768 // TP
+        assert sp_mod._cake_sp_capacity_rows(5000, TP) == 5000
 
 
 # ---------------------------------------------------------------------------

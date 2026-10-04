@@ -2,11 +2,14 @@
 
 Checks three things for the Cake adapter distributed by FlashInfer: the
 registry resolves the explicit FlashInfer backend (no GPU); the in-process
-``supports_*`` admission rejects wrong world sizes, shapes and dtypes and
-returns False when the installed FlashInfer lacks the Cake module; and, when
-launched under ``torchrun`` with 2, 4 or 8 ranks on sm_100a / sm_103a with the
-NVSHMEM symmetric-memory backend, the fused result matches NCCL all-gather +
-``torch.matmul``. The multi-rank tests skip with the reason otherwise.
+``supports_*`` admission admits the engine's operands (any row count, the
+``[N, K]`` parameter through its ``.t()`` view, any ``N % 256 == 0``), rejects
+wrong world sizes, shapes, strides and dtypes and returns False when the
+installed FlashInfer lacks the Cake module; and, when launched under
+``torchrun`` with 2, 4 or 8 ranks on sm_100a / sm_103a with the NVSHMEM
+symmetric-memory backend, the fused result matches NCCL all-gather +
+``torch.matmul`` for the one-shot kernel and the capacity-bound prepared
+launcher. The multi-rank tests skip with the reason otherwise.
 
 Usage::
 
@@ -58,43 +61,62 @@ def _module_available() -> bool:
     )
 
 
-def test_supports_rejects_bad_inputs(monkeypatch):
+def test_supports_admits_engine_operands_and_rejects_bad_inputs(monkeypatch):
     device = _cuda_or_skip()
     if not _module_available():
         pytest.skip("installed FlashInfer lacks the Cake all-gather matmul module")
     if torch.cuda.get_device_capability(device) not in cake_comm.ARCHS:
         pytest.skip("Cake all-gather matmul is built for sm_100a / sm_103a")
     inp = torch.empty(256, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
-    w = torch.empty(cake_comm.AG_K, cake_comm.AG_N, device=device, dtype=torch.bfloat16)
+    w = torch.empty(cake_comm.AG_K, 2048, device=device, dtype=torch.bfloat16)
+    # The engine's [N, K] parameter through its transposed view (no copy).
+    w_param = torch.empty(1280, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
     assert cake_comm.supports_all_gather_matmul(inp, w, world_size=8)
+    assert cake_comm.supports_all_gather_matmul(inp, w_param.t(), world_size=8)
     assert cake_comm.supports_all_gather_matmul(inp.half(), w.half(), world_size=2)
+    # Any row count (tail rows are masked in the kernel); any N % 256 == 0.
+    assert cake_comm.supports_all_gather_matmul(inp[:125], w_param.t(), world_size=8)
+    assert cake_comm.supports_all_gather_matmul(inp[:1], w, world_size=4)
+    for n in (256, 1280, 2560, 7168, 14336):
+        wide = torch.empty(n, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
+        assert cake_comm.supports_all_gather_matmul(inp, wide.t(), world_size=8)
     assert not cake_comm.supports_all_gather_matmul(inp, w, world_size=3)
     assert not cake_comm.supports_all_gather_matmul(inp, w, world_size=16)
-    assert not cake_comm.supports_all_gather_matmul(inp[:100], w, world_size=8)
+    assert not cake_comm.supports_all_gather_matmul(inp[:0], w, world_size=8)
     assert not cake_comm.supports_all_gather_matmul(inp, w[:, :1024], world_size=8)
+    assert not cake_comm.supports_all_gather_matmul(inp, w[:, :1000], world_size=8)
+    assert not cake_comm.supports_all_gather_matmul(inp, w[:4096], world_size=8)
+    assert not cake_comm.supports_all_gather_matmul(
+        inp, w_param.t()[:, :1024], world_size=8  # strided view, not a layout
+    )
+    assert not cake_comm.supports_all_gather_matmul(
+        inp.t().contiguous().t(), w, world_size=8  # strided input
+    )
     assert not cake_comm.supports_all_gather_matmul(
         inp.float(), w.float(), world_size=8
     )
     assert not cake_comm.supports_all_gather_matmul(inp, w.half(), world_size=8)
     assert not cake_comm.supports_all_gather_matmul(inp.cpu(), w.cpu(), world_size=8)
 
-    w_tp8 = torch.empty(cake_comm.AG_K, 1280, device=device, dtype=torch.bfloat16)
-    w_tp4 = torch.empty(cake_comm.AG_K, 2560, device=device, dtype=torch.bfloat16)
-    assert cake_comm.supports_prepare_all_gather_matmul(inp, w_tp8, world_size=8)
-    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w_tp8, world_size=4)
-    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w, world_size=8)
-    assert not cake_comm.supports_prepare_all_gather_matmul(
-        inp.half(), w_tp8.half(), world_size=8
+    # The prepared launcher admits the same operands plus a capacity >= rows.
+    assert cake_comm.supports_prepare_all_gather_matmul(inp, w_param.t(), world_size=8)
+    assert cake_comm.supports_prepare_all_gather_matmul(
+        inp, w_param.t(), world_size=8, max_rows=2048
     )
-    expect_tp4 = torch.cuda.get_device_capability(device) == cake_comm.SM103
-    assert (
-        cake_comm.supports_prepare_all_gather_matmul(inp, w_tp4, world_size=4)
-        is expect_tp4
+    assert cake_comm.supports_prepare_all_gather_matmul(
+        inp[:125].half(), w_param.t().half(), world_size=4, max_rows=125
+    )
+    assert not cake_comm.supports_prepare_all_gather_matmul(
+        inp, w_param.t(), world_size=8, max_rows=255
+    )
+    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w, world_size=3)
+    assert not cake_comm.supports_prepare_all_gather_matmul(
+        inp, w[:, :1000], world_size=8
     )
 
     monkeypatch.setattr(cake_comm, "flashinfer_module_available", lambda *a: False)
     assert not cake_comm.supports_all_gather_matmul(inp, w, world_size=8)
-    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w_tp8, world_size=8)
+    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w_param.t(), world_size=8)
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +164,19 @@ def _reference(inp: torch.Tensor, w: torch.Tensor, group: dist.ProcessGroup):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_all_gather_matmul_matches_nccl_reference(dtype):
+@pytest.mark.parametrize("rows", [256, 125])
+def test_all_gather_matmul_matches_nccl_reference(dtype, rows):
     device, group = _multi_rank_setup(cake_comm.AG_WORLD_SIZES)
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
     torch.manual_seed(1000 + rank)
-    inp = torch.randn(256, cake_comm.AG_K, device=device, dtype=dtype)
+    inp = torch.randn(rows, cake_comm.AG_K, device=device, dtype=dtype)
     torch.manual_seed(7)  # replicated weight
-    w = torch.randn(cake_comm.AG_K, cake_comm.AG_N, device=device, dtype=dtype) * 0.02
+    w = torch.randn(cake_comm.AG_K, 2048, device=device, dtype=dtype) * 0.02
     assert cake_comm.supports_all_gather_matmul(inp, w, world_size=world)
     out = cake_all_gather_matmul(inp, w, group)
     torch.cuda.synchronize()
-    assert tuple(out.shape) == (world * 256, cake_comm.AG_N)
+    assert tuple(out.shape) == (world * rows, 2048)
     assert out.dtype == dtype
     # FP32 accumulation, one 16-bit rounding of the output.
     torch.testing.assert_close(
@@ -162,33 +185,50 @@ def test_all_gather_matmul_matches_nccl_reference(dtype):
     dist.barrier(group=group)
 
 
-def test_prepared_packed_qkv_launcher_matches_nccl_reference():
+def test_all_gather_matmul_consumes_the_engine_parameter_view():
+    """The [N, K] parameter's ``.t()`` view is a supported weight layout."""
+    device, group = _multi_rank_setup(cake_comm.AG_WORLD_SIZES)
+    rank = dist.get_rank(group)
+    world = dist.get_world_size(group)
+    torch.manual_seed(3000 + rank)
+    inp = torch.randn(1025, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
+    torch.manual_seed(13)
+    param = torch.randn(2048, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+    assert cake_comm.supports_all_gather_matmul(inp, param.t(), world_size=world)
+    out = cake_all_gather_matmul(inp, param.t(), group)
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (world * 1025, 2048)
+    torch.testing.assert_close(
+        out.float(), _reference(inp, param.t(), group), atol=1e-2, rtol=1e-2
+    )
+    dist.barrier(group=group)
+
+
+def test_prepared_launcher_serves_every_row_count_up_to_its_capacity():
+    """Llama-3.1-70B column-parallel widths of this TP degree, [N, K] parameters."""
     device, group = _multi_rank_setup((4, 8))
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
-    n = {8: 1280, 4: 2560}[world]
-    torch.manual_seed(2000 + rank)
-    inp = torch.randn(512, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
-    torch.manual_seed(11)
-    w = torch.randn(cake_comm.AG_K, n, device=device, dtype=torch.bfloat16) * 0.02
-    if not cake_comm.supports_prepare_all_gather_matmul(inp, w, world_size=world):
-        pytest.skip(
-            f"packed-QKV route (world_size={world}, N={n}) not built for this GPU"
+    for n in {8: (1280, 7168), 4: (2560, 14336)}[world]:
+        torch.manual_seed(2000 + rank)
+        sample = torch.randn(512, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
+        torch.manual_seed(11)
+        param = torch.randn(n, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+        assert cake_comm.supports_prepare_all_gather_matmul(
+            sample, param.t(), world_size=world, max_rows=2048
         )
-    launcher = cake_prepare_all_gather_matmul(inp, w, group)
-    out = launcher(inp)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        out.float(), _reference(inp, w, group), atol=1e-2, rtol=1e-2
-    )
-    # Replay with new input contents, same binding.
-    inp2 = torch.randn_like(inp)
-    out2 = launcher(inp2)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        out2.float(), _reference(inp2, w, group), atol=1e-2, rtol=1e-2
-    )
-    dist.barrier(group=group)
+        launcher = cake_prepare_all_gather_matmul(sample, param.t(), group, max_rows=2048)
+        for rows in (512, 125, 1025, 2048):
+            inp = torch.randn(rows, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
+            out = launcher(inp)
+            torch.cuda.synchronize()
+            assert tuple(out.shape) == (world * rows, n)
+            torch.testing.assert_close(
+                out.float(), _reference(inp, param.t(), group), atol=1e-2, rtol=1e-2
+            )
+        with pytest.raises(ValueError):
+            launcher(torch.randn(2049, cake_comm.AG_K, device=device, dtype=torch.bfloat16))
+        dist.barrier(group=group)
 
 
 if __name__ == "__main__":

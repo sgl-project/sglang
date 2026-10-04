@@ -218,29 +218,28 @@ def sp_fused_matmul_eligible(linear) -> bool:
 # --- Cake all-gather + matmul route (SGLANG_CAKE_ROUTES=sp_all_gather_matmul) --
 # ``column_parallel_g_matmul`` is the engine's all-gather + GEMM site. With the
 # route selected, an unquantized bias-free BF16/FP16 participant whose shard
-# the adapter admits (local rows % 128 == 0, K = 8192; prepared packed-QKV
-# launcher for (world_size, N) in {(8, 1280), (4, 2560)} or the functional
-# kernel for N = 2048) runs FlashInfer's Cake kernel
-# (``communication.prepare_all_gather_matmul`` / ``communication.
-# all_gather_matmul``). Everything else keeps the stock path above unchanged.
+# the adapter admits (K = 8192, any local row count, N % 256 == 0: Llama-3.1-70B
+# qkv N = 1280 and gate_up N = 7168 at TP8, N = 2560 / 14336 at TP4) runs
+# FlashInfer's Cake kernel through one capacity-bound prepared launcher per
+# participant (``communication.prepare_all_gather_matmul`` with ``max_rows``;
+# the functional ``communication.all_gather_matmul`` is the fallback when the
+# launcher cannot be prepared). Everything else keeps the stock path unchanged.
 #
-# FlashInfer contract constraints: the weight must be K-major ``[K, N]``
-# contiguous while the engine stores ``[N, K]``, so one transposed copy per
-# participant is prepared on first eager use and cached on the weight storage
-# version; the prepared launcher binds the row count, so launchers are cached
-# per (participant, rows) and bounded. SP is prefill-only, so nothing here runs
+# The kernel consumes the engine's ``[N, K]`` parameter through its ``weight.t()``
+# view (a supported weight layout; no transposed copy) and pads the row count
+# inside the kernel, so the launcher is prepared once per participant for the
+# engine's prefill chunk cap spread over the TP ranks and re-prepared only when
+# a larger shard arrives (every rank sees the same shard rows) or the parameter
+# storage changes (weight reload). SP is prefill-only, so nothing here runs
 # inside CUDA-graph capture; the guard below keeps that invariant explicit.
 
 CAKE_ROUTE_SP_ALL_GATHER_MATMUL = "sp_all_gather_matmul"
 _CAKE_LOG_PREFIX = "[cake-route]"
-_CAKE_SP_MAX_LAUNCHERS_PER_WEIGHT = 8
 
 _cake_sp_logged: set[tuple[str, str]] = set()
 _cake_sp_rejected: set[tuple] = set()
-# id(linear) -> (weight storage key, K-major weight copy)
-_cake_sp_weights: dict[int, tuple[tuple, torch.Tensor]] = {}
-# (id(linear), rows, dtype, world_size) -> prepared launcher
-_cake_sp_launchers: dict[tuple, Callable[[torch.Tensor], torch.Tensor]] = {}
+# id(linear) -> (weight storage key, capacity rows, prepared launcher)
+_cake_sp_launchers: dict[int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]] = {}
 
 
 def _cake_sp_reason_kind(detail: str) -> str:
@@ -273,7 +272,6 @@ def _log_cake_sp_once(event: str, detail: str) -> None:
 def reset_cake_sp_state_for_tests() -> None:
     _cake_sp_logged.clear()
     _cake_sp_rejected.clear()
-    _cake_sp_weights.clear()
     _cake_sp_launchers.clear()
 
 
@@ -311,23 +309,65 @@ def cake_sp_eligible(linear, bias) -> bool:
 
 
 def _cake_sp_weight(linear) -> torch.Tensor:
-    """K-major ``[K, N]`` contiguous copy of ``linear.weight`` (FI contract).
+    """The engine's ``[N, K]`` parameter as the ``[K, N]`` view the Cake kernel
+    consumes in place (the same operand the stock symm-mem path passes)."""
+    return linear.weight.detach().t()
 
-    Forced by the FlashInfer contract (the stock symm-mem path passes the
-    ``weight.t()`` view; Cake needs contiguous K-major storage). Re-prepared
-    when the parameter storage or its in-place version changes (weight
-    reload), which also drops the launchers prepared on the old copy.
-    """
+
+def _cake_sp_weight_key(linear) -> tuple:
     weight = linear.weight
-    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
-    entry = _cake_sp_weights.get(id(linear))
-    if entry is None or entry[0] != key:
-        w_kn = weight.detach().t().contiguous()
-        _cake_sp_weights[id(linear)] = (key, w_kn)
-        for launcher_key in [k for k in _cake_sp_launchers if k[0] == id(linear)]:
-            del _cake_sp_launchers[launcher_key]
-        return w_kn
-    return entry[1]
+    return (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+
+
+def _cake_sp_capacity_rows(rows: int, world_size: int) -> int:
+    """Rows per rank the prepared launcher is sized for.
+
+    The engine's prefill chunk cap (``chunked_prefill_size``, else
+    ``max_prefill_tokens``) spread over the TP ranks the way ``sp_entry_scatter``
+    shards it, and at least the shard at hand; without a resolved schedule the
+    shard at hand is the capacity and the launcher grows on demand.
+    """
+    cap = 0
+    try:
+        from sglang.srt.runtime_context import get_schedule
+
+        schedule = get_schedule()
+        chunked = int(getattr(schedule, "chunked_prefill_size", 0) or 0)
+        cap = chunked if chunked > 0 else int(getattr(schedule, "max_prefill_tokens", 0) or 0)
+    except Exception:  # no schedule bag published (unit tests, offline tools)
+        cap = 0
+    per_rank = ceil_align(cap, world_size) // world_size if cap > 0 else 0
+    return max(int(rows), per_rank)
+
+
+def _cake_sp_launcher(
+    linear, input_parallel: torch.Tensor, group, *, world_size: int, detail: str
+) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+    """The participant's prepared launcher sized for this shard, or ``None``."""
+    _supports_ag, supports_prepare, _ag_matmul, prepare = _cake_sp_kernels()
+    rows = int(input_parallel.shape[0])
+    weight_key = _cake_sp_weight_key(linear)
+    entry = _cake_sp_launchers.get(id(linear))
+    if entry is not None and entry[0] != weight_key:
+        # Weight reload: the bound storage changed, re-prepare on the new one.
+        del _cake_sp_launchers[id(linear)]
+        entry = None
+    if entry is not None and rows <= entry[1]:
+        return entry[2]
+    capacity = _cake_sp_capacity_rows(rows, world_size)
+    if entry is not None:
+        capacity = max(capacity, entry[1])
+    w = _cake_sp_weight(linear)
+    if not supports_prepare(input_parallel, w, world_size=world_size, max_rows=capacity):
+        return None
+    try:
+        launcher = prepare(input_parallel, w, group, max_rows=capacity)
+    except NotImplementedError as error:  # FlashInfer host refusal
+        _cake_sp_rejected.add((id(linear), rows, input_parallel.dtype, world_size))
+        _log_cake_sp_once("fallback", f"FlashInfer refused to prepare ({error}): {detail}")
+        return None
+    _cake_sp_launchers[id(linear)] = (weight_key, capacity, launcher)
+    return launcher
 
 
 def cake_column_parallel_g_matmul(
@@ -353,32 +393,21 @@ def cake_column_parallel_g_matmul(
     key = (id(linear), int(input_parallel.shape[0]), input_parallel.dtype, world_size)
     if key in _cake_sp_rejected:
         return None
-    supports_ag, supports_prepare, ag_matmul, prepare = _cake_sp_kernels()
-    w_kn = _cake_sp_weight(linear)
+    supports_ag, _supports_prepare, ag_matmul, _prepare = _cake_sp_kernels()
     group = tp_group.device_group
-    if supports_prepare(input_parallel, w_kn, world_size=world_size):
-        launcher = _cake_sp_launchers.get(key)
-        if launcher is None:
-            prepared_here = sum(1 for k in _cake_sp_launchers if k[0] == id(linear))
-            if prepared_here < _CAKE_SP_MAX_LAUNCHERS_PER_WEIGHT:
-                try:
-                    launcher = prepare(input_parallel, w_kn, group)
-                except NotImplementedError as error:  # FlashInfer host refusal
-                    _cake_sp_rejected.add(key)
-                    _log_cake_sp_once(
-                        "fallback", f"FlashInfer refused to prepare ({error}): {detail}"
-                    )
-                    return None
-                _cake_sp_launchers[key] = launcher
-        if launcher is not None:
-            output = launcher(input_parallel)
-            _log_cake_sp_once(
-                "taken-prepared", f"prepared packed-QKV launcher: {detail}"
-            )
-            return output
-    if supports_ag(input_parallel, w_kn, world_size=world_size):
+    launcher = _cake_sp_launcher(
+        linear, input_parallel, group, world_size=world_size, detail=detail
+    )
+    if launcher is not None:
+        output = launcher(input_parallel)
+        _log_cake_sp_once("taken-prepared", f"prepared launcher: {detail}")
+        return output
+    if key in _cake_sp_rejected:
+        return None
+    w = _cake_sp_weight(linear)
+    if supports_ag(input_parallel, w, world_size=world_size):
         try:
-            output = ag_matmul(input_parallel, w_kn, group)
+            output = ag_matmul(input_parallel, w, group)
         except NotImplementedError as error:  # FlashInfer host refusal
             _cake_sp_rejected.add(key)
             _log_cake_sp_once("fallback", f"FlashInfer refused ({error}): {detail}")

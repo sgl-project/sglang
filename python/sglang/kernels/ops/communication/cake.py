@@ -62,22 +62,23 @@ _register(
     _TP + "all_gather_matmul",
     dtypes=("bfloat16", "float16"),
     signature=(
-        "inp [M,8192] (M%128==0), w [8192,2048] -> out [M*world_size,2048]; "
-        "NCCL group, world_size in {2,4,8}, NVSHMEM symmetric memory"
+        "inp [M,8192] (any M), w [8192,N] (N%256==0; contiguous or weight.t() "
+        "of a contiguous [N,8192]) -> out [M*world_size,N]; NCCL group, "
+        "world_size in {2,4,8}, NVSHMEM symmetric memory"
     ),
     description="Cake push-wait all-gather matmul distributed by FlashInfer.",
 )
 _register(
     "prepare_all_gather_matmul",
     _TP + "prepare_all_gather_matmul",
-    dtypes=("bfloat16",),
+    dtypes=("bfloat16", "float16"),
     signature=(
-        "packed-QKV launcher: (world_size,N) in {(8,1280) sm_100a/103a, "
-        "(4,2560) sm_103a}; returns callable(inp) -> out"
+        "capacity-bound launcher: binds w [8192,N], group and max_rows "
+        "(default inp rows); returns callable(inp [M<=max_rows,8192]) -> out"
     ),
     description=(
-        "Cake prepared BF16 packed-QKV all-gather matmul launcher distributed "
-        "by FlashInfer."
+        "Cake prepared all-gather matmul launcher distributed by FlashInfer "
+        "(one collective at prepare, any row count up to its capacity)."
     ),
 )
 
@@ -241,10 +242,13 @@ def cake_prepare_all_gather_matmul(
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    max_rows: Optional[int] = None,
     verbose: bool = False,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Explicit Cake entry point; callers gate on ``supports_prepare_all_gather_matmul``."""
-    return _k("prepare_all_gather_matmul")(inp, w, group, verbose=verbose)
+    return _k("prepare_all_gather_matmul")(
+        inp, w, group, max_rows=max_rows, verbose=verbose
+    )
 
 
 def cake_fused_norm_combine(
