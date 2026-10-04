@@ -670,6 +670,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if forward_batch.capture_hidden_mode > self.capture_hidden_mode:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1284,6 +1286,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise ValueError(
                 "Diffusion graph replay requires prepared input embeddings"
             )
+        # External planning callers must not overwrite EP Graph input buffers
+        # before the backend has ordered the preceding replay and its consumers.
+        require_session = getattr(self.backend, "require_replay_session", None)
+        if require_session is not None:
+            require_session()
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
