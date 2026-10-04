@@ -1,8 +1,10 @@
-"""Caller-owned, asynchronous nvCOMP decoding for direct weight deltas.
+"""Caller-owned nvCOMP decoding for direct weight deltas.
 
 Metadata, workspace and output allocations are prepared before pausing generation.
 The hot path calls the public C API directly: no nvCOMP Python array finalizers,
-implicit size discovery, host scalar reads or device-wide synchronization.
+implicit size discovery, host scalar reads or wrapper-added synchronization.
+The nvCOMP DE backend may wait for earlier work on the calling stream before
+submitting decompression, even though the public API is named Async.
 """
 
 from __future__ import annotations

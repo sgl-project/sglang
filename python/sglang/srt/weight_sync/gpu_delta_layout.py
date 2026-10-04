@@ -1121,13 +1121,24 @@ class PreparedDelta:
 
             host = self.backend.host_arena.tensor
             pointer_rows = []
+            tuned_batches, tune_bytes, tune_s, tune_cache_hits, tune_skipped = (
+                0,
+                0,
+                0.0,
+                0,
+                0,
+            )
             for _, _, groups, _ in static_plans:
                 for group in groups:
-                    pointer_rows.extend(
-                        self.decoded.data_ptr() + offset for offset in group.sources
+                    tuned, footprint, elapsed, reused, skipped = group.prepare(
+                        self.decoded, self.error
                     )
-                    pointer_rows.extend(group.targets)
-                    pointer_rows.extend(group.static_metadata)
+                    tuned_batches += tuned
+                    tune_bytes += footprint
+                    tune_s += elapsed
+                    tune_cache_hits += reused
+                    tune_skipped += skipped
+                    pointer_rows.extend(group.pointer_rows(self.decoded.data_ptr()))
             self.apply_host_metadata = torch.empty(
                 len(pointer_rows), dtype=torch.int64, pin_memory=True
             )
@@ -1144,9 +1155,8 @@ class PreparedDelta:
                 slot_offset = (index % self.h2d_stages) * self.encoded_slot_bytes
                 prepared_groups = []
                 for group in groups:
-                    count = 2 * len(group.sources) + len(group.static_metadata)
+                    count = 2 * len(group.sources)
                     pointers = self.apply_metadata[position : position + count]
-                    group.compile(pointers, self.error)
                     prepared_groups.append((group, pointers))
                     position += count
                 self.batches.append(
@@ -1193,18 +1203,31 @@ class PreparedDelta:
             self.ready.record(self.stream)
         self.timings.update(
             host_decoder_prepare_s=time.perf_counter() - decoder_started,
+            host_apply_tune_s=tune_s,
+            apply_tuned_batches=tuned_batches,
+            apply_tune_skipped_batches=tune_skipped,
+            apply_tune_bytes=tune_bytes,
+            apply_tune_cache_hits=tune_cache_hits,
             decoder_metadata_uploads=int(bool(plans)),
             decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frames)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
             apply_groups=sum(len(batch.groups) for batch in self.batches),
-            apply_persistent_ctas=sum(
+            apply_grid_ctas=sum(
                 group.grid[0] for batch in self.batches for group, _ in batch.groups
             ),
-            apply_descriptor_h2d_bytes=8
-            * sum(
-                len(group.static_metadata)
+            apply_descriptor_h2d_bytes=0,
+            apply_contracts=sum(
+                len(group.contracts)
                 for batch in self.batches
                 for group, _ in batch.groups
+            ),
+            apply_word32_contracts=sum(
+                group.word32_contracts
+                for batch in self.batches
+                for group, _ in batch.groups
+            ),
+            apply_static_groups=sum(
+                group.config[2] for batch in self.batches for group, _ in batch.groups
             ),
             transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
             compressed_batches=len(plans),

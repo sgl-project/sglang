@@ -91,21 +91,33 @@ Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
 
-Layer membership and normalized affine source/destination descriptors are cached
-for the current active tensor set. Fresh compressed lengths, frame lists and arena
+Layer membership and normalized affine source/destination views are cached for
+the current active tensor set. Fresh compressed lengths, frame lists and arena
 offsets are prepared for each update. Singleton and adjacent contiguous axes are
-collapsed without changing byte order. All affine tensor images in one layer
-share one persistent XOR launch, with no expert/dense name classification. A fixed
-grid of at most four CTAs per SM strides over the useful 4096-byte tiles. Each CTA
-retains its descriptor until a cumulative tile boundary is crossed; there is no
-expanded per-tile table or largest-tensor padding. Contiguous views use direct byte
-addresses. When an affine view's contiguous inner row is a whole number of tiles,
-only the scalar tile base needs stride arithmetic; other strided views map each
-byte. Irregular padded scales retain their explicit transform.
+collapsed without changing byte order. All affine images of a layer share one
+XOR launch. Its exact uniform contracts, counts and tile intervals are compile-time
+parameters, without model-name classification or a runtime geometry table. Only
+fresh source/destination pointers are uploaded. Proven four-byte alignment and
+row/tail geometry select uint32 XOR; other contracts use byte XOR in the same
+kernel. Contiguous inner tiles need only scalar base-address arithmetic. Irregular
+padded scales retain their explicit transform.
 
-CPU geometry/prefix metadata is cached. Fresh apply pointers and descriptors share
-one metadata upload before pause. Kernel compilation and module loading finish
-before `PREPARED`.
+Preparation loads the chosen module and queries CUDA's actual residency once per
+compiled kernel/device, before `PREPARED`. A small first-use search compares one
+CTA per 2048-byte tile with a static grid of at most four resident waves. It uses
+the complete batch's geometry/counts and disjoint synthetic source/target regions
+in unused decoded scratch, never live weights or the decoder. One warmup and three
+timed trials per candidate use events on the preparation stream. The sum of
+borrowed footprints is capped at 4 GiB per device; no additional weight-size
+allocation is made. Nonfitting batches or an exhausted budget use the measured
+naive policy. In the current full-model fixture the representative MoE and
+standalone batches do not fit this tuning scratch limit. Both measured and fixed
+choices are cached in-process by complete geometry, counts, proven alignment and
+device. Warm plan reuse performs no fitting check, occupancy query or tuning.
+Cold tuning can compete with serving for bandwidth and its cost is included in
+preparation. The winning launch is bound before pause; apply does no configuration
+selection, counter reset or dynamic work stealing.
+
 Bulk H2D starts only during paused apply. Ready/free events protect each
 encoded slot. Stage 2 retains the original next-batch schedule; larger rings
 queue further lookahead only after the current decoder and status check have been
@@ -237,16 +249,25 @@ worker durations must not be summed as wall time.
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
 `compressed_batches`, `compressed_h2d_spans` and `apply_groups` count layer
-decodes, bulk copies and affine XOR launches. `apply_persistent_ctas` counts the
-sum of fixed launch-grid sizes; `apply_descriptor_h2d_bytes` counts cached
-affine/prefix rows within the apply metadata slab. `encoded_buffers` records the
+decodes, bulk copies and affine XOR launches. `apply_contracts` separately counts
+the uniform compile-time contracts within those launches. `apply_grid_ctas`
+counts the sum of chosen grid sizes, including naive launches;
+`apply_descriptor_h2d_bytes` is zero because geometry is compiled into the kernel.
+`host_apply_tune_s`, `apply_tuned_batches` and `apply_tune_bytes` record cold tuning
+wall time, batch count and summed private scratch footprints (not allocations).
+`apply_tune_skipped_batches` counts newly cached fixed-policy decisions;
+`apply_tune_cache_hits` counts reused batch/config choices. `apply_word32_contracts`
+counts contracts using uint32 XOR; `apply_static_groups` counts static launches.
+`encoded_buffers` records the
 actual H2D ring stage count. `decoded_zero_ranges`/`decoded_zero_bytes`
 describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.
 With debug timing enabled, `paused_layer_h2d` measures copy-stream work and
 `paused_copy_wait` measures the apply stream waiting for ready data; these overlap
-with decode/apply and must not be added together.
+with decode/apply and must not be added together. The nvCOMP DE backend may wait
+for preceding calling-stream work inside its Async API, so host enqueue spans
+can include GPU backpressure; they are not CPU-only work measurements.
 
 `host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
 creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,
