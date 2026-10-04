@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -83,10 +84,17 @@ class TestDSABackendDPPadding(unittest.TestCase):
             )
 
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
+        self._check_trtllm_decode_padding(dcp_enabled=False)
+
+    def test_dcp_decode_restores_zero_output_and_negative_infinite_lse_padding(self):
+        self._check_trtllm_decode_padding(dcp_enabled=True)
+
+    def _check_trtllm_decode_padding(self, *, dcp_enabled):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
             max_seq_len_k=12,
+            dcp_cu_seqlens_q=torch.arange(3, dtype=torch.int32),
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
@@ -105,6 +113,12 @@ class TestDSABackendDPPadding(unittest.TestCase):
             _multi_ctas_kv_counter_buffer=None,
             device="cpu",
             num_q_heads=2,
+            num_dcp_q_heads=2,
+            dcp_enabled=dcp_enabled,
+            dcp_size=2,
+            dcp_rank=0,
+            dcp_head_groups=1,
+            get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
@@ -135,6 +149,15 @@ class TestDSABackendDPPadding(unittest.TestCase):
             captured.update(kwargs)
             return torch.ones((2, 1, 2, 2), dtype=torch.bfloat16)
 
+        def fake_dcp_attention(**kwargs):
+            captured.update(kwargs)
+            self.assertEqual(kwargs["block_tables"].shape[0], 2)
+            self.assertEqual(kwargs["seq_lens"].shape, (2,))
+            return (
+                torch.ones((2, 2, 2), dtype=torch.bfloat16),
+                torch.full((2, 2), 7.0),
+            )
+
         flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla = fake_decode
         flashinfer.decode = flashinfer_decode
 
@@ -164,6 +187,18 @@ class TestDSABackendDPPadding(unittest.TestCase):
                 "sglang.srt.layers.attention.dsa_backend.grow_multi_ctas_kv_counter_buffer_if_needed",
                 return_value=None,
             ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend._dcp_trtllm_sparse_attention",
+                side_effect=fake_dcp_attention,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.use_symmetric_memory",
+                side_effect=lambda _: nullcontext(),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_group=None),
+            ),
         ):
             output = DeepseekSparseAttnBackend._forward_trtllm(
                 backend,
@@ -178,7 +213,14 @@ class TestDSABackendDPPadding(unittest.TestCase):
             )
 
         self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
-        self.assertEqual(output.shape, (4, 1, 2, 2))
+        if dcp_enabled:
+            output, lse = output
+            self.assertEqual(output.shape, (4, 2, 2))
+            self.assertEqual(lse.shape, (4, 2))
+            self.assertTrue(torch.all(lse[:2] == 7))
+            self.assertTrue(torch.isneginf(lse[2:]).all())
+        else:
+            self.assertEqual(output.shape, (4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
 

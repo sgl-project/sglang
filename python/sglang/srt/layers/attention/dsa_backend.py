@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -46,6 +47,9 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -84,6 +88,8 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
+from sglang.srt.mem_cache.kv_cache_configurator import dsa_dcp_head_groups
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -103,6 +109,70 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _dcp_trtllm_sparse_attention(
+    *,
+    query: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lse: torch.Tensor,
+    head_groups: int,
+    cu_seqlens_q: torch.Tensor,
+    **attention_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use short-KV-safe head tiles and respect TRTLLM's 65535 batch limit.
+
+    FlashInfer 0.7.0.post1's sparse RoPE + return_lse path corrupts some
+    short-KV FP8 rows with >32 heads (observed at 1/63/64/65 active tokens).
+    This helper is limited to CUDA RoPE DSA DCP; <=32 heads use one group.
+    Remove the fold once upstream fixes that kernel condition. Counts vary
+    on device, so selecting short rows on the host would synchronize each
+    layer. Fold head groups into independent batch rows, with sparse metadata
+    already repeated by the ownership-remap kernel. Folding into query length
+    would instead change the vendor kernel's causal masking.
+    """
+    import flashinfer.decode
+
+    rows, _, heads, dim = query.shape
+    if rows == 0:
+        return torch.empty(
+            (0, heads, attention_kwargs["kv_lora_rank"]),
+            dtype=torch.bfloat16,
+            device=query.device,
+        ), lse
+    folded_rows = rows * head_groups
+    folded_heads = heads // head_groups
+    query = query.view(folded_rows, 1, folded_heads, dim)
+    folded_lse = lse.view(folded_rows, folded_heads)
+    rows_per_call = (65535 // head_groups) * head_groups
+    if folded_rows > rows_per_call:
+        # Each call reuses the same scratch and counter buffers. Keep chunk
+        # launches ordered instead of allowing programmatic overlap.
+        attention_kwargs["enable_pdl"] = False
+    outputs = []
+    for start in range(0, folded_rows, rows_per_call):
+        end = min(start + rows_per_call, folded_rows)
+        output, _ = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query[start:end],
+            block_tables=block_tables[start:end],
+            seq_lens=seq_lens[start:end],
+            return_lse=True,
+            lse=folded_lse[start:end],
+            **attention_kwargs,
+        )
+        output = output.view(end - start, folded_heads, -1)
+        # The fixup kernel also puts the batch in a 16-bit grid dimension.
+        fixup_zero_kv_rows(
+            output,
+            folded_lse[start:end],
+            seq_lens[start:end],
+            cu_seqlens_q[: end - start + 1],
+            1,
+        )
+        outputs.append(output)
+    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+    return output.view(rows, heads, -1), lse
 
 
 def prepare_kv_for_attention(
@@ -266,6 +336,8 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+    # Capture metadata must own the folded offsets even after eager arange growth.
+    dcp_cu_seqlens_q: Optional[torch.Tensor] = None
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -394,6 +466,17 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.dcp_size = (
+            get_parallel().attn_dcp_size
+            if _is_cuda
+            and self.qk_rope_head_dim > 0
+            and not model_runner.is_draft_worker
+            else 1
+        )
+        self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
+        self.dcp_enabled = self.dcp_size > 1
+        self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
+        self.dcp_head_groups = dsa_dcp_head_groups(self.num_dcp_q_heads)
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
@@ -404,7 +487,11 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        # Keep the replicated draft on MLA too: the shared MHA model path
+        # still assumes the process-wide DCP group implies sharded KV.
+        self.supports_mha_one_shot: bool = not (
+            _is_cuda and self.qk_rope_head_dim > 0 and get_parallel().dcp_enabled
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -592,10 +679,23 @@ class DeepseekSparseAttnBackend(
         elif _is_cuda and (
             self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
         ):
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                dsa_dcp_max_query_rows,
+                dsa_dcp_workspace_size_bytes,
+            )
+
+            workspace_bytes = dsa_dcp_workspace_size_bytes(
+                num_q_heads=self.num_q_heads,
+                dcp_size=self.dcp_size,
+                max_query_rows=dsa_dcp_max_query_rows(
+                    model_runner.model_config,
+                    max_running_requests=model_runner.max_running_requests,
+                ),
+            )
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    workspace_bytes,
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -603,7 +703,7 @@ class DeepseekSparseAttnBackend(
             self._multi_ctas_kv_counter_buffer = (
                 make_persistent_multi_ctas_kv_counter_buffer(
                     torch.device(self.device),
-                    self.num_q_heads,
+                    self.num_dcp_q_heads,
                     max_batch_size=model_runner.max_running_requests,
                 )
             )
@@ -1181,6 +1281,13 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
+            dcp_cu_seqlens_q=(
+                self.get_device_int32_arange(
+                    len(dsa_cache_seqlens_int32) * self.dcp_head_groups + 1
+                )
+                if self.dcp_enabled
+                else None
+            ),
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
@@ -1377,7 +1484,7 @@ class DeepseekSparseAttnBackend(
         counter = grow_multi_ctas_kv_counter_buffer_if_needed(
             buffer=self._multi_ctas_kv_counter_buffer,
             device=torch.device(self.device),
-            num_q_heads=self.num_q_heads,
+            num_q_heads=self.num_dcp_q_heads,
             batch_size=num_query_rows,
         )
         # Capacity is set before capture, so a grow here is a broken invariant.
@@ -1395,7 +1502,7 @@ class DeepseekSparseAttnBackend(
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 buffer=self._multi_ctas_kv_counter_buffer,
                 device=torch.device(self.device),
-                num_q_heads=self.num_q_heads,
+                num_q_heads=self.num_dcp_q_heads,
                 batch_size=num_query_rows,
             )
         )
@@ -1560,6 +1667,13 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
+            dcp_cu_seqlens_q=(
+                self.get_device_int32_arange(
+                    len(dsa_cache_seqlens_int32) * self.dcp_head_groups + 1
+                )
+                if self.dcp_enabled
+                else None
+            ),
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
@@ -3530,6 +3644,16 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
+        if self.dcp_enabled:
+            # Both top-k producers above emit global KV slots. Localize only
+            # here so fused top-k never gets interpreted as sequence positions.
+            page_table_1, seq_lens = remap_dcp_sparse_indices(
+                page_table_1,
+                self.dcp_size,
+                self.dcp_rank,
+                return_counts=True,
+                repeat_rows=self.dcp_head_groups,
+            )
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
@@ -3542,8 +3666,7 @@ class DeepseekSparseAttnBackend(
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
 
-        batch_size = page_table_1.shape[0]
-        _, num_heads, head_dim = q_all.shape
+        batch_size, num_heads, head_dim = q_all.shape
 
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
@@ -3552,15 +3675,19 @@ class DeepseekSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
+        lse_buffer = None
+        if self.dcp_enabled:
+            with use_symmetric_memory(get_parallel().dcp_group):
+                lse_buffer = torch.empty(
+                    (batch_size, num_heads), dtype=torch.float32, device=q.device
+                )
+
+        attention_kwargs = dict(
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=sparse_mla_top_k,
             bmm1_scale=bmm1_scale,
@@ -3570,6 +3697,33 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
+        if self.dcp_enabled:
+            out, lse = _dcp_trtllm_sparse_attention(
+                query=q,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                lse=lse_buffer,
+                head_groups=self.dcp_head_groups,
+                cu_seqlens_q=metadata.dcp_cu_seqlens_q,
+                **attention_kwargs,
+            )
+            if num_decode_padding_rows:
+                lse = torch.cat(
+                    [
+                        lse,
+                        lse.new_full((num_decode_padding_rows, num_heads), -torch.inf),
+                    ]
+                )
+            return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows), lse
+
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            return_lse=False,
+            lse=None,
+            **attention_kwargs,
+        )
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(

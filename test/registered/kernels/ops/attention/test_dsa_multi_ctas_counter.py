@@ -36,6 +36,7 @@ def _make_backend(*, allocate_counter: bool = True):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = "cuda"
     backend.num_q_heads = _NUM_Q_HEADS
+    backend.num_dcp_q_heads = _NUM_Q_HEADS
     backend.real_page_size = 64
     backend.hisparse_coordinator = None
     backend.speculative_num_draft_tokens = _NUM_DRAFT_TOKENS
@@ -74,6 +75,20 @@ def _would_grow(backend, rows: int) -> bool:
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
 class TestMultiCtasKvCounterLifetime(CustomTestCase):
+    def test_dcp_capture_sizes_counter_for_gathered_heads(self):
+        """DCP gathers heads before attention; the counter must cover them."""
+        for dcp_size in (2, 4):
+            with self.subTest(dcp_size=dcp_size):
+                backend = _make_backend()
+                backend.num_dcp_q_heads = backend.num_q_heads * dcp_size
+                backend._ensure_multi_ctas_kv_counter_capacity(8192)
+                counter = backend._multi_ctas_kv_counter_buffer
+                required = make_persistent_multi_ctas_kv_counter_buffer(
+                    torch.device("cuda"), backend.num_dcp_q_heads, 8192
+                )
+                self.assertGreaterEqual(counter.numel(), required.numel())
+                self.assertIs(backend._multi_ctas_kv_counter_for(8192), counter)
+
     def test_request_sized_counter_would_grow_at_capture(self):
         """The premise: sizing by requests undercounts captured query rows."""
         self.assertGreater(_NUM_CAPTURED_ROWS, TRTLLM_MLA_MAX_BATCH_SIZE)
