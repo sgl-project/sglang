@@ -697,10 +697,13 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
 }
 
 #[test]
-fn next_swa_uuid_counts_up_from_two() {
+fn next_component_uuid_counts_up_independently() {
     let mut tc = core();
-    assert_eq!(tc.next_swa_uuid_(), 2);
-    assert_eq!(tc.next_swa_uuid_(), 3);
+    assert_eq!(tc.next_component_uuid_(SWA), 100_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(SWA), 100_000_000_000_002);
+    assert_eq!(tc.next_component_uuid_(FULL), 200_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(MAMBA), 300_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(FULL), 200_000_000_000_002);
 }
 
 #[test]
