@@ -121,22 +121,16 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         # The shape knob must not disturb spec-off.
         self.assertTrue(_accepts(None, topk=None))
 
-    def test_draft_backend_is_audited_too(self):
-        """The draft worker runs its OWN forward on its OWN backend, resolved
-        from `--speculative-draft-attention-backend` before it falls back to
-        inheriting the target's. Checking only the target therefore leaves an
-        unaudited backend reachable: every target arm can be audited while the
-        draft translates nothing. Unset must still inherit and pass."""
-        self.assertTrue(_accepts("DSPARK", draft_backend=None))
-        for draft_backend in self.AUDITED_BACKENDS:
+    def test_dspark_draft_backend_is_not_constrained(self):
+        """DSPARK's draft owns a KV pool indexed directly by virtual id, so
+        its translator is a passthrough and any draft backend reads correctly.
+        Model hooks declare one on the operator's behalf -- Kimi-Linear /
+        Kimi-K3 + DSPARK on SM100 declares `trtllm_mha` -- so refusing it
+        would refuse a configuration the operator never touched."""
+        for draft_backend in (None, *self.AUDITED_BACKENDS, "fa4", "trtllm_mha"):
             self.assertTrue(
                 _accepts("DSPARK", draft_backend=draft_backend),
-                f"audited draft backend {draft_backend} should pass",
-            )
-        for draft_backend in ("fa4", "trtllm_mha", "torch_native"):
-            self.assertFalse(
-                _accepts("DSPARK", draft_backend=draft_backend),
-                f"unaudited draft backend {draft_backend} must be refused",
+                f"DSPARK draft backend {draft_backend} should pass",
             )
 
     def test_spec_off_admitted(self):

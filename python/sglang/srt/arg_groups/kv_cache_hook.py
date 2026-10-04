@@ -490,13 +490,11 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 
 
 def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
-    """Refuse spec backends whose verify id rails are not translation-audited.
+    """Refuse target backends whose verify id rails are not translation-audited.
 
-    Checks the target's prefill/decode pair AND the draft worker's own
-    backend: the latter resolves from `--speculative-draft-attention-backend`
-    before inheriting the target's, so it can be unaudited on its own."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
-
+    Only the target's prefill/decode pair is checked. A draft with a KV pool
+    of its own indexes that pool directly by virtual id, so its translator is
+    a passthrough and its backend has nothing to translate."""
     allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
@@ -505,14 +503,7 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
         f"attention backends {sorted(allowed)} for both prefill "
         f"and decode; got {sorted(backends)}. Other backends do "
         "not translate speculative verify indices to the unified "
-        "pool's kernel-facing space yet."
-    )
-    draft_backend = resolving_view(server_args).speculative_draft_attention_backend
-    assert draft_backend is None or draft_backend in allowed, (
-        f"--enable-unified-memory + {algorithm} requires the draft worker on a "
-        f"spec-verify-audited backend {sorted(allowed)}; got "
-        f"--speculative-draft-attention-backend={draft_backend!r}. Leave it "
-        "unset to inherit the target's."
+        "pool's physical ids yet."
     )
 
 
