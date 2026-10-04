@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -358,6 +359,41 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _split_host_resident_files(
+    files: List[str], patterns: Optional[Tuple[str, ...]]
+) -> Tuple[List[str], List[str]]:
+    """Split safetensors files into (device, host) groups, keeping their order.
+
+    A file goes to the host group when any tensor name in its header contains
+    one of ``patterns``. Only headers are read.
+    """
+    if not patterns:
+        return list(files), []
+    from safetensors.torch import safe_open
+
+    device_files, host_files = [], []
+    for path in files:
+        host = False
+        # Other files stay in the device group; InstantTensor rejects them.
+        if path.endswith(".safetensors"):
+            with safe_open(path, framework="pt") as f:
+                host = any(p in name for name in f.keys() for p in patterns)
+        (host_files if host else device_files).append(path)
+    return device_files, host_files
+
+
+def _to_device_unless_host_resident(
+    weights: Iterable[Tuple[str, torch.Tensor]], patterns: Tuple[str, ...]
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Move tensors that are not host-resident to the current device, where
+    InstantTensor puts every other tensor, so tensors that are combined
+    during loading share a device."""
+    for name, tensor in weights:
+        if not any(p in name for p in patterns):
+            tensor = tensor.to(current_platform.get_device(torch.cuda.current_device()))
+        yield name, tensor
+
+
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
@@ -418,6 +454,12 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        host_resident_weight_patterns: Optional[Tuple[str, ...]] = None
+        """Substrings of checkpoint tensor names the model keeps in host memory.
+
+        Device-direct loaders (InstantTensor) load the files containing them
+        through the CPU safetensors path instead."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -429,6 +471,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                host_resident_weight_patterns=getattr(
+                    model, "host_resident_weight_patterns", None
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -640,11 +685,35 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
-            weights_iterator = instanttensor_weights_iterator(
-                hf_weights_files,
-                extra_config=extra_config,
-                load_group=self.load_config.load_group,
+            device_files, host_files = _split_host_resident_files(
+                hf_weights_files, source.host_resident_weight_patterns
             )
+            weights_iterator = (
+                instanttensor_weights_iterator(
+                    device_files,
+                    extra_config=extra_config,
+                    load_group=self.load_config.load_group,
+                )
+                if device_files
+                else iter(())
+            )
+            if host_files:
+                logger.info(
+                    "Loading %d checkpoint file(s) with host-resident weights "
+                    "through the safetensors path.",
+                    len(host_files),
+                )
+                host_weights = buffered_multi_thread_safetensors_weights_iterator(
+                    host_files,
+                    max_workers=self.DEFAULT_NUM_THREADS,
+                    disable_mmap=get_model().weight_loader_disable_mmap,
+                )
+                weights_iterator = itertools.chain(
+                    weights_iterator,
+                    _to_device_unless_host_resident(
+                        host_weights, source.host_resident_weight_patterns
+                    ),
+                )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints

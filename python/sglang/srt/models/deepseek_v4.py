@@ -4413,6 +4413,13 @@ class DeepseekV4Model(nn.Module):
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
+    @property
+    def host_resident_weight_patterns(self) -> Optional[Tuple[str, ...]]:
+        """Checkpoint names of the Engram tables kept in host memory."""
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+            return (".engram.embed.",)
+        return None
+
     def __init__(
         self,
         config: DeepSeekV4Config,
