@@ -521,8 +521,13 @@ class TestSharedHostSnapshot(unittest.TestCase):
             metadata(),
         )
         original_inode = first.index["shared"]["identity"]
-        self.assertGreaterEqual(
-            first.index["shared"]["capacity"], 2 * first.index["arena_bytes"]
+        self.assertEqual(
+            first.index["shared"]["capacity"],
+            (first.index["arena_bytes"] + 1023) // 1024 * 1024,
+        )
+        self.assertEqual(
+            first.index["encoded"]["capacity"],
+            (manifest["files"][0]["nbytes"] + 1023) // 1024 * 1024,
         )
         first.mark_reusable()  # Oracle substitutes the production engine proof.
         first.close()
@@ -568,8 +573,13 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.assertNotEqual(third.index["shared"]["identity"], original_inode)
         self.assertEqual(third.index["shared"]["generation"], 2)
         self.assertEqual(growth["host_shared_allocation_calls"], 1)
-        self.assertGreaterEqual(
-            third.index["shared"]["capacity"], 2 * third.index["arena_bytes"]
+        self.assertEqual(
+            third.index["shared"]["capacity"],
+            (2 * third.index["arena_bytes"] + 1023) // 1024 * 1024,
+        )
+        self.assertEqual(
+            third.index["encoded"]["capacity"],
+            (2 * len(payload) + 1023) // 1024 * 1024,
         )
         self.assertEqual(original_inode[-1], before_capacity)
         self.assertLessEqual(

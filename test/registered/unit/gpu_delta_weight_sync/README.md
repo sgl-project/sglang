@@ -158,8 +158,9 @@ check passes. Hash and decode are both joined on failure before ownership is
 dropped; unverified bytes never become available for GPU use.
 
 Each backend retains its MAP_SHARED mapping and CUDA registration across updates.
-Cold and growth allocations reserve twice the needed decoded/encoded extent,
-rounded to 64 MiB. A fitting later publication reuses both allocations and each
+The first decoded/encoded allocations reserve the required extent, rounded to
+64 MiB. A later capacity increase reserves twice the newly required extent with
+the same rounding. A fitting later publication reuses both allocations and each
 rank's existing registration. Growth allocates a new inode;
 registered inodes are never resized. Each rank maps/registers the same shared
 physical pages through its own VA; there is no full per-rank Snappy copy. CUDA

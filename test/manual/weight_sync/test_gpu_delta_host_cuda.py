@@ -252,6 +252,17 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
         )
         for record in records:
             a, b, c = record["updates"]
+            alignment = 1 << 20
+            for row, multiplier in ((a, 1), (c, 2)):
+                assert row["metrics"]["host_shared_capacity_bytes"] == (
+                    (
+                        multiplier * row["metrics"]["host_shared_arena_bytes"]
+                        + alignment
+                        - 1
+                    )
+                    // alignment
+                    * alignment
+                )
             assert a["arena_identity"] == b["arena_identity"] != c["arena_identity"]
             assert a["mapping_pointer"] == b["mapping_pointer"] != c["mapping_pointer"]
             assert [
