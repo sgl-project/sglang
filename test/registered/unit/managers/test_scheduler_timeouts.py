@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -68,6 +69,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
+    s.dllm_config = None
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -133,6 +135,24 @@ class TestWaitingTimeout(CustomTestCase):
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):
             self.assertEqual(s._poll_timeout_aborts(), [])
+
+    def test_dllm_waiting_timeout_after_queue_transfer(self):
+        now = time.perf_counter()
+        stale = _req("stale", wait_entry=now - 10)
+        denoising = _req("denoising", wait_entry=now - 10, forward_entry=now - 5)
+        s = _scheduler([stale, denoising])
+        s.dllm_config = SimpleNamespace(max_running_requests=2)
+        s.dllm_manager = DllmManager(s.dllm_config)
+
+        s._fetch_waiting_reqs()
+        self.assertEqual(s.waiting_queue, [])
+        self.assertEqual(s.dllm_manager.waiting_queue, [stale, denoising])
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+        self.assertEqual(s.dllm_manager.waiting_queue, [stale, denoising])
 
 
 class TestRunningTimeout(CustomTestCase):
