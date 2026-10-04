@@ -160,12 +160,10 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
-# CUDA graph persistence (--cuda-graph-persistence). Foundry builds a torch
-# extension against the installed torch: install with --no-build-isolation.
-# A direct reference blocks uploading sglang to PyPI; it becomes a version
-# pin once Foundry publishes wheels.
+# CUDA graph persistence (--cuda-graph-persistence). foundry-core (import name
+# foundry) 0.1.0 is being published from https://github.com/foundry-org/foundry.
 foundry = [
-  "foundry @ git+https://github.com/foundry-org/foundry.git@sglang-dep",
+  "foundry-core>=0.1.0,<0.2",
 ]
 
 test = [

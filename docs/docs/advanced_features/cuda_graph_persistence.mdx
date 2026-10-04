@@ -12,10 +12,10 @@ Foundry runs a CUDA driver hook in the scheduler processes (and the data-paralle
 
 ## Installation
 
-Foundry is an optional dependency. Its CUDA extension is built against the installed `torch`, so install it without build isolation (it needs Boost filesystem/json and CMake >= 4.0):
+Foundry is an optional dependency, published on PyPI as `foundry-core` (import name `foundry`):
 
 ```bash
-pip install --no-build-isolation "sglang[foundry]"
+pip install "sglang[foundry]"
 ```
 
 ## Usage
@@ -43,6 +43,8 @@ The launcher and every scheduler log one activation line, and `load` logs the re
 [Foundry] cuda graph persistence active: pid=<pid> mode=load config=<toml or None>
 [Foundry] Loaded <N> SGLang graphs in <s>s
 ```
+
+A process is persistence-enabled from its first activation or not at all. Foundry's CUDA hook, its allocation region and the environment pins below cannot be undone in a live process, so an engine without `--cuda-graph-persistence` started in a process that already ran one with it fails with an error; run it in a separate process.
 
 ## What it changes
 
