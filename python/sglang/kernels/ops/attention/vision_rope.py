@@ -211,7 +211,7 @@ def precompile_fused_qk_complex_rope(
     qkv = torch.empty((1, 3, num_heads, head_dim), dtype=dtype, device=device)
     q, k, _ = torch.unbind(qkv, dim=1)
     freqs = torch.ones((1, head_dim // 2), dtype=torch.complex64, device=device)
-    if not can_use_fused_qk_complex_rope(dtype=dtype, device=device, freqs_cis=freqs):
+    if not can_use_fused_qk_complex_rope(dtype=dtype, device=q.device, freqs_cis=freqs):
         return False
     apply_fused_qk_complex_rope(q, k, freqs)
     return True
