@@ -183,7 +183,7 @@ class TestFusedDraftGate(CustomTestCase):
     a placement for it would price a fused entry the factory never allocates;
     a draft with recurrent state needs a state pool the fused arm lacks."""
 
-    def _decide(self, *, target_state=None, draft_state=None):
+    def _decide(self, *, target_state=None, draft_state=None, draft_kv_dtype=None):
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
@@ -203,11 +203,16 @@ class TestFusedDraftGate(CustomTestCase):
                 get_num_kv_heads=lambda tp: 4,
                 head_dim=64,
                 v_head_dim=64,
+                dtype=torch.bfloat16,
             ),
         )
         memory = SimpleNamespace(enable_unified_memory=True)
+        spec = SimpleNamespace(
+            speculative_num_steps=1, speculative_draft_kv_cache_dtype=draft_kv_dtype
+        )
         with (
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(kvc, "get_spec", return_value=spec),
             patch.object(kvc, "mambaish_config", return_value=draft_state),
             get_parallel().override(attn_tp_size=1),
         ):
@@ -215,6 +220,14 @@ class TestFusedDraftGate(CustomTestCase):
 
     def test_a_two_pool_target_places_a_stateless_draft(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
+        """A fused draft stores its rows in the host's KV dtype; an explicit
+        draft dtype that differs declines instead of mis-typing those rows."""
+        self.assertIsNotNone(self._decide(draft_kv_dtype="auto").placement)
+        declined = self._decide(draft_kv_dtype="fp8_e4m3")
+        self.assertIsNone(declined.placement)
+        self.assertIn("KV cache dtype", declined.declined)
 
     def test_recurrent_state_on_either_side_keeps_the_private_pool(self):
         state = SimpleNamespace()

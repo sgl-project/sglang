@@ -136,8 +136,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
 
-    def _run(self, *, algorithm, alloc, max_total_num_tokens):
+    def _run(self, *, algorithm, alloc, max_total_num_tokens, kv_dtype=torch.bfloat16):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
         cfg.draft_model_idx = None
         cfg.spec_algorithm = algorithm
@@ -213,6 +214,19 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
+
+    def test_a_draft_kv_dtype_unlike_the_region_refuses_to_bind(self):
+        """The region stores the target's KV dtype. A draft that resolved its
+        own -- `auto` picking up an fp8 quant config the target lacks, say --
+        must fail loudly rather than read those rows as another dtype."""
+        alloc = self._swa_allocator(with_draft_region=True)
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+                kv_dtype=torch.float8_e4m3fn,
+            )
 
     def test_eagle_draft_without_a_placement_falls_back_to_the_private_arm(self):
         """Target boot declines a placement for legitimate configurations (a

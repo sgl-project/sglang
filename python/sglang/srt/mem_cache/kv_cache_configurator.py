@@ -720,11 +720,23 @@ class KVCacheConfigurator:
         private arm is the rollback lever, not a boot-order bug."""
         if not self.spec_algorithm.is_eagle():
             return None
+        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
+
         placement = alloc.unified_buffer.fused_draft
         if placement is None:
             logger.info(
                 "[unified-memory-pool] no fused draft placement on the target's "
                 "buffer; the draft binds a private pool over the virtual id space."
+            )
+            return None
+        # The region stores rows in the target's KV dtype; a draft that resolved
+        # its own would read and write them as something else.
+        if _store_dtype_for(self.kv_cache_dtype) != placement.region.store_dtype:
+            raise ValueError(
+                f"Fused draft KV: the draft resolved its KV cache dtype to "
+                f"{self.kv_cache_dtype}, but its region inside the target's pages "
+                f"stores {placement.region.store_dtype}. Set "
+                "--speculative-draft-kv-cache-dtype to the target's KV cache dtype."
             )
         return placement
 
@@ -958,6 +970,30 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
+        # A fused draft stores its rows in the host's KV dtype. An explicit
+        # draft dtype resolves without the draft model, so a mismatch is
+        # declined here; `auto` follows the draft's quant config, which only
+        # the draft runner knows, and is checked when it binds.
+        draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+        if draft_kv_cache_dtype not in (None, "auto"):
+            from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+            _, draft_kv_dtype = configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=draft_kv_cache_dtype,
+                model=None,
+                model_dtype=aux.draft_model_config.dtype,
+                is_draft_worker=True,
+                is_dflash=False,
+                speculative_draft_attention_backend=None,
+                speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
+            )
+            if draft_kv_dtype != self.kv_cache_dtype:
+                return FusedDraftDecision(
+                    declined=(
+                        f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
+                        f"from the host's ({self.kv_cache_dtype})"
+                    )
+                )
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
