@@ -88,7 +88,8 @@ before another fails to pause; failed or uncertain activation never authorizes
 resume, rollback or automatic replay. Miles owns the ordered API sequence and
 sends resume only after every rank of that engine reports successful apply.
 Concurrent administration, retries and arbitrary call ordering are unsupported;
-SGLang does not duplicate the caller's identity/certificate validation. A failed
+SGLang does not revalidate caller identity/session echoes or accept a separate
+resume certificate. A failed
 fence must not reclaim KV/cache. Preparation can be aborted before update dispatch,
 while serving continues on the old version.
 
