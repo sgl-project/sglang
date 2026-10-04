@@ -28,7 +28,9 @@ DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 register_cuda_ci(est_time=1865, stage="extra-b", runner_config="4-gpu-h100")
 
 
-def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
+def _assert_dsv4_decode_cached_tokens(
+    result, history_len, output_len, label, *, previous_num_retractions=0
+):
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
     lower = max(0, expected - 256)

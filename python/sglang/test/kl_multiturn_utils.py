@@ -38,7 +38,8 @@ __all__ = [
 # Cache assertion callbacks
 # =============================================================================
 # Prefill signature: (result, prefix_len, label) -> None
-# Decode  signature: (result, history_len, output_len, label) -> None
+# Decode signature: (result, history_len, output_len, label,
+#                    *, previous_num_retractions=0) -> None
 
 
 def default_prefill_cache_assert(result: dict, prefix_len: int, label: str):
@@ -50,7 +51,12 @@ def default_prefill_cache_assert(result: dict, prefix_len: int, label: str):
 
 
 def default_decode_cache_assert(
-    result: dict, history_len: int, output_len: int, label: str
+    result: dict,
+    history_len: int,
+    output_len: int,
+    label: str,
+    *,
+    previous_num_retractions: int = 0,
 ):
     """Standard radix cache: cached_tokens == history_len + output_len."""
     expected = history_len + output_len
@@ -74,10 +80,26 @@ def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
     return _check
 
 
-def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
-    """Mamba: cached_tokens = floor((history+output-1)/interval)*interval."""
+def make_mamba_decode_assert(
+    track_interval: int = 16, prefill_chunk_size: int = 64
+) -> Callable:
+    """Check the last decode checkpoint, allowing a prefill fallback after retract.
 
-    def _check(result: dict, history_len: int, output_len: int, label: str):
+    Retraction discards decode checkpoints. The resumed prefill saves states
+    relative to its cached prefix, which need not be on the absolute decode
+    tracking grid. If decoding finishes before the next tracking boundary,
+    that prefill checkpoint can lag the expected boundary by less than one
+    prefill chunk.
+    """
+
+    def _check(
+        result: dict,
+        history_len: int,
+        output_len: int,
+        label: str,
+        *,
+        previous_num_retractions: int = 0,
+    ):
         actual = result["meta_info"]["cached_tokens"]
         if output_len <= 0:
             expected = history_len
@@ -85,8 +107,10 @@ def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
             expected = (
                 (history_len + output_len - 1) // track_interval
             ) * track_interval
+            if previous_num_retractions > 0:
+                expected = max(0, expected - (prefill_chunk_size - 1))
         assert actual >= expected, (
-            f"{label}: expected cached_tokens={expected}, got {actual}"
+            f"{label}: expected cached_tokens>={expected}, got {actual}"
         )
 
     return _check
@@ -237,6 +261,7 @@ def test_input_output_logprobs_match_helper(
     last_outputs = None
     prev_input_lens = [0] * n
     prev_output_lens = [0] * n
+    previous_results = None
 
     for turn in range(num_turns):
         if turn > 0:
@@ -261,11 +286,15 @@ def test_input_output_logprobs_match_helper(
                     prev_input_lens[i],
                     prev_output_lens[i],
                     f"{label}[turn{turn}][{i}]",
+                    previous_num_retractions=previous_results[i]["meta_info"].get(
+                        "num_retractions", 0
+                    ),
                 )
 
         last_outputs = [r["output_ids"] for r in results]
         prev_input_lens = [len(current_input[i]) for i in range(n)]
         prev_output_lens = [len(last_outputs[i]) for i in range(n)]
+        previous_results = results
 
     # Replay last turn
     replay_ids = [current_input[i] + results[i]["output_ids"] for i in range(n)]
@@ -370,6 +399,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     last_outputs = [r["output_ids"] for r in results]
     prev_input_lens = [len(full_input_ids[i]) for i in range(n)]
     prev_output_lens = [len(last_outputs[i]) for i in range(n)]
+    previous_results = results
 
     # Additional turns: decode cache hits (interleaved if order is set)
     if turn_suffixes:
@@ -395,11 +425,15 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
                     prev_input_lens[i],
                     prev_output_lens[i],
                     f"{label}[turn{t + 1}][{i}]",
+                    previous_num_retractions=previous_results[i]["meta_info"].get(
+                        "num_retractions", 0
+                    ),
                 )
 
             last_outputs = [r["output_ids"] for r in results]
             prev_input_lens = [len(current_input[i]) for i in range(n)]
             prev_output_lens = [len(last_outputs[i]) for i in range(n)]
+            previous_results = results
 
     # Replay last turn
     replay_ids = [current_input[i] + results[i]["output_ids"] for i in range(n)]
@@ -485,6 +519,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     last_outputs = [r["output_ids"] for r in results]
     prev_input_lens = [len(first_turn_input_ids[i]) for i in range(n)]
     prev_output_lens = [len(last_outputs[i]) for i in range(n)]
+    previous_results = results
 
     # Turns 2..N: decode cache hits (interleaved if order is set)
     for t, suffixes in enumerate(turn_suffixes):
@@ -508,11 +543,15 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
                 prev_input_lens[i],
                 prev_output_lens[i],
                 f"{label}[turn{t + 1}][{i}]",
+                previous_num_retractions=previous_results[i]["meta_info"].get(
+                    "num_retractions", 0
+                ),
             )
 
         last_outputs = [r["output_ids"] for r in results]
         prev_input_lens = [len(current_input[i]) for i in range(n)]
         prev_output_lens = [len(last_outputs[i]) for i in range(n)]
+        previous_results = results
 
     # Replay last turn
     replay_ids = [current_input[i] + results[i]["output_ids"] for i in range(n)]

@@ -79,6 +79,14 @@ def _track_seqlen(
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
+    def test_resumed_prefill_keeps_prefix_relative_checkpoint(self):
+        for prefix, extend, expected in ((4391, 491, 4839), (4372, 509, 4820)):
+            with self.subTest(prefix=prefix, extend=extend):
+                self.assertEqual(
+                    _track_seqlen(tree_page=1, prefix_len=prefix, extend_len=extend),
+                    expected,
+                )
+
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.
