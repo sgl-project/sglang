@@ -595,7 +595,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -4078,7 +4083,8 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4727,7 +4733,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's insert_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

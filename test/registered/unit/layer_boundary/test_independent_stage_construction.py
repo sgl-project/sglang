@@ -193,24 +193,16 @@ class TestIndependentStageConstruction(CustomTestCase):
                     )
                     self.assertEqual(edge.incoming.residual, source_input.residual_to)
 
-    def test_a_replicated_tail_stays_in_compute_without_a_fusion_object(self):
-        for local_tail in (False, True):
-            with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
-                boundary = make_ffn_stage(
-                    declaration=declare_ffn(
-                        previous=declare_attn(),
-                        sparse=True,
-                        reduction=ProducerReduction.TAIL_AFTER_SUM
-                        if local_tail
-                        else ProducerReduction.EXIT_SCOPED,
-                    ),
-                    norm=fixture.Norm(),
-                )
-                self.assertIsNone(boundary.plan.fusions)
-                produced = boundary.plan.paths[BatchVariant.ORDINARY].output
-                self.assertEqual(produced.may_defer_to_next, not local_tail)
-                # A local compute tail does not change the existing RS alternative.
-                self.assertTrue(produced.may_reduce_scatter)
+    def test_an_ffn_without_a_fusion_object_may_defer_or_reduce_scatter(self):
+        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
+            boundary = make_ffn_stage(
+                declaration=declare_ffn(previous=declare_attn(), sparse=True),
+                norm=fixture.Norm(),
+            )
+        self.assertIsNone(boundary.plan.fusions)
+        produced = boundary.plan.paths[BatchVariant.ORDINARY].output
+        self.assertTrue(produced.may_defer_to_next)
+        self.assertTrue(produced.may_reduce_scatter)
 
     def test_mixer_successor_comes_from_the_local_sequence(self):
         for following in (

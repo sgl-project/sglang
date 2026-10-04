@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,9 +18,6 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
-_FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
-
-logger = logging.getLogger(__name__)
 
 
 @cache_once
@@ -37,10 +33,6 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
             (
                 "residual_gate_add",
                 f"residual_gate_add::ResidualGateAddKernel<{args}>::run",
-            ),
-            (
-                "residual_gate_add_transposed",
-                f"residual_gate_add::ResidualGateAddKernel<{args}>::run_transposed",
             ),
         ],
     )
@@ -67,9 +59,6 @@ def _residual_gate_add_cuda_impl(
         device=residual.device,
     )
     module = _jit_residual_gate_add_module(residual.dtype)
-    if _is_transposed_dense_residual(residual, update, gate):
-        module.residual_gate_add_transposed(out, residual, update, gate)
-        return out
     gate_mode = _gate_mode(residual, gate)
     module.residual_gate_add(
         out.view(-1),
@@ -94,120 +83,6 @@ def _round16_f32(x, IS_BF16: tl.constexpr):
             "cvt.rn.f16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
         )
         return bits.to(tl.float16, bitcast=True).to(tl.float32)
-
-
-@triton.jit
-def _store16(out_ptr, offs, value_f32, mask, IS_BF16: tl.constexpr):
-    if IS_BF16:
-        bits = tl.inline_asm_elementwise(
-            "cvt.rn.bf16.f32 $0, $1;",
-            "=h,r",
-            [value_f32],
-            dtype=tl.int16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_ptr + offs, bits.to(tl.bfloat16, bitcast=True), mask=mask)
-    else:
-        bits = tl.inline_asm_elementwise(
-            "cvt.rn.f16.f32 $0, $1;",
-            "=h,r",
-            [value_f32],
-            dtype=tl.int16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_ptr + offs, bits.to(tl.float16, bitcast=True), mask=mask)
-
-
-@triton.jit
-def _rga_flat(
-    out,
-    res,
-    upd,
-    gate,
-    numel,
-    hid,
-    MODE: tl.constexpr,
-    IS_BF16: tl.constexpr,
-    IS_16: tl.constexpr,
-    BLK: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLK + tl.arange(0, BLK).to(tl.int64)
-    mask = offs < numel
-    rv = tl.load(res + offs, mask=mask)
-    uv = tl.load(upd + offs, mask=mask)
-    if MODE == 1:
-        gv = tl.load(gate + (offs % hid), mask=mask)
-    elif MODE == 2:
-        gv = tl.load(gate + (offs // hid), mask=mask)
-    else:
-        gv = tl.load(gate + offs, mask=mask)
-    if IS_16:
-        p32 = uv.to(tl.float32) * gv.to(tl.float32)
-        pf = _round16_f32(p32, IS_BF16)
-        o32 = rv.to(tl.float32) + pf
-        _store16(out, offs, o32, mask, IS_BF16)
-    else:
-        p32 = uv * gv
-        o32 = rv + p32
-        tl.store(out + offs, o32, mask=mask)
-
-
-@triton.jit
-def _rga_row(
-    out,
-    res,
-    upd,
-    gate,
-    hid: tl.constexpr,
-    IS_BF16: tl.constexpr,
-    EVG: tl.constexpr,
-    CG: tl.constexpr,
-    BLK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLK)
-    mask = offs < hid
-    if EVG:
-        gv = tl.load(gate + offs, mask=mask, eviction_policy="evict_last")
-    else:
-        gv = tl.load(gate + offs, mask=mask)
-    base = row * hid
-    if CG:
-        rv = tl.load(res + base + offs, mask=mask, cache_modifier=".cg")
-        uv = tl.load(upd + base + offs, mask=mask, cache_modifier=".cg")
-    else:
-        rv = tl.load(res + base + offs, mask=mask, eviction_policy="evict_first")
-        uv = tl.load(upd + base + offs, mask=mask, eviction_policy="evict_first")
-    p32 = uv.to(tl.float32) * gv.to(tl.float32)
-    pf = _round16_f32(p32, IS_BF16)
-    o32 = rv.to(tl.float32) + pf
-    _store16(out, base + offs, o32, mask, IS_BF16)
-
-
-@triton.jit
-def _rga_flat_m1(
-    out,
-    res,
-    upd,
-    gate,
-    numel,
-    hid: tl.constexpr,
-    IS_BF16: tl.constexpr,
-    BLK: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLK + tl.arange(0, BLK).to(tl.int64)
-    mask = offs < numel
-    rv = tl.load(res + offs, mask=mask, eviction_policy="evict_first")
-    uv = tl.load(upd + offs, mask=mask, eviction_policy="evict_first")
-    gv = tl.load(gate + (offs % hid), mask=mask, eviction_policy="evict_last")
-    p32 = uv.to(tl.float32) * gv.to(tl.float32)
-    pf = _round16_f32(p32, IS_BF16)
-    o32 = rv.to(tl.float32) + pf
-    _store16(out, offs, o32, mask, IS_BF16)
 
 
 @triton.jit
@@ -268,146 +143,30 @@ def _rga_transposed(
         tl.store(out + base + roffs, rv + uv * gv[:, None], mask=m2)
 
 
-def _residual_gate_add_triton(residual, update, gate):
-    if not can_use_residual_gate_add_cuda(residual, update, gate):
-        raise RuntimeError("unsupported input for residual_gate_add CUDA")
+def _residual_gate_add_transposed(residual, update, gate):
     out = torch.empty_strided(
         residual.shape, residual.stride(), dtype=residual.dtype, device=residual.device
     )
-    is_bf16 = residual.dtype == torch.bfloat16
-    dtype16 = residual.dtype in (torch.float16, torch.bfloat16)
-
-    if _is_transposed_dense_residual(residual, update, gate):
-        tokens = residual.shape[1]
-        hid = residual.shape[2]
-        batch = residual.shape[0]
-        if tokens * hid * batch <= 65536:
-            tile, warps = 16, 4
-        elif tokens * hid * batch >= 1 << 20:
-            tile, warps = 64, 8
-        else:
-            tile, warps = 32, 8
-        grid = (triton.cdiv(tokens, tile), triton.cdiv(hid, tile), batch)
-        _rga_transposed[grid](
-            out,
-            residual,
-            update,
-            gate,
-            tokens,
-            hid,
-            is_bf16,
-            dtype16,
-            TILE=tile,
-            num_warps=warps,
-        )
-        return out
-
-    if not dtype16:
-        # fp32: exact fp32 math, plain Triton elementwise
-        numel = residual.numel()
-        hid = residual.shape[-1]
-        if gate.shape == residual.shape:
-            mode = 0
-        elif _is_row_broadcast_gate(residual, gate):
-            mode = 1
-        else:
-            mode = 2
-        if numel <= 8192:
-            _rga_flat[(triton.cdiv(numel, 256),)](
-                out,
-                residual,
-                update,
-                gate,
-                numel,
-                hid,
-                mode,
-                False,
-                False,
-                BLK=256,
-                num_warps=4,
-            )
-        else:
-            _rga_flat[(triton.cdiv(numel, 1024),)](
-                out,
-                residual,
-                update,
-                gate,
-                numel,
-                hid,
-                mode,
-                False,
-                False,
-                BLK=1024,
-                num_warps=4,
-            )
-        return out
-
-    hid = residual.shape[-1]
-    numel = residual.numel()
-    if _is_row_broadcast_gate(residual, gate):
-        rows = numel // hid
-        if hid >= 4096 or (rows <= 512 and numel >= 1 << 20):
-            _rga_flat_m1[(triton.cdiv(numel, 1024),)](
-                out, residual, update, gate, numel, hid, is_bf16, BLK=1024, num_warps=4
-            )
-        elif hid <= 16384:
-            blk = triton.next_power_of_2(hid)
-            _rga_row[(rows,)](
-                out,
-                residual,
-                update,
-                gate,
-                hid,
-                is_bf16,
-                hid < 4608,
-                hid >= 4096,
-                BLK=blk,
-                num_warps=4 if hid >= 4608 else 8,
-            )
-        else:
-            _rga_flat[(triton.cdiv(numel, 1024),)](
-                out,
-                residual,
-                update,
-                gate,
-                numel,
-                hid,
-                1,
-                is_bf16,
-                True,
-                BLK=1024,
-                num_warps=4,
-            )
-        return out
-    mode = 0 if gate.shape == residual.shape else 2
-    if numel <= 8192:
-        _rga_flat[(triton.cdiv(numel, 256),)](
-            out,
-            residual,
-            update,
-            gate,
-            numel,
-            hid,
-            mode,
-            is_bf16,
-            True,
-            BLK=256,
-            num_warps=4,
-        )
+    batch, tokens, hidden = residual.shape
+    if residual.numel() <= 65536:
+        tile, warps = 16, 4
+    elif residual.numel() >= 1 << 20:
+        tile, warps = 64, 8
     else:
-        _rga_flat[(triton.cdiv(numel, 1024),)](
-            out,
-            residual,
-            update,
-            gate,
-            numel,
-            hid,
-            mode,
-            is_bf16,
-            True,
-            BLK=1024,
-            num_warps=4,
-        )
+        tile, warps = 32, 8
+    grid = (triton.cdiv(tokens, tile), triton.cdiv(hidden, tile), batch)
+    _rga_transposed[grid](
+        out,
+        residual,
+        update,
+        gate,
+        tokens,
+        hidden,
+        residual.dtype == torch.bfloat16,
+        residual.dtype in (torch.float16, torch.bfloat16),
+        TILE=tile,
+        num_warps=warps,
+    )
     return out
 
 
@@ -420,7 +179,12 @@ def _residual_gate_add_custom_op(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     with torch.cuda.device(residual.device):
-        return _residual_gate_add_triton(residual, update, gate)
+        # Take the Triton path only for the transposed-dense layout it was
+        # benchmarked on. For the contiguous layouts every other diffusion model
+        # uses, the existing JIT CUDA kernel is faster at every measured shape.
+        if _is_transposed_dense_residual(residual, update, gate):
+            return _residual_gate_add_transposed(residual, update, gate)
+        return _residual_gate_add_cuda_impl(residual, update, gate)
 
 
 def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
@@ -467,8 +231,6 @@ def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
     return (
-        # ROCm tensors also report is_cuda, but these kernels contain PTX
-        # rounding instructions and cannot be compiled for AMD GPUs.
         torch.version.hip is None
         and residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype
@@ -504,29 +266,11 @@ def residual_gate_add_cuda(
 def residual_gate_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """Use the bit-exact CUDA fast path when supported, otherwise eager.
-
-    Runtime build failures are cached per device and dtype so every diffusion
-    model shares one fallback policy instead of maintaining model-local flags.
-    """
-    runtime_key = (residual.device.index, residual.dtype)
-    if (
-        residual.dtype in _BIT_EXACT_DTYPES
-        and runtime_key not in _FAILED_RUNTIME_KEYS
-        and can_use_residual_gate_add_cuda(residual, update, gate)
+    """Use the bit-exact fast path for supported layouts, otherwise eager."""
+    if residual.dtype in _BIT_EXACT_DTYPES and can_use_residual_gate_add_cuda(
+        residual, update, gate
     ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            _FAILED_RUNTIME_KEYS.add(runtime_key)
-            logger.warning(
-                "Disabling diffusion residual-gate CUDA fast path on %s/%s: %s",
-                residual.device,
-                residual.dtype,
-                exc,
-            )
+        return _residual_gate_add_custom_op(residual, update, gate)
     return residual + update * gate
 
 

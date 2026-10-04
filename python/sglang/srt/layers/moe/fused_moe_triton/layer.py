@@ -222,7 +222,6 @@ def create_moe_dispatcher(
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
-            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -464,6 +463,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            layer=self,
         )
 
         self.quant_method = quant_method
