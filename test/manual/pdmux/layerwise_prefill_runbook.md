@@ -61,3 +61,23 @@ load. No GPU accuracy or throughput result is implied by passing CPU tests.
 
 The core branch supports plain TP. The third layer enables attention DP; the
 fourth adds speculative decoding. Earlier branches reject unsupported combinations.
+
+## HiCache/SWA layer
+
+Add `--enable-hierarchical-cache` for cache reload checks. The loop drains acks
+before admission and every 16 in-flight/waiting iterations; device frees and
+mapping updates publish a dependency to decode. Host-only write-through acks
+leave prefill/decode overlap intact. Buffer-mode load acks can release auxiliary
+device slots and also need that dependency.
+
+```bash
+SGLANG_TEST_DSV4_FLASH_MODEL_PATH="$MODEL_PATH" \
+  python -m pytest test/manual/pdmux/test_dsv4_pdmux_hicache_tp8.py -v
+```
+
+Test both SM layouts with long cached prefixes, pressure-driven FULL/SWA eviction,
+load-back and repeated chunk continuations. Check free-list ownership after
+tombstone recovery, including a protected prefix that ends inside the tombstone
+node. Include in-flight backup acks and post-storm output checks. The manual tests
+cover write-through; separately validate write-back and storage/buffer modes before
+relying on them in deployment.
