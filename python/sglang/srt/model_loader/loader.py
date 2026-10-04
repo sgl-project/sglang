@@ -1060,16 +1060,20 @@ class DefaultModelLoader(BaseModelLoader):
                 elif hasattr(quant_cfg, "kv_cache_scheme"):
                     kv_scheme = getattr(quant_cfg, "kv_cache_scheme", None)
 
-            if (
-                isinstance(kv_scheme, dict)
-                and kv_scheme.get("num_bits") == 8
-                and runtime_kv_dtype == "nvfp4"
-            ):
-                logger.info(
-                    "ignoring fp8 kv cache scales from checkpoint (kv_cache_scheme: %s) "
-                    "because runtime kv cache dtype is nvfp4. falling back to dynamic scales.",
-                    kv_scheme
-                )
+            if isinstance(kv_scheme, dict) and runtime_kv_dtype:
+                checkpoint_bits = kv_scheme.get("num_bits")
+                expected_bits = None
+                if "fp8" in runtime_kv_dtype or "int8" in runtime_kv_dtype:
+                    expected_bits = 8
+                elif "fp4" in runtime_kv_dtype:
+                    expected_bits = 4
+
+                if checkpoint_bits and expected_bits and checkpoint_bits != expected_bits:
+                    logger.info(
+                        "ignoring kv cache scales from checkpoint (checkpoint_bits=%s, runtime_dtype=%s). "
+                        "mismatch prevents scale corruption; falling back to dynamic scales.",
+                        checkpoint_bits, runtime_kv_dtype
+                    )
 
                 def _filter_kv_scales(ws):
                     for n, w in ws:
