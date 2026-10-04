@@ -1,4 +1,4 @@
-"""Receiver control-message publication and connection-pool invalidation."""
+"""Unit tests for srt/disaggregation/common/conn — receiver connection_pool invalidation."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
