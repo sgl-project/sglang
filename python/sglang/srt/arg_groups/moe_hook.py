@@ -30,7 +30,11 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
+from sglang.srt.utils.common import (
+    is_sm100_supported,
+    is_xpu,
+    parse_connector_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -311,7 +315,40 @@ def handle_a2a_moe(server_args: Any):
                     "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
                     "--deepep-mode low_latency or auto."
                 )
-        if cfg.deepep_mode == "normal":
+        deepep_mode = cfg.deepep_mode
+        if is_xpu():
+            # A deep_ep_cpp ABI/runtime mismatch raises OSError, not ImportError.
+            try:
+                import deep_ep_xpu  # noqa: F401
+            except (ImportError, OSError) as e:
+                raise ValueError(
+                    "--moe-a2a-backend deepep on XPU requires deep_ep_xpu, "
+                    f"which (or its deep_ep_cpp extension) failed to load: {e!r}"
+                ) from e
+            # deep_ep_xpu is intranode-only, so low_latency is unavailable.
+            if deepep_mode == "auto":
+                deepep_mode = "normal"
+                declare_resolution(
+                    server_args, "_handle_a2a_moe", deepep_mode=deepep_mode
+                )
+                logger.warning("Forcing --deepep-mode normal on XPU (deep_ep_xpu).")
+            elif deepep_mode == "low_latency":
+                raise ValueError(
+                    "deep_ep_xpu low_latency mode is not supported yet; "
+                    "use --deepep-mode normal."
+                )
+            if cfg.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
+                raise ValueError(
+                    "deep_ep_xpu only supports bf16 dispatch; "
+                    "use --deepep-dispatcher-output-dtype bf16."
+                )
+            if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+                raise ValueError(
+                    "deep_ep_xpu does not support two-batch or single-batch "
+                    "overlap; drop --enable-two-batch-overlap / "
+                    "--enable-single-batch-overlap."
+                )
+        if deepep_mode == "normal":
             logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
             declare_resolution(
                 server_args,

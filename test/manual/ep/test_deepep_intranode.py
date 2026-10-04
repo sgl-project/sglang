@@ -1,16 +1,15 @@
 # Copy from deepseek-ai/DeepEP/tests/test_intranode.py
+# Runs on CUDA (deep_ep) or Intel XPU (deep_ep_xpu, normal mode only).
+# XPU: NUM_PROCESSES=4 python test/manual/ep/test_deepep_intranode.py
 
+import os
 import time
 
-# noinspection PyUnresolvedReferences
-import deep_ep
-
-# Test compatibility with low latency functions
-import test_deepep_low_latency
 import torch
 import torch.distributed as dist
 
 from sglang.test.test_deepep_utils import (
+    DEVICE,
     bench,
     calc_diff,
     init_dist,
@@ -18,6 +17,16 @@ from sglang.test.test_deepep_utils import (
     per_token_cast_back,
     per_token_cast_to_fp8,
 )
+
+if DEVICE == "xpu":
+    # noinspection PyUnresolvedReferences
+    import deep_ep_xpu as deep_ep
+else:
+    # noinspection PyUnresolvedReferences
+    import deep_ep
+
+    # Test compatibility with low latency functions
+    import test_deepep_low_latency
 
 
 def test_main(
@@ -43,35 +52,35 @@ def test_main(
         )
 
     # Random data
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * rank
-    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=DEVICE) * rank
+    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=DEVICE)
     x_e4m3 = per_token_cast_to_fp8(x)
     scores = (
-        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device=DEVICE).abs()
         + 1
     )
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = (
-        torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda") * rank
+        torch.ones((num_tokens, num_topk), dtype=torch.float32, device=DEVICE) * rank
     )
     topk_weights_pure_rand = torch.randn(
-        (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+        (num_tokens, num_topk), dtype=torch.float32, device=DEVICE
     )
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
 
     # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device="cuda")
+    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device=DEVICE)
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
     # Rank layout meta
-    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device="cuda")
+    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device=DEVICE)
     token_idx_in_rank = torch.full(
-        (num_ranks, num_tokens), -1, dtype=torch.long, device="cuda"
+        (num_ranks, num_tokens), -1, dtype=torch.long, device=DEVICE
     )
     for i in range(num_ranks):
         num_tokens_per_rank[i] = (rank_idx == i).sum()
@@ -80,7 +89,7 @@ def test_main(
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         tokens[:count] = torch.sort(tokens[:count])[0]
         token_idx_in_rank[i][tokens[:count]] = torch.arange(
-            count, dtype=torch.long, device="cuda"
+            count, dtype=torch.long, device=DEVICE
         )
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
@@ -116,7 +125,10 @@ def test_main(
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_e4m3):
+            # deep_ep_xpu only supports bf16 dispatch.
+            for current_x in (
+                (x_pure_rand, x) if DEVICE == "xpu" else (x_pure_rand, x, x_e4m3)
+            ):
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
@@ -260,7 +272,7 @@ def test_main(
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
-    for current_x in (x_e4m3, x):
+    for current_x in (x,) if DEVICE == "xpu" else (x_e4m3, x):
         best_time, best_results = 1e10, None
         nvl_recv_bytes = (
             (dispatch_bf16_nvl_recv_bytes * fp8_factor)
@@ -288,7 +300,7 @@ def test_main(
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
             best_dispatch_results = torch.tensor(
-                [best_results[0], best_results[1]], dtype=torch.int32, device="cuda"
+                [best_results[0], best_results[1]], dtype=torch.int32, device=DEVICE
             )
             all_best_fp8_results_list = [
                 torch.zeros_like(best_dispatch_results)
@@ -352,7 +364,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     )
     torch.manual_seed(rank)
 
-    for i in (24,):
+    for i in (deep_ep.Buffer.num_eus,) if DEVICE == "xpu" else (24,):
         test_main(i, local_rank, num_ranks, rank, buffer, group)
         if local_rank == 0:
             print("", flush=True)
@@ -374,5 +386,5 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 
 if __name__ == "__main__":
-    num_processes = 8
+    num_processes = int(os.getenv("NUM_PROCESSES", 4 if DEVICE == "xpu" else 8))
     torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
