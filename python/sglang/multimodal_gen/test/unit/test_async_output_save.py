@@ -248,7 +248,10 @@ def test_deferred_reply_leaves_as_soon_as_finalize_finishes(fail):
 def test_reply_send_holds_the_socket_lock():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._socket_lock = threading.Lock()
-    scheduler.server_args = SimpleNamespace(scheduler_endpoint="tcp://10.0.0.1:5555")
+    scheduler.dp_replica = 0
+    scheduler.server_args = SimpleNamespace(
+        scheduler_endpoint_for=lambda replica: "tcp://10.0.0.1:5555"
+    )
     held = []
     scheduler.receiver = SimpleNamespace(
         send_multipart=lambda frames: held.append(scheduler._socket_lock.locked())
