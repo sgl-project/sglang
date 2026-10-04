@@ -153,7 +153,6 @@ class TestNixlBackendInitialization(CustomTestCase):
             api.nixl_agent_config.assert_called_once_with(
                 backends=[],
                 num_threads=8 if mode == DisaggregationMode.PREFILL else 0,
-                enable_prog_thread=True,
                 sync_mode="strict",
             )
 
