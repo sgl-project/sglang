@@ -108,6 +108,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "causal_seqs (global per-request KV lengths) is required for DCP "
                 "MLA decode."
             )
+        split_kv = self._kimi_k3_split_kv_override(query)
+        split_kwargs = (
+            {"split_kv": split_kv, "cute_dsl_impl": "monolithic"}
+            if split_kv is not None
+            else {}
+        )
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -133,6 +139,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 else causal_seqs.to(torch.int32)
             ),
             return_lse=True,  # DCP requires the rank-local LSE for the merge
+            **split_kwargs,
         )
         return raw_out, lse
 
