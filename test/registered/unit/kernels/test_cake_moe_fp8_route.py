@@ -5,8 +5,11 @@ fakes; no GPU is needed.  Covered: route switch off -> DeepGEMM path (Cake API
 never touched); route on -> one prepared runner pair per (per-token geometry,
 weights, alignment), rebound to the caller's tensors on every call with the
 packed UE8M0 int32 scales and the ``-1`` padding rows passed through untouched
-and the output written in place; the down GEMM input quantized with the
-DeepGEMM path's UE8M0 MN-major scale layout; the FP32 scale family
+and the output written in place; the down GEMM input produced by the
+DeepGEMM path's own activation stage (BF16 ``silu_and_mul`` then
+``sglang_per_token_group_quant_fp8`` by default, the fused FP32 kernel only
+with ``silu_mul_keep_fp32``) in its UE8M0 MN-major scale layout; the FP32
+scale family
 (``fill_padding``); mixed scale dtypes, non-32-multiple alignments and static
 shape mismatches -> DeepGEMM; first sight of a shape inside CUDA-graph capture
 -> DeepGEMM fallback; the compact-layout alignment policy; the adapter's
@@ -224,7 +227,8 @@ def api(monkeypatch):
 
 
 @pytest.fixture
-def fake_silu_quant(monkeypatch):
+def fake_fused_silu_quant(monkeypatch):
+    """The fused FP32 SiLU*up + quant kernel (``silu_mul_keep_fp32`` only)."""
     calls = []
 
     def fake(**kwargs):
@@ -233,6 +237,41 @@ def fake_silu_quant(monkeypatch):
         kwargs["output_scale"].fill_(1)
 
     monkeypatch.setattr(dsv4, "silu_and_mul_contig_post_quant", fake)
+    return calls
+
+
+@pytest.fixture
+def fake_silu_quant(monkeypatch, fake_fused_silu_quant):
+    """The DeepGEMM contiguous path's default activation stage: BF16
+    ``silu_and_mul`` (``silu_and_mul_clamp`` with a SwiGLU limit) followed by
+    ``sglang_per_token_group_quant_fp8``, which allocates the down GEMM
+    operands in the real layouts.  Records ``(silu, quant)`` call pairs; the
+    fused kernel's fake is installed too and must stay unused by default."""
+    calls = SimpleNamespace(silu=[], quant=[], fused=fake_fused_silu_quant)
+
+    def legacy_silu(x, out):
+        calls.silu.append(dict(kind="silu_and_mul", input=x, output=out))
+        out.fill_(CAKE_FILL)
+
+    def silu_clamp(x, out, limit):
+        calls.silu.append(
+            dict(kind="silu_and_mul_clamp", input=x, output=out, limit=limit)
+        )
+        out.fill_(CAKE_FILL)
+
+    def quant(x, group_size, **kwargs):
+        x_q = torch.empty(x.shape, dtype=FP8)
+        _fill(x_q, CAKE_FILL)
+        x_s = fp8_kernel.create_per_token_group_quant_fp8_output_scale(
+            x_shape=tuple(x.shape), device=x.device, group_size=group_size, **kwargs
+        )
+        x_s.fill_(1)
+        calls.quant.append(dict(input=x, group_size=group_size, output=x_q, scale=x_s, **kwargs))
+        return x_q, x_s
+
+    monkeypatch.setattr(dg, "_legacy_silu_and_mul", legacy_silu)
+    monkeypatch.setattr(dg, "silu_and_mul_clamp", silu_clamp)
+    monkeypatch.setattr(fp8_kernel, "sglang_per_token_group_quant_fp8", quant)
     return calls
 
 
@@ -367,14 +406,64 @@ def test_route_on_rebinds_callers_tensors_per_call(api, fake_deepgemm, fake_silu
     assert all(c == dict(fill_padding=False, alignment=128) for c in api.supports_calls)
 
 
-def test_down_input_quantized_with_deepgemm_ue8m0_layout(api, fake_silu_quant):
+def test_down_input_uses_deepgemm_activation_kernels_and_ue8m0_layout(
+    api, fake_silu_quant
+):
+    """Default (no ``silu_mul_keep_fp32``): the baseline's BF16 ``silu_and_mul``
+    + ``sglang_per_token_group_quant_fp8`` pair, never the fused FP32 kernel
+    (its SiLU*up is not BF16-rounded before the per-group absmax, so the two
+    stages are not bitwise equal and the model's numerics would drift)."""
     out = dg._CAKE_CONTIG_FP8.try_run(_request(), _allocate_output)
     assert out is not None
-    (call,) = fake_silu_quant
+    assert fake_silu_quant.fused == []
+    (silu,) = fake_silu_quant.silu
+    (quant,) = fake_silu_quant.quant
+    assert not _plan().fused_activation
+    gateup, down = api.prepared
+    # SiLU reads the gate_up output into a BF16 (M, H) activation ...
+    assert silu["kind"] == "silu_and_mul"
+    assert silu["input"].data_ptr() == gateup.launches[0]["out"].data_ptr()
+    assert tuple(silu["input"].shape) == (M, N)
+    act = silu["output"]
+    assert tuple(act.shape) == (M, H) and act.dtype == torch.bfloat16
+    # ... that the quantizer turns into the down GEMM's operands with the
+    # DeepGEMM path's exact arguments.
+    assert quant["input"] is act and quant["group_size"] == 128
+    assert quant["column_major_scales"] is True
+    assert quant["scale_tma_aligned"] is True and quant["scale_ue8m0"] is True
+    assert quant["output"] is down.launches[0]["a"]
+    assert tuple(quant["output"].shape) == (M, H) and quant["output"].dtype == FP8
+    scale = quant["scale"]
+    assert scale is down.launches[0]["a_scale"]
+    # Packed UE8M0 int32, MN-major: the DeepGEMM path's own down-input layout.
+    assert scale.dtype == torch.int32
+    assert tuple(scale.shape) == (M, _scale_cols(H)) and scale.stride() == (1, M)
+
+
+def test_swiglu_limit_uses_the_clamping_silu(api, fake_silu_quant):
+    out = dg._CAKE_CONTIG_FP8.try_run(_request(swiglu_limit=7.0), _allocate_output)
+    assert out is not None and fake_silu_quant.fused == []
+    (silu,) = fake_silu_quant.silu
+    assert silu["kind"] == "silu_and_mul_clamp" and silu["limit"] == 7.0
+    assert len(fake_silu_quant.quant) == 1
+
+
+def test_silu_mul_keep_fp32_uses_the_fused_kernel(api, fake_silu_quant):
+    """``silu_mul_keep_fp32`` is the DeepGEMM path's opt-in to the fused FP32
+    SiLU*up + quant kernel; the route follows it with the same arguments."""
+    out = dg._CAKE_CONTIG_FP8.try_run(
+        _request(silu_mul_keep_fp32=True), _allocate_output
+    )
+    assert out is not None
+    assert fake_silu_quant.silu == [] and fake_silu_quant.quant == []
+    (call,) = fake_silu_quant.fused
+    assert _plan().fused_activation
     assert call["scale_ue8m0"] is True and call["transposed"] is True
     assert call["swizzle"] is False and call["quant_group_size"] == 128
+    assert call["swiglu_limit"] is None
     gateup, down = api.prepared
-    # SwiGLU reads the gate_up output and writes the down GEMM's operands.
+    # The fused kernel reads the gate_up output and writes the down GEMM's
+    # operands, which the route allocated in the DeepGEMM path's layout.
     assert call["input"] is gateup.launches[0]["out"]
     assert (
         tuple(call["input"].shape) == (M, N) and call["input"].dtype == torch.bfloat16
@@ -383,9 +472,11 @@ def test_down_input_quantized_with_deepgemm_ue8m0_layout(api, fake_silu_quant):
     assert tuple(call["output"].shape) == (M, H) and call["output"].dtype == FP8
     scale = call["output_scale"]
     assert scale is down.launches[0]["a_scale"]
-    # Packed UE8M0 int32, MN-major: the DeepGEMM path's own down-input layout.
     assert scale.dtype == torch.int32
     assert tuple(scale.shape) == (M, _scale_cols(H)) and scale.stride() == (1, M)
+    # The fused and unfused stages are separate plans.
+    assert dg._CAKE_CONTIG_FP8.try_run(_request(), _allocate_output) is not None
+    assert len(dg._CAKE_CONTIG_FP8._plans) == 2 and len(fake_silu_quant.silu) == 1
 
 
 def test_fp32_scale_family_uses_fill_padding(api, fake_silu_quant):
@@ -394,9 +485,10 @@ def test_fp32_scale_family_uses_fill_padding(api, fake_silu_quant):
     assert out is not None and torch.all(out[acts.m_indices >= 0] == CAKE_FILL)
     assert all(r.fill_padding is True and r.alignment == 128 for r in api.prepared)
     assert not _plan().scale_ue8m0
-    (call,) = fake_silu_quant
-    assert call["scale_ue8m0"] is False and call["transposed"] is False
-    scale = call["output_scale"]
+    (quant,) = fake_silu_quant.quant
+    assert quant["scale_ue8m0"] is False and quant["column_major_scales"] is False
+    assert quant["scale_tma_aligned"] is False
+    scale = quant["scale"]
     assert scale.dtype == torch.float32 and tuple(scale.shape) == (M, H // 128)
     assert scale.is_contiguous()
 

@@ -301,12 +301,17 @@ def _cake_debug_describe(
         _cake_debug_tensor("w13_scale", req.w13_scale),
         _cake_debug_tensor("w2_weight", req.w2_weight),
         _cake_debug_tensor("w2_scale", req.w2_scale),
+    ]
+    for name in ("act", "down_input", "down_input_scale"):
+        tensor = getattr(ops, name)
+        if tensor is not None:
+            parts.append(_cake_debug_tensor(name, tensor))
+    parts += [
         _cake_debug_tensor("gateup", ops.gateup),
-        _cake_debug_tensor("down_input", ops.down_input),
-        _cake_debug_tensor("down_input_scale", ops.down_input_scale),
         _cake_debug_tensor("out", ops.out),
         f"alignment={plan.alignment} layout_alignment={req.layout_alignment} "
-        f"scale_ue8m0={plan.scale_ue8m0} swiglu_limit={req.swiglu_limit}",
+        f"scale_ue8m0={plan.scale_ue8m0} swiglu_limit={req.swiglu_limit} "
+        f"fused_activation={plan.fused_activation}",
         f"m_indices[min={int(raw.min())} max={int(raw.max())} neg={int((raw < 0).sum())} "
         f"valid_nondecreasing={bool((valid[1:] >= valid[:-1]).all())} "
         f"groups={int(req.w13_weight.shape[0])}]",
@@ -355,17 +360,40 @@ class _CakeContigPlan:
     # False: FP32 family (``fill_padding=True``), mirrors DEEPGEMM_SCALE_UE8M0=0.
     scale_ue8m0: bool
     swiglu_limit: Optional[float]
+    # True: the DeepGEMM path's fused FP32 SiLU*up + quant kernel
+    # (``silu_mul_keep_fp32``).  False: its default pair, BF16 ``silu_and_mul``
+    # then ``sglang_per_token_group_quant_fp8``; see ``_cake_fused_activation``.
+    fused_activation: bool
     debug_described: bool = False
 
 
 @dataclass
 class _CakeContigOperands:
-    """Per-call tensors: the same allocations the DeepGEMM path makes."""
+    """Per-call tensors: the same allocations the DeepGEMM path makes.
+
+    Fused activation: ``down_input`` / ``down_input_scale`` are the fused
+    kernel's outputs and ``act`` is ``None``.  Unfused (default): ``act`` is
+    the BF16 ``silu_and_mul`` output and the quantizer allocates the down GEMM
+    operands itself, exactly like the DeepGEMM path, so they are ``None`` here.
+    """
 
     gateup: torch.Tensor
-    down_input: torch.Tensor
-    down_input_scale: torch.Tensor
+    down_input: Optional[torch.Tensor]
+    down_input_scale: Optional[torch.Tensor]
     out: torch.Tensor
+    act: Optional[torch.Tensor] = None
+
+
+def _cake_fused_activation(req: "_CakeContigRequest") -> bool:
+    """Mirror of ``DeepGemmRunnerCore._run_contiguous_gemm``'s activation-stage
+    choice for the layouts the route admits (never swizzled): the fused FP32
+    ``silu_and_mul_contig_post_quant`` only with ``silu_mul_keep_fp32``,
+    otherwise BF16 ``silu_and_mul`` (``silu_and_mul_clamp`` with a SwiGLU
+    limit) followed by ``sglang_per_token_group_quant_fp8``.  The two stages
+    are not bitwise equal (FP32 vs BF16-rounded SiLU*up before the per-group
+    absmax), so the route must take the baseline's pick to keep the model's
+    numerics identical up to GEMM accumulation order."""
+    return bool(req.use_swizzle or req.silu_mul_keep_fp32)
 
 
 class _CakeContigFp8Route:
@@ -455,26 +483,24 @@ class _CakeContigFp8Route:
             req.w2_scale.data_ptr(),
             req.swiglu_limit,
             req.silu_mul_keep_fp32,
+            req.use_swizzle,
             alignment,
         )
 
     @staticmethod
-    def _operands(
-        req: _CakeContigRequest, allocate_output: Callable[[], torch.Tensor]
-    ) -> _CakeContigOperands:
-        """Allocate this call's intermediates exactly as the DeepGEMM contiguous
-        path does for its down GEMM input (``scale_ue8m0`` selects the packed
-        UE8M0 MN-major ``(M, ceil(H/512))`` int32 scales or FP32 ``(M, H/128)``)."""
+    def _down_operands(req: _CakeContigRequest) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The down GEMM's E4M3 input and its scales, laid out as the DeepGEMM
+        contiguous path's quantizer produces them (``scale_ue8m0`` selects the
+        packed UE8M0 MN-major ``(M, ceil(H/512))`` int32 scales or FP32
+        ``(M, H/128)``)."""
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
         )
 
         m = int(req.hidden_states.shape[0])
-        n = int(req.w13_weight.shape[1])
-        h = n // 2
+        h = int(req.w13_weight.shape[1]) // 2
         device = req.hidden_states.device
         scale_ue8m0 = req.hidden_states_scale.dtype == torch.int32
-        gateup = torch.empty((m, n), device=device, dtype=torch.bfloat16)
         down_input = torch.empty((m, h), device=device, dtype=torch.float8_e4m3fn)
         down_input_scale = create_per_token_group_quant_fp8_output_scale(
             x_shape=(m, h),
@@ -484,11 +510,32 @@ class _CakeContigFp8Route:
             scale_tma_aligned=scale_ue8m0,
             scale_ue8m0=scale_ue8m0,
         )
+        return down_input, down_input_scale
+
+    @classmethod
+    def _operands(
+        cls, req: _CakeContigRequest, allocate_output: Callable[[], torch.Tensor]
+    ) -> _CakeContigOperands:
+        """Allocate this call's intermediates exactly as the DeepGEMM contiguous
+        path does: gate_up BF16 plus, fused, the down GEMM operands, or,
+        unfused, the BF16 activation the quantizer reads."""
+        m = int(req.hidden_states.shape[0])
+        n = int(req.w13_weight.shape[1])
+        h = n // 2
+        device = req.hidden_states.device
+        gateup = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+        if _cake_fused_activation(req):
+            down_input, down_input_scale = cls._down_operands(req)
+            act = None
+        else:
+            down_input = down_input_scale = None
+            act = torch.empty((m, h), device=device, dtype=torch.bfloat16)
         return _CakeContigOperands(
             gateup=gateup,
             down_input=down_input,
             down_input_scale=down_input_scale,
             out=allocate_output(),
+            act=act,
         )
 
     def _build_plan(
@@ -503,6 +550,13 @@ class _CakeContigFp8Route:
         # FlashInfer to fill them.
         kwargs = dict(fill_padding=not scale_ue8m0, alignment=alignment)
         family = "ue8m0" if scale_ue8m0 else "fp32"
+        fused_activation = _cake_fused_activation(req)
+        if ops.down_input is not None and ops.down_input_scale is not None:
+            down_input, down_input_scale = ops.down_input, ops.down_input_scale
+        else:
+            # Unfused: the quantizer allocates these per call; prepare on
+            # same-layout templates (released below, every launch rebinds).
+            down_input, down_input_scale = self._down_operands(req)
         if not api.supports_plain(
             req.hidden_states,
             req.w13_weight,
@@ -517,9 +571,9 @@ class _CakeContigFp8Route:
                 f"scales={family} alignment={alignment})"
             )
         if not api.supports_plain(
-            ops.down_input,
+            down_input,
             req.w2_weight,
-            ops.down_input_scale,
+            down_input_scale,
             req.w2_scale,
             req.m_indices,
             ops.out,
@@ -539,9 +593,9 @@ class _CakeContigFp8Route:
             **kwargs,
         )
         down_runner = api.prepare_plain(
-            ops.down_input,
+            down_input,
             req.w2_weight,
-            ops.down_input_scale,
+            down_input_scale,
             req.w2_scale,
             req.m_indices,
             ops.out,
@@ -558,9 +612,11 @@ class _CakeContigFp8Route:
             alignment=alignment,
             scale_ue8m0=scale_ue8m0,
             swiglu_limit=req.swiglu_limit,
+            fused_activation=fused_activation,
         )
         return plan, (
-            f"M={m} N={n} K={k} G={groups} scales={family} alignment={alignment}"
+            f"M={m} N={n} K={k} G={groups} scales={family} alignment={alignment} "
+            f"activation={'fused_fp32' if fused_activation else 'silu_and_mul+quant'}"
         )
 
     # -- execution ---------------------------------------------------------
@@ -632,23 +688,43 @@ class _CakeContigFp8Route:
         )
         if debug:
             _cake_debug_sync("gateup")
-        # Same kernel and scale layout as the DeepGEMM contiguous path's down
-        # GEMM input; padding rows hold garbage the down GEMM never reads.
-        silu_and_mul_contig_post_quant(
-            input=ops.gateup,
-            output=ops.down_input,
-            output_scale=ops.down_input_scale,
-            quant_group_size=_CAKE_SCALE_BLOCK,
-            scale_ue8m0=plan.scale_ue8m0,
-            transposed=plan.scale_ue8m0,
-            swiglu_limit=plan.swiglu_limit,
-            swizzle=False,
-        )
+        # The DeepGEMM contiguous path's own activation stage and scale
+        # layout (``_cake_fused_activation``); padding rows hold garbage the
+        # down GEMM never reads.
+        if plan.fused_activation:
+            down_input, down_input_scale = ops.down_input, ops.down_input_scale
+            silu_and_mul_contig_post_quant(
+                input=ops.gateup,
+                output=down_input,
+                output_scale=down_input_scale,
+                quant_group_size=_CAKE_SCALE_BLOCK,
+                scale_ue8m0=plan.scale_ue8m0,
+                transposed=plan.scale_ue8m0,
+                swiglu_limit=plan.swiglu_limit,
+                swizzle=False,
+            )
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            n = int(ops.gateup.shape[1])
+            if plan.swiglu_limit is not None:
+                silu_and_mul_clamp(ops.gateup.view(-1, n), ops.act, plan.swiglu_limit)
+            else:
+                _legacy_silu_and_mul(ops.gateup.view(-1, n), ops.act)
+            down_input, down_input_scale = sglang_per_token_group_quant_fp8(
+                ops.act,
+                _CAKE_SCALE_BLOCK,
+                column_major_scales=plan.scale_ue8m0,
+                scale_tma_aligned=plan.scale_ue8m0,
+                scale_ue8m0=plan.scale_ue8m0,
+            )
         if debug:
             _cake_debug_sync("silu_quant")
         plan.down_runner.launch(
-            a=ops.down_input,
-            a_scale=ops.down_input_scale,
+            a=down_input,
+            a_scale=down_input_scale,
             m_indices=req.m_indices,
             out=ops.out,
         )
