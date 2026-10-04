@@ -274,10 +274,9 @@ class BeamMoE(nn.Module):
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
                 and hidden_states.data_ptr() % 16 == 0
-                and (
-                    hidden_states.shape[0] <= 16
-                    or hidden_states.shape[0] in (24, 32, 48, 64)
-                )
+                # Larger batches win in isolation but did not improve the
+                # full BF16 decode step; retain cuBLAS outside this envelope.
+                and hidden_states.shape[0] <= 16
             ):
                 router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
             else:
