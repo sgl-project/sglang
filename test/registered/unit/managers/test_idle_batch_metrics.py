@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -18,7 +18,7 @@ from sglang.srt.observability.metrics_collector import QueueCount
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestIdleBatchMetrics(unittest.TestCase):
+class TestIdleBatchMetrics(CustomTestCase):
     def setUp(self):
         # Exercise the real result handler and metrics reporter without a model.
         self.reporter = object.__new__(metrics_reporter.SchedulerMetricsReporter)
@@ -31,7 +31,9 @@ class TestIdleBatchMetrics(unittest.TestCase):
             enable_priority_scheduling=False,
             disaggregation_mode=metrics_reporter.DisaggregationMode.DECODE,
             disagg_decode_prealloc_queue=SimpleNamespace(queue=[]),
-            disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+            disagg_decode_transfer_queue=SimpleNamespace(
+                queue=[], num_pending_deferred_releases=lambda: 0
+            ),
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(update_scheduler_stats=Mock()),
                 streaming_session_count=lambda: 0,
@@ -62,6 +64,13 @@ class TestIdleBatchMetrics(unittest.TestCase):
     def idle_step(self, copy_done=None, now=101, device_timer=False):
         with (
             patch.object(metrics_reporter, "ENABLE_METRICS_DEVICE_TIMER", device_timer),
+            patch.object(
+                metrics_reporter,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_host_receive_threshold=0
+                ),
+            ),
             patch.object(metrics_reporter.time, "perf_counter", return_value=now),
         ):
             SchedulerBatchResultProcessor.process_batch_result_idle(
