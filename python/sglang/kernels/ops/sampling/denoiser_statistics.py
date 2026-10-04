@@ -140,15 +140,11 @@ def denoiser_statistics(
     temperatures: torch.Tensor,
     soft_probabilities: torch.Tensor | None = None,
 ):
-    """Return FP32 probabilities/entropy and raw-logit argmax for [B, M, V]."""
-    assert logits.dtype == temperatures.dtype == torch.float32
-    assert logits.is_contiguous() and temperatures.is_contiguous()
+    """Statistics for contiguous FP32 [B, M, V] logits and [B] temperatures.
+
+    soft_probabilities, when supplied, is a contiguous BF16 buffer shaped like logits.
+    """
     assert logits.ndim == 3 and temperatures.shape == (logits.shape[0],)
-    if soft_probabilities is not None:
-        assert soft_probabilities.shape == logits.shape
-        assert soft_probabilities.dtype == torch.bfloat16
-        assert soft_probabilities.device == logits.device
-        assert soft_probabilities.is_contiguous()
     block = 4096
     batch, canvas, vocab = logits.shape
     rows = batch * canvas

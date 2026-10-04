@@ -1192,11 +1192,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
 
-    def get_cuda_graph_variants(self, model_runner, forward_mode, captured_req_width):
-        return self.full_attn_backend.get_cuda_graph_variants(
-            model_runner, forward_mode, captured_req_width
-        )
-
     @property
     def use_mha(self) -> bool:
         return getattr(self.full_attn_backend, "use_mha", False)

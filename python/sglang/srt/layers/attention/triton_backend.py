@@ -141,7 +141,6 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
-    requires_contiguous_current_kv = True
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -155,9 +154,10 @@ class TritonAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        *,
+        dllm_fa4: bool = False,
     ):
         # Lazy import to avoid the initialization of cuda context
-        self._decode_graph_metadata = {}
         from sglang.kernels.ops.attention.decode_attention import (
             _LEAN_BLOCK_M,
             _lean_decode_launch_params,
@@ -387,7 +387,9 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+                (max_bs + 1,),
+                dtype=torch.int32 if dllm_fa4 else torch.int64,
+                device=model_runner.device,
             )
 
             self.mask_indptr = torch.zeros(
@@ -411,6 +413,11 @@ class TritonAttnBackend(AttentionBackend):
             Lq=head_dim, Lv=head_dim
         )
         self.extend_attention_block_m = block_m
+        if dllm_fa4:
+            from sglang.srt.dllm.attention import DllmFlashAttention
+
+            self.dllm_attention = DllmFlashAttention(self)
+            self.supports_prefill_cuda_graph_max_context_size = True
 
     def get_num_kv_splits(
         self,
@@ -707,6 +714,13 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.dllm_attention is not None:
+            return self.dllm_attention.init_forward_metadata_out_graph(
+                forward_batch, in_capture
+            )
+        self._init_forward_metadata_out_graph(forward_batch, in_capture)
+
+    def _init_forward_metadata_out_graph(self, forward_batch, in_capture):
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -738,7 +752,6 @@ class TritonAttnBackend(AttentionBackend):
                     lean_Op=self.cuda_graph_lean_Op,
                     lean_locks=self.cuda_graph_lean_locks,
                 )
-                self._decode_graph_metadata[bs] = self.forward_metadata
                 return
 
             self._apply_cuda_graph_metadata(
@@ -761,9 +774,7 @@ class TritonAttnBackend(AttentionBackend):
                 swa_out_cache_loc,
                 out_cache_loc_full_physical,
             )
-            self._decode_graph_metadata[bs] = self.forward_metadata
         else:
-            self.forward_metadata = self._decode_graph_metadata[bs]
             self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
@@ -817,6 +828,8 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+        if self.dllm_attention is not None:
+            self.dllm_attention.graph_mode = False
         self._dense_one_shot_kv_indptr = None
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
@@ -1079,6 +1092,8 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
+        if self.dllm_attention is not None:
+            self.dllm_attention.init_graph_state(max_bs, max_num_tokens)
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
@@ -1799,8 +1814,8 @@ class TritonAttnBackend(AttentionBackend):
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous() if self.requires_contiguous_current_kv else k,
-            v.contiguous() if self.requires_contiguous_current_kv else v,
+            k.contiguous() if self.dllm_attention is None else k,
+            v.contiguous() if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1827,6 +1842,8 @@ class TritonAttnBackend(AttentionBackend):
         return o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
+        if self.dllm_attention is not None:
+            return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)
 
     def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):

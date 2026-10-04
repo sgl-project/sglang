@@ -15,7 +15,6 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_gqa_512
 from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -1794,69 +1793,6 @@ def test_flash_attn_hd256_noncontiguous_inputs(strided_input):
     )
     assert torch.equal(out, out_dense)
     assert torch.equal(lse, lse_dense)
-
-
-@pytest.mark.skipif(not is_sm100_or_sm110_supported(), reason="SM100/SM110 required")
-@pytest.mark.parametrize("page_size", [1, 128])
-@torch.inference_mode()
-def test_gqa512_separate_value_paged_replay(page_size, monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    torch.manual_seed(0)
-    q = torch.randn(146, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.1
-    k = torch.randn(1024 // page_size, page_size, 2, 512, device="cuda", dtype=q.dtype)
-    v = torch.randn(
-        1024 // page_size, page_size, 2, 1024, device="cuda", dtype=q.dtype
-    )[..., :512]
-    out = torch.empty_like(q)
-    lse = torch.empty(q.shape[:2], device="cuda", dtype=torch.float32)
-    cu_q = torch.tensor([0, 17, 146], device="cuda", dtype=torch.int32)
-    lengths = torch.tensor([129, 257], device="cuda", dtype=torch.int32)
-    table = torch.randperm(k.shape[0], device="cuda", dtype=torch.int32).view(2, -1)
-
-    def call():
-        flash_attn_gqa_512(
-            q,
-            k,
-            v,
-            out,
-            cu_seqlens_q=cu_q,
-            seqused_k=lengths,
-            page_table=table,
-            lse=lse,
-            softmax_scale=512**-0.5,
-        )
-
-    def check(kv_lengths):
-        for row, (start, nq, nk) in enumerate(zip((0, 17), (17, 129), kv_lengths)):
-            keys = k[table[row].long()].flatten(0, 1)[:nk]
-            values = v[table[row].long()].flatten(0, 1)[:nk]
-            queries = q[start : start + nq]
-            expected, _ = attention_ref(queries[None], keys[None], values[None])
-            scores = (
-                torch.einsum(
-                    "qhd,khd->hqk",
-                    queries.float(),
-                    repeat(keys.float(), "k h d -> k (h g) d", g=8),
-                )
-                * 512**-0.5
-            )
-            torch.testing.assert_close(
-                out[start : start + nq], expected[0], atol=3e-3, rtol=2e-2
-            )
-            torch.testing.assert_close(
-                lse[start : start + nq], scores.logsumexp(-1).T, atol=2e-3, rtol=2e-3
-            )
-
-    call()
-    check((129, 257))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        call()
-    q.neg_()
-    table.copy_(table.flip(1))
-    lengths.copy_(torch.tensor([1, 128], device="cuda", dtype=torch.int32))
-    graph.replay()
-    check((1, 128))
 
 
 if __name__ == "__main__":

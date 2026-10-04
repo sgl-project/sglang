@@ -591,7 +591,7 @@ register_kernel(
         ),
         format_signature=FormatSignature(
             supported_dtypes=_NORM_DTYPES,
-            description="Three weighted RMSNorm outputs sharing a contiguous [M,2816] input.",
+            description="Three weighted RMSNorm outputs sharing a single-CTA row reduction.",
         ),
     )
 )

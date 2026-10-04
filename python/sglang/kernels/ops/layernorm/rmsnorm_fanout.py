@@ -4,25 +4,39 @@
 """Three RMSNorm outputs sharing FlashInfer's input load and reduction.
 
 Uses the CuTe RMSNormKernel layout/reduction interface from FlashInfer 0.6.18.
-The model dispatch covers SM100, FP16/BF16, width 2816 and up to 2048 rows.
+The row-count dispatch covers the measured decode buckets on Blackwell.
 """
 
 from functools import cache
 
 import torch
 
+_FANOUT_MAX_ROWS = 2048
+
+
+def can_use_rmsnorm_fanout(x):
+    return (
+        0 < x.shape[0] <= _FANOUT_MAX_ROWS
+        and _fanout_kernel(x.dtype, x.shape[1]) is not None
+    )
+
+
+@cache
+def _fanout_kernel(dtype, width):
+    if dtype not in (torch.bfloat16, torch.float16):
+        return None
+    kernel = _fanout_kernel_type()(_cutlass_dtype(dtype), width)
+    return kernel if kernel.cluster_n == 1 else None
+
+
+def _cutlass_dtype(dtype):
+    import cutlass
+
+    return cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
+
 
 def rmsnorm_fanout(x, weight0, weight1, weight2, eps):
-    """Normalize contiguous [M,2816] input against three independent weights."""
-    assert x.ndim == 2 and x.is_cuda and x.is_contiguous()
-    assert x.dtype in (torch.float16, torch.bfloat16) and x.shape[1] == 2816
-    assert all(
-        weight.shape == (x.shape[1],)
-        and weight.dtype == x.dtype
-        and weight.device == x.device
-        and weight.is_contiguous()
-        for weight in (weight0, weight1, weight2)
-    )
+    """Normalize contiguous FP16/BF16 rows with three matching [H] weights."""
     outputs = tuple(torch.empty_like(x) for _ in range(3))
     compiled = _compile_fanout(x.device, x.dtype, x.shape[1])
     compiled(x, weight0, weight1, weight2, *outputs, x.shape[0], eps)
@@ -34,10 +48,8 @@ def _compile_fanout(device, torch_dtype, width):
     import cutlass
     import cutlass.cute as cute
 
-    dtype = cutlass.BFloat16 if torch_dtype == torch.bfloat16 else cutlass.Float16
-    kernel_type = _fanout_kernel_type()
-    kernel = kernel_type(dtype, width)
-    assert kernel.cluster_n == 1
+    dtype = _cutlass_dtype(torch_dtype)
+    kernel = _fanout_kernel(torch_dtype, width)
     rows = cute.sym_int(64)
     matrix = cute.runtime.make_fake_compact_tensor(
         dtype, (rows, width), stride_order=(1, 0), assumed_align=16
@@ -59,6 +71,7 @@ def _compile_fanout(device, torch_dtype, width):
     )
 
 
+@cache
 def _fanout_kernel_type():
     import cutlass
     import cutlass.cute as cute

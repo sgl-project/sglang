@@ -75,12 +75,20 @@ def flash_attn_gqa_512(
         seqused_k,
         page_table,
     )
+    use_cpasync = page_table is not None and k.shape[1] != 128
     key = (
         pack_gqa,
         causal,
         q.device,
+        q.shape[-2] // k.shape[-2],
+        k.shape[-2],
+        q.shape[-1],
+        v.shape[-1],
+        use_cpasync,
         tuple(
-            (tuple(t.shape), t.stride(), t.dtype) if isinstance(t, torch.Tensor) else t
+            (t.ndim, t.dtype, tuple(s if s in (0, 1) else 2 for s in t.stride()))
+            if isinstance(t, torch.Tensor)
+            else t
             for t in args
         ),
     )
@@ -99,7 +107,7 @@ def flash_attn_gqa_512(
         ]
         kernel = FlashAttentionMLAForwardSm100(
             is_causal=causal,
-            use_cpasync_load_KV=page_table is not None and k.shape[1] != 128,
+            use_cpasync_load_KV=use_cpasync,
             is_topk_gather=False,
             pack_gqa=pack_gqa,
             qhead_per_kvhead=q.shape[-2] // k.shape[-2],

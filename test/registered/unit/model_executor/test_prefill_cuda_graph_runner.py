@@ -173,7 +173,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.model_runner = model_runner
         runner.device = torch.device("cpu")
         runner.prefill_backend_name = Backend.BREAKABLE
-        runner._is_full_backend = False
         runner.max_context_size = None
         runner._capture_req_slots = 1
         runner.max_bs = 4

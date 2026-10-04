@@ -288,6 +288,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     _use_draft_input_embeds = False
     _backend_can_run_prefill_cuda_graph = None
+    dllm_attention = None
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -297,8 +298,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"graph backend; got '{backend}'."
             )
         super().__init__(model_runner)
-        self._backend_can_run_prefill_cuda_graph = getattr(
-            model_runner.attn_backend, "can_run_prefill_cuda_graph", None
+        self.dllm_attention = model_runner.attn_backend.dllm_attention
+        self._backend_can_run_prefill_cuda_graph = (
+            self.dllm_attention.can_run_prefill_cuda_graph
+            if self.dllm_attention is not None
+            else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
         )
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
@@ -481,6 +485,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
+            if self.dllm_attention is not None:
+                self.dllm_attention.init_prefill_graph_state(
+                    max_req, self.capture_num_tokens
+                )
 
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
@@ -507,7 +515,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_chunked_prefix = (
             self._is_full_backend
             and not get_schedule().disable_chunked_prefix_cache
-            and model_runner.attn_backend.full_cuda_graph_uses_chunked_prefix
+            and self.dllm_attention is None
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -1408,11 +1416,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
         )
-        if self._is_full_backend:
-            query_limit = (
-                self.model_runner.attn_backend.get_prefill_cuda_graph_max_query_len(
-                    num_tokens, self._capture_req_slots
-                )
+        if self.dllm_attention is not None and self._is_full_backend:
+            query_limit = self.dllm_attention.get_prefill_cuda_graph_max_query_len(
+                num_tokens, self._capture_req_slots
             )
             if query_limit is not None:
                 context_length = min(context_length, query_limit)

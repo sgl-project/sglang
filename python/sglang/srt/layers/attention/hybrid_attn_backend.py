@@ -95,25 +95,12 @@ class HybridAttnBackend(AttentionBackend):
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
 
     @property
-    def full_cuda_graph_uses_chunked_prefix(self) -> bool:
-        return self.prefill_backend.full_cuda_graph_uses_chunked_prefix
+    def dllm_attention(self):
+        return self.prefill_backend.dllm_attention
 
     @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
-
-    def get_cuda_graph_variants(self, model_runner, forward_mode, captured_req_width):
-        return self._select_backend(forward_mode).get_cuda_graph_variants(
-            model_runner, forward_mode, captured_req_width
-        )
-
-    def can_run_prefill_cuda_graph(self, forward_batch):
-        return self.prefill_backend.can_run_prefill_cuda_graph(forward_batch)
-
-    def get_prefill_cuda_graph_max_query_len(self, num_tokens, max_requests):
-        return self.prefill_backend.get_prefill_cuda_graph_max_query_len(
-            num_tokens, max_requests
-        )
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,

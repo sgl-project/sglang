@@ -23,7 +23,10 @@ from transformers import PreTrainedModel
 
 from sglang.kernels.ops.attention.gemma_qkv_norm_rope import gemma_qkv_norm_rope
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
-from sglang.kernels.ops.layernorm.rmsnorm_fanout import rmsnorm_fanout
+from sglang.kernels.ops.layernorm.rmsnorm_fanout import (
+    can_use_rmsnorm_fanout,
+    rmsnorm_fanout,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -314,6 +317,7 @@ class DiffusionGemmaDecoderLayer(nn.Module):
             ),
         )
 
+        self.use_fanout = is_sm100_supported() and not is_batch_invariant_mode_enabled()
         eps = config.rms_norm_eps
         self.input_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=eps)
@@ -335,14 +339,7 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        use_fanout = (
-            residual.is_cuda
-            and residual.dtype in (torch.bfloat16, torch.float16)
-            and 0 < residual.shape[0] <= 2048
-            and residual.shape[1] == 2816
-            and is_sm100_supported()
-            and not is_batch_invariant_mode_enabled()
-        )
+        use_fanout = self.use_fanout and can_use_rmsnorm_fanout(residual)
         if use_fanout:
             if not self.router._scale_fused:
                 self.router.fuse_scale()
@@ -529,7 +526,7 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         is_context_encoding = not forward_batch.forward_mode.is_dllm_extend()
         if not is_context_encoding and input_embeds is None:
             input_embeds = self.prepare_dllm_input_embeds(
-                input_ids, forward_batch.input_preparation_state
+                input_ids, forward_batch.dllm_input_preparation_state
             )
         if is_context_encoding and forward_batch.contains_image_inputs():
             Gemma4ForConditionalGeneration.prepare_attn_masks(

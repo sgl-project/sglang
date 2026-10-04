@@ -49,6 +49,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
+    create_attention_graph_variants,
+    create_dsv41_candidate_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
@@ -219,7 +221,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
-    input_preparation = None
+    dllm_input_preparation = None
+    dllm_attention = None
 
     def __init__(
         self,
@@ -269,11 +272,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
-        self.input_preparation = None
+        self.dllm_input_preparation = None
         if self.is_dllm and self.dllm_config.capture_input_preparation:
             from sglang.srt.dllm.algorithm import get_algorithm_cls
 
-            self.input_preparation = get_algorithm_cls(
+            self.dllm_input_preparation = get_algorithm_cls(
                 self.dllm_config.algorithm
             ).prepare_graph_inputs
         self.dllm_uses_input_embeds = (
@@ -307,11 +310,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
+        self.dllm_attention = self.attn_backend.dllm_attention
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
-            self.attn_backend.get_cuda_graph_variants(
+            self.dllm_attention.graph_variants(self.captured_req_width)
+            if self.dllm_attention is not None and self.is_dllm
+            else create_attention_graph_variants(model_runner.model_config.hf_config)
+            or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
         )
+
+        if (
+            self.dllm_attention is not None
+            and self.attention_graph_variants is not None
+        ):
+            self._resolve_attention_variant = self.attention_graph_variants.select
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -458,11 +471,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_dp_ranks=self.num_dp_ranks,
             source=self.buffers,
         )
-        if self.input_preparation is not None:
+        if self.dllm_input_preparation is not None:
             width = self.buffers.input_embeds.shape[-1]
             self.buffer_registry.register_slot(
                 GraphSlot(
-                    "input_preparation_state",
+                    "dllm_input_preparation_state",
                     lambda bs, tokens: (tokens, width),
                     self.buffers.input_embeds.dtype,
                     axis="tokens",
@@ -601,11 +614,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, capture_batch_size: int
     ) -> Optional[str]:
         variants = self.attention_graph_variants
-        return (
-            variants.select(forward_batch, capture_batch_size)
-            if variants is not None
-            else None
-        )
+        if variants is None:
+            return None
+        return variants.select(forward_batch)
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -1234,13 +1245,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
-                    if self.input_preparation is None:
+                    if self.dllm_input_preparation is None:
                         kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
                     else:
                         state = self.buffer_registry.get_slot(
-                            "input_preparation_state"
+                            "dllm_input_preparation_state"
                         ).buffer[:num_tokens]
-                        kwargs["input_embeds"] = self.input_preparation(
+                        kwargs["input_embeds"] = self.dllm_input_preparation(
                             self.model_runner.model, forward_batch.input_ids, state
                         )
 
@@ -1304,7 +1315,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         if (
             self.dllm_uses_input_embeds
-            and self.input_preparation is None
+            and self.dllm_input_preparation is None
             and forward_batch.input_embeds is None
         ):
             raise ValueError(
@@ -1320,12 +1331,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
-            if self.input_preparation is not None:
-                state = self.buffer_registry.get_slot("input_preparation_state").buffer
-                source = forward_batch.input_preparation_state
-                state[: source.shape[0]].copy_(source)
-                state[source.shape[0] :].zero_()
-                self.buffers.input_ids[source.shape[0] :].zero_()
+            if self.dllm_input_preparation is not None:
+                slot = self.buffer_registry.get_slot("dllm_input_preparation_state")
+                source = forward_batch.dllm_input_preparation_state
+                padded_tokens = self.bs * self.captured_req_width
+                slot.buffer[: self.raw_num_token].copy_(source)
+                slot.reset_padding(self.raw_num_token, padded_tokens)
+                self.buffers.input_ids[self.raw_num_token : padded_tokens].zero_()
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             graph_size_key = (

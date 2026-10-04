@@ -103,6 +103,10 @@ def div_argmax(x: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
         and divisor.device == x.device
         and divisor.stride(1) == 1
     )
+    return _medium_row_argmax(x, divisor)
+
+
+def _medium_row_argmax(x, divisor=None):
     rows, n = x.shape
     block = 4096 if rows <= 256 else 8192
     splits = triton.cdiv(n, block)
@@ -118,7 +122,7 @@ def div_argmax(x: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
         splits,
         block,
         DIVISOR=divisor,
-        SD=divisor.stride(0),
+        SD=divisor.stride(0) if divisor is not None else 0,
         num_warps=4,
     )
     _medium_argmax_final_kernel[(rows,)](
@@ -131,21 +135,9 @@ def row_argmax(x: torch.Tensor) -> torch.Tensor:
     """``x.argmax(dim=-1)`` for FP32 speculative logits with a wide vocab."""
     assert x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
     rows, n = x.shape
-    out = torch.empty((rows,), dtype=torch.int64, device=x.device)
     if rows > 64:
-        # Whole aligned tiles avoid the loop and unaligned partition starts.
-        # Larger batches use wider tiles to limit the total number of CTAs.
-        block = 4096 if rows <= 256 else 8192
-        splits = triton.cdiv(n, block)
-        pv = torch.empty((rows, splits), dtype=torch.float32, device=x.device)
-        pi = torch.empty((rows, splits), dtype=torch.int32, device=x.device)
-        _medium_argmax_partial_kernel[(rows, splits)](
-            x, pv, pi, n, x.stride(0), splits, block, num_warps=4
-        )
-        _medium_argmax_final_kernel[(rows,)](
-            pv, pi, out, splits, triton.next_power_of_2(splits), num_warps=1
-        )
-        return out
+        return _medium_row_argmax(x)
+    out = torch.empty((rows,), dtype=torch.int64, device=x.device)
     pv = torch.empty((rows, _SPLITS), dtype=torch.float32, device=x.device)
     pi = torch.empty((rows, _SPLITS), dtype=torch.int32, device=x.device)
     _argmax_partial_kernel[(rows, _SPLITS)](

@@ -1,6 +1,10 @@
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
-"""FA4 dense attention using Triton's paged-cache metadata and KV writes."""
+"""dLLM FA4 compute and graph workspaces over Triton paged-cache metadata."""
+
+from dataclasses import dataclass
+from functools import cache
+from typing import ClassVar
 
 import torch
 
@@ -10,25 +14,14 @@ from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_gqa_512
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
     flash_attn_varlen_func,
 )
-from sglang.srt.layers.attention.graph_variants import (
-    DLLM_FULL_WINDOW,
-    DllmWindowGraphVariants,
-)
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
-    TritonAttnBackend,
     update_sliding_window_buffer,
 )
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import get_device_capability
 
 
@@ -41,119 +34,180 @@ class _DenseKVWorkspace:
         self.indices = torch.arange(capacity, device=device, dtype=torch.int64)
         self.window_start = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
-    def view(self, capacity, batch_size):
+    def fits(self, capacity, batch_size, heads, dim):
         return (
-            self.key[:capacity],
-            self.value[:capacity],
+            capacity * heads * dim <= self.key.numel()
+            and capacity <= self.indices.numel()
+            and batch_size < self.cu_seqlens.numel()
+        )
+
+    def view(self, capacity, batch_size, heads, dim):
+        shape = (capacity, heads, dim)
+        elements = capacity * heads * dim
+        return (
+            self.key.view(-1)[:elements].view(shape),
+            self.value.view(-1)[:elements].view(shape),
             self.cu_seqlens[: batch_size + 1],
             self.indices[:capacity],
             self.window_start[:batch_size],
         )
 
 
-class FlashAttentionDenseBackend(TritonAttnBackend):
-    """FA4 D256/D512 attention over Triton's paged-prefix metadata."""
+DLLM_VARLEN = "dllm_varlen"
+DLLM_FULL_WINDOW = "dllm_full_window"
 
-    requires_contiguous_current_kv = False
-    full_cuda_graph_uses_chunked_prefix = False
 
-    @staticmethod
-    def supports_model(model_config):
-        """Models validated with this adapter's paged-prefix metadata."""
-        return "DiffusionGemmaForBlockDiffusion" in model_config.hf_config.architectures
+@dataclass(frozen=True)
+class DllmWindowGraphVariants:
+    window_size: int
+    block_size: int
+    capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
 
-    def __init__(self, model_runner):
-        assert get_device_capability()[0] == 10, (
-            "Dense FA4 D256/D512 requires an SM100-family GPU."
-        )
-        super().__init__(model_runner)
-        self.qo_indptr = self.qo_indptr.to(torch.int32)
-        self._dense_workspaces = {}
-        self._prefill_graph_metadata = {}
-        self._prefill_capture_sizes = set(
-            get_exec().graph.cuda_graph_config.prefill.bs or ()
-        )
-        graphs = get_exec().graph.cuda_graph_config
-        self._dense_graph_slots = (
-            min(
-                max(graphs.decode.bs or (graphs.decode.max_bs or 1,)),
-                get_schedule().max_running_requests or 1,
-            )
-            if graphs.decode.backend != Backend.DISABLED
-            else 1
-        )
-        self._dense_graph_tokens = self._dense_graph_slots * self.dllm_block_size
-        self._prefill_capture_max_requests = graphs.prefill.full_prefill_max_req or 1
-        if graphs.prefill.backend == Backend.FULL:
-            self._dense_graph_slots = max(
-                self._dense_graph_slots, graphs.prefill.full_prefill_max_req or 1
-            )
-            self._dense_graph_tokens = max(
-                self._dense_graph_tokens,
-                max(graphs.prefill.bs or (graphs.prefill.max_bs or 1,)),
-            )
-        self.supports_prefill_cuda_graph_max_context_size = check_cuda_graph_backend(
-            Phase.PREFILL, Backend.FULL
-        )
-
-    def get_cuda_graph_variants(self, model_runner, forward_mode, captured_req_width):
+    def select(self, forward_batch: ForwardBatch, capture_batch_size: int) -> str:
+        lengths = forward_batch.seq_lens_cpu
         if (
-            forward_mode.is_dllm_extend()
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
+            forward_batch.batch_size > 0
+            and capture_batch_size == forward_batch.batch_size
+            and forward_batch.forward_mode.is_dllm_extend()
+            and forward_batch.input_ids.numel()
+            == forward_batch.batch_size * self.block_size
+            and lengths is not None
+            and int(lengths[: forward_batch.batch_size].min()) - self.block_size
+            >= self.window_size
         ):
-            return DllmWindowGraphVariants(self.sliding_window_size, captured_req_width)
-        return super().get_cuda_graph_variants(
-            model_runner, forward_mode, captured_req_width
+            return DLLM_FULL_WINDOW
+        return DLLM_VARLEN
+
+
+class DllmFlashAttention:
+    """FA4 computation and context-encoding graphs for DiffusionGemma."""
+
+    def __init__(self, backend):
+        assert get_device_capability()[0] == 10, (
+            "dLLM FA4 D256/D512 requires an SM100-family GPU."
         )
+        self.backend = backend
+        self.graph_mode = False
+        self._graph_workspaces = {}
+        self._eager_workspaces = {}
+        self._prefill_graph_metadata = {}
+        self.decode_graph_metadata = {}
+        self._graph_slots = self._graph_tokens = 0
+        self._prefill_capture_sizes = set()
+        self._prefill_capture_max_requests = 0
 
-    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            self._init_full_prefill_metadata(forward_batch, in_capture)
-        else:
-            super().init_forward_metadata_out_graph(forward_batch, in_capture)
+    def init_graph_state(self, max_requests, max_tokens):
+        self._graph_slots = max(self._graph_slots, max_requests)
+        self._graph_tokens = max(self._graph_tokens, max_tokens)
 
-    def _init_full_prefill_metadata(self, batch, in_capture):
+    def init_prefill_graph_state(self, max_requests, capture_tokens):
+        self.init_graph_state(max_requests, max(capture_tokens))
+        self._prefill_capture_sizes = set(capture_tokens)
+        self._prefill_capture_max_requests = max_requests
+
+    def graph_variants(self, block_size):
+        window = self.backend.sliding_window_size
+        if window is not None and window > 0:
+            return DllmWindowGraphVariants(window, block_size)
+        return None
+
+    def _workspace(self, key, capacity, batch_size, heads, dim, query):
+        if self.graph_mode:
+            capacity = self._graph_slots * key[0] + self._graph_tokens
+            batch_size = self._graph_slots
+        captured = self._graph_workspaces.setdefault(key, [])
+        candidates = (
+            captured
+            if self.graph_mode
+            else (w for group in self._graph_workspaces.values() for w in group)
+        )
+        workspace = next(
+            (
+                w
+                for w in candidates
+                if w.key.dtype == query.dtype
+                and w.fits(capacity, batch_size, heads, dim)
+            ),
+            None,
+        )
+        if workspace is None:
+            workspace = self._eager_workspaces.get(key)
+            if workspace is None or not workspace.fits(
+                capacity, batch_size, heads, dim
+            ):
+                workspace = _DenseKVWorkspace(
+                    capacity, heads, dim, batch_size, query.device, query.dtype
+                )
+            if self.graph_mode:
+                # Keep earlier captures' allocations alive when a later runner needs more capacity.
+                captured.append(workspace)
+                self._eager_workspaces.pop(key, None)
+            else:
+                self._eager_workspaces[key] = workspace
+        return workspace
+
+    def init_forward_metadata_out_graph(self, batch, in_capture):
+        self._eager_workspaces.clear()
+        self.graph_mode = True
+        if batch.forward_mode == ForwardMode.EXTEND:
+            return self.init_prefill_metadata(batch, in_capture)
+        bs = batch.batch_size
+        if not in_capture:
+            self.backend.forward_metadata = self.decode_graph_metadata[bs]
+        self.backend._init_forward_metadata_out_graph(batch, in_capture)
+        if in_capture:
+            self.decode_graph_metadata[bs] = self.backend.forward_metadata
+
+    def init_prefill_metadata(self, batch, in_capture):
+        backend = self.backend
         bs, tokens = batch.batch_size, batch.input_ids.numel()
         key = (bs, tokens)
         if in_capture:
-            capacity = batch.max_seq_len_override or self.max_context_len
-            swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+            self.init_graph_state(bs, tokens)
+            capacity = batch.max_seq_len_override or backend.max_context_len
+            swa = (
+                backend.sliding_window_size is not None
+                and backend.sliding_window_size > 0
+            )
             self._prefill_graph_metadata[key] = ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
                 num_kv_splits=None,
                 max_extend_len=max(batch.extend_seq_lens_cpu),
-                kv_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=self.device),
+                kv_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=backend.device),
                 kv_indices=torch.empty(
-                    bs * capacity, dtype=torch.int64, device=self.device
+                    bs * capacity, dtype=torch.int64, device=backend.device
                 ),
-                qo_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=self.device),
+                qo_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=backend.device),
                 custom_mask=None,
                 mask_indptr=None,
                 window_kv_indptr=torch.zeros(
-                    bs + 1, dtype=torch.int32, device=self.device
+                    bs + 1, dtype=torch.int32, device=backend.device
                 )
                 if swa
                 else None,
                 window_kv_indices=torch.empty(
-                    bs * self.sliding_window_size, dtype=torch.int64, device=self.device
+                    bs * backend.sliding_window_size,
+                    dtype=torch.int64,
+                    device=backend.device,
                 )
                 if swa
                 else None,
                 window_num_kv_splits=None,
-                window_kv_offsets=torch.empty(bs, dtype=torch.int64, device=self.device)
+                window_kv_offsets=torch.empty(
+                    bs, dtype=torch.int64, device=backend.device
+                )
                 if swa
                 else None,
                 swa_out_cache_loc=torch.empty_like(batch.out_cache_loc)
-                if self.use_sliding_window_kv_pool
+                if backend.use_sliding_window_kv_pool
                 else None,
                 out_cache_loc_full_physical=torch.empty_like(batch.out_cache_loc)
-                if self.kv_index_translator.is_translating
+                if backend.kv_index_translator.is_translating
                 else None,
             )
         metadata = self._prefill_graph_metadata[key]
-        self._fill_kv_indptr_and_indices(
+        backend._fill_kv_indptr_and_indices(
             bs,
             batch.extend_prefix_lens,
             batch.req_pool_indices,
@@ -165,40 +219,38 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
         if metadata.window_kv_indices is not None:
             _, _, _, offsets = update_sliding_window_buffer(
                 metadata.window_kv_indptr,
-                self.kv_index_translator,
+                backend.kv_index_translator,
                 batch.req_pool_indices,
-                self.sliding_window_size,
+                backend.sliding_window_size,
                 batch.extend_prefix_lens,
                 bs,
-                self.device,
-                self.token_to_kv_pool,
+                backend.device,
+                backend.token_to_kv_pool,
                 window_kv_indices=metadata.window_kv_indices,
             )
             metadata.window_kv_offsets.copy_(offsets)
         if metadata.swa_out_cache_loc is not None:
             metadata.swa_out_cache_loc.copy_(
-                self.kv_index_translator.sliding_window_write_loc_for(
+                backend.kv_index_translator.sliding_window_write_loc_for(
                     batch.out_cache_loc
                 )
             )
         if metadata.out_cache_loc_full_physical is not None:
-            self.kv_index_translator.fill_capture_write_loc(
+            backend.kv_index_translator.fill_capture_write_loc(
                 out=metadata.out_cache_loc_full_physical,
                 forward_batch=batch,
                 width=metadata.out_cache_loc_full_physical.numel(),
             )
-        self.forward_metadata = metadata
+        backend.forward_metadata = metadata
 
     def can_run_prefill_cuda_graph(self, batch):
-        if not check_cuda_graph_backend(Phase.PREFILL, Backend.FULL):
-            return True
         query_limit = self.get_prefill_cuda_graph_max_query_len(
             batch.input_ids.numel(), self._prefill_capture_max_requests
         )
         return (
             batch.forward_mode == ForwardMode.EXTEND
             and batch.input_ids.numel() in self._prefill_capture_sizes
-            and self.dcp_size == 1
+            and self.backend.dcp_size == 1
             and not batch.contains_image_inputs()
             and (
                 query_limit is None
@@ -207,11 +259,28 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
         )
 
     def get_prefill_cuda_graph_max_query_len(self, num_tokens, max_requests):
-        if num_tokens <= max_requests * self.dllm_block_size:
-            return self.dllm_block_size
+        if num_tokens <= max_requests * self.backend.dllm_block_size:
+            return self.backend.dllm_block_size
         return None
 
-    def _forward_extend_kernel(
+    @cache
+    def _supports_layer(self, layer, dtype):
+        pool = self.backend.token_to_kv_pool
+        buffers = (
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+        )
+        return (
+            layer.qk_head_dim == layer.v_head_dim
+            and layer.qk_head_dim in (256, 512)
+            and dtype in (torch.float16, torch.bfloat16)
+            and all(
+                buffer.ndim == 3 and buffer.dtype == dtype and buffer.stride(-1) == 1
+                for buffer in buffers
+            )
+        )
+
+    def forward_extend(
         self,
         layer,
         q,
@@ -233,25 +302,13 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
         **options,
     ):
         if (
-            q.shape[-1] not in (256, 512)
-            or q.dtype not in (torch.float16, torch.bfloat16)
-            or k.shape[-1] != q.shape[-1]
-            or v.shape[-1] != q.shape[-1]
-            or kb.ndim != 3
-            or vb.ndim != 3
-            or kb.dtype != q.dtype
-            or vb.dtype != q.dtype
-            or kb.stride(-1) != 1
-            or vb.stride(-1) != 1
+            not self._supports_layer(layer, q.dtype)
             or mask is not None
             or options.get("sinks") is not None
             or options.get("score_mod") is not None
             or options.get("logit_cap", 0.0)
-            or options.get("skip_prefix", False)
-            or options.get("skip_extend", False)
         ):
-            return super()._forward_extend_kernel(
-                layer,
+            return self.backend.extend_attention_fwd(
                 q,
                 k.contiguous(),
                 v.contiguous(),
@@ -275,24 +332,16 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size >= 0
         )
         prefix_capacity = (
-            self.sliding_window_size if is_window_layer else self.max_context_len
+            self.backend.sliding_window_size
+            if is_window_layer
+            else self.backend.max_context_len
         )
-        capacity = bs * prefix_capacity + q.shape[0]
+        prefix_tokens = bs * prefix_capacity if self.graph_mode else ids.numel()
+        capacity = prefix_tokens + q.shape[0]
         key = (prefix_capacity, heads, dim, q.dtype)
-        if key not in self._dense_workspaces:
-            self._dense_workspaces[key] = _DenseKVWorkspace(
-                self._dense_graph_slots * prefix_capacity + self._dense_graph_tokens,
-                heads,
-                dim,
-                self._dense_graph_slots,
-                q.device,
-                q.dtype,
-            )
-        workspace = self._dense_workspaces[key]
-        if capacity > workspace.key.shape[0] or bs > self._dense_graph_slots:
-            workspace = _DenseKVWorkspace(capacity, heads, dim, bs, q.device, q.dtype)
+        workspace = self._workspace(key, capacity, bs, heads, dim, q)
         dense_k, dense_v, cu_seqlens, dense_ids, window_start = workspace.view(
-            capacity, bs
+            capacity, bs, heads, dim
         )
         pack_prefix_current(
             k,

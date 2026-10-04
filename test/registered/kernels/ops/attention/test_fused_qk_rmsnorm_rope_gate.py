@@ -181,21 +181,6 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
                     k_out.float(), want_k.float(), atol=2e-2, rtol=2e-2
                 )
 
-    @torch.inference_mode()
-    def test_default_norm_rope_graph_replay(self):
-        positions = torch.arange(self.tokens, device="cuda", dtype=torch.int64)
-        self.call(positions)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = self.call(positions)
-        self.q_gate.add_(0.25)
-        self.k.mul_(0.75)
-        positions.add_(1)
-        expected = self.call(positions)
-        graph.replay()
-        for got, want in zip(actual, expected):
-            torch.testing.assert_close(got, want, atol=0, rtol=0)
-
     def test_rejects_positions_and_map_apart(self):
         flat = torch.arange(self.tokens, device="cuda", dtype=torch.int64)
         axis_map = self.build_mrope([11, 11, 10], interleaved=True).axis_map

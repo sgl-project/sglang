@@ -45,15 +45,17 @@ def _use_split_denoiser_statistics(logits, temperatures):
     )
 
 
-def _denoiser_statistics_cuda(logits, temperatures, soft_probabilities=None):
+def _denoiser_statistics_cuda(logits, temperatures, *, write_soft=False):
+    soft_probabilities = None
     if _use_split_denoiser_statistics(logits, temperatures):
         from sglang.kernels.ops.sampling.denoiser_statistics import denoiser_statistics
 
-        return denoiser_statistics(logits, temperatures, soft_probabilities)
-    result = _compiled_denoiser_statistics(logits, temperatures)
-    if soft_probabilities is not None:
-        soft_probabilities.copy_(result[0])
-    return result
+        if write_soft:
+            soft_probabilities = torch.empty_like(logits, dtype=torch.bfloat16)
+        result = denoiser_statistics(logits, temperatures, soft_probabilities)
+    else:
+        result = _compiled_denoiser_statistics(logits, temperatures)
+    return *result, soft_probabilities
 
 
 def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
@@ -300,18 +302,17 @@ class Gemma4Renoise(DllmAlgorithm):
                 )
             zero = self._zero_signals[key]
             shape = (len(states) * self.block_size, weight.shape[-1])
-            batched = getattr(forward_batch, "input_preparation_state", None)
+            batched = forward_batch.dllm_input_preparation_state
             if batched is None or batched.shape != shape:
                 batched = weight.new_empty(shape)
             torch.stack(
                 [zero if value is None else value for value in signals],
                 out=batched.view(len(states), self.block_size, -1),
             )
-            forward_batch.input_preparation_state = batched
+            forward_batch.dllm_input_preparation_state = batched
             signal = batched
 
         if self.use_graph_input_preparation:
-            forward_batch.input_preparation_state = signal
             forward_batch.input_embeds = None
         else:
             forward_batch.input_embeds = model_runner.model.prepare_dllm_input_embeds(
@@ -386,16 +387,16 @@ class Gemma4Renoise(DllmAlgorithm):
 
         temperatures = self._temperatures(logits, states)
         soft_probabilities = None
-        if (
-            logits.is_cuda
-            and _use_split_denoiser_statistics(logits, temperatures)
-            and self.embed_tokens.weight.dtype == torch.bfloat16
-            and getattr(self.embed_tokens, "tp_size", 1) == 1
-        ):
-            soft_probabilities = torch.empty_like(logits, dtype=torch.bfloat16)
         if logits.is_cuda:
-            probabilities, token_entropies, argmax_tokens = _denoiser_statistics_cuda(
-                logits, temperatures, soft_probabilities
+            probabilities, token_entropies, argmax_tokens, soft_probabilities = (
+                _denoiser_statistics_cuda(
+                    logits,
+                    temperatures,
+                    write_soft=(
+                        self.embed_tokens.weight.dtype == torch.bfloat16
+                        and getattr(self.embed_tokens, "tp_size", 1) == 1
+                    ),
+                )
             )
         else:
             probabilities, token_entropies, argmax_tokens = _denoiser_statistics(

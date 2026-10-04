@@ -12,44 +12,15 @@ logger = logging.getLogger(__name__)
 
 DSA_DENSE = "dense"
 DSA_SPARSE = "sparse"
-DLLM_VARLEN = "dllm_varlen"
-DLLM_FULL_WINDOW = "dllm_full_window"
 
 
 class AttentionGraphVariants(Protocol):
-    # Ordered variants captured in each batch's shared graph memory pool.
-    capture_labels: tuple[str, ...]
+    # Capture order is significant when variants share a graph memory pool.
+    capture_labels: ClassVar[tuple[str, ...]]
 
-    def select(
-        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
-    ) -> str:
-        """Select a variant for the actual batch and its padded capture size."""
+    def select(self, forward_batch: ForwardBatch) -> str:
+        """Select one of capture_labels for the batch."""
         ...
-
-
-@dataclass(frozen=True)
-class DllmWindowGraphVariants:
-    window_size: int
-    block_size: int
-    capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
-
-    def select(
-        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
-    ) -> str:
-        lengths = forward_batch.seq_lens_cpu
-        if (
-            forward_batch.batch_size > 0
-            and capture_batch_size in (None, forward_batch.batch_size)
-            and forward_batch.forward_mode.is_dllm_extend()
-            and forward_batch.input_ids.numel()
-            == forward_batch.batch_size * self.block_size
-            and lengths is not None
-            and lengths.device.type == "cpu"
-            and int(lengths[: forward_batch.batch_size].min()) - self.block_size
-            >= self.window_size
-        ):
-            return DLLM_FULL_WINDOW
-        return DLLM_VARLEN
 
 
 @dataclass(frozen=True)
@@ -58,9 +29,7 @@ class DsaGraphVariants:
     # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
     capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
 
-    def select(
-        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
-    ) -> str:
+    def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
@@ -112,9 +81,7 @@ class Dsv41CandidateGraphVariants:
     capture_labels: tuple[str, ...]
     verify_extra_tokens: int = 0
 
-    def select(
-        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
-    ) -> str:
+    def select(self, forward_batch: ForwardBatch) -> str:
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
         max_seq_len = None
         if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
