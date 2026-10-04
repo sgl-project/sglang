@@ -210,7 +210,7 @@ class OffloaderV2(BaseOffloader):
         mode: str,
     ):
         parallel = get_parallel()
-        dp_rank, dp_size = parallel.dp_rank, parallel.dp_size
+        dp_rank, num_dp_ranks = parallel.dp_rank, parallel.num_dp_ranks
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
@@ -224,7 +224,7 @@ class OffloaderV2(BaseOffloader):
             set_naive_distributed(
                 NaiveDistributed(
                     rank=dp_rank,
-                    world_size=dp_size,
+                    world_size=num_dp_ranks,
                     rendezvous=f"/tmp/{run_id}",
                 )
             )
