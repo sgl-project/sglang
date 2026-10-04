@@ -113,7 +113,11 @@ def _flex_attention_fn():
     if _compiled_flex_attention is None:
         from torch.nn.attention.flex_attention import flex_attention
 
-        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+        # Large sparse grids make ROCm's global max-autotune prohibitively slow.
+        options = {"max_autotune": False} if current_platform.is_hip() else None
+        _compiled_flex_attention = torch.compile(
+            flex_attention, dynamic=False, options=options
+        )
     return _compiled_flex_attention
 
 
