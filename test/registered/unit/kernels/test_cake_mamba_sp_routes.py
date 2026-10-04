@@ -100,15 +100,16 @@ def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
         cpu,
     )
     assert mapped is not None
-    boundaries, tokens, slots = mapped
-    assert boundaries == [256, 812]
-    assert tokens.dtype == torch.int32 and tokens.tolist() == [256, 812, -1, -1]
-    assert slots.dtype == torch.int32 and slots.tolist() == [5, 6, -1, -1]
+    assert mapped.boundaries == (256, 812)
+    assert mapped.token_indices.dtype == torch.int32
+    assert mapped.token_indices.tolist() == [256, 812, -1, -1]
+    assert mapped.state_slots.dtype == torch.int32
+    assert mapped.state_slots.tolist() == [5, 6, -1, -1]
     # Prefix lengths shift the tracked length, not the packed positions.
-    boundaries, tokens, _ = mamba_mod.cake_ssd_track_checkpoints(
+    mapped = mamba_mod.cake_ssd_track_checkpoints(
         [True], [1000], [400], [600], 256, torch.tensor([3]), cpu
     )
-    assert boundaries == [256] and tokens.tolist() == [256]
+    assert mapped.boundaries == (256,) and mapped.token_indices.tolist() == [256]
     # A tracked row whose last boundary is its own start (chunk 0) is not
     # expressible as a Cake checkpoint: the batch stays on the stock path.
     assert (
@@ -117,14 +118,14 @@ def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
         )
         is None
     )
-    # No tracked row: an all -1 pair (the route still admits, the backend
-    # copies nothing).
-    boundaries, tokens, slots = mamba_mod.cake_ssd_track_checkpoints(
-        [False, False], [96, 160], [96, 160], [0, 0], 256, torch.tensor([1, 2]), cpu
-    )
-    assert (
-        boundaries == [] and tokens.tolist() == [-1, -1] and slots.tolist() == [-1, -1]
-    )
+    # Only chunk-aligned (or no) tracked rows: nothing to checkpoint, the
+    # route admits without checkpoint arguments (the default-configuration
+    # case: the track grid is a multiple of the model chunk size).
+    for mask in ([False, False], [True, False]):
+        mapped = mamba_mod.cake_ssd_track_checkpoints(
+            mask, [512, 160], [512, 160], [0, 0], 256, torch.tensor([1, 2]), cpu
+        )
+        assert mapped == mamba_mod.CakeTrackCheckpoints((), None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +279,11 @@ def _tracked_inputs(**overrides):
     inputs = _ssd_inputs()
     inputs["track_seq_idx"] = torch.zeros(0, dtype=torch.int64)
     inputs["track_end_locs"] = torch.zeros(0, dtype=torch.int64)
-    inputs["cake_checkpoint_token_indices"] = torch.tensor([-1, 224], dtype=torch.int32)
-    inputs["cake_checkpoint_state_slots"] = torch.tensor([-1, 2], dtype=torch.int32)
+    inputs["cake_track_checkpoints"] = mamba_mod.CakeTrackCheckpoints(
+        (224,),
+        torch.tensor([-1, 224], dtype=torch.int32),
+        torch.tensor([-1, 2], dtype=torch.int32),
+    )
     inputs["track_states_out"] = torch.zeros(POOL, H, HEADDIM, DSTATE).bfloat16()
     inputs.update(overrides)
     return inputs
@@ -295,13 +299,28 @@ def test_ssd_route_tracked_batch_passes_checkpoints_and_returns_sentinel():
     ):
         result = mamba_mod.ssd_prefill(stock, **inputs)
     stock.assert_not_called()
+    ckpt = inputs["cake_track_checkpoints"]
     for call in (supports.call_args, cake.call_args):
         kw = call.kwargs
-        assert kw["checkpoint_token_indices"] is inputs["cake_checkpoint_token_indices"]
-        assert kw["checkpoint_state_slots"] is inputs["cake_checkpoint_state_slots"]
+        assert kw["checkpoint_token_indices"] is ckpt.token_indices
+        assert kw["checkpoint_state_slots"] is ckpt.state_slots
         # Written straight into the layer's state pool (the track slots).
         assert kw["checkpoint_states"] is inputs["track_states_out"]
     assert result[0] is None and torch.all(result[1] == 2.0)
+    assert result[2] is mamba_mod.SSD_TRACK_STATES_IN_PLACE
+    # Tracked batch with only chunk-aligned rows: admitted without checkpoint
+    # arguments (no pool needed), still the sentinel for the backend.
+    cake.reset_mock()
+    inputs = _tracked_inputs(
+        cake_track_checkpoints=mamba_mod.CakeTrackCheckpoints((), None, None),
+        track_states_out=None,
+    )
+    with (
+        _routes(mamba_mod, "mamba_ssd_prefill"),
+        mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
+    ):
+        result = mamba_mod.ssd_prefill(stock, **inputs)
+    assert "checkpoint_states" not in cake.call_args.kwargs
     assert result[2] is mamba_mod.SSD_TRACK_STATES_IN_PLACE
     # An untracked batch never carries checkpoints.
     cake.reset_mock()
@@ -320,9 +339,7 @@ def test_ssd_route_tracked_batch_without_usable_checkpoints_falls_back(case, cap
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
     if case == "no_mapping":
-        inputs = _tracked_inputs(
-            cake_checkpoint_token_indices=None, cake_checkpoint_state_slots=None
-        )
+        inputs = _tracked_inputs(cake_track_checkpoints=None)
     elif case == "no_pool":
         inputs = _tracked_inputs(track_states_out=None)
     elif case == "strided_pool":

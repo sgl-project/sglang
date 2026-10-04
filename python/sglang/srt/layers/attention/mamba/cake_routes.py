@@ -48,6 +48,7 @@ FlashInfer contract constraints that shape the wiring (see the adapter
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import itertools
 import logging
@@ -162,6 +163,23 @@ class _TrackStatesInPlace:
 SSD_TRACK_STATES_IN_PLACE = _TrackStatesInPlace()
 
 
+@dataclasses.dataclass(frozen=True)
+class CakeTrackCheckpoints:
+    """The engine's prefill track rows expressed for the Cake SSD runner.
+
+    ``boundaries`` are the absolute packed token positions the chunk-128
+    metadata must expose as logical chunk ends; ``token_indices`` /
+    ``state_slots`` the runner's per-sequence int32 checkpoint pair (``-1``
+    where no checkpoint is wanted), both ``None`` when no row needs a
+    checkpoint (every tracked row is chunk-aligned and takes the engine's
+    final-state slot copy, the default-configuration case).
+    """
+
+    boundaries: tuple[int, ...]
+    token_indices: Optional[torch.Tensor]
+    state_slots: Optional[torch.Tensor]
+
+
 def cake_ssd_track_checkpoints(
     track_mask: Sequence[bool],
     track_lens: Sequence[int],
@@ -170,21 +188,18 @@ def cake_ssd_track_checkpoints(
     state_chunk_size: int,
     track_slots: torch.Tensor,
     device: torch.device,
-) -> Optional[tuple[list[int], torch.Tensor, torch.Tensor]]:
+) -> Optional[CakeTrackCheckpoints]:
     """Map the engine's prefill track rows onto Cake selective checkpoints.
 
     The radix cache snapshots each tracked sequence's SSM state at its last
-    ``state_chunk_size`` boundary (``build_prefill_track_plan``). The stock
-    kernel serves the chunk-unaligned rows from its chunk grid or a recompute
-    pass; the Cake runner instead writes one checkpoint per sequence at an
-    exclusive absolute token boundary, provided that boundary is a logical
-    chunk end of the chunk-128 metadata.  Returns ``(boundaries,
-    checkpoint_token_indices, checkpoint_state_slots)``: the absolute token
-    positions ``cake_ssd_chunk_metadata`` must expose, and the per-sequence
-    int32 pair on ``device`` (``-1`` where no checkpoint is wanted).
-    Chunk-aligned rows keep the engine's final-state slot copy.  ``None`` when
-    a tracked row wants the state before its first token (chunk index 0): the
-    stock kernel owns that case, so the batch stays on the stock path.
+    ``state_chunk_size`` boundary (``build_prefill_track_plan``). Chunk-aligned
+    rows take the sequence's final state through the engine's slot copy (no
+    checkpoint). For chunk-unaligned rows the stock kernel reads its chunk grid
+    or runs a recompute pass; the Cake runner instead writes one checkpoint per
+    sequence at an exclusive absolute token boundary, provided that boundary
+    is a logical chunk end of the chunk-128 metadata.  ``None`` when a tracked
+    row wants the state before its first token (chunk index 0): the stock
+    kernel owns that case, so the batch stays on the stock path.
     """
     from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
         build_prefill_track_plan,
@@ -205,17 +220,18 @@ def cake_ssd_track_checkpoints(
         if chunk <= 0:
             return None
         tokens[row] = starts[row] + chunk * state_chunk_size
-    boundaries = [t for t in tokens if t >= 0]
+    if not plan.unaligned_rows:
+        return CakeTrackCheckpoints((), None, None)
+    boundaries = tuple(t for t in tokens if t >= 0)
     token_indices = torch.tensor(tokens, dtype=torch.int32).to(
         device, non_blocking=True
     )
     slots = torch.full((len(extend_lens),), -1, dtype=torch.int32, device=device)
-    if plan.unaligned_rows:
-        rows = torch.tensor(plan.unaligned_rows, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        slots[rows] = track_slots.index_select(0, rows).to(torch.int32)
-    return boundaries, token_indices, slots
+    rows = torch.tensor(plan.unaligned_rows, dtype=torch.int64).to(
+        device, non_blocking=True
+    )
+    slots[rows] = track_slots.index_select(0, rows).to(torch.int32)
+    return CakeTrackCheckpoints(boundaries, token_indices, slots)
 
 
 def cake_ssd_chunk_metadata(
@@ -290,20 +306,20 @@ def ssd_prefill(
     cake_chunk_indices: Optional[torch.Tensor],
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
-    cake_checkpoint_token_indices: Optional[torch.Tensor] = None,
-    cake_checkpoint_state_slots: Optional[torch.Tensor] = None,
+    cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
 ) -> tuple:
     """Run the prefill SSD scan; ``mamba_ssd_prefill`` may take the Cake kernel.
 
     Returns the stock ``(intermediate_states, varlen_state, track_states)``
     triple.  ``cake_chunk_indices`` / ``cake_chunk_offsets`` are the chunk-128
     metadata prepared once per forward by :class:`Mamba2Metadata`;
-    ``cake_checkpoint_token_indices`` / ``cake_checkpoint_state_slots`` the
-    radix-cache track rows mapped onto Cake checkpoints (same place) and
-    ``track_states_out`` the layer's SSM state pool they are written into.
-    When the Cake runner wrote those rows, ``track_states`` in the returned
-    triple is :data:`SSD_TRACK_STATES_IN_PLACE`.  Everything else is the stock
-    call's argument list.
+    ``cake_track_checkpoints`` the radix-cache track rows mapped onto Cake
+    checkpoints (same place) and ``track_states_out`` the layer's SSM state
+    pool they are written into.  For a tracked batch the Cake path returns
+    :data:`SSD_TRACK_STATES_IN_PLACE` in the ``track_states`` slot: the
+    chunk-unaligned rows (if any) were checkpointed in-kernel and only the
+    engine's aligned slot copies remain.  Everything else is the stock call's
+    argument list.
     """
     stock_kwargs = dict(
         chunk_size=chunk_size,
@@ -344,8 +360,7 @@ def ssd_prefill(
         cake_chunk_indices=cake_chunk_indices,
         cake_chunk_offsets=cake_chunk_offsets,
         track_states_out=track_states_out,
-        cake_checkpoint_token_indices=cake_checkpoint_token_indices,
-        cake_checkpoint_state_slots=cake_checkpoint_state_slots,
+        cake_track_checkpoints=cake_track_checkpoints,
     )
     if result is None:
         return stock(x, dt, A, B, C, **stock_kwargs)
@@ -370,8 +385,7 @@ def _cake_ssd_prefill(
     cake_chunk_indices: Optional[torch.Tensor],
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
-    cake_checkpoint_token_indices: Optional[torch.Tensor] = None,
-    cake_checkpoint_state_slots: Optional[torch.Tensor] = None,
+    cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
 ) -> Optional[tuple]:
     """``None`` means "use the stock call"."""
     route = CAKE_ROUTE_SSD_PREFILL
@@ -390,7 +404,7 @@ def _cake_ssd_prefill(
     tracking = track_seq_idx is not None
     checkpoints: dict = {}
     if tracking:
-        if cake_checkpoint_token_indices is None or cake_checkpoint_state_slots is None:
+        if cake_track_checkpoints is None:
             _log_cake_route_once(
                 route,
                 "fallback",
@@ -399,24 +413,25 @@ def _cake_ssd_prefill(
                 f"pre-first-token state): {detail}",
             )
             return None
-        if (
-            track_states_out is None
-            or track_states_out.dim() != 4
-            or not track_states_out.is_contiguous()
-            or track_states_out.dtype != state_dtype
-        ):
-            _log_cake_route_once(
-                route,
-                "fallback",
-                f"track-state pool is not a contiguous 4-D {state_dtype} tensor "
-                f"(checkpoint target): {detail}",
+        if cake_track_checkpoints.token_indices is not None:
+            if (
+                track_states_out is None
+                or track_states_out.dim() != 4
+                or not track_states_out.is_contiguous()
+                or track_states_out.dtype != state_dtype
+            ):
+                _log_cake_route_once(
+                    route,
+                    "fallback",
+                    f"track-state pool is not a contiguous 4-D {state_dtype} "
+                    f"tensor (checkpoint target): {detail}",
+                )
+                return None
+            checkpoints = dict(
+                checkpoint_token_indices=cake_track_checkpoints.token_indices,
+                checkpoint_state_slots=cake_track_checkpoints.state_slots,
+                checkpoint_states=track_states_out,
             )
-            return None
-        checkpoints = dict(
-            checkpoint_token_indices=cake_checkpoint_token_indices,
-            checkpoint_state_slots=cake_checkpoint_state_slots,
-            checkpoint_states=track_states_out,
-        )
     if cake_chunk_indices is None or cake_chunk_offsets is None:
         _log_cake_route_once(
             route, "fallback", f"no chunk-128 metadata for this batch: {detail}"
@@ -436,7 +451,7 @@ def _cake_ssd_prefill(
         x.dtype,
         state_dtype,
         initial_states is None,
-        tracking,
+        bool(checkpoints),
     )
     if key in _cake_route_rejected:
         return None

@@ -110,12 +110,10 @@ class Mamba2Metadata(ForwardMetadata):
         # route is off or the batch cannot take it. See ``cake_routes``.
         cake_chunk_indices: Optional[torch.Tensor] = None
         cake_chunk_offsets: Optional[torch.Tensor] = None
-        # Radix-cache track rows mapped onto Cake selective checkpoints (one
-        # int32 entry per prefill sequence, ``-1`` = none); ``None`` when the
-        # batch is not tracked or the mapping is unavailable. See
-        # ``cake_routes.cake_ssd_track_checkpoints``.
-        cake_checkpoint_token_indices: Optional[torch.Tensor] = None
-        cake_checkpoint_state_slots: Optional[torch.Tensor] = None
+        # Radix-cache track rows mapped onto Cake selective checkpoints;
+        # ``None`` when the batch is not tracked or the mapping is
+        # unavailable. See ``cake_routes.cake_ssd_track_checkpoints``.
+        cake_track_checkpoints: Optional[cake_routes.CakeTrackCheckpoints] = None
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
@@ -299,7 +297,7 @@ class Mamba2Metadata(ForwardMetadata):
         # whose token count is a 128-multiple. Built once per forward here so
         # the per-layer route check does no host work.
         cake_chunk_indices = cake_chunk_offsets = None
-        cake_checkpoint_token_indices = cake_checkpoint_state_slots = None
+        cake_track_checkpoints = None
         if (
             extend_seq_lens_cpu is not None
             and num_prefill_tokens % cake_routes.SSD_CHUNK_SIZE == 0
@@ -308,7 +306,7 @@ class Mamba2Metadata(ForwardMetadata):
             # A radix-cache-tracked batch needs its track rows expressed as
             # Cake checkpoints (host-side plan, same inputs as the engine's
             # own CPU track plan); without that mapping the route falls back.
-            track_boundaries: list[int] = []
+            track_boundaries: tuple[int, ...] = ()
             mappable = True
             if forward_metadata.has_mamba_track_mask:
                 mapped = None
@@ -330,11 +328,8 @@ class Mamba2Metadata(ForwardMetadata):
                 if mapped is None:
                     mappable = False
                 else:
-                    (
-                        track_boundaries,
-                        cake_checkpoint_token_indices,
-                        cake_checkpoint_state_slots,
-                    ) = mapped
+                    cake_track_checkpoints = mapped
+                    track_boundaries = mapped.boundaries
             if mappable:
                 cake_chunk_indices, cake_chunk_offsets = (
                     cake_routes.cake_ssd_chunk_metadata(
@@ -392,7 +387,6 @@ class Mamba2Metadata(ForwardMetadata):
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 cake_chunk_indices=cake_chunk_indices,
                 cake_chunk_offsets=cake_chunk_offsets,
-                cake_checkpoint_token_indices=cake_checkpoint_token_indices,
-                cake_checkpoint_state_slots=cake_checkpoint_state_slots,
+                cake_track_checkpoints=cake_track_checkpoints,
             ),
         )
