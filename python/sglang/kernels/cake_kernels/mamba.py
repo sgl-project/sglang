@@ -39,6 +39,15 @@ varlen without ``initial_states``, fp64-recurrence accuracy oracle):
     (128, 128)``, 1-D indices): BF16 state -> ``stp_bf16_*``; FP32 state ->
     ``stp_fp32_identity`` (no ``z``, no softplus, no ``disable_state_update``,
     destination is the source index tensor, ``B * nheads >= 8 * SMs``).
+  - T=1 headdim-64 decode (``x [B, nheads, 64]``, ``(dim, dstate) = (64,
+    128)``, BF16 or FP32 state, 1-D indices; Nemotron-H / granite-4.0-h):
+    dense ``x``/``B``/``C`` rows at any batch stride (the fused-projection
+    views), unit-head-stride ``dt``; BF16 state with an even head count and
+    even heads per group at ``B * nheads / 2 >= 2 * SMs`` -> paired TMA
+    programs ``stp_paired_*`` (16-byte aligned ``B``/``C`` rows), otherwise
+    the row-owner tiles ``stp_hd64_rows_*`` (BF16 only below ``8 * SMs``
+    batch-heads). This row also takes the engine's raw ABI: BF16
+    ``dt``/``D``/``dt_bias`` broadcasts with int32 slot tables.
   - MTP ``x [B, T, nheads, 128]`` BF16 state, T in {1, 2}, no ``z`` /
     destination / intermediate buffer / ``disable_state_update`` -> ``mtp_short``.
   - MTP BF16 state ``(dim, dstate, T) = (64, 128, 6)``, softplus,
@@ -384,6 +393,68 @@ def ssd_combined_fwd(
     )
 
 
+_HD64_PAIRED_MIN_BLOCKS_PER_SM = 2
+_HD64_ROWS_MAX_BATCH_HEADS_PER_SM = 8
+
+
+def _coefficient_abi(dt, D, dt_bias, indices, dst_indices, buffer_indices):
+    """``"canonical"`` (FP32 coefficients, int64 tables), ``"raw"`` (BF16
+    coefficients, int32 tables: the SGLang engine storage) or ``None``."""
+    import torch
+
+    for coefficient, index in ((torch.float32, torch.int64), (torch.bfloat16, torch.int32)):
+        if (
+            dt.dtype == coefficient
+            and D.dtype == coefficient
+            and dt_bias.dtype == coefficient
+            and indices.dtype == index
+            and (dst_indices is None or dst_indices.dtype == index)
+            and (buffer_indices is None or buffer_indices.dtype == index)
+        ):
+            return "canonical" if coefficient == torch.float32 else "raw"
+    return None
+
+
+def _dense_rows(tensor, batch: int, rows: int, row: int) -> bool:
+    """``(batch, rows, row)`` view with dense rows; the batch stride may pad."""
+    return (
+        tuple(tensor.shape) == (batch, rows, row)
+        and tensor.stride(2) == 1
+        and tensor.stride(1) == row
+        and (batch == 1 or tensor.stride(0) >= rows * row)
+    )
+
+
+def _supports_hd64_decode(
+    state, x, dt, B, C, z, indices, dst_indices, *, cache_steps, nheads, ngroups, device
+) -> bool:
+    """Mirror of FlashInfer's ``plan_route`` for the headdim-64 single-token row."""
+    import torch
+
+    batch = x.shape[0]
+    if not (
+        cache_steps == 0
+        and indices.ndim == 1
+        and (dst_indices is None or dst_indices.ndim == 1)
+        and _dense_rows(x, batch, nheads, 64)
+        and _dense_rows(B, batch, ngroups, 128)
+        and _dense_rows(C, batch, ngroups, 128)
+        and state.is_contiguous()
+        and dt.stride(1) == 1
+        and (z is None or (_dense_rows(z, batch, nheads, 64) and z.stride(0) == x.stride(0)))
+    ):
+        return False
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if (
+        state.dtype == torch.bfloat16
+        and nheads % 2 == 0
+        and (nheads // ngroups) % 2 == 0
+        and batch * (nheads // 2) >= _HD64_PAIRED_MIN_BLOCKS_PER_SM * num_sms
+    ):
+        return (B.data_ptr() | C.data_ptr()) & 15 == 0 and (B.stride(0) | C.stride(0)) & 7 == 0
+    return state.dtype == torch.float32 or batch * nheads < _HD64_ROWS_MAX_BATCH_HEADS_PER_SM * num_sms
+
+
 def _per_head_broadcast(tensor, nheads, trailing: int) -> bool:
     """``[nheads, ...]`` view whose trailing axes are stride-0 broadcasts."""
     return (
@@ -447,20 +518,13 @@ def supports_selective_state_update(
         and x.dtype == torch.bfloat16
         and B.dtype == torch.bfloat16
         and C.dtype == torch.bfloat16
-        and state_batch_indices.dtype == torch.int64
-        and dt.dtype == torch.float32
         and A.dtype == torch.float32
-        and D.dtype == torch.float32
-        and dt_bias.dtype == torch.float32
-        and (
-            dst_state_batch_indices is None
-            or dst_state_batch_indices.dtype == torch.int64
-        )
-        and (
-            intermediate_state_indices is None
-            or intermediate_state_indices.dtype == torch.int64
-        )
     ):
+        return False
+    abi = _coefficient_abi(
+        dt, D, dt_bias, state_batch_indices, dst_state_batch_indices, intermediate_state_indices
+    )
+    if abi is None:
         return False
     device = state.device
     if any(
@@ -496,6 +560,13 @@ def supports_selective_state_update(
         return False
     batch = x.shape[0]
     if x.ndim == 3:
+        if (dim, dstate) == (64, 128):
+            return _supports_hd64_decode(
+                state, x, dt, B, C, z, state_batch_indices, dst_state_batch_indices,
+                cache_steps=cache_steps, nheads=nheads, ngroups=ngroups, device=device,
+            )
+        if abi == "raw":
+            return False
         if not (
             cache_steps == 0
             and tuple(x.shape) == (batch, nheads, dim)
@@ -518,7 +589,8 @@ def supports_selective_state_update(
             and batch * nheads
             >= 8 * torch.cuda.get_device_properties(device).multi_processor_count
         )
-    if x.ndim != 4:
+    if x.ndim != 4 or abi == "raw":
+        # The raw-ABI MTP row (Granite projection views) is FlashInfer-internal.
         return False
     token_steps = x.shape[1]
     if tuple(x.shape) != (batch, token_steps, nheads, dim) or tuple(B.shape) != (

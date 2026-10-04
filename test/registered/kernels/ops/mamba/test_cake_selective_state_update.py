@@ -71,7 +71,7 @@ def _skip_unless_supported():
         )
 
 
-def _make(batch, nheads, ngroups, state_dtype, device, seed, *, dt_softplus):
+def _make(batch, nheads, ngroups, state_dtype, device, seed, *, dt_softplus, dim=DIM):
     """sglang's decode convention: per-head dt/A/D/dt_bias broadcast views.
 
     With ``dt_softplus`` the kernel positivises ``dt + dt_bias`` itself and the
@@ -80,10 +80,10 @@ def _make(batch, nheads, ngroups, state_dtype, device, seed, *, dt_softplus):
     """
     torch.manual_seed(seed)
     slots = batch + 4
-    state = (torch.randn(slots, nheads, DIM, DSTATE, device=device) * 0.05).to(
+    state = (torch.randn(slots, nheads, dim, DSTATE, device=device) * 0.05).to(
         state_dtype
     )
-    x = (torch.randn(batch, nheads, DIM, device=device) * 0.1).bfloat16()
+    x = (torch.randn(batch, nheads, dim, device=device) * 0.1).bfloat16()
     dt_raw = torch.randn(batch, nheads, device=device)
     bias_raw = torch.rand(nheads, device=device) - 4.0
     if dt_softplus:
@@ -91,14 +91,14 @@ def _make(batch, nheads, ngroups, state_dtype, device, seed, *, dt_softplus):
     else:
         dt_head = F.softplus(dt_raw + bias_raw)
         bias_head = torch.rand(nheads, device=device) * 0.05
-    dt = dt_head[:, :, None].expand(batch, nheads, DIM)
+    dt = dt_head[:, :, None].expand(batch, nheads, dim)
     A = (-torch.rand(nheads, device=device) - 1.0)[:, None, None].expand(
-        nheads, DIM, DSTATE
+        nheads, dim, DSTATE
     )
     B = (torch.randn(batch, ngroups, DSTATE, device=device) * 0.1).bfloat16()
     C = (torch.randn(batch, ngroups, DSTATE, device=device) * 0.1).bfloat16()
-    D = torch.randn(nheads, device=device)[:, None].expand(nheads, DIM)
-    dt_bias = bias_head[:, None].expand(nheads, DIM)
+    D = torch.randn(nheads, device=device)[:, None].expand(nheads, dim)
+    dt_bias = bias_head[:, None].expand(nheads, dim)
     indices = torch.randperm(slots, device=device)[:batch].to(torch.int64)
     out = torch.empty_like(x)
     return dict(
@@ -283,6 +283,106 @@ def test_fp32_identity_row_matches_flashinfer_and_reference(monkeypatch):
     torch.testing.assert_close(t["out"].float(), expected_out, atol=1e-2, rtol=1e-2)
 
 
+def _make_hd64_raw(batch, nheads, ngroups, state_dtype, device, seed):
+    """The Nemotron-H / granite decode call exactly as the hybrid backend
+    issues it: BF16 ``dt``/``D``/``dt_bias`` broadcasts, int32 slot table with
+    ``pad_slot_id=-1`` padding rows, and ``x``/``B``/``C`` as views into the
+    fused ``xBC`` projection (padded batch stride)."""
+    t = _make(batch, nheads, ngroups, state_dtype, device, seed, dt_softplus=True, dim=64)
+    width = nheads * 64 + 2 * ngroups * 128
+    xbc = (torch.randn(batch, width, device=device) * 0.1).bfloat16()
+    t["x"] = xbc[:, : nheads * 64].view(batch, nheads, 64)
+    t["B"] = xbc[:, nheads * 64 : nheads * 64 + ngroups * 128].view(batch, ngroups, 128)
+    t["C"] = xbc[:, nheads * 64 + ngroups * 128 :].view(batch, ngroups, 128)
+    t["dt"] = t["dt"].bfloat16()
+    t["D"] = t["D"].bfloat16()
+    t["dt_bias"] = t["dt_bias"].bfloat16()
+    t["idx"] = t["idx"].to(torch.int32)
+    t["out"] = torch.empty(batch, nheads, 64, dtype=torch.bfloat16, device=device)
+    return t
+
+
+@pytest.mark.parametrize(
+    "batch,nheads,ngroups,state_dtype",
+    [(2, 128, 8, torch.bfloat16), (64, 128, 8, torch.bfloat16), (8, 128, 8, torch.float32)],
+)
+def test_hd64_raw_decode_row_matches_flashinfer_and_reference(
+    batch, nheads, ngroups, state_dtype, monkeypatch
+):
+    """Row-owner (batch 2), paired TMA (batch 64) and FP32 programs on the raw
+    engine ABI, with one padded slot (``pad_slot_id=-1``) that must produce a
+    zero-state output and leave the state pool untouched."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    t = _make_hd64_raw(batch, nheads, ngroups, state_dtype, device, seed=batch)
+    idx = t["idx"].clone()
+    idx[-1] = -1
+    kwargs = dict(
+        dt_bias=t["dt_bias"], dt_softplus=True, state_batch_indices=idx, pad_slot_id=-1
+    )
+    args = (t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"])
+    assert cake_mamba.supports_selective_state_update(*args, **kwargs)
+    state_fi, state_ref = t["state"].clone(), t["state"].clone()
+    hits = _strict_cake(monkeypatch)
+    got = cake_selective_state_update(*args, out=t["out"], **kwargs)
+    assert hits == [True], "promoted row fell back inside FlashInfer"
+    assert got is t["out"]
+    from flashinfer.mamba import selective_state_update as fi_direct
+
+    out_fi = fi_direct(state_fi, *args[1:], backend="cake", **kwargs)
+    torch.cuda.synchronize()
+    assert torch.equal(t["out"], out_fi)
+    assert torch.equal(t["state"], state_fi)
+    _assert_matches_flashinfer_oracle(t, state_ref, kwargs)
+    live = idx[:-1].to(torch.int64)
+    expected_out, expected_state = _reference(
+        dict(t, idx=live, x=t["x"][:-1], B=t["B"][:-1], C=t["C"][:-1], dt=t["dt"][:-1]),
+        state_ref,
+        dt_softplus=True,
+    )
+    tol = 1e-2
+    torch.testing.assert_close(
+        t["state"].index_select(0, live).float(), expected_state, atol=tol, rtol=tol
+    )
+    torch.testing.assert_close(t["out"][:-1].float(), expected_out, atol=tol, rtol=tol)
+    # The padded row reads a zero state: output = dt * (x . B) . C + D * x.
+    pad_out, _ = _reference(
+        dict(t, idx=live[:1], x=t["x"][-1:], B=t["B"][-1:], C=t["C"][-1:], dt=t["dt"][-1:]),
+        torch.zeros_like(state_ref),
+        dt_softplus=True,
+    )
+    torch.testing.assert_close(t["out"][-1:].float(), pad_out, atol=tol, rtol=tol)
+    untouched = torch.ones(t["state"].shape[0], dtype=torch.bool, device=device)
+    untouched[live] = False
+    assert torch.equal(t["state"][untouched], state_ref[untouched])
+
+
+def test_hd64_raw_decode_captures_into_a_cuda_graph():
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    t = _make_hd64_raw(16, 128, 8, torch.bfloat16, device, seed=7)
+    kwargs = dict(
+        dt_bias=t["dt_bias"], dt_softplus=True, state_batch_indices=t["idx"], pad_slot_id=-1
+    )
+    args = (t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"])
+    state_ref = t["state"].clone()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for _ in range(2):  # warm the JIT path outside capture
+            t["state"].copy_(state_ref)
+            cake_selective_state_update(*args, out=t["out"], **kwargs)
+        torch.cuda.synchronize()
+        t["state"].copy_(state_ref)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            cake_selective_state_update(*args, out=t["out"], **kwargs)
+    t["state"].copy_(state_ref)
+    t["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_matches_flashinfer_oracle(t, state_ref, kwargs)
+
+
 def test_supports_refuses_unpromoted_forms():
     _skip_unless_supported()
     device = torch.device("cuda")
@@ -293,12 +393,22 @@ def test_supports_refuses_unpromoted_forms():
     # Stochastic rounding (sglang's FlashInferSSUBackend passes rand_seed).
     seed = torch.randint(0, 2**31, (1,), device=device)
     assert not cake_mamba.supports_selective_state_update(*args, rand_seed=seed, **base)
-    # int32 slot indices are outside the legacy-typed Cake rows.
+    # int32 slot indices are outside the legacy-typed 128x128 Cake rows (the
+    # raw engine ABI is served by the headdim-64 row only).
     assert not cake_mamba.supports_selective_state_update(
         *args,
         dt_bias=t["dt_bias"],
         dt_softplus=True,
         state_batch_indices=t["idx"].to(torch.int32),
+    )
+    # The headdim-64 raw row refuses non-dense rows (a transposed x view).
+    r = _make_hd64_raw(4, 128, 8, torch.bfloat16, device, seed=11)
+    raw = dict(dt_bias=r["dt_bias"], dt_softplus=True, state_batch_indices=r["idx"], pad_slot_id=-1)
+    raw_args = (r["state"], r["x"], r["dt"], r["A"], r["B"], r["C"], r["D"])
+    assert cake_mamba.supports_selective_state_update(*raw_args, **raw)
+    strided_x = r["x"].transpose(0, 1).contiguous().transpose(0, 1)
+    assert not cake_mamba.supports_selective_state_update(
+        r["state"], strided_x, *raw_args[2:], **raw
     )
     # A compact (non-broadcast) dt layout is rejected by Cake.
     assert not cake_mamba.supports_selective_state_update(

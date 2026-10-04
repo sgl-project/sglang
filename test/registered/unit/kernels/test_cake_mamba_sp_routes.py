@@ -705,7 +705,9 @@ def test_ssu_capture_without_warmup_falls_back_then_replays_after_warmup():
     assert stock.call_count == 1 and cake.call_count == 2
 
 
-def test_ssu_headdim64_decode_has_no_promoted_row_and_skips_adapter(caplog):
+def test_ssu_headdim64_decode_row_passes_the_engine_storage_without_copies(caplog):
+    """The headdim-64 T=1 row runs on Cake with the engine's BF16 coefficient
+    broadcasts, int32 slot table and fused-projection views passed as they are."""
     caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
     stock = mock.Mock(side_effect=_stock_ssu)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssu)
@@ -716,10 +718,53 @@ def test_ssu_headdim64_decode_has_no_promoted_row_and_skips_adapter(caplog):
         mock.patch.object(mamba_mod, "_cake_ssu_kernels", lambda: (supports, cake)),
     ):
         _call_ssu(stock, inputs)
-    stock.assert_called_once()
-    supports.assert_not_called()
-    cake.assert_not_called()
-    assert "no promoted T=1 row for (dim, dstate)=(64, 128)" in caplog.text
+    stock.assert_not_called()
+    cake.assert_called_once()
+    args, kw = cake.call_args
+    state, x, dt, A, B, C, D = args
+    assert state is inputs["state"] and x is inputs["x"] and A is inputs["A"]
+    assert dt is inputs["dt"] and D is inputs["D"]
+    assert kw["dt_bias"] is inputs["kwargs"]["dt_bias"]
+    assert kw["state_batch_indices"] is inputs["kwargs"]["state_batch_indices"]
+    assert kw["state_batch_indices"].dtype == torch.int32
+    assert kw["out"] is inputs["kwargs"]["out"]
+    assert kw["cache_steps"] == 0 and kw["algorithm"] == "auto" and kw["z"] is None
+    assert kw["dt_softplus"] is True and kw["disable_state_update"] is False
+    s_args, s_kw = supports.call_args
+    assert s_args[2] is inputs["dt"] and s_kw["state_batch_indices"].dtype == torch.int32
+    assert torch.all(inputs["kwargs"]["out"] == 2.0)
+    assert "[cake-route] mamba_ssu: Cake kernel selected" in caplog.text
+
+
+def test_ssu_static_row_admits_both_decode_tiles_only():
+    state = torch.zeros(POOL, H, HEADDIM, DSTATE, dtype=torch.bfloat16)
+    x = torch.zeros(2, H, HEADDIM, dtype=torch.bfloat16)
+    assert mamba_mod._ssu_static_row(state, x, False, False) is None
+    assert mamba_mod._ssu_static_row(state.float(), x, False, False) is None
+    wide = torch.zeros(POOL, H, 128, 128, dtype=torch.bfloat16)
+    assert mamba_mod._ssu_static_row(wide, torch.zeros(2, H, 128, dtype=torch.bfloat16), False, False) is None
+    narrow = torch.zeros(POOL, H, 64, 64, dtype=torch.bfloat16)
+    reason = mamba_mod._ssu_static_row(narrow, x, False, False)
+    assert reason == "no promoted T=1 row for (dim, dstate)=(64, 64)"
+
+
+def test_ssu_decode_with_fp32_coefficients_takes_the_canonical_conversion():
+    """A headdim-64 decode call whose coefficients are not the engine's BF16
+    storage goes through the FP32 / int64 conversions like the other rows."""
+    stock = mock.Mock(side_effect=_stock_ssu)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssu)
+    inputs = _ssu_decode_inputs()
+    inputs["dt"] = inputs["dt"].float()
+    with (
+        _routes(mamba_mod, "mamba_ssu"),
+        _not_capturing(),
+        mock.patch.object(mamba_mod, "_cake_ssu_kernels", lambda: (supports, cake)),
+    ):
+        _call_ssu(stock, inputs)
+    args, kw = cake.call_args
+    assert args[2].dtype == torch.float32 and args[6].dtype == torch.float32
+    assert kw["dt_bias"].dtype == torch.float32
+    assert kw["state_batch_indices"].dtype == torch.int64
 
 
 def test_ssu_tree_verify_falls_back():
