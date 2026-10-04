@@ -182,8 +182,8 @@ admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibi
 ```json
 {"buckets": [{
   "id": "default",
-  "prefill": {"worker_ids": ["p0", "p1"], "admission": {"max_kv_usage": 0.9}},
-  "decode": {"worker_ids": ["d0", "d1"], "admission": {"max_running_usage": 0.95}}
+  "prefill": {"worker_ids": ["p0", "p1"], "admission": {"max_pending_prefill_tokens": 32768}},
+  "decode": {"worker_ids": ["d0", "d1"], "admission": {"max_kv_usage": 0.9}}
 }]}
 ```
 

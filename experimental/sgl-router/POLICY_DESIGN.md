@@ -460,8 +460,8 @@ set `worker_ids`, `policy` and `admission`.
       "max_input_tokens": 4096,
       "max_context_tokens": 8192,
       "ttft_ms": 300,
-      "prefill": {"worker_ids": ["P1", "P2"], "admission": {"max_kv_usage": 0.9}},
-      "decode": {"worker_ids": ["D1", "D2"], "admission": {"max_running_usage": 0.95}}
+      "prefill": {"worker_ids": ["P1", "P2"], "admission": {"max_pending_prefill_tokens": 32768}},
+      "decode": {"worker_ids": ["D1", "D2"], "admission": {"max_kv_usage": 0.9}}
     },
     {
       "id": "long-context",
