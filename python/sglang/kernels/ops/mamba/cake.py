@@ -34,8 +34,8 @@ for _op, _target, _signature, _description in (
             in_place=True,
             description=(
                 "prepared Mamba2 SSD combined prefill runner (chunk 128, headdim 64, "
-                "dstate 128, seqlen % 128 == 0): BF16 x/B/C/D/z, BF16 or FP16 state, "
-                "caller-owned out [B,nheads,64,nchunks,128], selective checkpoints"
+                "dstate 128, any seqlen): BF16 x/B/C/D/z, BF16/FP16/FP32 state, "
+                "caller-owned token-major out [B,S,nheads,64], selective checkpoints"
             ),
         ),
         "Cake SSD combined prefill runner (flashinfer.mamba.SSDCombined, "
@@ -136,6 +136,7 @@ def cake_ssd_combined_fwd(
     chunk_offsets: Optional[torch.Tensor] = None,
     seq_chunk_cumsum: Optional[torch.Tensor] = None,
     update_seq_chunk_cumsum: bool = False,
+    num_seqs: Optional[int] = None,
     checkpoint_token_indices: Optional[torch.Tensor] = None,
     checkpoint_state_slots: Optional[torch.Tensor] = None,
     checkpoint_states: Optional[torch.Tensor] = None,
@@ -160,6 +161,7 @@ def cake_ssd_combined_fwd(
         chunk_offsets=chunk_offsets,
         seq_chunk_cumsum=seq_chunk_cumsum,
         update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+        num_seqs=num_seqs,
         checkpoint_token_indices=checkpoint_token_indices,
         checkpoint_state_slots=checkpoint_state_slots,
         checkpoint_states=checkpoint_states,

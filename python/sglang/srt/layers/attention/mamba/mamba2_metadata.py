@@ -293,15 +293,13 @@ class Mamba2Metadata(ForwardMetadata):
             )
 
         # The Cake SSD runner is a chunk-128 kernel: it needs its own logical
-        # chunk metadata (always, not only with initial states) for a batch
-        # whose token count is a 128-multiple. Built once per forward here so
-        # the per-layer route check does no host work.
+        # chunk metadata (always, not only with initial states; the last
+        # physical chunk may be partial). Built once per forward here so the
+        # per-layer route check does no host work.
         cake_chunk_indices = cake_chunk_offsets = None
         cake_track_checkpoints = None
-        if (
-            extend_seq_lens_cpu is not None
-            and num_prefill_tokens % cake_routes.SSD_CHUNK_SIZE == 0
-            and cake_route_enabled(cake_routes.CAKE_ROUTE_SSD_PREFILL)
+        if extend_seq_lens_cpu is not None and cake_route_enabled(
+            cake_routes.CAKE_ROUTE_SSD_PREFILL
         ):
             # A radix-cache-tracked batch needs its track rows expressed as
             # Cake checkpoints (host-side plan, same inputs as the engine's

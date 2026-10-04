@@ -21,13 +21,11 @@ FlashInfer contract constraints that shape the wiring (see the adapter
 * SSD: chunk 128 (the engine builds its chunk metadata for the model's
   ``mamba_chunk_size``, 256 for Nemotron-H, so :class:`Mamba2Metadata`
   carries a second, chunk-128 ``chunk_indices`` / ``chunk_offsets`` pair when
-  the route is on), ``seqlen % 128 == 0`` (an unaligned prefill batch falls
-  back; chunked-prefill batches of a 128-multiple size are covered), BF16 or
-  FP16 state (``--mamba-ssm-dtype bfloat16``), varlen always needs
-  ``initial_states`` (a cached zero buffer stands in when no sequence has a
-  prefix), and the caller-owned ``out`` is head-major chunked
-  ``[1, H, 64, nchunks, 128]`` while the engine's output is token-major, so
-  the result is copied once into the engine buffer.
+  the route is on), any packed token count (the kernel handles a partial last
+  chunk), BF16 / FP16 / FP32 state (every ``--mamba-ssm-dtype``), varlen
+  without a prefix passes ``initial_states=None`` plus the sequence count, and
+  the engine's token-major ``[1, S, H, 64]`` output buffer is the kernel's
+  ``out`` (no copy).
 * SSD radix-cache tracking (``track_seq_idx`` / ``track_end_locs``): the
   Cake runner exposes selective checkpoints only at logical chunk ends
   (``checkpoint_token_indices`` + ``checkpoint_state_slots``); the mapping
@@ -87,8 +85,6 @@ _ssu_warm: set[tuple] = set()
 _ssu_admission: dict[tuple, bool] = {}
 # FP32 copies of the per-head parameters (D / dt_bias) keyed by storage.
 _fp32_params: dict[tuple, torch.Tensor] = {}
-# Zero initial states for varlen SSD batches without a prefix, per shape.
-_zero_states: dict[tuple, torch.Tensor] = {}
 
 
 def _log_cake_route_once(route: str, event: str, detail: str) -> None:
@@ -110,7 +106,6 @@ def reset_cake_route_state_for_tests() -> None:
     _ssu_warm.clear()
     _ssu_admission.clear()
     _fp32_params.clear()
-    _zero_states.clear()
 
 
 @functools.lru_cache(maxsize=None)
@@ -270,19 +265,6 @@ def cake_ssd_chunk_metadata(
     )
 
 
-def _zero_initial_states(
-    num_seqs: int, nheads: int, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    key = (num_seqs, nheads, dtype, device)
-    states = _zero_states.get(key)
-    if states is None:
-        states = torch.zeros(
-            (num_seqs, nheads, SSD_HEADDIM, SSD_DSTATE), dtype=dtype, device=device
-        )
-        _zero_states[key] = states
-    return states
-
-
 def ssd_prefill(
     stock: Callable[..., tuple],
     *,
@@ -307,7 +289,6 @@ def ssd_prefill(
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
-    extend_seq_lens_cpu: Optional[Sequence[int]] = None,
 ) -> tuple:
     """Run the prefill SSD scan; ``mamba_ssd_prefill`` may take the Cake kernel.
 
@@ -362,25 +343,10 @@ def ssd_prefill(
         cake_chunk_offsets=cake_chunk_offsets,
         track_states_out=track_states_out,
         cake_track_checkpoints=cake_track_checkpoints,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
     )
     if result is None:
         return stock(x, dt, A, B, C, **stock_kwargs)
     return result
-
-
-def _single_chunk_batch(
-    seqlen: int, num_seqs: int, extend_seq_lens_cpu: Optional[Sequence[int]]
-) -> bool:
-    """True when no sequence of the call spans more than one chunk-128.
-
-    Uses the host extend lengths when the metadata carries them; without them
-    the total length bounds the longest sequence (``seqlen <= 128 * num_seqs``
-    is conservative: it also covers batches like ``(64, 192)``).
-    """
-    if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) == num_seqs:
-        return max(int(n) for n in extend_seq_lens_cpu) <= SSD_CHUNK_SIZE
-    return seqlen <= SSD_CHUNK_SIZE * num_seqs
 
 
 def _cake_ssd_prefill(
@@ -402,7 +368,6 @@ def _cake_ssd_prefill(
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
-    extend_seq_lens_cpu: Optional[Sequence[int]] = None,
 ) -> Optional[tuple]:
     """``None`` means "use the stock call"."""
     route = CAKE_ROUTE_SSD_PREFILL
@@ -410,25 +375,7 @@ def _cake_ssd_prefill(
     nheads = x.shape[2]
     detail = _tensor_summary(x=x, dt=dt, B=B, seq_idx=seq_idx, out=out)
     detail += f" state={str(state_dtype).removeprefix('torch.')}"
-    if seqlen % SSD_CHUNK_SIZE:
-        _log_cake_route_once(
-            route, "fallback", f"seqlen {seqlen} is not a multiple of 128: {detail}"
-        )
-        return None
     num_seqs = int(cu_seqlens.shape[0]) - 1
-    if _single_chunk_batch(seqlen, num_seqs, extend_seq_lens_cpu):
-        # The Cake runner returns a varying number of NaN outputs and final
-        # states when every sequence of the call is exactly one 128-token
-        # chunk (with random and with zero initial states; any batch holding
-        # a >= 2-chunk sequence is clean).  The radix-cache prefix-hit extend
-        # of 128 tokens is exactly this call, so keep the stock kernel for it.
-        _log_cake_route_once(
-            route,
-            "fallback",
-            f"every sequence is a single 128-token chunk (Cake SSD kernel "
-            f"returns NaN for this geometry): {detail}",
-        )
-        return None
     # ``track_seq_idx`` is set for every forward of a radix-cache-tracked batch
     # (even with no row to recompute); the mapped checkpoints decide whether
     # the Cake runner can write the tracked rows itself.
@@ -468,11 +415,11 @@ def _cake_ssd_prefill(
             route, "fallback", f"no chunk-128 metadata for this batch: {detail}"
         )
         return None
-    if state_dtype not in (torch.bfloat16, torch.float16):
+    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         _log_cake_route_once(
             route,
             "fallback",
-            f"state dtype not BF16/FP16 (--mamba-ssm-dtype): {detail}",
+            f"state dtype not BF16/FP16/FP32 (--mamba-ssm-dtype): {detail}",
         )
         return None
     key = (
@@ -487,17 +434,9 @@ def _cake_ssd_prefill(
     if key in _cake_route_rejected:
         return None
     supports, cake_fwd = _cake_ssd_kernels()
-    if initial_states is None:
-        # The Cake varlen runner requires initial states; a zero buffer is the
-        # "no prefix" case the stock kernel expresses with ``None``.
-        initial_states = _zero_initial_states(num_seqs, nheads, state_dtype, x.device)
-    # FlashInfer owns the head-major chunked output layout; the token-major
-    # view it returns is copied into the engine's preallocated buffer below.
-    cake_out = torch.empty(
-        (1, nheads, SSD_HEADDIM, seqlen // SSD_CHUNK_SIZE, SSD_CHUNK_SIZE),
-        dtype=torch.bfloat16,
-        device=x.device,
-    )
+    # ``initial_states=None`` is the stock "no prefix" call; the Cake runner
+    # takes it as such and learns the packed sequence count from ``num_seqs``.
+    # The engine's token-major output buffer is the kernel's ``out``.
     dt_limit = (0.0, float("inf"))
     admitted = supports(
         x,
@@ -513,7 +452,8 @@ def _cake_ssd_prefill(
         seq_idx=seq_idx,
         chunk_indices=cake_chunk_indices,
         chunk_offsets=cake_chunk_offsets,
-        out=cake_out,
+        out=out,
+        num_seqs=num_seqs,
         chunk_size=SSD_CHUNK_SIZE,
         **checkpoints,
     )
@@ -521,7 +461,7 @@ def _cake_ssd_prefill(
         _log_cake_route_once(route, "fallback", f"adapter admission rejected: {detail}")
         return None
     try:
-        out_view, final_states = cake_fwd(
+        _, final_states = cake_fwd(
             x,
             dt,
             A,
@@ -536,7 +476,8 @@ def _cake_ssd_prefill(
             seq_idx=seq_idx,
             chunk_indices=cake_chunk_indices,
             chunk_offsets=cake_chunk_offsets,
-            out=cake_out,
+            out=out,
+            num_seqs=num_seqs,
             return_final_states=True,
             **checkpoints,
         )
@@ -548,9 +489,6 @@ def _cake_ssd_prefill(
             f"FlashInfer refused the configuration ({error}): {detail}",
         )
         return None
-    # Forced by the FI contract: Cake's ``out`` is [1, H, 64, nchunks, 128];
-    # the engine consumes the token-major [1, S, H, 64] buffer it passed.
-    out.copy_(out_view)
     _log_cake_route_once(route, "taken", detail)
     # Stock contract: (intermediate_states, varlen_state, track_states); the
     # per-sequence final states are the varlen states the mixer scatters back.

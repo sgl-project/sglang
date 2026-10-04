@@ -167,7 +167,6 @@ def _ssd_inputs(seqlen=S, lengths=LENGTHS, state_dtype=torch.bfloat16):
         state_dtype=state_dtype,
         cake_chunk_indices=ci,
         cake_chunk_offsets=co,
-        extend_seq_lens_cpu=list(lengths),
     )
 
 
@@ -201,7 +200,7 @@ def _stock_ssd(x, dt, A, B, C, **kw):
 def _cake_ssd(x, dt, A, B, C, **kw):
     kw["out"].fill_(2.0)
     final = torch.full((2, H, HEADDIM, DSTATE), 2.0, dtype=torch.bfloat16)
-    return kw["out"].permute(0, 3, 4, 1, 2).reshape(1, -1, H, HEADDIM), final
+    return kw["out"], final
 
 
 def test_ssd_route_off_uses_stock_with_exact_kwargs():
@@ -251,20 +250,15 @@ def test_ssd_route_on_admitted_uses_cake_with_contract_args(caplog):
     # Chunk-128 metadata, not the engine's chunk-256 metadata.
     assert kw["chunk_indices"] is inputs["cake_chunk_indices"]
     assert kw["chunk_offsets"] is inputs["cake_chunk_offsets"]
-    # Varlen needs initial states: zeros for the "no prefix" batch.
-    init = kw["initial_states"]
-    assert tuple(init.shape) == (2, H, HEADDIM, DSTATE) and init.dtype == torch.bfloat16
-    assert torch.all(init == 0)
-    # Head-major chunked, caller-owned Cake output.
-    cake_out = kw["out"]
-    assert tuple(cake_out.shape) == (1, H, HEADDIM, S // 128, 128)
-    assert cake_out.dtype == torch.bfloat16 and cake_out.is_contiguous()
-    assert cake_out is not inputs["out"]
+    # Varlen without a prefix: ``None`` initial states plus the sequence count
+    # (no zero buffer); the engine's token-major buffer is the kernel's out.
+    assert kw["initial_states"] is None and kw["num_seqs"] == 2
+    assert kw["out"] is inputs["out"]
     # Admission saw the same tensors at chunk 128.
     s_args, s_kw = supports.call_args
     assert s_args[0] is inputs["x"] and s_args[3] is inputs["B"]
-    assert s_kw["chunk_size"] == 128 and s_kw["out"] is cake_out
-    assert s_kw["initial_states"] is init
+    assert s_kw["chunk_size"] == 128 and s_kw["out"] is inputs["out"]
+    assert s_kw["initial_states"] is None and s_kw["num_seqs"] == 2
     assert s_kw["chunk_indices"] is inputs["cake_chunk_indices"]
     assert s_kw["seq_idx"] is inputs["seq_idx"] and s_kw["z"] is None
     # Stock return contract: (None, varlen_state, None) and the engine out filled.
@@ -405,6 +399,7 @@ def test_ssd_route_passes_engine_initial_states_through():
     ):
         mamba_mod.ssd_prefill(stock, **inputs)
     assert cake.call_args.kwargs["initial_states"] is inputs["initial_states"]
+    assert cake.call_args.kwargs["num_seqs"] == 2
 
 
 def test_ssd_route_on_rejected_falls_back_and_logs_once(caplog):
@@ -425,57 +420,55 @@ def test_ssd_route_on_rejected_falls_back_and_logs_once(caplog):
 
 
 @pytest.mark.parametrize(
-    "lengths, host_lens, admitted",
-    [
-        ((128,), True, False),
-        ((128, 128), True, False),
-        ((96, 160), True, True),
-        ((96, 160), False, False),  # no host lengths: total bounds the longest
-        ((256, 128), True, True),
-        ((128, 896), False, True),
-    ],
+    "lengths",
+    [(128,), (128, 128), (72, 128), (96, 160), (256, 128), (128, 896), (1000,)],
 )
-def test_ssd_route_single_chunk_batches_fall_back(lengths, host_lens, admitted, caplog):
-    """A call in which every sequence is one chunk-128 keeps the stock kernel
-    (the Cake runner returns NaN for that geometry); any batch with a
-    >= 2-chunk sequence is routed."""
-    caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
+def test_ssd_route_single_chunk_and_partial_chunk_batches_are_routed(lengths):
+    """Every packed geometry is routed: single-chunk sequences (the CAKE-950
+    NaN geometry, fixed in the kernel) and token counts off the 128 grid (the
+    kernel handles a partial last chunk); the Cake call names the sequence
+    count and writes the engine buffer."""
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
     inputs = _ssd_inputs(seqlen=sum(lengths), lengths=lengths)
-    if not host_lens:
-        inputs["extend_seq_lens_cpu"] = None
     with (
         _routes(mamba_mod, "mamba_ssd_prefill"),
         mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
     ):
         mamba_mod.ssd_prefill(stock, **inputs)
-    if admitted:
-        cake.assert_called_once()
-        stock.assert_not_called()
-    else:
-        stock.assert_called_once()
-        supports.assert_not_called()
-        cake.assert_not_called()
-        assert "every sequence is a single 128-token chunk" in caplog.text
+    cake.assert_called_once()
+    stock.assert_not_called()
+    assert cake.call_args.kwargs["num_seqs"] == len(lengths)
+    assert cake.call_args.kwargs["out"] is inputs["out"]
 
 
-@pytest.mark.parametrize("case", ["unaligned", "tracking", "no_metadata", "fp32_state"])
+def test_ssd_route_admits_fp32_state():
+    """``--mamba-ssm-dtype float32`` (the engine default) is routed."""
+    stock = mock.Mock(side_effect=_stock_ssd)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
+    inputs = _ssd_inputs(state_dtype=torch.float32)
+    with (
+        _routes(mamba_mod, "mamba_ssd_prefill"),
+        mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
+    ):
+        mamba_mod.ssd_prefill(stock, **inputs)
+    cake.assert_called_once()
+    stock.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["tracking", "no_metadata", "fp64_state"])
 def test_ssd_route_static_fallbacks_skip_adapter(case):
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
-    if case == "unaligned":
-        inputs = _ssd_inputs(seqlen=200, lengths=(72, 128))
-    else:
-        inputs = _ssd_inputs()
+    inputs = _ssd_inputs()
     if case == "tracking":
         # tracked batch whose rows were not mapped onto Cake checkpoints
         inputs["track_seq_idx"] = torch.zeros(1, S, dtype=torch.int32)
         inputs["track_end_locs"] = torch.tensor([96], dtype=torch.int32)
     elif case == "no_metadata":
         inputs["cake_chunk_indices"] = inputs["cake_chunk_offsets"] = None
-    elif case == "fp32_state":
-        inputs["state_dtype"] = torch.float32
+    elif case == "fp64_state":
+        inputs["state_dtype"] = torch.float64
     with (
         _routes(mamba_mod, "mamba_ssd_prefill"),
         mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),

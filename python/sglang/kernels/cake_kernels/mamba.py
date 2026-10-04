@@ -1,23 +1,28 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at ``46340689a5ab``):
+FlashInfer entries (contract at ``2a57c19bace5``, the CAKE-956 revision of the
+``46340689a5ab`` contract: any ``seqlen``, FP32 state, token-major ``out``,
+varlen without ``initial_states``, fp64-recurrence accuracy oracle):
 
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
   functional ``flashinfer.mamba.ssd_combined_fwd`` (E1-32, Cake-only, runner
   cached per device / stream / config). Locked domain: ``chunk_size=128``,
-  ``headdim=64``, ``dstate=128``, ``seqlen % 128 == 0``; BF16 ``x [B, S,
-  nheads, 64]``, ``B``/``C [B, S, ngroups, 128]`` (``nheads % ngroups == 0``),
-  ``dt [B, S, nheads]`` BF16 or FP32, FP32 ``A [nheads]``, optional BF16 ``D
-  [nheads]`` or ``[nheads, 64]``, ``z`` like ``x``, ``dt_bias [nheads]``;
-  state dtype BF16 or FP16 (``initial_states [num_seqs, nheads, 64, 128]``);
-  varlen needs ``seq_idx`` (int32/int64 ``[B, S]``), int32 ``chunk_indices`` /
-  ``chunk_offsets`` and ``initial_states``. Only backend that writes selective
-  ``checkpoint_states`` (``checkpoint_token_indices`` + ``checkpoint_state_slots``,
-  all int32, together). ``out`` is caller-owned contiguous BF16
-  ``[B, nheads, 64, nchunks, 128]``; ``run`` returns the token-major
-  ``[B, S, nheads, 64]`` view plus final states. The runner materializes
-  strided inputs into graph-stable storage.
+  ``headdim=64``, ``dstate=128``, any ``seqlen > 0`` (the last physical chunk
+  may be partial); BF16 ``x [B, S, nheads, 64]``, ``B``/``C [B, S, ngroups,
+  128]`` (``nheads % ngroups == 0``), ``dt [B, S, nheads]`` BF16 or FP32, FP32
+  ``A [nheads]``, optional BF16 ``D [nheads]`` or ``[nheads, 64]``, ``z`` like
+  ``x``, ``dt_bias [nheads]``; state dtype BF16, FP16 or FP32
+  (``initial_states [num_seqs, nheads, 64, 128]``); varlen needs ``seq_idx``
+  (int32/int64 ``[B, S]``) and int32 ``chunk_indices`` / ``chunk_offsets``,
+  and takes the packed sequence count from ``initial_states``,
+  ``seq_chunk_cumsum`` or ``num_seqs`` (at least one; they must agree). Only
+  backend that writes selective ``checkpoint_states``
+  (``checkpoint_token_indices`` + ``checkpoint_state_slots``, all int32,
+  together). ``out`` is caller-owned contiguous token-major BF16
+  ``[B, S, nheads, 64]`` (the engine's own buffer); ``run`` returns it plus
+  the final states. The runner materializes strided inputs into graph-stable
+  storage.
 * ``flashinfer.mamba.selective_state_update(..., backend="cake")`` (E1-29) ->
   ``flashinfer.jit.mamba.cake_selective_state_update.try_cake_selective_state_update``
   and the thin ``flashinfer.mamba.cake_selective_state_update`` (E1-30).
@@ -111,6 +116,7 @@ def supports_ssd_combined(
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
     seq_chunk_cumsum: Optional[torch.Tensor] = None,
+    num_seqs: Optional[int] = None,
     checkpoint_token_indices: Optional[torch.Tensor] = None,
     checkpoint_state_slots: Optional[torch.Tensor] = None,
     checkpoint_states: Optional[torch.Tensor] = None,
@@ -126,6 +132,7 @@ def supports_ssd_combined(
     """
     import torch
 
+    state_dtypes = (torch.bfloat16, torch.float16, torch.float32)
     if not (
         flashinfer_module_available(FI_MODULE, FI_SSD_MODULE)
         and cuda_tensor_on(x, ARCHS)
@@ -142,14 +149,12 @@ def supports_ssd_combined(
     if not (
         batch > 0
         and seqlen > 0
-        and seqlen % SSD_CHUNK_SIZE == 0
         and headdim == SSD_HEADDIM
         and nheads > 0
         and ngroups > 0
         and nheads % ngroups == 0
     ):
         return False
-    nchunks = seqlen // SSD_CHUNK_SIZE
     for tensor in (x, B, C):
         if not (
             tensor.is_cuda
@@ -191,7 +196,7 @@ def supports_ssd_combined(
     varlen = seq_idx is not None
     metadata = (seq_idx, chunk_indices, chunk_offsets)
     if varlen:
-        if any(t is None for t in metadata) or initial_states is None:
+        if any(t is None for t in metadata):
             return False
         if not (
             seq_idx.is_cuda
@@ -203,25 +208,43 @@ def supports_ssd_combined(
             and tuple(chunk_indices.shape) == tuple(chunk_offsets.shape)
         ):
             return False
-    elif any(t is not None for t in metadata) or seq_chunk_cumsum is not None:
+        # The packed sequence count comes from whichever of initial_states /
+        # seq_chunk_cumsum / num_seqs the caller gives; they must agree.
+        counts = set()
+        if initial_states is not None:
+            counts.add(int(initial_states.shape[0]))
+        if seq_chunk_cumsum is not None:
+            counts.add(int(seq_chunk_cumsum.numel()) - 1)
+        if num_seqs is not None:
+            counts.add(int(num_seqs))
+        if len(counts) != 1:
+            return False
+        num_sequences = counts.pop()
+        if num_sequences < 1:
+            return False
+    elif (
+        any(t is not None for t in metadata)
+        or seq_chunk_cumsum is not None
+        or num_seqs is not None
+    ):
         return False
+    else:
+        num_sequences = batch
     if initial_states is not None:
-        num_sequences = initial_states.shape[0] if varlen else batch
         if not (
             initial_states.is_cuda
             and initial_states.device == device
-            and initial_states.dtype in (torch.bfloat16, torch.float16)
+            and initial_states.dtype in state_dtypes
             and tuple(initial_states.shape)
             == (num_sequences, nheads, SSD_HEADDIM, SSD_DSTATE)
         ):
             return False
         state_dtype = initial_states.dtype
     else:
-        num_sequences = batch
         state_dtype = (
             checkpoint_states.dtype if checkpoint_states is not None else torch.bfloat16
         )
-        if state_dtype not in (torch.bfloat16, torch.float16):
+        if state_dtype not in state_dtypes:
             return False
     if seq_chunk_cumsum is not None and not (
         seq_chunk_cumsum.is_cuda
@@ -248,8 +271,8 @@ def supports_ssd_combined(
         ):
             return False
     if out is not None and not (
-        _contiguous(out, torch.bfloat16, device, ndim=5)
-        and tuple(out.shape) == (batch, nheads, SSD_HEADDIM, nchunks, SSD_CHUNK_SIZE)
+        _contiguous(out, torch.bfloat16, device, ndim=4)
+        and tuple(out.shape) == tuple(x.shape)
     ):
         return False
     return True
@@ -275,7 +298,7 @@ def ssd_combined(
 
     Returns the prepared runner; call ``.run(x, dt, A, B, C, D=, z=, dt_bias=,
     dt_softplus=, dt_limit=, initial_states=, seq_idx=, chunk_indices=,
-    chunk_offsets=, seq_chunk_cumsum=, update_seq_chunk_cumsum=,
+    chunk_offsets=, seq_chunk_cumsum=, update_seq_chunk_cumsum=, num_seqs=,
     checkpoint_token_indices=, checkpoint_state_slots=, checkpoint_states=,
     out=, return_final_states=)`` per batch. One runner per stream (its
     workspaces are mutable). Dtype defaults: BF16 I/O and state, int64
@@ -318,6 +341,7 @@ def ssd_combined_fwd(
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
     seq_chunk_cumsum: Optional[torch.Tensor] = None,
+    num_seqs: Optional[int] = None,
     update_seq_chunk_cumsum: bool = False,
     checkpoint_token_indices: Optional[torch.Tensor] = None,
     checkpoint_state_slots: Optional[torch.Tensor] = None,
@@ -329,7 +353,8 @@ def ssd_combined_fwd(
 
     Returns ``(token-major output [B, S, nheads, 64], final_states or None)``.
     The state dtype is inferred from ``initial_states`` / ``checkpoint_states``
-    (BF16 when neither is given).
+    (BF16 when neither is given); a varlen call without ``initial_states``
+    names its packed sequence count through ``num_seqs``.
     """
     from flashinfer.mamba import ssd_combined_fwd as fi_ssd_combined_fwd
 
@@ -350,6 +375,7 @@ def ssd_combined_fwd(
         chunk_offsets=chunk_offsets,
         seq_chunk_cumsum=seq_chunk_cumsum,
         update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+        num_seqs=num_seqs,
         checkpoint_token_indices=checkpoint_token_indices,
         checkpoint_state_slots=checkpoint_state_slots,
         checkpoint_states=checkpoint_states,
