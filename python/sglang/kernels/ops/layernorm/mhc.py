@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_ppu
 from sglang.srt.utils.common import is_gfx1250_supported
 
 _is_hip = is_hip()
@@ -1207,12 +1207,19 @@ def mhc_pre(
         )
 
     if _use_deep_gemm_hc_prenorm():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        if is_ppu():
+            assert n_splits == 1, (
+                "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+            )
+        else:
+            n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-        gemm_out_mul = torch.empty(
+        # NOTE(PPU): Need to use torch.zeros instead of torch.empty here
+        # to fix precision problem on PPU SM80 with DeepSeek V4 Pro W8A8
+        gemm_out_mul = torch.zeros(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
         )
-        gemm_out_sqrsum = torch.empty(
+        gemm_out_sqrsum = torch.zeros(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
@@ -1795,17 +1802,22 @@ def mhc_fused_post_pre(
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+    elif is_ppu() and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        # PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k
+        n_splits = 1
     else:
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-    gemm_out_mul = torch.empty(
+    # NOTE(PPU): Need to use torch.zeros instead of torch.empty here
+    # to fix precision problem on PPU SM80 with DeepSeek V4 Pro W8A8
+    gemm_out_mul = torch.zeros(
         n_splits,
         num_tokens,
         hc_mult3,
         dtype=torch.float32,
         device=residual.device,
     )
-    gemm_out_sqrsum = torch.empty(
+    gemm_out_sqrsum = torch.zeros(
         n_splits,
         num_tokens,
         dtype=torch.float32,
