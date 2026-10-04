@@ -21,8 +21,10 @@ Plain GEMM contract (block-scaled FlashInfer, the ``alignment`` keyword):
   block): ``a_scale`` ``(M, ceil(K/512))`` with any strides (the DeepGEMM
   MN-major ``(1, M)`` layout included); ``b_scale`` ``(G, N, ceil(K/512))``
   (row-repeated, ``transform_scale_ue8m0``) or ``(G, N/128, ceil(K/512))``;
-  ``N % 16 == 0``.  ``-1`` rows of ``m_indices`` are skipped natively (their
-  output rows are left untouched; ``fill_padding`` must be ``False``).  Every
+  ``N % 16 == 0``.  ``-1`` rows of ``m_indices`` are skipped natively per
+  32-row sub-block (a sub-block that starts with padding is never written;
+  padding rows sharing a sub-block with an expert's rows are computed from
+  their own operands and never read back; ``fill_padding`` must be ``False``).  Every
   expert's run must start on a multiple of ``alignment`` rows (``alignment`` a
   multiple of 32; multiples of 128 run the fast single-run schedule, other
   values a slower multi-run fallback).
