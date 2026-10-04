@@ -19,11 +19,11 @@
 
 use crate::policies::power_of_two::select_k_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+pub(crate) use crate::state::load_monitor::engine_ranking::{
+    compare_decode_engines, compare_prefill_engines, CandidateLoads,
+};
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
-};
-pub(crate) use crate::state::load_monitor::pressure::{
-    compare_decode_pressure, compare_prefill_pressure, CandidateLoads,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -324,7 +324,7 @@ pub fn resolve_cache_candidates(
                     })
                     .min_by(|left, right| {
                         pin_loads
-                            .compare_prefill_pressure(&left.worker, &right.worker)
+                            .compare_prefill_engines(&left.worker, &right.worker)
                             .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
                     })
             })
@@ -512,7 +512,7 @@ pub fn resolve_decode(
         .is_some_and(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot));
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
         (true, Some(backup), true) => {
-            if compare_decode_pressure(&proposal.primary, backup, Some(snapshot)).is_gt() {
+            if compare_decode_engines(&proposal.primary, backup, Some(snapshot)).is_gt() {
                 (Arc::clone(backup), DecisionReason::BackupPressureGuard)
             } else {
                 (Arc::clone(&proposal.primary), DecisionReason::Primary)
@@ -616,7 +616,7 @@ fn compare_cache_candidates(
         return left
             .uncached_tokens
             .cmp(&right.uncached_tokens)
-            .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+            .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
             .then_with(|| left.worker.id.0.cmp(&right.worker.id.0));
     }
     if enable_pressure_guard {
@@ -643,7 +643,7 @@ fn compare_cache_candidates(
     }
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+        .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 
@@ -735,7 +735,7 @@ fn range_fallback(
     // for the whole unqueued tier to router-local.
     let loads = CandidateLoads::new(Some(snapshot), pool.iter());
     loads
-        .min_by_pressure_key(pool, CandidateLoads::compare_prefill_keys)
+        .select_min_by_load_key(pool, CandidateLoads::compare_prefill_load_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -766,7 +766,7 @@ fn decode_domain_fallback(
         .collect::<Vec<_>>();
     let loads = CandidateLoads::new(Some(snapshot), admitted.iter());
     loads
-        .min_by_pressure_key(admitted, CandidateLoads::compare_decode_keys)
+        .select_min_by_load_key(admitted, CandidateLoads::compare_decode_load_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 

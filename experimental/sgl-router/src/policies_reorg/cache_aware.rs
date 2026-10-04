@@ -18,10 +18,10 @@ use crate::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, PrefixLookupResult,
     RadixTreePrefixProvider,
 };
+use crate::state::load_monitor::engine_ranking::CandidateLoads;
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable,
 };
-use crate::state::load_monitor::pressure::CandidateLoads;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
@@ -137,7 +137,7 @@ struct Candidate<'a> {
 fn rank(loads: &CandidateLoads<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(left.engine, right.engine))
+        .then_with(|| loads.compare_prefill_engines(left.engine, right.engine))
         .then_with(|| left.engine.id.0.cmp(&right.engine.id.0))
 }
 

@@ -144,7 +144,7 @@ fn compare_candidate_seed(
     right
         .matched_prefix_tokens
         .cmp(&left.matched_prefix_tokens)
-        .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+        .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 

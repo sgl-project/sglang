@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Engine pressure comparisons over one captured load snapshot.
+//! Stage-specific engine ranking over one captured load snapshot.
 
 use super::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedSchedulingLoad, EngineReportedWorkerLoad,
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Compares prefill pressure by queue time when available, then by the V3 load tuple.
-pub(crate) fn compare_prefill_pressure(
+pub(crate) fn compare_prefill_engines(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
     snapshot: Option<&EngineReportedLoadSnapshot>,
@@ -35,7 +35,7 @@ pub(crate) fn compare_prefill_pressure(
     }
 }
 
-fn prefill_pressure_key(load: &EngineReportedSchedulingLoad) -> (u64, u64, u64) {
+fn prefill_load_key(load: &EngineReportedSchedulingLoad) -> (u64, u64, u64) {
     (
         load.num_waiting_uncached_tokens,
         load.num_waiting_reqs,
@@ -53,13 +53,13 @@ fn compare_prefill_load(
     ) {
         (Some(left_ms), Some(right_ms)) => left_ms
             .total_cmp(&right_ms)
-            .then_with(|| prefill_pressure_key(left).cmp(&prefill_pressure_key(right))),
-        _ => prefill_pressure_key(left).cmp(&prefill_pressure_key(right)),
+            .then_with(|| prefill_load_key(left).cmp(&prefill_load_key(right))),
+        _ => prefill_load_key(left).cmp(&prefill_load_key(right)),
     }
 }
 
 /// Compares decode pressure from LoadStat without treating unknown capacity as zero.
-pub(crate) fn compare_decode_pressure(
+pub(crate) fn compare_decode_engines(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
     snapshot: Option<&EngineReportedLoadSnapshot>,
@@ -105,7 +105,7 @@ fn compare_decode_load(
 /// candidate sets use Router-local active load to preserve ordering.
 ///
 /// The key-level helpers (`comparable_get`, `compare_*_keys`,
-/// `min_by_pressure_key`) are `pub(crate)` only for legacy admission.
+/// `select_min_by_load_key`) are `pub(crate)` only for legacy admission.
 pub(crate) struct CandidateLoads<'a> {
     by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
     basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
@@ -171,7 +171,7 @@ impl<'a> CandidateLoads<'a> {
         self.compare_engine.then(|| self.get(worker_id)).flatten()
     }
 
-    fn pressure_key(&self, worker: &Arc<Worker>) -> LoadKey<'a> {
+    fn load_key(&self, worker: &Arc<Worker>) -> LoadKey<'a> {
         LoadKey {
             load: self.comparable_get(&worker.id),
             local_active: self
@@ -182,7 +182,11 @@ impl<'a> CandidateLoads<'a> {
         }
     }
 
-    pub(crate) fn compare_prefill_keys(&self, left: &LoadKey<'a>, right: &LoadKey<'a>) -> Ordering {
+    pub(crate) fn compare_prefill_load_keys(
+        &self,
+        left: &LoadKey<'a>,
+        right: &LoadKey<'a>,
+    ) -> Ordering {
         match (left.load, right.load) {
             (Some(left_load), Some(right_load)) => compare_prefill_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
@@ -190,7 +194,11 @@ impl<'a> CandidateLoads<'a> {
         }
     }
 
-    pub(crate) fn compare_decode_keys(&self, left: &LoadKey<'a>, right: &LoadKey<'a>) -> Ordering {
+    pub(crate) fn compare_decode_load_keys(
+        &self,
+        left: &LoadKey<'a>,
+        right: &LoadKey<'a>,
+    ) -> Ordering {
         match (left.load, right.load) {
             (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
@@ -198,12 +206,12 @@ impl<'a> CandidateLoads<'a> {
         }
     }
 
-    pub(crate) fn compare_prefill_pressure(
+    pub(crate) fn compare_prefill_engines(
         &self,
         left: &Arc<Worker>,
         right: &Arc<Worker>,
     ) -> Ordering {
-        self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
+        self.compare_prefill_load_keys(&self.load_key(left), &self.load_key(right))
     }
 
     pub(crate) fn prefill_pressure_source(&self) -> &'static str {
@@ -248,16 +256,16 @@ impl<'a> CandidateLoads<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
-    pub(crate) fn min_by_pressure_key(
+    pub(crate) fn select_min_by_load_key(
         &self,
         candidates: Vec<Arc<Worker>>,
         compare: impl Fn(&Self, &LoadKey<'a>, &LoadKey<'a>) -> Ordering,
     ) -> Option<Arc<Worker>> {
         let mut candidates = candidates.into_iter();
         let mut best = candidates.next()?;
-        let mut best_key = self.pressure_key(&best);
+        let mut best_key = self.load_key(&best);
         for candidate in candidates {
-            let key = self.pressure_key(&candidate);
+            let key = self.load_key(&candidate);
             if compare(self, &key, &best_key).is_lt() {
                 best = candidate;
                 best_key = key;
@@ -320,7 +328,7 @@ mod tests {
         let busy = worker("busy");
         let idle = worker("idle");
         let loads = snapshot(&[(&busy, 1, 8), (&idle, 9, 2)]);
-        assert!(compare_prefill_pressure(&busy, &idle, Some(&loads)).is_gt());
+        assert!(compare_prefill_engines(&busy, &idle, Some(&loads)).is_gt());
     }
 
     #[test]
@@ -328,13 +336,13 @@ mod tests {
         let left = worker("left");
         let right = worker("right");
         let _guard = left.load_guard();
-        assert!(compare_prefill_pressure(&left, &right, None).is_gt());
+        assert!(compare_prefill_engines(&left, &right, None).is_gt());
     }
 
     #[test]
     fn decode_pressure_tie_is_not_broken_by_worker_id() {
         let (a, z) = (worker("a"), worker("z"));
-        assert_eq!(compare_decode_pressure(&a, &z, None), Ordering::Equal);
+        assert_eq!(compare_decode_engines(&a, &z, None), Ordering::Equal);
     }
 
     #[test]
@@ -349,6 +357,6 @@ mod tests {
         let loads = CandidateLoads::new(Some(&snapshot), [&idle, &busy, &stale]);
         assert!(loads.get(&idle.id).is_some());
         assert!(loads.get(&stale.id).is_none());
-        assert!(loads.compare_prefill_pressure(&idle, &busy).is_gt());
+        assert!(loads.compare_prefill_engines(&idle, &busy).is_gt());
     }
 }
