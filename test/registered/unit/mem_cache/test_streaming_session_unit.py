@@ -13,6 +13,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -54,6 +56,15 @@ class _FakeReqToTokenPool:
         req.kv.req_pool_idx = None
 
 
+@pytest.fixture
+def published_config():
+    # release_kv_cache reads the spec / serving bags.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="scheduler")
+    yield
+    reset_context()
+
+
 class _FakeInnerCache:
     """Stands in for UnifiedRadixCache: owns the session and tries it first."""
 
@@ -69,11 +80,17 @@ class _FakeInnerCache:
         self.dec_lock_ref_skip_swa = []
         self.session = StreamingSession(self)
 
-    def checkpoint(self, *args, **kwargs):
-        raise AssertionError("Streaming requests should not delegate to inner cache")
+    def checkpoint(self, req, *, up_to):
+        pass
 
     def claim_kv_row(self, req):
         return self.session.try_cache_finished_req(req)
+
+    def unpin(self, req):
+        pass
+
+    def on_release(self, req, *, inserted):
+        pass
 
     def match_prefix(self, params):
         result = self.session.try_match_prefix(params)
@@ -124,9 +141,20 @@ class _FakeReq:
         self.finished_reason = None
         self.finished_len = None
 
+    skip_radix_cache_insert = False
+
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
+
+    def finished(self):
+        return self.finished_reason is not None
+
+    def owned_kv_len(self):
+        return self.kv.kv_committed_len
+
+    def refresh_fill_ids(self):
+        pass
 
 
 def test_session_slot_round_trip_preserves_component_state():
@@ -207,9 +235,9 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert len(result.device_indices) == 0
 
 
-def test_first_mid_abort_nukes_ephemeral_slot():
-    """First-request mid-processing abort: no slot exists yet, ephemeral
-    slot is created from req state and nuked via release_session."""
+def test_first_mid_abort_releases_like_any_request(published_config):
+    """First-turn abort: no slot exists, so the request is released like any
+    aborted request and no slot is created."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
@@ -218,7 +246,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     tree_cache = inner
 
     # No slot exists yet (first request).
-    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
     req.finished_reason = FINISH_ABORT("input too long")
 
     release_kv_cache(req, tree_cache)
@@ -232,10 +260,10 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert allocator.freed[0].tolist() == list(range(20))
 
 
-def test_nth_mid_abort_nukes_session_slot():
-    """Nth-request mid-processing abort: slot exists, restore_to_req ran.
-    ALL KV is wiped (release_session). Slot is deleted. Token IDs stay
-    in req_nodes for next turn's re-prefill."""
+def test_nth_mid_abort_drops_session_slot(published_config):
+    """Later-turn abort: the request ran on the slot's record, so releasing it
+    frees the whole row and drops the slot with its tree lock (skipping an
+    early-released SWA lock); the session re-prefills next turn."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
@@ -243,17 +271,24 @@ def test_nth_mid_abort_nukes_session_slot():
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = inner
 
-    # Mid-processing abort: restore_to_req ran, so the req runs on the slot's
-    # record, which this turn has grown to committed=60 / allocated=65.
-    req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
+    # restore_to_req ran, so the req runs on the slot's record.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
-    tree_cache.session.slots["session-a"] = SessionSlot(kv=req.kv, last_node=None)
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.session.slots["session-a"] = SessionSlot(
+        kv=req.kv,
+        last_node=lock_node,
+        lock_receipt=DecLockRefParams(
+            node_id=42, component_lock_uuids={ComponentType.SWA: 7}
+        ),
+        swa_prefix_lock_released=True,
+    )
 
     release_kv_cache(req, tree_cache)
 
-    # Slot wiped — deleted from slots dict.
     assert "session-a" not in tree_cache.session.slots
-    # All KV freed: [0, 65) from release_session.
+    assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_skip_swa == [True]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(65))
     # Pool slot returned.
