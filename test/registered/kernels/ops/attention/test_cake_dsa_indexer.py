@@ -8,7 +8,8 @@ DeepGEMM as the oracle on both engine paths:
   clean_logits=False)`` -- finite logits within FP32-accumulation tolerance of
   exact FP8 products (atol 1e-2 of the row max, rtol 1e-2), the window mask
   exact, and equality of the top-k index *sets* after the engine's ``+inf``
-  init / local-token scatter on tie-free inputs;
+  init / local-token scatter (exact away from the selection boundary, where
+  FP32 accumulation order may swap values within the logits tolerance);
 * paged decode / verify: ``get_paged_mqa_logits_metadata`` +
   ``fp8_paged_mqa_logits`` with the same gates (skips while the installed
   FlashInfer catalog has no paged route for the shape);
@@ -120,28 +121,32 @@ def _mask_init_and_local_tokens(logits, lengths, row_starts=None):
     return logits
 
 
-def _topk_sets(logits, topk):
-    values, indices = torch.topk(logits, k=min(topk, logits.shape[1]), dim=1)
-    rows = []
-    for row_values, row_indices in zip(values.tolist(), indices.tolist()):
-        rows.append(
-            frozenset(i for v, i in zip(row_values, row_indices) if v != float("-inf"))
-        )
-    return rows
-
-
-def _assert_tie_free(logits, topk):
-    """The k-th and (k+1)-th finite values of every row differ by more than the
-    FP32-accumulation tolerance, so the top-k set is well defined."""
-    finite = logits.masked_fill(~torch.isfinite(logits), float("-inf"))
-    k = min(topk + 1, finite.shape[1])
-    values, _ = torch.topk(finite, k=k, dim=1)
-    if k <= topk:
-        return
-    gap = values[:, topk - 1] - values[:, topk]
-    both = torch.isfinite(values[:, topk - 1]) & torch.isfinite(values[:, topk])
-    assert bool((gap[both] > 1e-1).all()), (
-        "inputs are not tie-free at the top-k boundary"
+def _assert_topk_sets_match(got, ref, topk):
+    """Top-k index sets after the engine's forced-include scatter agree exactly away
+    from the selection boundary. Both sides accumulate exact FP8 products in FP32
+    in different orders, so a reference value within the logits tolerance of the
+    k-th reference value may legitimately land on either side of the cut; every
+    index that differs between the two sets must lie in that boundary band, and
+    both selections keep the same number of finite entries."""
+    k = min(topk, ref.shape[1])
+    ref_values, ref_indices = torch.topk(ref, k=k, dim=1)
+    got_values, got_indices = torch.topk(got, k=k, dim=1)
+    # Same forced includes and the same finite cells selected on both sides.
+    assert torch.equal(
+        (got_values != float("-inf")).sum(dim=1),
+        (ref_values != float("-inf")).sum(dim=1),
+    )
+    ref_finite = ref.masked_fill(~torch.isfinite(ref), 0.0)
+    row_max = ref_finite.abs().amax(dim=1, keepdim=True).clamp_min(1.0)
+    kth = ref_values[:, k - 1 : k]
+    kth = torch.where(torch.isfinite(kth), kth, torch.zeros_like(kth))
+    band = 1e-2 * row_max + 1e-2 * kth.abs()
+    in_ref = torch.zeros_like(ref, dtype=torch.bool).scatter_(1, ref_indices, True)
+    in_got = torch.zeros_like(got, dtype=torch.bool).scatter_(1, got_indices, True)
+    differs = (in_ref ^ in_got) & (ref != float("-inf"))
+    off_band = differs & ((ref_finite - kth).abs() > band)
+    assert not bool(off_band.any()), (
+        f"{int(off_band.sum())} top-k indices differ outside the boundary band"
     )
 
 
@@ -214,9 +219,10 @@ def test_ragged_fp8_mqa_logits_matches_deep_gemm(queries, keys, heads):
     ref_masked = _mask_init_and_local_tokens(
         ref.masked_fill(~inside, float("-inf")).clone(), lengths, ks
     )
-    got_masked = _mask_init_and_local_tokens(got.clone(), lengths, ks)
-    _assert_tie_free(ref_masked, topk)
-    assert _topk_sets(got_masked, topk) == _topk_sets(ref_masked, topk)
+    got_masked = _mask_init_and_local_tokens(
+        got.masked_fill(~inside, float("-inf")).clone(), lengths, ks
+    )
+    _assert_topk_sets_match(got_masked, ref_masked, topk)
 
 
 def test_ragged_admission_rules():
@@ -375,8 +381,7 @@ def test_paged_fp8_mqa_logits_matches_deep_gemm(batch, next_n, heads, avg_ctx):
     got_masked = _mask_init_and_local_tokens(
         got.masked_fill(~inside, float("-inf")).clone(), lengths
     )
-    _assert_tie_free(ref_masked, topk)
-    assert _topk_sets(got_masked, topk) == _topk_sets(ref_masked, topk)
+    _assert_topk_sets_match(got_masked, ref_masked, topk)
 
 
 def test_paged_admission_rules():
@@ -392,7 +397,8 @@ def test_paged_admission_rules():
     assert not cake.supports_fp8_paged_mqa_logits(
         q, kv_cache, weights, ctx_2d[:, -1].contiguous(), block_table
     )
-    page128 = kv_cache.reshape(-1).view(-1, 128, 1, 132)[: kv_cache.shape[0] // 2]
+    even_pages = kv_cache.shape[0] // 2 * 2
+    page128 = kv_cache[:even_pages].reshape(-1).view(-1, 128, 1, 132)
     assert not cake.supports_fp8_paged_mqa_logits(
         q, page128, weights, ctx_2d, block_table
     )
