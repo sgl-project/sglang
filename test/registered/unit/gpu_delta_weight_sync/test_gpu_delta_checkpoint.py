@@ -54,7 +54,11 @@ def selection_helpers():
     exec(  # noqa: S102 - exact local source, isolated from CUDA-only imports.
         compile(
             ast.Module(
-                body=[node for node in tree.body if getattr(node, "name", "") in names],
+                body=[
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name in names
+                ],
                 type_ignores=[],
             ),
             str(_root / "model_loader/weight_utils.py"),

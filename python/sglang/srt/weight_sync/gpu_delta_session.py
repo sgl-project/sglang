@@ -75,6 +75,8 @@ def _identities(values: list[dict]) -> set[str]:
 @dataclass
 class _Session:
     request: dict
+    participant_keys: set[str]
+    cohort_digest: str
     state: str = "PREPARING"
     message: str = ""
     prepared: Any = None
@@ -126,9 +128,7 @@ class DeltaSession:
             receipt = {
                 "identity": copy.deepcopy(self.identity),
                 "state": session.state,
-                "cohort_digest": hashlib.sha256(
-                    json.dumps(sorted(_identities(request["participants"]))).encode()
-                ).hexdigest(),
+                "cohort_digest": session.cohort_digest,
                 "message": session.message,
                 **{
                     key: request[key]
@@ -199,7 +199,13 @@ class DeltaSession:
                 )
             if self.stream_id is not None and request["stream_id"] != self.stream_id:
                 raise ValueError("delta stream changed")
-            session = self._session = _Session(request=request)
+            session = self._session = _Session(
+                request=request,
+                participant_keys=local,
+                cohort_digest=hashlib.sha256(
+                    json.dumps(sorted(local)).encode()
+                ).hexdigest(),
+            )
             self._seen_ids.add(session_id)
             self._executor.submit(self._prepare, session)
             return self.status(session_id)
@@ -259,17 +265,13 @@ class DeltaSession:
             return self.status(session_id)
 
     def _validate_applied(self, session: _Session, receipts: list[dict]) -> None:
-        expected = _identities(session.request["participants"])
         actual = _identities([receipt["identity"] for receipt in receipts])
-        if actual != expected:
+        if actual != session.participant_keys:
             raise ValueError(
                 "certificate must contain every original rank exactly once"
             )
-        cohort_digest = hashlib.sha256(
-            json.dumps(sorted(expected)).encode()
-        ).hexdigest()
         for receipt in receipts:
-            if receipt.get("cohort_digest") != cohort_digest:
+            if receipt.get("cohort_digest") != session.cohort_digest:
                 raise ValueError("certificate cohort differs from the prepared cohort")
             if receipt["state"] != "APPLIED":
                 raise ValueError("certificate requires APPLIED on every rank")
@@ -450,18 +452,15 @@ class GpuDeltaSchedulerControl:
                     )
                 receipt = self.session.prepare(
                     {
-                        key: getattr(request, key)
-                        for key in (
-                            "session_id",
-                            "manifest_path",
-                            "manifest_sha256",
-                            "stream_id",
-                            "base_version",
-                            "target_version",
-                            "plan_digest",
-                            "participants",
-                            "host_tensor_names",
-                        )
+                        "session_id": request.session_id,
+                        "manifest_path": request.manifest_path,
+                        "manifest_sha256": request.manifest_sha256,
+                        "stream_id": request.stream_id,
+                        "base_version": request.base_version,
+                        "target_version": request.target_version,
+                        "plan_digest": request.plan_digest,
+                        "participants": request.participants,
+                        "host_tensor_names": request.host_tensor_names,
                     }
                 )
             elif self.session is None:

@@ -18,7 +18,7 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _reference_layer(values, *, independent_mma=False):
+def _reference_layer(values, independent_mma=False):
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
@@ -34,6 +34,7 @@ def _reference_layer(values, *, independent_mma=False):
 
     layer = torch.nn.Module()
     layer.moe_tp_size = 1
+    layer.use_presharded_weights = False
     layer.moe_ep_rank = 1
     layer.num_experts, layer.num_local_experts = 4, 2
     layer.quant_method = SimpleNamespace(_is_cutedsl_v2_standard=True)

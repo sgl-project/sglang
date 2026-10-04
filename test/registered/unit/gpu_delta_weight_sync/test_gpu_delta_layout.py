@@ -92,6 +92,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
             for name in ("local", "foreign")
         ]
         backend = SimpleNamespace(
+            _canonical_plan=None,
             layout=SimpleNamespace(
                 inventory={
                     name: {"dtype": "U8", "shape": [2, 4]}
@@ -99,7 +100,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 },
                 excluded={"foreign": "expert owned by another EP rank"},
                 bindings=[SimpleNamespace(name="local")],
-            )
+            ),
         )
         definitions = [
             {key: entry[key] for key in ("name", "dtype", "shape", "encoding")}
@@ -296,7 +297,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 unit = layout._PreparedTensor(
                     binding,
-                    {"nbytes": size},
+                    size,
                     torch.empty_like(canonical),
                     decoder,
                     payload,
@@ -347,6 +348,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     stem = "w2" if projection == "down" else "w13"
                     layer = SimpleNamespace(
                         moe_tp_size=1,
+                        use_presharded_weights=False,
                         quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
                         moe_runner_config=SimpleNamespace(is_gated=True),
                         _map_global_expert_id_to_local_expert_id=lambda _: 0,
@@ -497,7 +499,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     )
                     prepared.ready = object()
                     prepared.applied = prepared.timing_enabled = False
-                    prepared.raw_copies, prepared.units, prepared.raw_units = {}, [], []
+                    prepared.raw_copies, prepared.units = {}, []
+                    prepared.raw_tensor_count = 0
                     prepared.derived = [
                         layout.DerivedImage("consumer", target, source),
                         layout.DerivedImage("other", other_target, other_source),
@@ -541,7 +544,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     ]
                     prepared.error = torch.tensor([error], dtype=torch.int32)
                     prepared.timings, prepared.h2d_bytes = {}, 0
-                    prepared.manifest = {"target_version": 1}
+                    prepared.target_version = 1
                     # Exercise apply's actual tensor logic with CPU tensors;
                     # only the CUDA scheduling boundary is stubbed here.
                     with (
@@ -594,6 +597,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         prefix = "model.layers.0.mlp.experts"
         layer = SimpleNamespace(
             moe_tp_size=1,
+            use_presharded_weights=False,
             quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
             moe_runner_config=SimpleNamespace(is_gated=True),
             _map_global_expert_id_to_local_expert_id=lambda expert: (
@@ -641,6 +645,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         content = json.dumps(manifest).encode()
         backend = SimpleNamespace(
+            _canonical_plan=None,
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
@@ -738,6 +743,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             **metadata,
         )
         backend = SimpleNamespace(
+            _canonical_plan=None,
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
@@ -890,6 +896,16 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             backend = layout.GpuDeltaBackend(
                 SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
             )
+            with (
+                patch.object(torch.cuda, "device", return_value=nullcontext()),
+                patch.object(
+                    torch.cuda,
+                    "Stream",
+                    side_effect=RuntimeError("stream creation failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "stream creation failed"),
+            ):
+                backend.prepare("unused-manifest", "unused-sha", {})
             with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
                 self.assertEqual(backend.describe()["codec"], "snappy-zstd")
                 backend.describe()
@@ -1003,6 +1019,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             **metadata,
         )
         backend = SimpleNamespace(
+            _canonical_plan=None,
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(

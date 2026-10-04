@@ -118,9 +118,14 @@ def applied(session, backend, req=None):
 
 def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     session, backend = make_session()
-    assert session.prepare(request([session.identity]))["state"] == "PREPARING"
+    req = request([session.identity])
+    preparing = session.prepare(req)
+    assert preparing["state"] == "PREPARING"
+    req["participants"] = [identity("replacement")]
     assert backend.started.wait(2)
-    assert session.status("publication-1")["state"] == "PREPARING"
+    status = session.status("publication-1")
+    assert status["state"] == "PREPARING"
+    assert status["cohort_digest"] == preparing["cohort_digest"]
     assert backend.payload.applications == 0
     session.abort("publication-1")
     backend.ready.set()

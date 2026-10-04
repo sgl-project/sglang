@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def entry(payload, *, name="weight", size=36):
+def entry(payload, name="weight", size=36):
     return {
         "name": name,
         "nbytes": (1 << 16) + 16,

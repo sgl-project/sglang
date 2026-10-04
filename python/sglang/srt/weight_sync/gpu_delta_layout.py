@@ -47,7 +47,7 @@ def swizzle_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
 
 
 def interleave_gate_up_bytes(
-    gate: torch.Tensor, up: torch.Tensor, *, group_rows: int, up_first: bool
+    gate: torch.Tensor, up: torch.Tensor, group_rows: int, up_first: bool
 ) -> torch.Tensor:
     """Fuse projections using row groups without interpreting packed nibbles."""
     if gate.dtype != torch.uint8 or up.dtype != torch.uint8 or gate.shape != up.shape:
@@ -67,7 +67,6 @@ def interleave_gate_up_bytes(
 
 def flashinfer_delta_layout(
     tensor: torch.Tensor,
-    *,
     dtype: str,
     backend: str,
     kind: str,
@@ -280,7 +279,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         raise ValueError("runtime NVFP4 delta requires standard flashinfer_cutedsl")
     if not layer.moe_runner_config.is_gated:
         raise ValueError("runtime NVFP4 delta currently requires gated experts")
-    if getattr(layer, "use_presharded_weights", False):
+    if layer.use_presharded_weights:
         raise ValueError("presharded canonical checkpoints are not admitted")
     local = layer._map_global_expert_id_to_local_expert_id(expert)
     stem = "w2" if projection == "down" else "w13"
@@ -589,15 +588,13 @@ class GpuDeltaLayout:
         gate = layer.w13_weight_scale_2[:, 0]
         up = layer.w13_weight_scale_2[:, 1]
         down = layer.w2_weight_scale_2
-        for name, source in (
-            ("g1_alphas", gate),
-            ("g1_alphas_up", up),
-            ("g2_alphas", down),
+        for name, destination, source in (
+            ("g1_alphas", layer.g1_alphas, gate),
+            ("g1_alphas_up", layer.g1_alphas_up, up),
+            ("g2_alphas", layer.g2_alphas, down),
         ):
-            self.derived.append(
-                DerivedImage(f"{prefix}.{name}", getattr(layer, name), source)
-            )
-        if getattr(layer, "_cutedsl_wrapper", None) is None:
+            self.derived.append(DerivedImage(f"{prefix}.{name}", destination, source))
+        if layer._cutedsl_wrapper is None:
             raise ValueError(
                 "CuTe DSL warmup must initialize its wrapper before delta admission"
             )
@@ -720,8 +717,8 @@ class GpuDeltaBackend:
 
         self.codec = configured_codec()
         _require_fixed_moe_topology(get_exec().moe)
-        self.runner = model_runner
         self.identity = dict(identity)
+        self._canonical_plan = None
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
@@ -762,15 +759,9 @@ class GpuDeltaBackend:
 @dataclass
 class _PreparedTensor:
     binding: TensorBinding
-    entry: dict
+    nbytes: int
     pinned: torch.Tensor
     decoder: object
-    payload: torch.Tensor
-
-
-@dataclass
-class _PreparedRawTensor:
-    binding: TensorBinding
     payload: torch.Tensor
 
 
@@ -786,7 +777,7 @@ def _canonical_views(views):
 
 def _qualify_canonical_plan(backend, manifest):
     """Cache only qualified static definitions; payload geometry stays per-publication."""
-    cached = getattr(backend, "_canonical_plan", None)
+    cached = backend._canonical_plan
     if cached is not None and manifest["plan_digest"] != cached[0]:
         raise ValueError("negotiated canonical delta plan changed")
     entries, signatures, definitions = {}, {}, []
@@ -866,6 +857,11 @@ def _qualify_canonical_plan(backend, manifest):
 
 class PreparedDelta:
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
+        self.stream = None
+        self.host_snapshot = None
+        self.units = []
+        self.raw_copies = {}
+
         from pathlib import Path
 
         preparation_started = time.perf_counter()
@@ -877,10 +873,6 @@ class PreparedDelta:
 
         self.backend = backend
         self.device = backend.device
-        self.host_snapshot = None
-        self.units = []
-        self.raw_units = []
-        self.raw_copies = {}
         self.stream = torch.cuda.Stream(device=self.device)
         self.done = None
         self.applied = False
@@ -889,7 +881,7 @@ class PreparedDelta:
         content = path.read_bytes()
         if hashlib.sha256(content).hexdigest() != manifest_sha256:
             raise ValueError("immutable delta manifest SHA256 mismatch")
-        self.manifest = manifest = orjson.loads(content)
+        manifest = orjson.loads(content)
         self.timings["host_manifest_read_parse_s"] = (
             time.perf_counter() - manifest_started
         )
@@ -903,7 +895,8 @@ class PreparedDelta:
             or manifest["target_version"] != manifest["base_version"] + 1
         ):
             raise ValueError("direct deltas require one consecutive version transition")
-        self._entries, reused_plan = _qualify_canonical_plan(backend, manifest)
+        self.target_version = manifest["target_version"]
+        entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
         host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
@@ -913,7 +906,7 @@ class PreparedDelta:
             or host_names != sorted(set(host_names))
             or not {binding.name for binding in backend.layout.bindings}
             <= set(host_names)
-            or not set(host_names) <= self._entries.keys()
+            or not set(host_names) <= entries.keys()
         ):
             raise ValueError(
                 "host tensor union does not cover the admitted local tensors"
@@ -939,7 +932,7 @@ class PreparedDelta:
         max_encoded, max_decoded = 0, 0
         batches = []
         for binding in backend.layout.bindings:
-            entry = self._entries[binding.name]
+            entry = entries[binding.name]
             if entry["encoding"] != binding.encoding:
                 raise ValueError(f"canonical tensor encoding mismatch: {binding.name}")
             matching = [v for v in entry["views"] if v["id"] == binding.view_id]
@@ -964,7 +957,7 @@ class PreparedDelta:
                 for frame in entry["frames"]
             ]
             batches.append(frames)
-            prepared.append((binding, entry, pinned, frames))
+            prepared.append((binding, entry["nbytes"], pinned))
             max_encoded = max(max_encoded, pinned.numel())
             max_decoded = max(max_decoded, entry["nbytes"])
         # Rank-local tensor metadata; host-shared decompression is measured above.
@@ -973,6 +966,7 @@ class PreparedDelta:
         # Pack once on the preparation worker and upload the small arena before
         # pause, avoiding a pinned allocation/H2D/decode per tiny tensor.
         raw_started = time.perf_counter()
+        self.raw_tensor_count = len(direct)
         raw_bytes = sum(entry["nbytes"] for _, entry in direct)
         raw_offsets, raw_h2d_bytes = [], 0
         for _, entry in direct:
@@ -1015,7 +1009,6 @@ class PreparedDelta:
                 targets, sources = self.raw_copies.setdefault(target.dtype, ([], []))
                 targets.append(target)
                 sources.append(source)
-                self.raw_units.append(_PreparedRawTensor(binding, payload))
             self.encoded = torch.empty(
                 max_encoded,
                 dtype=torch.uint8,
@@ -1032,20 +1025,23 @@ class PreparedDelta:
                 if batches
                 else []
             )
-            for (binding, entry, pinned, frames), decode in zip(prepared, decoders):
+            for (binding, nbytes, pinned), decode in zip(prepared, decoders):
                 self.units.append(
                     _PreparedTensor(
                         binding,
-                        entry,
+                        nbytes,
                         pinned,
                         decode,
-                        binding.selected_bytes(self.decoded[: entry["nbytes"]]),
+                        binding.selected_bytes(self.decoded[:nbytes]),
                     )
                 )
+            changed_bindings = [unit.binding for unit in self.units] + [
+                binding for binding, _ in direct
+            ]
             changed_storages = {
                 tensor.untyped_storage().data_ptr()
-                for unit in (*self.units, *self.raw_units)
-                for tensor in unit.binding.storage
+                for binding in changed_bindings
+                for tensor in binding.storage
             }
             self.derived = [
                 image
@@ -1154,8 +1150,8 @@ class PreparedDelta:
         return {
             "applied": True,
             "verification": "artifact-sha256-and-decoder-status",
-            "target_version": self.manifest["target_version"],
-            "tensors": len(self.units) + len(self.raw_units),
+            "target_version": self.target_version,
+            "tensors": len(self.units) + self.raw_tensor_count,
             "timing_enabled": self.timing_enabled,
             "timings": self.timings,
             "h2d_bytes": self.h2d_bytes,
@@ -1163,7 +1159,7 @@ class PreparedDelta:
 
     def _apply_tensor(self, unit):
         binding = unit.binding
-        decoded = self.decoded[: unit.entry["nbytes"]]
+        decoded = self.decoded[: unit.nbytes]
         with self._phase("paused_tensor_h2d"):
             self.encoded[: unit.pinned.numel()].copy_(unit.pinned, non_blocking=True)
         with self._phase("decode"):
@@ -1191,12 +1187,11 @@ class PreparedDelta:
         # Cancellation may race a background upload, but never frees storage
         # while the decoder or CUDA is using it. Only this object's stream is
         # drained; no device-wide synchronization is performed here.
-        if getattr(self, "stream", None) is not None:
+        if self.stream is not None:
             self.stream.synchronize()
         self.units.clear()
-        self.raw_units.clear()
         self.raw_copies.clear()
-        if getattr(self, "host_snapshot", None) is not None:
+        if self.host_snapshot is not None:
             self.host_snapshot.close()
             self.host_snapshot = None
         self.encoded = self.decoded = self.raw_device = self.raw_pinned = None

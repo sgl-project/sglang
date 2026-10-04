@@ -42,7 +42,7 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch, fail_fenc
         assert scheduler._engine_paused and obj.mode == "retract"
         events.append("retract")
 
-    def flush(*, empty_cache):
+    def flush(empty_cache):
         assert not empty_cache
         events.append("flush")
         return True
