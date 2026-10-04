@@ -16,7 +16,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.swa import swa_kept_out_of_tree
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -420,7 +420,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 write_through_threshold=256,
                 device=str(self.device),
                 swa_sliding_window_size=params.sliding_window_size,
-                swa_req_ring=is_swa_req_ring(self._allocator),
+                swa_req_ring=swa_kept_out_of_tree(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
