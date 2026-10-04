@@ -1073,7 +1073,7 @@ class Envs:
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
-    # means each call site keeps its own default.
+    # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
     # FlashInfer MegaMOE (generic moe_ep.MoEEpMegaLayer backend). Sizes the
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
