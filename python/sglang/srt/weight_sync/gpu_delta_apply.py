@@ -60,7 +60,7 @@ class ByteApplyGroup:
     def compile(self, pointers, error):
         if self.kernel is None:
             source_shape, source_stride, target_shape, target_stride = self.geometry
-            self.grid = (triton.cdiv(math.prod(source_shape), 4096), len(self.sources))
+            self.grid = (triton.cdiv(math.prod(source_shape), 4096), len(self.sources), 1)
             self.kernel = _xor_group.warmup(
                 pointers,
                 error,
