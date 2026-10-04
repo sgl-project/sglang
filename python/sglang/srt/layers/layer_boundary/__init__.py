@@ -44,9 +44,6 @@ from sglang.srt.layers.layer_boundary.factories import (
     declare_attn,
     declare_ffn,
     layer_stack,
-    make_attn_stage,
-    make_ffn_stage,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
@@ -87,9 +84,6 @@ from sglang.srt.layers.layer_boundary.residual.mhc import (
 __all__ = [
     "declare_attn",
     "declare_ffn",
-    "make_attn_stage",
-    "make_ffn_stage",
-    "make_stages",
     "append_stages",
     "layer_stack",
     "PLAIN_ADD",

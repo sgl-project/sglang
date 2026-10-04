@@ -198,9 +198,10 @@ class StageDeclaration:
         update: Producer operation that writes compute output into the residual.
         sparse: Whether this FFN is a MoE; used to resolve input/output rows.
             Expert routing and all-to-all remain inside the MoE computation.
-        terminal: Whether this stage ends the model's layer stack. Prevents
-            leaving work that requires a following layer; a finalize handoff
-            may still reach the terminal norm when the fusion provider allows it.
+        terminal: Whether this stage ends the model's layer stack, as the
+            stack records it. Prevents leaving work that requires a following
+            layer; a finalize handoff may still reach the terminal norm when
+            the fusion provider allows it.
         output_transform: Optional operation on the contribution before the
             residual update. An FFN's exit runs it under an explicit
             reduction-order contract; an attention's is run by the input of
@@ -211,8 +212,8 @@ class StageDeclaration:
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
-        previous: Declaration whose output this stage consumes. It may be
-            reconstructed locally, including across pipeline ranks.
+        previous: Declaration whose output this stage consumes, as the stack
+            records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
             Mutually exclusive with previous; avoids a second update/read.
 
@@ -267,11 +268,8 @@ class StageConnection:
 
 def declare_attn(
     *,
-    previous: Optional[StageDeclaration] = None,
-    prepared_from: Optional[StageDeclaration] = None,
     read=NORM_QUANT_READOUT,
     update=PLAIN_ADD,
-    terminal=False,
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
     output_transform=None,
@@ -279,11 +277,8 @@ def declare_attn(
     """Declare attention or a mixer; construct its executable boundary later.
 
     Args:
-        previous: Producer declaration whose output this stage consumes.
-        prepared_from: Source of an already-read branch input, instead of previous.
         read: Input operation; defaults to normalization with quantization support.
         update: Operation that adds this stage's output to the residual.
-        terminal: Whether this stage ends the model's layer stack.
         reduction: ALWAYS_PARTIAL for an attention whose sum the next stage's
             input always completes; EXIT_SCOPED for a mixer whose exit decides.
         gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
@@ -304,9 +299,6 @@ def declare_attn(
         StageKind.ATTENTION,
         read,
         update,
-        previous=previous,
-        prepared_from=prepared_from,
-        terminal=terminal,
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
@@ -315,12 +307,9 @@ def declare_attn(
 
 def declare_ffn(
     *,
-    previous: Optional[StageDeclaration] = None,
-    prepared_from: Optional[StageDeclaration] = None,
     sparse=False,
     read=NORM_READOUT,
     update=PLAIN_ADD,
-    terminal=False,
     output_transform=None,
     next_layer_sparse=False,
     dense_tp_size=None,
@@ -329,12 +318,9 @@ def declare_ffn(
     """Declare a dense or MoE FFN independently of its compute module.
 
     Args:
-        previous: Producer declaration whose output this stage consumes.
-        prepared_from: Source of an already-read branch input, instead of previous.
         sparse: Whether the FFN is a MoE; EP dispatch stays inside compute.
         read: Operation deriving FFN input from the residual.
         update: Operation writing FFN output into the residual.
-        terminal: Whether this stage ends the model's layer stack.
         output_transform: Optional contribution transform before residual update.
         next_layer_sparse: Whether the next decoder layer's FFN is sparse; used only
             to derive the TBO exit rows when exit_rows is not supplied.
@@ -351,9 +337,6 @@ def declare_ffn(
         read,
         update,
         sparse=sparse,
-        previous=previous,
-        prepared_from=prepared_from,
-        terminal=terminal,
         output_transform=output_transform,
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
@@ -570,88 +553,6 @@ def _incoming(stage):
         previous,
         stage,
         residual_from=source,
-    )
-
-
-def _connections(stage, following=None):
-    if following is not None and following.previous != stage:
-        raise ValueError("the following declaration must consume this stage's output")
-    incoming = _incoming(stage)
-    outgoing = _connect(
-        stage,
-        following,
-        residual_from=incoming,
-    )
-    return incoming, outgoing
-
-
-def make_attn_stage(
-    *,
-    declaration,
-    norm,
-    following: Optional[StageDeclaration] = None,
-    qkv_latent_func=None,
-    fusions=None,
-):
-    """Resolve one attention/mixer's boundaries and bind its input norm.
-
-    Args:
-        declaration: Attention StageDeclaration, including its input source.
-        norm: This consumer's normalization module, never its neighbour's norm.
-        following: Local consumer declaration whose previous is declaration.
-            None leaves a layer or stack exit for an independently bound reader.
-        qkv_latent_func: Optional attention input hook, invoked after preparation
-            and movement onto the compute input rows.
-        fusions: Optional backend provider. Consumer side: ordered
-            attention_input(plan) and ffn_input(plan) candidates. Producer side
-            (FFN exit): can_defer_finalize(plan, batch), called on every exit,
-            and can_defer_all_reduce(plan, batch), called when LoRA or TP1 shared
-            experts are enabled.
-
-    Returns:
-        A StageBoundary with precomputed paths for supported batch variants.
-    """
-    if declaration.kind is not StageKind.ATTENTION:
-        raise TypeError("make_attn_stage requires an attention declaration")
-    incoming, outgoing = _connections(declaration, following)
-    return _bind_stage(
-        declaration,
-        norm,
-        incoming,
-        outgoing,
-        qkv_latent_func=qkv_latent_func,
-        fusions=fusions,
-    )
-
-
-def make_ffn_stage(
-    *,
-    declaration,
-    norm,
-    following: Optional[StageDeclaration] = None,
-    fusions=None,
-):
-    """Resolve one FFN's boundaries and bind its input norm.
-
-    Args:
-        declaration: FFN StageDeclaration, including its input source.
-        norm: This FFN's input normalization module.
-        following: Local consumer declaration whose previous is declaration;
-            None leaves a layer or stack exit for an independently bound reader.
-        fusions: Optional backend fusion provider, as in make_attn_stage.
-
-    Returns:
-        A StageBoundary. Expert routing and all-to-all stay inside compute.
-    """
-    if declaration.kind is not StageKind.FFN:
-        raise TypeError("make_ffn_stage requires an FFN declaration")
-    incoming, outgoing = _connections(declaration, following)
-    return _bind_stage(
-        declaration,
-        norm,
-        incoming,
-        outgoing,
-        fusions=fusions,
     )
 
 
@@ -1015,88 +916,4 @@ def _extend(chain, append, prepared_from):
         for producer, consumer in zip(boundaries[:-2], boundaries[1:-1]):
             _carry_capture(producer, consumer)
         chain.previous = _detached(chained[-1])
-    return tuple(boundaries)
-
-
-def make_stages(
-    *stages, previous=None, prepared_from=None, following=None, terminal=False
-):
-    """Bind a local linear sequence of any positive number of stages.
-
-    Args:
-        *stages: Items of (declaration, norm) or (declaration, norm, options).
-            Declarations must have no source or terminal flag. Options are
-            constructor keywords: fusions, and qkv_latent_func for attention.
-        previous: External producer declaration consumed by the first stage.
-        prepared_from: Already-read input declaration reused by the first stage
-            of a branch; mutually exclusive with previous.
-        following: External consumer declaration after the last local stage.
-            None denotes a layer or stack exit with an independently bound read.
-        terminal: Marks only the final stage as the end of the model's stack.
-
-    Returns:
-        A tuple of independent StageBoundary objects in declaration order.
-        Sources are connected on copied declarations; caller inputs are unchanged.
-        No sequence object or runtime routing is retained.
-    """
-    if not stages:
-        raise ValueError("make_stages needs at least one stage")
-    if previous is not None and prepared_from is not None:
-        raise ValueError("choose a previous output or a prepared branch input")
-    declarations = []
-    bindings = []
-    for index, item in enumerate(stages):
-        if len(item) not in (2, 3):
-            raise ValueError("a stage needs (declaration, norm[, options])")
-        declaration, norm = item[:2]
-        if not isinstance(declaration, StageDeclaration):
-            raise TypeError("make_stages requires stage declarations")
-        if declaration.previous is not None or declaration.prepared_from is not None:
-            raise ValueError("pass input sources to make_stages, not its declarations")
-        if declaration.terminal:
-            raise ValueError("pass terminal to make_stages, not its declarations")
-        declaration = replace(
-            declaration,
-            previous=previous if index == 0 else declarations[-1],
-            prepared_from=prepared_from if index == 0 else None,
-            terminal=terminal and index == len(stages) - 1,
-        )
-        declarations.append(declaration)
-        bindings.append((norm, item[2] if len(item) == 3 else {}))
-    external_consumer = following
-    boundaries = []
-    incoming = _incoming(declarations[0])
-    for index, (declaration, (norm, options)) in enumerate(zip(declarations, bindings)):
-        following = (
-            declarations[index + 1]
-            if index + 1 < len(declarations)
-            else external_consumer
-        )
-        outgoing = _connect(declaration, following, residual_from=incoming)
-        options = dict(options)
-        if declaration.kind is StageKind.FFN:
-            unexpected = options.keys() - {
-                "fusions",
-            }
-            if unexpected:
-                raise TypeError(f"unsupported FFN options: {sorted(unexpected)}")
-        boundaries.append(_bind_stage(declaration, norm, incoming, outgoing, **options))
-        incoming = outgoing
-    for producer, consumer in zip(boundaries, boundaries[1:]):
-        if not (
-            producer.kind is StageKind.ATTENTION
-            and producer.declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
-            and consumer.kind is StageKind.FFN
-        ):
-            continue
-        for variant, steps in producer.plan.paths.items():
-            next_steps = consumer.plan.paths[variant]
-            predicate = next_steps.entry.preserves_residual
-            if predicate is not None:
-                producer.plan.paths[variant] = msgspec.structs.replace(
-                    steps,
-                    entry=msgspec.structs.replace(
-                        steps.entry, capture_preserves_residual=predicate
-                    ),
-                )
     return tuple(boundaries)
