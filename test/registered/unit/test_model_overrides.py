@@ -242,6 +242,8 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                 ("Qwen3ForCausalLM", "ar"),
                 ("Qwen3Model", "ar"),
                 ("MossVLForConditionalGeneration", "ar"),
+                ("Qwen4ExpForConditionalGeneration", "ar"),
+                ("Qwen4ExpForCausalLMMTP", "ar"),
                 ("BailingMoELinearForCausalLM", "rsv"),
                 ("BailingMoeV2_5ForCausalLM", "rsv"),
                 ("LongcatFlashForCausalLM", "rsv"),

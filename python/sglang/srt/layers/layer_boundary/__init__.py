@@ -72,6 +72,9 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
     PLAIN_RESIDUAL_OPS,
 )
+from sglang.srt.layers.layer_boundary.residual.gated import (
+    GatedResidualState,
+)
 from sglang.srt.layers.layer_boundary.residual.ihc import (
     IHCState,
 )
@@ -96,6 +99,7 @@ __all__ = [
     "FfnExit",
     "FfnInputFusion",
     "DeferredFinalize",
+    "GatedResidualState",
     "IHCState",
     "LayerResidualOps",
     "Layout",
