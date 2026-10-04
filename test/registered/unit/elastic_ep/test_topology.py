@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -140,3 +141,7 @@ def test_physical_health_uses_all_members_rule():
         False,
         True,
     ]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
