@@ -7,6 +7,8 @@ the reference two-step implementation:
 """
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -320,6 +322,73 @@ def test_verify_scratch_pitch_uses_allocated_steps():
     assert not torch.isnan(buffer[:N, :T]).any()
     assert torch.isnan(buffer[N:]).all()
     assert torch.isnan(buffer[:N, T:]).all()
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_sm103_kda_verify_and_gated_norm_preserve_rounding():
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("SM103 dispatch")
+    from sglang.kernels.ops.attention.fla import fused_norm_gate as norm
+    from sglang.kernels.ops.attention.fla import (
+        fused_sigmoid_gating_recurrent as recurrent,
+    )
+
+    A_log, _, _, b, q, k, v, state, indices, cu = _make_tensors(1, 8, 8, 8, 128, 128)
+    a = torch.randn(1, 8, 1024, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(1024, dtype=torch.float32, device="cuda")
+    original_state = state.clone()
+    scratch = torch.randn(2, 8, 8, 128, 128, device="cuda")
+    reference_scratch, actual_scratch = scratch.clone(), scratch.clone()
+    kwargs = dict(
+        A_log=A_log,
+        dt_bias=bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state_source=state,
+        initial_state_indices=indices,
+        cu_seqlens=cu,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        disable_state_update=True,
+        intermediate_state_indices=indices,
+        cache_steps=8,
+        lower_bound=-5.0,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    )
+    with patch.object(
+        recurrent, "get_jit_cuda_arch", return_value=SimpleNamespace(major=10, minor=0)
+    ):
+        reference = recurrent.fused_sigmoid_gating_delta_rule_update(
+            **kwargs, intermediate_states_buffer=reference_scratch
+        )
+    actual = recurrent.fused_sigmoid_gating_delta_rule_update(
+        **kwargs, intermediate_states_buffer=actual_scratch
+    )
+    assert torch.equal(actual, reference)
+    assert torch.equal(actual_scratch, reference_scratch)
+    assert torch.equal(actual_scratch[1], scratch[1])
+    assert torch.equal(state, original_state)
+    gate = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(
+        g=gate,
+        weight=weight,
+        bias=None,
+        activation="sigmoid",
+        is_rms_norm=True,
+        out_dtype=torch.bfloat16,
+    )
+    with patch.object(
+        norm, "get_jit_cuda_arch", return_value=SimpleNamespace(major=10, minor=0)
+    ):
+        expected = norm.layer_norm_gated_fwd(reference.reshape(64, 128), **kwargs)
+    observed = norm.layer_norm_gated_fwd(actual.reshape(64, 128), **kwargs)
+    for old, new in zip(expected, observed):
+        assert (old is None and new is None) or torch.equal(old, new)
 
 
 if __name__ == "__main__":

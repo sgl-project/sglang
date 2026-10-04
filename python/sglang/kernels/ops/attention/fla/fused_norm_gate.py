@@ -7,7 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -224,6 +224,10 @@ def layer_norm_gated_fwd(
 
     if D <= 512:
         BT = 32
+        if (T, D) == (64, 128) and x.dtype == torch.bfloat16 and is_arch_support_pdl():
+            arch = get_jit_cuda_arch()
+            if (arch.major, arch.minor) == (10, 3):
+                BT = 8
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
         )

@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
+    get_fp8_moe_weights,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
@@ -89,6 +90,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -2423,6 +2425,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
+            if (
+                envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT.get()
+                and self._owns_moe_runner
+                and not self.use_mxfp8
+                and not self.is_fp4_expert
+                and self.quant_config.weight_block_size == [128, 128]
+                and (
+                    get_moe_runner_backend().is_flashinfer_trtllm()
+                    or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                )
+            ):
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    prepare_fp8_moe_block_layout,
+                )
+
+                offload = get_exec().offload
+                prepare_fp8_moe_block_layout(
+                    layer,
+                    cache_views=offload.cpu_offload_gb == 0
+                    and offload.offload_group_size == 0,
+                )
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -3092,9 +3115,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
+            weight_layout = getattr(layer, "_flashinfer_weight_layout", 0)
+            w13, w2 = get_fp8_moe_weights(layer)
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
+                w13_weight=w13,
+                w2_weight=w2,
+                weight_layout=weight_layout,
                 global_num_experts=global_num_experts,
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
