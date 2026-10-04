@@ -5182,9 +5182,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        """V4 only fuses when explicitly asked to, and then the checkpoint must
-        carry exactly one shared expert. Asked by the loader before any layer is
-        built."""
+        """V4 fuses when explicitly asked to, or by default with the gfx950 aiter
+        MoE and MXFP4 routed experts; the checkpoint must then carry exactly one
+        shared expert. Asked by the loader before any layer is built."""
         # Need to disable if quant precision mismatch, even if
         # --enforce-shared-experts-fusion is specified
         if quant_blocks_shared_experts_fusion(quant_config):
@@ -5200,7 +5200,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "routed weight tensor (only DeepEP/MegaMOE per-rank shared slots "
                 "support fusion under EP)."
             )
-        if not get_exec().moe.enforce_shared_experts_fusion:
+        # the FP8 shared expert is requantized to MXFP4 and runs as one more routed slot
+        fuse_by_default = (
+            _use_aiter
+            and _is_gfx95_supported
+            and getattr(quant_config, "is_fp4_experts", False)
+            and not getattr(quant_config, "dequant_fp4_to_fp8", False)
+        )
+        if not (get_exec().moe.enforce_shared_experts_fusion or fuse_by_default):
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
             raise ValueError(
