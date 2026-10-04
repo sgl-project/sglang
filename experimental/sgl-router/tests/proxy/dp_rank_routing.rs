@@ -58,6 +58,7 @@ fn router(
             model_ids: vec![ModelId(MODEL.into())],
             bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
             version_group: None,
+            services: Default::default(),
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),

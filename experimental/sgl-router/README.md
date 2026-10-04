@@ -182,10 +182,25 @@ admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibi
 ```json
 {"buckets": [{
   "id": "default",
-  "prefill": {"worker_ids": ["p0", "p1"], "admission": {"max_pending_prefill_tokens": 32768}},
-  "decode": {"worker_ids": ["d0", "d1"], "admission": {"max_kv_usage": 0.9}}
+  "prefill": {"worker_services": ["inference/prefill"], "admission": {"max_pending_prefill_tokens": 32768}},
+  "decode": {"worker_services": ["inference/decode"], "admission": {"max_kv_usage": 0.9}}
 }]}
 ```
+
+`worker_services` matches Kubernetes Services by `namespace/name`, using the
+`kubernetes.io/service-name` label on watched EndpointSlices. Replacement pods
+and new replicas join the same group automatically. The router's discovery
+selectors must include those EndpointSlices; this field does not expand the watch.
+A worker selected by several Services belongs to each of them.
+
+For static URL discovery, use `"worker_ids": ["http://worker:30000"]`: each ID
+is the configured worker URL. Kubernetes worker IDs are `namespace/pod-UID`
+(and change when a pod is replaced), so use `worker_services` for durable pools.
+Set only one membership field, or omit both for every engine of the group's role.
+Empty membership lists and blank worker IDs are rejected at startup.
+
+Admission fields left unset or set to `null` inherit CLI defaults. To apply a
+limit only to selected groups, omit that CLI default and set it on those groups.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
@@ -208,8 +223,9 @@ and queue/saturation gates in favor of these shared affinity settings.
 `--no-tokenizer` skips tokenizer loading for load-only policies such as
 `power_of_two` and `session_aware`, on either routing path. Workers tokenize the
 original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
-Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
-require a tokenizer.
+Cache-aware routing, prefix-cache terms or filters, and buckets with token-length
+or context limits require a tokenizer. Reorg buckets that only select membership
+and load-based policies can use `--no-tokenizer`.
 
 ### DP-rank routing
 

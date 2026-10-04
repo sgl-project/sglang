@@ -94,6 +94,7 @@ fn rejecting_policy() -> Arc<FirstPolicy> {
 
 fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some([WorkerId(id.into())].into_iter().collect()),
         policy,
     }
@@ -673,6 +674,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let mut first = Bucket::new(
         "first",
         BucketGroups::Plain(EngineGroup {
+            worker_services: None,
             worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
             policy: Arc::new(rejecting),
         }),
@@ -681,6 +683,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let mut second = Bucket::new(
         "second",
         BucketGroups::Plain(EngineGroup {
+            worker_services: None,
             worker_ids: Some(
                 [WorkerId("owner".into()), WorkerId("cold".into())]
                     .into_iter()
@@ -974,6 +977,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
                 version_group: Some(group.into()),
+                services: Default::default(),
             })
             .unwrap();
     }
