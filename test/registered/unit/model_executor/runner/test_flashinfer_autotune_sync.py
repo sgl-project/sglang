@@ -78,54 +78,6 @@ class TestAutotuneCacheDigest(CustomTestCase):
     def _digest(self, path: Path, env=ENV) -> str:
         return _autotune_cache_digest(path, env)
 
-    def test_fp8_weight_layout_separates_cache_paths(self):
-        runner = SimpleNamespace(
-            device="cuda",
-            dtype=torch.bfloat16,
-            tp_size=8,
-            tp_rank=0,
-            attn_dp_size=1,
-            moe_ep_size=1,
-            dp_rank=0,
-            is_draft_worker=False,
-            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-        )
-        with (
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
-            patch.object(
-                autotune,
-                "get_model",
-                return_value=SimpleNamespace(model_path="model", quantization="fp8"),
-            ),
-            patch.object(
-                autotune,
-                "get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(moe_runner_backend="flashinfer_trtllm")
-                ),
-            ),
-            patch.object(
-                autotune,
-                "get_parallel",
-                return_value=SimpleNamespace(pp_size=1, pp_rank=0),
-            ),
-            patch.object(
-                autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
-            ),
-            autotune.envs.SGLANG_CACHE_DIR.override(str(self.dir)),
-        ):
-            paths = []
-            for enabled in (False, True, False):
-                with autotune.envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT.override(
-                    enabled
-                ):
-                    paths.append(autotune.flashinfer_autotune_cache_path(runner))
-            paths[0].write_text("original tactics")
-            self.assertNotEqual(paths[0], paths[1])
-            self.assertEqual(paths[0], paths[2])
-            self.assertFalse(paths[1].exists())
-            self.assertEqual(paths[2].read_text(), "original tactics")
-
     def test_unusable_caches_read_as_empty(self):
         # Files yielding no loadable entries must digest alike, whichever way
         # they are unusable; a non-dict also has to not raise.

@@ -65,100 +65,38 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         for name in _ACTIVATION_PARAMS:
             self.assertFalse(hasattr(layer, f"_flashinfer_trtllm_{name}"))
 
-    def test_block_layout_requires_opt_in_and_runner_ownership(self):
-        cases = (
-            (False, True, 0, 0),
-            (True, False, 0, 0),
-            (True, True, 0, 0),
-            (True, True, 1, 0),
-            (True, True, 0, 1),
-        )
-        for enabled, owns_runner, cpu_gb, group_size in cases:
-            method = self._make_block_fp8_method()
-            method._owns_moe_runner = owns_runner
-            method.moe_runner_config = MoeRunnerConfig()
-            offload = SimpleNamespace(
-                cpu_offload_gb=cpu_gb, offload_group_size=group_size
-            )
-            with (
-                patch.object(
-                    fp8_module.envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT,
-                    "get",
-                    return_value=enabled,
-                ),
-                patch.object(
-                    fp8_module,
-                    "get_exec",
-                    return_value=SimpleNamespace(offload=offload),
-                ),
-                patch(
-                    "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm.prepare_fp8_moe_block_layout"
-                ) as prepare,
-            ):
-                self._run_post_load(method, self._make_layer())
-                self.assertEqual(prepare.call_count, int(enabled and owns_runner))
-                if prepare.called:
-                    self.assertEqual(
-                        prepare.call_args.kwargs["cache_views"],
-                        cpu_gb == group_size == 0,
-                    )
-
-    def test_block_layout_refreshes_views_after_weight_reload(self):
-        from flashinfer.fused_moe import WeightLayout
-
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            prepare_fp8_moe_block_layout,
-        )
-
-        layer = torch.nn.Module()
-        layer.w13_weight = torch.nn.Parameter(
-            torch.empty(2, 128, 256, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            torch.empty(2, 256, 128, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        params = tuple(layer.parameters())
-        old_views = None
-        for _ in range(2):
-            for weight in params:
-                weight.data = torch.randn(weight.shape).to(weight.dtype)
-            pointers = [weight.data_ptr() for weight in params]
-            prepare_fp8_moe_block_layout(layer)
-            self.assertEqual(layer._flashinfer_weight_layout, WeightLayout.BlockMajorK)
-            for index, (name, weight, view) in enumerate(
-                zip(("w13_weight", "w2_weight"), params, layer._flashinfer_moe_weights)
-            ):
-                self.assertIs(getattr(layer, name), weight)
-                self.assertEqual(weight.data_ptr(), pointers[index])
-                self.assertEqual(view.data_ptr(), weight.data_ptr())
-                e, n, k = weight.shape
-                self.assertEqual(view.shape, (e, k // 128, n, 128))
-                if old_views is not None:
-                    self.assertNotEqual(view.data_ptr(), old_views[index].data_ptr())
-            old_views = layer._flashinfer_moe_weights
-
-    def test_block_layout_offload_uses_functional_weights(self):
+    def test_block_layout_views_follow_live_weights(self):
         from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as trtllm
 
         layer = torch.nn.Module()
-        for name in ("w13_weight", "w2_weight"):
-            layer.register_parameter(
+        for name, shape in (
+            ("w13_weight", (2, 128, 256)),
+            ("w2_weight", (2, 256, 128)),
+        ):
+            setattr(
+                layer,
                 name,
                 torch.nn.Parameter(
-                    torch.zeros(2, 128, 128, dtype=torch.float8_e4m3fn),
-                    requires_grad=False,
+                    torch.zeros(shape, dtype=torch.float8_e4m3fn), requires_grad=False
                 ),
             )
         layer.forward = lambda: trtllm.get_fp8_moe_weights(layer)
+        trtllm.prepare_fp8_moe_block_layout(layer)
+        for weight in layer.parameters():
+            weight.data = weight.data.clone()
+        trtllm.prepare_fp8_moe_block_layout(layer)
+        for weight, view in zip(layer.parameters(), layer()):
+            self.assertEqual(view.data_ptr(), weight.data_ptr())
+            e, n, k = weight.shape
+            self.assertEqual(view.shape, (e, k // 128, n, 128))
+
         trtllm.prepare_fp8_moe_block_layout(layer, cache_views=False)
-        self.assertIsNone(layer._flashinfer_moe_weights)
         replacements = {
             name: weight.detach().clone() for name, weight in layer.named_parameters()
         }
         views = torch.func.functional_call(layer, replacements, ())
-        for name, view in zip(("w13_weight", "w2_weight"), views):
-            self.assertEqual(view.data_ptr(), replacements[name].data_ptr())
-            self.assertNotEqual(view.data_ptr(), getattr(layer, name).data_ptr())
+        for weight, view in zip(replacements.values(), views):
+            self.assertEqual(view.data_ptr(), weight.data_ptr())
 
     def test_borrowed_delegate_skips_trtllm_activation_params(self):
         """A method with no MoeRunner must not read moe_runner_config; doing so

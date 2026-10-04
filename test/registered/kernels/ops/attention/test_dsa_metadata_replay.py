@@ -27,31 +27,6 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestDSAMetadataReplay(CustomTestCase):
-    def test_verify_reuses_pooled_page_table(self):
-        mode = ForwardMode.TARGET_VERIFY
-        seq, req = inputs(*ROUNDS[0])
-        backend = make_backend(mode, seq, req)
-        metadata = backend.forward_metadata
-        pooled = metadata.pooled_real_page_table
-        self.assertTrue(pooled.is_contiguous())
-        indexer = SimpleNamespace(index_kpool=POOL)
-        for lengths, requests in ROUNDS:
-            seq.copy_(torch.tensor(lengths, device="cuda"))
-            req.copy_(torch.tensor(requests, device="cuda"))
-            apply_metadata(backend, mode, seq, req)
-            expected = build_pooled_page_table_64(metadata.real_page_table, POOL)
-            torch.testing.assert_close(pooled, expected, rtol=0, atol=0)
-            for _ in range(11):
-                _, _, table, _ = IndexerKPool._get_kpool_decode_metadata(
-                    indexer,
-                    SimpleNamespace(attn_metadata=metadata),
-                    metadata.real_page_table,
-                    metadata.dsa_seqlens_expanded,
-                    64,
-                    build_schedule_metadata=False,
-                )
-                self.assertIs(table, pooled)
-
     def test_fusion_matches_ordinary_metadata(self):
         for mode in (
             ForwardMode.DECODE,
@@ -79,6 +54,23 @@ class TestDSAMetadataReplay(CustomTestCase):
                         self, fused.forward_metadata, ordinary.forward_metadata
                     )
                     self.assertEqual(pointers, addresses(fused.forward_metadata))
+                    if mode.is_target_verify():
+                        metadata = fused.forward_metadata
+                        _, _, table, _ = IndexerKPool._get_kpool_decode_metadata(
+                            SimpleNamespace(index_kpool=POOL),
+                            SimpleNamespace(attn_metadata=metadata),
+                            metadata.real_page_table,
+                            metadata.dsa_seqlens_expanded,
+                            64,
+                            build_schedule_metadata=False,
+                        )
+                        self.assertIs(table, metadata.pooled_real_page_table)
+                        torch.testing.assert_close(
+                            table,
+                            build_pooled_page_table_64(metadata.real_page_table, POOL),
+                            rtol=0,
+                            atol=0,
+                        )
 
     def test_precomputed_verify_retains_live_tail(self):
         mode = ForwardMode.TARGET_VERIFY
