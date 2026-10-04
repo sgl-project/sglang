@@ -118,10 +118,14 @@ Cold tuning can compete with serving for bandwidth and its cost is included in
 preparation. The winning launch is bound before pause; apply does no configuration
 selection, counter reset or dynamic work stealing.
 
-Bulk H2D starts only during paused apply. Ready/free events protect each
-encoded slot. Stage 2 retains the original next-batch schedule; larger rings
-queue further lookahead only after the current decoder and status check have been
-enqueued. Reused-slot waits always refer to an already-recorded free event.
+Preparation uploads the standalone batch into the first existing encoded slot
+and waits for its copy-ready event before `PREPARED`. This adds no HBM allocation
+and performs no decompression or model writes. Model-layer H2D starts during
+paused apply; without a standalone batch, all compressed uploads remain paused.
+Ready/free events protect each encoded slot. Stage 2 retains the original
+next-batch schedule; larger rings queue further lookahead only after the current
+decoder and status check have been enqueued. Reused-slot waits always refer to an
+already-recorded free event.
 Decoded scratch, status checks and updates remain ordered on the
 apply stream. Completion joins the final copy, and cancellation drains both
 streams before releasing shared host views. The existing reader fence and
@@ -263,7 +267,10 @@ actual H2D ring stage count. `decoded_zero_ranges`/`decoded_zero_bytes`
 describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.
-With debug timing enabled, `paused_layer_h2d` measures copy-stream work and
+`prepared_standalone_h2d_bytes`/`prepared_standalone_h2d_spans` count the transfers
+moved into preparation; total `h2d_bytes` and encoded capacity are unchanged.
+With debug timing enabled, `prepared_standalone_h2d` measures that preparation
+copy, while `paused_layer_h2d` measures the remaining copy-stream work and
 `paused_copy_wait` measures the apply stream waiting for ready data; these overlap
 with decode/apply and must not be added together. The nvCOMP DE backend may wait
 for preceding calling-stream work inside its Async API, so host enqueue spans

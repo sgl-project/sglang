@@ -671,8 +671,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 },
                 excluded={"foreign": "expert owned by another EP rank"},
                 derived=[],
+                check_identity=lambda: None,
             ),
         )
+        copies, decoded_batches = [], []
+        copy_batch = layout.PreparedDelta._copy_batch
+
+        def record_copy(prepared, batch, index, phase="paused_layer_h2d"):
+            copies.append((index, phase))
+            copy_batch(prepared, batch, index, phase)
 
         class CpuLiteralDecoder:
             # Explicit CPU test substitute; this does not qualify nvCOMP/CUDA.
@@ -687,6 +694,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
 
             def _prepare(self, frames, encoded, decoded):
                 def enqueue():
+                    decoded_batches.append(frames)
                     for frame in frames:
                         data = encoded[
                             frame.input_offset : frame.input_offset
@@ -722,8 +730,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             with (
                 cpu_host_snapshot(backend, metadata, directory),
                 patch.object(torch, "empty", side_effect=unpinned),
-                patch.object(torch.cuda, "Stream", return_value=object()),
+                patch.object(
+                    torch.cuda,
+                    "Stream",
+                    return_value=SimpleNamespace(
+                        wait_event=lambda _: None,
+                        wait_stream=lambda _: None,
+                        synchronize=lambda: None,
+                    ),
+                ),
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
+                patch.object(torch.cuda, "device", return_value=nullcontext()),
+                patch.object(torch.cuda, "default_stream", return_value=object()),
                 patch.object(
                     torch.cuda,
                     "Event",
@@ -731,6 +749,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         record=lambda _: None, synchronize=lambda: None
                     ),
                 ),
+                patch.object(layout.PreparedDelta, "_copy_batch", record_copy),
                 patch(
                     "sglang.srt.weight_sync.gpu_delta_codec.NvcompDecoder",
                     CpuLiteralDecoder,
@@ -760,7 +779,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.timings["compressed_h2d_spans"], 3)
                 self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
                 self.assertEqual(prepared.timings["decoded_zero_ranges"], 0)
-                self.assertEqual(len(prepared.batches[0].decoder.statuses), 2)
+                self.assertEqual(len(prepared.batches[0].decoder.statuses), 1)
+                self.assertEqual(prepared.timings["prepared_standalone_h2d_spans"], 1)
+                self.assertEqual(prepared.timings["prepared_standalone_h2d_bytes"], 8)
+                self.assertEqual(copies, [(0, "prepared_standalone_h2d")])
+                self.assertFalse(decoded_batches)
+                for destination, source in prepared.batches[0].copies:
+                    torch.testing.assert_close(destination, source)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
                 pointer = prepared.encoded.data_ptr()
                 prepared.decoded.fill_(0xA5)
@@ -770,11 +795,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             source.untyped_storage().data_ptr(),
                             backend.host_arena.tensor.untyped_storage().data_ptr(),
                         )
-                    for destination, source in batch.copies:
-                        destination.copy_(source)
-                    prepared._decode_batch(batch)
-                    prepared._apply_batch(batch)
-                    self.assertEqual(prepared.encoded.data_ptr(), pointer)
+                prepared.apply()
+                self.assertEqual(
+                    copies,
+                    [
+                        (0, "prepared_standalone_h2d"),
+                        (1, "paused_layer_h2d"),
+                        (2, "paused_layer_h2d"),
+                    ],
+                )
+                self.assertEqual(len(decoded_batches), 3)
+                self.assertEqual(prepared.encoded.data_ptr(), pointer)
                 for target in targets:
                     torch.testing.assert_close(
                         target,
@@ -794,8 +825,44 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 reduced = layout._plan_layers(
                     backend, local[1:], {e["name"]: e for e in entries}
                 )
-                self.assertEqual(reduced[0][0][0][0].name, names[1])
+                self.assertEqual(reduced[0][0][0][0].name, names[-1])
+                self.assertEqual(reduced[1][0][0][0].name, names[1])
                 self.assertIsNot(backend.batch_plan, previous)
+                layers_only = layout._plan_layers(
+                    backend, local[:-1], {e["name"]: e for e in entries}
+                )
+                self.assertEqual([plan[0][0][0].layer for plan in layers_only], [0, 1])
+                # Without standalone weights, preparation never submits copies
+                # or decode, and apply still primes the first model layer.
+                layers_backend = copy.copy(backend)
+                layers_backend.layout = copy.copy(backend.layout)
+                layers_backend.layout.bindings = local[:-1]
+                layers_backend.batch_plan = None
+                layer_metadata = dict(metadata)
+                copies.clear()
+                decoded_batches.clear()
+                with (
+                    tempfile.TemporaryDirectory() as layer_directory,
+                    cpu_host_snapshot(layers_backend, layer_metadata, layer_directory),
+                ):
+                    layers_prepared = layout.PreparedDelta(
+                        layers_backend,
+                        path,
+                        layout.hashlib.sha256(content).hexdigest(),
+                        layer_metadata,
+                    )
+                    self.assertFalse(layers_prepared.preloaded_standalone)
+                    self.assertFalse(copies)
+                    self.assertFalse(decoded_batches)
+                    layers_prepared.apply()
+                    self.assertEqual(
+                        copies, [(0, "paused_layer_h2d"), (1, "paused_layer_h2d")]
+                    )
+                    self.assertTrue(
+                        all(torch.count_nonzero(t) == 0 for t in targets[:-1])
+                    )
+                    layers_prepared.host_snapshot.mark_reusable()
+                    layers_prepared.close()
                 # An engine-proof release permits the next immutable publication;
                 # its corrupt payload must still fail before model writes.
                 prepared.host_snapshot.mark_reusable()
@@ -1018,6 +1085,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
             self.assertFalse(prepared.batches)
+            self.assertFalse(prepared.preloaded_standalone)
+            self.assertEqual(prepared.timings["prepared_standalone_h2d_bytes"], 0)
+            self.assertEqual(prepared.timings["prepared_standalone_h2d_spans"], 0)
             self.assertIsNone(prepared.decoder)
             self.assertEqual(prepared.timings["raw_tensors"], 4)
             self.assertEqual(prepared.timings["raw_bytes"], len(blob))

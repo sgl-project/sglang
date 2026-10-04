@@ -799,6 +799,9 @@ def _plan_layers(backend, bindings, entries):
         layers = {}
         for binding in bindings:
             layers.setdefault(binding.layer, []).append(binding)
+        if None in layers:
+            # The standalone batch can fill slot zero before the serving pause.
+            layers = {None: layers.pop(None), **layers}
         plans = []
         for group in layers.values():
             outputs, size = [], 0
@@ -1020,6 +1023,7 @@ class PreparedDelta:
             compressed.append(binding)
         previous_plan = backend.batch_plan
         static_plans = _plan_layers(backend, compressed, entries)
+        self.preloaded_standalone = any(binding.layer is None for binding in compressed)
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
@@ -1202,6 +1206,13 @@ class PreparedDelta:
             ]
             ready = torch.cuda.Event()
             ready.record(self.stream)
+        preloaded = self.batches[0].copies if self.preloaded_standalone else []
+        if self.preloaded_standalone:
+            # Allocation/metadata/tuning work precedes this copy. Reuse slot zero;
+            # decompression and all weight writes still wait for apply's pause.
+            self.copy_stream.wait_event(ready)
+            self._copy_batch(self.batches[0], 0, "prepared_standalone_h2d")
+            ready = self.copy_ready[0]
         self.timings.update(
             host_decoder_prepare_s=time.perf_counter() - decoder_started,
             host_apply_tune_s=tune_s,
@@ -1224,6 +1235,10 @@ class PreparedDelta:
             compressed_batches=len(plans),
             compressed_tensors=self.matrix_tensor_count,
             compressed_h2d_spans=sum(len(batch.copies) for batch in self.batches),
+            prepared_standalone_h2d_spans=len(preloaded),
+            prepared_standalone_h2d_bytes=sum(
+                source.numel() for _, source in preloaded
+            ),
             decoded_zero_ranges=sum(len(batch.zero_ranges) for batch in self.batches),
             decoded_zero_bytes=sum(
                 span.numel() for batch in self.batches for span in batch.zero_ranges
@@ -1238,7 +1253,8 @@ class PreparedDelta:
         )
         # This constructor runs on the preparation worker. PREPARED means
         # immutable pinned inputs, reusable arenas and decoder metadata are ready.
-        # Encoded bytes are uploaded only as each model layer is applied.
+        # Standalone encoded bytes are also ready in slot zero. Model-layer
+        # uploads remain on the paused copy/decode pipeline.
         ready_started = time.perf_counter()
         ready.synchronize()
         self.timings["host_ready_wait_s"] = time.perf_counter() - ready_started
@@ -1283,7 +1299,7 @@ class PreparedDelta:
                         torch._foreach_copy_(targets, sources)
                 self.timings["host_raw_enqueue_s"] = time.perf_counter() - raw_started
                 matrices_started = time.perf_counter()
-                if self.batches:
+                if self.batches and not self.preloaded_standalone:
                     self._copy_batch(self.batches[0], 0)
                 prefetched = 1
                 for index, batch in enumerate(self.batches):
@@ -1349,11 +1365,11 @@ class PreparedDelta:
             "h2d_bytes": self.h2d_bytes,
         }
 
-    def _copy_batch(self, batch, index):
+    def _copy_batch(self, batch, index, phase="paused_layer_h2d"):
         with torch.cuda.stream(self.copy_stream):
             if index >= self.h2d_stages:
                 self.copy_stream.wait_event(self.copy_free[index % self.h2d_stages])
-            with self._phase("paused_layer_h2d", self.copy_stream):
+            with self._phase(phase, self.copy_stream):
                 for destination, source in batch.copies:
                     destination.copy_(source, non_blocking=True)
             self.copy_ready[index % self.h2d_stages].record(self.copy_stream)
