@@ -448,6 +448,9 @@ pub struct CacheAwareConfig {
     /// delays a failed seed's replica and a fleet-wide restart is a delay, not
     /// an outage.
     pub bootstrap_seed_required: bool,
+    /// How long a routed prompt credits its worker before KV events confirm
+    /// it; 0 disables.
+    pub pending_prefix_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -458,6 +461,7 @@ impl Default for CacheAwareConfig {
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
             bootstrap_seed_required: false,
+            pending_prefix_ttl_ms: 0,
         }
     }
 }

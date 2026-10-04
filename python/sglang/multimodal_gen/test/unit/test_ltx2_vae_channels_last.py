@@ -13,6 +13,13 @@ class TestLTX2CausalConvChannelsLast(unittest.TestCase):
     the original repeat()+concatenate() temporal padding (only the conv kernel's
     floating-point accumulation order may differ, which fp32 keeps negligible)."""
 
+    def setUp(self):
+        # From torch 2.14 (cuDNN 9.24), cuDNN picks a TF32 kernel for the
+        # channels_last_3d conv, which this fp32 comparison would read as drift.
+        flags = torch.backends.cudnn.flags(enabled=True, allow_tf32=False)
+        flags.__enter__()
+        self.addCleanup(flags.__exit__, None, None, None)
+
     def _check(self, causal: bool, kernel_size):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         torch.manual_seed(0)

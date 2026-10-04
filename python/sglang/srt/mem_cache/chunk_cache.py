@@ -51,8 +51,8 @@ class ChunkCache(BasePrefixCache):
 
         self.protected_size_ = 0
 
-    def is_chunk_cache(self) -> bool:
-        return True
+    def supports_prefix_sharing(self) -> bool:
+        return False
 
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
