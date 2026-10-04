@@ -448,6 +448,17 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
+        if (
+            node.component_data[self.component_type].value is None
+            and params.prev_prefix_len > total_prefix_len
+        ):
+            # This node crosses the already-cached prefix boundary. The incoming
+            # prefix aliases its FULL pages and has no SWA slots to donate.
+            # Adopting the whole range would free FULL pages still owned by the
+            # node and rebuild phantom SWA slots. Leave it tombstoned; the insert
+            # walk deduplicates only the fresh suffix.
+            return prefix_len
+
         window_start = params.get_evicted_seqlen(self.component_type)
         if self._independent:
             window_start = max(window_start, params.prev_prefix_len)

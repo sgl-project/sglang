@@ -325,6 +325,10 @@ class SchedulerMultiplexMixin:
         self.running_batch = running_batch
         return running_batch
 
+    # Use a rank-consistent tick while formation is skipped. Ack retirement
+    # includes TP consensus; avoid paying that collective on every iteration.
+    HICACHE_PUMP_INTERVAL = 16
+
     @torch.inference_mode()
     def event_loop_pdmux(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
@@ -332,6 +336,7 @@ class SchedulerMultiplexMixin:
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
+        self._hicache_pump_tick = 0
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
@@ -348,7 +353,30 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 sm_count = self.sm_counts[stream_idx][0]
                 formation_done = None
+                # Batch formation is the only other caller of the HiCache pump,
+                # and it is skipped for every iteration a split prefill occupies
+                # -- which is most of them under the long prefills PDMux exists
+                # to overlap. Pump exactly on those iterations: skipping starves
+                # HiCache of ack processing and host-lock release for the whole
+                # prefill, while doubling up desyncs the pump's collective
+                # all-reduces across TP ranks, which deadlocks rather than
+                # degrades. The pump's cache actions can free device KV
+                # segments and zero full-to-SWA mapping rows on this stream, so
+                # it needs the same dependency publication as batch formation
+                # -- decode allocates from that free list and the decode graph
+                # re-reads the mapping on replay.
                 had_inflight_split = self.split_prefill_batch is not None
+                if wait_prefill_kernel_done or had_inflight_split:
+                    self._hicache_pump_tick += 1
+                    if self._hicache_pump_tick % self.HICACHE_PUMP_INTERVAL == 0:
+                        # Publish a dependency only when the pump reports it
+                        # may have enqueued device work (write_back frees,
+                        # storage-queue actions): an event recorded here lands
+                        # after the in-flight split segments and serializes
+                        # decode behind the whole prefill's completion, so a
+                        # host-only ack drain must not pay it.
+                        if self.check_hicache_events_if_enabled():
+                            formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
                     if not had_inflight_split:
                         self._process_hicache_events()
