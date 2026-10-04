@@ -670,11 +670,9 @@ class ForwardFlags:
         "is_extend_in_batch": False,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
-        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
         # defer_moe_finalize: next layer's fused collective absorbs the finalize.
-        "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         "defer_moe_finalize": False,
@@ -694,7 +692,6 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
-            "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "defer_moe_finalize",
@@ -2061,6 +2058,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2135,4 +2138,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor

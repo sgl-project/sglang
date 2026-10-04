@@ -214,6 +214,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             mlp_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -365,9 +366,8 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.feed_forward(hidden_states, forward_batch)
-        return ffn_exit.finish(hidden_states)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 ALL_DECODER_LAYER_TYPES = {
