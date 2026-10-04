@@ -14,7 +14,10 @@ DeepGEMM as the oracle on both engine paths:
   ``fp8_paged_mqa_logits`` with the same gates (skips while the installed
   FlashInfer catalog has no paged route for the shape);
 * the ``Indexer`` helper methods pick the Cake entry when the route admits and
-  the stock DeepGEMM call otherwise, on the real tensors.
+  the stock DeepGEMM call otherwise, on the real tensors;
+* both route helpers captured in a CUDA graph (the engine's decode / verify
+  path) replay the eager bits -- the FlashInfer entries launch on the capture
+  stream, an empty capture fails loudly.
 
 GPU tests skip when FlashInfer lacks the modules, the device is outside
 sm_100a / sm_103a, or DeepGEMM is not importable. Shapes the installed catalog
@@ -464,6 +467,146 @@ def test_indexer_ragged_helper_switches_on_route():
                 stock.masked_fill(~inside, float("-inf")),
             )
     _routes.reset_cache_for_tests()
+    cake_indexer_routes.reset_cake_route_state_for_tests()
+
+
+def _route_on():
+    from sglang.kernels.cake_kernels import _routes
+    from sglang.srt.layers.attention.dsa import cake_indexer_routes
+
+    _routes.reset_cache_for_tests()
+    cake_indexer_routes.reset_cake_route_state_for_tests()
+    return mock.patch.dict(os.environ, {_routes.ENV_VAR: "dsa_indexer"}, clear=False)
+
+
+def _assert_graph_replay(launch, poison, compare):
+    """``launch()`` eagerly (warm-up: JIT build + capture-gate registration), then
+    captured in a CUDA graph on a side stream; the captured output is poisoned
+    before every replay so an empty capture (kernels launched outside the
+    capture stream) fails loudly. ``compare(got, ref)`` must raise on mismatch."""
+    eager = launch()
+    torch.cuda.synchronize()
+    assert eager is not None, "route not taken eagerly"
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = launch()
+    assert captured is not None, "route fell back inside CUDA-graph capture"
+    with torch.cuda.stream(stream):
+        poison(captured)
+        graph.replay()
+    stream.synchronize()
+    compare(captured, eager)
+    finite = torch.isfinite(captured)
+    assert bool(finite.any()) and bool((captured[finite] != 0).any())
+    return graph, captured, eager
+
+
+def test_ragged_route_graph_replay_matches_eager():
+    """sglang decode/verify runs the indexer under CUDA-graph capture: the Cake
+    ragged entry must launch on the capture stream (replay == eager bits)."""
+    _skip_unless_device(cake.FI_DENSE_MQA_MODULE, cake.FI_DENSE_MQA_BACKEND_MODULE)
+    deep_gemm = _deep_gemm()
+    from sglang.srt.layers.attention.dsa import cake_indexer_routes
+
+    device = torch.device("cuda")
+    q, kv, kv_scales, weights, ks, ke = _ragged_inputs(16, 4096, 32, device)
+    if not cake.supports_fp8_mqa_logits(q, kv, kv_scales, weights, ks, ke):
+        pytest.skip(
+            "installed FlashInfer catalog does not serve the 32-head K=4096 row"
+        )
+    num_sms = deep_gemm.get_num_sms()
+    position = torch.arange(4096, device=device)[None, :]
+    inside = (position >= ks[:, None]) & (position < ke[:, None])
+
+    def compare(got, ref):
+        assert torch.equal(got[inside], ref[inside]), "graph replay != eager logits"
+
+    with _route_on():
+        graph, captured, eager = _assert_graph_replay(
+            lambda: cake_indexer_routes.cake_fp8_mqa_logits(
+                q, kv, kv_scales, weights, ks, ke, num_sms=num_sms
+            ),
+            lambda out: out.fill_(float("nan")),
+            compare,
+        )
+        stock = deep_gemm.fp8_mqa_logits(
+            q, (kv, kv_scales), weights, ks, ke, clean_logits=False
+        )
+        torch.cuda.synchronize()
+        _assert_logits_close(
+            captured.masked_fill(~inside, float("-inf")),
+            stock.masked_fill(~inside, float("-inf")),
+        )
+        # Changed operands reach the replayed kernels.
+        weights.neg_()
+        captured.fill_(float("nan"))
+        graph.replay()
+        changed = cake_indexer_routes.cake_fp8_mqa_logits(
+            q, kv, kv_scales, weights, ks, ke, num_sms=num_sms
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(captured[inside], changed[inside])
+        assert not torch.equal(captured[inside], eager[inside])
+    cake_indexer_routes.reset_cake_route_state_for_tests()
+
+
+def test_paged_route_graph_replay_matches_eager():
+    """One paged decode call (metadata + logits) captured in a CUDA graph through
+    the engine route helper replays the eager bits inside every row's length."""
+    _skip_unless_device(cake.FI_PAGED_MQA_MODULE, cake.FI_PAGED_MQA_BACKEND_MODULE)
+    deep_gemm = _deep_gemm()
+    from sglang.srt.layers.attention.dsa import cake_indexer_routes
+
+    device = torch.device("cuda")
+    q, kv_cache, weights, ctx_2d, block_table, max_len = _paged_inputs(
+        4, 1, 64, 1024, device
+    )
+    if not cake.supports_fp8_paged_mqa_logits(
+        q, kv_cache, weights, ctx_2d, block_table
+    ):
+        pytest.skip(
+            "installed FlashInfer catalog does not serve H=64, page 64, next_n=1"
+        )
+    num_sms = deep_gemm.get_num_sms()
+    inside = torch.arange(max_len, device=device)[None, :] < ctx_2d.reshape(-1)[:, None]
+
+    def compare(got, ref):
+        assert torch.equal(got[inside], ref[inside]), "graph replay != eager logits"
+
+    with _route_on():
+        graph, captured, eager = _assert_graph_replay(
+            lambda: cake_indexer_routes.cake_fp8_paged_mqa_logits(
+                q,
+                kv_cache,
+                weights,
+                ctx_2d,
+                block_table,
+                max_len,
+                block_kv=cake.DSA_MQA_PAGE,
+                num_sms=num_sms,
+            ),
+            lambda out: out.fill_(float("nan")),
+            compare,
+        )
+        weights.neg_()
+        captured.fill_(float("nan"))
+        graph.replay()
+        changed = cake_indexer_routes.cake_fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            weights,
+            ctx_2d,
+            block_table,
+            max_len,
+            block_kv=cake.DSA_MQA_PAGE,
+            num_sms=num_sms,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(captured[inside], changed[inside])
+        assert not torch.equal(captured[inside], eager[inside])
     cake_indexer_routes.reset_cake_route_state_for_tests()
 
 
