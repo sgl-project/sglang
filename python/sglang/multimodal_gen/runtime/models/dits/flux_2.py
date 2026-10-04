@@ -28,6 +28,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_flux2_gated_resnorm,
     can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    can_use_fused_packed_silu_mul,
     flux2_gated_resnorm_raw,
     flux2_nvfp4_swiglu_quant_active,
     flux2_strided_qknorm_rope,
@@ -426,20 +427,14 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     # how the two packed halves are addressed and therefore need verification.
     sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
     verified = sig in _FLUX2_SWIGLU_SIGS
-    can_fuse = (
-        not _FLUX2_SWIGLU.disabled
-        and x.is_cuda
-        and x.dtype is torch.bfloat16
-        and x.dim() == 3
-        and x.stride(-1) == 1
-        and x.stride(-2) >= x.shape[-1]
-        and x.stride(0) == x.shape[1] * x.stride(1)
-        and x.shape[-1] % 2 == 0
-        and x.numel() > 0
-    )
+    can_fuse = not _FLUX2_SWIGLU.disabled and can_use_fused_packed_silu_mul(x)
     # Per-signature verification may compare tensors and synchronize.  Never
-    # verify a new layout while a CUDA graph is being captured.
-    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+    # verify a new layout while a device graph is being captured.
+    if (
+        can_fuse
+        and not verified
+        and torch.get_device_module(x.device).is_current_stream_capturing()
+    ):
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
@@ -460,6 +455,24 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
                 ),
             )
     return F.silu(x[..., :half]) * x[..., half:]
+
+
+def _flux2_cat_swiglu(x: torch.Tensor, gate_up: torch.Tensor) -> torch.Tensor | None:
+    """Bit-exact ``cat([x, _flux2_swiglu(gate_up)], -1)``, the mul writing into the cat.
+    XPU only (the one backend timed); None where the fused kernel or Inductor runs."""
+    if (
+        x.device.type != "xpu"
+        or torch.compiler.is_compiling()
+        or (not _FLUX2_SWIGLU.disabled and can_use_fused_packed_silu_mul(gate_up))
+        or x.dtype != gate_up.dtype
+        or x.shape[:-1] != gate_up.shape[:-1]
+    ):
+        return None
+    d, half = x.shape[-1], gate_up.shape[-1] // 2
+    out = x.new_empty(*x.shape[:-1], d + half)
+    out[..., :d].copy_(x)
+    torch.mul(F.silu(gate_up[..., :half]), gate_up[..., half:], out=out[..., d:])
+    return out
 
 
 class Flux2SwiGLU(nn.Module):
@@ -1035,7 +1048,13 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
-        # Handle the feedforward (FF) logic
+        # Handle the feedforward (FF) logic. An eager SwiGLU's mul writes into the
+        # to_out input, so its output and the cat's copy of it go away.
+        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+            cat_input = _flux2_cat_swiglu(hidden_states, mlp_hidden_states)
+            if cat_input is not None:
+                hidden_states, _ = self.to_out(cat_input)
+                return hidden_states
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
         # Concatenate and parallel output projection. FP8 writes a packed

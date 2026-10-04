@@ -89,6 +89,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux import (
 )
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     _can_use_nvfp4_swiglu_quant_fusion,
+    _flux2_cat_swiglu,
     _flux2_norm_modulate,
     _flux2_swiglu,
 )
@@ -517,6 +518,16 @@ class TestFlux2EagerFusions(CustomTestCase):
 
         with patch("torch.compiler.is_compiling", return_value=True):
             self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
+
+
+def test_flux2_cat_swiglu_is_xpu_only():
+    # Bit-exactness is tested on XPU in test_xpu_flux2_cat_swiglu.py.
+    for device in ("cuda", "cpu"):
+        attn = torch.randn(1, 19, 96, device=device, dtype=torch.bfloat16)
+        fused = torch.randn(
+            1, 19, 3 * 96 + 2 * 128, device=device, dtype=torch.bfloat16
+        )
+        assert _flux2_cat_swiglu(attn, fused[..., 3 * 96 :]) is None
 
 
 # -------------------------------------------------------------------------
