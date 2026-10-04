@@ -1854,15 +1854,30 @@ class Req(ReqDllmMixin):
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
+                # Several stop strings can match within the same step. Stop at
+                # the one that appears earliest in the output; otherwise only
+                # the list-first match gets trimmed and the earlier stop
+                # string is left in the response (see trim_matched_stop).
+                earliest_stop_str = None
+                earliest_pos = None
                 for stop_str in self.sampling_params.stop_strs:
-                    stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
-                            )
-                        return True
+                    if stop_str in tail_str or stop_str in self.decoded_text:
+                        pos = self.decoded_text.find(stop_str)
+                        if pos == -1:
+                            # Matched only inside the tail window; approximate
+                            # its position at the start of the tail.
+                            pos = max(len(self.decoded_text) - len(tail_str), 0)
+                        if earliest_pos is None or pos < earliest_pos:
+                            earliest_pos = pos
+                            earliest_stop_str = stop_str
+                if earliest_stop_str is not None:
+                    stop_str_in_tail = earliest_stop_str in tail_str
+                    self.finished_reason = FINISH_MATCHED_STR(matched=earliest_stop_str)
+                    if stop_str_in_tail:
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=earliest_stop_str
+                        )
+                    return True
 
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
