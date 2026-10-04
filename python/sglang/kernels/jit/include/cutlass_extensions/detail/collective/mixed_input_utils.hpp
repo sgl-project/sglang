@@ -25,6 +25,20 @@
 
 namespace cutlass::gemm::collective::detail {
 
+// The mixed-input scale reaches the collective as Array<scalar, TileK/GroupSize>, so the group
+// size is only recoverable from the array width.
+template <class T>
+struct packed_scale_traits {
+  using element = T;
+  static constexpr int kNum = 1;
+};
+
+template <class T, int N, bool RegisterSized>
+struct packed_scale_traits<cutlass::Array<T, N, RegisterSized>> {
+  using element = T;
+  static constexpr int kNum = N;
+};
+
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
  private:
@@ -43,6 +57,12 @@ struct MixedGroupedGemmInputUtils {
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+  // This is instantiated on the upstream CollectiveMma, not on the vendored
+  // CollectiveMmaArrayMixedInput that owns the mainloop (see CollectiveType there), so anything
+  // the vendored class adds is invisible here and has to be recomputed from the types.
+  static constexpr int ScalePackedNum = packed_scale_traits<ElementScale>::kNum;
+  static constexpr bool UsePerElementScale = KernelConversionMode == ConversionMode::ConvertAndScale &&
+      cute::is_same_v<typename packed_scale_traits<ElementScale>::element, uint8_t>;
 
  public:
   static constexpr auto elements_per_smem_scale() {
@@ -372,6 +392,125 @@ struct MixedGroupedGemmInputUtils {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(dst_vm); ++i) {
       LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+    }
+  }
+
+  /// The multiplier a per-group accumulator is folded into the real accumulator with. The E8M0
+  /// path already scaled the A fragment, so its single chunk folds in unscaled.
+  template <class TensorScale, class Coord>
+  CUTLASS_DEVICE static float chunk_scale(TensorScale const& tCrS, Coord const& coord, int const chunk_id) {
+    if constexpr (UsePerElementScale) {
+      return 1.0f;
+    } else {
+      return static_cast<float>(tCrS(coord)[chunk_id]);
+    }
+  }
+
+  /// Converts eight E2M1 codes to bf16 without renormalizing. CUTLASS has no bf16 <- e2m1
+  /// converter for sm_90 -- its fp16 one needs Blackwell's cvt.rn.f16x2.e2m1x2 -- so the code is
+  /// placed by hand: bits [2:0] at bf16 bits [8:6] with the sign at bit 15 makes the pattern
+  /// exactly the fp4 value times 2^-126, subnormal codes included, because fp4's and bf16's
+  /// denormal ladders line up when the exponent field starts at zero. The missing 2^126 is baked
+  /// into the E8M0 scale byte offline, as marlin's dequant<nv_bfloat162, kFE2M1f, true> also does.
+  template <class TensorSrc, class TensorDst>
+  CUTLASS_DEVICE static void convert_e2m1_kblock(TensorSrc const& src, TensorDst&& dst) {
+    static_assert(
+        decltype(cute::size(src))::value == 8 && decltype(cute::size(dst))::value == 8,
+        "The E2M1 converter consumes one 32-bit source register at a time.");
+    uint32_t const src_reg = cute::recast<uint32_t>(src)(0);
+    uint32_t const src_reg_shifted = src_reg >> 4;
+    Tensor dst_reg = cute::recast<uint32_t>(dst);
+    // Byte ii of the two operands holds codes 2*ii and 2*ii+1; these selectors spread that pair
+    // into the two halves of one register, so the fragment's value order is preserved.
+    uint32_t const prmt_indices[4] = {0xF4F0, 0xF5F1, 0xF6F2, 0xF7F3};
+    CUTLASS_PRAGMA_UNROLL
+    for (int ii = 0; ii < 4; ++ii) {
+      uint32_t code;
+      asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                   : "=r"(code)
+                   : "r"(src_reg), "r"(src_reg_shifted), "r"(prmt_indices[ii]));
+      static constexpr uint32_t mag_mask = 0x01C001C0;   // bf16 bits [8:6] in both halves
+      static constexpr uint32_t sign_mask = 0x80008000;
+      dst_reg(ii) = ((code << 6) & mag_mask) | ((code << 12) & sign_mask);
+    }
+  }
+
+  /// Multiplies four packed bf16 pairs by their E8M0 group scale. The byte is the biased exponent
+  /// (127 == 1.0), so 2^(e-127) is the bf16 whose exponent field is the byte and whose mantissa is
+  /// zero. One prmt lands a pair's two bytes one bit above their exponent fields, taking the two
+  /// halves' multiplier from four byte extracts and a shift down to two instructions; prmt has no
+  /// zero source for the bytes in between, so the shift that finishes the alignment carries a mask.
+  /// mul.rn.bf16x2 keeps subnormal operands, which the fp32 round trip of bfloat16_t::operator*
+  /// would flush under -use_fast_math, taking every E2M1 code below 1.0 with it.
+  template <class TensorDst, class TensorScale>
+  CUTLASS_DEVICE static void apply_exponent_scales(
+      TensorDst&& dst, TensorScale const& scales, int const scale_idx) {
+    static_assert(
+        sizeof(typename cute::remove_cvref_t<TensorScale>::value_type) == sizeof(uint32_t),
+        "one packed scale group must be four E8M0 bytes, so that it is a single prmt source");
+    Tensor dst_reg = cute::recast<uint32_t>(dst);
+    Tensor scale_word = cute::recast<uint32_t const>(scales);
+    // Output byte 1 takes the even element's scale byte and byte 3 the odd element's, which the
+    // shift below turns into bits [14:7] and [30:23] -- the two bf16 exponent fields.
+    uint32_t const selector =
+        ((static_cast<uint32_t>(scale_idx) + 4) << 12) | (static_cast<uint32_t>(scale_idx) << 4);
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < cute::size(dst_reg); ++r) {
+      uint32_t mult;
+      asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                   : "=r"(mult)
+                   : "r"(scale_word(2 * r)), "r"(scale_word(2 * r + 1)), "r"(selector));
+      mult = (mult >> 1) & 0x7F807F80u;
+      uint32_t d = dst_reg(r);
+      asm("mul.rn.bf16x2 %0, %0, %1;\n" : "+r"(d) : "r"(mult));
+      dst_reg(r) = d;
+    }
+  }
+
+  /// Converts one k_block of A, folding the E8M0 group scale into the same pass when the scales
+  /// are exponent bytes. Scaling the A fragment rather than a per-group accumulator keeps the
+  /// register cost independent of the group size, which is what makes MXFP4's group-32 usable
+  /// at the tile shapes where the per-group accumulators would not fit.
+  template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
+  CUTLASS_DEVICE static void convert_A_kblock_scaled(
+      Tensor<EngineIn, LayoutIn> const& tCrA_load,
+      Tensor<EngineOut, LayoutOut>& tCrA_mma,
+      cute::tuple<Ts...>& partitioned_extra_info,
+      int const k_block) {
+    if constexpr (!UsePerElementScale) {
+      convert_A_kblock(tCrA_load, tCrA_mma, k_block);
+    } else {
+      using SrcType = typename EngineIn::value_type;
+      using DstType = typename EngineOut::value_type;
+      static_assert(
+          cute::is_same_v<DstType, cutlass::bfloat16_t>,
+          "The E8M0 per-element scale path builds bf16 powers of two from the exponent byte.");
+
+      Tensor src = tCrA_load(_, _, k_block);
+      Tensor dst = tCrA_mma(_, _, k_block);
+      int constexpr NumValPerSrcReg =
+          cute::min(decltype(size(src(_, 0)))::value, ceil_div(32, sizeof_bits_v<SrcType>));
+      Tensor src_vm = cute::group_modes<1, -1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+      Tensor dst_vm = cute::group_modes<1, -1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+      // The scale tile is (TileM, 1) and copy_tensors_MK fills it only at k_block == 0, so the
+      // fragment has a single K entry that every k_block reads.
+      Tensor scales = cute::get<1>(partitioned_extra_info)(_, _, Int<0>{});
+      Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+
+      // A k_block spans MmaK <= ScaleGroupSize contiguous elements, so it never straddles a
+      // group boundary and one byte of the packed array covers the whole k_block.
+      constexpr int KBlockMax = size<2>(LayoutIn{});
+      int const scale_idx = k_block * ScalePackedNum / KBlockMax;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size<1>(dst_vm); ++i) {
+        if constexpr (cute::is_same_v<SrcType, cutlass::float_e2m1_t>) {
+          convert_e2m1_kblock(src_vm(_, i), dst_vm(_, i));
+        } else {
+          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+        }
+        apply_exponent_scales(dst_vm(_, i), scales_vm(_, i), scale_idx);
+      }
     }
   }
 
