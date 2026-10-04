@@ -89,7 +89,6 @@ class TestReduceMoeOutput(CustomTestCase):
 
     def test_a_later_step_owns_the_sum(self):
         for flags, config in (
-            ({"fuse_mlp_allreduce": True}, {}),
             ({"mlp_reduce_scatter": True}, {}),
             ({"mlp_reduce_scatter": True}, {"reduce_scatterv": True}),
         ):
@@ -136,7 +135,6 @@ class TestReplicatedMoeOutput(CustomTestCase):
 
     def test_a_later_sum_counts_it_once(self):
         for flags, config in (
-            ({"fuse_mlp_allreduce": True}, {}),
             ({"mlp_reduce_scatter": True}, {}),
             ({"mlp_reduce_scatter": True}, {"reduce_scatterv": True}),
         ):
@@ -158,7 +156,7 @@ class TestReplicatedMoeOutput(CustomTestCase):
     def test_a_single_rank_adds_it(self):
         with (
             moe_config(tp_size=1, tp_rank=0),
-            get_forward().scoped(fuse_mlp_allreduce=True),
+            get_forward().scoped(mlp_reduce_scatter=True),
         ):
             self.assertTrue(should_add_replicated_moe_output())
 
@@ -202,6 +200,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         get_moe_a2a_backend=lambda: a2a(),
                         should_use_dp_reduce_scatterv=lambda: use_rsv,
                         is_dp_gatherv_active=lambda: False,
+                        is_cp_active=lambda batch: False,
                         envs=types.SimpleNamespace(
                             SGLANG_DP_USE_REDUCE_SCATTER=types.SimpleNamespace(
                                 get=lambda: False
@@ -243,9 +242,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                     )
                     with (
                         moe_config(),
-                        get_forward().scoped(
-                            fuse_mlp_allreduce=False, mlp_reduce_scatter=False
-                        ),
+                        get_forward().scoped(mlp_reduce_scatter=False),
                         patch(
                             "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
                             side_effect=lambda value: trace.append("AR") or value * 2,

@@ -1626,6 +1626,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
         mgr.transfer_source_rank = 0
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
