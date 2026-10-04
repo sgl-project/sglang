@@ -36,7 +36,6 @@ class AbortWeightsFromDeltaReqInput(BaseReq, kw_only=True):
 
 class ResumeWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
-    receipts: List[Dict[str, Any]]
 
 
 class DeltaWeightsReqOutput(BaseReq, kw_only=True):

@@ -1,17 +1,14 @@
-"""Fail-closed control plane for the opt-in GPU delta receiver.
+"""Ordered control plane for the Miles-owned GPU delta receiver.
 
-One exclusive controller owns these engines from startup through disposal. Mixing
-ordinary weight, memory, topology, or pause controls is unsupported. Preparation
-owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
+Miles owns these engines from startup through disposal and sends ordered controls.
+Concurrent administration, retries, and arbitrary API sequences are unsupported.
+Preparation owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
 scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
 """
 
 from __future__ import annotations
 
 import asyncio
-import copy
-import hashlib
-import json
 import os
 import socket
 import threading
@@ -23,10 +20,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.srt.weight_sync import gpu_delta_io as delta_io
-
-
-class GpuDeltaConflict(ValueError):
-    """A delta control conflicts with the current engine/session state."""
 
 
 class GpuDeltaCommunicator:
@@ -63,22 +56,9 @@ class GpuDeltaCommunicator:
         self._fan_out = fan_out
 
 
-def _identity_key(identity: dict) -> str:
-    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
-
-
-def _identities(values: list[dict]) -> set[str]:
-    keys = {_identity_key(value) for value in values}
-    if not values or len(keys) != len(values):
-        raise ValueError("participant identities must be nonempty and unique")
-    return keys
-
-
 @dataclass
 class _Session:
     request: dict
-    participant_keys: set[str]
-    cohort_digest: str
     state: str = "PREPARING"
     message: str = ""
     prepared: Any = None
@@ -89,7 +69,7 @@ class _Session:
 
 
 class DeltaSession:
-    """One original process, one leased publication, and no automatic XOR retry.
+    """One original process following the Miles prepare/apply/resume sequence.
 
     The backend is injected so lifecycle tests do not need CUDA. ``prepare`` may
     allocate/upload on its own stream; ``apply`` must check decoder status and finish its GPU work
@@ -97,40 +77,22 @@ class DeltaSession:
     """
 
     def __init__(self, identity: dict, backend: Any, initial_version: int = 0):
-        self.identity = copy.deepcopy(identity)
+        self.identity = identity
         self.backend = backend
         self.version = initial_version
-        self.stream_id = None
         self._session: _Session | None = None
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="gpu-delta"
         )
-        self._seen_ids: set[str] = set()
-
-    @property
-    def leased(self) -> bool:
-        with self._lock:
-            return self._session is not None and self._session.state not in {
-                "ABORTED",
-                "RESUMED",
-            }
-
-    def _get(self, session_id: str) -> _Session:
-        if self._session is None or self._session.request["session_id"] != session_id:
-            raise ValueError(
-                "unknown delta session; never retry an ambiguous update as a new session"
-            )
-        return self._session
 
     def status(self, session_id: str) -> dict:
         with self._lock:
-            session = self._get(session_id)
+            session = self._session
             request = session.request
             receipt = {
-                "identity": copy.deepcopy(self.identity),
+                "identity": self.identity,
                 "state": session.state,
-                "cohort_digest": session.cohort_digest,
                 "message": session.message,
                 **{
                     key: request[key]
@@ -143,7 +105,7 @@ class DeltaSession:
                         "plan_digest",
                     )
                 },
-                "result": copy.deepcopy(session.result),
+                "result": session.result,
                 # One original process's clock, never subtract across ranks.
                 # Open/failed pauses have no qualified completed duration.
                 "scheduler_timing": {
@@ -159,39 +121,11 @@ class DeltaSession:
                     ),
                 },
             }
-            if session.state == "APPLIED":
-                receipt["certificate"] = {
-                    key: copy.deepcopy(receipt[key])
-                    for key in (
-                        "identity",
-                        "state",
-                        "cohort_digest",
-                        "session_id",
-                        "manifest_sha256",
-                        "stream_id",
-                        "base_version",
-                        "target_version",
-                        "plan_digest",
-                    )
-                }
             return receipt
 
     def prepare(self, request: dict) -> dict:
-        request = copy.deepcopy(request)
         with self._lock:
             session_id = request["session_id"]
-            if self.leased or session_id in self._seen_ids:
-                raise ValueError(
-                    "delta session already leased or session identity already consumed"
-                )
-            local = _identities(request["participants"])
-            engine_id = self.identity["engine_id"]
-            if _identity_key(self.identity) not in local or any(
-                item["engine_id"] != engine_id for item in request["participants"]
-            ):
-                raise ValueError(
-                    "prepare does not bind this original engine's complete participants"
-                )
             if (
                 request["base_version"] != self.version
                 or request["target_version"] <= self.version
@@ -199,16 +133,7 @@ class DeltaSession:
                 raise ValueError(
                     "delta base version differs from committed local version"
                 )
-            if self.stream_id is not None and request["stream_id"] != self.stream_id:
-                raise ValueError("delta stream changed")
-            session = self._session = _Session(
-                request=request,
-                participant_keys=local,
-                cohort_digest=hashlib.sha256(
-                    json.dumps(sorted(local)).encode()
-                ).hexdigest(),
-            )
-            self._seen_ids.add(session_id)
+            session = self._session = _Session(request=request)
             self._executor.submit(self._prepare, session)
             return self.status(session_id)
 
@@ -241,11 +166,9 @@ class DeltaSession:
         flush: Callable[[], bool],
     ) -> dict:
         with self._lock:
-            session = self._get(session_id)
-            if session.state != "PREPARED":
-                raise ValueError(f"apply requires PREPARED, got {session.state}")
+            session = self._session
             # The scheduler has stopped new work. From this point a peer may
-            # already be mutating: even a failed fence cannot make this abortable.
+            # already be mutating. Miles does not abort after dispatching apply.
             session.state = "APPLYING"
             session.pause_started_ns = time.monotonic_ns()
         try:
@@ -266,66 +189,29 @@ class DeltaSession:
             session.state = "APPLIED"
             return self.status(session_id)
 
-    def _validate_applied(self, session: _Session, receipts: list[dict]) -> None:
-        actual = _identities([receipt["identity"] for receipt in receipts])
-        if actual != session.participant_keys:
-            raise ValueError(
-                "certificate must contain every original rank exactly once"
-            )
-        for receipt in receipts:
-            if receipt.get("cohort_digest") != session.cohort_digest:
-                raise ValueError("certificate cohort differs from the prepared cohort")
-            if receipt["state"] != "APPLIED":
-                raise ValueError("certificate requires APPLIED on every rank")
-            for key in (
-                "session_id",
-                "manifest_sha256",
-                "stream_id",
-                "base_version",
-                "target_version",
-                "plan_digest",
-            ):
-                if receipt[key] != session.request[key]:
-                    raise ValueError(
-                        f"certificate {key} differs from prepared publication"
-                    )
-
-    def resume(
-        self, session_id: str, receipts: list[dict], resume: Callable[[int], None]
-    ) -> dict:
+    def resume(self, session_id: str, resume: Callable[[int], None]) -> dict:
         with self._lock:
-            session = self._get(session_id)
-            if session.state != "APPLIED":
-                raise ValueError(f"resume requires APPLIED, got {session.state}")
-            self._validate_applied(session, receipts)
+            session = self._session
             self.version = session.request["target_version"]
-            self.stream_id = session.request["stream_id"]
             session.state = "RESUMING"
             resume(self.version)
             session.resumed_ns = time.monotonic_ns()
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
-            # it before the next prepare. Only this engine's APPLIED proof releases.
+            # it before the next prepare. Miles sends resume after every rank applied.
             self._executor.submit(prepared.release_and_close)
             return self.status(session_id)
 
     def abort(self, session_id: str) -> dict:
         with self._lock:
-            if not self.leased and (
-                self._session is None
-                or self._session.request["session_id"] != session_id
-            ):
+            if self._session is None:
                 return {
-                    "identity": copy.deepcopy(self.identity),
+                    "identity": self.identity,
                     "state": "ABORTED",
                     "session_id": session_id,
                 }
-            session = self._get(session_id)
-            if session.state not in {"PREPARING", "PREPARED", "FAILED", "ABORTED"}:
-                raise ValueError(
-                    f"cannot abort {session.state}; keep this engine paused"
-                )
+            session = self._session
             session.state = "ABORTED"
             if session.prepared is not None:
                 prepared, session.prepared = session.prepared, None
@@ -419,8 +305,6 @@ class GpuDeltaSchedulerControl:
             self.identity = identity
             self.backend = backend
             self.session = DeltaSession(identity, backend)
-        elif self.identity["engine_id"] != engine_id:
-            raise ValueError("engine identity is already bound")
         return {
             "identity": self.identity,
             "state": "IDLE",
@@ -435,22 +319,6 @@ class GpuDeltaSchedulerControl:
             if isinstance(request, delta_io.GetWeightsDeltaInfoReqInput):
                 receipt = self._describe(request.engine_id)
             elif isinstance(request, delta_io.PrepareWeightsFromDeltaReqInput):
-                if (
-                    self.identity is not None
-                    and request.engine_id != self.identity["engine_id"]
-                ):
-                    raise ValueError("prepare engine identity mismatch")
-                if self.session is None:
-                    raise ValueError(
-                        "describe original engine participants before prepare"
-                    )
-                if (
-                    self.scheduler.weight_updater._session is not None
-                    or self.scheduler.weight_updater.offload_tags
-                ):
-                    raise ValueError(
-                        "another weight update or memory offload is active"
-                    )
                 receipt = self.session.prepare(
                     {
                         "session_id": request.session_id,
@@ -464,8 +332,6 @@ class GpuDeltaSchedulerControl:
                         "host_tensor_names": request.host_tensor_names,
                     }
                 )
-            elif self.session is None:
-                raise ValueError("no GPU delta session")
             elif isinstance(request, delta_io.GetWeightsDeltaStatusReqInput):
                 receipt = self.session.status(request.session_id)
             elif isinstance(request, delta_io.UpdateWeightsFromDeltaReqInput):
@@ -486,9 +352,7 @@ class GpuDeltaSchedulerControl:
                         io.ContinueGenerationReqInput(torch_empty_cache=False)
                     )
 
-                receipt = self.session.resume(
-                    request.session_id, request.receipts, resume
-                )
+                receipt = self.session.resume(request.session_id, resume)
             elif isinstance(request, delta_io.AbortWeightsFromDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
@@ -502,11 +366,10 @@ class GpuDeltaSchedulerControl:
             )
         except Exception as exc:
             receipt = {"identity": self.identity, "state": "REJECTED"}
-            if self.session is not None and getattr(request, "session_id", None):
-                try:
-                    receipt = self.session.status(request.session_id)
-                except ValueError:
-                    pass
+            if self.session is not None and self.session._session is not None:
+                receipt = self.session.status(
+                    self.session._session.request["session_id"]
+                )
             return delta_io.DeltaWeightsReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )

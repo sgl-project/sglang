@@ -63,7 +63,7 @@ original rank reports `PREPARED`, Miles fans out
 pauses scheduling, fences existing readers, retracts requests, flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
 checks. Miles waits for each engine's original ranks to apply, then sends that
-engine `resume_weights_from_delta` with its compact apply receipts. Independent
+engine `resume_weights_from_delta(session_id)`. Independent
 engines prepare, apply and resume separately; the trainer waits for all engines
 before advancing its update baseline. Resume records the new version and reopens
 generation after successful local acknowledgments.
@@ -85,9 +85,12 @@ reader/completion fences retain their existing behavior.
 
 There is no separate global quiesce or commit round. A participant may apply
 before another fails to pause; failed or uncertain activation never authorizes
-resume, rollback or automatic replay. The update becomes unabortable before the
-reader fence starts. A failed fence must not reclaim KV/cache. Preparation can be
-aborted before update dispatch, while serving continues on the old version.
+resume, rollback or automatic replay. Miles owns the ordered API sequence and
+sends resume only after every rank of that engine reports successful apply.
+Concurrent administration, retries and arbitrary call ordering are unsupported;
+SGLang does not duplicate the caller's identity/certificate validation. A failed
+fence must not reclaim KV/cache. Preparation can be aborted before update dispatch,
+while serving continues on the old version.
 
 The admitted topology uses ordinary globally ordered control broadcast. Local
 control broadcast and elastic EP joiners are unsupported. Delta application itself
@@ -130,7 +133,7 @@ subdirectories and advertised `host_cache_id` values. Independent engines
 deliberately duplicate CPU buffers and work; they share no build locks or release
 lifecycle. Container hostname is not used to infer sharing.
 Miles negotiates the canonical tensor-name union per cache ID and sends it in
-`host_tensor_names`. Each receiver requires its local names to be covered; foreign
+`host_tensor_names`. This negotiated union covers each receiver's local names; foreign
 experts outside that union are not decoded.
 
 Each rank qualifies the canonical tensor/view plan once and retains only detached
@@ -162,9 +165,8 @@ physical pages through its own VA; there is no full per-rank Snappy copy. CUDA
 registration/unregistration runs outside the host build mutex. Torch's pinned
 allocator does not own this external memory.
 
-Only successful resume with the complete original engine APPLIED certificate
-authorizes reuse: that engine's ranks have finished H2D and their update-stream
-fences. Another engine's state does not authorize or block this release. The
+Miles sends resume only after the engine's ranks have finished H2D and their
+update-stream fences. Successful local resume authorizes shared-arena reuse. Another engine's state does not authorize or block this release. The
 session queues generation-specific release and view cleanup on its existing FIFO
 executor, off the scheduler thread and ahead of the next local prepare. Local
 apply, abort, failure and ordinary close cannot release a shared generation. A

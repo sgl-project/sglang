@@ -431,7 +431,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         wait_event=lambda _: None, wait_stream=lambda _: None
                     )
                     prepared.ready = object()
-                    prepared.applied = prepared.timing_enabled = False
+                    prepared.timing_enabled = False
                     prepared.raw_copies, prepared.units = {}, []
                     prepared.raw_tensor_count = 0
                     prepared.derived = [

@@ -80,11 +80,7 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
         )
         assert result.rid == "apply-rid" and scheduler._engine_paused
         assert result.success and events == ["fence", "retract", "flush", "apply"]
-        result = wrapped(
-            io.ResumeWeightsFromDeltaReqInput(
-                session_id="p", receipts=[result.participant["certificate"]]
-            )
-        )
+        result = wrapped(io.ResumeWeightsFromDeltaReqInput(session_id="p"))
         assert result.success and result.participant["state"] == "RESUMED"
         assert events[-2:] == [("version", "1"), "resume"]
         assert not scheduler._engine_paused

@@ -875,7 +875,6 @@ class PreparedDelta:
         self.device = backend.device
         self.stream = torch.cuda.Stream(device=self.device)
         self.done = None
-        self.applied = False
         manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
         content = path.read_bytes()
@@ -887,9 +886,6 @@ class PreparedDelta:
         )
         plan_started = time.perf_counter()
         validate_codec(manifest, backend.codec)
-        for key in ("stream_id", "base_version", "target_version", "plan_digest"):
-            if manifest.get(key) != metadata[key]:
-                raise ValueError(f"delta manifest/request mismatch: {key}")
         if (
             type(manifest["base_version"]) is not int
             or manifest["target_version"] != manifest["base_version"] + 1
@@ -901,11 +897,7 @@ class PreparedDelta:
         self.timings["host_plan_cache_reused"] = int(reused_plan)
         host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
         if (
-            not isinstance(host_names, list)
-            or not all(isinstance(name, str) for name in host_names)
-            or host_names != sorted(set(host_names))
-            or not {binding.name for binding in backend.layout.bindings}
-            <= set(host_names)
+            not {binding.name for binding in backend.layout.bindings} <= set(host_names)
             or not set(host_names) <= entries.keys()
         ):
             raise ValueError(
@@ -1077,9 +1069,6 @@ class PreparedDelta:
         self.events.setdefault(name, []).append((start, end))
 
     def apply(self):
-        if self.applied:
-            raise RuntimeError("a prepared delta may be applied only once")
-        self.applied = True
         apply_started = time.perf_counter()
         backend = self.backend
         backend.layout.check_identity()
@@ -1174,7 +1163,7 @@ class PreparedDelta:
             binding.xor(torch.where(self.error == 0, unit.payload, 0))
 
     def release_and_close(self):
-        # Queued only after resume with every original engine rank's APPLIED proof.
+        # Miles queues resume only after every original engine rank applied.
         # Ordinary abort/error close must never authorize a shared overwrite.
         try:
             self.host_snapshot.mark_reusable()

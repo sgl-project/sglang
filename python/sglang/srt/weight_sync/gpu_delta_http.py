@@ -16,18 +16,10 @@ from sglang.srt.weight_sync.gpu_delta_io import (
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
-from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaConflict
 
 
 def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     """Use the app's route class and resolve its tokenizer manager per request."""
-
-    @app.exception_handler(GpuDeltaConflict)
-    async def conflict(request, exc):
-        return ORJSONResponse(
-            {"success": False, "message": str(exc), "participants": []},
-            status_code=HTTPStatus.CONFLICT,
-        )
 
     async def dispatch(obj, request):
         content = await get_global_state().tokenizer_manager.gpu_delta.request(

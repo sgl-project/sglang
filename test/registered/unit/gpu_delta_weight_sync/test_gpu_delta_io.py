@@ -4,11 +4,6 @@ import io
 import sys
 from types import SimpleNamespace
 
-import pytest
-
-from sglang.srt.weight_sync.gpu_delta_io import (
-    PrepareWeightsFromDeltaReqInput,
-)
 from sglang.srt.weight_sync.gpu_delta_session import (
     GpuDeltaSchedulerControl,
 )
@@ -108,59 +103,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
         assert receipt["plan"] == plan
         assert control._describe("engine-0") == receipt
         assert len(backends) == 1
-        with pytest.raises(ValueError, match="already bound"):
-            control._describe("different-engine")
         assert cache_engines == ["engine-0"]
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()
-
-
-@pytest.mark.parametrize(
-    "legacy_session,offloaded", [(False, False), (True, False), (False, True)]
-)
-def test_prepare_uses_scheduler_updater_session_and_offload_state(
-    legacy_session, offloaded
-):
-    who = {"engine_id": "engine-0", "rank_id": "original-0"}
-    control = GpuDeltaSchedulerControl(
-        SimpleNamespace(
-            weight_updater=SimpleNamespace(
-                _session=object() if legacy_session else None,
-                offload_tags={"weights"} if offloaded else set(),
-            )
-        )
-    )
-    control.identity = who
-    prepared = []
-
-    def prepare(request):
-        prepared.append(request)
-        return {
-            "identity": who,
-            "session_id": request["session_id"],
-            "state": "PREPARING",
-        }
-
-    def status(session_id):
-        # Rejected before DeltaSession.prepare, so no session exists to inspect.
-        raise ValueError("unknown delta session")
-
-    control.session = SimpleNamespace(prepare=prepare, status=status)
-    request = PrepareWeightsFromDeltaReqInput(
-        session_id="publication-1",
-        engine_id=who["engine_id"],
-        manifest_path="/immutable/manifest.json",
-        manifest_sha256="a" * 64,
-        stream_id="run-1",
-        base_version=0,
-        target_version=1,
-        plan_digest="b" * 64,
-        participants=[who],
-        host_tensor_names={"host": []},
-    )
-    result = control.handle(request)
-    assert result.success is not (legacy_session or offloaded)
-    assert bool(prepared) is result.success
-    if not result.success:
-        assert "another weight update or memory offload" in result.message

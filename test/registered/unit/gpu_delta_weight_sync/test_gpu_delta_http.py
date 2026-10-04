@@ -25,7 +25,6 @@ from sglang.srt.weight_sync.gpu_delta_io import (
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
-from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaConflict
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -47,8 +46,6 @@ def http_delta():
     async def dispatch(obj, request):
         assert request.app is app
         calls.append(obj)
-        if isinstance(reply.get("error"), Exception):
-            raise reply["error"]
         return reply
 
     # Global state is populated at startup, after the routes are registered.
@@ -97,7 +94,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         (
             "resume_weights_from_delta",
             ResumeWeightsFromDeltaReqInput,
-            session | {"receipts": receipts},
+            session,
         ),
         ("abort_weights_from_delta", AbortWeightsFromDeltaReqInput, session),
     ]
@@ -131,22 +128,12 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
     assert len(calls) == len(cases)
 
 
-def test_delta_failure_is_conflict_and_invalid_body_never_dispatches(http_delta):
+def test_delta_runtime_failure_returns_conflict(http_delta):
     client, _, calls, reply, _ = http_delta
-    reply.update(success=False, message="original participant changed")
-    result = client.post("/get_weights_delta_info", json={"engine_id": "e0"})
+    reply.update(success=False, message="delta payload checksum failed")
+    result = client.post("/get_weights_delta_status", json={"session_id": "p"})
     assert result.status_code == 409 and result.json() == reply
-    result = client.post("/prepare_weights_from_delta", json={"session_id": "p"})
-    assert result.status_code == 422
     assert len(calls) == 1
-    reply["error"] = GpuDeltaConflict("another delta session is active")
-    result = client.post("/get_weights_delta_info", json={"engine_id": "e0"})
-    assert result.status_code == 409
-    assert result.json() == {
-        "success": False,
-        "message": "another delta session is active",
-        "participants": [],
-    }
 
 
 if __name__ == "__main__":

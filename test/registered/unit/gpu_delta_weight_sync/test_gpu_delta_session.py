@@ -1,7 +1,6 @@
 """CPU tests for distributed delta transaction failure boundaries."""
 
 import asyncio
-import copy
 import sys
 import threading
 import time
@@ -122,11 +121,9 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     req = request([session.identity])
     preparing = session.prepare(req)
     assert preparing["state"] == "PREPARING"
-    req["participants"] = [identity("replacement")]
     assert backend.started.wait(2)
     status = session.status("publication-1")
     assert status["state"] == "PREPARING"
-    assert status["cohort_digest"] == preparing["cohort_digest"]
     assert backend.payload.applications == 0
     session.abort("publication-1")
     backend.ready.set()
@@ -137,7 +134,7 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
 
 def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session):
     session, backend = make_session()
-    receipt = applied(session, backend)
+    applied(session, backend)
     entered, release = threading.Event(), threading.Event()
     caller = threading.get_ident()
 
@@ -150,12 +147,7 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
 
     backend.payload.release_and_close = cleanup
     try:
-        assert (
-            session.resume("publication-1", [receipt["certificate"]], lambda _: None)[
-                "state"
-            ]
-            == "RESUMED"
-        )
+        assert session.resume("publication-1", lambda _: None)["state"] == "RESUMED"
         assert entered.wait(2)
         backend.started.clear()
         req = request([session.identity]) | dict(
@@ -175,96 +167,21 @@ def test_bad_publication_never_mutates(make_session):
     session.prepare(request([session.identity]))
     backend.ready.set()
     assert "checksum" in wait_state(session, "FAILED")["message"]
-    with pytest.raises(ValueError, match="requires PREPARED"):
-        session.apply(
-            "publication-1",
-            lambda: pytest.fail("must not fence"),
-            lambda: None,
-            lambda: True,
-        )
     assert backend.payload.applications == 0
     session.abort("publication-1")
-    assert not session.leased
+    assert session.status("publication-1")["state"] == "ABORTED"
 
 
-def test_repeated_apply_or_prepare_never_replays_xor(make_session):
-    session, backend = make_session()
-    applied(session, backend)
-    with pytest.raises(ValueError, match="requires PREPARED"):
-        session.apply(
-            "publication-1",
-            lambda: pytest.fail("duplicate fence"),
-            lambda: None,
-            lambda: True,
-        )
-    assert backend.payload.applications == 1
-    for next_request in (
-        request([session.identity]),
-        request([session.identity]) | {"session_id": "new-id"},
-    ):
-        with pytest.raises(ValueError, match="already leased"):
-            session.prepare(next_request)
-
-
-def test_exact_original_applied_cohort_required_before_resume(make_session):
-    ids = [identity("a", 0), identity("a", 1)]
-    sessions = [make_session(who) for who in ids]
-    first, backend = sessions[0]
-    first_receipt = applied(first, backend, request(ids))
-    second, backend = sessions[1]
-    prepare_ready(second, backend, request(ids))
-    with pytest.raises(ValueError, match="every original rank"):
-        first.resume(
-            "publication-1",
-            [first_receipt["certificate"]],
-            lambda _: pytest.fail("early resume"),
-        )
-    second_receipt = second.apply(
-        "publication-1", lambda: None, lambda: None, lambda: True
-    )
-    certificates = [first_receipt["certificate"], second_receipt["certificate"]]
-    assert "result" not in certificates[0] and "scheduler_timing" not in certificates[0]
-    for field, value, error in (
-        ("start_ticks", 43, "every original rank"),
-        ("manifest_sha256", "wrong", "manifest_sha256"),
-        ("state", "PREPARED", "requires APPLIED"),
-    ):
-        wrong = copy.deepcopy(certificates)
-        if field == "start_ticks":
-            wrong[1]["identity"][field] = value
-        else:
-            wrong[1][field] = value
-        with pytest.raises(ValueError, match=error):
-            first.resume(
-                "publication-1", wrong, lambda _: pytest.fail("bad certificate resumed")
-            )
-    resumed = []
-    for session, _ in sessions:
-        assert (
-            session.resume("publication-1", certificates, resumed.append)["state"]
-            == "RESUMED"
-        )
-        assert not session.leased and session.version == 1
-    assert resumed == [1, 1]
-    assert all(backend.payload.released.wait(2) for _, backend in sessions)
-
-
-def test_engine_resume_is_independent_and_cannot_bind_foreign_ranks(make_session):
+def test_engine_resume_does_not_wait_for_another_engine(make_session):
     first, first_backend = make_session(identity("a"))
     second, second_backend = make_session(identity("b"))
-    with pytest.raises(ValueError, match="complete participants"):
-        first.prepare(request([first.identity, second.identity]))
-    assert not first_backend.started.is_set()
     second.prepare(request([second.identity]))
     assert second_backend.started.wait(2)
-    receipt = applied(first, first_backend)
-    assert (
-        first.resume("publication-1", [receipt["certificate"]], lambda _: None)["state"]
-        == "RESUMED"
-    )
+    applied(first, first_backend)
+    assert first.resume("publication-1", lambda _: None)["state"] == "RESUMED"
     assert first_backend.payload.released.wait(2)
     assert second.status("publication-1")["state"] == "PREPARING"
-    assert second.leased and not second_backend.payload.released.is_set()
+    assert not second_backend.payload.released.is_set()
 
 
 @pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])
@@ -301,25 +218,19 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
         status["state"] == "POISONED"
         and status["scheduler_timing"]["blocked_s"] is None
     )
-    with pytest.raises(ValueError, match="cannot abort POISONED"):
-        session.abort("publication-1")
-    with pytest.raises(ValueError, match="requires PREPARED"):
-        session.apply("publication-1", lambda: None, lambda: None, lambda: True)
+    assert not backend.payload.released.is_set()
 
 
 def test_resume_failure_retains_ownership(make_session):
     session, backend = make_session()
-    receipt = applied(session, backend)
+    applied(session, backend)
     with pytest.raises(RuntimeError, match="resume failed"):
         session.resume(
             "publication-1",
-            [receipt["certificate"]],
             lambda _: (_ for _ in ()).throw(RuntimeError("resume failed")),
         )
-    assert session.leased
+    assert session.status("publication-1")["state"] == "RESUMING"
     assert not backend.payload.released.is_set()
-    with pytest.raises(ValueError, match="cannot abort RESUMING"):
-        session.abort("publication-1")
     assert session.status("publication-1")["scheduler_timing"]["blocked_s"] is None
 
 
@@ -346,7 +257,7 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
 
     receipt = session.apply("publication-1", fence, lambda: None, lambda: True)
     now[0] = 60_000_000_000
-    resumed = session.resume("publication-1", [receipt["certificate"]], lambda _: None)
+    resumed = session.resume("publication-1", lambda _: None)
     assert resumed["scheduler_timing"] == {
         "clock": "monotonic_ns",
         "pause_started_ns": 10_000_000_000,

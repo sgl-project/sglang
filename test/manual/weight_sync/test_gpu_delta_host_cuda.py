@@ -141,7 +141,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     record["offset"] : record["offset"] + record["nbytes"]
                 ]
                 assert bytes(actual.numpy()) == value
-            # Substitute the production all-original-engine-rank APPLIED certificate with
+            # Substitute the Miles all-original-engine-rank completion barrier with
             # an explicit two-process completion barrier in this isolated oracle.
             barrier.wait(timeout=90)
             snapshot.mark_reusable()

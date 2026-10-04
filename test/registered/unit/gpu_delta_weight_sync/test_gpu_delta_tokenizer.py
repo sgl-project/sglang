@@ -30,9 +30,7 @@ def control(monkeypatch):
         tokenizer.GpuDeltaTokenizerControl
     )
     control.manager = manager
-    control.session_id = "publication-1"
-    control.participants = [{"engine_id": "engine-0", "rank_id": "rank-0"}]
-    control.communicator = GpuDeltaCommunicator(control._send, 1)
+    control.communicator = GpuDeltaCommunicator(manager._dispatch_to_scheduler, 1)
     return control, sent, versions
 
 
@@ -43,7 +41,7 @@ def reply(control, obj, state, success=True):
             success=success,
             message="" if success else "rejected",
             participant={
-                "identity": control.participants[0],
+                "identity": {"engine_id": "engine-0", "rank_id": "rank-0"},
                 "session_id": obj.session_id,
                 "state": state,
                 "target_version": 1,
@@ -52,7 +50,10 @@ def reply(control, obj, state, success=True):
     )
 
 
-def test_only_update_gates_admission_and_only_successful_resume_releases_it(control):
+@pytest.mark.parametrize("resume_success", [True, False])
+def test_only_update_gates_admission_and_successful_resume_releases_it(
+    control, resume_success
+):
     async def run():
         facade, sent, versions = control
         status = io.GetWeightsDeltaStatusReqInput(session_id="publication-1")
@@ -61,34 +62,24 @@ def test_only_update_gates_admission_and_only_successful_resume_releases_it(cont
         assert not facade.manager.is_pause
         reply(facade, status, "PREPARED")
         assert (await task)["success"]
-
         update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(update))
         await asyncio.sleep(0)
         assert sent[-1] is update and facade.manager.is_pause
         reply(facade, update, "APPLIED")
         assert (await task)["success"] and facade.manager.is_pause
-
-        resume = io.ResumeWeightsFromDeltaReqInput(
-            session_id="publication-1", receipts=[]
-        )
+        resume = io.ResumeWeightsFromDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(resume))
         await asyncio.sleep(0)
-        reply(facade, resume, "APPLIED", success=False)
-        assert not (await task)["success"]
-        assert facade.manager.is_pause and facade.session_id == "publication-1"
-        assert versions == []
-
-        resume = io.ResumeWeightsFromDeltaReqInput(
-            session_id="publication-1", receipts=[{"state": "APPLIED"}]
+        reply(
+            facade,
+            resume,
+            "RESUMED" if resume_success else "RESUMING",
+            success=resume_success,
         )
-        task = asyncio.create_task(facade.request(resume))
-        await asyncio.sleep(0)
-        assert facade.manager.is_pause and not task.done()
-        reply(facade, resume, "RESUMED")
-        assert (await task)["success"]
-        assert not facade.manager.is_pause and facade.session_id is None
-        assert versions == ["1"]
+        assert (await task)["success"] is resume_success
+        assert facade.manager.is_pause is not resume_success
+        assert versions == (["1"] if resume_success else [])
 
     asyncio.run(run())
 
@@ -102,7 +93,7 @@ def test_uncertain_update_keeps_admission_paused(control, failure):
             def fail(_):
                 raise OSError("transport unavailable")
 
-            facade.manager._dispatch_to_scheduler = fail
+            facade.communicator._send = fail
         update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(update))
         await asyncio.sleep(0)
@@ -110,36 +101,6 @@ def test_uncertain_update_keeps_admission_paused(control, failure):
             task.cancel()
         with pytest.raises(OSError if failure == "send" else asyncio.CancelledError):
             await task
-        assert facade.manager.is_pause and facade.session_id == "publication-1"
-
-    asyncio.run(run())
-
-
-def test_prepare_ownership_survives_failed_send(control):
-    async def run():
-        facade, _, _ = control
-        facade.session_id = None
-
-        def fail(_):
-            raise OSError("transport unavailable")
-
-        facade.manager._dispatch_to_scheduler = fail
-        prepare = io.PrepareWeightsFromDeltaReqInput(
-            session_id="publication-1",
-            engine_id="engine-0",
-            manifest_path="/manifest",
-            manifest_sha256="a" * 64,
-            stream_id="run",
-            base_version=0,
-            target_version=1,
-            plan_digest="b" * 64,
-            participants=facade.participants,
-            host_tensor_names={"host": []},
-        )
-        with pytest.raises(OSError):
-            await facade.request(prepare)
-        assert facade.session_id == "publication-1" and not facade.manager.is_pause
-        with pytest.raises(tokenizer.GpuDeltaConflict, match="another delta session"):
-            await facade.request(prepare)
+        assert facade.manager.is_pause
 
     asyncio.run(run())

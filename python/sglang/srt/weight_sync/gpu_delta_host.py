@@ -247,7 +247,7 @@ class HostArena:
     """Backend-owned mapping and CUDA registration, retained across updates.
 
     A namespace binds the original engine ranks, delta stream and host tensor union.
-    Only a successful all-rank APPLIED resume releases a generation for overwrite.
+    Miles sends resume after all engine ranks apply; it releases the generation.
     Abort/failure retains its bytes and cannot recycle the slot automatically.
     """
 
