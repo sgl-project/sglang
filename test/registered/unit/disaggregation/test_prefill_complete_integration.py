@@ -663,6 +663,8 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
         mgr.failed_sessions = set()
+        mgr.state_layout_rejections = {}
+        mgr.state_strides_validated = set()
         mgr.enable_deferred_decode_kv_release = True
         mgr.decode_kv_args_table = {
             "session": SimpleNamespace(requires_dcp_relayout=False, dst_aux_ptrs=[])
