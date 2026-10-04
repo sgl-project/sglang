@@ -30,6 +30,9 @@ VISION_MODELS = (
     "vision_gqa",
     "vision_legacy",
     "siglip",
+    "glm4v_mlp",
+    "glm4v_merger",
+    "internvl_mlp",
     "qwen_merger",
     "minimax_projector",
     "minimax_merger",
@@ -64,6 +67,17 @@ def build_vision(model, use_data_parallel=False, width=32, quant_config=None):
             **options,
         )
         layers = (module.qkv_proj, module.proj)
+    elif model in ("glm4v_mlp", "glm4v_merger"):
+        from sglang.srt.models.glm4v import Glm4vPatchMerger, Glm4vVisionMLP
+
+        constructor = Glm4vVisionMLP if model == "glm4v_mlp" else Glm4vPatchMerger
+        module = constructor(width, 2 * width, bias=True, **options)
+        layers = (module.gate_up_proj, module.down_proj)
+    elif model == "internvl_mlp":
+        from sglang.srt.models.internvl import InternMLP
+
+        module = InternMLP(config, use_data_parallel=use_data_parallel)
+        layers = (module.fc1, module.fc2)
     elif model == "siglip":
         from sglang.srt.models.siglip import SiglipMLP
 
@@ -163,12 +177,34 @@ def load_projection(layer):
         else:
             weight = values(layer.output_size, layer.input_size, 3)
             layer.weight.weight_loader(layer.weight, weight)
-            shard = weight.chunk(size, dim=1 if row else 0)[rank]
+            shard = (
+                weight.chunk(size, dim=1)[rank]
+                if row
+                else torch.cat(
+                    [
+                        p.chunk(size)[rank]
+                        for p in weight.split(
+                            getattr(layer, "output_sizes", [layer.output_size])
+                        )
+                    ]
+                )
+            )
             bias_shard = None
             if layer.bias is not None:
                 bias = values(layer.output_size, 1, 4).flatten()
                 layer.bias.weight_loader(layer.bias, bias)
-                bias_shard = bias if row else bias.chunk(size)[rank]
+                bias_shard = (
+                    bias
+                    if row
+                    else torch.cat(
+                        [
+                            p.chunk(size)[rank]
+                            for p in bias.split(
+                                getattr(layer, "output_sizes", [layer.output_size])
+                            )
+                        ]
+                    )
+                )
     return shard, bias_shard
 
 
@@ -212,7 +248,16 @@ class TestVisionParallelGroups(CustomTestCase):
                             continue
                         module, layers = build_vision(model, replicated)
                         group = (
-                            "tp" if model in ("siglip", "qwen_merger") else "attn_tp"
+                            "tp"
+                            if model
+                            in (
+                                "siglip",
+                                "qwen_merger",
+                                "glm4v_mlp",
+                                "glm4v_merger",
+                                "internvl_mlp",
+                            )
+                            else "attn_tp"
                         )
                         rank, size = (
                             (0, 1)

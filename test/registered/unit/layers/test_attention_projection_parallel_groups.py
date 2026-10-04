@@ -25,6 +25,8 @@ ATTENTION_CASES = (
     ("gigachat", True),
     ("hunyuan", None),
     ("hunyuan", "elementwise"),
+    ("exaone4", False),
+    ("exaone4", True),
     ("mimo", False),
     ("mimo", True),
     ("minimax", "dense"),
@@ -112,6 +114,23 @@ def build_attention(
                 layer_id=0,
             )
             names = (name,) if getattr(module, name, None) is not None else ()
+    elif model == "exaone4":
+        from sglang.srt.models.exaone4 import Exaone4Attention
+
+        module = Exaone4Attention(
+            config,
+            width,
+            8,
+            1 if variant else 4,
+            head_dim=head_dim,
+            max_position_embeddings=16,
+            quant_config=quant_config,
+            bias=True,
+            bias_o_proj=True,
+        )
+        # Preserve the existing full-TP head counts independently of projection placement.
+        assert module.num_heads == 8 // get_parallel().tp_size
+        names = ("qkv_proj", "o_proj")
     elif model == "mimo":
         from sglang.srt.models.mimo_v2 import MiMoV2Attention
 
