@@ -443,7 +443,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
+        if (
+            seq_lens_cpu_backup is not None
+            and not self._verify_backend_self_adds_seq_lens()
+        ):
             verify_lens_cpu = (
                 layout.verify_lens_cpu
                 if layout.verify_lens_cpu is not None
