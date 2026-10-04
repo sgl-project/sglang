@@ -279,6 +279,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     if not status and not prepared.error.item():
                         mask = pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
                         expected.bitwise_xor_(_bytes(mask))
+                    for destination, source in batch.copies:
+                        destination.copy_(source)
+                    prepared._decode_batch(batch)
                     prepared._apply_batch(batch)
                     torch.testing.assert_close(_bytes(target), expected)
                     self.assertEqual(target.data_ptr(), pointer)
@@ -742,7 +745,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.timings["host_payload_cache_created"], 1)
                 self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 4)
                 self.assertEqual(prepared.timings["host_outer_zstd_frames"], 4)
-                self.assertEqual(prepared.encoded.numel(), 30)
+                self.assertEqual(prepared.encoded.numel(), 64)
+                self.assertEqual(prepared.timings["encoded_slot_bytes"], 32)
+                self.assertEqual(prepared.timings["encoded_buffers"], 2)
                 self.assertEqual(prepared.decoded.numel(), 28)
                 self.assertEqual(prepared.h2d_bytes, 50)
                 self.assertEqual(prepared.timings["compressed_batches"], 3)
@@ -756,6 +761,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             source.untyped_storage().data_ptr(),
                             backend.host_arena.tensor.untyped_storage().data_ptr(),
                         )
+                    for destination, source in batch.copies:
+                        destination.copy_(source)
+                    prepared._decode_batch(batch)
                     prepared._apply_batch(batch)
                     self.assertEqual(prepared.encoded.data_ptr(), pointer)
                 for target in targets:
@@ -841,6 +849,19 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             backend.describe()
             backend.describe()
             read_inventory.assert_called_once()
+
+        drains = []
+
+        def copy_failure():
+            drains.append("copy")
+            raise RuntimeError("copy stream failed")
+
+        prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
+        prepared.copy_stream = SimpleNamespace(synchronize=copy_failure)
+        prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
+        with self.assertRaisesRegex(RuntimeError, "copy stream failed"):
+            prepared.close()
+        self.assertEqual(drains, ["copy", "compute"])
 
     def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
         root = torch.nn.Module()

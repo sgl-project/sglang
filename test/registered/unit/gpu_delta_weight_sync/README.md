@@ -81,13 +81,19 @@ there is no intra-layer streaming. Preparation coalesces adjacent rank-owned
 ranges of the shared pinned Snappy arena into bulk transfers, without copying
 foreign experts or making a second per-rank host arena. GPU scratch fits the
 largest batch, and one nvCOMP call decodes all retained frames in that batch.
+Two encoded slots let a copy stream prefetch the next batch while the apply
+stream decodes and updates the current batch. Decoded scratch and decoder
+workspace remain single-buffered.
 
 Layer membership, layout groups and destination geometry are reusable. Fresh
 compressed lengths, frame lists and arena offsets are prepared for each update.
 Compatible byte layouts use batched in-place XOR; irregular padded scales retain
 their explicit transform. Decoder metadata and apply pointers upload before
-pause. Transfers, decode and apply remain ordered on the session's stream, with
-the existing reader/completion fences and device-side decoder failure gate.
+pause. Bulk H2D starts only during paused apply. Ready/free events protect each
+encoded slot; decoded scratch, status checks and updates remain ordered on the
+apply stream. Completion joins the final copy, and cancellation drains both
+streams before releasing shared host views. The existing reader fence and
+device-side decoder failure gate remain in place.
 
 There is no separate global quiesce or commit round. A participant may apply
 before another fails to pause; failed or uncertain activation never authorizes
@@ -214,6 +220,9 @@ matrix/raw payload byte counts.
 decodes, bulk copies and uniform-layout XOR launches. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.
+With debug timing enabled, `paused_layer_h2d` measures copy-stream work and
+`paused_copy_wait` measures the apply stream waiting for ready data; these overlap
+with decode/apply and must not be added together.
 
 `host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
 creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,

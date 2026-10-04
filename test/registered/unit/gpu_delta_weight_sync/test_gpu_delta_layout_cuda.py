@@ -75,12 +75,14 @@ def _apply_prepared_masks(bindings, masks):
     # An earlier decode error suppresses all mappings, including transformed
     # padded scales. Reset only in this oracle, then exercise the successful XOR.
     prepared.error.fill_(1)
+    prepared._decode_batch(batch)
     prepared._apply_batch(batch)
     for value, before in saved:
         torch.testing.assert_close(
             value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
         )
     prepared.error.zero_()
+    prepared._decode_batch(batch)
     prepared._apply_batch(batch)
 
 

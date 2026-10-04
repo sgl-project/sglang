@@ -795,9 +795,7 @@ def _plan_layers(backend, bindings, entries):
 
 def _plan_batch(outputs, entries, records):
     """Map adjacent registered host spans and canonical outputs for one layer."""
-    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame
-
-    frames, spans = [], []
+    ranges, spans = [], []
     encoded_size = 0
     for binding, decoded_offset, _ in outputs:
         entry, record = entries[binding.name], records[binding.name]
@@ -810,16 +808,8 @@ def _plan_batch(outputs, entries, records):
             encoded_offset = (encoded_size + 15) // 16 * 16
             spans.append((source, encoded_offset, size))
         encoded_size = encoded_offset + size
-        frames.extend(
-            DecodeFrame(
-                encoded_offset + frame["encoded_offset"],
-                frame["encoded_bytes"],
-                decoded_offset + frame["decoded_offset"],
-                frame["decoded_bytes"],
-            )
-            for frame in entry["frames"]
-        )
-    return frames, spans, encoded_size
+        ranges.append((entry["frames"], encoded_offset, decoded_offset))
+    return ranges, spans, encoded_size
 
 
 def _canonical_views(views):
@@ -915,6 +905,7 @@ def _qualify_canonical_plan(backend, manifest):
 class PreparedDelta:
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
         self.stream = None
+        self.copy_stream = None
         self.host_snapshot = None
         self.batches = []
         self.raw_copies = {}
@@ -925,7 +916,7 @@ class PreparedDelta:
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
         self.events = {}
         self.timings = {}
-        from sglang.srt.weight_sync.gpu_delta_codec import NvcompDecoder
+        from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
         from sglang.srt.weight_sync.gpu_delta_payload import validate_codec
 
         self.backend = backend
@@ -999,8 +990,27 @@ class PreparedDelta:
             _plan_batch(outputs, entries, self.host_snapshot.index["tensors"])
             for outputs, _, _, _ in static_plans
         ]
-        frames = [plan[0] for plan in plans]
         max_encoded = max((plan[2] for plan in plans), default=0)
+        self.encoded_slot_bytes = (max_encoded + 15) // 16 * 16
+        frames = [
+            [
+                DecodeFrame(
+                    (index % 2) * self.encoded_slot_bytes
+                    + encoded_offset
+                    + frame["encoded_offset"],
+                    frame["encoded_bytes"],
+                    decoded_offset + frame["decoded_offset"],
+                    frame["decoded_bytes"],
+                )
+                for ranges, encoded_offset, decoded_offset in plan[0]
+                for frame in ranges
+            ]
+            for index, plan in enumerate(plans)
+        ]
+        if plans:
+            self.copy_stream = torch.cuda.Stream(device=self.device)
+            self.copy_ready = [torch.cuda.Event(), torch.cuda.Event()]
+            self.copy_free = [torch.cuda.Event(), torch.cuda.Event()]
         max_decoded = max((plan[1] for plan in static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
         # Rank-local tensor metadata; host-shared decompression is measured above.
@@ -1053,7 +1063,7 @@ class PreparedDelta:
                 targets.append(target)
                 sources.append(source)
             self.encoded = torch.empty(
-                max_encoded,
+                2 * self.encoded_slot_bytes,
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -1084,9 +1094,12 @@ class PreparedDelta:
                 self.device, non_blocking=True
             )
             position = 0
-            for (_, spans, _), (_, decoded_size, groups, transformed), decode in zip(
-                plans, static_plans, decoders
-            ):
+            for index, (
+                (_, spans, _),
+                (_, decoded_size, groups, transformed),
+                decode,
+            ) in enumerate(zip(plans, static_plans, decoders)):
+                slot_offset = (index % 2) * self.encoded_slot_bytes
                 prepared_groups = []
                 for group in groups:
                     count = 2 * len(group.sources)
@@ -1098,7 +1111,9 @@ class PreparedDelta:
                     _PreparedBatch(
                         [
                             (
-                                self.encoded[target : target + size],
+                                self.encoded[
+                                    slot_offset + target : slot_offset + target + size
+                                ],
                                 host[source : source + size],
                             )
                             for source, target, size in spans
@@ -1140,7 +1155,9 @@ class PreparedDelta:
             compressed_batches=len(plans),
             compressed_tensors=self.matrix_tensor_count,
             compressed_h2d_spans=sum(len(batch.copies) for batch in self.batches),
-            encoded_scratch_bytes=max_encoded,
+            encoded_scratch_bytes=self.encoded.numel(),
+            encoded_slot_bytes=self.encoded_slot_bytes,
+            encoded_buffers=2 if plans else 0,
             decoded_scratch_bytes=max_decoded,
             decoder_workspace_bytes=(
                 self.workspace.temporary.numel() if self.workspace else 0
@@ -1158,7 +1175,7 @@ class PreparedDelta:
         )
 
     @contextmanager
-    def _phase(self, name):
+    def _phase(self, name, stream=None):
         if not self.timing_enabled:
             yield
             return
@@ -1166,9 +1183,10 @@ class PreparedDelta:
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
-        start.record(self.stream)
+        stream = self.stream if stream is None else stream
+        start.record(stream)
         yield
-        end.record(self.stream)
+        end.record(stream)
         self.events.setdefault(name, []).append((start, end))
 
     def apply(self):
@@ -1193,7 +1211,17 @@ class PreparedDelta:
                         torch._foreach_copy_(targets, sources)
                 self.timings["host_raw_enqueue_s"] = time.perf_counter() - raw_started
                 matrices_started = time.perf_counter()
-                for batch in self.batches:
+                if self.batches:
+                    self._copy_batch(self.batches[0], 0)
+                for index, batch in enumerate(self.batches):
+                    with self._phase("paused_copy_wait"):
+                        self.stream.wait_event(self.copy_ready[index % 2])
+                    self._decode_batch(batch)
+                    self.copy_free[index % 2].record(self.stream)
+                    # No new prefetch follows a synchronous decoder launch error.
+                    # Device status errors keep the existing sticky apply gate.
+                    if index + 1 < len(self.batches):
+                        self._copy_batch(self.batches[index + 1], index + 1)
                     self._apply_batch(batch)
                 self.timings["host_matrix_enqueue_s"] = (
                     time.perf_counter() - matrices_started
@@ -1247,10 +1275,16 @@ class PreparedDelta:
             "h2d_bytes": self.h2d_bytes,
         }
 
-    def _apply_batch(self, batch):
-        with self._phase("paused_layer_h2d"):
-            for destination, source in batch.copies:
-                destination.copy_(source, non_blocking=True)
+    def _copy_batch(self, batch, index):
+        with torch.cuda.stream(self.copy_stream):
+            if index >= 2:
+                self.copy_stream.wait_event(self.copy_free[index % 2])
+            with self._phase("paused_layer_h2d", self.copy_stream):
+                for destination, source in batch.copies:
+                    destination.copy_(source, non_blocking=True)
+            self.copy_ready[index % 2].record(self.copy_stream)
+
+    def _decode_batch(self, batch):
         with self._phase("decode"):
             # Raw targets have a separate prepared arena and foreach-copy
             # pass. Every tensor here is XOR; absent frames are zero deltas.
@@ -1260,6 +1294,8 @@ class PreparedDelta:
                 batch.decoder.actual_sizes != batch.decoder.expected_sizes
             ).any()
             self.error.bitwise_or_(invalid.to(torch.int32))
+
+    def _apply_batch(self, batch):
         # No gather of current weights, canonical reconstruction or weight hash.
         with self._phase("layout_apply"):
             for group, pointers in batch.groups:
@@ -1277,10 +1313,15 @@ class PreparedDelta:
 
     def close(self):
         # Cancellation may race a background upload, but never frees storage
-        # while the decoder or CUDA is using it. Only this object's stream is
-        # drained; no device-wide synchronization is performed here.
-        if self.stream is not None:
-            self.stream.synchronize()
+        # while either stream is using it. A failed decode can leave its already
+        # queued copy in flight; attempt both drains before releasing any views.
+        # No device-wide synchronization is performed here.
+        try:
+            if self.copy_stream is not None:
+                self.copy_stream.synchronize()
+        finally:
+            if self.stream is not None:
+                self.stream.synchronize()
         self.batches.clear()
         self.raw_copies.clear()
         self.apply_metadata = self.apply_host_metadata = None
