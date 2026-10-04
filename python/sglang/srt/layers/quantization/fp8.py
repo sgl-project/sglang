@@ -2425,27 +2425,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
-            if (
-                envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT.get()
-                and self._owns_moe_runner
-                and not self.use_mxfp8
-                and not self.is_fp4_expert
-                and self.quant_config.weight_block_size == [128, 128]
-                and (
-                    get_moe_runner_backend().is_flashinfer_trtllm()
-                    or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-                )
-            ):
-                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                    prepare_fp8_moe_block_layout,
-                )
-
-                offload = get_exec().offload
-                prepare_fp8_moe_block_layout(
-                    layer,
-                    cache_views=offload.cpu_offload_gb == 0
-                    and offload.offload_group_size == 0,
-                )
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -2579,6 +2558,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
+            if (
+                envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT.get()
+                and self.weight_block_size == [128, 128]
+                and layer.w13_weight.dtype == torch.float8_e4m3fn
+            ):
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    prepare_fp8_moe_block_layout,
+                )
+
+                offload = get_exec().offload
+                prepare_fp8_moe_block_layout(
+                    layer,
+                    cache_views=offload.cpu_offload_gb == 0
+                    and offload.offload_group_size == 0,
+                )
 
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)

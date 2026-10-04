@@ -223,14 +223,13 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
+        use_pdl = is_arch_support_pdl()
         BT = 32
-        if (T, D) == (64, 128) and x.dtype == torch.bfloat16 and is_arch_support_pdl():
+        if use_pdl and (T, D, x.dtype) == (64, 128, torch.bfloat16):
             arch = get_jit_cuda_arch()
             if (arch.major, arch.minor) == (10, 3):
                 BT = 8
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,

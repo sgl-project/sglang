@@ -330,6 +330,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Update hidden state: h += k[:, None] * v[None, :]
         if ROUND_STATE_PRODUCT:
+            # Round the FP32 product and addition separately, without FMA contraction.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
                 constraints="=f,f,f",
@@ -440,16 +441,13 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BV, num_warps = _select_recurrent_launch_config(N, H, HV, K, V, is_kda)
+    use_pdl = is_arch_support_pdl()
     round_state_product = False
     if (
         is_kda
         and disable_state_update
-        and intermediate_states_buffer is not None
-        and retrieve_parent_token is None
-        and not cache_ring
         and (N, H, HV, K, V, cache_steps) == (1, 8, 8, 128, 128, 8)
-        and q.device.type == "cuda"
-        and is_arch_support_pdl()
+        and use_pdl
     ):
         arch = get_jit_cuda_arch()
         if (arch.major, arch.minor) == (10, 3):
@@ -515,7 +513,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
     # already launches dependents. Bit-exact (scheduling only) — benefits both
     # KDA and GDN recurrent paths.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,

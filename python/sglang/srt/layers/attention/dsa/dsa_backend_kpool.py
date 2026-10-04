@@ -102,16 +102,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
             )
 
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            metadata = init_pooled_paged_mqa_metadata(
-                metadata,
-                metadata.cache_seqlens_int32,
-                forward_mode,
-                pool_size=self.dsa_index_kpool,
-                real_page_size=self.real_page_size,
-                slots_per_page=slots_per_page,
-                build_schedule_metadata=build_schedule_metadata,
-            )
+        metadata = init_pooled_paged_mqa_metadata(
+            metadata,
+            metadata.cache_seqlens_int32,
+            forward_mode,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
+            build_schedule_metadata=build_schedule_metadata,
+        )
 
         if forward_mode.is_decode_or_idle():
             return init_kpool_write_plan(
@@ -172,16 +171,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            metadata = init_pooled_paged_mqa_metadata(
-                metadata,
-                metadata.cache_seqlens_int32,
-                forward_mode,
-                pool_size=self.dsa_index_kpool,
-                real_page_size=self.real_page_size,
-                slots_per_page=slots_per_page,
-                build_schedule_metadata=build_schedule_metadata,
-            )
+        metadata = init_pooled_paged_mqa_metadata(
+            metadata,
+            metadata.cache_seqlens_int32,
+            forward_mode,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
+            build_schedule_metadata=build_schedule_metadata,
+        )
 
         if (
             forward_mode.is_decode_or_idle()
@@ -220,16 +218,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            update_pooled_paged_mqa_metadata(
-                metadata,
-                metadata.cache_seqlens_int32,
-                forward_mode,
-                pool_size=self.dsa_index_kpool,
-                real_page_size=self.real_page_size,
-                slots_per_page=slots_per_page,
-                build_schedule_metadata=build_schedule_metadata,
-            )
+        update_pooled_paged_mqa_metadata(
+            metadata,
+            metadata.cache_seqlens_int32,
+            forward_mode,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
+            build_schedule_metadata=build_schedule_metadata,
+        )
 
         if not (
             forward_mode.is_decode_or_idle()
@@ -272,16 +269,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            update_pooled_paged_mqa_metadata(
-                metadata,
-                precomputed.cache_seqlens,
-                forward_mode,
-                pool_size=self.dsa_index_kpool,
-                real_page_size=self.real_page_size,
-                slots_per_page=slots_per_page,
-                build_schedule_metadata=build_schedule_metadata,
-            )
+        update_pooled_paged_mqa_metadata(
+            metadata,
+            precomputed.cache_seqlens,
+            forward_mode,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
+            build_schedule_metadata=build_schedule_metadata,
+        )
 
         if not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()):
             return
