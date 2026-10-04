@@ -2706,13 +2706,16 @@ class DeepseekV4AttnBackend(
                 else None
             )
 
+    def clear_forward_metadata_for_idle(self) -> None:
+        self.online_c128_mtp.clear()
+        self.forward_metadata = None
+        self.tail_forward_metadata = None
+        self.encoder_replay = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if logical_forward_mode.is_idle():
-            self.online_c128_mtp.clear()
-            self.forward_metadata = None
-            self.tail_forward_metadata = None
-            self.encoder_replay = False
+            self.clear_forward_metadata_for_idle()
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)

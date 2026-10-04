@@ -756,7 +756,12 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+    def forward_batch_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+    ):
         # Decode resets the consumer between slices; restore load-back fences.
         self.set_hicache_consumer(batch.hicache_consumer_index)
 
@@ -764,6 +769,7 @@ class TpModelWorker(BaseTpWorker):
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
             batch.split_forward_batch = forward_batch

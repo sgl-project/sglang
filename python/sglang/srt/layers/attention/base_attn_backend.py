@@ -101,6 +101,11 @@ class AttentionBackend(ABC):
         """Return token-major K/V buffers and physical slots for a fused writer."""
         return None
 
+
+    def clear_forward_metadata_for_idle(self) -> None:
+        """Discard eager state without planning an unsupported zero-token batch."""
+        self.forward_metadata = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

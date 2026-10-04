@@ -5,7 +5,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -77,6 +82,8 @@ class _Tail:
     def __init__(self):
         self.token_indices = torch.tensor([1, 3])
         self.positions = torch.tensor([1, 3])
+        self.extend_seq_lens = torch.tensor([2], dtype=torch.int32)
+        self.extend_seq_lens_cpu = [2]
 
     def rows(self, tensor):
         return None if tensor is None else tensor[self.token_indices]
@@ -105,7 +112,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             patch(
                 "sglang.kernels.ops.layernorm.mhc.hc_combine",
                 side_effect=lambda x, pre, *_: (
-                    x.reshape(x.shape[0], 2, -1).sum(dim=1) + pre
+                    x.reshape(x.shape[0], 2, x.shape[1] // 2).sum(dim=1) + pre
                 ),
             )
         )
@@ -351,6 +358,185 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             (2, 2),
         )
         torch.testing.assert_close(ids, torch.tensor([1, 2**30]))
+
+    def wrapper(self, body, *, capture_aux=False):
+        body.forward_split_prefill = MethodType(
+            DeepseekV4Model.forward_split_prefill, body
+        )
+
+        def logits(ids, hidden, head, metadata, aux, *, hidden_states_before_norm):
+            # Use the real FULL hidden-selection behavior consumed by NextN
+            # and DSpark, while keeping LM-head kernels out of the CPU test.
+            captured = LogitsProcessor._get_hidden_states_to_store(
+                None,
+                hidden,
+                hidden_states_before_norm,
+                aux,
+                hidden,
+                hidden_states_before_norm,
+                aux,
+                None,
+                metadata,
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=hidden, hidden_states=captured
+            )
+
+        return SimpleNamespace(
+            vision=None,
+            model=body,
+            capture_aux_hidden_states=capture_aux,
+            logits_processor=Mock(side_effect=logits),
+            lm_head=object(),
+        )
+
+    def wrapper_split(self, wrapper, batch, interval):
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_attn_tp_context",
+            return_value=SimpleNamespace(maybe_input_scattered=lambda _: nullcontext()),
+        ):
+            return DeepseekV4ForCausalLM.forward_split_prefill(
+                wrapper, batch.input_ids, batch.positions, batch, interval
+            )
+
+    def test_mtp_full_capture_preserves_flattened_pre_mhc_for_nextn(self):
+        model = self.model(predecessor=True)
+        model.embed_tokens = lambda ids: torch.stack(
+            (ids.float(), ids.float() + 10, ids.float() + 20), dim=1
+        )
+        wrapper = self.wrapper(model)
+        batch = self.batch()
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.assertIsNone(self.wrapper_split(wrapper, batch, (0, 2)))
+        wrapper.logits_processor.assert_not_called()
+        output = self.wrapper_split(wrapper, batch, (2, 4))
+        self.assertEqual(output.hidden_states.shape, (4, 6))
+        ordinary = self.model(predecessor=True)
+        ordinary.embed_tokens = model.embed_tokens
+        expected = self.normal(ordinary, self.batch())[1]
+        torch.testing.assert_close(output.hidden_states, expected)
+        torch.testing.assert_close(
+            output.hidden_states.view(4 * model.hc_mult, 3),
+            expected.view(4 * model.hc_mult, 3),
+        )
+        wrapper.logits_processor.assert_called_once()
+
+    def test_mtp_idle_final_slice_publishes_empty_flattened_hidden(self):
+        model = self.model(predecessor=True)
+        wrapper = self.wrapper(model)
+        batch = self.batch(0)
+        batch.forward_mode = ForwardMode.IDLE
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.assertIsNone(self.wrapper_split(wrapper, batch, (0, 1)))
+        output = self.wrapper_split(wrapper, batch, (1, 4))
+        self.assertEqual(output.hidden_states.shape, (0, model.hc_mult))
+        wrapper.logits_processor.assert_called_once()
+
+    def test_dspark_capture_across_slices_matches_ordinary_forward(self):
+        for predecessor in (False, True):
+            with self.subTest(predecessor=predecessor):
+                model = self.model(predecessor=predecessor)
+                model.dspark_layers_to_capture = [0, 2]
+                batch = self.batch()
+                self.assertIsNone(self.split(model, batch, (0, 1)))
+                aux = batch.model_specific_states["dspark_aux_hidden_states"]
+                self.assertEqual(len(aux), 1)
+                first_capture = aux[0].clone()
+                result, captures = self.split(model, batch, (1, 4))
+                self.assertIs(captures, aux)
+                self.assertEqual(len(captures), 2)
+                torch.testing.assert_close(captures[0], first_capture)
+                ordinary = self.model(predecessor=predecessor)
+                ordinary.dspark_layers_to_capture = model.dspark_layers_to_capture
+                expected, expected_captures = self.normal(ordinary, self.batch())
+                self.assert_results_equal(result, expected)
+                for actual, expected in zip(captures, expected_captures):
+                    torch.testing.assert_close(actual, expected)
+
+    def test_dspark_aux_storage_is_independent_for_interleaved_prefill(self):
+        model = self.model(predecessor=True)
+        model.dspark_layers_to_capture = [0, 2]
+        a, b = self.batch(), self.batch(offset=20)
+        self.assertIsNone(self.split(model, a, (0, 1)))
+        a_aux = a.model_specific_states["dspark_aux_hidden_states"]
+        self.assertIsNone(self.split(model, b, (0, 3)))
+        b_aux = b.model_specific_states["dspark_aux_hidden_states"]
+        self.assertIsNot(a_aux, b_aux)
+        self.assertEqual(len(a_aux), 1)
+        self.assertEqual(len(b_aux), 2)
+        _, final_a = self.split(model, a, (1, 4))
+        _, final_b = self.split(model, b, (3, 4))
+        ordinary = self.model(predecessor=True)
+        ordinary.dspark_layers_to_capture = model.dspark_layers_to_capture
+        for result, batch in (
+            (final_a, self.batch()),
+            (final_b, self.batch(offset=20)),
+        ):
+            _, expected = self.normal(ordinary, batch)
+            for actual, expected in zip(result, expected):
+                torch.testing.assert_close(actual, expected)
+
+    def test_dspark_wrapper_captures_aux_instead_of_pre_mhc(self):
+        body = self.model(predecessor=True)
+        body.dspark_layers_to_capture = [0, 2]
+        wrapper = self.wrapper(body, capture_aux=True)
+        batch = self.batch()
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.assertIsNone(self.wrapper_split(wrapper, batch, (0, 1)))
+        output = self.wrapper_split(wrapper, batch, (1, 4))
+        aux = batch.model_specific_states["dspark_aux_hidden_states"]
+        torch.testing.assert_close(output.hidden_states, torch.cat(aux, dim=-1))
+        self.assertIsNone(
+            wrapper.logits_processor.call_args.kwargs["hidden_states_before_norm"]
+        )
+
+    def test_dspark_tail_final_logits_use_batch_owned_rows_and_indices(self):
+        tail = _Tail()
+        self.backend.tail_forward_metadata = SimpleNamespace(late_layer_tail=tail)
+        self.backend.enter_late_layer_tail = Mock(return_value=object())
+        self.backend.exit_late_layer_tail = Mock()
+        body = self.model(predecessor=True)
+        body.late_layer_start = 2
+        body.dspark_layers_to_capture = [0, 3]
+        wrapper = self.wrapper(body, capture_aux=True)
+        batch = self.batch()
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.extend_seq_lens = torch.tensor([4], dtype=torch.int32)
+        batch.extend_seq_lens_cpu = [4]
+        batch.extend_logprob_start_lens_cpu = [4]
+        full_ids = batch.input_ids.clone()
+        self.assertIsNone(self.wrapper_split(wrapper, batch, (0, 1)))
+        self.assertIsNone(self.wrapper_split(wrapper, batch, (1, 3)))
+        wrapper.logits_processor.assert_not_called()
+        # A later forward may refresh backend scratch. Finalization must use
+        # the tail associated with these persisted target captures.
+        self.backend.tail_forward_metadata = SimpleNamespace(late_layer_tail=object())
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            extend_seq_lens=batch.extend_seq_lens,
+            extend_seq_lens_cpu=batch.extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=batch.extend_logprob_start_lens_cpu,
+        )
+        with patch(
+            "sglang.srt.models.deepseek_v4.LogitsMetadata.from_forward_batch",
+            return_value=metadata,
+        ):
+            output = self.wrapper_split(wrapper, batch, (3, 4))
+        call = wrapper.logits_processor.call_args
+        torch.testing.assert_close(call.args[0], tail.rows(full_ids))
+        self.assertIs(call.args[3], metadata)
+        self.assertIs(metadata.extend_seq_lens, tail.extend_seq_lens)
+        self.assertEqual(metadata.extend_seq_lens_cpu, [2])
+        self.assertEqual(metadata.extend_logprob_start_lens_cpu, [2])
+        self.assertEqual(batch.extend_seq_lens_cpu, [4])
+        self.assertIs(output.hidden_states_token_indices, tail.token_indices)
+        self.assertEqual(output.hidden_states.shape, (2, 2))
+        torch.testing.assert_close(
+            output.hidden_states, torch.cat(call.args[4], dim=-1)
+        )
+        self.backend.exit_late_layer_tail.assert_called_once()
+        self.assertTrue(DeepseekV4ForCausalLM.supports_pdmux_dspark_prefill)
 
 
 if __name__ == "__main__":

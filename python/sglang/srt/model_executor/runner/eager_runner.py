@@ -47,8 +47,10 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
+    get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
+    has_forward_context,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
@@ -233,10 +235,20 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if self.enable_pdmux:
-            return model_runner.decode_attn_backend, forward_context(
-                ForwardContext(attn_backend=model_runner.decode_attn_backend)
+        if (
+            self.enable_pdmux
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_eagle()
+        ):
+            backend = (
+                get_attn_backend()
+                if has_forward_context()
+                else model_runner.attn_backend
             )
+            return backend, contextlib.nullcontext()
+        if self.enable_pdmux:
+            backend = model_runner.get_decode_attn_backend()
+            return backend, forward_context(ForwardContext(attn_backend=backend))
         return model_runner.attn_backend, contextlib.nullcontext()
 
     def _execute_decode(
@@ -279,6 +291,13 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+        if forward_batch.forward_mode.is_target_verify():
+            attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
+        else:
+            attn_backend, pdmux_ctx = (
+                model_runner.attn_backend,
+                contextlib.nullcontext(),
+            )
 
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -325,9 +344,9 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
             shared_read_ends = (
-                model_runner.attn_backend.resolve_prefill_shared_read_ends(
+                attn_backend.resolve_prefill_shared_read_ends(
                     forward_batch,
                     num_qo_tokens=len(forward_batch.input_ids),
                 )
@@ -348,6 +367,7 @@ class EagerRunner(BaseRunner):
         )
         with (
             device_timer_ctx(model_runner.device_timer, category),
+            pdmux_ctx,
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
             if cp_active and (
@@ -446,18 +466,20 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
+        attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
         else:
-            model_runner.attn_backend.forward_metadata = None
+            attn_backend.clear_forward_metadata_for_idle()
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         with (
             device_timer_ctx(model_runner.device_timer, "idle"),
+            pdmux_ctx,
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
             return model_runner.model.forward(
