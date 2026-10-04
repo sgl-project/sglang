@@ -170,6 +170,19 @@ class RotaryEmbedding(BaseFusedOp):
                     query.device, dtype=query.dtype
                 )
 
+    def _cos_sin_cache_as(self, dtype: torch.dtype) -> torch.Tensor:
+        # sgl_kernel.rotary_embedding reads the cache as the query dtype, while HIP
+        # keeps the buffer fp32 for the QSA indexer. Cast once and reuse the copy
+        # until the buffer is replaced (moved or extended).
+        cache = self.cos_sin_cache
+        if cache.dtype == dtype:
+            return cache
+        cast = getattr(self, "_cos_sin_cache_cast", None)
+        if cast is None or cast[0] is not cache or cast[1].dtype != dtype:
+            cast = (cache, cache.to(dtype=dtype))
+            self._cos_sin_cache_cast = cast
+        return cast[1]
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
@@ -447,17 +460,20 @@ class RotaryEmbedding(BaseFusedOp):
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
                 if _is_hip:
-                    self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    if self.cos_sin_cache.device != query.device:
+                        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = self._cos_sin_cache_as(query.dtype)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key
