@@ -58,6 +58,10 @@ def _jit_topk_v2_module():
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
         wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
+    else:
+        wrappers.append(
+            ("topk_transform_ragged_amax8", f"{kernel}::transform_ragged_amax8")
+        )
     return load_jit(
         make_name("topk_v2"),
         *args,
@@ -217,6 +221,25 @@ def topk_transform_ragged_v2(
         return
     module = _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+def topk_transform_ragged_amax8(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+    out_block_keys: torch.Tensor,
+) -> None:
+    """Select row-local top-k and emit 8-position block maxima from FP32 scores.
+
+    Selected positions include ``out_offsets`` and are -1 padded. Each row's
+    last visible block key is +inf; keys beyond its block count are untouched.
+    Score rows start at column zero and have a stride divisible by eight.
+    """
+    _jit_topk_v2_module().topk_transform_ragged_amax8(
+        scores, seq_lens, out_offsets, out_indices, out_block_keys
+    )
 
 
 def topk_transform_paged_v2(
