@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -21,7 +23,10 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
+    init_unified_swa_pools,
 )
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 
 BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 
@@ -174,6 +179,30 @@ def _build_tri(device, page_size=4):
     return buf, kvcache.swa_kv_pool, allocator
 
 
+def _build_swa_poisoned(device, page_size=4):
+    """A full + SWA unified pool built under SGLANG_DEBUG_POISON_POOL."""
+    with envs.SGLANG_DEBUG_POISON_POOL.override(True):
+        return init_unified_swa_pools(
+            device=device,
+            kv_cache_dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=2,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=page_size,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            enable_memory_saver=False,
+            need_sort=False,
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required (fused alloc kernel)")
 class TestUnifiedHandoutZeroing(unittest.TestCase):
     """Root-cause guard: pages must leave the allocator ZEROED.
@@ -262,6 +291,42 @@ class TestTriPoolSWAHandoutZeroing(unittest.TestCase):
             pages = (sa.translate_kv_loc(out) // sa.page_size).unique()
             self.assertTrue((env[pages] == 0).all().item())
             allocator.free(out)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (fused alloc kernel)")
+class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
+    """SGLANG_DEBUG_POISON_POOL marks never-written bytes. The slot-0 sink is
+    not one: a freed window page's read-table entry resolves to it, kernels that
+    load whole tiles read its rows (at zero weight), and in serving it holds
+    zeros. So the poison must leave it zero, or every window model fails it."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
+    def test_freed_window_page_reads_zeros(self):
+        ps = 4
+        bundle = _build_swa_poisoned("cuda", page_size=ps)
+        alloc = bundle.token_to_kv_pool_allocator
+        ids = alloc.alloc(4 * ps)
+        self.assertIsNotNone(ids)
+        # The window moved past the request's first two pages.
+        alloc.free_swa_segment(ids[: 2 * ps], start_pos=0)
+
+        dev = ids.device
+        table = torch.full((1, 4), -1, dtype=torch.int32, device=dev)
+        build_kv_read_table(
+            req_to_token=ids.to(torch.int32).view(1, -1),
+            req_pool_indices=torch.tensor([0], device=dev),
+            seq_lens=torch.tensor([4 * ps], device=dev),
+            v2p=alloc.swa_attn_allocator.virtual_to_physical,
+            page_size=ps,
+            max_pages=4,
+            out=table,
+        )
+        self.assertEqual(table[0, :2].tolist(), [0, 0])  # freed: the sink
+        v = bundle.token_to_kv_pool.swa_kv_pool.v_buffer[0]
+        self.assertFalse(torch.isnan(v[:ps].float()).any().item())
 
 
 if __name__ == "__main__":  # pragma: no cover
