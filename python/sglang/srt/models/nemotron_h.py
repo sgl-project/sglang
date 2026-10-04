@@ -38,6 +38,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -108,6 +109,8 @@ class NemotronHMLP(nn.Module):
         tp_rank: int | None = None,
         tp_size: int | None = None,
         prefix: str = "",
+        *,
+        parallel_group: LinearParallelGroup | None = None,
     ) -> None:
         super().__init__()
 
@@ -118,6 +121,7 @@ class NemotronHMLP(nn.Module):
             quant_config=quant_config,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            parallel_group=parallel_group,
             prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -128,6 +132,8 @@ class NemotronHMLP(nn.Module):
             reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            parallel_group=parallel_group,
+            allocation_group="tp" if parallel_group == "replicated" else None,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -232,7 +238,7 @@ class NemotronHMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 **(
-                    dict(tp_rank=0, tp_size=1)
+                    dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
