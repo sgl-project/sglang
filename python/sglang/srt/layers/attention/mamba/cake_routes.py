@@ -666,7 +666,13 @@ def _cake_selective_state_update(
     supports, cake_ssu = _cake_ssu_kernels()
     dt_bias = kw.get("dt_bias")
     if _ssu_raw_abi_row(
-        state, x, dt, D, dt_bias, kw.get("state_batch_indices"), kw.get("dst_state_batch_indices")
+        state,
+        x,
+        dt,
+        D,
+        dt_bias,
+        kw.get("state_batch_indices"),
+        kw.get("dst_state_batch_indices"),
     ):
         # The headdim-64 decode programs read the engine's BF16 coefficient
         # broadcasts, int32 slot tables and fused-projection views in place.

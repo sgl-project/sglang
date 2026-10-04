@@ -402,7 +402,10 @@ def _coefficient_abi(dt, D, dt_bias, indices, dst_indices, buffer_indices):
     coefficients, int32 tables: the SGLang engine storage) or ``None``."""
     import torch
 
-    for coefficient, index in ((torch.float32, torch.int64), (torch.bfloat16, torch.int32)):
+    for coefficient, index in (
+        (torch.float32, torch.int64),
+        (torch.bfloat16, torch.int32),
+    ):
         if (
             dt.dtype == coefficient
             and D.dtype == coefficient
@@ -441,7 +444,10 @@ def _supports_hd64_decode(
         and _dense_rows(C, batch, ngroups, 128)
         and state.is_contiguous()
         and dt.stride(1) == 1
-        and (z is None or (_dense_rows(z, batch, nheads, 64) and z.stride(0) == x.stride(0)))
+        and (
+            z is None
+            or (_dense_rows(z, batch, nheads, 64) and z.stride(0) == x.stride(0))
+        )
     ):
         return False
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
@@ -451,8 +457,13 @@ def _supports_hd64_decode(
         and (nheads // ngroups) % 2 == 0
         and batch * (nheads // 2) >= _HD64_PAIRED_MIN_BLOCKS_PER_SM * num_sms
     ):
-        return (B.data_ptr() | C.data_ptr()) & 15 == 0 and (B.stride(0) | C.stride(0)) & 7 == 0
-    return state.dtype == torch.float32 or batch * nheads < _HD64_ROWS_MAX_BATCH_HEADS_PER_SM * num_sms
+        return (B.data_ptr() | C.data_ptr()) & 15 == 0 and (
+            B.stride(0) | C.stride(0)
+        ) & 7 == 0
+    return (
+        state.dtype == torch.float32
+        or batch * nheads < _HD64_ROWS_MAX_BATCH_HEADS_PER_SM * num_sms
+    )
 
 
 def _per_head_broadcast(tensor, nheads, trailing: int) -> bool:
@@ -526,7 +537,12 @@ def supports_selective_state_update(
     ):
         return False
     abi = _coefficient_abi(
-        dt, D, dt_bias, state_batch_indices, dst_state_batch_indices, intermediate_state_indices
+        dt,
+        D,
+        dt_bias,
+        state_batch_indices,
+        dst_state_batch_indices,
+        intermediate_state_indices,
     )
     if abi is None:
         return False
@@ -566,8 +582,18 @@ def supports_selective_state_update(
     if x.ndim == 3:
         if (dim, dstate) == (64, 128):
             return _supports_hd64_decode(
-                state, x, dt, B, C, z, state_batch_indices, dst_state_batch_indices,
-                cache_steps=cache_steps, nheads=nheads, ngroups=ngroups, device=device,
+                state,
+                x,
+                dt,
+                B,
+                C,
+                z,
+                state_batch_indices,
+                dst_state_batch_indices,
+                cache_steps=cache_steps,
+                nheads=nheads,
+                ngroups=ngroups,
+                device=device,
             )
         if abi == "raw":
             return False

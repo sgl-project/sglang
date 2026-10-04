@@ -733,7 +733,9 @@ def test_ssu_headdim64_decode_row_passes_the_engine_storage_without_copies(caplo
     assert kw["pad_slot_id"] == -1  # the engine's padding slot value is forwarded
     s_args, s_kw = supports.call_args
     assert s_kw["pad_slot_id"] == -1
-    assert s_args[2] is inputs["dt"] and s_kw["state_batch_indices"].dtype == torch.int32
+    assert (
+        s_args[2] is inputs["dt"] and s_kw["state_batch_indices"].dtype == torch.int32
+    )
     assert torch.all(inputs["kwargs"]["out"] == 2.0)
     assert "[cake-route] mamba_ssu: Cake kernel selected" in caplog.text
 
@@ -759,7 +761,12 @@ def test_ssu_static_row_admits_both_decode_tiles_only():
     assert mamba_mod._ssu_static_row(state, x, False, False) is None
     assert mamba_mod._ssu_static_row(state.float(), x, False, False) is None
     wide = torch.zeros(POOL, H, 128, 128, dtype=torch.bfloat16)
-    assert mamba_mod._ssu_static_row(wide, torch.zeros(2, H, 128, dtype=torch.bfloat16), False, False) is None
+    assert (
+        mamba_mod._ssu_static_row(
+            wide, torch.zeros(2, H, 128, dtype=torch.bfloat16), False, False
+        )
+        is None
+    )
     narrow = torch.zeros(POOL, H, 64, 64, dtype=torch.bfloat16)
     reason = mamba_mod._ssu_static_row(narrow, x, False, False)
     assert reason == "no promoted T=1 row for (dim, dstate)=(64, 64)"
