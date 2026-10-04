@@ -4103,23 +4103,22 @@ fn insert_host_allows_a_suffix_under_an_unbacked_write_back_parent() {
 fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
-    let root = tc.arena.root();
+    let anchor = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
     let nodes_before = tc.arena.len();
     let result = tc
         .insert_host(
-            tc.arena.node(root).id,
+            anchor,
             /* extra_key = */ None,
-            vec![1, 2, 3, 4],
-            Tensor::from_slice(&[100i64, 101, 102, 103]),
-            vec!["h0", "h1", "h2", "h3"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            vec![3, 4],
+            Tensor::from_slice(&[102i64, 103]),
+            vec!["h2", "h3"].into_iter().map(String::from).collect(),
         )
         .expect("live test node");
 
-    assert_eq!(result.prefix_len, 2);
-    assert_eq!(result.total_len, 4);
+    assert_eq!(result.prefix_len, 0);
+    assert_eq!(result.total_len, 2);
     assert_eq!(result.inserted_host_node, None);
     assert!(result.host_insert_dropped);
     assert!(result.cache_actions.is_empty());
@@ -4127,7 +4126,7 @@ fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
 }
 
 #[test]
-fn insert_host_drop_preserves_split_actions_and_lengths() {
+fn insert_host_refill_preserves_split_actions_and_lengths() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let leaf = tc
@@ -4146,10 +4145,10 @@ fn insert_host_drop_preserves_split_actions_and_lengths() {
         )
         .expect("live test node");
 
-    assert_eq!(result.prefix_len, 1);
+    assert_eq!(result.prefix_len, 0);
     assert_eq!(result.total_len, 2);
-    assert_eq!(result.inserted_host_node, None);
-    assert!(result.host_insert_dropped);
+    assert!(result.inserted_host_node.is_some());
+    assert!(!result.host_insert_dropped);
     assert!(matches!(
         result.cache_actions.as_slice(),
         [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
@@ -4252,7 +4251,7 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     let root = tc.arena.root();
-    // The device-only match reports no host node.
+    // The device-only match consumes the supplied host slots.
     let result = tc
         .insert_host(
             tc.arena.node(root).id,
@@ -4262,14 +4261,15 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
             vec!["h0".to_string(), "h1".to_string()],
         )
         .expect("live test node");
-    assert_eq!(result.prefix_len, 2);
-    assert_eq!(result.inserted_host_node, None);
+    assert_eq!(result.prefix_len, 0);
+    assert_eq!(result.inserted_host_node, Some(leaf));
     assert!(!result.host_insert_dropped);
-    // Once backuped, the same insert reports the node.
-    tc.arena.set_host_value(
-        tc.arena.resolve(leaf).expect("live test node"),
-        FULL,
-        Tensor::from_slice(&[20i64, 21]),
+    // The refill owns these rows; a repeat reports only the duplicate prefix.
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .host_value(FULL)
+            .equal(&Tensor::from_slice(&[100i64, 101]))
     );
     let result = tc
         .insert_host(
