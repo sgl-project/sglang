@@ -432,7 +432,7 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
 }
 
 #[test]
-fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
+fn host_reclaim_uses_node_ids_across_reversed_acks_and_rebackup() {
     let mut tc = write_back_core();
     let mut handles = Vec::new();
     for token in 1..=3i64 {
@@ -442,11 +442,13 @@ fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
         tc.commit_backup(handle, Tensor::from_slice(&[token + 1000]), HashMap::new())
             .expect("live test node");
         tc.mark_write_through_pending(vec![handle], handle).unwrap();
-        tc.finish_write_through(vec![handle], handle).unwrap();
         handles.push(handle);
     }
+    for &handle in handles.iter().rev() {
+        tc.finish_write_through(vec![handle], handle).unwrap();
+    }
 
-    for expected_host_slot in [1001, 1002, 1003, 2001] {
+    for expected_host_slot in [1001, 2001, 1002, 1003] {
         let step = tc.drive_host_eviction(FULL, 1);
         assert_eq!(step.tracker[&FULL], 1);
         assert!(step.device_frees.is_empty());
@@ -456,8 +458,7 @@ fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
             expected_host_slot
         );
         if expected_host_slot == 1001 {
-            // A new host copy of the reclaimed slot joins behind the surviving
-            // duplicates. Refreshing another settled member must not move it.
+            // Rebackup changes membership order, but not the node's identity.
             tc.commit_backup(handles[0], Tensor::from_slice(&[2001i64]), HashMap::new())
                 .unwrap();
             tc.mark_write_through_pending(vec![handles[0]], handles[0])
@@ -475,7 +476,7 @@ fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
 }
 
 #[test]
-fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
+fn host_reclaim_orders_pending_internal_split_fragments_by_node_id() {
     let mut tc = write_back_core();
     insert(&mut tc, &vec![1, 2, 3, 4], &[10, 11, 12, 13]);
     insert(&mut tc, &vec![1, 2, 3, 4, 5], &[10, 11, 12, 13, 14]);
@@ -531,7 +532,9 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
             .children
             .is_empty()
     );
-    for expected in [[20i64, 21], [22, 23], [27, 28]] {
+    // The original child retains its older handle; the split prefix has a new
+    // one. Both internal nodes are reclaimed before the evictable device leaf.
+    for expected in [[22i64, 23], [20, 21], [27, 28]] {
         let step = tc.drive_host_eviction(FULL, 1);
         assert_eq!(step.tracker[&FULL], 2);
         assert!(step.device_frees.is_empty());

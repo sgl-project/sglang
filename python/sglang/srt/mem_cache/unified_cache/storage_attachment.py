@@ -418,7 +418,7 @@ class StorageAttachment:
                 cache.discard_storage_prefetch_accounting(handle)
                 if info.host_indices is None:
                     # Host pages were never allocated for this operation.
-                    cache.revoke_pending_prefetch(handle)
+                    cache.revoke_pending_prefetch(handle, local_only=True)
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
                 del cache.ongoing_prefetch[handle]
@@ -432,9 +432,9 @@ class StorageAttachment:
                 controller.append_host_mem_release(
                     host_indices=info.host_indices[:completed_tokens],
                     extra_pools=(
-                        [x for xfers in info.comp_xfers.values() for x in xfers]
-                        if info.operation.pool_transfers_done
-                        else None
+                        None
+                        if cache._controller_owns_pool_transfer_release(info.operation)
+                        else [x for xfers in info.comp_xfers.values() for x in xfers]
                     ),
                 )
                 controller.prefetch_tokens_occupied = max(

@@ -2112,6 +2112,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
+    def _controller_owns_pool_transfer_release(
+        self, operation: PrefetchOperation
+    ) -> bool:
+        return not operation.pool_transfers_done
+
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
             time.monotonic() - operation.start_time
@@ -2761,7 +2766,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # storage hit there, not device_covered.
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
-    def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
+    def revoke_pending_prefetch(
+        self, request: CacheRequestHandle, *, local_only: bool = False
+    ) -> None:
         info = self.ongoing_prefetch.pop(request, None)
         self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
         if info is None:
@@ -2774,6 +2781,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        if local_only and not operation.is_terminated():
+            operation.mark_terminate()
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)
@@ -2951,7 +2960,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 )
                 cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-            cc.prefetch_buffer.put(operation)
+            try:
+                cc.prefetch_buffer.put(operation)
+            except Exception:
+                # The transfer was not submitted, so all staging is still ours.
+                cc.free_prefetch_host_buffers(operation, host_indices)
+                operation.host_indices = None
+                self.ongoing_prefetch[request] = info._replace(host_indices=None)
+                self.revoke_pending_prefetch(request, local_only=True)
+                operation.buffer_host_occupied_units = None
+                raise
             return True
 
         def _drain_and_alloc_storage_hit():

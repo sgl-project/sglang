@@ -581,6 +581,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with hierarchical cache does not support "
             "pipeline parallelism (--pp-size > 1)."
         )
+        if cfg.hicache_storage_backend in {"mooncake", "nixl"}:
+            raise ValueError(
+                "--enable-unified-memory with hierarchical cache does not "
+                "support the Mooncake or NIXL storage backends."
+            )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with hierarchical cache requires lazy "
             "compaction so pending H2D physical reservations remain stable."

@@ -208,7 +208,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if tracker[&FULL] >= num_tokens {
                 break;
             }
-            let candidates: Vec<NodeIdx_> = tree_core.full_coexisting_host_nodes.iter().collect();
+            let mut candidates: Vec<NodeIdx_> =
+                tree_core.full_coexisting_host_nodes.iter().collect();
+            // Arena slots and completion order are not stable node identities.
+            candidates.sort_unstable_by_key(|&idx| tree_core.arena.node(idx).id);
             for node_id in candidates {
                 if tracker[&FULL] >= num_tokens {
                     break;

@@ -1904,7 +1904,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for spare_imminent_demotes in (True, False):
             if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                 break
-            for node in self.full_host_duplicates.values():
+            # Completion order can differ across ranks; select by stable node id.
+            for node in sorted(self.full_host_duplicates.values(), key=lambda n: n.id):
                 if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                     break
                 cd = node.component_data[BASE_COMPONENT_TYPE]

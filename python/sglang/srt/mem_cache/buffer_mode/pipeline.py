@@ -864,13 +864,21 @@ class BufferModePipeline:
                     indices_from_pool=staged.indices_from_pool,
                 )
             )
-        operation_id = self._cache.cache_controller.write_storage(
-            entry.host_indices,
-            snapshot.key.token_ids,
-            snapshot.hash_values,
-            snapshot.prefix_keys,
-            extra_pools=storage_xfers or None,
-        )
+        try:
+            operation_id = self._cache.cache_controller.write_storage(
+                entry.host_indices,
+                snapshot.key.token_ids,
+                snapshot.hash_values,
+                snapshot.prefix_keys,
+                extra_pools=storage_xfers or None,
+            )
+        except Exception:
+            self._free_staging_now(entry.host_indices, entry.aux_xfers)
+            self.write_staged_tokens_ -= entry.occupied_units
+            self.inflight_backup_node_ids.discard(snapshot.node_id)
+            _untrack_content_refs(self.inflight_backup_hashes, snapshot.hash_values)
+            self._log_backup_dropped(len(snapshot.hash_values) * self._cache.page_size)
+            raise
         self.ongoing_backup[operation_id] = entry
 
     def finish_storage_write_ack(self, operation_id: int) -> None:
