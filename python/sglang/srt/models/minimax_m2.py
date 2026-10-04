@@ -644,7 +644,6 @@ class MiniMaxM2Attention(nn.Module):
         self.hidden_size = config.hidden_size
 
         # Use attention TP rank/size for dp-attention support
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         # Get dimensions from config
@@ -700,8 +699,7 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 

@@ -480,8 +480,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         self.attn = RadixAttention(

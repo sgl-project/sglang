@@ -106,11 +106,9 @@ class NemotronHMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         reduce_results: bool = True,
-        tp_rank: int | None = None,
-        tp_size: int | None = None,
         prefix: str = "",
         *,
-        parallel_group: LinearParallelGroup | None = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
 
@@ -119,8 +117,6 @@ class NemotronHMLP(nn.Module):
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
             prefix=f"{prefix}.up_proj",
         )
@@ -130,8 +126,6 @@ class NemotronHMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
             prefix=f"{prefix}.down_proj",
         )
@@ -546,7 +540,6 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_rank = get_parallel().attn_tp_rank
         tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -584,8 +577,7 @@ class NemotronHAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",

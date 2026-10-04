@@ -215,8 +215,7 @@ class CLIPAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
     def forward(

@@ -69,10 +69,8 @@ class LagunaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         *,
-        parallel_group: Optional[LinearParallelGroup] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -85,8 +83,6 @@ class LagunaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
@@ -96,8 +92,6 @@ class LagunaMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
         )
         self.act_fn = SiluAndMul()
@@ -261,7 +255,6 @@ class LagunaAttention(nn.Module):
         self.gating = gating != "disabled"
         self.gate_per_head = gating == "per-head"
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -292,8 +285,7 @@ class LagunaAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )

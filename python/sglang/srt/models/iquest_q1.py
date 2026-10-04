@@ -326,8 +326,7 @@ class IQuestQ1Attention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
         )
