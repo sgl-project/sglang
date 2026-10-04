@@ -103,9 +103,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
     def prefill_cache_assert(self, result, prefix_len, label):
         self._record_cache_result(result, prefix_len, label)
 
-    def decode_cache_assert(
-        self, result, history_len, output_len, label, *, previous_num_retractions=0
-    ):
+    def decode_cache_assert(self, result, history_len, output_len, label):
         self._record_cache_result(result, history_len + output_len, label)
 
     def _record_cache_result(self, result, expected_cached_tokens, label):

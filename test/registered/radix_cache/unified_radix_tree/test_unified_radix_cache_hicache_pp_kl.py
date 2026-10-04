@@ -24,9 +24,7 @@ register_cuda_ci(est_time=738, stage="nightly", runner_config="4-gpu-h100")
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
 
-def _assert_pp_decode_cached_tokens(
-    result, history_len, output_len, label, *, previous_num_retractions=0
-):
+def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
     lower = max(0, expected - 1)
