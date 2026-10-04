@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.pad import (
@@ -45,7 +46,6 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
