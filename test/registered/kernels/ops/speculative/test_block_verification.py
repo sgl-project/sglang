@@ -49,6 +49,7 @@ def _verify(target, draft, candidates, coins, final_coins, *, block=True):
 
 
 def _reference(target, draft, candidates, coins, final_coins, *, block):
+    target, draft = target.double(), draft.double()
     batch, slots, _ = target.shape
     lengths = torch.zeros(batch, dtype=torch.long)
     prefix_prob = torch.ones(batch)
@@ -83,14 +84,14 @@ def _reference(target, draft, candidates, coins, final_coins, *, block):
         residual_scale[rejected, None] * weights[rejected]
         - draft[rows[rejected], lengths[rejected]]
     ).clamp(min=0)
-    cdf = weights.cumsum(-1)
-    final = (cdf <= final_coins[:, None] * weights.sum(-1, keepdim=True)).sum(-1)
+    cdf = weights.cumsum(-1) / weights.sum(-1, keepdim=True)
+    final = (cdf <= final_coins[:, None]).sum(-1)
     output = torch.full((batch, slots), -1, dtype=torch.int32)
     for row in range(batch):
         length = lengths[row]
         output[row, :length] = candidates[row, 1 : length + 1]
         output[row, length] = final[row]
-    return lengths, output
+    return lengths, output, cdf
 
 
 @pytest.mark.parametrize("block", [False, True])
@@ -107,7 +108,7 @@ def test_matches_reference(steps, vocab, block):
         candidates[:, 1:] = torch.multinomial(draft.flatten(0, 1), 1).view(batch, steps)
     coins = torch.rand(batch, steps + 1)
     final_coins = torch.rand(batch)
-    expected_lengths, expected = _reference(
+    expected_lengths, expected, cdf = _reference(
         target, draft, candidates, coins, final_coins, block=block
     )
 
@@ -118,8 +119,19 @@ def test_matches_reference(steps, vocab, block):
     ]
     lengths, output = _verify(*tensors, final_coins.to(DEVICE), block=block)
     torch.testing.assert_close(lengths.cpu().long(), expected_lengths)
-    valid = torch.arange(steps + 1)[None, :] <= expected_lengths[:, None]
-    torch.testing.assert_close(output.cpu()[valid], expected[valid])
+    output = output.cpu()
+    accepted = torch.arange(steps + 1)[None, :] < expected_lengths[:, None]
+    torch.testing.assert_close(output[accepted], expected[accepted])
+    final = output[torch.arange(batch), expected_lengths].long()
+    assert ((final >= 0) & (final < vocab)).all()
+    upper = cdf[torch.arange(batch), final]
+    lower = torch.where(
+        final > 0, cdf[torch.arange(batch), (final - 1).clamp(min=0)], 0
+    )
+    # FP32 reductions may cross a nearby CDF boundary; compare probability, not token IDs.
+    assert (upper > lower).all()
+    assert (final_coins >= lower - 1e-6).all()
+    assert (final_coins <= upper + 1e-6).all()
 
 
 def test_accepts_longer_prefix_after_rejection():
@@ -167,7 +179,7 @@ def test_selects_longest_accepted_prefix():
         torch.arange(steps + 1)[None, :] < expected_lengths[:, None], 0.0, 0.9
     )
     final_coins = torch.full((batch,), 0.75)
-    reference_lengths, expected = _reference(
+    reference_lengths, expected, _ = _reference(
         target, draft, candidates, coins, final_coins, block=True
     )
     torch.testing.assert_close(reference_lengths, expected_lengths)
@@ -198,7 +210,7 @@ def test_prefix_acceptance_boundary(target_next, draft_next, threshold):
         ]
     )
     final_coins = torch.full((3,), 0.5)
-    expected_lengths, expected = _reference(
+    expected_lengths, expected, _ = _reference(
         target, draft, candidates, coins, final_coins, block=True
     )
     assert expected_lengths.tolist() == [1, 0, 0]
