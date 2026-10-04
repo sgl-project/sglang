@@ -11249,7 +11249,10 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         )
         req = self._streaming_req(node, lock, session=session)
         req.finished_reason = FINISH_ABORT()
-        self.assertTrue(cache.session.try_cache_finished_req(req))
+        # The session leaves an abort to the normal release, whose unpin
+        # must not release the SWA lock a second time.
+        self.assertFalse(cache.session.try_cache_finished_req(req))
+        cache.unpin(req)
         cache.sanity_check()
 
 
