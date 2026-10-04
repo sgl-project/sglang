@@ -117,6 +117,7 @@ def _run(io, window_size=0, sink_size=0):
         kv_indices,
         kv_indptr,
         io["positions"],
+        None,  # v2p: no unified-pool translation
         io["pool_len"],
         kv_indices.shape[1],
         kv_indptr.shape[1],
