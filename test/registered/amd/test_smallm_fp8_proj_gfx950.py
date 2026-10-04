@@ -2,7 +2,6 @@
 
 import itertools
 import os
-import socket
 import types
 import unittest
 from unittest.mock import patch
@@ -16,6 +15,16 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _OFF = {"SGLANG_ROCM_SMALLM_FP8_PROJ": "0"}
+
+
+def _per_token_scheme():
+    from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+        QuarkW8A8Fp8,
+    )
+
+    return QuarkW8A8Fp8(
+        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+    )
 
 
 @unittest.skipUnless(is_gfx95_supported(), "gfx950 (MI35x) only")
@@ -53,14 +62,14 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             x, w, s, input_scale=xs, use_per_token_if_dynamic=True
         )
 
-    def run_counted(self, *inputs):
+    def run_counted(self, *thunks):
         calls, real = [], self.fp8_utils.smallm_fp8_gemm
         with patch.object(
             self.fp8_utils,
             "smallm_fp8_gemm",
             lambda *a, **k: calls.append(1) or real(*a, **k),
         ):
-            return [self.linear(*i) for i in inputs], len(calls)
+            return [f() for f in thunks], len(calls)
 
     def test_gemm_matches_aiter_tuple_fallback_and_kill_switch(self):
         from aiter import gemm_a8w8_bpreshuffle
@@ -70,7 +79,9 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                 with self.subTest(n=w.shape[1], m=m):
                     x = torch.randn(m, w.shape[0], device="cuda", dtype=torch.bfloat16)
                     q, xs = self.quant(x, group_size=x.shape[1])
-                    (got, got_tuple), n = self.run_counted((x, w, s), ((q, xs), w, s))
+                    (got, got_tuple), n = self.run_counted(
+                        lambda: self.linear(x, w, s), lambda: self.linear((q, xs), w, s)
+                    )
                     self.assertEqual(n, 2 if m <= max_m else 0)
                     self.assertTrue(torch.equal(got, got_tuple))
                     ref = gemm_a8w8_bpreshuffle(q, w.t(), xs, s, None, torch.bfloat16)
@@ -79,19 +90,14 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                     err = (got.float() - ref).abs()
                     self.assertTrue((err <= ulp + 1e-5 * ref.abs().max()).all())
                     with patch.dict(os.environ, _OFF):
-                        (off,), n = self.run_counted((x, w, s))
+                        (off,), n = self.run_counted(lambda: self.linear(x, w, s))
                     self.assertEqual(n, 0)
                     self.assertTrue(torch.equal(off.float(), ref))
 
     def test_producer_guard(self):
-        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
-            QuarkW8A8Fp8,
-        )
         from sglang.srt.models import qwen3_5
 
-        scheme = QuarkW8A8Fp8(
-            {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
-        )
+        scheme = _per_token_scheme()
         fwd = types.SimpleNamespace(sp_active=False)
         # weight is [K, N] after Quark loading; TP4 o_proj (N, K) = (4096, 2048)
         o_proj = types.SimpleNamespace(scheme=scheme, weight=torch.empty(2048, 4096))
@@ -142,42 +148,17 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                     self.assertTrue(torch.equal(s, rs))
 
     def test_quark_row_linear_takes_producer_tuple(self):
-        from sglang.srt.distributed.parallel_state import (
-            destroy_distributed_environment,
-            destroy_model_parallel,
-            init_distributed_environment,
-            initialize_model_parallel,
-        )
         from sglang.srt.layers.linear import RowParallelLinear
         from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
-        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
-            QuarkW8A8Fp8,
-        )
         from sglang.srt.runtime_context import get_context, get_parallel
-        from sglang.test.test_utils import publish_build_topology
+        from sglang.test.layer_ut_utils import init_single_process_dist
 
         class _QuarkPerToken:
             def get_quant_method(self, layer, prefix):
-                layer.scheme = QuarkW8A8Fp8(
-                    {"qscheme": "per_channel"},
-                    {"qscheme": "per_channel", "is_dynamic": True},
-                )
+                layer.scheme = _per_token_scheme()
                 return QuarkLinearMethod(self)
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-        publish_build_topology(tp_size=1)
-        initialize_model_parallel(backend="gloo")
-        self.addCleanup(destroy_distributed_environment)
-        self.addCleanup(destroy_model_parallel)
+        init_single_process_dist()
         with (
             get_parallel().override(tp_size=1, tp_rank=0),
             get_context().override_server_args(),
@@ -198,20 +179,15 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             )
             proj.weight_scale.data.copy_(torch.rand(4096, device="cuda") * 0.01 + 1e-3)
             proj.quant_method.process_weights_after_loading(proj)
-            calls, real = [], self.fp8_utils.smallm_fp8_gemm
-            with patch.object(
-                self.fp8_utils,
-                "smallm_fp8_gemm",
-                lambda *a, **k: calls.append(1) or real(*a, **k),
-            ):
-                for t in (1, 4, 36):
-                    fused, _, plain = self.producers(t)
-                    for f, p in zip(fused, plain):
-                        with self.subTest(t=t):
-                            calls.clear()
-                            got = proj(f())[0]
-                            self.assertEqual(len(calls), 1)
-                            self.assertTrue(torch.equal(got, proj(p)[0]))
+            for t in (1, 4, 36):
+                fused, _, plain = self.producers(t)
+                for f, p in zip(fused, plain):
+                    with self.subTest(t=t):
+                        (got, ref), n = self.run_counted(
+                            lambda: proj(f())[0], lambda: proj(p)[0]
+                        )
+                        self.assertEqual(n, 2)
+                        self.assertTrue(torch.equal(got, ref))
 
     def test_graph_replay_matches_eager(self):
         (w_in, s_in, _), _, (w_out, s_out, _) = self.shapes[:3]
