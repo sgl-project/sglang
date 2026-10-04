@@ -38,6 +38,7 @@ def fused_moe_triton_api(
 ):
     topk_op = TopK(
         top_k=topk,
+        layer_id=0,
         renormalize=False,
         use_grouped_topk=False,
         output_format=TopKOutputFormat.TRITON_KERNEL,

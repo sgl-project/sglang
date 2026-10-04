@@ -72,7 +72,7 @@ The CP and attention-backend compatibility matrix is being expanded, with suppor
 
 ### Prefill CP × TP, DP, and EP
 
-Attention TP splits heads within each CP partition; attention DP separates request batches. Dense FFNs and MoE layers can use a different layout, bridged by layer communicators. The Qwen3 example in [Usage and Examples](#usage-and-examples) combines CP=2 with attention TP=2 and EP=4. For interleave DSA on DeepSeek V3.2 and the GLM-5 series, keep DP=1 and use the resolved attention CP=TP topology.
+Attention TP splits heads within each CP partition; attention DP separates request batches. Dense FFNs and MoE layers can use a different layout, bridged by the layer boundaries between stages (see [Layer boundaries](/docs/developer_guide/layer_boundary)). The Qwen3 example in [Usage and Examples](#usage-and-examples) combines CP=2 with attention TP=2 and EP=4. For interleave DSA on DeepSeek V3.2 and the GLM-5 series, keep DP=1 and use the resolved attention CP=TP topology.
 
 ### Prefill CP × pipeline parallelism
 
