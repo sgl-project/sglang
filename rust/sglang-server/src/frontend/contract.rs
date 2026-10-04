@@ -281,6 +281,10 @@ pub(crate) struct ModelInfo {
     pub(crate) served_model_name: String,
     pub(crate) tokenizer_path: String,
     pub(crate) is_generation: bool,
+    pub(crate) has_image_understanding: bool,
+    pub(crate) has_audio_understanding: bool,
+    pub(crate) model_type: Option<String>,
+    pub(crate) architectures: Option<Vec<String>>,
     pub(crate) preferred_sampling_params: Option<PreferredSamplingParams>,
     pub(crate) weight_version: Option<String>,
     pub(crate) load_format: Option<String>,
@@ -299,6 +303,10 @@ pub(crate) struct ServerInfo {
     pub(crate) max_total_num_tokens: u64,
     pub(crate) version: String,
     pub(crate) frontend: &'static str,
+    /// Python reports the scheduler's configuration at the top level as well
+    /// as in each scheduler state; clients read either place.
+    #[serde(flatten)]
+    pub(crate) config: PublicConfig,
     pub(crate) internal_states: Vec<InternalState>,
 }
 
@@ -310,6 +318,10 @@ pub(crate) struct ServerInfo {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct InternalState {
+    #[serde(flatten)]
+    pub(crate) config: PublicConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) startup_time: Option<StartupTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_gen_throughput: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,6 +334,73 @@ pub(crate) struct InternalState {
     pub(crate) step_time_dict: Option<BTreeMap<u64, Vec<f64>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rust_mm_transport: Option<BTreeMap<String, u64>>,
+}
+
+/// Scheduler configuration read by cache, speculative-decoding, and topology
+/// clients. The scheduler's state carries every resolved launch argument,
+/// including credentials and storage-backend options, so fields are promoted
+/// here deliberately. `None` is reported as `null`, like Python.
+///
+/// Integers are signed, like Python's: launch arguments such as
+/// `chunked_prefill_size` and `hicache_size` accept nonpositive values, and a
+/// value this struct cannot decode fails the whole response.
+///
+/// `dp_size` and `attn_dp_size` are left out on purpose. Each DP rank has its
+/// own Rust listener, which ignores `data_parallel_rank`. DP-aware clients
+/// would split one URL into virtual ranks that all reach this one.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct PublicConfig {
+    pub(crate) dtype: Option<String>,
+    pub(crate) quantization: Option<String>,
+    pub(crate) kv_cache_dtype: Option<String>,
+    pub(crate) device: Option<String>,
+    pub(crate) context_length: Option<i64>,
+    pub(crate) is_embedding: Option<bool>,
+    pub(crate) tp_size: Option<i64>,
+    pub(crate) pp_size: Option<i64>,
+    pub(crate) ep_size: Option<i64>,
+    pub(crate) world_size: Option<i64>,
+    pub(crate) enable_dp_attention: Option<bool>,
+    pub(crate) enable_dp_attention_local_control_broadcast: Option<bool>,
+    pub(crate) disaggregation_mode: Option<String>,
+    pub(crate) max_running_requests: Option<i64>,
+    pub(crate) max_total_tokens: Option<i64>,
+    pub(crate) chunked_prefill_size: Option<i64>,
+    pub(crate) page_size: Option<i64>,
+    pub(crate) disable_radix_cache: Option<bool>,
+    pub(crate) enable_deterministic_inference: Option<bool>,
+    pub(crate) enable_hierarchical_cache: Option<bool>,
+    pub(crate) hicache_ratio: Option<f64>,
+    pub(crate) hicache_size: Option<i64>,
+    pub(crate) hicache_write_policy: Option<String>,
+    pub(crate) hicache_io_backend: Option<String>,
+    pub(crate) hicache_mem_layout: Option<String>,
+    pub(crate) hicache_storage_backend: Option<String>,
+    pub(crate) hicache_host_memory_mode: Option<String>,
+    pub(crate) speculative_algorithm: Option<String>,
+    pub(crate) speculative_num_steps: Option<i64>,
+    pub(crate) speculative_eagle_topk: Option<i64>,
+    pub(crate) speculative_num_draft_tokens: Option<i64>,
+    pub(crate) speculative_accept_threshold_single: Option<f64>,
+    pub(crate) speculative_accept_threshold_acc: Option<f64>,
+    pub(crate) enable_metrics: Option<bool>,
+    pub(crate) enable_metrics_for_all_schedulers: Option<bool>,
+}
+
+/// Scheduler startup phase durations in seconds; `cuda_graph` is keyed by
+/// capture phase.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct StartupTime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kv_cache_allocation: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scheduler_e2e: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cuda_graph: Option<BTreeMap<String, f64>>,
 }
 
 /// Public subset of scheduler memory metrics.

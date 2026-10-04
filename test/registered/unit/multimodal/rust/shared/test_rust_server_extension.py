@@ -9,13 +9,59 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
+from sglang.srt.rust_server.config import _build_server_args  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestRustServerExtension(CustomTestCase):
+    def test_config_handoff_uses_serving_tokenizer_and_model_capabilities(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tokenizer_path="public-tokenizer",
+            served_model_name="served-model",
+        )
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
+        extension = SimpleNamespace(
+            ServerArgs=SimpleNamespace,
+            ModelConfig=SimpleNamespace,
+            DefaultSamplingParams=SimpleNamespace,
+            DisaggregationMode=SimpleNamespace(
+                Null="null", Prefill="prefill", Decode="decode"
+            ),
+        )
+        scheduler = SimpleNamespace(
+            server_args=server_args,
+            model_config=SimpleNamespace(
+                context_len=4096,
+                vocab_size=256,
+                is_multimodal=True,
+                is_generation=True,
+                is_image_understandable_model=True,
+                is_audio_understandable_model=False,
+                hf_config=SimpleNamespace(
+                    model_type="llama", architectures=["LlamaForCausalLM"]
+                ),
+                get_default_sampling_params=lambda: {"temperature": 0.5},
+            ),
+            rust_server_tokenizer_path=lambda: "/data/tokenizer/tokenizer.json",
+            max_total_num_tokens=8192,
+        )
+
+        args = _build_server_args(scheduler, extension=extension)
+
+        self.assertEqual(args.public_tokenizer_path, "public-tokenizer")
+        self.assertEqual(args.tokenizer_path, "/data/tokenizer/tokenizer.json")
+        self.assertTrue(args.model_config.is_generation)
+        self.assertTrue(args.model_config.has_image_understanding)
+        self.assertFalse(args.model_config.has_audio_understanding)
+        self.assertEqual(args.model_config.architectures, ["LlamaForCausalLM"])
+
     def test_launch_uses_the_model_extension_and_instance_worker_state(self):
         extension = ModuleType("model_server")
         extension.Server = Mock()

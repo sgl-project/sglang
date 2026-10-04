@@ -2293,8 +2293,12 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     # A language-only worker may advertise VLM capability for encoder
     # disaggregation, but its local warmup must stay on the text path.
+    # The Rust frontend's chat route rejects image content (only /generate
+    # carries image_data, and that needs model-specific placeholder tokens),
+    # so Rust mode also warms up through text /generate.
     is_vlm = (
         bool(model_info.get("has_image_understanding", False))
+        and not envs.SGLANG_RUST_SERVER.get()
         and not get_disagg().language_only
         and not get_disagg().language_model_only
         and not get_exec().features.enable_encoder_swa_bounded_replay
