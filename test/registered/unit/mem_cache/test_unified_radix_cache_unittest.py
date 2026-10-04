@@ -11370,7 +11370,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
             session=self._session("s2"),
             finished_reason=None,
         )
-        cache.hand_to_session(req)
+        cache.maybe_hand_to_session(req)
         slot = cache.session.slots["s2"]
         self.assertIs(req.last_node, slot.virtual_node)
 
@@ -11386,7 +11386,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache, allocator, pool = build_fixture(self.cfg)
         tokens = list(range(1, 9))
         req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
-        cache.hand_to_session(req)
+        cache.maybe_hand_to_session(req)
         slot = cache.session.slots["s"]
 
         cache.checkpoint(req, up_to=len(tokens))
@@ -11409,7 +11409,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache, allocator, pool = build_fixture(self.cfg)
         tokens = list(range(1, 9))
         req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
-        cache.hand_to_session(req)
+        cache.maybe_hand_to_session(req)
         cache.checkpoint(req, up_to=len(tokens))
         slot = cache.session.slots["s"]
 
@@ -11423,7 +11423,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache, allocator, pool = build_fixture(self.cfg)
         tokens = list(range(1, 9))
         req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
-        cache.hand_to_session(req)
+        cache.maybe_hand_to_session(req)
         cache.checkpoint(req, up_to=len(tokens))
         slot = cache.session.slots["s"]
 

@@ -1040,7 +1040,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    def hand_to_session(self, req: Req) -> None:
+    def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:

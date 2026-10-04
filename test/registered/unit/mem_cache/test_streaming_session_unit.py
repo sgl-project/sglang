@@ -83,7 +83,7 @@ class _FakeInnerCache:
     def checkpoint(self, req, *, up_to):
         pass
 
-    def hand_to_session(self, req):
+    def maybe_hand_to_session(self, req):
         self.session.take(req)
 
     def claim_kv_row(self, req):
@@ -174,7 +174,7 @@ def _single_row_cache():
 
 def _finished_turn(tree_cache, req):
     """The session took the record at allocation; the turn then finished."""
-    tree_cache.hand_to_session(req)
+    tree_cache.maybe_hand_to_session(req)
     req.finished_reason = FINISH_LENGTH(length=0)
     assert tree_cache.session.try_cache_finished_req(req)
     return tree_cache.session.slots[req.session.session_id]
@@ -271,7 +271,7 @@ def test_first_mid_abort_releases_like_any_request(published_config):
     req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
     lock_node = SimpleNamespace(id=7)
     req.last_node = lock_node
-    tree_cache.hand_to_session(req)
+    tree_cache.maybe_hand_to_session(req)
     assert tree_cache.session.slots["session-a"].last_node is lock_node
     req.finished_reason = FINISH_ABORT("input too long")
 

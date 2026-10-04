@@ -57,7 +57,7 @@ class _FakeTreeCache:
     def supports_prefix_sharing(self):
         return False
 
-    def hand_to_session(self, req):
+    def maybe_hand_to_session(self, req):
         pass
 
 
