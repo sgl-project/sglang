@@ -16,6 +16,7 @@ from sglang.srt.configs.hybrid_arch import (
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
@@ -586,11 +587,21 @@ class KVCacheConfigurator:
                     from sglang.srt.mem_cache.unified_draft_pool import (
                         bind_fused_draft,
                         draft_kv_layer_ids,
+                        draft_state_layer_classes,
                     )
 
                     assert req_to_token_pool is not None, (
                         "a draft worker shares the target's req_to_token_pool"
                     )
+                    # The target placed this draft from its config; the built
+                    # model is the ground truth for whether it carries state.
+                    state_layers = draft_state_layer_classes(self.model)
+                    if state_layers:
+                        raise ValueError(
+                            "Fused draft KV: the draft model has recurrent / "
+                            f"linear-attention layers ({', '.join(state_layers)}) "
+                            "that the fused region gives no state pool."
+                        )
                     draft_pool = bind_fused_draft(
                         unified_buffer=alloc.unified_buffer,
                         host_allocator=alloc,
@@ -969,6 +980,13 @@ class KVCacheConfigurator:
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
+        if aux.draft_model_config.attention_arch != AttentionArch.MHA:
+            return FusedDraftDecision(
+                declined=(
+                    f"the draft's attention is {aux.draft_model_config.attention_arch.name}; "
+                    "the fused region holds dense MHA K/V rows"
+                )
+            )
         profile = draft_kv_profile(
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),

@@ -217,7 +217,15 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
 
-    def _run(self, *, algorithm, alloc, max_total_num_tokens, kv_dtype=torch.bfloat16):
+    def _run(
+        self,
+        *,
+        algorithm,
+        alloc,
+        max_total_num_tokens,
+        kv_dtype=torch.bfloat16,
+        state_layers=(),
+    ):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -265,6 +273,11 @@ class TestDraftBindingDispatch(CustomTestCase):
             patch.object(kcc.KVCacheConfigurator, "_build_token_to_kv_pool", _capture),
             # The real scan walks the draft nn.Module for RadixAttention layers.
             patch.object(unified_draft_pool, "draft_kv_layer_ids", return_value=[0]),
+            patch.object(
+                unified_draft_pool,
+                "draft_state_layer_classes",
+                return_value=list(state_layers),
+            ),
         ):
             return cfg._init_pools(
                 sizes=sizes,
@@ -307,6 +320,18 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
                 kv_dtype=torch.float8_e4m3fn,
+            )
+
+    def test_a_draft_with_state_layers_refuses_to_bind(self):
+        """The target places a draft from its config; the built model is the
+        ground truth. Recurrent layers would run with no state pool."""
+        alloc = self._swa_allocator(with_draft_region=True)
+        with self.assertRaisesRegex(ValueError, "MambaMixer2"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+                state_layers=["MambaMixer2"],
             )
 
     def test_eagle_draft_without_a_placement_falls_back_to_the_private_arm(self):

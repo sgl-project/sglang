@@ -237,7 +237,8 @@ class TestFusedEntryPricing(CustomTestCase):
 class TestFusedDraftDecision(CustomTestCase):
     """The target's boot decision over a host whose full sub-pool fuses."""
 
-    def _decide(self, *, draft_kv_dtype=None):
+    def _decide(self, *, draft_kv_dtype=None, attention_arch=None):
+        from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
@@ -259,6 +260,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
+                attention_arch=attention_arch or AttentionArch.MHA,
             ),
         )
         memory = SimpleNamespace(enable_unified_memory=True)
@@ -275,6 +277,15 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_a_non_mha_draft_keeps_the_private_pool(self):
+        """The region holds dense MHA K/V rows. An MLA draft is kept out by its
+        own architecture, not by the accident of asymmetric head dims."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        declined = self._decide(attention_arch=AttentionArch.MLA)
+        self.assertIsNone(declined.placement)
+        self.assertIn("MLA", declined.declined)
 
     def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
         """A fused draft stores its rows in the host's KV dtype; an explicit
