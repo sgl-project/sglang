@@ -159,11 +159,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     )
 
     if cfg.speculative_use_block_verification:
-        if not cfg.speculative_use_rejection_sampling:
-            raise ValueError(
-                "--speculative-use-block-verification requires "
-                "--speculative-use-rejection-sampling."
-            )
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
             raise ValueError(
                 "--speculative-use-block-verification only supports EAGLE / EAGLE3 / NEXTN."
@@ -171,6 +166,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if cfg.device != "cuda":
             raise ValueError(
                 "--speculative-use-block-verification only supports CUDA or ROCm."
+            )
+        # Block verification needs sampled proposals and their full distributions.
+        if not cfg.speculative_use_rejection_sampling:
+            declare_resolution(
+                server_args,
+                "handle_speculative_decoding",
+                speculative_use_rejection_sampling=True,
             )
 
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,

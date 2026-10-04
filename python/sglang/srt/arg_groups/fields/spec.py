@@ -119,7 +119,7 @@ class Spec(msgspec.Struct):
     speculative_use_block_verification: A[
         bool,
         "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
-        "(requires --speculative-use-rejection-sampling and topk=1).",
+        "(requires topk=1).",
     ] = False
     speculative_token_map: A[
         Optional[str],

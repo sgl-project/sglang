@@ -18,7 +18,6 @@ class TestBlockVerificationArgs(unittest.TestCase):
             speculative_eagle_topk=1,
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
-            speculative_use_rejection_sampling=True,
             speculative_use_block_verification=True,
         )
         args._model_config = SimpleNamespace(
@@ -30,25 +29,51 @@ class TestBlockVerificationArgs(unittest.TestCase):
 
     def test_supported_algorithms(self):
         for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
-            with self.subTest(algorithm=algorithm):
-                args = self._args(speculative_algorithm=algorithm)
+            for use_rejection_sampling in (False, True):
+                with self.subTest(
+                    algorithm=algorithm, use_rejection_sampling=use_rejection_sampling
+                ):
+                    args = self._args(
+                        speculative_algorithm=algorithm,
+                        speculative_use_rejection_sampling=use_rejection_sampling,
+                    )
+                    handle_speculative_decoding(args)
+                    self.assertTrue(
+                        resolution_result(args, "speculative_use_block_verification")
+                    )
+                    self.assertTrue(
+                        resolution_result(args, "speculative_use_rejection_sampling")
+                    )
+                    self.assertEqual(
+                        args.speculative_use_rejection_sampling, use_rejection_sampling
+                    )
+
+    def test_other_verification_modes_unchanged(self):
+        for use_rejection_sampling in (False, True):
+            with self.subTest(use_rejection_sampling=use_rejection_sampling):
+                args = self._args(
+                    speculative_algorithm="EAGLE3",
+                    speculative_use_block_verification=False,
+                    speculative_use_rejection_sampling=use_rejection_sampling,
+                )
                 handle_speculative_decoding(args)
-                self.assertTrue(
+                self.assertFalse(
                     resolution_result(args, "speculative_use_block_verification")
+                )
+                self.assertEqual(
+                    resolution_result(args, "speculative_use_rejection_sampling"),
+                    use_rejection_sampling,
                 )
 
     def test_unsupported_configurations(self):
         cases = [
-            (
-                {"speculative_use_rejection_sampling": False},
-                "requires --speculative-use-rejection-sampling",
-            ),
             ({"speculative_algorithm": None}, "only supports EAGLE"),
             ({"speculative_algorithm": "STANDALONE"}, "only supports EAGLE"),
             ({"speculative_algorithm": "DFLASH"}, "only supports EAGLE"),
             ({"device": "cpu"}, "only supports CUDA or ROCm"),
             ({"device": "npu"}, "only supports CUDA or ROCm"),
             ({"speculative_eagle_topk": 2}, "requires --speculative-eagle-topk=1"),
+            ({"speculative_accept_threshold_single": 0.5}, "incompatible"),
             ({"speculative_accept_threshold_acc": 0.5}, "incompatible"),
             ({"enable_deterministic_inference": True}, "incompatible"),
         ]
