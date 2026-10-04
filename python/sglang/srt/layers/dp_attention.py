@@ -23,7 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
-    derive_attention_widths,
+    derive_attn_tp_size,
     get_device,
     get_exec,
     get_flags,
@@ -51,13 +51,7 @@ def deployment_attn_dp_size() -> int:
     the target's replicas.
     """
     parallel = get_parallel()
-    attn_dp_size, _ = derive_attention_widths(
-        tp_size=parallel.tp_size,
-        attn_cp_size=parallel.attn_cp_size,
-        dp_size=parallel.dp_size,
-        enable_dp_attention=parallel.enable_dp_attention,
-    )
-    return attn_dp_size
+    return parallel.num_dp_ranks if parallel.attn_dp_enabled else 1
 
 
 def dp_gather_width() -> int:
@@ -69,7 +63,7 @@ def dp_gather_width() -> int:
     """
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.dp_size
+        return parallel.num_dp_ranks
     if get_flags().dp.scoped_gather_slot is not None:
         return deployment_attn_dp_size()
     return parallel.attn_dp_size
@@ -127,7 +121,7 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
-        "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
+        "[Elastic EP] dp_attention switched to WORLD: num_dp_ranks=%d dp_rank=%d",
         new_dp_size,
         new_dp_rank,
     )
@@ -154,7 +148,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = dp_gather_width()
+        gather_width = dp_gather_width()
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -169,11 +163,11 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
-        # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
-        # overhead from uneven token distribution.
-        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
+        # When is_extend_in_batch and the gather spans several DP ranks, use
+        # SUM_LEN to avoid padding overhead from uneven token distribution.
+        # Over one rank, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
-        if is_extend_in_batch and dp_size > 1:
+        if is_extend_in_batch and gather_width > 1:
             # Hybrid-SSM models materialize idle ranks via the MAX_LEN
             # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
@@ -184,7 +178,7 @@ class DpPaddingMode(IntEnum):
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
-        if sum_len * 2 >= max_len * dp_size:
+        if sum_len * 2 >= max_len * gather_width:
             return cls.MAX_LEN
         else:
             return cls.SUM_LEN
@@ -405,25 +399,19 @@ def is_dp_max_padding() -> bool:
 
 
 def compute_dp_attention_world_info(
-    enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
+    tp_rank, tp_size, attn_dp_size, attn_cp_size: int = 1
 ):
     """This rank's place in the attention topology, plus the widths it sits in.
 
-    The widths come from `derive_attention_widths`; what this adds is the two
-    ranks, which are per-process and so are not among the widths
+    The attention-TP width comes from `derive_attn_tp_size`; what this adds is
+    the two ranks, which are per-process and so are not among the widths
     `override_permanently` records.
     """
-    attn_dp_size, attn_tp_size = derive_attention_widths(
-        tp_size=tp_size,
-        attn_cp_size=attn_cp_size,
-        dp_size=dp_size,
-        enable_dp_attention=enable_dp_attention,
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=tp_size, attn_cp_size=attn_cp_size, attn_dp_size=attn_dp_size
     )
     attn_tp_rank, attn_dp_rank = derive_attention_ranks(
-        tp_rank=tp_rank,
-        attn_tp_size=attn_tp_size,
-        attn_cp_size=attn_cp_size,
-        enable_dp_attention=enable_dp_attention,
+        tp_rank=tp_rank, attn_tp_size=attn_tp_size, attn_cp_size=attn_cp_size
     )
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
@@ -431,7 +419,7 @@ def compute_dp_attention_world_info(
 def initialize_dp_attention_flags(server_args: ServerArgs):
     """Initialize DP runtime flags without changing the worker's placement."""
     dp = get_flags().dp
-    dp.enabled = get_parallel().enable_dp_attention
+    dp.enabled = get_parallel().attn_dp_enabled
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         if ep_scale_joiner_of(resolving_view(server_args)):
@@ -443,10 +431,9 @@ def initialize_dp_attention(server_args: ServerArgs):
     initialize_dp_attention_flags(server_args)
     parallel = get_parallel()
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
-        parallel.enable_dp_attention,
         parallel.tp_rank,
         parallel.tp_size,
-        parallel.dp_size,
+        parallel.attn_dp_size,
         parallel.attn_cp_size,
     )
     parallel.override_permanently(attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank)
@@ -466,6 +453,79 @@ def init_dp_gathered_buffer(model_config: ModelConfig):
 
 def is_dp_attention_enabled() -> bool:
     return get_flags().dp.enabled
+
+
+def get_dp_tp_group() -> GroupCoordinator:
+    """The TP ranks that run one DP rank's batch: the attention-TP group with
+    attention DP, otherwise the whole TP group.
+
+    Attention-CP peers of a DP rank are members only in the second case.
+    """
+    parallel = get_parallel()
+    return parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
+
+
+def multimodal_encoder_runs_here() -> bool:
+    """Whether a multimodal tower built on this worker is also forwarded here.
+
+    A tower is built unconditionally by most models, but an encoder-disaggregated
+    language instance forwards it on the encoder instance, a language-model-only
+    instance rejects multimodal requests, and a PD decode instance embeds nothing
+    (`general_mm_embed_routine` skips decode and target-verify forwards).
+
+    Adaptive dispatch is the exception on the first of those: it keeps the
+    requests it does not send to the encoder, and forwards the tower for them.
+    """
+    from sglang.srt.runtime_context import get_disagg
+
+    disagg = get_disagg()
+    offloaded_to_an_encoder_instance = (
+        disagg.language_only and not disagg.enable_adaptive_dispatch_to_encoder
+    )
+    return not (
+        offloaded_to_an_encoder_instance
+        or disagg.language_model_only
+        or disagg.disaggregation_mode == "decode"
+    )
+
+
+def reject_attn_tp_shard_with_tp_reduce(
+    layer: str,
+    *,
+    shard_tp_size: int,
+    reduces_over_attn_tp: bool,
+    multimodal_encoder: bool = False,
+    hint: str = "",
+) -> None:
+    """Reject a layer that shards over attention TP but all-reduces over the TP group.
+
+    The two groups differ only when attention DP or attention CP makes attention
+    TP narrower than TP. There the all-reduce mixes ranks that hold other
+    requests or replicated inputs, so the output is wrong; a one-rank shard does
+    not reduce at all.
+    """
+    tp_size = get_parallel().tp_size
+    if reduces_over_attn_tp or not 1 < shard_tp_size < tp_size:
+        return
+    if multimodal_encoder and not multimodal_encoder_runs_here():
+        return
+    # Name only the widths that are actually narrowing the group here, so the
+    # remedy is one the operator can apply.
+    parallel = get_parallel()
+    narrowed_by = []
+    if parallel.attn_dp_size > 1:
+        narrowed_by.append(f"--attn-dp-size {parallel.attn_dp_size}")
+    if parallel.attn_cp_size > 1:
+        narrowed_by.append(f"--attn-cp-size {parallel.attn_cp_size}")
+    remedy = " and ".join(f"drop {flag}" for flag in narrowed_by) or (
+        "widen the attention TP group"
+    )
+    raise ValueError(
+        f"{layer} shards over the attention TP group ({shard_tp_size} ranks) "
+        f"but all-reduces over the full TP group ({tp_size} ranks), so it does "
+        f"not support {' with '.join(narrowed_by) or 'this layout'} yet. "
+        f"Use --attn-dp-size equal to --tp-size, or {remedy}{hint}."
+    )
 
 
 def is_allocation_symmetric() -> bool:
@@ -652,7 +712,7 @@ def _dp_gather_via_all_gather(
 # Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
 # rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
 # gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
-# tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
+# tp_size==attn_dp_size (attn_tp_size==1) case is supported for now (e.g. tp8, attn_dp8).
 _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
 
 _DP_GATHER_FP8_GROUP = 128
@@ -725,7 +785,7 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     """Set MAX_LEN pad rows' (post-translation, local) topk_ids to -1 in place.
 
     Under dp-attention MAX_LEN padding the gathered MoE buffer is
-    [dp_size * max_len, hidden] with rank r's real rows at
+    [num_dp_ranks * max_len, hidden] with rank r's real rows at
     [r*max_len, r*max_len + global_num_tokens[r]); the pad rows carry stale
     hidden values, run the router, and get dispatched into experts whose
     outputs are then discarded by the post-reorder scatter — pure wasted
@@ -794,7 +854,7 @@ def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
     enabled and applicable to the CURRENT forward. Requires:
       - env SGLANG_DP_USE_GATHERV (default off),
-      - supported layout (attn_tp_size==1, tp_size==dp_size),
+      - supported layout (attn_tp_size==1, tp_size==attn_dp_size),
       - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
         only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
         gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
@@ -1004,7 +1064,7 @@ def can_use_dp_reduce_scatter() -> bool:
         return True
 
     parallel = get_parallel()
-    return parallel.tp_size == parallel.dp_size * parallel.attn_tp_size
+    return parallel.tp_size == parallel.num_dp_ranks * parallel.attn_tp_size
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

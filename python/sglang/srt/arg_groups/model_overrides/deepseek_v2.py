@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    context_parallel_attn_dp_size,
     is_attention_backend_not_set,
     resolving_view,
     use_mla_backend,
@@ -85,7 +86,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
-                overrides["enable_dp_attention"] = True
+                attn_dp_size = context_parallel_attn_dp_size(
+                    cfg, "DSA context parallelism"
+                )
+                overrides["attn_dp_size"] = attn_dp_size
+                overrides["dp_size"] = 1
                 overrides["moe_dense_tp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
                     overrides["moe_a2a_backend"] = "deepep"
@@ -95,7 +100,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
                 else:
-                    assert cfg.dp_size == 1, (
+                    assert attn_dp_size == 1, (
                         "interleave DSA CP does not support DP attention."
                     )
                 assert cfg.tp_size <= 8, (
@@ -103,12 +108,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # The DSA / MLA CP gather and reduce-scatter
-                # (communicator_dsa_cp) assume it.
-                attn_cp_size = cfg.tp_size // cfg.dp_size
+                # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+                attn_cp_size = cfg.tp_size // attn_dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "
-                    f"strategy={cfg.cp_strategy}, dp_size={cfg.dp_size}, "
+                    f"strategy={cfg.cp_strategy}, attn_dp_size={attn_dp_size}, "
                     f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
@@ -158,7 +163,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "MLA prefill context parallel is still experimental. "
                 "Verified on Hopper with the fa3 backend."
             )
-            overrides["enable_dp_attention"] = True
+            attn_dp_size = context_parallel_attn_dp_size(cfg, "MLA context parallelism")
+            overrides["attn_dp_size"] = attn_dp_size
+            overrides["dp_size"] = 1
             # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
             overrides["moe_dense_tp_size"] = 1
             overrides["moe_a2a_backend"] = "deepep"
@@ -168,12 +175,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
             # The DSA / MLA CP gather and reduce-scatter
-            # (communicator_dsa_cp) assume it.
-            attn_cp_size = cfg.tp_size // cfg.dp_size
+            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+            attn_cp_size = cfg.tp_size // attn_dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
                 f"Enable Context Parallel opt for MLA, "
-                f"Setting dp_size == {cfg.dp_size} and "
+                f"Setting attn_dp_size == {attn_dp_size} and "
                 f"attn_cp_size == {attn_cp_size}, "
                 f"moe_dense_tp_size == {overrides['moe_dense_tp_size']}, "
                 f"ep_size == {overrides['ep_size']}, "

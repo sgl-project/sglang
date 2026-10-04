@@ -46,7 +46,8 @@ pub struct SnapshotNode {
 
 impl SnapshotNode {
     /// Keep the carriers `map` accepts, renumbering each to what it returns,
-    /// and keep their tier entries in lockstep.
+    /// and keep their tier entries in lockstep. `map` sees each carrier's
+    /// worker index and the tiers it restores onto ([`Self::carrier_tiers`]).
     ///
     /// The only correct way to filter a record's carriers: `workers` and
     /// `tiers` are parallel by index, so filtering one alone silently re-pairs
@@ -58,7 +59,7 @@ impl SnapshotNode {
     /// record a carrier with no tier entry is dropped, never padded onto
     /// device: padding would invent the device holding [`Tiers::from_bits`]
     /// refuses to.
-    pub fn retain_carriers(&mut self, mut map: impl FnMut(u32) -> Option<u32>) {
+    pub fn retain_carriers(&mut self, mut map: impl FnMut(u32, Tiers) -> Option<u32>) {
         let tiered = !self.tiers.is_empty();
         let mut workers = Vec::with_capacity(self.workers.len());
         let mut tiers = Vec::with_capacity(if tiered { self.workers.len() } else { 0 });
@@ -67,7 +68,7 @@ impl SnapshotNode {
             if tiered && bits.is_none() {
                 continue;
             }
-            let Some(kept) = map(w) else {
+            let Some(kept) = map(w, self.carrier_tiers(k)) else {
                 continue;
             };
             workers.push(kept);
@@ -79,7 +80,7 @@ impl SnapshotNode {
 
     /// The tiers carrier `k` restores onto. Absent `tiers` reads as device;
     /// otherwise [`Tiers::from_bits`]. Empty means the carrier is skipped.
-    fn carrier_tiers(&self, k: usize) -> Tiers {
+    pub(in crate::state::kv_events) fn carrier_tiers(&self, k: usize) -> Tiers {
         match self.tiers.get(k) {
             Some(&bits) => Tiers::from_bits(bits),
             None => Tiers::DEVICE,
@@ -90,6 +91,32 @@ impl SnapshotNode {
     fn has_restorable_carrier(&self) -> bool {
         (0..self.workers.len()).any(|k| !self.carrier_tiers(k).is_empty())
     }
+
+    /// The shape rules every consumer of an untrusted record enforces before
+    /// reading it: `parent` is a backward reference (strictly less than
+    /// `index`, the record's own position), and `tiers` is either empty or
+    /// paired one-to-one with `workers`.
+    pub(in crate::state::kv_events) fn check_shape(
+        &self,
+        index: usize,
+    ) -> Result<(), ShapeViolation> {
+        if let Some(parent) = self.parent.filter(|&p| p as usize >= index) {
+            return Err(ShapeViolation::NonBackwardParent { parent });
+        }
+        if !self.tiers.is_empty() && self.tiers.len() != self.workers.len() {
+            return Err(ShapeViolation::TierTableMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Which rule of [`SnapshotNode::check_shape`] a record broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::state::kv_events) enum ShapeViolation {
+    /// `parent` pointed at the record itself or at a later one.
+    NonBackwardParent { parent: u32 },
+    /// `tiers` was neither empty nor the same length as `workers`.
+    TierTableMismatch,
 }
 
 /// Why a [`HashTree::restore_snapshot`] was rejected.
@@ -268,7 +295,6 @@ impl HashTree {
     /// the other writer (`KvEventIndex::remove_worker`, off the discovery
     /// task) cannot prune a parent that an earlier chunk placed and a later
     /// chunk is about to hang a child from.
-    #[allow(dead_code)]
     pub(in crate::state::kv_events) fn restore_snapshot(
         &self,
         worker_table: &[KvWorkerId],
@@ -278,18 +304,18 @@ impl HashTree {
         // the placement lookup below infallible; the bounds check keeps
         // malformed input from silently dropping cache carriers.
         for (i, rec) in nodes.iter().enumerate() {
-            if rec.parent.is_some_and(|p| p as usize >= i) {
-                return Err(RestoreError::ForwardParentReference { index: i });
-            }
+            rec.check_shape(i).map_err(|v| match v {
+                ShapeViolation::NonBackwardParent { .. } => {
+                    RestoreError::ForwardParentReference { index: i }
+                }
+                ShapeViolation::TierTableMismatch => RestoreError::TierTableMismatch { index: i },
+            })?;
             if let Some(&worker) = rec
                 .workers
                 .iter()
                 .find(|&&w| w as usize >= worker_table.len())
             {
                 return Err(RestoreError::WorkerIndexOutOfRange { index: i, worker });
-            }
-            if !rec.tiers.is_empty() && rec.tiers.len() != rec.workers.len() {
-                return Err(RestoreError::TierTableMismatch { index: i });
             }
         }
 
@@ -775,7 +801,7 @@ mod tests {
             vec![Tiers::DEVICE.bits(), Tiers::HOST.bits(), Tiers::ALL.bits()],
         );
         // Drop worker 1, renumber 2 → 1.
-        node.retain_carriers(|w| match w {
+        node.retain_carriers(|w, _| match w {
             0 => Some(0),
             2 => Some(1),
             _ => None,
@@ -785,7 +811,7 @@ mod tests {
 
         // A legacy record stays legacy: no tiers are invented.
         let mut legacy = rec(None, 1, vec![0, 1], vec![]);
-        legacy.retain_carriers(|w| (w == 1).then_some(0));
+        legacy.retain_carriers(|w, _| (w == 1).then_some(0));
         assert_eq!(legacy.workers, vec![0]);
         assert!(legacy.tiers.is_empty());
     }
@@ -796,7 +822,7 @@ mod tests {
     #[test]
     fn retain_carriers_drops_a_carrier_with_no_tier_entry() {
         let mut node = rec(None, 1, vec![0, 1], vec![Tiers::HOST.bits()]);
-        node.retain_carriers(Some);
+        node.retain_carriers(|w, _| Some(w));
         assert_eq!(node.workers, vec![0]);
         assert_eq!(node.tiers, vec![Tiers::HOST.bits()]);
     }

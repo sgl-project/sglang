@@ -15,10 +15,19 @@ from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -466,23 +475,20 @@ class Qwen3GatedDeltaNet(nn.Module):
 def _apply_qwen3_next_mlp(
     layer: nn.Module,
     hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    hidden_states, residual = layer.layer_communicator.prepare_mlp(
-        hidden_states, residual, forward_batch
-    )
-    with layer.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = layer.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            hidden_states = layer.mlp(hidden_states)
-    hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+) -> torch.Tensor:
+    hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
+    hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+    else:
+        hidden_states = layer.mlp(hidden_states)
+    hidden_states = layer.ffn_boundary.finish(hidden_states, forward_batch)
 
-    return hidden_states, residual
+    return hidden_states
 
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
@@ -507,14 +513,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         is_next_layer_sparse = True
         self.layer_id = layer_id
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -525,6 +523,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -533,34 +532,41 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -568,11 +574,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
-        hidden_states, residual = _apply_qwen3_next_mlp(
-            self, hidden_states, residual, forward_batch
-        )
+        hidden_states = _apply_qwen3_next_mlp(self, hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
@@ -675,14 +679,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -693,6 +689,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -701,6 +698,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -710,11 +708,21 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
         self.alt_stream = alt_stream
@@ -823,18 +831,14 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs: Any,
     ):
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -844,11 +848,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = _apply_qwen3_next_mlp(
-            self, hidden_states, residual, forward_batch
-        )
+        hidden_states = _apply_qwen3_next_mlp(self, hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -929,33 +931,26 @@ class Qwen3NextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
-        residual = None
-        aux_hidden_states = []
+        residual_batch.start(forward_batch)
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     layer_id=i,
                     positions=positions,
                     hidden_states=hidden_states,
-                    residual=residual,
                     forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    captured_last_layer_outputs=aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None,
                 )
 
-        last_layer = self.layers[-1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
