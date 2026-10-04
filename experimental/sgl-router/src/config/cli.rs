@@ -2935,7 +2935,7 @@ mod tests {
                 {"id": "short", "max_input_tokens": 4096, "plain": {
                     "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9}
                 }},
-                {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two"}}
+                {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two", "worker_services": ["ns/decode"]}}
             ]
         }))
         .unwrap();
@@ -2944,6 +2944,14 @@ mod tests {
             .map(|b| (b.id.as_str(), b.rank, b.limits.max))
             .collect();
         assert_eq!(shape, [("short", 0, Some(4096)), ("long", 1, None)]);
+        let crate::buckets_reorg::BucketGroups::Pd { decode, .. } = &resolver.buckets[1].groups
+        else {
+            panic!("expected PD bucket");
+        };
+        assert_eq!(
+            decode.worker_services.as_ref().unwrap(),
+            &["ns/decode".into()].into()
+        );
         for bad in [
             json!({"buckets": []}),
             json!({"buckets": [{"id": "x", "plain": {}, "prefill": {}}]}),
@@ -2961,6 +2969,15 @@ mod tests {
             json!({"buckets": [{"id": "x", "ttft_ms": 0, "plain": {}}]}),
             json!({"buckets": [{"id": "x", "tokens_per_second": 0.0, "plain": {}}]}),
             json!({"buckets": [{"id": "x", "plain": {"worker_ids": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [""]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [" \t"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/short/extra"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/ short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": ["a"], "worker_services": ["ns/short"]}}]}),
         ] {
             assert!(build(&bad).is_err(), "accepted {bad}");
         }

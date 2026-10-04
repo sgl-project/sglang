@@ -59,6 +59,8 @@ pub struct BucketSpec {
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
     pub worker_ids: Option<HashSet<WorkerId>>,
+    /// Any listed Kubernetes Service, as namespace/name; exclusive with worker_ids.
+    pub worker_services: Option<HashSet<String>>,
     pub policy: Option<PolicyKind>,
     pub admission: Option<AdmissionLimits>,
 }
@@ -175,10 +177,12 @@ pub fn build_resolver(
              and positive capacity and SLO estimates"
         );
         let bucket_groups = match (&spec.plain, &spec.prefill, &spec.decode) {
-            (Some(plain), None, None) => BucketGroups::Plain(groups.build(Stage::Plain, plain)?),
+            (Some(plain), None, None) => {
+                BucketGroups::Plain(groups.build(id, Stage::Plain, plain)?)
+            }
             (None, Some(prefill), Some(decode)) => BucketGroups::Pd {
-                prefill: groups.build(Stage::Prefill, prefill)?,
-                decode: groups.build(Stage::Decode, decode)?,
+                prefill: groups.build(id, Stage::Prefill, prefill)?,
+                decode: groups.build(id, Stage::Decode, decode)?,
             },
             _ => bail!("bucket {id:?} needs either plain or both prefill and decode"),
         };
@@ -211,7 +215,7 @@ struct Groups<'a> {
 }
 
 impl Groups<'_> {
-    fn build(&mut self, stage: Stage, spec: &GroupSpec) -> Result<EngineGroup> {
+    fn build(&mut self, bucket: &str, stage: Stage, spec: &GroupSpec) -> Result<EngineGroup> {
         let default = match stage {
             Stage::Decode => PolicyKind::PowerOfTwo,
             _ => self.model.policy,
@@ -223,8 +227,25 @@ impl Groups<'_> {
             "bucket groups use power_of_two or --policy, not {kind:?}"
         );
         ensure!(
-            spec.worker_ids.as_ref().is_none_or(|ids| !ids.is_empty()),
-            "bucket group worker_ids must not be empty; omit it for every engine"
+            spec.worker_ids.as_ref().is_none_or(|ids| {
+                !ids.is_empty() && ids.iter().all(|id| !id.0.trim().is_empty())
+            }),
+            "bucket {bucket:?} {stage:?} worker_ids and their values must not be empty; omit it for every engine"
+        );
+        ensure!(
+            spec.worker_ids.is_none() || spec.worker_services.is_none(),
+            "bucket {bucket:?} {stage:?} must use either worker_ids or worker_services"
+        );
+        ensure!(
+            spec.worker_services.as_ref().is_none_or(|services| {
+                !services.is_empty() && services.iter().all(|service| {
+                    service.split_once('/').is_some_and(|(namespace, name)| {
+                        !namespace.trim().is_empty() && !name.trim().is_empty()
+                            && !name.contains('/') && !service.chars().any(char::is_whitespace)
+                    })
+                })
+            }),
+            "bucket {bucket:?} {stage:?} worker_services must be a nonempty list of namespace/service names"
         );
         let defaults = &self.model.reorg_admission;
         let admission = spec
@@ -255,6 +276,7 @@ impl Groups<'_> {
         };
         Ok(EngineGroup {
             worker_ids: spec.worker_ids.clone(),
+            worker_services: spec.worker_services.clone(),
             policy,
         })
     }

@@ -17,7 +17,7 @@
 //!
 //! The handler tries buckets in order, advancing on missing candidates or admission
 //! rejection. Both P/D picks must succeed in the same bucket before dispatch.
-//! [`WorkerRegistry`] owns live workers; groups reference their IDs. Policies own
+//! [`WorkerRegistry`] owns live workers; groups select by ID or Service. Policies own
 //! their load/KV/affinity dependencies and pass selected observations to admission.
 
 use std::collections::HashSet;
@@ -41,8 +41,10 @@ impl TokenLimits {
 
 #[derive(Debug)]
 pub struct EngineGroup {
-    /// `None` includes all registered engines matching the request's model and role.
+    /// Exact identities. Omit both membership fields to include all engines of the role.
     pub worker_ids: Option<HashSet<WorkerId>>,
+    /// Match any named Kubernetes Service (namespace/name), across pod replacements.
+    pub worker_services: Option<HashSet<String>>,
     pub policy: Arc<dyn Policy>,
 }
 
@@ -50,6 +52,7 @@ impl EngineGroup {
     pub fn new(policy: Arc<dyn Policy>) -> Self {
         Self {
             worker_ids: None,
+            worker_services: None,
             policy,
         }
     }
@@ -73,6 +76,11 @@ impl EngineGroup {
                 self.worker_ids
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&engine.id))
+            })
+            .filter(|engine| {
+                self.worker_services
+                    .as_ref()
+                    .is_none_or(|services| engine.matches_services(services))
             })
             .collect()
     }

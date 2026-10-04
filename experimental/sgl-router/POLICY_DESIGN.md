@@ -39,10 +39,11 @@ workers. Group policy instances are reused across requests.
 | `WorkerRegistry` | Live workers, model membership, health, and role |
 | Request handler | Request preparation, ordered bucket attempts, HTTP errors, and dispatch |
 
-`worker_ids: None` means every healthy engine serving the requested model and
-role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
-a catch-all membership group. `BucketGroups::Pd` requires both groups, making
-partial or mixed plain/PD bucket configurations unrepresentable.
+Omitting both `worker_ids` and `worker_services` includes every healthy engine
+serving the requested model and role. Explicit empty membership lists are rejected
+by the config factory. `EngineGroup::new(policy)` creates a catch-all group.
+`BucketGroups::Pd` requires both groups, making partial or mixed plain/PD bucket
+configurations unrepresentable.
 
 ## 1. Code organization
 
@@ -449,7 +450,7 @@ selection or dispatch fails. It must not increment dispatch accounting.
 
 Under `--chat-routing reorg`, `--bucket-config` reads a JSON file of complete
 buckets. Each bucket sets `plain`, or both `prefill` and `decode`; each group may
-set `worker_ids`, `policy` and `admission`.
+set `worker_ids` or `worker_services`, plus `policy` and `admission`.
 
 ```json
 {
@@ -460,15 +461,15 @@ set `worker_ids`, `policy` and `admission`.
       "max_input_tokens": 4096,
       "max_context_tokens": 8192,
       "ttft_ms": 300,
-      "prefill": {"worker_ids": ["P1", "P2"], "admission": {"max_pending_prefill_tokens": 32768}},
-      "decode": {"worker_ids": ["D1", "D2"], "admission": {"max_kv_usage": 0.9}}
+      "prefill": {"worker_services": ["inference/prefill-short"], "admission": {"max_pending_prefill_tokens": 32768}},
+      "decode": {"worker_services": ["inference/decode-short"], "admission": {"max_kv_usage": 0.9}}
     },
     {
       "id": "long-context",
       "rank": 1,
       "max_context_tokens": 131072,
-      "prefill": {"worker_ids": ["P3", "P4"]},
-      "decode": {"worker_ids": ["D3", "D4"]}
+      "prefill": {"worker_services": ["inference/prefill-long"]},
+      "decode": {"worker_services": ["inference/decode-long"]}
     }
   ]
 }
@@ -478,13 +479,28 @@ A request with 4k input tokens and a 16k expected peak cannot fit the short
 bucket's context capacity. It selects the long bucket and both of its P/D groups.
 With a known peak of 8k or less, the same input selects both groups of the short bucket.
 
+Membership has two mutually exclusive forms. `worker_ids` pins exact discovery
+identities: URLs for static discovery, `namespace/pod-UID` for Kubernetes pods.
+`worker_services` lists Kubernetes `namespace/service` names and matches any
+listed Service through its EndpointSlices' `kubernetes.io/service-name` label.
+Service membership survives pod replacement and scale-up; worker IDs still
+change per pod incarnation so breaker, load and affinity state cannot carry over.
+Only Services included by the discovery watch are visible. Multiple slices and
+Services selecting one pod contribute the union of its memberships; removing a
+slice removes only memberships no longer advertised by another slice. Membership
+updates preserve the live worker and its in-flight state. Readiness and routing
+use the same group filter, including model, health and role constraints.
+
 Omitted group fields mean every engine of the group's role and `--policy`
 (power-of-two on decode). Admission limits a group leaves unset take
-`--max-in-flight` / `--max-kv-usage`, field by field. A group policy is
+`--max-in-flight` / `--max-kv-usage`, field by field. JSON `null` also inherits;
+there is no per-group disable value. To limit only some groups, leave the CLI
+default unset and configure those groups explicitly. A group policy is
 `power_of_two` or the `--policy` kind, whose affinity, cache and tokenizer
 settings are the ones resolved. Startup rejects empty or duplicate IDs, a bucket
 that is not exactly plain or P/D, inverted token ranges, a minimum input above
-the context capacity, empty `worker_ids`, non-positive capacity or SLO
+the context capacity, empty membership lists, blank worker IDs, malformed
+Service names, both membership fields together, non-positive capacity or SLO
 estimates, usages outside (0, 1], zero count limits, and a policy a stage cannot
 serve. Without the flag, reorg builds one plain and one P/D bucket
 over all engines. The worker registry still rejects mixed plain and PD engines

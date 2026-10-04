@@ -355,6 +355,14 @@ async fn handle_discovery_event(
                 al.forget_worker(&id);
             }
         }
+        DiscoveryEvent::ServicesChanged { id, services } => {
+            if let Some(prev) = pending.remove(&id) {
+                let _ = prev.await;
+            }
+            if let Some(worker) = registry.get(&id) {
+                worker.set_services(services);
+            }
+        }
         DiscoveryEvent::ModeChanged { id, mode } => {
             if let Some(prev) = pending.remove(&id) {
                 // Same rationale as Removed: wait for the registry
@@ -443,6 +451,7 @@ fn reconcile_unresolved_workers(
             model_ids: worker.model_ids.clone(),
             bootstrap_port: worker.bootstrap_port(),
             version_group: worker.version_group().map(str::to_owned),
+            services: worker.services(),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
@@ -1295,6 +1304,7 @@ mod tests {
             model_ids: vec![model.clone()],
             bootstrap_port: None,
             version_group: Some("v1".into()),
+            services: ["ns/prefill".into()].into(),
         }))
         .await
         .unwrap();
@@ -1317,6 +1327,10 @@ mod tests {
         .unwrap();
         assert_eq!(registry.healthy_workers_for(&model).len(), 1);
         assert_eq!(registry.get(&id).unwrap().version_group(), Some("v1"));
+        assert_eq!(
+            registry.get(&id).unwrap().services(),
+            ["ns/prefill".into()].into()
+        );
         drop(tx);
         manager.await.unwrap();
     }

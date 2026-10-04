@@ -549,6 +549,7 @@ fn pd_spec(
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: port,
         version_group: group.map(str::to_owned),
+        services: Default::default(),
     }
 }
 
