@@ -71,7 +71,10 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_mla_kv_page_table_for_dcp,
+    pack_dcp_verify_rows,
+)
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -1451,6 +1454,127 @@ class AiterAttnBackend(AttentionBackend):
         )
         return out, lse.view(bs, num_heads)
 
+    def _forward_verify_asm_prefix(self, q, layer, k_descale, n_rows, num_heads):
+        """Prefix half of DCP verify, one q_len=1 ASM decode per query row."""
+        qo = getattr(self, "_verify_asm_qo", None)
+        if qo is None:
+            raise RuntimeError(
+                "AITER MLA DCP ASM verify selected without a prefix plan"
+            )
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        q_mla = q.view(n_rows, num_heads, layer.qk_head_dim)
+        q_scale = k_descale
+        if q_mla.dtype != fp8_dtype:
+            q_mla, q_scale = scaled_fp8_quant(q_mla.reshape(n_rows, -1))
+            q_mla = q_mla.view(n_rows, num_heads, layer.qk_head_dim)
+        out = torch.empty(
+            (n_rows, num_heads, layer.v_head_dim),
+            dtype=self.input_dtype,
+            device=q.device,
+        )
+        _, lse = mla_decode_fwd(
+            q_mla,
+            k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+            out,
+            self._verify_asm_qo,
+            self._verify_asm_kv_indptr,
+            self._verify_asm_kv_indices,
+            self._verify_asm_kv_last,
+            1,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            num_kv_splits=self.max_split_per_batch,
+            work_meta_data=self._verify_asm_work_metadata,
+            work_indptr=self._verify_asm_work_indptr,
+            work_info_set=self._verify_asm_work_info_set,
+            reduce_indptr=self._verify_asm_reduce_indptr,
+            reduce_final_map=self._verify_asm_reduce_final_map,
+            reduce_partial_map=self._verify_asm_reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=k_descale,
+            intra_batch_mode=False,
+            return_lse=True,
+        )
+        if lse is None:
+            raise RuntimeError("aiter mla_decode_fwd(return_lse=True) returned no LSE")
+        return out, lse.view(n_rows, num_heads)
+
+    def _plan_dcp_verify_asm_prefix(self, local_kv_lens, token_table, *, graph: bool):
+        """Flatten the repeated prefix table into q_len=1 MLA-ASM metadata."""
+        if not self.use_mla_dcp_asm:
+            return
+        n_rows = int(local_kv_lens.shape[0])
+        cols = int(token_table.shape[1])
+        if graph:
+            qo = self.verify_asm_qo_indptr[: n_rows + 1]
+            kv_indptr = self.verify_asm_kv_indptr[: n_rows + 1]
+            kv_indices = self.verify_asm_kv_indices
+            kv_last = self.verify_asm_kv_last_page_len[:n_rows]
+            work_metadata = self.verify_asm_work_metadata
+            work_indptr = self.verify_asm_work_indptr
+            work_info_set = self.verify_asm_work_info_set
+            reduce_indptr = self.verify_asm_reduce_indptr
+            reduce_final_map = self.verify_asm_reduce_final_map
+            reduce_partial_map = self.verify_asm_reduce_partial_map
+        else:
+            device = local_kv_lens.device
+            qo = torch.arange(n_rows + 1, dtype=torch.int32, device=device)
+            kv_indptr = torch.zeros(n_rows + 1, dtype=torch.int32, device=device)
+            kv_indices = torch.empty(
+                n_rows * cols, dtype=torch.int32, device=device
+            )
+            kv_last = torch.ones(n_rows, dtype=torch.int32, device=device)
+            (
+                work_metadata,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(
+                1,
+                n_rows,
+                metadata_fast_mode=True,
+                metadata_intra_batch_mode=False,
+            )
+        kv_indptr.zero_()
+        if n_rows:
+            torch.cumsum(local_kv_lens, dim=0, out=kv_indptr[1:])
+        if n_rows and cols:
+            pack_dcp_verify_rows[(n_rows, triton.cdiv(cols, 128))](
+                token_table,
+                local_kv_lens,
+                kv_indptr,
+                kv_indices,
+                token_table.stride(0),
+                BLOCK=128,
+            )
+        self.make_mla_meta_data(
+            qo,
+            kv_indptr,
+            kv_last,
+            work_metadata,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            1,
+            fast_mode=True,
+            max_split_per_batch=self.max_split_per_batch,
+            intra_batch_mode=False,
+        )
+        self._verify_asm_qo = qo
+        self._verify_asm_kv_indptr = kv_indptr
+        self._verify_asm_kv_indices = kv_indices
+        self._verify_asm_kv_last = kv_last
+        self._verify_asm_work_metadata = work_metadata
+        self._verify_asm_work_indptr = work_indptr
+        self._verify_asm_work_info_set = work_info_set
+        self._verify_asm_reduce_indptr = reduce_indptr
+        self._verify_asm_reduce_final_map = reduce_final_map
+        self._verify_asm_reduce_partial_map = reduce_partial_map
+
     def _forward_verify_dcp(self, q, k_window, layer, k_descale):
         """Attend the committed prefix and the verify window separately, then
         merge -> (out, natural-log lse).
@@ -1465,19 +1589,26 @@ class AiterAttnBackend(AttentionBackend):
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
 
-        out_a, lse_a = mla_gluon_decode(
-            q=q.view(n_rows, num_heads, layer.qk_head_dim),
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            layer=layer,
-            kv_indices=fm.verify_token_table,
-            kv_indptr=seqused_k,
-            sm_scale=layer.scaling,
-            kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
-            min_kv_seq_len=1,
-            return_lse=True,
-            use_2d_view=True,
-        )
-        lse_a = lse_a.view(n_rows, num_heads)
+        if self.use_mla_dcp_asm:
+            # Prefix rows are independent q_len=1 decodes. The window below
+            # still needs the global-position mask, which this kernel cannot do.
+            out_a, lse_a = self._forward_verify_asm_prefix(
+                q, layer, k_descale, n_rows, num_heads
+            )
+        else:
+            out_a, lse_a = mla_gluon_decode(
+                q=q.view(n_rows, num_heads, layer.qk_head_dim),
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                layer=layer,
+                kv_indices=fm.verify_token_table,
+                kv_indptr=seqused_k,
+                sm_scale=layer.scaling,
+                kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                min_kv_seq_len=1,
+                return_lse=True,
+                use_2d_view=True,
+            )
+            lse_a = lse_a.view(n_rows, num_heads)
 
         # The verify window arrives as `k_window`, computed this forward and
         # identical on every rank, so only one rank attends it; the others
@@ -1951,6 +2082,9 @@ class AiterAttnBackend(AttentionBackend):
                         bs,
                         draft_num,
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
+                    )
+                    self._plan_dcp_verify_asm_prefix(
+                        local_kv_lens, verify_token_table, graph=False
                     )
 
                 if _use_mla_ps_kernel and self.dcp_world_size <= 1:
@@ -2449,6 +2583,38 @@ class AiterAttnBackend(AttentionBackend):
                 metadata_fast_mode=metadata_fast_mode,
                 metadata_intra_batch_mode=metadata_intra_batch_mode,
             )
+            if self.use_mla_dcp_asm and self.num_draft_tokens:
+                n_verify_rows = max_bs * self.num_draft_tokens
+                max_local = max(self._get_dcp_graph_max_local_kv_len(), 1)
+                self.verify_asm_qo_indptr = torch.arange(
+                    n_verify_rows + 1, dtype=torch.int32, device=self.device
+                )
+                self.verify_asm_kv_indptr = torch.zeros(
+                    n_verify_rows + 1, dtype=torch.int32, device=self.device
+                )
+                self.verify_asm_kv_indices = torch.empty(
+                    n_verify_rows * max_local, dtype=torch.int32, device=self.device
+                )
+                self.verify_asm_kv_last_page_len = torch.ones(
+                    n_verify_rows, dtype=torch.int32, device=self.device
+                )
+                (
+                    self.verify_asm_work_metadata,
+                    self.verify_asm_work_indptr,
+                    self.verify_asm_work_info_set,
+                    self.verify_asm_reduce_indptr,
+                    self.verify_asm_reduce_final_map,
+                    self.verify_asm_reduce_partial_map,
+                ) = self.make_mla_decode_meta_data_buffer(
+                    1,
+                    n_verify_rows,
+                    metadata_fast_mode=True,
+                    metadata_intra_batch_mode=False,
+                )
+                logger.info(
+                    "DCP verify prefix uses MLA ASM as q_len=1 rows (max %s)",
+                    n_verify_rows,
+                )
 
         else:
             self.work_metadata = None
@@ -2731,6 +2897,9 @@ class AiterAttnBackend(AttentionBackend):
                     self._get_dcp_graph_max_local_kv_len(),
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
+                )
+                self._plan_dcp_verify_asm_prefix(
+                    local_kv_lens, verify_token_table, graph=True
                 )
 
             if self.use_mla:
