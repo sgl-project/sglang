@@ -173,38 +173,53 @@ def _make_quant_config(name: str, **attrs):
 
 class TestTransformerQuantHelpers(unittest.TestCase):
     def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
-        method = ModelOptFp8LinearMethod(
-            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        )
-        method.cutlass_fp8_supported = True
-        layer = torch.nn.Module()
-        layer.logical_widths = [2, 2, 2]
-        weight = (
-            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
-        )
-        layer.register_parameter(
-            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
-        )
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(
-                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
-                requires_grad=False,
-            ),
-        )
-        layer.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
-        )
+        for fnuz in (False, True):
+            with (
+                self.subTest(fnuz=fnuz),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization."
+                    "modelopt_quant.is_fp8_fnuz",
+                    return_value=fnuz,
+                ),
+            ):
+                method = ModelOptFp8LinearMethod(
+                    ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+                )
+                method.cutlass_fp8_supported = True
+                layer = torch.nn.Module()
+                layer.logical_widths = [2, 2, 2]
+                values = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+                values[0, 0] = -0.0
+                weight = values.to(torch.float8_e4m3fn)
+                scales = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+                layer.register_parameter(
+                    "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+                )
+                layer.register_parameter(
+                    "weight_scale",
+                    torch.nn.Parameter(scales.clone(), requires_grad=False),
+                )
+                layer.register_parameter(
+                    "input_scale",
+                    torch.nn.Parameter(torch.ones(3), requires_grad=False),
+                )
 
-        method.process_weights_after_loading(layer)
+                method.process_weights_after_loading(layer)
 
-        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
-        torch.testing.assert_close(
-            layer.weight_scale,
-            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
-        )
-        torch.testing.assert_close(layer.input_scale, torch.tensor(1.0))
+                factor = 2 if fnuz else 1
+                expected_dtype = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
+                self.assertEqual(layer.weight.dtype, expected_dtype)
+                expected_scales = scales.repeat_interleave(2).view(-1, 1)
+                torch.testing.assert_close(layer.weight_scale, expected_scales * factor)
+                torch.testing.assert_close(
+                    layer.input_scale, torch.tensor(float(factor))
+                )
+                torch.testing.assert_close(
+                    layer.weight.t().float() * layer.weight_scale,
+                    weight.float() * expected_scales,
+                    atol=0,
+                    rtol=0,
+                )
 
     def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
         method = ModelOptFp8LinearMethod(

@@ -101,15 +101,9 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_full_tokens()
             total = ps.full_capacity
         elif self.is_hybrid_ssm:
-            # Branch on cache type for the protected accessor (a mamba-capable
-            # cache splits full/mamba; ChunkCache only has the single protected_size).
-            # Use the allocator's `.size` for `total`: static max_total_num_tokens for
-            # non-unified pools, the dynamic byte-coordinated cap (matching
-            # `available_size`) for the unified pool.
-            if self.tree_cache.supports_mamba():
-                protected = self.tree_cache.full_protected_size()
-            else:
-                protected = self.tree_cache.protected_size()
+            # `total` is the allocator's `.size`: static for non-unified pools,
+            # the byte-coordinated cap (matching `available_size`) for the unified pool.
+            protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.req_to_token_pool.schedulable_token_capacity(
                 self.token_to_kv_pool_allocator.size
@@ -524,7 +518,7 @@ class SchedulerInvariantChecker:
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
             return
         if (
-            self.tree_cache.is_tree_cache()
+            self.tree_cache.supports_prefix_sharing()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
             or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
