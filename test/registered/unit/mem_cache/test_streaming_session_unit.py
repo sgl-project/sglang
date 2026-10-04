@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -12,9 +13,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -438,6 +441,55 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
         if component == ComponentType.SWA
         else [list(range(32, 64))]
     )
+
+
+class TestStreamingSessionMambaSlots(CustomTestCase):
+    def _make_session(self, *, lazy):
+        pool = _FakeReqToTokenPool(torch.arange(128).reshape(1, 128))
+        pool.mamba_allocator = MambaSlotAllocator(size=8, device="cpu")
+        pool.enable_mamba_extra_buffer_lazy = lazy
+        pool.mamba_ping_pong_track_buffer_size = 2
+        pool.get_mamba_ping_pong_other_idx = lambda idx: 1 - idx
+        req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
+        req.kv.mamba_pool_idx = pool.mamba_allocator.alloc(1)[0]
+        HybridReqToTokenPool._alloc_ping_pong_buffer(pool, req)
+        cache = StreamingSession(_FakeInnerCache(pool, _FakeAllocator(), 1))
+        return cache, req, pool.mamba_allocator
+
+    def test_held_slots_exclude_unallocated_lazy_buffer(self):
+        """An idle session must account for only the slots removed from the pool."""
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                cache, req, allocator = self._make_session(lazy=lazy)
+                release_kv_cache(req, cache)
+                self.assertEqual(
+                    allocator.available_size() + cache.session_held_mamba_slots(),
+                    allocator.size,
+                )
+                self.assertEqual(cache.session_held_mamba_slots({0}), 0)
+
+    def test_close_and_abort_do_not_return_lazy_sentinel_to_pool(self):
+        """Closing or aborting a session must not make -1 allocatable."""
+        for lazy in (False, True):
+            for finish in ("close", "first_abort", "resumed_abort"):
+                with self.subTest(lazy=lazy, finish=finish):
+                    cache, req, allocator = self._make_session(lazy=lazy)
+                    if finish != "first_abort":
+                        release_kv_cache(req, cache)
+                    if finish == "close":
+                        cache.release_session("session-a")
+                    else:
+                        if finish == "resumed_abort":
+                            cache.slots["session-a"].restore_to_req(req)
+                        req.finished_reason = FINISH_ABORT("cancelled")
+                        release_kv_cache(req, cache)
+                    cache.release_session("session-a")
+                    self.assertEqual(cache.session_held_mamba_slots(), 0)
+                    self.assertEqual(allocator.available_size(), allocator.size)
+                    self.assertEqual(
+                        sorted(allocator.alloc(allocator.size).tolist()),
+                        list(range(1, allocator.size + 1)),
+                    )
 
 
 if __name__ == "__main__":
