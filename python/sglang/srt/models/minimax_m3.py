@@ -28,9 +28,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -149,6 +146,17 @@ if _is_npu:
         process_shared_expert,
         wait_share_stream,
     )
+
+_aiter = None
+_has_aiter_fused_qknorm = False
+if _is_hip and envs.SGLANG_USE_AITER.get():
+    try:
+        import aiter as _aiter
+
+        _has_aiter_fused_qknorm = hasattr(_aiter, "fused_qknorm_idxrqknorm")
+    except ImportError:
+        _aiter = None
+        _has_aiter_fused_qknorm = False
 
 logger = logging.getLogger(__name__)
 
@@ -315,15 +323,10 @@ class MiniMaxM3MLP(nn.Module):
         self,
         x,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -432,22 +435,13 @@ class MiniMaxM3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_deepep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
 
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
@@ -470,9 +464,6 @@ class MiniMaxM3MoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -794,6 +785,23 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
             and self.index_rotary_emb is self.rotary_emb
         )
+        self._aiter_cos_sin_cache = None
+        self._can_use_aiter_fused_qknorm_static = (
+            self.is_sparse_attention_layer
+            and self.disable_index_value
+            and _has_aiter_fused_qknorm
+            and envs.SGLANG_M3_USE_AITER_FUSED_QKNORM.get()
+            and self.qk_norm_type == "per_head"
+            and self.use_gemma_norm
+            and self.head_dim == 128
+            and self.idx_head_dim == 128
+            and self.rotary_dim <= self.head_dim
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.index_rotary_emb is self.rotary_emb
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and self.index_q_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
+        )
 
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
@@ -1023,6 +1031,158 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    def _get_aiter_cos_sin_cache(self, packed_qkv: torch.Tensor) -> torch.Tensor:
+        source = self.rotary_emb.cos_sin_cache
+        cached = self._aiter_cos_sin_cache
+        if (
+            cached is not None
+            and cached.dtype == packed_qkv.dtype
+            and cached.device == packed_qkv.device
+            and cached.shape == source.shape
+        ):
+            return cached
+
+        cached = source.to(
+            device=packed_qkv.device, dtype=packed_qkv.dtype
+        ).contiguous()
+        if not torch.compiler.is_compiling():
+            self._aiter_cos_sin_cache = cached
+        return cached
+
+    def _aiter_sparse_qknorm_cache(
+        self,
+        packed_qkv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+        ]
+    ]:
+        """Run AITER's packed MiniMax-M3 producer with SGLang cache semantics.
+
+        The SGLang contract is page-major NHD storage, unit-scale main FP8, and
+        a BF16 index-K cache. The sparse attention consumer reads those caches
+        directly, so K/V/index-K tensor outputs are intentionally left raw and
+        must not be stored a second time by the backend.
+        """
+        if not self._can_use_aiter_fused_qknorm_static:
+            return None
+
+        kv_pool = self._get_sparse_kv_pool()
+        main_pool = getattr(kv_pool, "main_pool", None)
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if (
+            kv_pool is None
+            or main_pool is None
+            or getattr(main_pool, "kv_cache_layout", None) != "nhd"
+            or out_cache_loc is None
+            or positions.dim() != 1
+            or positions.dtype != torch.int64
+            or not positions.is_contiguous()
+            or out_cache_loc.dim() != 1
+            or out_cache_loc.dtype != torch.int64
+            or not out_cache_loc.is_contiguous()
+            or packed_qkv.dim() != 2
+            or packed_qkv.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            return None
+
+        num_tokens = packed_qkv.shape[0]
+        expected_width = (
+            self.num_heads + 2 * self.num_kv_heads + self.num_idx_heads + 1
+        ) * self.head_dim
+        if (
+            packed_qkv.shape[1] != expected_width
+            or positions.shape[0] < num_tokens
+            or out_cache_loc.shape[0] < num_tokens
+        ):
+            return None
+
+        layer_id = self.attn.layer_id
+        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
+        page_size = int(kv_pool.page_size)
+        if (
+            page_size <= 0
+            or k_cache.dim() != 3
+            or v_cache.dim() != 3
+            or idx_k_cache.dim() != 3
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+            or not idx_k_cache.is_contiguous()
+            or k_cache.shape != v_cache.shape
+            or k_cache.shape[1:] != (self.num_kv_heads, self.head_dim)
+            or idx_k_cache.shape[1:] != (1, self.idx_head_dim)
+            or k_cache.shape[0] % page_size != 0
+            or idx_k_cache.dtype != packed_qkv.dtype
+        ):
+            return None
+
+        fp8_e4m3_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        if k_cache.dtype in fp8_e4m3_dtypes:
+            kv_cache_dtype = "fp8_e4m3_unit"
+        elif k_cache.dtype == packed_qkv.dtype:
+            kv_cache_dtype = "auto"
+        else:
+            return None
+
+        num_blocks = k_cache.shape[0] // page_size
+        k_cache_pages = k_cache.view(
+            num_blocks, page_size, self.num_kv_heads, self.head_dim
+        )
+        v_cache_pages = v_cache.view(
+            num_blocks, page_size, self.num_kv_heads, self.head_dim
+        )
+        q_out = torch.empty(
+            (num_tokens, self.q_size),
+            dtype=packed_qkv.dtype,
+            device=packed_qkv.device,
+        )
+        idx_q_out = torch.empty(
+            (num_tokens, self.num_idx_heads * self.idx_head_dim),
+            dtype=packed_qkv.dtype,
+            device=packed_qkv.device,
+        )
+
+        _aiter.fused_qknorm_idxrqknorm(
+            packed_qkv.contiguous(),
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self._get_aiter_cos_sin_cache(packed_qkv),
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight.data,
+            self.index_k_norm.weight.data,
+            self.num_idx_heads,
+            out_cache_loc,
+            k_cache_pages,
+            v_cache_pages,
+            idx_k_cache,
+            page_size,
+            q_out,
+            idx_q_out,
+            out_cache_loc,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype="auto",
+            asm_layout=False,
+        )
+
+        main_qkv = packed_qkv[:, : self._fused_main_size]
+        _, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        idx_qkv = packed_qkv[:, self._fused_main_size :]
+        _, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+        self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+        return q_out, k, v, idx_q_out, idx_k, idx_v
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1126,6 +1286,14 @@ class MiniMaxM3Attention(nn.Module):
         if self._fused_qkv_index is not None:
             fused_out = self.fused_qkv_index_proj(hidden_states)
             qkv = fused_out[:, : self._fused_main_size]
+
+            aiter_prepared = self._aiter_sparse_qknorm_cache(
+                fused_out, positions, forward_batch
+            )
+            if aiter_prepared is not None:
+                q, k, v, idx_q, idx_k, idx_v = aiter_prepared
+                inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+                return None, forward_batch, inner_state
 
             if self._combined_qknorm_ok:
                 from sglang.kernels.ops.attention.minimax_qknorm_rope import (
@@ -1325,6 +1493,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 intermediate_size=config.dense_intermediate_size,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
@@ -1393,15 +1562,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.is_layer_sparse or hidden_states.shape[0] != 0:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch=forward_batch,
-                    should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
-                    use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
-                )
-        return ffn_exit.finish(hidden_states)
+        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class MiniMaxM3Model(nn.Module):

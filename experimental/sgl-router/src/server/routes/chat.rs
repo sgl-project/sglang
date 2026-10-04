@@ -218,11 +218,25 @@ async fn select_workers(
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
+    record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
+}
+
+/// Credit the chosen prefill with the prompt's prefix until KV events confirm
+/// it. Called only once the whole selection succeeded, so a request that is
+/// never dispatched credits nobody.
+fn record_prefill_route(
+    ctx: &AppContext,
+    signal: Option<&ExternalPrefixSignal>,
+    prefill_url: &str,
+) {
+    if let (Some(provider), Some(signal)) = (&ctx.radix_tree_prefix_provider, signal) {
+        provider.record_route(signal, prefill_url);
+    }
 }
 
 /// Keep prefills whose version group has a decode that fits this request, so a
@@ -422,6 +436,7 @@ async fn lookup_prefix_matches(
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.

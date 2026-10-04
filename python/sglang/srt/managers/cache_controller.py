@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -51,7 +52,7 @@ device_module = get_device_module()
 
 
 def storage_model_name(
-    model_name: Optional[str], host_pool: HostKVCache
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
 ) -> Optional[str]:
     """The model name storage backends key pages on, tagged with the host
     pool's page format when it has one of its own."""
@@ -704,17 +705,15 @@ class HiCacheController:
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
 
+        parallel = get_parallel()
         if is_dp_attention_enabled():
-            self.tp_rank = get_parallel().attn_tp_rank
-            self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_parallel().attn_dp_rank
+            tp_rank = parallel.attn_tp_rank
+            tp_size = parallel.attn_tp_size
+            dp_rank = parallel.attn_dp_rank
         else:
-            self.tp_rank = get_parallel().tp_rank
-            self.tp_size = get_parallel().tp_size
-            self.dp_rank = 0
-
-        self.pp_rank = get_parallel().pp_rank
-        self.pp_size = get_parallel().pp_size
+            tp_rank = parallel.tp_rank
+            tp_size = parallel.tp_size
+            dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -731,23 +730,23 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
+            assert tp_lcm_size % tp_size == 0, (
                 "tp_lcm_size must be divisible by tp_size."
             )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
-                and tp_lcm_size > self.tp_size
+                and tp_lcm_size > tp_size
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
@@ -757,7 +756,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
-            dp_rank=self.dp_rank,
+            dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
         )
 

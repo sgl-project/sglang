@@ -89,14 +89,68 @@ class TestAttnDpSize(CustomTestCase):
                 "replicas combined with attention data parallelism",
             ),
             (
-                {"tp_size": 4, "attn_dp_size": 2, "enable_dp_attention": True},
-                "pass --attn-dp-size alone",
+                {
+                    "tp_size": 4,
+                    "dp_size": 2,
+                    "attn_dp_size": 2,
+                    "enable_dp_attention": True,
+                },
+                "replicas combined with attention data parallelism",
             ),
             ({"tp_size": 2, "attn_dp_size": 0}, "must be positive"),
         ):
             with self.subTest(**fields):
                 with self.assertRaisesRegex(ValueError, message):
                     self.resolve(**fields)
+
+    def test_the_deprecated_flag_next_to_attn_dp_size_is_redundant(self):
+        both = self.resolve(tp_size=4, attn_dp_size=2, enable_dp_attention=True)
+        new = self.resolve(tp_size=4, attn_dp_size=2)
+        self.assertEqual(self.layout(both), (1, 2, False))
+        self.assertEqual(both.resolved_dict(), new.resolved_dict())
+
+    def test_the_readback_reports_the_deprecated_field_as_attention_dp(self):
+        for fields, attention_dp in (
+            ({"tp_size": 4, "attn_dp_size": 2}, True),
+            ({"tp_size": 4, "dp_size": 2, "enable_dp_attention": True}, True),
+            ({"tp_size": 4, "dp_size": 2}, False),
+            ({"tp_size": 4}, False),
+        ):
+            with self.subTest(**fields):
+                server_args = self.resolve(**fields)
+                self.assertFalse(resolution_result(server_args, "enable_dp_attention"))
+                readback = server_args.resolved_dict()
+                self.assertIs(readback["enable_dp_attention"], attention_dp)
+                # A read-back config resolves to the same layout.
+                again = self.resolve(
+                    **{
+                        name: readback[name]
+                        for name in (
+                            "tp_size",
+                            "dp_size",
+                            "attn_dp_size",
+                            "enable_dp_attention",
+                        )
+                    }
+                )
+                self.assertEqual(self.layout(again), self.layout(server_args))
+
+    def test_the_readback_reports_the_width_not_the_joiner_arm(self):
+        """`attn_dp_enabled` is also true for an elastic scale joiner at width
+        one. The readback reports the configured width instead, so a joiner's
+        replicas are not folded into attention-DP groups when it is read back."""
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.runtime_context import attn_dp_enabled_of
+
+        joiner = ServerArgs(
+            model_path="dummy", tp_size=2, dp_size=2, ep_join_mode="scale"
+        )
+        joiner.resolve_once()
+        self.assertTrue(attn_dp_enabled_of(resolving_view(joiner)))
+        readback = joiner.resolved_dict()
+        self.assertFalse(readback["enable_dp_attention"])
+        self.assertEqual(readback["dp_size"], 2)
+        self.assertEqual(readback["attn_dp_size"], 1)
 
     def test_both_cli_spellings_parse(self):
         parser = argparse.ArgumentParser()

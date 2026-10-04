@@ -1191,7 +1191,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
         reclaim_plan = self.reclaim_plan(
@@ -1231,6 +1231,57 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             ):
                 return 0
             return fa.flush_opportunistic() + sa.flush_opportunistic()
+
+    def resize(self, config) -> None:
+        """Synchronize allocator capacity after the shared pool is finalized."""
+        if not self.unified_buffer.post_capture_active:
+            raise RuntimeError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires post-capture backing"
+            )
+        final_pool_bytes = config.unified_memory_pool_bytes
+        if final_pool_bytes is None:
+            raise ValueError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires "
+                "config.unified_memory_pool_bytes"
+            )
+        if int(final_pool_bytes) != self.unified_buffer.total_bytes:
+            raise RuntimeError(
+                "UnifiedKVPool.finalize_backing must run before allocator.resize: "
+                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
+                f"{self.unified_buffer.total_bytes} bytes"
+            )
+        for allocator in (self.full_attn_allocator, self.swa_attn_allocator):
+            if allocator.allocated_count() != 0 or allocator._pending_reuse:
+                raise RuntimeError(
+                    f"cannot resize non-empty unified allocator "
+                    f"{allocator.sub_pool_name!r}"
+                )
+        self.full_attn_allocator._set_capacity(self.unified_buffer.max_slots("full"))
+        self.swa_attn_allocator._set_capacity(
+            self.unified_buffer.max_slots("swa"),
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
+        )
+        self._empty_shared_gap_bytes = self.full_attn_allocator._current_gap_bytes()
+        self._size_full = self.full_attn_allocator.available_size()
+        self._size_swa = min(
+            self.swa_attn_allocator.available_size(),
+            len(self.full_attn_allocator.free_virtual_ids) * self.page_size,
+        )
+        self._full_max_total_num_tokens = self._size_full
+        self._swa_max_total_num_tokens = self._size_swa
+        self._kvcache.size = self.full_attn_allocator.max_slots - 1
+        self._kvcache.size_swa = self.swa_attn_allocator.max_slots - 1
+        for allocator, pool, host_capacity in (
+            (self.full_attn_allocator, self._kvcache.full_kv_pool, self._size_full),
+            (self.swa_attn_allocator, self._kvcache.swa_kv_pool, self._size_swa),
+        ):
+            pool._num_pages = allocator.num_pages
+            pool.size = allocator.num_pages * self.page_size - self.page_size
+            pool.host_capacity_tokens = host_capacity
+            pool.host_capacity_bytes = (
+                host_capacity
+                * self.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
+            )
 
 
 class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):

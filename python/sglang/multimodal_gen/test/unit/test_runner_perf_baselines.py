@@ -12,7 +12,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 
 @pytest.mark.parametrize(
     "runner",
-    ["b200-fin03-4-4567", "b200-cirrascale2", "b200-cirrascale4-0123", "unknown", ""],
+    ["b200-fin03-4-4567", "b200-cirrascale2", "unknown", ""],
 )
 def test_default_runner_baseline(monkeypatch, runner):
     monkeypatch.setenv("RUNNER_NAME", runner)
@@ -29,8 +29,11 @@ def test_default_runner_baseline(monkeypatch, runner):
     [
         ("b200-di01-4567", 1334.16, 16126.87),
         ("b200-cirrascale1-0123", 1574.32, 17742.04),
+        ("b200-cirrascale1-4567", 1574.32, 17742.04),
         ("b200-cirrascale3-0123", 1470.24, 17894.49),
         ("b200-cirrascale3-4567", 1471.19, 17346.65),
+        ("b200-cirrascale4-0123", 1470.24, 17894.49),
+        ("b200-cirrascale4-4567", 1471.19, 17346.65),
     ],
 )
 def test_runner_override_preserves_other_metrics(monkeypatch, runner, flux, qwen):
@@ -58,8 +61,11 @@ def test_runner_override_preserves_other_metrics(monkeypatch, runner, flux, qwen
         "b200-di01-4567",
         "b200-fin03-4-4567",
         "b200-cirrascale1-0123",
+        "b200-cirrascale1-4567",
         "b200-cirrascale3-0123",
         "b200-cirrascale3-4567",
+        "b200-cirrascale4-0123",
+        "b200-cirrascale4-4567",
     ],
 )
 def test_runner_baseline_enforces_e2e_boundary(monkeypatch, runner):
