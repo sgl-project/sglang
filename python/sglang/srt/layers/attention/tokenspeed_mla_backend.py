@@ -44,6 +44,7 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_without_rope_for_fp8,
 )
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -63,6 +64,56 @@ if is_flashinfer_available():
 
 if is_tokenspeed_mla_available():
     import tokenspeed_mla
+
+    if envs.SGLANG_TOKENSPEED_MLA_SPLIT_KV_TARGET.get() > 0:
+        import functools
+
+        import tokenspeed_mla.mla_decode as _ts_decode
+
+        _ts_split_kv_and_workspace = _ts_decode._get_split_kv_and_workspace_size
+
+        @functools.cache
+        def _split_kv_and_workspace_for_target(
+            B,
+            q_len,
+            H,
+            kv_lora_rank,
+            max_active_blocks,
+            max_seq_len,
+            torch_dtype,
+            mma_qk_tiler_mn,
+        ):
+            # The M128 path splits each request's KV into min(SMs // B // 2, 32)
+            # parts whatever the lengths, so from ~37 requests each request is
+            # read by one CTA pair and a step waits for the longest context.
+            split_kv, workspace_size = _ts_split_kv_and_workspace(
+                B,
+                q_len,
+                H,
+                kv_lora_rank,
+                max_active_blocks,
+                max_seq_len,
+                torch_dtype,
+                mma_qk_tiler_mn,
+            )
+            if mma_qk_tiler_mn[0] != 128:
+                return split_kv, workspace_size
+            target = envs.SGLANG_TOKENSPEED_MLA_SPLIT_KV_TARGET.get()
+            # The backend's workspace holds num_sms * _TOKENSPEED_MAX_Q_LEN rows.
+            max_split = max_active_blocks * _TOKENSPEED_MAX_Q_LEN // (B * q_len)
+            wanted = min(32, max_split, max(split_kv, -(-target // (B * q_len))))
+            if wanted <= split_kv:
+                return split_kv, workspace_size
+            return (
+                wanted,
+                _ts_decode.BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+                    H, q_len, kv_lora_rank, B, wanted, _ts_decode.cutlass.Float32
+                ),
+            )
+
+        _ts_decode._get_split_kv_and_workspace_size = (
+            _split_kv_and_workspace_for_target
+        )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

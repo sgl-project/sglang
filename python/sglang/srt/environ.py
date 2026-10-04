@@ -1158,6 +1158,10 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    # tokenspeed_mla decode, M128 path: split each request's KV so that batch size
+    # x split_kv reaches this target (at most 32 splits, within the workspace).
+    # 0 keeps the kernel's split, which is 1 from ~37 requests on.
+    SGLANG_TOKENSPEED_MLA_SPLIT_KV_TARGET = EnvInt(0)
     # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
