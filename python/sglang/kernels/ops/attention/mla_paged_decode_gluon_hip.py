@@ -51,7 +51,7 @@ def qualified_k3_mla_backend(backend, model_runner) -> bool:
         and backend.use_mla
         and backend.dcp_size == 1
         and backend.page_size == 1
-        and getattr(backend, "_translate_kv_loc", None) is None
+        and not model_runner.kv_index_translator.is_translating
         and backend.max_context_len == 1048576
         and not backend.enable_deterministic
         and not model_runner.is_draft_worker
@@ -59,7 +59,6 @@ def qualified_k3_mla_backend(backend, model_runner) -> bool:
         and not getattr(server_args, "speculative_algorithm", None)
         and get_parallel().attn_tp_size == 8
         and backend.num_head == 12
-        and backend.num_kv_head == 1
         and model_runner.kv_cache_dtype == torch.float8_e4m3fn
         and (
             model_config.qk_nope_head_dim,

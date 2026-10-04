@@ -63,6 +63,56 @@ class TestMlaPagedDecode(unittest.TestCase):
         for rows in (0, 3, 10, 20, 48, 257):
             self.assertIsNone(adapter.entrypoint_name(rows))
 
+    def test_backend_qualification_uses_mla_cache_contract(self):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=("KimiK3ForConditionalGeneration",)
+            ),
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            kv_lora_rank=512,
+            v_head_dim=128,
+        )
+        model_runner = SimpleNamespace(
+            model_config=model_config,
+            gpu_id=0,
+            kv_index_translator=SimpleNamespace(is_translating=False),
+            is_draft_worker=False,
+            kv_cache_dtype=torch.float8_e4m3fn,
+        )
+        backend = SimpleNamespace(
+            use_mla=True,
+            dcp_size=1,
+            page_size=1,
+            max_context_len=1048576,
+            enable_deterministic=False,
+            num_head=12,
+            # Generic config heads are not MLA latent-cache heads. Kimi-K3
+            # reports 96 checkpoint KV heads, or 12 per TP8 rank, while the
+            # absorbed MLA cache contract checked by covered() has one head.
+            num_kv_head=12,
+        )
+        with (
+            mock.patch.object(adapter, "is_hip", return_value=True),
+            mock.patch.object(adapter, "_has_required_gluon_api", return_value=True),
+            mock.patch.object(adapter, "_rocm_arch", return_value="gfx950"),
+            mock.patch.object(
+                adapter,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=8),
+            ),
+            mock.patch.object(
+                adapter,
+                "get_server_args",
+                return_value=SimpleNamespace(
+                    enable_lora=False, speculative_algorithm=None
+                ),
+            ),
+        ):
+            self.assertTrue(adapter.qualified_k3_mla_backend(backend, model_runner))
+            model_runner.kv_index_translator.is_translating = True
+            self.assertFalse(adapter.qualified_k3_mla_backend(backend, model_runner))
+
     def test_runtime_contract_rejects_semantic_changes(self):
         inputs = make_inputs(2)
         backend = SimpleNamespace(max_context_len=1048576)
