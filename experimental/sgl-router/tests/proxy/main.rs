@@ -27,6 +27,7 @@ mod pd_pool_isolation;
 mod pd_protocol_binding;
 mod radix_tree_routing;
 mod reorg_launch;
+mod rerank_routing;
 mod roundrobin_input_ids;
 mod sampling_overrides;
 mod shared_prefill_admission;
