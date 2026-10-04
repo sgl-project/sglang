@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _ceil_ue8m0_exp,
+    _fp4_e2m1_code_rne,
     quantize_fp4_indexer_row,
     quantize_fp4_indexer_tensor,
 )
@@ -639,25 +641,38 @@ def _quantize_fp4_query_flydsl_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
 ):
-    """One program per (token, head slot of 64): quantize_fp4_indexer_row (RNE codes) with
-    the e8m0 byte of chunk c stored straight into the FlyDSL scale layout
-    [t, 0, c, h % 16, h // 16]; head slots past HEADS write zero bytes."""
+    """One program per (token, group of 16 heads), with the math of quantize_fp4_indexer_row
+    (RNE codes); the e8m0 byte of head h, chunk c goes straight into the FlyDSL scale layout
+    [t, 0, c, h % 16, h // 16]; head slots past HEADS get zero bytes."""
     token_id = tl.program_id(0)
-    h = tl.program_id(1)
-    scale_base = q_scale + token_id * (4 * 16 * 4) + (h % 16) * 4 + h // 16
-    chunks = tl.arange(0, 4)
-    if h >= HEADS:
-        tl.store(scale_base + chunks * (16 * 4), tl.zeros([4], dtype=tl.uint8))
-        return
-    row = token_id * HEADS + h
-    values = tl.load(x + row * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.float32)
-    v0, v1 = tl.split(tl.reshape(values, (BLOCK_N // 2, 2)))
-    packed, packed_sf = quantize_fp4_indexer_row(
-        values, v0, v1, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N, RNE=True
+    head_group = tl.program_id(1)
+    CHUNKS: tl.constexpr = BLOCK_N // GROUP_N
+    # one row of GROUP_N values per (head, chunk)
+    rows = head_group * 16 * CHUNKS + tl.arange(0, 16 * CHUNKS)
+    group = token_id * HEADS * CHUNKS + rows
+    offs = tl.arange(0, GROUP_N)
+    values = tl.load(x + group[:, None] * GROUP_N + offs[None, :]).to(tl.float32)
+    exp = _ceil_ue8m0_exp(tl.maximum(tl.max(tl.abs(values), axis=1) / 6.0, 1.0e-4))
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    v0, v1 = tl.split(
+        tl.reshape(values / scale[:, None], (16 * CHUNKS, GROUP_N // 2, 2))
     )
-    sf_bytes = ((packed_sf >> (8 * chunks)) & 0xFF).to(tl.uint8)
-    tl.store(scale_base + chunks * (16 * 4), sf_bytes)
-    tl.store(x_fp4 + row * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2), packed)
+    packed = (_fp4_e2m1_code_rne(v0) & 0x0F) | ((_fp4_e2m1_code_rne(v1) & 0x0F) << 4)
+    tl.store(
+        x_fp4 + group[:, None] * (GROUP_N // 2) + tl.arange(0, GROUP_N // 2)[None, :],
+        packed,
+    )
+    scale_base = q_scale + token_id * (CHUNKS * 16 * 4)
+    h, c = rows // CHUNKS, rows % CHUNKS
+    tl.store(scale_base + c * (16 * 4) + (h % 16) * 4 + h // 16, exp.to(tl.uint8))
+    if HEADS < 64:
+        slots = tl.arange(0, 64 * CHUNKS)
+        h, c = slots // CHUNKS, slots % CHUNKS
+        tl.store(
+            scale_base + c * (16 * 4) + (h % 16) * 4 + h // 16,
+            tl.zeros([64 * CHUNKS], dtype=tl.uint8),
+            mask=(h >= HEADS) & (head_group == 0),
+        )
 
 
 def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -675,7 +690,7 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
     q_scale = torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
     if num_tokens > 0:
-        _quantize_fp4_query_flydsl_kernel[(num_tokens, 64)](
+        _quantize_fp4_query_flydsl_kernel[(num_tokens, heads // 16)](
             x,
             q_fp4,
             q_scale,
