@@ -77,6 +77,7 @@ class NanbeigeMLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -262,7 +263,7 @@ class NanbeigeDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return self.ffn_boundary.finish_complete_output(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class NanbeigeModel(nn.Module):

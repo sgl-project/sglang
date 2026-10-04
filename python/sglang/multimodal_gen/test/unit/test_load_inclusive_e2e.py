@@ -24,7 +24,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 @pytest.fixture
 def validator(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
-    # These guard tests exercise the strict policy, independent of the host GPU.
     monkeypatch.setattr(utils.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig.from_dict(
         {
