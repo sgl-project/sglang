@@ -115,11 +115,9 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
     let engine = engine();
     let table = EngineReportedLoadTable::new();
     table.set(&engine.url, 0, report(1, 2, 80, 5), Instant::now());
-    let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10);
     let guard = engine.load_guard();
     assert_eq!(
-        EngineMetrics::observe(&engine, &table.capture_snapshot(Instant::now()), &request),
+        EngineMetrics::observe(&engine, &table.capture_snapshot(Instant::now())),
         EngineMetrics {
             running_requests: Some(1),
             running_capacity: Some(100),
@@ -128,7 +126,6 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
             kv_capacity: Some(1000),
             pending_prefill_tokens: Some(5),
             inflight_requests: 1,
-            request_tokens: 10,
         }
     );
     drop(guard);
@@ -138,8 +135,7 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
         ..report(1, 2, 80, 5)
     };
     table.set(&engine.url, 0, basic, Instant::now());
-    let metrics =
-        EngineMetrics::observe(&engine, &table.capture_snapshot(Instant::now()), &request);
+    let metrics = EngineMetrics::observe(&engine, &table.capture_snapshot(Instant::now()));
     assert_eq!(
         (
             metrics.running_requests,
@@ -156,10 +152,12 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
         ..Default::default()
     });
     let engines = [engine];
-    // Capacities are 100 running requests and 1000 KV tokens; the request adds 10 tokens.
+    let model = ModelId("m".into());
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    // Capacities are 100 running requests and 1000 KV tokens.
     for (running, kv_tokens, rejection) in [
-        (1, 91, Some("max_kv_usage")),
-        (1, 90, None),
+        (1, 100, Some("max_kv_usage")),
+        (1, 99, None),
         (2, 0, Some("max_running_usage")),
     ] {
         table.set(
@@ -180,44 +178,45 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
 }
 
 #[test]
-fn usages_count_the_request_and_fail_open_without_capacity() {
+fn usages_admit_below_the_share_and_fail_open_without_capacity() {
     let limits = AdmissionLimits {
         max_running_usage: Some(0.9),
         max_kv_usage: Some(0.9),
         ..Default::default()
     };
-    let metrics = |running, request_tokens, capacity: Option<u64>| EngineMetrics {
+    let metrics = |running, kv_tokens, capacity: Option<u64>| EngineMetrics {
         running_requests: Some(running),
         running_capacity: capacity.map(|_| 10),
-        kv_tokens: Some(800),
+        kv_tokens: Some(kv_tokens),
         kv_capacity: capacity,
-        request_tokens,
         ..Default::default()
     };
     let check = |m| limits.check(&engine(), &m).unwrap();
-    assert_eq!(check(metrics(8, 100, Some(1000))), Decision::Allow);
+    assert_eq!(check(metrics(8, 899, Some(1000))), Decision::Allow);
     assert_eq!(
-        check(metrics(9, 100, Some(1000))),
+        check(metrics(9, 0, Some(1000))),
         reject("max_running_usage")
     );
-    assert_eq!(check(metrics(8, 101, Some(1000))), reject("max_kv_usage"));
-    assert_eq!(check(metrics(9, 101, None)), Decision::Allow);
-    // Exactly at the share admits, even where `share * capacity` rounds below it.
-    let tight = AdmissionLimits {
-        max_kv_usage: Some(0.29),
-        ..Default::default()
+    assert_eq!(check(metrics(0, 900, Some(1000))), reject("max_kv_usage"));
+    assert_eq!(check(metrics(9, 900, None)), Decision::Allow);
+    let kv = |share, kv_tokens| {
+        let limits = AdmissionLimits {
+            max_kv_usage: Some(share),
+            ..Default::default()
+        };
+        let metrics = EngineMetrics {
+            kv_tokens: Some(kv_tokens),
+            kv_capacity: Some(100),
+            ..Default::default()
+        };
+        limits.check(&engine(), &metrics).unwrap()
     };
-    let kv = |kv_tokens| EngineMetrics {
-        kv_tokens: Some(kv_tokens),
-        kv_capacity: Some(100),
-        request_tokens: 10,
-        ..Default::default()
-    };
-    assert_eq!(tight.check(&engine(), &kv(19)).unwrap(), Decision::Allow);
-    assert_eq!(
-        tight.check(&engine(), &kv(20)).unwrap(),
-        reject("max_kv_usage")
-    );
+    // A full share still admits one more request below it, whatever its size.
+    assert_eq!(kv(1.0, 99), Decision::Allow);
+    assert_eq!(kv(1.0, 100), reject("max_kv_usage"));
+    // `0.07 * 100.0` rounds above 7; the boundary still rejects exactly at the share.
+    assert_eq!(kv(0.07, 6), Decision::Allow);
+    assert_eq!(kv(0.07, 7), reject("max_kv_usage"));
 }
 
 #[test]
@@ -258,24 +257,4 @@ fn group_limits_override_defaults_field_by_field() {
             ..Default::default()
         }
     );
-}
-
-#[test]
-fn request_tokens_are_input_on_prefill_and_expected_peak_otherwise() {
-    let engine = engine();
-    let table = EngineReportedLoadTable::new();
-    table.set(&engine.url, 0, report(0, 0, 0, 0), Instant::now());
-    let load = table.capture_snapshot(Instant::now());
-    let model = ModelId("m".into());
-    for (stage, peak, expected) in [
-        (Stage::Prefill, Some(50), 10),
-        (Stage::Decode, Some(50), 50),
-        (Stage::Plain, Some(50), 50),
-        (Stage::Plain, None, 10),
-    ] {
-        let mut request = PickRequest::new(&model, stage, 10);
-        request.expected_peak_tokens = peak;
-        let metrics = EngineMetrics::observe(&engine, &load, &request);
-        assert_eq!(metrics.request_tokens, expected, "{stage:?} {peak:?}");
-    }
 }

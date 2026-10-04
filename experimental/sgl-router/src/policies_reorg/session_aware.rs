@@ -60,13 +60,8 @@ impl SessionAwarePolicy {
         ))
     }
 
-    fn check(
-        &self,
-        engine: &Worker,
-        load: &EngineReportedLoadSnapshot,
-        request: &PickRequest<'_>,
-    ) -> Result<(), PickError> {
-        let metrics = EngineMetrics::observe(engine, load, request);
+    fn check(&self, engine: &Worker, load: &EngineReportedLoadSnapshot) -> Result<(), PickError> {
+        let metrics = EngineMetrics::observe(engine, load);
         match self.admission.check(engine, &metrics)? {
             Decision::Allow => Ok(()),
             Decision::Reject(reason) => Err(PickError::AdmissionRejected(Rejection {
@@ -90,7 +85,7 @@ impl Policy for SessionAwarePolicy {
             let key = Self::assignment_key(request);
             if let Some(bound) = key.as_ref().and_then(|key| self.store.bound(key, engines)) {
                 let load = self.engine_load.capture_snapshot(Instant::now());
-                let rejection = match self.check(bound, &load, request) {
+                let rejection = match self.check(bound, &load) {
                     Ok(()) => None,
                     Err(error @ PickError::AdmissionRejected(_)) => Some(error),
                     Err(error) => return Err(error),
@@ -112,7 +107,7 @@ impl Policy for SessionAwarePolicy {
                 }
                 let fallback = async {
                     let pick = self.pick_fallback(&alternatives, request).await?;
-                    self.check(&pick.engine, &load, request)?;
+                    self.check(&pick.engine, &load)?;
                     Ok::<_, PickError>(pick)
                 }
                 .await;
@@ -128,7 +123,7 @@ impl Policy for SessionAwarePolicy {
                 // Excluding the old binding lets a concurrent replacement win.
                 let effective = self.store.bind(key.unwrap(), &pick.engine, &alternatives);
                 if !Arc::ptr_eq(effective, &pick.engine) {
-                    self.check(effective, &load, request)?;
+                    self.check(effective, &load)?;
                 }
                 pick.engine = Arc::clone(effective);
                 pick.reason = "session_rebound";
@@ -140,7 +135,7 @@ impl Policy for SessionAwarePolicy {
             // replacing a binding.
             let mut pick = self.pick_fallback(engines, request).await?;
             let load = self.engine_load.capture_snapshot(Instant::now());
-            self.check(&pick.engine, &load, request)?;
+            self.check(&pick.engine, &load)?;
             let Some(key) = key else {
                 pick.reason = "no_session";
                 return Ok(pick);
@@ -150,7 +145,7 @@ impl Policy for SessionAwarePolicy {
             if !Arc::ptr_eq(effective, &pick.engine) {
                 // A racing first assignment wins. Check it once, without
                 // rewriting a rejected binding or retrying another engine.
-                self.check(effective, &load, request)?;
+                self.check(effective, &load)?;
                 pick.reason = "session_primary";
             } else {
                 pick.reason = "assigned";

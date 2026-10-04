@@ -246,8 +246,8 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub max_in_flight: Option<usize>,
 
-    /// Reorg admission: reject an engine whose KV tokens plus this request's
-    /// would exceed this share of its reported capacity, in (0, 1].
+    /// Reorg admission: reject an engine whose KV tokens have reached this share
+    /// of its reported capacity, in (0, 1].
     #[arg(long)]
     pub max_kv_usage: Option<f64>,
 

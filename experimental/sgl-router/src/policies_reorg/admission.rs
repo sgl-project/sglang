@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Per-engine admission: a set of caps compared against the selected engine's
-//! current measurements; usage caps also count the request itself.
+//! current measurements. Request size is a bucket concern, not an admission one.
 
 use std::fmt::Debug;
 
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
-use super::{PickError, PickRequest, Stage};
+use super::PickError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -31,17 +31,11 @@ pub struct EngineMetrics {
     pub kv_capacity: Option<u64>,
     pub pending_prefill_tokens: Option<u64>,
     pub inflight_requests: u64,
-    /// KV tokens this request adds: its input on prefill, its expected peak otherwise.
-    pub request_tokens: u64,
 }
 
 impl EngineMetrics {
     /// Read `engine` from the load snapshot selection already captured.
-    pub fn observe(
-        engine: &Worker,
-        load: &EngineReportedLoadSnapshot,
-        request: &PickRequest<'_>,
-    ) -> Self {
+    pub fn observe(engine: &Worker, load: &EngineReportedLoadSnapshot) -> Self {
         let basic = load.fresh_load_for_url(&engine.url);
         let native = load.fresh_native_cache_load_for_url(&engine.url);
         let capacity = |max: u64| (max > 0).then_some(max);
@@ -56,10 +50,6 @@ impl EngineMetrics {
             kv_capacity: native.and_then(|load| capacity(load.max_total_num_tokens)),
             pending_prefill_tokens: native.map(|load| load.num_waiting_uncached_tokens),
             inflight_requests: engine.router_inflight_load() as u64,
-            request_tokens: match request.stage {
-                Stage::Prefill => request.input_tokens,
-                _ => request.expected_peak_tokens.unwrap_or(request.input_tokens),
-            },
         }
     }
 }
@@ -71,9 +61,10 @@ pub trait EngineAdmission: Send + Sync + Debug {
 }
 
 /// Per-engine caps; an unset limit is not checked and unknown metrics fail open.
-/// Counts admit while below their cap. Usages are shares, in (0, 1], of the
-/// engine's reported capacity that its load plus this request may fill.
-/// Checks observe load; they do not reserve capacity.
+/// Each admits while the engine's load is below it: counts directly, usages as
+/// shares, in (0, 1], of the engine's reported capacity. Checks observe load;
+/// they do not reserve capacity, and the request itself may take an engine past
+/// a cap.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionLimits {
@@ -151,23 +142,21 @@ impl EngineAdmission for AdmissionLimits {
             (
                 "max_running_usage",
                 self.max_running_usage,
-                engine.running_requests.map(|running| running + 1),
+                engine.running_requests,
                 engine.running_capacity,
             ),
             (
                 "max_kv_usage",
                 self.max_kv_usage,
-                engine
-                    .kv_tokens
-                    .map(|kv| kv.saturating_add(engine.request_tokens)),
+                engine.kv_tokens,
                 engine.kv_capacity,
             ),
         ];
         for (name, share, used, capacity) in usages {
             if let (Some(share), Some(used), Some(capacity)) = (share, used, capacity) {
-                // Dividing exact integers rounds to the share's own value at the
-                // boundary; multiplying the share can round below it.
-                if used as f64 / capacity as f64 > share {
+                // Dividing exact integers lands on the share itself at the
+                // boundary; multiplying the share can round to either side.
+                if used as f64 / capacity as f64 >= share {
                     return Ok(Decision::Reject(name.into()));
                 }
             }
