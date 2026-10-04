@@ -810,7 +810,8 @@ export const Deployment = ({ config, benchmarks }) => {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
       const PARALLELISM_ANCHORS = new Set([
-        "--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp",
+        "--attn-dp-size", "--attention-data-parallel-size",
+        "--dp-size", "--dp", "--tp-size", "--tp",
         "--sp-degree", "--ulysses-degree", "--ring-degree",
       ]);
       let i = flags.reduce(

@@ -148,6 +148,169 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         )
 
 
+class TestPPReplaySSMVerifySourceRows(CustomTestCase):
+    @staticmethod
+    def _spec_state():
+        state = torch.empty((1, 8, 4, 2), dtype=torch.float32)
+        spec_state = MagicMock()
+        for name in "temporal replayssm_d replayssm_k replayssm_rawv replayssm_g replayssm_beta".split():  # noqa: SIM905
+            setattr(spec_state, name, state)
+        spec_state.replayssm_rawk = state.unsqueeze(2)
+        spec_state.conv = spec_state.intermediate_conv_window = [state]
+        return spec_state
+
+    def test_fold_helpers_read_pp_request_rows(self):
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+            commit_gdn_replayssm_fold_after_verify,
+        )
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
+
+        cases = (
+            (
+                commit_gdn_replayssm_fold_after_verify,
+                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold",
+                "commit_gdn_replayssm_fold_all_layers",
+            ),
+            (
+                commit_kda_replayssm_after_verify,
+                "sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode",
+                "commit_kda_replayssm_spec_all_layers",
+            ),
+        )
+        for commit, module, fold_name in cases:
+            with (
+                self.subTest(module=module),
+                patch(f"{module}.{fold_name}"),
+                patch(
+                    "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
+                    "fused_conv_window_scatter_with_mask"
+                ) as scatter,
+            ):
+                source_rows = torch.tensor([17, 23])
+                commit(
+                    spec_state=self._spec_state(),
+                    state_batch_indices=torch.tensor([5, 7]),
+                    accept_lens=torch.tensor([3, 1]),
+                    last_correct_step_indices=torch.tensor([2, 0]),
+                    src_indices_raw=source_rows,
+                )
+
+                scatter.assert_called_once()
+                torch.testing.assert_close(scatter.call_args.args[4], source_rows)
+
+    def test_circular_commit_reads_pp_request_rows(self):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = MagicMock()
+        req_pool = target_worker.model_runner.req_to_token_pool
+        req_pool.mamba_pool.replayssm_spec_fold = False
+        req_pool.mamba_pool.replayssm_is_kda = False
+        req_pool.mamba_pool.replayssm_cache_base = torch.empty(1)
+        req_pool.get_mamba_indices.return_value = torch.tensor(
+            [5, 7], dtype=torch.int32
+        )
+        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+            self._spec_state()
+        )
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.req_pool_indices = torch.tensor([17, 23], dtype=torch.int64)
+        batch.mamba_track_indices = None
+        batch.seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        accept_lens = torch.tensor([2, 1], dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1, -1], [3, -1, -1]], dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.pp_spec_stable_rows_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "commit_gdn_replayssm_spec"
+            ),
+            patch(
+                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "commit_gdn_replayssm_circular"
+            ),
+            patch(
+                "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
+                "fused_conv_window_scatter_with_mask"
+            ) as scatter,
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=3,
+            )
+
+        scatter.assert_called_once()
+        torch.testing.assert_close(scatter.call_args.args[4], batch.req_pool_indices)
+
+
+class TestDelayedMambaCommitBatchPairing(CustomTestCase):
+    def test_flashinfer_gdn_positional_scratch_moves_to_request_rows(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            copy_verify_intermediate_rows,
+        )
+
+        destination = torch.zeros((8, 2, 3), dtype=torch.float32)
+        positional = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+        rows = torch.tensor([5, 2, 7], dtype=torch.int32)
+
+        copy_verify_intermediate_rows(destination, positional, rows)
+
+        torch.testing.assert_close(destination[rows.long()], positional)
+
+    def test_ple_commit_reads_stable_request_rows(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        dst = torch.zeros((1, 8, 2), dtype=torch.float32)
+        src = torch.zeros((1, 16, 4, 2), dtype=torch.float32)
+        src[0, 11, 2] = torch.tensor([3.0, 7.0])
+
+        HybridLinearAttnBackend._scatter_speculative_state_with_mask(
+            dst,
+            src,
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([11], dtype=torch.int64),
+        )
+
+        torch.testing.assert_close(dst[0, 5], torch.tensor([3.0, 7.0]))
+
+    def test_pp_verify_scratch_uses_stable_request_rows_for_all_backends(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
+        )
+
+        default = torch.arange(8, dtype=torch.int32)
+        req_rows = torch.tensor([17, 23, 31], dtype=torch.int64)
+        cache_indices = torch.tensor([4, -1, 9], dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.layers.attention.linear.utils.pp_spec_stable_rows_enabled",
+            return_value=True,
+        ):
+            result = select_verify_intermediate_state_indices(
+                default, req_rows, cache_indices >= 0, pool_size=64
+            )
+
+        torch.testing.assert_close(
+            result, torch.tensor([17, 64, 31], dtype=torch.int32)
+        )
+
+
 class TestMtpVerifyHookSignature(CustomTestCase):
     """Every ``update_mamba_state_after_mtp_verify`` override must accept the full
     keyword call the spec workers make, or it raises TypeError at verify time on
