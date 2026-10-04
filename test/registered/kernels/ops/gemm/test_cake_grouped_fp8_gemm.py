@@ -202,6 +202,25 @@ def _make_block_scaled_inputs(group_counts, n, k, alignment, *, seed, device):
     )
 
 
+def _padding_classes(m_indices: torch.Tensor):
+    """The block-scaled programs skip ``-1`` padding per 32-row sub-block: a sub-block
+    whose first row is padding is never written (``untouched``); padding rows that
+    share a sub-block with an expert's rows are computed from their own operands
+    (``shared_padding``, finite, never read back by the dispatcher)."""
+    valid = m_indices >= 0
+    leading = (m_indices.view(-1, 32)[:, :1] < 0).expand(-1, 32).reshape(-1)
+    return leading, (~valid) & ~leading
+
+
+def _assert_padding_contract(out, untouched, shared_padding):
+    assert torch.isnan(out[untouched].float()).all(), (
+        "padding sub-blocks must stay untouched"
+    )
+    assert torch.isfinite(out[shared_padding].float()).all(), (
+        "shared padding rows must be finite"
+    )
+
+
 @pytest.mark.parametrize(
     "group_counts,n,k,alignment",
     [
@@ -219,7 +238,9 @@ def test_block_scaled_ue8m0_skips_padding_and_rebinds(group_counts, n, k, alignm
         )
     device = torch.device("cuda")
     x = _make_block_scaled_inputs(group_counts, n, k, alignment, seed=99, device=device)
-    assert x.a_scale.dtype == torch.int32 and x.a_scale.stride() == (1, x.a.shape[0])
+    assert x.a_scale.dtype == torch.int32 and x.a_scale.stride(0) == 1
+    # A single packed column (K <= 512) has no distinguishable column stride.
+    assert x.a_scale.shape[1] == 1 or x.a_scale.stride(1) == x.a.shape[0]
     out = torch.full(
         x.a.shape[:1] + (n,), float("nan"), dtype=torch.bfloat16, device=device
     )
@@ -240,7 +261,8 @@ def test_block_scaled_ue8m0_skips_padding_and_rebinds(group_counts, n, k, alignm
     runner.launch()
     torch.cuda.synchronize()
     valid = x.m_indices >= 0
-    assert torch.isnan(out[~valid].float()).all(), "padding rows must stay untouched"
+    untouched, shared_padding = _padding_classes(x.m_indices)
+    _assert_padding_contract(out, untouched, shared_padding)
     ref = _reference_gemm(x.a, x.b, x.a_scale_f32, x.b_scale_f32, x.m_indices)
     assert torch.isfinite(out[valid].float()).all()
     torch.testing.assert_close(out[valid].float(), ref[valid], atol=ATOL, rtol=RTOL)
@@ -249,7 +271,7 @@ def test_block_scaled_ue8m0_skips_padding_and_rebinds(group_counts, n, k, alignm
     out2 = torch.full_like(out, float("nan"))
     runner.launch(a=a2, a_scale=x.a_scale, m_indices=x.m_indices, out=out2)
     torch.cuda.synchronize()
-    assert torch.isnan(out2[~valid].float()).all()
+    _assert_padding_contract(out2, untouched, shared_padding)
     ref2 = _reference_gemm(a2, x.b, x.a_scale_f32, x.b_scale_f32, x.m_indices)
     torch.testing.assert_close(out2[valid].float(), ref2[valid], atol=ATOL, rtol=RTOL)
     # The first result was not disturbed by the rebinding.
