@@ -750,6 +750,7 @@ class HiCacheController:
             pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            attn_tp_rank=parallel.attn_tp_rank,
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
             is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
