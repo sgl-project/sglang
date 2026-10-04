@@ -417,19 +417,27 @@ class KVIndexTranslator:
         """Whole-sequence-verify view: every row's live prefix widened by
         `seq_len_delta` columns (the drafts are read back from the pool).
         Not memoized -- verify is one consumer, and the batch's memoized
-        prefix table stays valid for the others."""
+        prefix table stays valid for the others.
+
+        The width comes from the LIVE prefix: a DSPARK/DFLASH verify batch
+        carries `seq_lens_cpu` already expanded by the window and keeps the
+        live lens on `spec_info.live_seq_lens_cpu`, so widening the expanded
+        lens would count the window twice. The width never exceeds the
+        `req_to_token` row it is read from."""
         max_pages = None
         if self.is_translating:
-            slc = forward_batch.seq_lens_cpu
+            row_pages = -(-self.req_to_token.shape[1] // self.page_size)
+            live = getattr(forward_batch.spec_info, "live_seq_lens_cpu", None)
+            slc = live if live is not None else forward_batch.seq_lens_cpu
             if (
                 forward_batch.seq_lens_sum is not None
                 and slc is not None
                 and slc.numel() > 0
             ):
                 max_seq = int(slc.max()) + seq_len_delta
+                max_pages = min(max(-(-max_seq // self.page_size), 1), row_pages)
             else:
-                max_seq = self.req_to_token.shape[1]
-            max_pages = max(-(-max_seq // self.page_size), 1)
+                max_pages = row_pages
         return self.build_index_table(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
