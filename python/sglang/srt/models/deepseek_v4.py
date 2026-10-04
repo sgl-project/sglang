@@ -4473,26 +4473,28 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
+    def _check_late_layer_tail_readers(
+        self, forward_batch: ForwardBatch, tail: LateLayerTail
+    ) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
+            and tail.extend_seq_lens_cpu != list(forward_batch.extend_seq_lens_cpu)
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot capture hidden states of all "
-                "prompt tokens"
+                "decoder SWA bounded replay tail misses captured hidden-state rows"
             )
         if forward_batch.return_logprob and any(
-            start < n
-            for start, n in zip(
+            start < n - t
+            for start, n, t in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
                 forward_batch.extend_seq_lens_cpu,
+                tail.extend_seq_lens_cpu,
             )
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
-                "set logprob_start_len to the prompt length"
+                "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
     def _forward_layers_hc_pre_from_prev(
@@ -4537,9 +4539,9 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+            self._check_late_layer_tail_readers(forward_batch, tail)
         saved_full = None
         prev_pre = None
         precomputed_attn = None
@@ -5267,7 +5269,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+            # Shift prompt-logprob starts from the extend into the tail.
+            logits_metadata.extend_logprob_start_lens_cpu = (
+                [
+                    start - (n - t)
+                    for start, n, t in zip(
+                        forward_batch.extend_logprob_start_lens_cpu,
+                        forward_batch.extend_seq_lens_cpu,
+                        tail.extend_seq_lens_cpu,
+                    )
+                ]
+                if forward_batch.return_logprob
+                else tail.extend_seq_lens_cpu
+            )
 
         output = self.logits_processor(
             input_ids,

@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _tail_rows,
+    late_layer_tail_lens,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -2081,7 +2082,7 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
+        replay: each request's tail (late_layer_tail_lens), whose window is floored at the
         tail start since no window KV before it is written at those layers."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -2090,7 +2091,8 @@ class DeepseekV4HipRadixBackend(
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
+            tail_len=late_layer_tail_lens(forward_batch),
+            window=SWA_WINDOW,
             device=device,
         )
         contiguous_start = (
