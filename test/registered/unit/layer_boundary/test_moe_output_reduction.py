@@ -200,6 +200,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         get_moe_a2a_backend=lambda: a2a(),
                         should_use_dp_reduce_scatterv=lambda: use_rsv,
                         is_dp_gatherv_active=lambda: False,
+                        is_cp_active=lambda batch: False,
                         envs=types.SimpleNamespace(
                             SGLANG_DP_USE_REDUCE_SCATTER=types.SimpleNamespace(
                                 get=lambda: False

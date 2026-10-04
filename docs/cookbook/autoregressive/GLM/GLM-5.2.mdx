@@ -255,7 +255,7 @@ For the full setup (streaming, tool-use, count_tokens, persisting env in `~/.cla
 ### 3.5 Context Parallelism
 
 <Warning>
-Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.2. For prefill CP on CUDA, use `interleave` with `--attn-dp-size 1` as shown below.
+Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.2. For prefill CP on CUDA, use `interleave` as shown below. Attention DP is supported: each DP group uses `tp_size / attn_dp_size` CP ranks. Dense FFNs retain the configured TP width; use `--moe-dense-tp-size 1` for local dense computation.
 </Warning>
 
 Prefill context parallelism can help with reduction of TTFT under long context. To enable prefill context parallelism for GLM 5.2, please append the following arguments:
