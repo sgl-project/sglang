@@ -782,6 +782,7 @@ class DeepseekV2MoE(nn.Module):
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_nccl_ep()
                 or get_moe_a2a_backend().is_pplx()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
@@ -910,6 +911,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_nccl_ep()
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
@@ -1010,6 +1012,9 @@ class DeepseekV2MoE(nn.Module):
                     use_vision_topk=use_vision_topk,
                 )
         else:
+            # NCCL EP: use forward_deepep (LL path) for both prefill and decode,
+            # matching DeepEP behavior. The LL dispatch/combine handles arbitrary
+            # batch sizes (bounded by num_max_dispatch_tokens_per_rank).
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
@@ -1618,7 +1623,11 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.clear_overlap_args()
                 post_combine_hook_handle.remove()
 
-            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+            assert isinstance(
+                self.experts.dispatcher,
+                (MaybeTboDeepEPDispatcher, NcclEpDispatcher),
+            )
             deepep_dispatch_hook_handle = (
                 self.experts.dispatcher.register_deepep_dispatch_hook(
                     _deepep_dispatch_hook
@@ -1749,7 +1758,10 @@ class DeepseekV2MoE(nn.Module):
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
             # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
-            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
+            if (
+                self.experts.should_fuse_routed_scaling_factor_in_topk
+                or _use_aiter
+            ):
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)

@@ -1400,6 +1400,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_a2a_backend = get_moe_a2a_backend()
             if not (
                 moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_nccl_ep()
                 or moe_a2a_backend.is_mooncake()
                 or moe_a2a_backend.is_nixl()
             ):
