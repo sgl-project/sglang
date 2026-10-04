@@ -331,6 +331,10 @@ class SchedulerMultiplexMixin:
         self.running_batch = running_batch
         return running_batch
 
+    # Use a rank-consistent tick while formation is skipped. Ack retirement
+    # includes TP consensus; avoid paying that collective on every iteration.
+    HICACHE_PUMP_INTERVAL = 16
+
     @torch.inference_mode()
     def event_loop_pdmux(self: Scheduler):
         """Run PDMux with layerwise prefill."""
@@ -338,6 +342,7 @@ class SchedulerMultiplexMixin:
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
+        self._hicache_pump_tick = 0
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
@@ -355,6 +360,14 @@ class SchedulerMultiplexMixin:
                 sm_count = self.sm_counts[stream_idx][0]
                 formation_done = None
                 had_inflight_split = self.split_prefill_batch is not None
+                if wait_prefill_kernel_done or had_inflight_split:
+                    self._hicache_pump_tick += 1
+                    if self._hicache_pump_tick % self.HICACHE_PUMP_INTERVAL == 0:
+                        # A host-only ack drain needs no event behind the
+                        # in-flight prefill kernels. Device page/mapping work
+                        # must complete before decode reuses the freed slots.
+                        if self.check_hicache_events_if_enabled():
+                            formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
                     if not had_inflight_split:
                         # Match the normal scheduler's pre-admission event drain.

@@ -69,6 +69,28 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                     expected.append(call.retry())
                 self.assertEqual(self.calls.mock_calls, expected)
 
+    def test_pdmux_pump_reports_device_work_and_storage_retries(self):
+        s = self.scheduler
+        with patch(
+            "sglang.srt.managers.scheduler.get_memory",
+            return_value=SimpleNamespace(enable_flexkv=False),
+        ):
+            for cache_result, retry_result, expected in (
+                (False, False, False),
+                (True, False, True),
+                (False, True, True),
+                (None, False, True),
+            ):
+                with self.subTest(cache=cache_result, retry=retry_result):
+                    self.calls.drain.return_value = cache_result
+                    self.calls.retry.return_value = retry_result
+                    self.assertEqual(s.check_hicache_events_if_enabled(), expected)
+            s.enable_hierarchical_cache = False
+            self.calls.reset_mock()
+            self.assertFalse(s.check_hicache_events_if_enabled())
+            self.calls.drain.assert_not_called()
+            self.calls.retry.assert_not_called()
+
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler
         s.resolve_waiting_queue_bootstrap = Mock()
