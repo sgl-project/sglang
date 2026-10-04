@@ -1098,3 +1098,116 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
     grouped_weight = grouped_attn.qkv_proj.weight
     assert grouped_weight.checkpoint_mapping_unsafe is True
     assert grouped_weight.rank_local_weight_transform is not None
+
+
+@pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
+def test_integrated_h3_int8_loader_preserves_quantized_weights(
+    tmp_path, monkeypatch, backend, out_features
+):
+    _ensure_single_process_parallel_runtime()
+    import json
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
+    from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import spec
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.minimax_h3 import (
+        _build_dit_config,
+    )
+
+    class SmallH3(torch.nn.Module):
+        param_names_mapping = {}
+        _fsdp_forward_methods = ()
+
+        def __init__(self, config, hf_config, quant_config=None):
+            super().__init__()
+            self.proj = ReplicatedLinear(
+                256,
+                out_features,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                prefix="proj",
+            )
+
+        def post_load_weights(self):
+            pass
+
+    marker = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+    weight = torch.arange(out_features * 256).reshape(out_features, 256).to(torch.int8)
+    scales = torch.arange(1, out_features + 1, dtype=torch.float32).reshape(
+        out_features, 1
+    )
+    path = tmp_path / "h3.safetensors"
+    save_file(
+        {
+            "proj.weight": weight,
+            "proj.weight_scale": scales,
+            "proj.comfy_quant": torch.tensor(
+                list(json.dumps(marker).encode()), dtype=torch.uint8
+            ),
+        },
+        path,
+    )
+    monkeypatch.setattr(
+        spec.ModelRegistry, "resolve_model_cls", lambda _: (SmallH3, None)
+    )
+    monkeypatch.setattr(spec, "get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        spec,
+        "get_comfyui_checkpoint_spec",
+        lambda _: spec.ComfyUICheckpointSpec(
+            dit_cls_name="MiniMaxH3DiTModel", build_dit_config=_build_dit_config
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen._load_comfy_kitchen",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit._load_jit_kernel",
+        lambda: None,
+    )
+    monkeypatch.setenv("SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", backend)
+    arguments = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            dit_config=MiniMaxH3DiTConfig(), dit_precision="bf16"
+        ),
+        model_paths={},
+        transformer_weights_path=None,
+        component_weights_paths={},
+        model_path=str(path),
+        dit_precision="bf16",
+        component_precisions={},
+        quantization=None,
+        nunchaku_config=None,
+        hsdp_replicate_dim=1,
+        hsdp_shard_dim=1,
+        pin_cpu_memory=False,
+        should_start_component_on_cpu=lambda _: True,
+        should_use_fsdp_for_component=lambda _: False,
+    )
+    pipeline = SimpleNamespace(
+        pipeline_name="MiniMaxH3Pipeline",
+        model_path=str(path),
+        get_module=lambda _: None,
+    )
+    loaded = spec.load_comfyui_transformer(pipeline, arguments)["transformer"]
+    assert loaded.proj.weight.dtype == torch.int8
+    assert torch.equal(loaded.proj.weight, weight)
+    assert torch.equal(loaded.proj.weight_scale, scales)
+    assert loaded.proj.quant_method.is_checkpoint_serialized
+    assert loaded.proj.quant_method.quant_config.backend == backend
+    assert (
+        arguments.pipeline_config.dit_config.arch_config.qkv_checkpoint_grouped is False
+    )
+    assert all(not parameter.requires_grad for parameter in loaded.parameters())
+    arguments.quantization = "kitchen_int8"
+    with pytest.raises(ValueError, match="per-layer metadata"):
+        spec.load_comfyui_transformer(pipeline, arguments)
+    arguments.quantization = None
+    arguments.should_use_fsdp_for_component = lambda _: True
+    with pytest.raises(ValueError, match="FSDP"):
+        spec.load_comfyui_transformer(pipeline, arguments)
