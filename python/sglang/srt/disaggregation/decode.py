@@ -2221,7 +2221,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
-        self.tree_cache.adopt_kv_record(req)
+        self.tree_cache.hand_to_session(req)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:

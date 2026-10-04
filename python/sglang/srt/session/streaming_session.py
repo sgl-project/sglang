@@ -181,7 +181,7 @@ class StreamingSession:
         slot = self.slots.get(req.session.session_id)
         return slot if slot is not None and slot.kv is req.kv else None
 
-    def adopt_record(self, req: Req) -> None:
+    def take(self, req: Req) -> None:
         """A streaming turn's first row allocation: the session takes the
         request's record and the tree lock it took at admission, and the
         request borrows them from here on. A turn already on a slot's record
@@ -207,8 +207,7 @@ class StreamingSession:
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
         if isinstance(req.finished_reason, FINISH_ABORT):
-            del self.slots[req.session.session_id]
-            _move_tree_lock(slot, req)
+            self._hand_back(slot, req)
             req.session.abort_req()
             return False
 
@@ -295,6 +294,12 @@ class StreamingSession:
             slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
+
+    def _hand_back(self, slot: SessionSlot, req: Req) -> None:
+        """Drop the slot and give its record and tree lock back to the request,
+        which then releases like any request."""
+        del self.slots[req.session.session_id]
+        _move_tree_lock(slot, req)
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         """Move the request's tree lock to the slot; the request is left on the

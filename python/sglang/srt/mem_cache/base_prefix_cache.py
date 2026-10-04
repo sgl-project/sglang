@@ -516,7 +516,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-    def adopt_kv_record(self, req: Req) -> None:
+    def hand_to_session(self, req: Req) -> None:
         """The request's KV row was just allocated. A cache that keeps a record
         across requests (a streaming session) takes it here with the request's
         tree lock; the request runs on it as a borrower."""
