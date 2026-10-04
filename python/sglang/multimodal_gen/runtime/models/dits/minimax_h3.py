@@ -1576,6 +1576,10 @@ class MiniMaxH3DiTBlock(nn.Module):
             qkv_override=qkv_override,
             return_pre_out_proj=cake_on,
         )
+        # The fused pre-attention pack (q/k/v views, 3 * T * hidden BF16) is
+        # consumed; drop the last reference before the out-projection and MLP
+        # stages so it does not stay resident through the rest of the block.
+        qkv_override = None
         fused = None
         if cake_on:
             # ``h`` is the attention-core output [T, heads, head_dim]; the Cake
