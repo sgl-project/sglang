@@ -75,7 +75,9 @@ from sglang.srt.layers.linear import (
     LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
@@ -1189,8 +1191,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
-        self.kv_tp_size = self.attn_tp_size // dcp_size
-        self.kv_tp_rank = self.attn_tp_rank // dcp_size
+        kv_parallel_group = ReplicatedParallelGroup("attn_tp", dcp_size)
+        self.kv_tp_rank, self.kv_tp_size = resolve_linear_parallel_group(
+            kv_parallel_group
+        )
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
@@ -1238,10 +1242,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            kv_tp_rank=self.kv_tp_rank,
-            kv_tp_size=self.kv_tp_size,
+            parallel_group="attn_tp",
+            kv_parallel_group=kv_parallel_group,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -1251,8 +1253,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
