@@ -490,8 +490,12 @@ def supports_selective_state_update(
     num_accepted_tokens: Optional[torch.Tensor] = None,
     algorithm: str = "auto",
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    pad_slot_id: int = -1,
 ) -> bool:
     """``True`` only when FlashInfer's Cake SSU would run a promoted program.
+
+    ``pad_slot_id`` (the slot value of CUDA-graph padding rows) is accepted for
+    every row; the headdim-64 programs skip such rows on the device.
 
     Encodes the promoted rows listed in the module docstring (except the
     Granite raw-view row, whose fixed strides are FlashInfer-internal, and

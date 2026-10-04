@@ -695,6 +695,7 @@ def _cake_selective_state_update(
         intermediate_state_indices=buffer_indices_fi,
         cache_steps=cache_steps,
         algorithm=algorithm,
+        pad_slot_id=int(kw.get("pad_slot_id", -1)),
     )
     admitted = _ssu_admission.get(key)
     if admitted is None:
