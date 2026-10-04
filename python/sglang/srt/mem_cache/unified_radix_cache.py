@@ -2397,6 +2397,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        # The rank-synced fetch proves L3 presence even if the host insert is dropped.
+        self.storage_existence_cache.add(
+            PoolName.KV, hash_value[: completed_tokens // self.page_size]
+        )
+
         if insert_result.host_insert_dropped:
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
