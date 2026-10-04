@@ -11,6 +11,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+    fill_verify_padding_rows,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -76,6 +79,10 @@ else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
+
+# FlashInfer's top-p renorm keeps every probability >= its threshold, so it
+# leaves a uniform row unchanged (up to the renormalization rounding).
+_TOP_P_RENORM_KEEPS_TIES = is_cuda()
 
 
 def is_dflash_sampling_verify_available() -> bool:
@@ -1136,7 +1143,11 @@ def build_speculative_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    padding_verify_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``padding_verify_lens``: optional [bs] lengths; the caller guarantees
+    that rows at or past ``padding_verify_lens[i]`` of request i are exactly
+    uniform after softmax (zero-logit padding with no logit adjustments)."""
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
@@ -1190,10 +1201,26 @@ def build_speculative_verify_target_probs(
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = _dflash_top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            top_ps = torch.repeat_interleave(
+                sampling_info.top_ps, draft_token_num, dim=0
             )
+            if (
+                padding_verify_lens is not None
+                and not need_top_k
+                and _TOP_P_RENORM_KEEPS_TIES
+            ):
+                # Avoid uniform input to AIR top-p.
+                lens = padding_verify_lens.to(device=device)
+                uniform = target_probs[:, 0].contiguous()
+                fill_verify_padding_rows(
+                    target_probs, lens, uniform, draft_token_num, restore=False
+                )
+                target_probs = _dflash_top_p_renorm_prob(target_probs, top_ps)
+                fill_verify_padding_rows(
+                    target_probs, lens, uniform, draft_token_num, restore=True
+                )
+            else:
+                target_probs = _dflash_top_p_renorm_prob(target_probs, top_ps)
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
