@@ -411,7 +411,11 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
-        if not enable_two_batch_overlap:
+        if not enable_two_batch_overlap or (
+            get_moe_a2a_backend().is_nccl_ep()
+            and local_batch is not None
+            and not local_batch.forward_mode.is_cuda_graph()
+        ):
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
 
@@ -1159,6 +1163,13 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_pplx():
             self._inners = [
                 PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nccl_ep():
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+            self._inners = [
+                NcclEpDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
 
     @property

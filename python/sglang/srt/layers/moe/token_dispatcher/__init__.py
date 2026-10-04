@@ -49,6 +49,10 @@ from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPDispatcher,
     NixlEPDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+    NcclEpRankMajorCombineInput,
+    NcclEpRankMajorDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.pplx import (
     PplxCombineInput,
     PplxDispatcher,
@@ -87,6 +91,8 @@ __all__ = [
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",
+    "NcclEpRankMajorDispatchOutput",
+    "NcclEpRankMajorCombineInput",
     "PplxCombineInput",
     "PplxDispatchOutput",
     "PplxDispatcher",
