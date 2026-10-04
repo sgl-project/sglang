@@ -1375,6 +1375,7 @@ fn insert_first_write_creates_the_namespace() {
     let mut tc = core();
     matched_chain(&mut tc);
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
@@ -1876,6 +1877,7 @@ fn swa_host_backed_node_advances_best_match_but_keeps_the_device_anchor() {
 
 fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -1883,7 +1885,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -1892,8 +1894,225 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
 
 fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params(key, value)
+    }
+}
+
+fn tlru_core(tail_budget: usize) -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            eviction_policy: "tlru".to_string(),
+            tlru_tail_budget: tail_budget,
+            ..Default::default()
+        },
+        vec![FULL],
+    )
+}
+
+fn tlru_lens(tc: &UnifiedTreeCore<Vec<i64>>, node_id: NodeId) -> (usize, usize) {
+    let node = tc.arena.node(tc.arena.resolve(node_id).expect("live node"));
+    (node.tlru_cached_prefix_len, node.tlru_history_len)
+}
+
+#[test]
+fn tlru_device_splits_inherit_branch_history_without_changing_suffix_depth() {
+    let mut tc = tlru_core(2);
+    let a = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6],
+            &[10, 11, 12, 13, 14, 15],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    let b = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6, 7, 8],
+            &[10, 11, 12, 13, 14, 15, 16, 17],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    let sibling = tc
+        .insert(&insert_params(&vec![1, 2, 9, 10], &[20, 21, 22, 23]))
+        .last_device_node_id
+        .expect("inserted device node");
+    let prefix = tc.arena.node(tc.arena.resolve(a).unwrap()).parent();
+    let prefix_id = tc.arena.node(prefix).id;
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 8));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    assert_eq!(tlru_lens(&tc, sibling), (4, 4));
+
+    // Tail removal must not turn the ancestor's historical depth into its
+    // shorter current residency. Otherwise each subsequent pass over-trims.
+    tc.evict_device_leaf(b, false).expect("unlocked leaf");
+    assert!(tc.arena.resolve(b).is_err());
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 8));
+
+    // A longer extension raises only its own ancestry, not the other branch.
+    let extended = tc
+        .insert(&insert_params(
+            &vec![1, 2, 9, 10, 11, 12, 13, 14, 15, 16],
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, extended), (10, 10));
+    assert_eq!(tlru_lens(&tc, sibling), (4, 10));
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 10));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn tlru_repeated_small_evictions_stop_trimming_at_the_historical_tail_budget() {
+    let mut tc = tlru_core(2);
+    let older = tc
+        .insert(&insert_params(&vec![90, 91, 92, 93], &[90, 91, 92, 93]))
+        .last_device_node_id
+        .expect("inserted device node");
+    let mut chain = Vec::new();
+    for size in [2, 4, 6, 8] {
+        let key: Vec<i64> = (1..=size).collect();
+        let values: Vec<i64> = (10..10 + size).collect();
+        chain.push(
+            tc.insert(&insert_params(&key, &values))
+                .last_device_node_id
+                .expect("inserted device node"),
+        );
+    }
+    // The newest two-token tail is safe; the old four-token branch is not.
+    // After the tail is gone, history remains eight and ordinary recency
+    // chooses the old branch rather than stripping another two tail tokens.
+    for expected in [chain[3], older] {
+        tc.evict_device_start(FULL, 1);
+        let (candidate, step) = tc.evict_device_next_node(FULL, &HashMap::new());
+        assert!(step.device_frees.is_empty());
+        assert_eq!(candidate, Some(expected));
+        let (_, freed) = tc
+            .evict_device_leaf(expected, false)
+            .expect("unlocked leaf");
+        assert!(freed.tracker[&FULL] > 0);
+        tc.evict_device_end(FULL);
+        assert_eq!(tlru_lens(&tc, chain[2]), (6, 8));
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn tlru_host_insert_and_split_keep_history_after_host_tail_reclamation() {
+    let mut tc = tlru_core(2);
+    let root_id = tc.arena.node(tc.arena.root()).id;
+    let a = tc
+        .insert_host(
+            root_id,
+            None,
+            vec![1, 2, 3, 4, 5, 6],
+            Tensor::from_slice(&[100i64, 101, 102, 103, 104, 105]),
+            (0..6).map(|i| format!("h{i}")).collect(),
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    let b = tc
+        .insert_host(
+            a,
+            None,
+            vec![7, 8],
+            Tensor::from_slice(&[106i64, 107]),
+            vec!["h6".to_string(), "h7".to_string()],
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    let reclaimed = tc.drive_host_eviction(FULL, 1);
+    assert_eq!(reclaimed.tracker[&FULL], 2);
+    assert!(tc.arena.resolve(b).is_err());
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    let branch = tc
+        .insert_host(
+            root_id,
+            None,
+            vec![1, 2, 9, 10],
+            Tensor::from_slice(&[200i64, 201, 202, 203]),
+            (0..4).map(|i| format!("g{i}")).collect(),
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    let prefix = tc.arena.node(tc.arena.resolve(a).unwrap()).parent();
+    assert_eq!(tlru_lens(&tc, tc.arena.node(prefix).id), (2, 8));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, branch), (4, 4));
+    assert_eq!(tlru_lens(&tc, root_id), (0, 8));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn tlru_reused_node_slots_and_reset_do_not_inherit_old_branch_history() {
+    let mut tc = tlru_core(2);
+    let old = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6],
+            &[10, 11, 12, 13, 14, 15],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    let old_slot = tc.arena.resolve(old).unwrap();
+    tc.evict_device_leaf(old, false).expect("unlocked leaf");
+    let fresh = tc
+        .insert(&insert_params(&vec![9, 8], &[90, 80]))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tc.arena.resolve(fresh).unwrap(), old_slot);
+    assert!(tc.arena.resolve(old).is_err());
+    assert_eq!(tlru_lens(&tc, fresh), (2, 2));
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 6));
+    tc.reset();
+    assert!(tc.arena.resolve(fresh).is_err());
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 0));
+    let after_reset = tc
+        .insert(&insert_params(&vec![7], &[70]))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, after_reset), (1, 1));
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 1));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn non_tlru_policies_leave_history_bookkeeping_disabled_for_both_tiers() {
+    for policy in ["lru", "slru", "priority"] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                eviction_policy: policy.to_string(),
+                tlru_tail_budget: usize::MAX,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+        tc.insert(&insert_params(&vec![1, 2, 9], &[20, 21, 29]));
+        tc.insert_host(
+            tc.arena.node(tc.arena.root()).id,
+            None,
+            vec![8, 9],
+            Tensor::from_slice(&[80i64, 90]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .unwrap();
+        for node in tc.collect_all_nodes_() {
+            let node = tc.arena.node(node);
+            assert_eq!(node.tlru_cached_prefix_len, 0, "{policy}");
+            assert_eq!(node.tlru_history_len, 0, "{policy}");
+        }
+        tc.sanity_check(&[], &[]);
     }
 }
 
@@ -1944,6 +2163,7 @@ fn insert_params_in_namespace<'a>(
     cache_salt: Option<&'a str>,
 ) -> InsertParams<'a, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(extra_key, cache_salt),
         ..insert_params(key, value)
     }
@@ -1988,6 +2208,7 @@ fn insert_prev_prefix_len_narrows_the_dup_window() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 2,
         ..insert_params(&vec![1, 2, 3], &[20, 21, 22])
     });
@@ -2031,6 +2252,7 @@ fn insert_prev_prefix_len_spans_a_multi_node_walk() {
     // The request already matched [1,2,3]: only the second node's overlap
     // is duplicate.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 3,
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
@@ -2052,6 +2274,7 @@ fn insert_prev_prefix_len_narrows_mid_node_on_a_multi_node_walk() {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     // prev_prefix_len 4 lands mid second node: only its last token is duplicate.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 4,
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
@@ -2124,6 +2347,7 @@ fn insert_priority_floor_applies_along_the_path() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     tc.insert(&InsertParams {
+        rotation_base: None,
         priority: 5,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
@@ -2136,7 +2360,7 @@ fn insert_priority_floor_applies_along_the_path() {
 }
 
 #[test]
-fn insert_chunked_skips_the_hit_count() {
+fn insert_below_the_hit_watermark_skips_the_hit_count() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let a = tc
@@ -2147,7 +2371,8 @@ fn insert_chunked_skips_the_hit_count() {
         .node(tc.arena.resolve(a).expect("live test node"))
         .hit_count;
     tc.insert(&InsertParams {
-        chunked: true,
+        rotation_base: None,
+        inserted_len: 2,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
     assert_eq!(
@@ -2586,6 +2811,107 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
         /* write_back = */ true,
     );
     assert_eq!(action.node_ids, vec![c]);
+}
+
+// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
+// node and stamp every node its transfers cover with that node's ack.
+// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
+fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
+    for &node_id in &backup.node_ids {
+        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
+        if device_value.numel() == 0 && comp_xfers.is_empty() {
+            continue;
+        }
+        let mut publish_node_ids = Vec::new();
+        for transfer in comp_xfers.values_mut().flatten() {
+            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
+            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
+        }
+        if !publish_node_ids.contains(&node_id) {
+            publish_node_ids.push(node_id);
+        }
+        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
+            .expect("live test node");
+        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
+            .expect("live test nodes");
+    }
+}
+
+#[test]
+fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+    // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
+    //                  -> d(Full unbacked) -> t2(Full backed)
+    // Every node holds a device-only SWA value inside the window.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            swa_sliding_window_size: Some(8),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let (key_t1, key_t2) = (vec![1, 2, 3, 4], vec![1, 2, 5, 6]);
+    tc.insert(&insert_params(&key_t1, &[10, 11, 12, 13]));
+    tc.insert(&insert_params(&key_t2, &[10, 11, 14, 15]));
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2, 5], &[10, 11, 14]));
+    let child = |parent, page: &[i64]| {
+        tc.arena
+            .child_on_page(parent, /* extra_key = */ None, page)
+            .expect("child on page")
+    };
+    let c_idx = child(tc.arena.root(), &[1]);
+    let b_idx = child(c_idx, &[3]);
+    let t1_idx = child(b_idx, &[4]);
+    let d_idx = child(c_idx, &[5]);
+    let t2_idx = child(d_idx, &[6]);
+    let [c, b, t1, d, t2] = [c_idx, b_idx, t1_idx, d_idx, t2_idx].map(|idx| tc.arena.node(idx).id);
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        let full = tc.arena.node(idx).device_value(FULL).copy();
+        tc.set_component_device_value(tc.arena.node(idx).id, SWA, full.copy())
+            .expect("live test node");
+        if [b_idx, t1_idx, t2_idx].contains(&idx) {
+            tc.arena.set_host_value(idx, FULL, full);
+        }
+    }
+
+    // Two requests in one batch finish at t1 and t2; neither ack drains.
+    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+        let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
+        let backups: Vec<&BackupKV> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::BackupKV(backup) => Some(backup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].node_ids, vec![target]);
+        execute_backup_kv_for_test(&mut tc, backups[0]);
+    }
+
+    let pending = |node_id| {
+        tc.arena
+            .node(tc.arena.resolve(node_id).expect("live test node"))
+            .write_through_pending_id
+    };
+    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
+        assert_eq!(pending(node_id), Some(ack_id));
+    }
+    // Write-back defers the unbacked Full prefix to eviction.
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(c).expect("live test node"))
+            .backuped()
+    );
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(d).expect("live test node"))
+            .backuped()
+    );
 }
 
 #[test]
@@ -3100,6 +3426,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     );
     let key: Vec<(i64, i64)> = vec![(1, 2), (2, 3)];
     tc.insert(&InsertParams {
+        rotation_base: None,
         key: &key,
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
@@ -3107,7 +3434,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -3419,6 +3746,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -3448,6 +3776,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     );
     // A node minted by a split inherits the namespace.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7], &[30])
     });
@@ -4082,6 +4411,12 @@ fn backuped_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
         .expect("live test node");
     tc.commit_backup(child, Tensor::from_slice(&[22i64, 23]), HashMap::new())
         .expect("live test node");
+    for node_id in [parent, child] {
+        tc.mark_write_through_pending(vec![node_id], node_id)
+            .expect("live test node");
+        tc.finish_write_through(vec![node_id], node_id)
+            .expect("live test node");
+    }
     (
         tc.arena.resolve(parent).expect("live test node"),
         tc.arena.resolve(child).expect("live test node"),
@@ -4487,6 +4822,12 @@ fn mixed_backup_evict_insert_keeps_the_leaf_sets_disjoint() {
         .best_match_node_id;
     tc.commit_backup(third, Tensor::from_slice(&[104i64, 105]), HashMap::new())
         .expect("live test node");
+    for node_id in [first, second, third] {
+        tc.mark_write_through_pending(vec![node_id], node_id)
+            .expect("live test node");
+        tc.finish_write_through(vec![node_id], node_id)
+            .expect("live test node");
+    }
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     tc.evict_device_start(FULL, /* request_cnt = */ 4);
@@ -4713,6 +5054,7 @@ fn insert_empty_key_is_a_noop_and_mints_no_namespace_root() {
     assert_eq!(tc.arena.len(), 1);
     // A namespaced empty insert never creates the namespace root.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![], &[])
     });
@@ -4730,6 +5072,7 @@ fn root_node_handle_is_namespace_independent() {
     assert_eq!(tc.root_node_handle(Some("ghost")), root_handle);
     assert!(!tc.arena.namespace_exists(Some("ghost")));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![1], &[10])
     });
@@ -4801,12 +5144,14 @@ fn get_hash_values_reads_the_nodes_own_hashes() {
 fn insert_empty_key_still_touches_the_existing_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         priority: 7,
         ..insert_params(&vec![], &[])
     });
     assert_eq!(tc.arena.node(tc.arena.root()).priority, 7);
     // A namespaced empty insert touches the same single root.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         priority: 9,
         ..insert_params(&vec![], &[])
@@ -4818,6 +5163,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
 fn insert_into_a_named_namespace_is_isolated() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -4849,6 +5195,7 @@ fn insert_sub_page_key_is_a_noop_and_mints_no_namespace_root() {
     assert!(result.mamba_exist);
     assert_eq!(tc.arena.len(), 1);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![1], &[10])
     });
@@ -5945,7 +6292,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 1);
     // The tree defaults keep the host tier off and the threshold at 256.
     assert!(!tc.enable_hicache);
@@ -5953,7 +6300,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
 }
 
 #[test]
-fn inc_hit_count_skips_evicted_or_chunked_nodes() {
+fn inc_hit_count_skips_evicted_nodes() {
     let mut tc = core();
     let root = tc.arena.root();
     let evicted = tc
@@ -5965,21 +6312,8 @@ fn inc_hit_count_skips_evicted_or_chunked_nodes() {
             /* extra_key = */ None,
         )
         .unwrap();
-    let chunked = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(chunked, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(evicted, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(evicted));
     assert_eq!(tc.arena.node(evicted).hit_count, 0);
-    assert!(!tc.inc_hit_count_and_check_(chunked, /* chunked = */ true));
-    assert_eq!(tc.arena.node(chunked).hit_count, 0);
 }
 
 #[test]
@@ -6001,7 +6335,7 @@ fn inc_hit_count_is_a_noop_in_write_back_mode() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 0);
 }
 
@@ -6022,12 +6356,12 @@ fn inc_hit_count_fires_the_write_through_check() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
-    assert!(tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
+    assert!(tc.inc_hit_count_and_check_(a));
     // A backuped node never re-fires.
     tc.arena
         .set_host_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 3);
 }
 
@@ -6623,6 +6957,7 @@ fn reset_restores_a_fresh_tree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -6703,6 +7038,7 @@ fn total_size_spans_namespaces_and_aux_values() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -6750,6 +7086,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7049,6 +7386,7 @@ fn all_values_flatten_spans_namespaces() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7061,6 +7399,7 @@ fn collect_all_nodes_visits_every_root_subtree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7076,6 +7415,7 @@ fn pretty_format_renders_every_namespace_and_component() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7], &[30])
     });
@@ -7109,6 +7449,7 @@ fn sane_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&insert_params(&vec![1, 2, 9], &[30, 31, 39]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
@@ -7657,11 +7998,13 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
     let recorder = Arc::new(RecordingComponentForTest::default());
     tc.register_component_(recorder.clone());
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The deeper insert walks down through the existing [7,8] node.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8, 9], &[40, 41, 42])
     });
@@ -8107,6 +8450,10 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
         HashMap::new(),
     )
     .expect("live test node");
+    tc.mark_write_through_pending(vec![h_leaf], h_leaf)
+        .expect("live test node");
+    tc.finish_write_through(vec![h_leaf], h_leaf)
+        .expect("live test node");
     demote_node(&mut tc, h_leaf_idx);
     let step = tc.begin_insert(&insert_params(
         &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -8133,6 +8480,10 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
         HashMap::new(),
     )
     .expect("live test node");
+    tc.mark_write_through_pending(vec![top], top)
+        .expect("live test node");
+    tc.finish_write_through(vec![top], top)
+        .expect("live test node");
     let done = tc.resume_insert();
     let result = done.result.expect("the resumed walk completes");
     assert_eq!(result.prefix_len, 4);
@@ -8170,6 +8521,11 @@ fn aborted_barrier_crossing_refires_on_the_next_insert() {
         HashMap::new(),
     )
     .expect("live test node");
+    let node_id = tc.arena.node(a).id;
+    tc.mark_write_through_pending(vec![node_id], node_id)
+        .expect("live test node");
+    tc.finish_write_through(vec![node_id], node_id)
+        .expect("live test node");
     let done = tc.resume_insert();
     assert_eq!(
         done.result.expect("the resumed walk completes").prefix_len,
@@ -8475,6 +8831,7 @@ fn sequence_insert_params<'k>(
         Tensor::from_slice(&[*mamba_next])
     });
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(&kv),
@@ -8482,7 +8839,7 @@ fn sequence_insert_params<'k>(
         prev_prefix_len,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -8636,6 +8993,7 @@ fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
 fn an_emptied_namespace_leaves_nothing_behind() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -8653,6 +9011,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     tc.sanity_check(&[], &[]);
     // A later insert respins the namespace from scratch.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -8666,6 +9025,7 @@ fn namespaces_do_not_accumulate_across_salts() {
     for salt in 0..64 {
         let salt = format!("session-{salt}");
         tc.insert(&InsertParams {
+            rotation_base: None,
             namespace: KeyNamespaceRef::new(Some(&salt), None),
             ..insert_params(&vec![1, 2], &[10, 11])
         });
@@ -8680,6 +9040,7 @@ fn namespaces_do_not_accumulate_across_salts() {
 fn a_zero_length_match_anchors_at_the_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
