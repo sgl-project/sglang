@@ -246,5 +246,44 @@ class TestOriginalTraceExport(CustomTestCase):
                 )
 
 
+class TestRaggedVerifyLayoutPerTier(CustomTestCase):
+    """Every graph variant of a token tier must replay the staged live layout."""
+
+    def test_replay_stages_layout_of_every_variant(self):
+        import torch
+
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = 6
+        runner.capture_num_tokens = [6, 12, 24, 48]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        with mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        ):
+            # capture_one_shape captures each tier once per attention variant;
+            # each capture's graph reads the layout returned for it.
+            captured = {
+                variant: runner._capture_ragged_verify_layout(24)
+                for variant in ("candidate_unfiltered", "candidate_filtered")
+            }
+
+        live = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([6, 1, 6, 3, 6], dtype=torch.int32),
+            graph_num_tokens=24,
+        )
+        expected = live.padded_to_bucket(padded_bs=8, cap=6)
+        runner._stage_ragged_verify_layout(live, 24)
+        for variant, layout in captured.items():
+            with self.subTest(variant=variant):
+                torch.testing.assert_close(
+                    layout.qo_indptr_device, expected.qo_indptr_device
+                )
+                torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
 if __name__ == "__main__":
     unittest.main()

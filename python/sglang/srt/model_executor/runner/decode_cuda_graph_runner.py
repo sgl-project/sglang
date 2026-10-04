@@ -653,6 +653,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
+        # A tier can be captured several times (graph variants, PD-mux streams),
+        # and replay stages live lengths into this one layout, so every capture
+        # must use it.
+        layout = self._captured_ragged_layouts.get(num_tokens)
+        if layout is not None:
+            return layout
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
