@@ -29,9 +29,25 @@ class TestPDMuxValidation(unittest.TestCase):
     def test_ordinary_scheduler_is_unchanged(self):
         validate(enable_pdmux=False, disable_overlap_schedule=False)
 
-    def test_core_rejects_speculative_worker(self):
-        with self.assertRaisesRegex(AssertionError, "worker adapter"):
-            validate(speculative_algorithm="EAGLE")
+    def test_single_layer_mtp_and_dspark_are_supported(self):
+        for algorithm in ("EAGLE", "NEXTN", "DSPARK"):
+            validate(speculative_algorithm=algorithm)
+
+    def test_unsupported_speculative_combinations_are_rejected(self):
+        for options, message in (
+            (dict(speculative_algorithm="NGRAM"), "MTP/EAGLE and DSpark"),
+            (
+                dict(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True),
+                "multi-layer",
+            ),
+            (
+                dict(speculative_algorithm="EAGLE", speculative_adaptive=True),
+                "fixed speculative",
+            ),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate(**options)
 
     def test_attention_dp_is_supported(self):
         for size in (2, 8):

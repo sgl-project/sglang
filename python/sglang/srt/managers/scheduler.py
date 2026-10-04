@@ -4501,15 +4501,7 @@ class Scheduler(
                     )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch is self.split_prefill_batch:
-                if batch.split_index == 0:
-                    resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                if batch_result.has_sampled_token_ids:
-                    self._relay_forward_payload(
-                        batch, batch.req_pool_indices, batch_result
-                    )
-                batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
+                batch_result = self._run_pdmux_split_prefill(batch)
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
@@ -4699,6 +4691,27 @@ class Scheduler(
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
             model_runner._pending_elastic_scale_update = None
+
+    def _run_pdmux_split_prefill(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        if batch.split_index == 0:
+            resolve_forward_inputs(batch, self.future_map)
+        worker = self.tp_worker if batch.spec_algorithm.is_none() else self.model_worker
+        result = worker.forward_batch_split_prefill(batch)
+        # Intermediate target slices carry no draft input. Publish only the
+        # final worker handoff, preserving batch-owned state across slices.
+        if result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
+            new_seq_lens = result.new_seq_lens
+            if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
+                batch.seq_lens = new_seq_lens
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        if result.has_sampled_token_ids or result.next_draft_input is not None:
+            self._relay_forward_payload(batch, batch.req_pool_indices, result)
+        batch.input_ids = None
+        self._copy_auxiliary_output_to_cpu(batch, result)
+        return result
 
     def _relay_forward_payload(
         self,

@@ -26,7 +26,7 @@ Save as `/tmp/dsv41-pdmux.yaml`, then launch plain TP8:
 
 ```bash
 python -m sglang.launch_server --model-path "$MODEL_PATH" --trust-remote-code \
-  --tp 8 --enable-pdmux --disable-overlap-schedule --sm-group-num 3 \
+  --tp 8 --moe-a2a-backend none --enable-pdmux --disable-overlap-schedule --sm-group-num 3 \
   --pdmux-config-path /tmp/dsv41-pdmux.yaml --chunked-prefill-size 8192
 ```
 
@@ -94,3 +94,51 @@ that vector across multiple attention DP ranks, including when the optional
 ordinary-scheduler skip-gather environment setting is enabled.
 
 This matrix covers TP/attention DP. EP, CP and DCP need their own validation.
+
+## Single-layer MTP/EAGLE and DSpark layer
+
+For checkpoint MTP, add these options to the launch above using a checkpoint
+that contains the compatible single NextN head:
+
+```bash
+--speculative-algorithm EAGLE --speculative-draft-model-path "$MODEL_PATH" \
+--speculative-num-steps 3 --speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4
+```
+
+The target captures FULL pre-mHC hidden states shaped
+`[tokens, hc_mult * hidden_size]`. Intermediate slices do not run draft extend.
+Only the final slice hands an independent batch view to the draft. MTP draft
+decode/extend runs eager; target decode/verify retains its per-stream graph path.
+`NEXTN` is an alias of EAGLE. Multi-layer EAGLE, EAGLE3, adaptive parameters and
+other speculative algorithms are rejected with PDMux.
+
+For DSpark, set `DSPARK_MODEL_PATH` to the matching independent draft checkpoint
+and use:
+
+```bash
+--speculative-algorithm DSPARK \
+--speculative-draft-model-path "$DSPARK_MODEL_PATH" \
+--speculative-draft-attention-backend flashinfer \
+--speculative-num-draft-tokens 8
+```
+
+With DSpark attention DP, also add `--enable-dp-lm-head`, as required by the
+ordinary DSpark adapter. Keep `--moe-a2a-backend none` for this TP/attention-DP
+matrix. Existing DSpark backend and static ragged-verify checks still apply if
+you enable the optional DP speculative-prefill coordination environment setting.
+
+DSpark accumulates aux hidden states across target slices, injects draft KV once
+at completion and preserves its existing per-stream draft graph support. Target
+verify and DSpark draft select the active decode backend; Eagle draft preserves
+the caller's per-step backend. Final draft/injection work uses a bidirectional
+stream fence: wait for prior decode, then publish completion to the next decode.
+Intermediate target layers continue to overlap.
+
+Compare each speculative configuration with its ordinary-scheduler counterpart.
+Cover single-request greedy output and acceptance, long prefill during decode,
+chunk continuation/abort, HiCache on/off, both SM layouts, TP8/DP8 and TP8/DP2,
+peer-only work and IDLE completion without logits. Confirm draft KV injection
+counts, final-only draft extension and graph/backend selection across stream
+switches. Preserve the upstream restriction that decoder bounded replay/tail
+does not support MTP FULL capture or DP; DSpark tail is tested without DP.

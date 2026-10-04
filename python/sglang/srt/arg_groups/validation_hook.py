@@ -25,6 +25,20 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pdmux_speculative_compat(cfg: Any) -> None:
+    if cfg.speculative_algorithm is None:
+        return
+    assert cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN", "DSPARK"), (
+        "PD-Multiplexing supports single-layer MTP/EAGLE and DSpark."
+    )
+    assert not cfg.enable_multi_layer_eagle, (
+        "PD-Multiplexing does not support multi-layer EAGLE."
+    )
+    assert not cfg.speculative_adaptive, (
+        "PD-Multiplexing requires fixed speculative parameters."
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -169,9 +183,7 @@ def check_server_args(server_args: Any):
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
         )
-        assert cfg.speculative_algorithm is None, (
-            "PD-Multiplexing speculative decoding requires the split-prefill worker adapter."
-        )
+        check_pdmux_speculative_compat(cfg)
         if cfg.chunked_prefill_size > 0:
             assert not cfg.enable_mixed_chunk, (
                 "PD-Multiplexing does not support mixed prefill/decode chunks."

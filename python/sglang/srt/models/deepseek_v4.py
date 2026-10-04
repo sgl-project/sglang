@@ -5153,6 +5153,7 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    supports_pdmux_dspark_prefill = True
 
     def __init__(
         self,
@@ -5496,16 +5497,34 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             result, aux_hidden_states = result
         hidden_states, pre_hc_head = result
-        return self.logits_processor(
+        logits_metadata = forward_batch
+        tail = None
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # The backend restored its full metadata at the final layer. Keep
+            # logits and draft-KV injection tied to this batch's captured rows.
+            tail = forward_batch.model_specific_states["hc_pre"]["tail"]
+            input_ids = tail.rows(input_ids)
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             hidden_states_before_norm=(
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.token_indices
+        return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         if _FP8_WO_A_UE8M0:

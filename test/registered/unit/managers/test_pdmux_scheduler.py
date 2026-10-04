@@ -3,8 +3,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -226,6 +231,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
         model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
         scheduler = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             split_prefill_batch=object(),
             pdmux_config=SimpleNamespace(
                 manual_divisions=manual_divisions, decode_bs_divisor=36
@@ -322,6 +328,110 @@ class TestPDMuxScheduler(unittest.TestCase):
             ]
 
         self.assertEqual(indices, [2, 2, 2])
+
+    def test_stream_switch_updates_speculative_worker(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[32, 100, 1]], group_num=3
+        )
+        scheduler.spec_algorithm = SpeculativeAlgorithm.DSPARK
+        scheduler.model_worker = Mock()
+        batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 2)
+        with self._stubbed_stream_idx():
+            index, _ = SchedulerMultiplexMixin.adjust_stream_groups(scheduler, batch)
+        scheduler.tp_worker.model_runner.update_decode_attn_backend.assert_called_once_with(
+            index
+        )
+        scheduler.model_worker.update_decode_attn_backend.assert_called_once_with(index)
+
+    def test_split_prefill_routes_spec_worker_and_publishes_only_final_draft(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.future_map = object()
+        scheduler.tp_worker = Mock()
+        scheduler.model_worker = Mock()
+        scheduler._relay_forward_payload = Mock()
+        scheduler._copy_auxiliary_output_to_cpu = Mock()
+        state = object()
+        old_draft = object()
+        seq_lens = torch.tensor([3, 4])
+        batch = SimpleNamespace(
+            split_index=0,
+            split_forward_batch=state,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            spec_info=old_draft,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            seq_lens_sum=7,
+            req_pool_indices=torch.tensor([0, 1]),
+            input_ids=torch.tensor([1]),
+        )
+        intermediate = GenerationBatchResult(
+            logits_output=None, can_run_cuda_graph=False
+        )
+        final_draft = object()
+        new_seq_lens = torch.tensor([4, 5])
+        final = GenerationBatchResult(
+            logits_output=None,
+            can_run_cuda_graph=False,
+            next_draft_input=final_draft,
+            new_seq_lens=new_seq_lens,
+        )
+        scheduler.model_worker.forward_batch_split_prefill.side_effect = [
+            intermediate,
+            final,
+        ]
+        with patch("sglang.srt.managers.scheduler.resolve_forward_inputs") as resolve:
+            self.assertIs(scheduler._run_pdmux_split_prefill(batch), intermediate)
+            self.assertIs(batch.spec_info, old_draft)
+            self.assertIs(batch.seq_lens, seq_lens)
+            self.assertIs(batch.split_forward_batch, state)
+            scheduler._relay_forward_payload.assert_not_called()
+            batch.split_index = 1
+            self.assertIs(scheduler._run_pdmux_split_prefill(batch), final)
+            resolve.assert_called_once_with(batch, scheduler.future_map)
+        scheduler.tp_worker.forward_batch_split_prefill.assert_not_called()
+        self.assertIs(batch.spec_info, final_draft)
+        self.assertIs(batch.seq_lens, new_seq_lens)
+        self.assertEqual(batch.seq_lens_sum, 9)
+        self.assertIsNone(batch.input_ids)
+        scheduler._relay_forward_payload.assert_called_once_with(
+            batch, batch.req_pool_indices, final
+        )
+
+    def test_plain_split_prefill_uses_target_worker(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model_worker = Mock()
+        scheduler.tp_worker = Mock()
+        scheduler._copy_auxiliary_output_to_cpu = Mock()
+        scheduler._relay_forward_payload = Mock()
+        result = GenerationBatchResult(logits_output=None, can_run_cuda_graph=False)
+        scheduler.tp_worker.forward_batch_split_prefill.return_value = result
+        batch = SimpleNamespace(split_index=1, spec_algorithm=SpeculativeAlgorithm.NONE)
+        self.assertIs(scheduler._run_pdmux_split_prefill(batch), result)
+        scheduler.model_worker.forward_batch_split_prefill.assert_not_called()
+
+    def test_first_target_slice_passes_hidden_capture_request(self):
+        worker = TpModelWorker.__new__(TpModelWorker)
+        worker.set_hicache_consumer = Mock()
+        worker._maybe_finalize_elastic_cuda_graph_scale = Mock()
+        worker._model_runner = Mock()
+        worker._model_runner.forward.return_value = SimpleNamespace(
+            logits_output=None, can_run_graph=False, expert_distribution_metrics=None
+        )
+        batch = SimpleNamespace(
+            hicache_consumer_index=7, split_index=0, split_forward_count=1
+        )
+        persistent = object()
+        with patch(
+            "sglang.srt.managers.tp_worker.ForwardBatch.init_new",
+            return_value=persistent,
+        ) as initialize:
+            TpModelWorker.forward_batch_split_prefill(
+                worker, batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
+        self.assertEqual(
+            initialize.call_args.kwargs["capture_hidden_mode"], CaptureHiddenMode.FULL
+        )
+        self.assertIs(batch.split_forward_batch, persistent)
 
     def test_split_prefill_forward_installs_hicache_consumer_first(self):
         """Every split-prefill segment must install the HiCache consumer index

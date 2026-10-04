@@ -17,6 +17,7 @@ class TestPDMuxSplitDispatch(unittest.TestCase):
     def _runner(self):
         runner = object.__new__(ModelRunner)
         runner.device = "cuda"
+        runner.is_draft_worker = False
         runner.hisparse_coordinator = None
         runner.decode_cuda_graph_runner = SimpleNamespace(
             can_run_graph=Mock(return_value=True),
