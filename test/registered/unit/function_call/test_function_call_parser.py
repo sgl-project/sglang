@@ -1561,6 +1561,43 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def test_streaming_args_emitted_when_fence_and_end_arrive_together(self):
+        """Regression: fence + end tokens in the same final delta must still emit the arguments."""
+        chunks = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n",
+            '```json\n{"city": "Paris"}\n',
+            "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+        detector = DeepSeekV3Detector()
+        streamed = [
+            c
+            for chunk in chunks
+            for c in detector.parse_streaming_increment(chunk, self.tools).calls
+        ]
+        streamed_args = "".join(c.parameters for c in streamed)
+        parsed = DeepSeekV3Detector().detect_and_parse(
+            "".join(chunks), self.tools
+        )
+        self.assertEqual(
+            streamed_args,
+            parsed.calls[0].parameters,
+            "Streaming must emit the same arguments as detect_and_parse",
+        )
+
+    def test_streaming_args_emitted_when_everything_in_one_chunk(self):
+        """Regression: entire tool call in a single delta must emit both name and arguments."""
+        single = (
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            '```json\n{"city": "Tokyo"}\n'
+            "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        )
+        detector = DeepSeekV3Detector()
+        streamed = list(detector.parse_streaming_increment(single, self.tools).calls)
+        names = [c.name for c in streamed if c.name]
+        args = "".join(c.parameters for c in streamed)
+        self.assertEqual(names, ["get_weather"])
+        self.assertEqual(json.loads(args), {"city": "Tokyo"})
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
