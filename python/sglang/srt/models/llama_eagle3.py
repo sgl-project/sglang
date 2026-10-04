@@ -49,7 +49,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            stage_boundaries=False,
+        )
 
         # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0

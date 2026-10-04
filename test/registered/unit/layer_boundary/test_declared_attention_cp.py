@@ -44,7 +44,6 @@ def layernorm(hidden_states, residual=None):
 
 class Flags:
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
@@ -197,8 +196,9 @@ class TestAttentionCpBoundary(CustomTestCase):
         )
 
     def run_ranks(self, use_reduce_scatter):
-        """Gather on each rank, run an FFN that leaves a partial sum or not,
-        finish the exit and return what each rank got back and published."""
+        """Gather on each rank, run an FFN that leaves its partial sum, finish
+        the exit and return the ranks the exit summed over, what each rank got
+        back, and the ranks the reduce-scatter summed over."""
         handed = {}
 
         def record_gather(cp):
@@ -239,10 +239,17 @@ class TestAttentionCpBoundary(CustomTestCase):
         for cp in range(CP_SIZE):
             torch.testing.assert_close(gathered[cp], expected_rows, rtol=0, atol=0)
 
-        def compute_output(cp, leaves):
-            return gathered[cp] * PARTIAL_WEIGHTS[cp] if leaves else gathered[cp]
+        reduced, summed = {}, {}
 
-        reduced = {}
+        def record_sum(cp):
+            def sum_output(value, *args, **kwargs):
+                summed[cp] = value.clone()
+                return value
+
+            return sum_output
+
+        def fill_sum(value, *args, **kwargs):
+            return sum(summed[r] for r in range(CP_SIZE))
 
         def record_reduce_scatter(cp):
             def reduce_scatter(output, input_):
@@ -257,7 +264,7 @@ class TestAttentionCpBoundary(CustomTestCase):
 
             return reduce_scatter
 
-        published, back = {}, {}
+        back = {}
         for phase in ("record", "fill"):
             for cp in range(CP_SIZE):
                 reduce_scatter = (
@@ -265,33 +272,38 @@ class TestAttentionCpBoundary(CustomTestCase):
                     if phase == "record"
                     else fill_reduce_scatter(cp)
                 )
-                with self.as_rank(
-                    cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
-                ) as rank:
+                with (
+                    self.as_rank(
+                        cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
+                    ) as rank,
+                    patch_communicator(
+                        "sum_output", record_sum(cp) if phase == "record" else fill_sum
+                    ),
+                ):
                     communicator = self.build(use_reduce_scatter)
                     with communicator.ffn.plan.output.ffn_exit(
                         self.cp_extend(), stream=ResidualStream()
                     ) as exit_:
-                        published[cp] = rank.flags.mlp_reduce_scatter
-                        output = compute_output(cp, leaves=published[cp])
+                        self.assertFalse(rank.flags.mlp_reduce_scatter)
+                        output = gathered[cp] * PARTIAL_WEIGHTS[cp]
                     back[cp], _ = finish_exit(
                         exit_, output, ResidualStream(residuals[cp].residual)
                     )
-        return published, back, reduced
+        return summed, back, reduced
 
     def test_the_reduce_scatter_completes_the_sum_the_moe_leaves(self):
-        published, back, reduced = self.run_ranks(use_reduce_scatter=True)
-        self.assertEqual(published, {0: True, 1: True}, "the MoE leaves its sum")
+        summed, back, reduced = self.run_ranks(use_reduce_scatter=True)
+        self.assertEqual(summed, {}, "the exit runs no all-reduce")
         self.assertEqual(sorted(reduced), [0, 1], "every rank joins the reduce-scatter")
         for cp in range(CP_SIZE):
             torch.testing.assert_close(
                 back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
             )
 
-    def test_a_complete_output_is_only_taken_back(self):
-        published, back, reduced = self.run_ranks(use_reduce_scatter=False)
-        self.assertEqual(published, {0: False, 1: False}, "the MoE sums itself")
-        self.assertEqual(reduced, {}, "nothing is summed again")
+    def test_without_a_reduce_scatter_the_exit_sums_then_takes_back(self):
+        summed, back, reduced = self.run_ranks(use_reduce_scatter=False)
+        self.assertEqual(sorted(summed), [0, 1], "the exit sums what the MoE leaves")
+        self.assertEqual(reduced, {}, "the take-back sums nothing")
         for cp in range(CP_SIZE):
             torch.testing.assert_close(
                 back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
@@ -338,41 +350,48 @@ class TestAttentionCpBoundary(CustomTestCase):
                         dsa_cp.attn_cp_interleave_gather(local), expected
                     )
 
-    def test_a_sum_over_other_ranks_is_not_left_to_it(self):
-        # A MoE group narrower than attention CP, as when MoE DP splits CP.
-        self.moe_tp_size = 1
-        published, back, reduced = self.run_ranks(use_reduce_scatter=True)
-        self.assertEqual(published, {0: False, 1: False}, "the MoE sums itself")
-        self.assertEqual(reduced, {}, "CP must not sum over the wrong ranks")
-        for cp in range(CP_SIZE):
-            torch.testing.assert_close(
-                back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
-            )
-
-    def test_attention_tp_completes_ffn_sum_before_cp_take_back(self):
-        # DP1 x CP2 x attention TP2: the FFN sums over TP4, not CP2.
-        self.attn_tp_size = 2
+    def test_exit_sums_over_the_ffn_group_before_cp_take_back(self):
+        # DP1 x CP2 x attention TP2 needs a TP4 sum, not CP2. A MoE group
+        # narrower than CP likewise must not leave its sum to CP.
         complete_output = torch.cat(self.values)
 
         def unused(*args):
             raise AssertionError("a complete FFN output needs no CP collective")
 
-        for sparse in (False, True):
-            with self.subTest(sparse=sparse):
+        for sparse, attn_tp_size, group_size in (
+            (False, 2, 4),
+            (True, 2, 4),
+            (True, 1, 1),
+        ):
+            with self.subTest(
+                sparse=sparse, attn_tp=attn_tp_size, group_size=group_size
+            ):
                 self.sparse = sparse
+                self.attn_tp_size = attn_tp_size
+                self.moe_tp_size = group_size
+                expected_group = (
+                    comm.SumGroup.MOE_OUTPUT if sparse else comm.SumGroup.TP
+                )
+
+                def sum_output(value, group, *args, **kwargs):
+                    self.assertEqual(group, expected_group)
+                    torch.testing.assert_close(
+                        value, complete_output / group_size, rtol=0, atol=0
+                    )
+                    return value * group_size
+
                 for cp in range(CP_SIZE):
-                    with self.as_rank(
-                        cp, dict(gather=unused, reduce_scatter=unused)
-                    ) as rank:
+                    with (
+                        self.as_rank(cp, dict(gather=unused, reduce_scatter=unused)),
+                        patch_communicator("sum_output", sum_output),
+                    ):
                         stages = self.build(use_reduce_scatter=True)
                         stream = ResidualStream(self.residuals[cp])
                         with stages.ffn.plan.output.ffn_exit(
                             self.cp_extend(), stream=stream
                         ) as exit_:
-                            self.assertFalse(rank.flags.mlp_reduce_scatter)
-                            self.assertFalse(rank.flags.fuse_mlp_allreduce)
-                            # Compute must return its completed TP4 sum.
-                            output = complete_output.clone()
+                            # Compute returns a partial sum; the exit owns it.
+                            output = complete_output / group_size
                         back, stream = finish_exit(exit_, output, stream)
                         torch.testing.assert_close(
                             back, self.values[cp], rtol=0, atol=0
