@@ -29,7 +29,7 @@ attn_tp_size % dcp_size == 0
 For example, `TP=64, attention DP=4, DCP=16` creates four valid 16-rank attention replicas. `DCP=32` would cross replica boundaries and is invalid.
 
 <Warning>
-Startup currently checks only `tp_size % dcp_size == 0`, not the stronger condition above. Until that check is fixed, DPA+DCP deployments must enforce containment when choosing the topology.
+RoPE DSA models validate the stronger attention-TP condition at startup. Other model paths may check only `tp_size % dcp_size == 0`; enforce containment when choosing their topology.
 </Warning>
 
 MLA decode on DeepSeek-V3.1 with DCP 8 inside TP 8:
@@ -59,6 +59,71 @@ sglang serve \
 ```
 
 See the [Kimi K3 cookbook](/cookbook/autoregressive/Moonshotai/Kimi-K3) for large-scale presets that combine DCP with DPA and expert parallelism.
+
+### RoPE DSA on Blackwell
+
+GLM-5.3, GLM-5.2, and DeepSeek-V3.2 use a replicated sparse-attention indexer with a striped target KV cache. Every rank selects the same global top-k, keeps the selected slots it owns, and returns a partial output and base-2 LSE. Decode and chunked prefill use the same query-gather and LSE-merge path. Fused top-k remains enabled.
+
+| Configuration | CUDA RoPE DSA DCP |
+| --- | --- |
+| GPU and sparse backends | SM100/SM103; `trtllm` prefill and decode |
+| KV dtype | `fp8_e4m3` (default) or `bfloat16` |
+| Communication | `ag_rs`, `a2a`, `fi_a2a`; the usual Blackwell default is `fi_a2a` |
+| Decode CUDA graphs, chunked prefill, radix cache, retraction | Supported |
+| Expert parallelism | Composes with the default MoE path |
+| Attention DP | Requires `attn_tp_size % dcp_size == 0` |
+| EAGLE/MTP | Checkpoint-native draft, single chain; flags below |
+| Replicated Q projection | Rejected at launch |
+| HiSparse, prefill CP, HiCache/L3, PD disaggregation, unified memory | Rejected at launch |
+| Other CUDA sparse backends or GPU architectures | Rejected at launch |
+
+This support applies to the RoPE DSA path; GLM-5.3-Flash uses a separate NoPE path. GLM-5.3 NVFP4 is the primary validation model. GLM-5.2 and DeepSeek-V3.2 share the implementation but require their own model accuracy validation.
+
+On four B200/B300 GPUs with FlashInfer 0.7.0.post1:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --quantization modelopt_fp4 \
+  --tp-size 4 \
+  --dcp-size 2 \
+  --reasoning-parser glm45
+```
+
+Use `--dcp-size 4` for a larger logical KV capacity. The indexer cache remains replicated, so total capacity grows by less than the DCP factor. Pool sizing includes the replicated index keys and extra workspace. DCP can increase per-token latency; compare the communication backends on your workload. With `ag_rs`, also measure `--enable-symm-mem`.
+
+#### Choose between TP, attention DP, and DCP
+
+DCP raises KV capacity, not speed. Measured with GLM-5.3 NVFP4 on four B300 GPUs (FP8 KV, 1,024 output tokens per request, warm prefix cache, steady-state output tokens per second):
+
+| Input tokens | Concurrency | TP4 | TP4 + attention DP4 | TP4 + DCP4 |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,000 | 1 | 149 | 81 | 117 |
+| 32,000 | 16 | 1,300 | 955 | 1,065 |
+| 32,000 | 64 | 3,079 | 2,829 | 2,596 |
+| 32,000 | 128 | over capacity | 4,710 | 3,808 |
+| 32,000 | 256 | over capacity | 7,866 | 4,181 |
+| 128,000 | 16 | 1,185 | 935 | 1,001 |
+| 128,000 | 64 | over capacity | 2,605 | 2,273 |
+
+- Use plain TP when the workload fits its KV cache. It is the fastest option at every point it can serve.
+- Use attention DP when you need throughput beyond that capacity. It requires a router that keeps a session on one DP rank to reuse the prefix cache.
+- Use DCP when you need the larger capacity at low concurrency, or one KV pool shared by all ranks. Its per-token latency sits between TP and attention DP at low concurrency and falls behind attention DP from about 64 concurrent requests.
+
+The replicated indexer cache bounds the capacity gain. For GLM-5.3 with FP8 KV, each token stores 44,928 bytes of sharded target KV and 2,772 bytes of replicated index keys, so equal memory gives 1.89x the TP capacity at DCP2, 3.41x at DCP4, and 5.69x at DCP8. The DCP workspace reservation lowers the measured values to 1.85x and 3.22x at DCP2 and DCP4.
+
+The current DCP launch policy disables prefill CUDA graphs. Decode graph capture remains enabled. FP8 partial attention can differ slightly from unsharded attention because each shard quantizes its softmax numerator using a local maximum; validate model accuracy alongside latency.
+
+For checkpoint-native MTP, add these flags to the launch above:
+
+```bash
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6
+```
+
+The draft cache is replicated over the full virtual address space; only target KV is sharded. The supported chain requires explicit positive steps, top-k 1, and draft tokens equal to steps plus one. Other speculative algorithms, branching trees, adaptive or multi-layer EAGLE, external draft checkpoints, non-DSA draft backends, and draft-only KV dtype overrides are rejected at launch. This configuration was validated with GLM-5.3 NVFP4 at TP4/DCP2.
 
 ## Why decode context parallelism?
 
