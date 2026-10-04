@@ -47,6 +47,7 @@ from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.arg_groups.engram_config import EngramPlacement
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -4628,6 +4629,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         # The loader hands this mapper to every quant config; other formats were
         # written against different names, so only Quark checkpoints get it.
         return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
+
+    @property
+    def host_resident_weight_patterns(self) -> Optional[Tuple[str, ...]]:
+        """Checkpoint names of the Engram tables kept in host memory."""
+        config = get_exec().offload.engram_config
+        if config is not None and config.placement == EngramPlacement.CPU:
+            return (".engram.embed.",)
+        return None
 
     def __init__(
         self,
