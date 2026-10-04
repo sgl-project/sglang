@@ -247,16 +247,16 @@ change buckets, or mutate affinity.
 
 An admission policy is a set of per-engine caps, `AdmissionLimits`. Each cap
 is optional; an unset cap is not checked, and the default admits everything.
-Count caps admit while the engine's metric is below them. Usage caps are
-shares, in (0, 1], of the engine's reported capacity that its load plus this
-request may fill, so one limit fits engines of any size. The request counts as
-one running request and as its input tokens on prefill, its expected peak
-otherwise. Admission observes load without reserving it.
+Each cap admits while the engine's load is below it. Usage caps are shares, in
+(0, 1], of the engine's reported capacity, so one limit fits engines of any
+size. The request itself is not counted: an engine just below a cap still takes
+it, and the engine queues or retracts if it overflows. Admission observes load
+without reserving it.
 
 | Limit | Checks |
 | --- | --- |
-| `max_running_usage` | Running requests + 1 against reported max running requests |
-| `max_kv_usage` | KV tokens + this request against reported KV capacity |
+| `max_running_usage` | Running requests against reported max running requests |
+| `max_kv_usage` | KV tokens against reported KV capacity |
 | `max_waiting_requests` | Reported waiting requests |
 | `max_pending_prefill_tokens` | Reported waiting uncached tokens |
 | `max_inflight_requests` | Router-local in-flight requests |

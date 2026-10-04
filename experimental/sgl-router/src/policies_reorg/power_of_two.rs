@@ -63,7 +63,7 @@ impl Policy for PowerOfTwoPolicy {
                     Arc::clone(if ordering.is_gt() { right } else { left })
                 }
             };
-            let metrics = EngineMetrics::observe(&engine, &load, request);
+            let metrics = EngineMetrics::observe(&engine, &load);
             if let Decision::Reject(reason) = self.admission.check(&engine, &metrics)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),

@@ -172,7 +172,7 @@ Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
 settings, external indexers, session headers/timeouts, and `--filter overloaded`
 with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
-an engine whose KV tokens plus the request's would exceed 95% of its capacity.
+an engine whose KV tokens have reached 95% of its capacity.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each

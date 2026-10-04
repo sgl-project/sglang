@@ -241,9 +241,8 @@ impl CacheAwarePolicy {
         &self,
         engine: &Worker,
         load: &EngineReportedLoadSnapshot,
-        request: &PickRequest<'_>,
     ) -> Result<Option<Rejection>, PickError> {
-        let metrics = EngineMetrics::observe(engine, load, request);
+        let metrics = EngineMetrics::observe(engine, load);
         Ok(match self.admission.check(engine, &metrics)? {
             Decision::Allow => None,
             Decision::Reject(reason) => Some(Rejection {
@@ -257,12 +256,11 @@ impl CacheAwarePolicy {
         &self,
         candidates: &[Candidate<'e>],
         load: &EngineReportedLoadSnapshot,
-        request: &PickRequest<'_>,
         rejections: &mut Vec<Rejection>,
     ) -> Result<Vec<Candidate<'e>>, PickError> {
         let mut admitted = Vec::new();
         for &candidate in candidates {
-            match self.check(candidate.engine, load, request)? {
+            match self.check(candidate.engine, load)? {
                 None => admitted.push(candidate),
                 Some(rejection) => rejections.push(rejection),
             }
@@ -307,7 +305,7 @@ impl Policy for CacheAwarePolicy {
             let load = self.engine_load.capture_snapshot(Instant::now());
             let candidates = self.candidates(engines, request, signal.as_deref(), &load);
             let mut rejections = Vec::new();
-            let admitted = self.admit(&candidates, &load, request, &mut rejections)?;
+            let admitted = self.admit(&candidates, &load, &mut rejections)?;
             let affinity = admitted.first().map(|c| Pick {
                 engine: Arc::clone(c.engine),
                 reason: "cache_candidate",
@@ -333,7 +331,7 @@ impl Policy for CacheAwarePolicy {
                 if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
                     return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
                 }
-                if let Some(rejection) = self.check(&pick.engine, &load, request)? {
+                if let Some(rejection) = self.check(&pick.engine, &load)? {
                     return Err(PickError::AdmissionRejected(rejection));
                 }
                 pick.reason = if affinity.is_some() {
