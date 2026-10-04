@@ -81,7 +81,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.swa import (
+    DraftSWATokenToKVPoolAllocator,
+    is_swa_req_ring,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -393,6 +396,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        # A bounded speculative draft pool is the allocator's SWA side.
+        self.bounded_draft_kv = isinstance(
+            token_to_kv_pool_allocator, DraftSWATokenToKVPoolAllocator
+        )
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -444,9 +451,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
         if (
-            self.scheduler.tp_worker.is_hybrid_swa
-            and not self._uses_swa_tail_prealloc()
-        ):
+            self.scheduler.tp_worker.is_hybrid_swa or self.bounded_draft_kv
+        ) and not self._uses_swa_tail_prealloc():
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
             self.max_total_num_tokens = min(
@@ -468,7 +474,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            (
+                isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+                or self.bounded_draft_kv
+            )
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
@@ -527,17 +536,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
-        if self.scheduler.tp_worker.is_hybrid_swa:
+        if self.scheduler.tp_worker.is_hybrid_swa or self.bounded_draft_kv:
             return self.tree_cache.full_evictable_size()
         return self.tree_cache.evictable_size()
 
     def _radix_full_protected(self) -> int:
-        if self.scheduler.tp_worker.is_hybrid_swa:
+        if self.scheduler.tp_worker.is_hybrid_swa or self.bounded_draft_kv:
             return self.tree_cache.full_protected_size()
         return self.tree_cache.protected_size()
 
     def _radix_full_available(self) -> int:
-        if self.scheduler.tp_worker.is_hybrid_swa:
+        if self.scheduler.tp_worker.is_hybrid_swa or self.bounded_draft_kv:
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
@@ -659,6 +668,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            bounded_draft_kv=self.bounded_draft_kv,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold > 0:
             pool = self.token_to_kv_pool

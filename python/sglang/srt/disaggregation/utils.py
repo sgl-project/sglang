@@ -1312,6 +1312,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    bounded_draft_kv: bool = False,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1678,6 +1679,13 @@ def setup_state_kv_args(
                 draft_lens,
                 draft_item_lens,
             )
+
+    # A bounded speculative draft pool is the SWA side of the target allocator
+    # and holds only its window, so it travels as SWA state.
+    if bounded_draft_kv and draft_token_to_kv_pool is not None:
+        append_state_component(
+            kv_args, StateType.SWA, *draft_token_to_kv_pool.get_state_buf_infos()
+        )
 
     if (
         StateType.MAMBA not in kv_args.state_types
