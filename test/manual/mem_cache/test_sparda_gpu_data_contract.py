@@ -134,7 +134,9 @@ def main() -> None:
     first_source_v = source_v[0][:chunk_size]
     second_source_k = source_k[0][chunk_size:]
     second_source_v = source_v[0][chunk_size:]
-    missing_key = replace(key, cache_salt="deliberate-miss")
+    # Use an unstored chunk in the same cache namespace for the miss.
+    missing_key = replace(key, chunk_hash=b"\x00" * len(key.chunk_hash))
+    assert missing_key != key
 
     # Full hit: the destination is a separate page range and should match the
     # source values after sparse_retrieve's device event has been consumed.
@@ -200,6 +202,23 @@ def main() -> None:
         and bool(torch.all(v_pool[0][partial_destination[chunk_size:]] == -7))
     )
     if not partial_equal:
+        print(
+            {
+                "partial_result": partial_result,
+                "hit_k_equal": torch.equal(
+                    k_pool[0][partial_destination[:chunk_size]], first_source_k
+                ),
+                "hit_v_equal": torch.equal(
+                    v_pool[0][partial_destination[:chunk_size]], first_source_v
+                ),
+                "miss_k_untouched": bool(
+                    torch.all(k_pool[0][partial_destination[chunk_size:]] == -7)
+                ),
+                "miss_v_untouched": bool(
+                    torch.all(v_pool[0][partial_destination[chunk_size:]] == -7)
+                ),
+            }
+        )
         raise AssertionError("partial sparse retrieve did not preserve hit/miss pages")
     release_partial = _future_result(
         connector.sparse_release_prefetch(partial_request, 1, 0)
