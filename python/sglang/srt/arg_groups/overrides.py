@@ -60,7 +60,7 @@ from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     get_context,
@@ -1743,14 +1743,38 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     if cfg.disaggregation_mode != "decode":
         prefill_cfg = cfg.cuda_graph_config.prefill
+        if prefill_cfg.backend == Backend.DISABLED or cfg.chunked_prefill_size <= 0:
+            return False
         # We can only skip eager activation headroom when the largest
         # prefill forward batch size is already graph-captured. Otherwise,
         # an eager forward will need more memory and lead to OOM.
-        if (
-            prefill_cfg.backend == Backend.DISABLED
-            or cfg.chunked_prefill_size <= 0
-            or max_prefill_buffer_tokens(server_args) > max(prefill_cfg.bs or (0,))
-        ):
+        prefill_buffer_tokens = max_prefill_buffer_tokens(server_args)
+        max_captured_prefill_tokens = max(prefill_cfg.bs or (0,))
+        if prefill_buffer_tokens > max_captured_prefill_tokens:
+            required_tokens = required_prefill_capture_bucket(prefill_buffer_tokens)
+            if (Phase.PREFILL, "bs") in getattr(
+                server_args, "_cuda_graph_config_locked", ()
+            ):
+                # The bucket list came from --cuda-graph-bs-prefill, so the
+                # capture ceiling is not the knob that is short; the list is.
+                remedy = (
+                    f"Add a bucket of at least {required_tokens} tokens to "
+                    "--cuda-graph-bs-prefill"
+                )
+            else:
+                remedy = (
+                    f"Raise --cuda-graph-max-bs-prefill to at least {required_tokens}"
+                )
+            logger.warning(
+                "Post-capture KV sizing is disabled because the prefill CUDA graph "
+                "does not cover every reachable prefill batch: the prefill buffer "
+                "ceiling is %d tokens but the largest captured prefill bucket is "
+                "%d. %s, or lower --chunked-prefill-size, to enable post-capture "
+                "KV sizing.",
+                prefill_buffer_tokens,
+                max_captured_prefill_tokens,
+                remedy,
+            )
             return False
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
@@ -1803,6 +1827,32 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         record = record_of(server_args)
     return prefill_buffer_ceiling_of(record, tokens)
+
+
+def required_prefill_capture_bucket(tokens: int) -> int:
+    """Smallest prefill capture bucket that covers ``tokens``.
+
+    Capture buckets are quantised (256-wide up to 4096, then 512-wide), and
+    ``--cuda-graph-max-bs-prefill`` does not add its own value to the list, so
+    naming it a value that falls between buckets would leave the largest
+    captured bucket still short of the ceiling. Quoting a bucket instead keeps
+    the diagnostic actionable on the first try. ``tokens`` values off the grid
+    are reachable: the flag is documented in tokens, and PP dynamic chunking
+    derives a 1.25x probe from the chunk size.
+    """
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
+    )
+
+    # Probe past ``tokens`` (widest step is 512) so the generator emits at
+    # least one bucket at or above it. The probe stays on the 512 grid that
+    # the top segment is built from, so it is itself a bucket.
+    probe = max(4608, -(-tokens // 512) * 512 + 512)
+    return min(
+        bucket
+        for bucket in generate_prefill_cuda_graph_batch_sizes(probe)
+        if bucket >= tokens
+    )
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:
