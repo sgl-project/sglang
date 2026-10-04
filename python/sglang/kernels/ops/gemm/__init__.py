@@ -559,3 +559,18 @@ register_kernel(
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="gemm.fp32_router",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.fp32_router:fp32_router_gemm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float32"),
+            description="BF16 [M,5120] @ FP32 [256,5120].T -> FP32, 1 <= M <= 64",
+        ),
+        description="Small-batch router GEMM with full FP32 weights and accumulation.",
+    )
+)

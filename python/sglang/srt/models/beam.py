@@ -25,6 +25,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.kernels.ops.gemm.fp32_router import fp32_router_gemm
 from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
@@ -64,7 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
 
 _is_cuda = is_cuda()
@@ -252,10 +253,35 @@ class BeamMoE(nn.Module):
         )
         # Offloading replaces parameters, but TopKConfig keeps an alias.
         self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
+        # Preserve the normal linear path for offloading, adapters and strict
+        # deterministic inference. Never cache or downcast router weights.
+        self.use_fp32_router = (
+            _is_cuda
+            and config.hidden_size == 5120
+            and config.num_experts == 256
+            and torch.cuda.get_device_capability()[0] in (9, 10)
+            and not self.refresh_correction_bias
+            and not get_lora().enable_lora
+            and not get_exec().deterministic.enable_deterministic_inference
+            and get_fused_op_backend() != KernelBackend.TORCH
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
-            router_logits, _ = self.gate(hidden_states.float())
+            if (
+                self.use_fp32_router
+                and not torch.compiler.is_compiling()
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_contiguous()
+                and hidden_states.data_ptr() % 16 == 0
+                and (
+                    hidden_states.shape[0] <= 16
+                    or hidden_states.shape[0] in (24, 32, 48, 64)
+                )
+            ):
+                router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
+            else:
+                router_logits, _ = self.gate(hidden_states.float())
             if self.refresh_correction_bias:
                 self.topk.topk_config.correction_bias = (
                     self.gate.e_score_correction_bias
