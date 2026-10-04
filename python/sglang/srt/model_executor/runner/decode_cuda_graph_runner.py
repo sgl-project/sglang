@@ -149,6 +149,16 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -1476,6 +1486,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
+    def _build_decode_replay_kv_len_nvtx_msg(self) -> Optional[str]:
+        raw_bs = int(getattr(self, "raw_bs", 0) or 0)
+        capture_bs = int(getattr(self, "bs", 0) or 0)
+        seq_lens_cpu = self.buffers.seq_lens_cpu[:raw_bs]
+        kv_lens = [int(x) for x in seq_lens_cpu.tolist()]
+        return (
+            "decode_cudagraph_kvlen "
+            f"raw_bs={raw_bs} capture_bs={capture_bs} kv_lens={kv_lens}"
+        )
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1506,7 +1526,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if SGLANG_PROFILE_NVTX:
+                info = self._build_decode_replay_kv_len_nvtx_msg()
+                th_nvtx_range_push(info)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

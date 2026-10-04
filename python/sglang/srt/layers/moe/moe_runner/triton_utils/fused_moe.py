@@ -57,6 +57,15 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_ppu = is_ppu()
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError:
+        SGLANG_PROFILE_NVTX = False
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -307,6 +316,15 @@ def fused_experts(
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
+        if SGLANG_PROFILE_NVTX:
+            if torch.cuda.is_current_stream_capturing():
+                th_nvtx_range_push(
+                    f"D_MoE,M_{hidden_states.shape[0]}_E_{w1.shape[0]}_H_{w1.shape[2]}_In_{w1.shape[1]}_topk_{topk_ids.shape[1]}"
+                )
+            else:
+                th_nvtx_range_push(
+                    f"P_MoE,M_{hidden_states.shape[0]}_E_{w1.shape[0]}_H_{w1.shape[2]}_In_{w1.shape[1]}_topk_{topk_ids.shape[1]}"
+                )
         inplace_fused_experts(
             hidden_states,
             w1,
@@ -339,9 +357,20 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
         return hidden_states
     else:
-        return outplace_fused_experts(
+        if SGLANG_PROFILE_NVTX:
+            if torch.cuda.is_current_stream_capturing():
+                th_nvtx_range_push(
+                    f"D_MoE,M_{hidden_states.shape[0]}_E_{w1.shape[0]}_H_{w1.shape[2]}_In_{w1.shape[1]}_topk_{topk_ids.shape[1]}"
+                )
+            else:
+                th_nvtx_range_push(
+                    f"P_MoE,M_{hidden_states.shape[0]}_E_{w1.shape[0]}_H_{w1.shape[2]}_In_{w1.shape[1]}_topk_{topk_ids.shape[1]}"
+                )
+        result = outplace_fused_experts(
             hidden_states,
             w1,
             w2,
@@ -374,6 +403,9 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return result
 
 
 @torch.compile

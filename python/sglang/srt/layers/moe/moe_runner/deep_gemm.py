@@ -88,6 +88,18 @@ elif _is_musa:
 else:
     _legacy_silu_and_mul = None
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_TOPID = envs.SGLANG_PROFILE_NVTX_PRINT_TOPID.get()
+
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError:
+        SGLANG_PROFILE_NVTX = False
+
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
@@ -381,6 +393,51 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             else None
         )
         with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
+            if SGLANG_PROFILE_NVTX:
+                topkid_pushed = False
+                w1 = quant_info.w13_weight
+                hidden_states = runner_input.hidden_states
+                topk_ids = running_state["topk_ids"]
+                M = topk_ids.shape[0]
+                E = w1.shape[0]
+                H = w1.shape[2]
+                In = w1.shape[1]
+                topk = topk_ids.shape[1]
+
+                if torch.cuda.is_current_stream_capturing():
+                    th_nvtx_range_push(f"D_MoE,M_{M}_E_{E}_H_{H}_In_{In}_topk_{topk}")
+                else:
+                    th_nvtx_range_push(f"P_MoE,M_{M}_E_{E}_H_{H}_In_{In}_topk_{topk}")
+
+                if (
+                    SGLANG_PROFILE_NVTX_PRINT_TOPID
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    num_recv_tokens_per_expert = torch.bincount(
+                        (
+                            runner_input.m_indices
+                            if runner_input.m_indices is not None
+                            else runner_input.masked_m
+                        ),
+                        minlength=self.config.num_local_experts,
+                    )
+                    token_counts_list = (
+                        num_recv_tokens_per_expert.flatten().cpu().tolist()
+                    )
+                    num_activated_experts = (
+                        (num_recv_tokens_per_expert > 0).sum().item()
+                    )
+
+                    nvtx_tag = (
+                        f"MoE,"
+                        f"M_{M}_E_{E}_H_{H}_In_{In}_"
+                        f"topk_{topk}_"
+                        f"topkids{token_counts_list}_"
+                        f"unique_{num_activated_experts}"
+                    )
+                    th_nvtx_range_push(nvtx_tag)
+                    topkid_pushed = True
+
             if not runner_input.use_masked_gemm:
                 if weight_dtype == torch.bfloat16:
                     hidden_states = self._run_bf16_contiguous_gemm(
@@ -437,6 +494,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     )
                 else:
                     raise NotImplementedError
+
+            if SGLANG_PROFILE_NVTX:
+                if topkid_pushed:
+                    th_nvtx_range_pop()
+                th_nvtx_range_pop()
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_contiguous_gemm(

@@ -416,6 +416,10 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+    IS_H200 = EnvBool(False)
+    SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -448,6 +452,9 @@ class Envs:
     # ===================================================================
     # Profiling, tracing, and metrics
     # ===================================================================
+    SGLANG_PROFILE_NVTX = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_TOPID = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_SEQLEN = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)

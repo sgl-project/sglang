@@ -175,6 +175,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils import (
+    get_is_capture_mode,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -250,6 +253,48 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
+
+MLA_ATTENTION_BACKENDS = [
+    "aiter",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+    "ascend",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
+    "intel_xpu",
+]
+
+
+def add_mla_attention_backend(backend_name):
+    if backend_name not in MLA_ATTENTION_BACKENDS:
+        MLA_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter
+
+        use_model_prof = True
+
+    except ImportError as e:
+        use_model_prof = False
+
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 
 # Detect stragger ranks in model loading
 
@@ -396,6 +441,8 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
+        if SGLANG_PROFILE_NVTX:
+            self.iteration = 0
 
         # Apply the rank zero filter to logger
         if get_observability().show_time_cost:
@@ -1750,6 +1797,18 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if SGLANG_PROFILE_NVTX:
+                # Use forward_mode to detect real prefill; MTP decode fakes extend mode
+                if (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                    and forward_batch.extend_seq_lens_cpu is not None
+                ):
+                    p_bs = len(forward_batch.extend_seq_lens_cpu)
+                else:
+                    p_bs = 0
+                th_nvtx_range_push(
+                    f"total bs={forward_batch.batch_size}, P bs={p_bs}, forward_pass_id={self.forward_pass_id}"
+                )
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
@@ -1764,6 +1823,8 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -1885,11 +1946,27 @@ class ModelRunner:
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
+
+            if SGLANG_PROFILE_NVTX:
+                if use_model_prof:
+                    # Skip during capture: prof_iter -> cudaDeviceSynchronize() is
+                    # illegal under CUDA Graph capture (error 900).
+                    # always use target_worker for prof_iter to avoid iteration mismatch
+                    if not get_is_capture_mode() and not self.is_draft_worker:
+                        prof_iter(self.iteration)
+                        # Increment inside guard so capture forwards don't bump
+                        # iteration and misalign the trace.
+                        self.iteration += 1
+
             if can_run_graph:
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_push("decode_cudagraph")
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_pop()
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1909,6 +1986,8 @@ class ModelRunner:
                 dwdp_mgr.prefetch_first_layers()
 
             if forward_batch.forward_mode.is_split_prefill():
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_push("forward_split_prefill")
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
                     forward_batch,
@@ -1936,12 +2015,22 @@ class ModelRunner:
                 # load_batch time. Move it into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 with device_timer_ctx(self.device_timer, category):
+                    if SGLANG_PROFILE_NVTX:
+                        th_nvtx_range_push("forward_extend")
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
+                if SGLANG_PROFILE_NVTX:
+                    mode = forward_batch.forward_mode
+                    if mode.is_decode():
+                        th_nvtx_range_push("forward_decode")
+                    if mode.is_idle():
+                        th_nvtx_range_push("forward_idle")
+                    if mode.is_extend(include_draft_extend_v2=True):
+                        th_nvtx_range_push("forward_extend")
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
@@ -1951,6 +2040,9 @@ class ModelRunner:
                 and self.pp_group.is_last_rank
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
@@ -1996,6 +2088,14 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+
+        if SGLANG_PROFILE_NVTX:
+            logits_output_shape = getattr(
+                logits_output.next_token_logits, "shape", None
+            )
+            th_nvtx_range_push(
+                f"[FW_NATIVE] op:sample,logits_output:{logits_output_shape}"
+            )
         # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
@@ -2036,6 +2136,8 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
         return next_token_ids
 
     def compute_logprobs_only(

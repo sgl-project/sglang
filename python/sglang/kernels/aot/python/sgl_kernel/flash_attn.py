@@ -4,6 +4,7 @@ from typing import Optional, Union
 import torch
 from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_ppu
 
 if not is_ppu():
@@ -13,6 +14,17 @@ if not is_ppu():
         raise ImportError(
             "Can not import FA3 in sgl_kernel. Please check your installation."
         )
+
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
 
 
 @lru_cache(maxsize=1)
@@ -230,6 +242,34 @@ def flash_attn_with_kvcache(
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
+    if SGLANG_PROFILE_NVTX:
+        if cu_seqlens_q is not None:
+            batch_size = len(cu_seqlens_q) - 1
+        else:
+            batch_size = 0
+        if page_table is not None:
+            num_blocks = k_cache.shape[-4]
+            page_block_size = k_cache.shape[-3]
+            page_table_flag = 1
+        else:
+            num_blocks = 0
+            page_block_size = 0
+            page_table_flag = 0
+
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_q_list = (
+                    cu_seqlens_q.flatten().cpu().tolist()
+                    if cu_seqlens_q is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag},num_blocks:{num_blocks},page_block_size:{page_block_size},cu_seqlens_q:{cu_seqlens_q_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag}"
+        th_nvtx_range_push(nvtx_message)
+
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
@@ -270,6 +310,9 @@ def flash_attn_with_kvcache(
         only_qv,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
+    if SGLANG_PROFILE_NVTX:
+        th_nvtx_range_pop()
+
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
@@ -321,6 +364,26 @@ def flash_attn_varlen_func(
         )
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
+    if SGLANG_PROFILE_NVTX:
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_q_list = (
+                    cu_seqlens_q.flatten().cpu().tolist()
+                    if cu_seqlens_q is not None
+                    else "[]"
+                )
+                cu_seqlens_k_list = (
+                    cu_seqlens_k.flatten().cpu().tolist()
+                    if cu_seqlens_k is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},cu_seqlens_q:{cu_seqlens_q_list},cu_seqlens_k:{cu_seqlens_k_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap}"
+        th_nvtx_range_push(nvtx_message)
+
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k,
@@ -361,6 +424,8 @@ def flash_attn_varlen_func(
         only_qv=only_qv,
     )
 
+    if SGLANG_PROFILE_NVTX:
+        th_nvtx_range_pop()
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
