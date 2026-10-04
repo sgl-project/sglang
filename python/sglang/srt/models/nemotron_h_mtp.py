@@ -69,8 +69,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -151,8 +150,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),

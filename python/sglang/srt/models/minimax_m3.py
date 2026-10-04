@@ -598,8 +598,7 @@ class MiniMaxM3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -609,8 +608,7 @@ class MiniMaxM3Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 

@@ -162,8 +162,6 @@ class DsV3MLA(DeepseekV2AttentionMLA):
             alt_stream,
             skip_rope,
         )
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
         self.gated_attention_proj_granularity_type = getattr(
             config, "gated_attention_proj_granularity_type", None
         )
@@ -175,8 +173,7 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 bias=False,
                 prefix=f"{prefix}.output_gate",
                 quant_config=None,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         elif self.gated_attention_proj_granularity_type == "element_wise":
             self.g_proj = ColumnParallelLinear(
@@ -184,8 +181,7 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 self.num_heads * self.v_head_dim,
                 bias=False,
                 prefix=f"{prefix}.output_gate",
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.g_proj = None

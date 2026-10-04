@@ -1250,8 +1250,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("q_proj", prefix),
         )
         self.k_proj = ColumnParallelLinear(
@@ -1259,8 +1258,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_kv_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("k_proj", prefix),
         )
         self.gate_proj = ColumnParallelLinear(
@@ -1268,8 +1266,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("gate_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -1277,8 +1274,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -1346,8 +1342,7 @@ class XllmGatedAttention(_XllmMoVAAttentionBase):
             self.total_num_kv_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("v_proj", prefix),
         )
 
