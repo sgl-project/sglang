@@ -200,6 +200,11 @@ class TestDsaDcpSparseLse(CustomTestCase):
         backend._arange_buf = torch.arange(16384, dtype=torch.int32, device="cuda")
         backend.dcp_enabled, backend.dcp_size, backend.dcp_rank = True, 2, 0
         backend.dcp_head_groups = groups
+        backend._dsa_hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=topk,
+            indexer_types=["full"],
+        )
         backend.num_q_heads, backend.num_dcp_q_heads = 32, heads
         backend.dsa_index_topk, backend.dsa_index_kpool = topk, 1
         backend.dsa_drop_wide_page_table = True

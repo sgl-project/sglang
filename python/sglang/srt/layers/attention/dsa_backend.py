@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -136,11 +140,14 @@ def _dcp_trtllm_sparse_attention(
 
     rows, _, heads, dim = query.shape
     if rows == 0:
-        return torch.empty(
-            (0, heads, attention_kwargs["kv_lora_rank"]),
-            dtype=torch.bfloat16,
-            device=query.device,
-        ), lse
+        return (
+            torch.empty(
+                (0, heads, attention_kwargs["kv_lora_rank"]),
+                dtype=torch.bfloat16,
+                device=query.device,
+            ),
+            lse,
+        )
     folded_rows = rows * head_groups
     folded_heads = heads // head_groups
     query = query.view(folded_rows, 1, folded_heads, dim)
@@ -302,6 +309,51 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
+@dataclass
+class DcpRemapCache:
+    """One localized top-k table, valid for the next shared-top-k layer only."""
+
+    layer_id: int = -1
+    source: Optional[torch.Tensor] = None
+    block_tables: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    sparse_mla_top_k: int = 0
+    num_padding_rows: int = 0
+
+    def clear(self) -> None:
+        self.layer_id = -1
+        self.source = self.block_tables = self.seq_lens = None
+
+    def hit(self, layer_id: int, source: torch.Tensor, shares_topk: bool) -> bool:
+        """Reuse only on the shared layer right after the layer that stored it.
+
+        Producers always miss: they may rewrite the same tensor object in place.
+        """
+        return shares_topk and self.layer_id == layer_id - 1 and self.source is source
+
+    def store(
+        self,
+        layer_id: int,
+        source: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sparse_mla_top_k: int,
+        num_padding_rows: int,
+        next_shares_topk: bool,
+    ) -> None:
+        """Keep the table only while the next layer shares this top-k, so a
+        finished forward or a captured graph never retains it."""
+        if not next_shares_topk:
+            self.clear()
+            return
+        self.layer_id = layer_id
+        self.source = source
+        self.block_tables = block_tables
+        self.seq_lens = seq_lens
+        self.sparse_mla_top_k = sparse_mla_top_k
+        self.num_padding_rows = num_padding_rows
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -338,6 +390,8 @@ class DSAMetadata:
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
     # Capture metadata must own the folded offsets even after eager arange growth.
     dcp_cu_seqlens_q: Optional[torch.Tensor] = None
+    # Host-side reuse of the localized top-k table across shared-top-k layers.
+    dcp_remap_cache: DcpRemapCache = field(default_factory=DcpRemapCache)
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -477,6 +531,7 @@ class DeepseekSparseAttnBackend(
         self.dcp_enabled = self.dcp_size > 1
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
         self.dcp_head_groups = dsa_dcp_head_groups(self.num_dcp_q_heads)
+        self._dsa_hf_config = hf_config
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
@@ -3603,15 +3658,35 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        # A shared-top-k decode layer consumes the tensor its producer emitted,
+        # so the localized table of the previous layer is still exact. Target
+        # verify and prefill arrive with is_prefill=True and always remap.
+        remap_cache = None
+        remap_hit = False
+        if self.dcp_enabled and not is_prefill and topk_indices is not None:
+            remap_cache = metadata.dcp_remap_cache
+            remap_hit = remap_cache.hit(
+                layer.layer_id,
+                topk_indices,
+                dsa_layer_skips_topk(self._dsa_hf_config, layer.layer_id),
+            )
+        remap_source = topk_indices
+
         # Eager DP attention can pad q beyond metadata that was deliberately
         # planned on the real draft batch. Pad top-k to the physical q shape,
         # then run decode attention only on metadata-backed rows. The output is
         # restored below before downstream MLP/EP collectives.
-        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+        if remap_hit:
+            pass
+        elif (self.use_fused_topk or not is_prefill) and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
         num_decode_padding_rows = 0
-        if not is_prefill:
+        if remap_hit:
+            num_decode_padding_rows = remap_cache.num_padding_rows
+            if num_decode_padding_rows:
+                q_all = q_all[: q_all.shape[0] - num_decode_padding_rows]
+        elif not is_prefill:
             q_all, topk_indices, num_decode_padding_rows = (
                 _trim_trtllm_decode_dp_padding(
                     q_all,
@@ -3620,7 +3695,9 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
-        if self.use_fused_topk:
+        if remap_hit:
+            page_table_1 = None
+        elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3641,18 +3718,36 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
-        page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
-            page_table_1
-        )
-        if self.dcp_enabled:
-            # Both top-k producers above emit global KV slots. Localize only
-            # here so fused top-k never gets interpreted as sequence positions.
-            page_table_1, seq_lens = remap_dcp_sparse_indices(
+        if remap_hit:
+            page_table_1 = remap_cache.block_tables
+            seq_lens = remap_cache.seq_lens
+            sparse_mla_top_k = remap_cache.sparse_mla_top_k
+        else:
+            page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
+                page_table_1
+            )
+            if self.dcp_enabled:
+                # Both top-k producers above emit global KV slots. Localize only
+                # here so fused top-k never gets interpreted as sequence positions.
+                if remap_cache is not None:
+                    # Release the previous table before allocating a new one.
+                    remap_cache.clear()
+                page_table_1, seq_lens = remap_dcp_sparse_indices(
+                    page_table_1,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    return_counts=True,
+                    repeat_rows=self.dcp_head_groups,
+                )
+        if remap_cache is not None:
+            remap_cache.store(
+                layer.layer_id,
+                remap_source,
                 page_table_1,
-                self.dcp_size,
-                self.dcp_rank,
-                return_counts=True,
-                repeat_rows=self.dcp_head_groups,
+                seq_lens,
+                sparse_mla_top_k,
+                num_decode_padding_rows,
+                dsa_layer_skips_topk(self._dsa_hf_config, layer.layer_id + 1),
             )
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:

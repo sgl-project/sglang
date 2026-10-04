@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention.dsa_backend import (
+    DcpRemapCache,
     DeepseekSparseAttnBackend,
     _restore_trtllm_decode_dp_padding,
     _trim_trtllm_decode_dp_padding,
@@ -15,6 +16,55 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestDcpRemapCache(unittest.TestCase):
+    """Localized top-k reuse across the pattern full, shared, shared, full, shared."""
+
+    SHARED = [False, True, True, False, True]
+
+    def _run(self, cache, sources):
+        hits = []
+        for layer_id, source in enumerate(sources):
+            hit = cache.hit(layer_id, source, self.SHARED[layer_id])
+            hits.append(hit)
+            table = cache.block_tables if hit else torch.full((1, 4), layer_id)
+            next_shared = layer_id + 1 < len(self.SHARED) and self.SHARED[layer_id + 1]
+            cache.store(layer_id, source, table, table, 4, 0, next_shared)
+        return hits
+
+    def test_producer_rewriting_the_same_tensor_always_remaps(self):
+        cache = DcpRemapCache()
+        topk = torch.zeros((1, 4), dtype=torch.int32)
+        # Every layer sees one tensor object; identity alone would hit at layer 3.
+        self.assertEqual(self._run(cache, [topk] * 5), [False, True, True, False, True])
+        # The finished forward retains nothing, and a second one starts cold.
+        self.assertIsNone(cache.block_tables)
+        self.assertEqual(self._run(cache, [topk] * 5), [False, True, True, False, True])
+
+    def test_changed_source_or_skipped_layer_misses(self):
+        cache = DcpRemapCache()
+        first, other = torch.zeros((1, 4)), torch.zeros((1, 4))
+        # A shared layer that received a different tensor (e.g. DP padding).
+        self.assertEqual(
+            self._run(cache, [first, other, other, first, first]),
+            [False, False, True, False, True],
+        )
+        # A stage that starts on a shared layer has no producer entry to reuse.
+        cache = DcpRemapCache()
+        self.assertFalse(cache.hit(2, first, True))
+        cache.store(0, first, first, first, 4, 0, True)
+        self.assertFalse(cache.hit(2, first, True))
+
+    def test_metadata_instances_do_not_share_a_cache(self):
+        from dataclasses import fields
+
+        from sglang.srt.layers.attention.dsa_backend import DSAMetadata
+
+        factory = next(
+            f for f in fields(DSAMetadata) if f.name == "dcp_remap_cache"
+        ).default_factory
+        self.assertIsNot(factory(), factory())
 
 
 class TestDSABackendDPPadding(unittest.TestCase):
@@ -95,6 +145,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
             max_seq_len_k=12,
             dcp_cu_seqlens_q=torch.arange(3, dtype=torch.int32),
+            dcp_remap_cache=DcpRemapCache(),
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
@@ -118,6 +169,11 @@ class TestDSABackendDPPadding(unittest.TestCase):
             dcp_size=2,
             dcp_rank=0,
             dcp_head_groups=1,
+            _dsa_hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_topk=2,
+                indexer_types=["full", "shared"],
+            ),
             get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
         )
         backend._pad_topk_indices = MethodType(
