@@ -1408,6 +1408,9 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Also capture ragged verify tiers below one request's width, so a single request
+    # can verify fewer draft tokens than gamma + 1.
+    SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
