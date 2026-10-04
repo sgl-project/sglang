@@ -326,8 +326,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
             cast_x_before_out_mul=cast_x_before_out_mul,
             force_native=force_native_norm,
         )
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -336,8 +334,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -346,8 +343,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.2", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
             ]
         )
