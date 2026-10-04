@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Mapping, Optional
@@ -48,6 +51,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
     REPLACE_AT_EXIT,
 )
+from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -649,6 +653,369 @@ def make_ffn_stage(
         outgoing,
         fusions=fusions,
     )
+
+
+class _Append:
+    """One append_stages call: its validated stages, the boundaries it
+    returned, which the stack fills in when it closes, and where it was made."""
+
+    __slots__ = ("declarations", "bindings", "prepared_from", "boundaries", "origin")
+
+    def __init__(self, declarations, bindings, prepared_from, boundaries, origin):
+        self.declarations = declarations
+        self.bindings = bindings
+        self.prepared_from = prepared_from
+        self.boundaries = boundaries
+        self.origin = origin
+
+
+class _LayerStack:
+    """A layer stack under construction: what was appended, in order, and how
+    to reach the layers other pipeline ranks hold on either side of it."""
+
+    __slots__ = ("appends", "previous_layers", "next_layers")
+
+    def __init__(self, previous_layers=(), next_layers=()):
+        self.appends = []
+        self.previous_layers = previous_layers
+        self.next_layers = next_layers
+
+
+# The stack being built; layer_stack saves and restores an outer one.
+_stack: Optional[_LayerStack] = None
+
+
+@contextlib.contextmanager
+def layer_stack(*, previous_layers=(), next_layers=()):
+    """Open a layer stack that append_stages extends in order.
+
+    Every stage binds when the stack closes, once its producer and its
+    consumer are both known: the stage appended before and after it. The last
+    stage ends the model's layer stack unless a later layer declares a stage.
+
+    Args:
+        previous_layers: Callables that build, nearest first, the layers before
+            this stack that another pipeline rank holds. Called only if this
+            stack appended stages, after its own layers are built, until one of
+            them declares a stage: its last stage is the producer of this
+            stack's first. What they build is discarded.
+        next_layers: Likewise for the layers after this stack, whose first
+            declared stage is the consumer of this stack's last.
+    """
+    global _stack
+    outer = _stack
+    stack = _LayerStack(previous_layers, next_layers)
+    _stack = stack
+    try:
+        yield stack
+        if stack.appends:
+            _bind_stack(
+                stack.appends,
+                previous=_neighbour_stage(stack.previous_layers, last=True),
+                following=_neighbour_stage(stack.next_layers, last=False),
+            )
+    finally:
+        _stack = outer
+
+
+def _neighbour_stage(build_layers, *, last):
+    """The stage a neighbouring layer declares next to this stack: the last
+    one of the nearest layer before it, or the first of the nearest after.
+    Branches are side paths, so they never stand next to the stack."""
+    global _stack
+    for build_layer in build_layers:
+        outer = _stack
+        _stack = _LayerStack()
+        try:
+            build_layer()
+            appends = [a for a in _stack.appends if a.prepared_from is None]
+        finally:
+            _stack = outer
+        if appends:
+            return appends[-1].declarations[-1] if last else appends[0].declarations[0]
+    return None
+
+
+def _require_stack() -> _LayerStack:
+    if _stack is None:
+        raise RuntimeError(
+            "append_stages needs an open layer stack; build the layers inside "
+            "make_layers or layer_stack"
+        )
+    return _stack
+
+
+def _note_origin(error: Exception, origin: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        add_note(f"while binding the stages appended at {origin}")
+
+
+class _PendingStage:
+    """The last stage of a linear append. Its consumer is the next append's
+    first stage, or the stack exit, so it binds only once that is known."""
+
+    __slots__ = (
+        "boundary",
+        "declaration",
+        "norm",
+        "options",
+        "predecessor",
+        "predecessor_incoming",
+        "predecessor_boundary",
+        "origin",
+    )
+
+    def __init__(
+        self,
+        boundary,
+        declaration,
+        norm,
+        options,
+        predecessor,
+        predecessor_incoming,
+        predecessor_boundary,
+        origin,
+    ):
+        self.boundary = boundary
+        self.declaration = declaration
+        self.norm = norm
+        self.options = options
+        # The stage before it within the same append, or None when it is the
+        # append's only stage and takes its input from the stack.
+        self.predecessor = predecessor
+        self.predecessor_incoming = predecessor_incoming
+        self.predecessor_boundary = predecessor_boundary
+        self.origin = origin
+
+
+class _Chain:
+    """The stage a following append extends, and the one stage still waiting
+    for its consumer, while the stack binds its appends in order."""
+
+    __slots__ = ("previous", "pending")
+
+    def __init__(self, previous):
+        self.previous = _detached(previous)
+        self.pending = None
+
+
+def _detached(declaration):
+    """The declaration a following append extends, without its own history.
+
+    A stage's incoming edge reads its producer's own incoming edge only when
+    the producer is an attention that always leaves its sum; the copy has no
+    history, so that lookback stops at the producer.
+    """
+    if declaration is None:
+        return None
+    return replace(declaration, previous=None, prepared_from=None)
+
+
+def _bind_stack(appends, *, previous, following):
+    """Bind every appended stage, in order, and fill in the boundaries each
+    append returned."""
+    chain = _Chain(previous)
+    # A returned declaration's boundary as bound, for the branches that read it.
+    sources = {}
+    bound = []
+    for append in appends:
+        prepared_from = append.prepared_from
+        if prepared_from is not None:
+            source = sources.get(id(prepared_from))
+            if source is None:
+                raise ValueError(
+                    "prepared_from must be the declaration of a stage appended "
+                    f"earlier to the same layer stack (at {append.origin})"
+                )
+            prepared_from = source.declaration
+        boundaries = _extend(chain, append, prepared_from)
+        for returned, boundary in zip(append.boundaries, boundaries):
+            sources[id(returned.declaration)] = boundary
+        bound.append(boundaries)
+    # The last stage's consumer is the next rank's first stage, if any;
+    # without one it ends the model's layer stack.
+    _bind_pending(chain, consumer=following, terminal=following is None)
+    for append, boundaries in zip(appends, bound):
+        for returned, boundary in zip(append.boundaries, boundaries):
+            returned.plan = boundary.plan
+            returned.declaration = boundary.declaration
+
+
+def _bind_pending(chain: _Chain, *, consumer, terminal):
+    pending = chain.pending
+    if pending is None:
+        return
+    chain.pending = None
+    try:
+        declaration = replace(pending.declaration, terminal=terminal)
+        if pending.predecessor is None:
+            incoming = _incoming(declaration)
+        else:
+            incoming = _connect(
+                pending.predecessor,
+                declaration,
+                residual_from=pending.predecessor_incoming,
+            )
+        outgoing = _connect(declaration, consumer, residual_from=incoming)
+        bound = _bind_stage(
+            declaration, pending.norm, incoming, outgoing, **pending.options
+        )
+    except Exception as error:
+        _note_origin(error, pending.origin)
+        raise
+    pending.boundary.plan = bound.plan
+    pending.boundary.declaration = declaration
+    if pending.predecessor_boundary is not None:
+        _carry_capture(pending.predecessor_boundary, pending.boundary)
+
+
+def _carry_capture(producer, consumer):
+    """Let an attention that always leaves its sum preserve the residual its
+    FFN's entry needs for capture. Only between stages of one append."""
+    if not (
+        producer.kind is StageKind.ATTENTION
+        and producer.declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
+        and consumer.kind is StageKind.FFN
+    ):
+        return
+    for variant, steps in producer.plan.paths.items():
+        next_steps = consumer.plan.paths[variant]
+        predicate = next_steps.entry.preserves_residual
+        if predicate is not None:
+            producer.plan.paths[variant] = msgspec.structs.replace(
+                steps,
+                entry=msgspec.structs.replace(
+                    steps.entry, capture_preserves_residual=predicate
+                ),
+            )
+
+
+_STAGE_OPTIONS = {
+    StageKind.ATTENTION: frozenset({"qkv_latent_func", "fusions"}),
+    StageKind.FFN: frozenset({"fusions"}),
+}
+
+
+def _stage_items(stages):
+    declarations, bindings = [], []
+    for item in stages:
+        if len(item) not in (2, 3):
+            raise ValueError("a stage needs (declaration, norm[, options])")
+        declaration, norm = item[:2]
+        if not isinstance(declaration, StageDeclaration):
+            raise TypeError("append_stages requires stage declarations")
+        if declaration.previous is not None or declaration.prepared_from is not None:
+            raise ValueError("a declaration takes its source from the layer stack")
+        if declaration.terminal:
+            raise ValueError("the layer stack marks the terminal stage")
+        options = dict(item[2] if len(item) == 3 else {})
+        unexpected = options.keys() - _STAGE_OPTIONS[declaration.kind]
+        if unexpected:
+            raise TypeError(
+                f"unsupported {declaration.kind.name} stage options: "
+                f"{sorted(unexpected)}"
+            )
+        declarations.append(declaration)
+        bindings.append((norm, options))
+    return declarations, bindings
+
+
+def _origin(stack: _LayerStack) -> str:
+    """Where the current append_stages call was made, and its place in the stack."""
+    frame = sys._getframe(2)
+    return (
+        f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno} "
+        f"(append {len(stack.appends)} of its layer stack)"
+    )
+
+
+def append_stages(*stages, prepared_from=None):
+    """Append a local linear sequence of stages to the open layer stack.
+
+    Args:
+        *stages: Items of (declaration, norm) or (declaration, norm, options).
+            Declarations carry no source or terminal flag. Options are
+            constructor keywords: fusions, and qkv_latent_func for attention.
+        prepared_from: The ``declaration`` of a boundary an earlier call
+            returned on this stack: the already-read stage this sequence
+            branches from. A branch is a side path the model merges back
+            explicitly: it neither extends the stack nor waits for a consumer,
+            so each of its stages binds with only the stages of the branch.
+
+    Returns:
+        A tuple of StageBoundary objects in declaration order. Their
+        declarations are usable at once and gain their place in the stack when
+        it closes, which is also when their plans are bound.
+    """
+    if not stages:
+        raise ValueError("append_stages needs at least one stage")
+    stack = _require_stack()
+    declarations, bindings = _stage_items(stages)
+    declarations = [replace(d) for d in declarations]
+    boundaries = tuple(StageBoundary(None, declaration=d) for d in declarations)
+    stack.appends.append(
+        _Append(declarations, bindings, prepared_from, boundaries, _origin(stack))
+    )
+    return boundaries
+
+
+def _extend(chain, append, prepared_from):
+    """Chain one append onto the stack and bind what can be bound."""
+    declarations, bindings = append.declarations, append.bindings
+    branch = prepared_from is not None
+    if not branch:
+        # This append's first stage is the consumer the pending stage waited for.
+        _bind_pending(chain, consumer=declarations[0], terminal=False)
+    try:
+        chained = []
+        for index, declaration in enumerate(declarations):
+            chained.append(
+                replace(
+                    declaration,
+                    previous=(
+                        chained[-1] if index else (None if branch else chain.previous)
+                    ),
+                    prepared_from=prepared_from if index == 0 else None,
+                )
+            )
+        boundaries = []
+        last = len(chained) - 1
+        # incoming feeds the stage being bound; previous_incoming fed the one
+        # before.
+        previous_incoming, incoming = None, _incoming(chained[0])
+        for index, (declaration, (norm, options)) in enumerate(zip(chained, bindings)):
+            if index == last and not branch:
+                boundaries.append(StageBoundary(None, declaration=declaration))
+                chain.pending = _PendingStage(
+                    boundaries[-1],
+                    declaration,
+                    norm,
+                    options,
+                    predecessor=chained[index - 1] if index else None,
+                    predecessor_incoming=previous_incoming,
+                    predecessor_boundary=boundaries[-2] if index else None,
+                    origin=append.origin,
+                )
+                break
+            following = chained[index + 1] if index < last else None
+            outgoing = _connect(declaration, following, residual_from=incoming)
+            boundaries.append(
+                _bind_stage(declaration, norm, incoming, outgoing, **options)
+            )
+            previous_incoming, incoming = incoming, outgoing
+    except Exception as error:
+        _note_origin(error, append.origin)
+        raise
+    if branch:
+        for producer, consumer in zip(boundaries, boundaries[1:]):
+            _carry_capture(producer, consumer)
+    else:
+        # The pair that ends on the pending stage is carried when it binds.
+        for producer, consumer in zip(boundaries[:-2], boundaries[1:-1]):
+            _carry_capture(producer, consumer)
+        chain.previous = _detached(chained[-1])
+    return tuple(boundaries)
 
 
 def make_stages(

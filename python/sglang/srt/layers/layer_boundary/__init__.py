@@ -40,8 +40,10 @@ from sglang.srt.layers.layer_boundary.contracts import (
 )
 from sglang.srt.layers.layer_boundary.exit import ExitDecision, FfnExit, MixerExit
 from sglang.srt.layers.layer_boundary.factories import (
+    append_stages,
     declare_attn,
     declare_ffn,
+    layer_stack,
     make_attn_stage,
     make_ffn_stage,
     make_stages,
@@ -88,6 +90,8 @@ __all__ = [
     "make_attn_stage",
     "make_ffn_stage",
     "make_stages",
+    "append_stages",
+    "layer_stack",
     "PLAIN_ADD",
     "AttentionInputs",
     "StagePath",
