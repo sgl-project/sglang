@@ -459,8 +459,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
 
         if self.use_qk_norm:
@@ -473,8 +472,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.output_gate",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
         self.dense = RowParallelLinear(
             self.hidden_inner_size,

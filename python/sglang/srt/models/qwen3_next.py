@@ -641,8 +641,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 and quant_config.get_name() != "modelopt_fp4"
                 else None
             ),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
