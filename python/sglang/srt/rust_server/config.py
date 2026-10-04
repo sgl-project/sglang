@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -66,6 +67,7 @@ def _build_server_args(
         grpc_port=grpc_port,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
+        enable_request_decompression=envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get(),
         chat_template=get_serving().chat_template,
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,

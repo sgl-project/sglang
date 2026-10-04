@@ -106,6 +106,7 @@ pub async fn serve(
     }
 
     // Apply logging and access log middleware.
+    let app = super::decompression::apply(app, server_args.enable_request_decompression);
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port

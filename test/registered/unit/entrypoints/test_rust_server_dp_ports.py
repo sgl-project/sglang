@@ -5,6 +5,7 @@ import pytest
 
 from sglang.srt import rust_extensions
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
@@ -28,13 +29,8 @@ def _scheduler_for_typed_config():
     )
 
 
-@pytest.mark.parametrize(
-    "legacy_args,expected",
-    [({}, 50051), ({"smg_grpc_mode": True}, None), ({"grpc_mode": True}, None)],
-    ids=["native", "legacy-smg", "deprecated-legacy-smg"],
-)
-def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
-    extension = SimpleNamespace(
+def _typed_config_extension():
+    return SimpleNamespace(
         DisaggregationMode=SimpleNamespace(
             Null="null", Prefill="prefill", Decode="decode"
         ),
@@ -42,6 +38,15 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
         ServerArgs=MagicMock(return_value="server-args"),
     )
+
+
+@pytest.mark.parametrize(
+    "legacy_args,expected",
+    [({}, 50051), ({"smg_grpc_mode": True}, None), ({"grpc_mode": True}, None)],
+    ids=["native", "legacy-smg", "deprecated-legacy-smg"],
+)
+def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
+    extension = _typed_config_extension()
     with (
         get_context().override_server_args(grpc_port=50051, **legacy_args),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
@@ -53,6 +58,21 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         )
 
     assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_typed_config_forwards_request_decompression(enabled):
+    extension = _typed_config_extension()
+    with (
+        get_context().override_server_args(),
+        envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.override(enabled),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    kwargs = extension.ServerArgs.call_args.kwargs
+    assert kwargs["enable_request_decompression"] is enabled
 
 
 @pytest.mark.parametrize(
