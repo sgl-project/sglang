@@ -90,7 +90,6 @@ class Step3p5MLP(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
-            allocation_group="tp" if parallel_group == "replicated" else None,
         )
         self.act_fn = SiluAndMul()
         self.limit = swiglu_limit

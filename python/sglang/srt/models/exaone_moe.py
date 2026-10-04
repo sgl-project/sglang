@@ -106,7 +106,6 @@ class ExaoneMoEMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
             parallel_group=parallel_group,
-            allocation_group="tp" if parallel_group == "replicated" else None,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -360,7 +359,6 @@ class ExaoneMoEAttention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
-            allocation_group="tp",
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)

@@ -354,6 +354,7 @@ class InklingAttention(nn.Module):
             bias=o_bias,
             prefix=add_prefix("wo_ud", prefix),
             parallel_group="attn_tp",
+            use_dp_attention_reduce=True,
             reduce_results=False,
             quant_config=quant_config,
         )
