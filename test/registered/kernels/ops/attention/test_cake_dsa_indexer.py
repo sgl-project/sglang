@@ -527,7 +527,7 @@ def test_ragged_route_graph_replay_matches_eager():
     with _route_on():
         graph, captured, eager = _assert_graph_replay(
             lambda: cake_indexer_routes.cake_fp8_mqa_logits(
-                q, kv, kv_scales, weights, ks, ke, num_sms=num_sms
+                q, (kv, kv_scales), weights, ks, ke, num_sms=num_sms
             ),
             lambda out: out.fill_(float("nan")),
             compare,
@@ -545,7 +545,7 @@ def test_ragged_route_graph_replay_matches_eager():
         captured.fill_(float("nan"))
         graph.replay()
         changed = cake_indexer_routes.cake_fp8_mqa_logits(
-            q, kv, kv_scales, weights, ks, ke, num_sms=num_sms
+            q, (kv, kv_scales), weights, ks, ke, num_sms=num_sms
         )
         torch.cuda.synchronize()
         assert torch.equal(captured[inside], changed[inside])
