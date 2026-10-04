@@ -438,9 +438,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
-            # Control messages use ZMQ; engine progress must not depend on
-            # receiver polling or reading native NIXL notifications.
-            enable_prog_thread=True,
             backends=[],
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
@@ -2243,7 +2240,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_info.decode_tp_rank,
             dst_info.decode_tp_size,
             dst_info.dst_kv_item_len,
-            "",
             staging_buffer=staging_strategy.staging_buffer,
         )
         if handle is None:
