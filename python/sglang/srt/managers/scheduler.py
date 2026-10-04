@@ -3092,6 +3092,25 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (
+            get_exec().features.enable_decoder_swa_bounded_replay
+            and req.return_logprob
+            and req.logprob_start_len != -1
+            and req.logprob_start_len < len(req.origin_input_ids)
+        ):
+            # Bounded replay runs the late layers only over each request's last
+            # SWA window, so prompt-token logprobs are never computed; the model
+            # would raise in the forward pass and take down the scheduler.
+            error_msg = (
+                "Prompt input logprobs (logprob_start_len) are not supported "
+                "with --enable-decoder-swa-bounded-replay; omit "
+                "logprob_start_len to get output logprobs."
+            )
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
         if recv_req.return_routed_experts:
             error_msg = None
             if recv_req.routed_experts_start_len < 0:
