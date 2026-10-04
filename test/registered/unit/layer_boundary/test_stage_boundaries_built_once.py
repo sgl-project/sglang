@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_BUILDERS = {"make_stages", "make_attn_stage", "make_ffn_stage"}
+_BUILDERS = {"append_stages"}
 
 
 def _called(node):
@@ -146,7 +146,7 @@ class TestStageBoundariesBuiltOnce(CustomTestCase):
             "        if build_stages:\n"
             "            self.stages = self._build_stages()\n"
             "    def _build_stages(self):\n"
-            "        return make_stages((declare_attn(), norm), (declare_ffn(), norm))\n"
+            "        return append_stages((declare_attn(), norm), (declare_ffn(), norm))\n"
             "class Twice(Base):\n"
             "    def __init__(self):\n"
             "        super().__init__()\n"

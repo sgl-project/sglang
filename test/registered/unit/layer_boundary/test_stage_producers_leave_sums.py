@@ -34,7 +34,7 @@ def _is_sum(name) -> bool:
 
 
 _BUILDS_STAGES = (
-    "make_stages(",
+    "append_stages(",
     "declare_attn(",
     "declare_ffn(",
     "_build_stages(",

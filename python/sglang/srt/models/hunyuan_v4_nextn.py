@@ -6,10 +6,11 @@ from torch import nn
 
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -71,14 +72,13 @@ class HYV4MTPDecoderLayer(nn.Module):
         )
         if hasattr(self.mlp, "shared_experts"):
             self.mlp.shared_experts.swiglu_limit = None
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
                 {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
             ),
             (declare_ffn(sparse=True), self.post_attention_layernorm),
-            terminal=True,
         )
 
     def forward(
@@ -124,12 +124,13 @@ class HYV4ModelNextN(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.alt_stream = get_stream("alt") if is_cuda() else None
-        self.decoder = HYV4MTPDecoderLayer(
-            config,
-            quant_config,
-            f"{prefix}.decoder",
-            self.alt_stream,
-        )
+        with layer_stack():
+            self.decoder = HYV4MTPDecoderLayer(
+                config,
+                quant_config,
+                f"{prefix}.decoder",
+                self.alt_stream,
+            )
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 

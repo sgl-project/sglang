@@ -9,10 +9,11 @@ from transformers import PretrainedConfig
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layer_boundary import (
     IHCState,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -583,8 +584,8 @@ def _build_stages(
 
     layer_types = config.mlp_layer_types
     is_sparse = layer_types[layer_id] != "dense"
-    next_id, previous_id = layer_id + 1, layer_id - 1
-    return make_stages(
+    next_id = layer_id + 1
+    return append_stages(
         (
             declare_attn(read=residual.attn_readout, update=residual.attn_update),
             input_layernorm,
@@ -601,16 +602,6 @@ def _build_stages(
             ),
             post_attention_layernorm,
         ),
-        previous=(
-            declare_ffn(
-                sparse=layer_types[previous_id] != "dense",
-                next_layer_sparse=is_sparse,
-                update=residual.ffn_update,
-            )
-            if layer_id != 0
-            else None
-        ),
-        terminal=layer_id == config.num_hidden_layers - 1,
     )
 
 
@@ -703,18 +694,19 @@ class HYV4Model(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = get_stream("alt") if is_cuda() else None
-        self.layers = nn.ModuleList(
-            [
-                HYV4DecoderLayer(
-                    config,
-                    i,
-                    quant_config,
-                    f"{prefix}.layers.{i}",
-                    self.alt_stream,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    HYV4DecoderLayer(
+                        config,
+                        i,
+                        quant_config,
+                        f"{prefix}.layers.{i}",
+                        self.alt_stream,
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # The head mixes the streams down and fuses the final norm into one kernel.
