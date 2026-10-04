@@ -292,13 +292,15 @@ jobs:
 
       - name: Run ltx_2_5 repro
         timeout-minutes: 62
+        # No -e: a failing (slow) launch must not stop the remaining launches.
+        shell: bash --noprofile --norc {0}
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           OUT: ${{ github.workspace }}/ltx25-repro
         run: |
-          set -uo pipefail
+          set -u
           mkdir -p "$OUT"
           CASE=ltx_2_5_diffusion_decoder_2gpus
           CASES_FILE=python/sglang/multimodal_gen/test/server/gpu_cases.py
