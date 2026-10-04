@@ -348,6 +348,9 @@ pub struct ModelConfig {
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
     pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
+    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// and `--max-kv-usage`.
+    pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -382,8 +385,6 @@ pub struct EligibilityConfig {
     pub max_in_flight: Option<usize>,
     /// `prefix_cache` minimum cached prompt share.
     pub min_prefix_share: Option<f32>,
-    /// Reorg admission: share of reported KV capacity a request may fill.
-    pub max_kv_usage: Option<f64>,
 }
 
 /// Default `--policy fused_score` terms.

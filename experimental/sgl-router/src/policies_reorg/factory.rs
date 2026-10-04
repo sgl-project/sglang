@@ -53,8 +53,8 @@ pub struct BucketSpec {
     pub decode: Option<GroupSpec>,
 }
 
-/// Omitted fields mean every engine of the role, `--policy` (power-of-two on
-/// decode), and the `--max-in-flight` / `--max-kv-usage` limits.
+/// Omitted fields mean every engine of the role and `--policy` (power-of-two on
+/// decode); admission limits left unset take `--max-in-flight` / `--max-kv-usage`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -133,25 +133,23 @@ pub fn build_resolver(
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
 ) -> Result<(BucketResolver, Option<JanitorHandle>)> {
-    let eligibility = model.eligibility.as_ref();
     let mut groups = Groups {
         model,
         state,
         external_index,
         affinity: model.affinity.clone().unwrap_or_default(),
-        admission: AdmissionLimits {
-            max_inflight_requests: eligibility.and_then(|e| e.max_in_flight).map(|n| n as u64),
-            max_kv_usage: eligibility.and_then(|e| e.max_kv_usage),
-            ..Default::default()
-        },
         store: None,
         cleanup: None,
         source: None,
     };
-    let config = model
-        .reorg_buckets
-        .clone()
-        .unwrap_or_else(BucketsConfig::default_buckets);
+    let default_buckets;
+    let config = match &model.reorg_buckets {
+        Some(config) => config,
+        None => {
+            default_buckets = BucketsConfig::default_buckets();
+            &default_buckets
+        }
+    };
     ensure!(!config.buckets.is_empty(), "--bucket-config has no buckets");
     let mut ids = HashSet::new();
     let mut buckets = Vec::new();
@@ -166,11 +164,15 @@ pub fn build_resolver(
                 .zip(spec.max_input_tokens)
                 .is_none_or(|(min, max)| min <= max)
                 && spec.max_context_tokens != Some(0)
+                && (spec.min_input_tokens)
+                    .zip(spec.max_context_tokens)
+                    .is_none_or(|(min, context)| min <= context)
                 && spec.ttft_ms != Some(0)
                 && spec
                     .tokens_per_second
                     .is_none_or(|t| t.is_finite() && t > 0.0),
-            "bucket {id:?} needs min <= max input tokens and positive capacity and SLO estimates"
+            "bucket {id:?} needs min input tokens <= max input and context tokens, \
+             and positive capacity and SLO estimates"
         );
         let bucket_groups = match (&spec.plain, &spec.prefill, &spec.decode) {
             (Some(plain), None, None) => BucketGroups::Plain(groups.build(Stage::Plain, plain)?),
@@ -203,7 +205,6 @@ struct Groups<'a> {
     state: &'a KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     affinity: AffinityConfig,
-    admission: AdmissionLimits,
     store: Option<Arc<AffinityStore>>,
     cleanup: Option<JanitorHandle>,
     source: Option<Arc<CacheSource>>,
@@ -221,9 +222,17 @@ impl Groups<'_> {
             kind == PolicyKind::PowerOfTwo || kind == self.model.policy,
             "bucket groups use power_of_two or --policy, not {kind:?}"
         );
-        let admission = spec.admission.as_ref().unwrap_or(&self.admission);
+        ensure!(
+            spec.worker_ids.as_ref().is_none_or(|ids| !ids.is_empty()),
+            "bucket group worker_ids must not be empty; omit it for every engine"
+        );
+        let defaults = &self.model.reorg_admission;
+        let admission = spec
+            .admission
+            .as_ref()
+            .map_or(defaults.clone(), |a| a.or(defaults));
         admission.validate()?;
-        let admission = Arc::new(admission.clone());
+        let admission = Arc::new(admission);
         let load = self.state.engine_reported_load();
         let policy: Arc<dyn Policy> = match kind {
             PolicyKind::PowerOfTwo => {

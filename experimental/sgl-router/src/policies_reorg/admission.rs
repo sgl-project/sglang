@@ -46,7 +46,10 @@ impl EngineMetrics {
         let native = load.fresh_native_cache_load_for_url(&engine.url);
         let capacity = |max: u64| (max > 0).then_some(max);
         Self {
-            running_requests: basic.map(|load| load.num_running_reqs),
+            // Native first, so the count covers the ranks `running_capacity` sums.
+            running_requests: native
+                .map(|load| load.num_running_reqs)
+                .or(basic.map(|load| load.num_running_reqs)),
             running_capacity: native.and_then(|load| capacity(load.max_running_requests)),
             waiting_requests: basic.map(|load| load.num_waiting_reqs),
             kv_tokens: native.map(|load| load.num_total_tokens),
@@ -82,14 +85,38 @@ pub struct AdmissionLimits {
 }
 
 impl AdmissionLimits {
+    /// Rejects usages outside (0, 1] and zero counts, which would admit nothing.
     pub fn validate(&self) -> Result<(), PickError> {
         let share = |usage: Option<f64>| usage.is_none_or(|u| u > 0.0 && u <= 1.0);
-        if share(self.max_running_usage) && share(self.max_kv_usage) {
-            Ok(())
-        } else {
-            Err(PickError::InvalidConfiguration(
+        let count = |cap: Option<u64>| cap != Some(0);
+        if !(share(self.max_running_usage) && share(self.max_kv_usage)) {
+            return Err(PickError::InvalidConfiguration(
                 "admission usages must be in (0, 1]".into(),
-            ))
+            ));
+        }
+        if !(count(self.max_waiting_requests)
+            && count(self.max_pending_prefill_tokens)
+            && count(self.max_inflight_requests))
+        {
+            return Err(PickError::InvalidConfiguration(
+                "admission counts must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// These limits, with each unset one taken from `defaults`.
+    pub fn or(&self, defaults: &Self) -> Self {
+        Self {
+            max_running_usage: self.max_running_usage.or(defaults.max_running_usage),
+            max_kv_usage: self.max_kv_usage.or(defaults.max_kv_usage),
+            max_waiting_requests: self.max_waiting_requests.or(defaults.max_waiting_requests),
+            max_pending_prefill_tokens: self
+                .max_pending_prefill_tokens
+                .or(defaults.max_pending_prefill_tokens),
+            max_inflight_requests: self
+                .max_inflight_requests
+                .or(defaults.max_inflight_requests),
         }
     }
 }
@@ -138,7 +165,9 @@ impl EngineAdmission for AdmissionLimits {
         ];
         for (name, share, used, capacity) in usages {
             if let (Some(share), Some(used), Some(capacity)) = (share, used, capacity) {
-                if used as f64 > share * capacity as f64 {
+                // Dividing exact integers rounds to the share's own value at the
+                // boundary; multiplying the share can round below it.
+                if used as f64 / capacity as f64 > share {
                     return Ok(Decision::Reject(name.into()));
                 }
             }

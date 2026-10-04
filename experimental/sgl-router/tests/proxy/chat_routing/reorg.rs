@@ -160,6 +160,8 @@ async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops(
     let state = KvEventIndex::new();
     ctx.engine_reported_load = state.engine_reported_load();
     ctx.config.model.policy = PolicyKind::PowerOfTwo;
+    // The group sets its usages; the CLI in-flight default still applies.
+    ctx.config.model.reorg_admission.max_inflight_requests = Some(1);
     ctx.config.model.reorg_buckets = Some(
         serde_json::from_value(serde_json::json!({"buckets": [{
             "id": "default",
@@ -173,12 +175,17 @@ async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops(
     let (resolver, _) = build_resolver(&ctx.config.model, &state, None).unwrap();
     ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let ctx = Arc::new(ctx);
+    let engine = ctx.registry.get(&WorkerId("w".into())).unwrap();
     let app = build_router(ctx.clone());
-    for (running, kv_tokens, expected) in [
-        (1, 0, StatusCode::SERVICE_UNAVAILABLE),
-        (0, 100, StatusCode::SERVICE_UNAVAILABLE),
-        (0, 0, StatusCode::OK),
+    for (running, kv_tokens, inflight, expected) in [
+        (1, 0, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 100, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, 1, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, 0, StatusCode::OK),
     ] {
+        engine
+            .active_requests
+            .store(inflight, std::sync::atomic::Ordering::Relaxed);
         ctx.engine_reported_load.set(
             &worker.url,
             0,
@@ -702,7 +709,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
 
 #[tokio::test]
 async fn default_pd_groups_apply_configured_inflight_admission() {
-    use sgl_router::config::{EligibilityConfig, FilterKind, PolicyKind};
+    use sgl_router::config::PolicyKind;
     use std::sync::atomic::Ordering;
 
     let prefill = MockWorker::start(vec![]).await;
@@ -716,12 +723,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
     );
     let mutable = Arc::get_mut(&mut ctx).unwrap();
     mutable.config.model.policy = PolicyKind::PowerOfTwo;
-    mutable.config.model.eligibility = Some(EligibilityConfig {
-        filters: vec![FilterKind::Overloaded],
-        max_in_flight: Some(1),
-        min_prefix_share: None,
-        max_kv_usage: None,
-    });
+    mutable.config.model.reorg_admission.max_inflight_requests = Some(1);
     let state = sgl_router::state::kv_events::KvEventIndex::new();
     let (resolver, _) =
         sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
