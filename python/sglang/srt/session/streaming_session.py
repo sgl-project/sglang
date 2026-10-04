@@ -32,40 +32,27 @@ class _VirtualNode:
 
 @dataclass
 class SessionSlot:
-    """Holds KV state between streaming session turns."""
+    """A streaming session's KV record and the tree lock on its prefix. The
+    session owns both from its first turn's row allocation until it closes or
+    a turn aborts; every turn runs on the record as a borrower."""
 
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
     # KV pool state
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
-    # First req's radix tree node (for dec_lock_ref on session close)
+    # Tree lock on the session's tree-owned prefix, and its receipt.
     last_node: Any = None
-    # Receipt of the first request's tree lock on last_node.
     lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
-    # Whether the first request already released its SWA lock.
+    # Whether the SWA part of that lock was released early.
     swa_prefix_lock_released: bool = False
-
-    def save_from_req(self, req: Req, is_first: bool):
-        """Save KV state from a finishing request into this slot."""
-        kv = req.detach_kv()
-        if is_first:
-            self.last_node = req.last_node
-            self.lock_receipt = req.lock_receipt
-            self.swa_prefix_lock_released = req.swa_prefix_lock_released
-            # The slot takes over the request's KV record.
-            self.kv = kv
-        else:
-            # Later turns run on the slot's record (see restore_to_req).
-            assert kv is self.kv
-
-        req.swa_branching_seqlen = None
+    # Until the first turn finishes or is retracted, its checkpoints publish
+    # the prompt into the tree and move the lock onto the deepest published node.
+    publishes_prompt: bool = False
 
     def restore_to_req(self, req: Req):
-        """Restore KV state from this slot into an incoming request."""
+        """Lend the record to an incoming turn; the slot keeps the tree lock."""
         req.kv = self.kv
-        req.lock_receipt = self.lock_receipt
-        req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
         # The slot keeps sharing the record: a rejected chunked request calls
         # match_prefix -> restore_to_req again next cycle.
@@ -73,6 +60,13 @@ class SessionSlot:
 
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
+
+
+def _move_tree_lock(src: Any, dst: Any) -> None:
+    """Hand the tree lock ``src`` holds (a request or a slot) to ``dst``."""
+    dst.last_node = src.last_node
+    dst.lock_receipt = src.lock_receipt
+    dst.swa_prefix_lock_released = src.swa_prefix_lock_released
 
 
 class StreamingSession:
@@ -180,34 +174,43 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
+    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
+        """The slot whose record the request runs on, if any."""
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        return slot if slot is not None and slot.kv is req.kv else None
+
+    def adopt_record(self, req: Req) -> None:
+        """A streaming turn's first row allocation: the session takes the
+        request's record and the tree lock it took at admission, and the
+        request borrows them from here on. A turn already on a slot's record
+        has nothing to hand over."""
+        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
+            return
+        session_id = req.session.session_id
+        assert session_id not in self.slots, f"{session_id=} already has a slot"
+        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        self._lock_to_slot(req, slot)
+        self.slots[session_id] = slot
+
     def try_cache_finished_req(self, req: Req) -> bool:
-        """Hands a turn's row to the session slot when it finishes or is
-        retracted. Returns False for non-streaming requests and aborts, which
-        the caller releases."""
+        """Keeps a finished or retracted turn's record in the session slot.
+        An aborted turn gets the record and the tree lock back and is released
+        like any request (returns False); the session re-prefills from its
+        last finished request next turn."""
         if not _is_streaming(req):
             return False
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-        session_id = req.session.session_id
-        slot = self.slots.get(session_id)
+        slot = self.borrowed_slot(req)
+        assert slot is not None, f"streaming {req.rid=} does not run on its slot"
         if isinstance(req.finished_reason, FINISH_ABORT):
-            if slot is not None:
-                # The turn ran on the slot's record, which the caller releases
-                # (row and mamba state): drop the slot with its tree lock. The
-                # session keeps its last finished request and re-prefills next turn.
-                assert slot.kv is req.kv
-                del self.slots[session_id]
-                if slot.last_node is not None:
-                    skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
-                    self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
+            del self.slots[req.session.session_id]
+            _move_tree_lock(slot, req)
             req.session.abort_req()
             return False
-
-        is_first = slot is None
-        if is_first:
-            slot = SessionSlot()
-            self.slots[session_id] = slot
 
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
@@ -215,7 +218,9 @@ class StreamingSession:
         target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
-        slot.save_from_req(req, is_first=is_first)
+        req.detach_kv()
+        req.swa_branching_seqlen = None
+        slot.publishes_prompt = False
         # Use the finished length, not the req clock (it lags an in-flight verify
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
@@ -226,16 +231,28 @@ class StreamingSession:
         return True
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
-        """A first turn checkpoints into the tree like any request (its
-        prompt prefix is tree-owned and the slot inherits that lock); later
-        turns run on the slot's KV, so only the chunk cursor is kept."""
-        if not _is_streaming(req) or req.session.session_id not in self.slots:
+        """A turn on the slot's record publishes nothing of its own, so only
+        the chunk cursor is kept. The exception is the first prompt: the slot
+        publishes it for other requests to share, and its lock follows the
+        insert."""
+        slot = self.borrowed_slot(req)
+        if slot is None:
             return False
+        if slot.publishes_prompt:
+            _move_tree_lock(slot, req)
+            self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            self._lock_to_slot(req, slot)
+            return True
         kv_indices = self.cache.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :up_to
         ]
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
+
+    def lock_holder(self, req: Req) -> Any:
+        """Whoever holds the tree lock on the request's prefix: its slot for a
+        session turn, else the request itself."""
+        return self.borrowed_slot(req) or req
 
     # -- Session lifecycle --
 
@@ -278,6 +295,14 @@ class StreamingSession:
             slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
+
+    def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
+        """Move the request's tree lock to the slot; the request is left on the
+        slot's virtual node, where locking is a no-op."""
+        _move_tree_lock(req, slot)
+        req.last_node = slot.virtual_node
+        req.lock_receipt = DecLockRefParams()
+        req.swa_prefix_lock_released = False
 
     def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
         """Free [prefix_len, allocated) before alloc_for_extend overwrites it:

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -83,11 +83,17 @@ class _FakeInnerCache:
     def checkpoint(self, req, *, up_to):
         pass
 
+    def adopt_kv_record(self, req):
+        self.session.adopt_record(req)
+
     def claim_kv_row(self, req):
         return self.session.try_cache_finished_req(req)
 
     def unpin(self, req):
-        pass
+        if req.last_node is not None:
+            self.dec_lock_ref(
+                req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
+            )
 
     def on_release(self, req, *, inserted):
         pass
@@ -101,6 +107,8 @@ class _FakeInnerCache:
         return self.match_results.pop(0)
 
     def dec_lock_ref(self, node, *args, **kwargs):
+        if self.session.try_dec_lock_ref(node) is not None:
+            return
         self.dec_lock_ref_calls.append(node)
         self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
         self.dec_lock_ref_skip_swa.append(kwargs.get("skip_swa", False))
@@ -157,6 +165,21 @@ class _FakeReq:
         pass
 
 
+def _single_row_cache():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    return _FakeInnerCache(
+        _FakeReqToTokenPool(req_to_token), _FakeAllocator(), page_size=1
+    )
+
+
+def _finished_turn(tree_cache, req):
+    """The session took the record at allocation; the turn then finished."""
+    tree_cache.adopt_kv_record(req)
+    req.finished_reason = FINISH_LENGTH(length=0)
+    assert tree_cache.session.try_cache_finished_req(req)
+    return tree_cache.session.slots[req.session.session_id]
+
+
 def test_session_slot_round_trip_preserves_component_state():
     # The mamba state rides in the shared ReqKvInfo record. mamba_branching_seqlen
     # is a per-turn match observation on the Req and is not preserved by the slot.
@@ -167,8 +190,7 @@ def test_session_slot_round_trip_preserves_component_state():
     req.kv.set_evicted_seqlen(ComponentType.SWA, 2)
     req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 3)
 
-    slot = SessionSlot()
-    slot.save_from_req(req, is_first=True)
+    slot = _finished_turn(_single_row_cache(), req)
 
     next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
     slot.restore_to_req(next_req)
@@ -236,8 +258,9 @@ def test_preabort_detaches_session_and_preserves_slot():
 
 
 def test_first_mid_abort_releases_like_any_request(published_config):
-    """First-turn abort: no slot exists, so the request is released like any
-    aborted request and no slot is created."""
+    """First-turn abort: the session took the record and the admission lock at
+    allocation; the abort hands both back, so the request is released like
+    any aborted request."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
@@ -245,14 +268,17 @@ def test_first_mid_abort_releases_like_any_request(published_config):
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = inner
 
-    # No slot exists yet (first request).
     req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
+    lock_node = SimpleNamespace(id=7)
+    req.last_node = lock_node
+    tree_cache.adopt_kv_record(req)
+    assert tree_cache.session.slots["session-a"].last_node is lock_node
     req.finished_reason = FINISH_ABORT("input too long")
 
     release_kv_cache(req, tree_cache)
 
-    # Slot must NOT be created.
     assert "session-a" not in tree_cache.session.slots
+    assert inner.dec_lock_ref_calls == [lock_node]
     # Transient pool slot freed.
     assert req.kv.req_pool_idx is None
     assert req_to_token_pool.free_slots == [0]
@@ -383,8 +409,7 @@ def test_session_slot_does_not_restore_swa_branching_seqlen():
     req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
     req.swa_branching_seqlen = 8
 
-    slot = SessionSlot()
-    slot.save_from_req(req, is_first=True)
+    slot = _finished_turn(_single_row_cache(), req)
 
     next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
     slot.restore_to_req(next_req)
@@ -453,9 +478,7 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
         tree_cache.session._trim_overshoot(req, finished_len=12)
         assert len(req.output_ids) == 12
     else:
-        slot = SessionSlot()
-        slot.save_from_req(req, is_first=True)
-        tree_cache.session.slots["session-a"] = slot
+        tree_cache.session.slots["session-a"] = SessionSlot(kv=req.detach_kv())
         req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
         result = tree_cache.match_prefix(SimpleNamespace(req=req, key=list(range(38))))
         assert result.device_indices.tolist() == list(range(32))

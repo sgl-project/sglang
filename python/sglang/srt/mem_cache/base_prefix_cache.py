@@ -516,6 +516,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def adopt_kv_record(self, req: Req) -> None:
+        """The request's KV row was just allocated. A cache that keeps a record
+        across requests (a streaming session) takes it here with the request's
+        tree lock; the request runs on it as a borrower."""
+
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""

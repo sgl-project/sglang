@@ -3920,7 +3920,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
             release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
-                self.tree_cache, "dec_swa_lock_only"
+                self.tree_cache, "release_swa_prefix_lock"
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -3952,16 +3952,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # release that part of the tree lock so SWA LRU can reclaim it.
                     if (
                         release_leaf_lock
-                        and not req.swa_prefix_lock_released
-                        and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
-                        is not None
-                        and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
-                        self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.lock_receipt
-                        )
-                        req.swa_prefix_lock_released = True
+                        self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()
                     and not self.tree_cache.supports_prefix_sharing()
