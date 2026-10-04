@@ -99,6 +99,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_pp_layers,
 )
+from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -408,7 +409,12 @@ class MiniMaxM2QKRMSNorm:
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
-        if self._world_size > 1 and _is_cuda and use_fused_norm:
+        if (
+            self._world_size > 1
+            and _is_cuda
+            and use_fused_norm
+            and not is_building_neighbour_layer()
+        ):
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
                 self._world_size,

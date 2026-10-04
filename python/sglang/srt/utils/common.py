@@ -1542,6 +1542,33 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
+# Set while a layer another pipeline stage holds is built, only for the stage
+# boundaries it declares.
+_building_neighbour_layer = False
+
+
+def is_building_neighbour_layer() -> bool:
+    """Whether the layer under construction belongs to another pipeline stage
+    and is built here only to read the stage boundaries it declares. It is
+    built on the meta device and never loaded or run, so its constructor skips
+    the host and device resources a running layer needs: tables, streams,
+    engines and communicators."""
+    return _building_neighbour_layer
+
+
+@contextmanager
+def building_neighbour_layer():
+    """Build a pipeline neighbour layer: on the meta device, with
+    is_building_neighbour_layer() true."""
+    global _building_neighbour_layer
+    outer, _building_neighbour_layer = _building_neighbour_layer, True
+    try:
+        with torch.device("meta"):
+            yield
+    finally:
+        _building_neighbour_layer = outer
+
+
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
