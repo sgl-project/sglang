@@ -27,7 +27,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -101,7 +101,7 @@ class MiMoV2MTPLayer(nn.Module):
         is_previous_layer_sparse = True
         is_next_layer_sparse = False
 
-        if enable_moe_dense_fully_dp():
+        if is_dense_ffn_fully_dp():
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
@@ -113,6 +113,7 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             tp_rank=mlp_tp_rank,
             tp_size=mlp_tp_size,
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
@@ -124,12 +125,12 @@ class MiMoV2MTPLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -154,12 +155,9 @@ class MiMoV2MTPLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with (
-            self.ffn_boundary.exit(forward_batch) as ffn_exit,
-            get_global_expert_distribution_recorder().disable_this_region(),
-        ):
+        with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -235,7 +233,7 @@ class MiMoV2ModelNextN(nn.Module):
                 hidden_states_before_norm = residual_batch.snapshot(
                     hidden_states, forward_batch
                 )
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
 
@@ -252,7 +250,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
