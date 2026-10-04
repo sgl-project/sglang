@@ -45,6 +45,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
@@ -177,6 +178,21 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 # the query-prep kernels (which already trigger their PDL secondary).
 _ENABLE_PDL = is_arch_support_pdl()
 
+# Opt-in Cake Kimi-K3 FP8 MLA decode (``SGLANG_CAKE_ROUTES=kimi_k3_mla``): the
+# decode call switches the FlashInfer public entry to ``backend="cake"`` when the
+# ``sglang.kernels.cake_kernels.attention_mla`` admission check accepts the call
+# (FP8 e4m3 query + latent cache, kv_lora_rank 512 + rope 64, page size 64, no
+# LSE / DCP / sinks). Everything else keeps the trtllm-gen kernel.
+CAKE_MLA_ROUTE = "kimi_k3_mla"
+_cake_mla_logged: set = set()
+
+
+def _cake_mla_log_once(key, msg: str) -> None:
+    if key in _cake_mla_logged:
+        return
+    _cake_mla_logged.add(key)
+    logger.info(msg)
+
 
 @dataclass
 class TRTLLMMLADecodeMetadata:
@@ -241,6 +257,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
+        self._cake_mla_verdicts: dict = {}
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
@@ -1021,6 +1038,56 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return self.dense_q_indptr_verify[: bs + 1]
         return self.q_indptr_decode[: bs + 1] * draft_token_num
 
+    def _cake_mla_decode_admitted(
+        self, query: torch.Tensor, kv_cache: torch.Tensor, return_lse: bool
+    ) -> bool:
+        """Whether this decode call takes the opt-in Cake Kimi-K3 FP8 MLA route.
+
+        Admission is the adapter's ``supports_trtllm_batch_decode_with_kv_cache_mla``
+        (shape / dtype / page-size / module checks, never raises) evaluated once per
+        query shape and cached; the verdict is logged once per shape. An explicit
+        non-trtllm-gen kernel backend (cute-dsl, ...) and LSE-returning calls keep
+        their own kernel.
+        """
+        if not cake_route_enabled(CAKE_MLA_ROUTE):
+            return False
+        if self.backend != "trtllm-gen":
+            _cake_mla_log_once(
+                ("backend", self.backend),
+                f"[cake-route] {CAKE_MLA_ROUTE}: skipped (explicit kernel backend "
+                f"{self.backend!r} keeps priority)",
+            )
+            return False
+        if return_lse:
+            _cake_mla_log_once(
+                "lse", f"[cake-route] {CAKE_MLA_ROUTE}: skipped (return_lse requested)"
+            )
+            return False
+        key = (tuple(query.shape), query.dtype, kv_cache.dtype, self.page_size)
+        verdict = self._cake_mla_verdicts.get(key)
+        if verdict is None:
+            from sglang.kernels.cake_kernels import attention_mla as cake_mla
+
+            verdict = bool(
+                cake_mla.supports_trtllm_batch_decode_with_kv_cache_mla(
+                    query,
+                    kv_cache,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    return_lse=return_lse,
+                )
+            )
+            self._cake_mla_verdicts[key] = verdict
+            _cake_mla_log_once(
+                ("verdict", key),
+                f"[cake-route] {CAKE_MLA_ROUTE}: "
+                f"{'taken' if verdict else 'skipped (not admitted)'} "
+                f"query={tuple(query.shape)} {query.dtype} kv={tuple(kv_cache.shape)} "
+                f"{kv_cache.dtype} page={self.page_size}",
+            )
+        return verdict
+
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -1075,6 +1142,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        if self._cake_mla_decode_admitted(query, kv_cache, return_lse):
+            # Cake contract (FlashInfer ``backend="cake"``): host float scales,
+            # no PDL, no skip-softmax, no LSE, no multi-CTA counter buffer.
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                enable_pdl=False,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=max_seq_len,
+                bmm1_scale=float(bmm1_scale),
+                backend="cake",
+            )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
