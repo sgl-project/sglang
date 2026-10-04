@@ -88,11 +88,9 @@ class TestScaleExpandedRows(CustomTestCase):
     """In-place row scaling must match x * w[:, None] on any strides."""
 
     def _check(self, x, weights):
-        ref = x.to(torch.float32) * weights.to(torch.float32).unsqueeze(1)
+        ref = x * weights.unsqueeze(1)
         scale_expanded_rows_(x, weights)
-        torch.testing.assert_close(
-            x.to(torch.float32), ref.to(x.dtype).to(torch.float32)
-        )
+        torch.testing.assert_close(x, ref)
 
     def test_contiguous(self):
         x = torch.randn(37, 128, device=DEVICE)
@@ -113,6 +111,14 @@ class TestScaleExpandedRows(CustomTestCase):
         # Must not launch or raise on an empty dispatch.
         scale_expanded_rows_(x, weights)
         self.assertEqual(x.shape, (0, 128))
+
+    def test_rejects_non_fp32(self):
+        # A bf16 x would round the weights; a packed UE8M0 scale cannot take them.
+        for dtype in (torch.bfloat16, torch.int32):
+            with self.subTest(dtype=dtype):
+                x = torch.ones(4, 8, device=DEVICE, dtype=dtype)
+                with self.assertRaises(AssertionError):
+                    scale_expanded_rows_(x, torch.rand(4, device=DEVICE))
 
 
 if __name__ == "__main__":

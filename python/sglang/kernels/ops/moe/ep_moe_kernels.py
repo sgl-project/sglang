@@ -2611,9 +2611,11 @@ def scale_expanded_rows_(
     deepep_v2 `do_expand=True` prefill folds the router weights into the
     down-proj input scale here, because ElasticBuffer.combine ignores
     topk_weights in expand mode. `row_weights` must be a 1-D `[rows]` tensor
-    (what DeepEP hands back).
+    (what DeepEP hands back). `x` must be fp32: a packed UE8M0 scale cannot
+    absorb the weight, and a lower-precision `x` would round it.
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
+    assert x.dtype == torch.float32, f"expected fp32 x, got {x.dtype}"
     rows, _ = x.shape
     assert row_weights.dim() == 1, (
         f"expected 1-D row_weights, got {row_weights.dim()}-D {tuple(row_weights.shape)}"
@@ -2621,7 +2623,7 @@ def scale_expanded_rows_(
     assert row_weights.numel() == rows, (
         f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
     )
-    x.mul_(row_weights.to(x.dtype).unsqueeze(1))
+    x.mul_(row_weights.unsqueeze(1))
     return x
 
 
