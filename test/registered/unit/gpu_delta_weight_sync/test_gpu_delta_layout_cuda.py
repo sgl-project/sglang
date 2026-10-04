@@ -5,6 +5,7 @@ update timing path and deliberately use the normal value-layout implementation
 as an independent oracle for the feature-owned byte-mask implementation.
 """
 
+import math
 import sys
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _apply_prepared_masks(bindings, masks):
+def _apply_prepared_masks(bindings, masks, expert_contracts):
     """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
     from sglang.srt.weight_sync.gpu_delta_apply import plan_groups, prepare_status_check
     from sglang.srt.weight_sync.gpu_delta_layout import PreparedDelta, _PreparedBatch
@@ -35,7 +36,7 @@ def _apply_prepared_masks(bindings, masks):
     prepared.error = torch.zeros(1, dtype=torch.int32, device="cuda")
     prepared.timing_enabled = False
     decoded = torch.empty_like(payload)
-    groups, transformed = plan_groups(outputs)
+    groups, transformed = plan_groups(outputs, expert_contracts)
     saved = [
         (value, value.clone()) for binding in bindings for value in binding.storage
     ]
@@ -43,10 +44,11 @@ def _apply_prepared_masks(bindings, masks):
     for group in groups:
         rows.extend(decoded.data_ptr() + offset for offset in group.sources)
         rows.extend(group.targets)
+        rows.extend(group.static_metadata)
     metadata = torch.tensor(rows, dtype=torch.int64, device="cuda")
     compiled, position = [], 0
     for group in groups:
-        count = 2 * len(group.sources)
+        count = 2 * len(group.sources) + len(group.static_metadata)
         pointers = metadata[position : position + count]
         group.compile(pointers, prepared.error)
         compiled.append((group, pointers))
@@ -91,6 +93,7 @@ def _apply_prepared_masks(bindings, masks):
     decoder.actual_sizes.fill_(size)
     prepared._decode_batch(batch)
     prepared._apply_batch(batch)
+    return groups
 
 
 def _reference_layer(values, independent_mma=False):
@@ -252,7 +255,9 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             else:
                 bindings.append(binding)
                 masks.append(mask)
-    _apply_prepared_masks(bindings, masks)
+    contracts = {}
+    _apply_prepared_masks(bindings, masks, contracts)
+    assert len(contracts) == len({binding.expert_family for binding in bindings})
     from sglang.srt.weight_sync.gpu_delta_layout import _direct_binding
 
     for dtype in (torch.uint8, torch.bfloat16, torch.float32):
@@ -278,9 +283,62 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             live_tp,
             [[2, 10], [5, 13]],
         )
-        _apply_prepared_masks([binding], [mask.reshape(-1)])
+        _apply_prepared_masks([binding], [mask.reshape(-1)], {})
         torch.testing.assert_close(
             live_tp.view(torch.uint8), expected_tp, rtol=0, atol=0
+        )
+
+    # Mixed linear lengths, a column-strided source and cached uniform experts.
+    # Tiny items, exact tile ends and partial tails share only useful CTAs.
+    # Guard bytes catch stores that escape an item's final mask.
+    dense, guards = [], []
+    for index, size in enumerate((1, 4095, 4096, 4097, 9001)):
+        storage = torch.full((size + 2,), 0x5A, dtype=torch.uint8, device="cuda")
+        guards.append(storage)
+        target = storage[1:-1].view(1, size)
+        dense.append(
+            _direct_binding(
+                f"model.layers.3.dense{index}.weight",
+                {"dtype": "U8", "shape": [1, size]},
+                target,
+            )
+        )
+    routed = [b for b in bindings if b.name.endswith(".down_proj.weight")]
+    previous_contracts = dict(contracts)
+    for dense_subset in (dense, dense[1:4]):
+        selected = dense_subset + routed + [binding]
+        masks = [
+            torch.zeros(
+                math.prod(b.shape) * b.torch_dtype.itemsize,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            if b.expert_family
+            else torch.randint(
+                256,
+                (math.prod(b.shape) * b.torch_dtype.itemsize,),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            for b in selected
+        ]
+        expected_values = [
+            b.destinations[0].clone()
+            ^ b.selected_bytes(mask).reshape(b.destinations[0].shape)
+            for b, mask in zip(selected, masks)
+        ]
+        groups = _apply_prepared_masks(selected, masks, contracts)
+        linear = [group for group in groups if group.static_metadata]
+        assert len(groups) == 3 and len(linear) == 1
+        assert contracts == previous_contracts
+        sizes = [b.destinations[0].numel() for b in dense_subset]
+        assert linear[0].grid == (sum((size + 4095) // 4096 for size in sizes), 1, 1)
+        for b, expected_value in zip(selected, expected_values):
+            torch.testing.assert_close(
+                b.destinations[0], expected_value, rtol=0, atol=0
+            )
+        assert all(
+            storage[0].item() == storage[-1].item() == 0x5A for storage in guards
         )
 
     plan = GpuDeltaLayout.__new__(GpuDeltaLayout)
@@ -342,7 +400,7 @@ def test_feature_scale_permutation_matches_loader_padding():
                 "weight_scale",
             )
             mask = torch.randint(256, shape, dtype=torch.uint8, device="cuda")
-            _apply_prepared_masks([binding], [mask.reshape(-1)])
+            _apply_prepared_masks([binding], [mask.reshape(-1)], {})
             torch.testing.assert_close(
                 live[0].view(torch.uint8),
                 expected ^ swizzle_scale_bytes(mask),

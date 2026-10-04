@@ -155,6 +155,12 @@ class TensorBinding:
         self._selection = tuple(slice(start, stop) for start, stop in self.slices)
         layer = re.search(r"(?:^|\.)layers\.(\d+)\.", self.name)
         self.layer = int(layer[1]) if layer else None
+        expert = re.search(r"\.experts\.\d+\.", self.name)
+        self.expert_family = (
+            self.name[: expert.start()] + ".experts.*." + self.name[expert.end() :]
+            if expert
+            else None
+        )
 
     @cached_property
     def view_id(self):
@@ -740,6 +746,7 @@ class GpuDeltaBackend:
         self.identity = dict(identity)
         self._canonical_plan = None
         self.batch_plan = None
+        self.expert_apply_contracts = {}
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
@@ -807,7 +814,7 @@ def _plan_layers(backend, bindings, entries):
                 nbytes = entries[binding.name]["nbytes"]
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
-            apply, transformed = plan_groups(outputs)
+            apply, transformed = plan_groups(outputs, backend.expert_apply_contracts)
             plans.append((outputs, size, apply, transformed))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
@@ -1124,6 +1131,7 @@ class PreparedDelta:
                         self.decoded.data_ptr() + offset for offset in group.sources
                     )
                     pointer_rows.extend(group.targets)
+                    pointer_rows.extend(group.static_metadata)
             self.apply_host_metadata = torch.empty(
                 len(pointer_rows), dtype=torch.int64, pin_memory=True
             )
@@ -1140,7 +1148,7 @@ class PreparedDelta:
                 slot_offset = (index % 2) * self.encoded_slot_bytes
                 prepared_groups = []
                 for group in groups:
-                    count = 2 * len(group.sources)
+                    count = 2 * len(group.sources) + len(group.static_metadata)
                     pointers = self.apply_metadata[position : position + count]
                     group.compile(pointers, self.error)
                     prepared_groups.append((group, pointers))
@@ -1193,6 +1201,17 @@ class PreparedDelta:
             decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frames)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
             apply_groups=sum(len(batch.groups) for batch in self.batches),
+            apply_variable_groups=sum(
+                bool(group.static_metadata)
+                for batch in self.batches
+                for group, _ in batch.groups
+            ),
+            apply_prefix_h2d_bytes=8
+            * sum(
+                len(group.static_metadata)
+                for batch in self.batches
+                for group, _ in batch.groups
+            ),
             transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
             compressed_batches=len(plans),
             compressed_tensors=self.matrix_tensor_count,

@@ -53,10 +53,8 @@ source views, failure gating and destination addresses across CUDA graph replay.
 Preparation checks compressed artifact SHA-256 and unwraps outer Zstd once per
 host sharing domain. Each rank registers the retained shared Snappy/raw arena for
 CUDA and constructs descriptors without reading weights or stopping serving.
-Preparation reserves the largest required encoded/decoded tensor arenas. During
-apply, each required matrix tensor is uploaded from pinned host memory, decoded and
-applied before reusing those arenas. There is no staging selector or full-publication
-HBM copy. Every retained changed matrix frame is Snappy, including inputs whose
+There is no staging selector or full-publication HBM copy. Every retained changed
+matrix frame is Snappy, including inputs whose
 compressed representation expands; there is no raw-frame fallback. Once every
 original rank reports `PREPARED`, Miles fans out
 `update_weights_from_delta`. Each local handler closes generation admission,
@@ -74,6 +72,9 @@ views; padded geometries retain the explicit zero-padded mask transform. Primary
 and MMA images that alias receive one XOR, while independent consumer images each
 receive it. Derived refresh uses a device predicate and writes into the existing
 destination without allocating a transformed source or replacement buffer.
+Before apply, identity checks cover live parameter roots and independent consumer
+objects/storage. Feature-owned immutable views do not need separate scans, and
+the in-place apply does not repeat the walk afterward.
 
 Compressed tensors form one batch per target model layer, plus one standalone
 batch for embedding/head and other non-layer weights. Each batch must fit HBM;
@@ -84,12 +85,25 @@ largest batch, and one nvCOMP call decodes all retained frames in that batch.
 Two encoded slots let a copy stream prefetch the next batch while the apply
 stream decodes and updates the current batch. Decoded scratch and decoder
 workspace remain single-buffered.
+Preparation records the omitted frame gaps and tails. Only those byte ranges are
+zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
+all decoded sizes/statuses and ORs failures into the sticky apply gate.
 
 Layer membership, layout groups and destination geometry are reusable. Fresh
 compressed lengths, frame lists and arena offsets are prepared for each update.
-Compatible byte layouts use batched in-place XOR; irregular padded scales retain
-their explicit transform. Decoder metadata and apply pointers upload before
-pause. Bulk H2D starts only during paused apply. Ready/free events protect each
+Singleton and adjacent contiguous axes are collapsed without changing byte order.
+Expert layout metadata comes from one representative per canonical
+`.experts.<id>.<suffix>` family, retaining the layer and complete projection/suffix;
+each expert still contributes its own destination pointers. Uniform experts and
+strided layouts keep the uniform batched XOR kernel. Contiguous non-expert tensors
+with unequal lengths share one per-layer launch: a compact cumulative tile lookup
+schedules exactly the useful byte tiles, with no largest-tensor padding or expanded
+per-tile table. Equal-length groups use the uniform kernel. Irregular padded scales
+retain their explicit transform.
+
+The current active tensor set caches geometry and CPU prefix metadata. Fresh apply
+pointers and the small prefix/length tails share one metadata upload before pause.
+Bulk H2D starts only during paused apply. Ready/free events protect each
 encoded slot; decoded scratch, status checks and updates remain ordered on the
 apply stream. Completion joins the final copy, and cancellation drains both
 streams before releasing shared host views. The existing reader fence and
@@ -217,7 +231,10 @@ worker durations must not be summed as wall time.
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
 `compressed_batches`, `compressed_h2d_spans` and `apply_groups` count layer
-decodes, bulk copies and uniform-layout XOR launches. `host_batch_plan_reused`
+decodes, bulk copies and grouped XOR launches. `apply_variable_groups` counts the
+mixed-length linear groups; `apply_prefix_h2d_bytes` counts their compact lookup
+rows within the apply metadata slab. `decoded_zero_ranges`/`decoded_zero_bytes`
+describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.
 With debug timing enabled, `paused_layer_h2d` measures copy-stream work and
@@ -278,7 +295,7 @@ detect arbitrary same-buffer writes by another updater.
 Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
-The paired Miles feature contains `tests/manual/bench_gpu_delta.py`, which launches
+The paired Miles feature contains `tests/manual/gpu_delta/bench_gpu_delta.py`, which launches
 one EP8 or two EP4 engines and measures the snappy-zstd contract using persistent
 altered checkpoint and publications. `GPU_DELTA_TIMING=1` enables
 phase events without synchronizing every tensor; correctness comparisons stay

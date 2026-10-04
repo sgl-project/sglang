@@ -10,6 +10,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
+from itertools import accumulate
 
 import torch
 import triton
@@ -78,36 +79,75 @@ def _xor_group(
         tl.store(target + target_offset, previous ^ value, mask=mask)
 
 
+@triton.jit
+def _xor_linear_group(
+    pointers,
+    error,
+    COUNT: tl.constexpr,
+    LOOKUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if tl.load(error) == 0:
+        tile = tl.program_id(0).to(tl.int64)
+        lookup = tl.arange(0, LOOKUP)
+        # Pointer rows are followed by cumulative tile ends and byte lengths.
+        ends = tl.load(pointers + 2 * COUNT + lookup, lookup < COUNT, other=0)
+        item = tl.sum(((lookup < COUNT) & (tile >= ends)).to(tl.int32), 0)
+        first = tl.load(pointers + 2 * COUNT + item - 1, item > 0, other=0)
+        size = tl.load(pointers + 3 * COUNT + item)
+        index = (tile - first) * BLOCK + tl.arange(0, BLOCK)
+        source = tl.load(pointers + item).to(tl.pointer_type(tl.uint8))
+        target = tl.load(pointers + COUNT + item).to(tl.pointer_type(tl.uint8))
+        mask = index < size
+        value = tl.load(source + index, mask, other=0)
+        previous = tl.load(target + index, mask, other=0)
+        tl.store(target + index, previous ^ value, mask)
+
+
 @dataclass
 class ByteApplyGroup:
     """Static geometry and live destinations; version scratch pointers stay separate."""
 
-    geometry: tuple
+    geometry: tuple | None
     sources: list[int]
     targets: list[int]
+    static_metadata: tuple[int, ...] = ()
     kernel: object = None
 
     def compile(self, pointers, error):
         if self.kernel is None:
-            source_shape, source_stride, target_shape, target_stride = self.geometry
-            self.grid = (
-                triton.cdiv(math.prod(source_shape), 4096),
-                len(self.sources),
-                1,
-            )
-            self.kernel = _xor_group.warmup(
-                pointers,
-                error,
-                len(self.sources),
-                math.prod(source_shape),
-                source_shape,
-                source_stride,
-                target_shape,
-                target_stride,
-                4096,
-                grid=self.grid,
-                num_warps=4,
-            )
+            count = len(self.sources)
+            if self.geometry is None:
+                self.grid = (self.static_metadata[count - 1], 1, 1)
+                self.kernel = _xor_linear_group.warmup(
+                    pointers,
+                    error,
+                    count,
+                    triton.next_power_of_2(count),
+                    4096,
+                    grid=self.grid,
+                    num_warps=4,
+                )
+            else:
+                source_shape, source_stride, target_shape, target_stride = self.geometry
+                self.grid = (
+                    triton.cdiv(math.prod(source_shape), 4096),
+                    count,
+                    1,
+                )
+                self.kernel = _xor_group.warmup(
+                    pointers,
+                    error,
+                    count,
+                    math.prod(source_shape),
+                    source_shape,
+                    source_stride,
+                    target_shape,
+                    target_stride,
+                    4096,
+                    grid=self.grid,
+                    num_warps=4,
+                )
             # Resolving the compiled launcher loads its CUDA module without
             # executing a kernel or touching the live weights.
             _ = self.kernel.run
@@ -117,23 +157,61 @@ class ByteApplyGroup:
         self.launch(pointers, error)
 
 
-def plan_groups(outputs):
+def _normalize(shape, stride):
+    """Keep the same flat byte mapping with fewer affine axes."""
+    axes = []
+    for size, step in reversed(tuple(zip(shape, stride))):
+        if size == 1:
+            continue
+        if axes and step == axes[-1][0] * axes[-1][1]:
+            axes[-1] = (size * axes[-1][0], axes[-1][1])
+        else:
+            axes.append((size, step))
+    if not axes:
+        return (1,), (1,)
+    shape, stride = zip(*reversed(axes))
+    return shape, stride
+
+
+def plan_groups(outputs, expert_contracts):
     """Build once per active tensor set, using only CPU metadata/meta tensors."""
-    groups, transformed = {}, []
+    groups, transformed, linear_sizes = {}, [], []
     for binding, offset, size in outputs:
         if not binding.destinations:
             transformed.append((binding, offset, size))
             continue
-        canonical = torch.empty(size, dtype=torch.uint8, device="meta")
-        source = binding.selected_bytes(canonical)
-        for target in binding.destinations:
-            geometry = (
-                tuple(source.shape),
-                source.stride(),
-                tuple(target.shape),
-                target.stride(),
+        # The admitted expert family has one layout contract. Its layer and
+        # projection/suffix remain distinct; only actual pointers vary by expert.
+        family = binding.expert_family
+        contract = expert_contracts.get(family) if family is not None else None
+        if contract is None:
+            canonical = torch.empty(size, dtype=torch.uint8, device="meta")
+            source = binding.selected_bytes(canonical)
+            contract = (
+                _normalize(source.shape, source.stride()),
+                source.storage_offset(),
+                tuple(_normalize(t.shape, t.stride()) for t in binding.destinations),
             )
+            if family is not None:
+                expert_contracts[family] = contract
+        (source_shape, source_stride), source_offset, destinations = contract
+        for index, target in enumerate(binding.destinations):
+            target_shape, target_stride = destinations[index]
+            geometry = source_shape, source_stride, target_shape, target_stride
+            if family is None and source_stride == target_stride == (1,):
+                geometry = None
+                linear_sizes.append(math.prod(source_shape))
             group = groups.setdefault(geometry, ByteApplyGroup(geometry, [], []))
-            group.sources.append(offset + source.storage_offset())
+            group.sources.append(offset + source_offset)
             group.targets.append(target.data_ptr())
+    if linear_sizes:
+        group = groups[None]
+        if all(size == linear_sizes[0] for size in linear_sizes):
+            shape = (linear_sizes[0],)
+            group.geometry = shape, (1,), shape, (1,)
+        else:
+            group.static_metadata = (
+                *accumulate((size + 4095) // 4096 for size in linear_sizes),
+                *linear_sizes,
+            )
     return list(groups.values()), transformed
