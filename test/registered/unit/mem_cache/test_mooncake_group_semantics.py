@@ -175,6 +175,30 @@ class FakeIndexerPool:
         return [3000 + i for i in range(len(indices))], [8] * len(indices)
 
 
+class FakeMambaPool:
+    """Mamba host pool whose page also carries registered slot side states."""
+
+    page_size = 1
+    COMPONENTS = ["temporal", "conv_0", "ple_short_conv_0", "ple_ngram_0"]
+
+    def __init__(self):
+        self.buffer = torch.empty((128,), dtype=torch.uint8)
+
+    def get_hybrid_pool_buffer(self):
+        return [self.buffer]
+
+    def get_page_component_names(self):
+        return list(self.COMPONENTS)
+
+    def get_page_buffer_meta(self, indices):
+        ptrs, sizes = [], []
+        for index in indices.tolist():
+            for c in range(len(self.COMPONENTS)):
+                ptrs.append(5000 + index * 10 + c)
+                sizes.append(8 * (c + 1))
+        return ptrs, sizes
+
+
 class FakeMultiBufferPool:
     page_size = 1
 
@@ -422,6 +446,35 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_v2_mamba_keys_follow_host_pool_component_names(self):
+        store, fake_store = _make_store(enable_group_semantics=False)
+        store.register_mem_host_pool_v2(FakeMambaPool(), PoolName.MAMBA)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.MAMBA], [True, True])
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from")
+        self.assertEqual(
+            call["keys"],
+            [
+                f"{page}_{store.mha_suffix}_{name}"
+                for page in ("page0", "page1")
+                for name in FakeMambaPool.COMPONENTS
+            ],
+        )
+        # Each component key is zipped with that component's pointer.
+        self.assertEqual(call["ptrs"], [5000, 5001, 5002, 5003, 5010, 5011, 5012, 5013])
+        self.assertEqual(call["sizes"], [8, 16, 24, 32] * 2)
 
     def test_v2_multi_buffer_put_passes_group_ids(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
