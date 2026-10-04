@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import test_declared_decoder_boundary as fixture
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
@@ -38,7 +39,10 @@ class TestQwen4ExpPleRows(CustomTestCase):
         # rank's slice of the rows between layers; the PLE embedding is
         # computed for every row, so its layer must read the full rows.
         config = SimpleNamespace(num_hidden_layers=4, ple_layer_ids=[3])
-        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True):
+        with (
+            fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True),
+            layer_stack(),
+        ):
             layers = [
                 _build_qwen4_exp_stages(
                     _residual_ops(), sparse=True, layer_id=layer_id, config=config

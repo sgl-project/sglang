@@ -39,10 +39,10 @@ from sglang.srt.layers.hyperconnection import (
 from sglang.srt.layers.layer_boundary import (
     ExitRows,
     GatedResidualState,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1447,7 +1447,7 @@ def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
     the writes are gated injections, so neither stage offers a fused
     add-and-norm candidate.
     """
-    return make_stages(
+    return append_stages(
         (
             declare_attn(read=residual.attn_readout, update=residual.attn_update),
             None,
@@ -1462,17 +1462,6 @@ def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
             ),
             None,
         ),
-        previous=(
-            declare_ffn(
-                sparse=sparse,
-                next_layer_sparse=sparse,
-                update=residual.ffn_update,
-                exit_rows=_ffn_exit_rows(layer_id - 1, config),
-            )
-            if layer_id != 0
-            else None
-        ),
-        terminal=layer_id == config.num_hidden_layers - 1,
     )
 
 

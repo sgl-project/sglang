@@ -54,9 +54,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 
 # Layers - Attention
@@ -1077,7 +1077,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
@@ -1091,7 +1090,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1107,7 +1105,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
-            self.attn_boundary, self.ffn_boundary = make_stages(
+            self.attn_boundary, self.ffn_boundary = append_stages(
                 (
                     declare_attn(
                         read=NormQuantReadout(
@@ -1129,12 +1127,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     {"fusions": boundary_fusions},
                 ),
-                previous=declare_ffn(
-                    sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
-                )
-                if layer_id != 0
-                else None,
-                terminal=layer_id == config.num_hidden_layers - 1,
             )
 
     def forward(
@@ -1284,7 +1276,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
@@ -1303,7 +1294,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1322,7 +1312,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
-            self.attn_boundary, self.ffn_boundary = make_stages(
+            self.attn_boundary, self.ffn_boundary = append_stages(
                 (
                     declare_attn(
                         read=NormQuantReadout(
@@ -1342,12 +1332,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     {"fusions": boundary_fusions},
                 ),
-                previous=declare_ffn(
-                    sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
-                )
-                if layer_id != 0
-                else None,
-                terminal=layer_id == config.num_hidden_layers - 1,
             )
 
         self.alt_stream = alt_stream

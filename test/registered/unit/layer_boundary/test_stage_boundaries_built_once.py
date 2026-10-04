@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_BUILDERS = {"make_stages", "make_attn_stage", "make_ffn_stage"}
+_BUILDERS = {"append_stages", "make_stages", "make_attn_stage", "make_ffn_stage"}
 
 
 def _called(node):
