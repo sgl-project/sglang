@@ -135,6 +135,37 @@ def collect_hashes(directory, exclude=("result.json",)):
             for p in sorted(directory.rglob("*")) if p.is_file() and p.name not in exclude}
 
 
+def export_song_artifacts(directory, *, request, latents, semantic_ids, prefix_ids,
+                          abc_ids, timing, truncated):
+    """Write one request's WSB-style artifact bundle (latent/token arrays + plan).
+
+    ``latents`` is the NAR output (``[1, 64, T]`` or ``[64, T]``); other token
+    lists are raw ids. The manifest hashes the frozen plan inputs so the scorer
+    can verify the bundle later with :func:`verify_result`.
+    """
+    import numpy as np
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    latent = latents.squeeze(0)
+    if latent.shape[0] == 64 and latent.shape[-1] != 64:
+        latent = latent.T  # [64, T] -> [T, 64]
+    np.save(directory / "latent.npy", latent.detach().float().cpu().numpy())
+    np.save(directory / "semantic.npy", np.asarray(semantic_ids, dtype=np.int32))
+    np.save(directory / "prefix.npy", np.asarray(prefix_ids, dtype=np.int32))
+    np.save(directory / "abc_tokens.npy", np.asarray(abc_ids, dtype=np.int32))
+    request_dict = request.to_dict()
+    write_json(directory / "plan.json", {
+        "request": request_dict, "timing": timing, "truncated": truncated,
+        "prefix": prefix_ids, "abc_ids": abc_ids, "abc": request.abc,
+    })
+    write_json(directory / "plan_manifest.json", {
+        name: sha256_file(directory / name)
+        for name in ("plan.json", "abc_tokens.npy", "prefix.npy")
+    })
+    write_json(directory / "request.json", request_dict)
+
+
 def verify_result(directory, expected_identity=None):
     directory = Path(directory)
     result = json.loads((directory / "result.json").read_text())

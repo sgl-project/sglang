@@ -1,9 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
 """YuE2 AR–NAR Mixture-of-Transformers, with checkpoint-compatible names.
 
 This module is self contained for Transformers ``trust_remote_code`` loading.
 It imports no CUDA extension and implements the released model architecture.
 ``generate`` returns token IDs; the package pipeline supplies song generation.
 """
+
+# NOTE (yiakwy) : same to
+# https://github.com/multimodal-art-projection/YuE/tree/main/src/yue2/modeling_yue2.py
+
 from __future__ import annotations
 
 import math
@@ -17,15 +22,20 @@ from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
+# TODO (yiakwy) : switch to sglang's GQA backend
 def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
     """Use native grouped-query attention, including a portable MPS fallback."""
     grouped = query.shape[1] != key.shape[1]
+
+    # NOTE (yiakwy) : to be verified at M3 Ultra
     if grouped and query.device.type == "mps":
+
         # PyTorch's MPS attention does not implement enable_gqa on every release.
         groups = query.shape[1] // key.shape[1]
         key = key.repeat_interleave(groups, dim=1)
         value = value.repeat_interleave(groups, dim=1)
         grouped = False
+
     return F.scaled_dot_product_attention(
         query, key, value, attn_mask=attn_mask, is_causal=is_causal,
         enable_gqa=grouped,
@@ -52,6 +62,7 @@ def _causal_mask(attention_mask, cache_position, key_length, batch_size):
     if mask.dtype == torch.bool:
         return visible & mask
     return mask.masked_fill(~visible, float("-inf"))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
@@ -98,9 +109,12 @@ class YuE2Config(PretrainedConfig):
     ):
         if latent_type != "vae":
             raise ValueError("YuE2 inference supports only latent_type='vae'")
+
         # Serialize only the documented model and Transformers configuration.
         kwargs = {key: value for key, value in kwargs.items() if key in self._hf_fields}
+
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads

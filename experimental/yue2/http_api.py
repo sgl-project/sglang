@@ -41,6 +41,9 @@ class Yue2AudioGenerationsRequest(BaseModel):
     vae_halo_frames: int = Field(16, ge=0)
     output_path: Optional[str] = Field(None, description="output directory")
     output_file_name: Optional[str] = Field(None, description="output file name")
+    cfg_scale: Optional[float] = Field(None, description="classifier-free guidance scale")
+    artifacts_dir: Optional[str] = Field(
+        None, description="export plan/semantic/latent/request/config artifacts here")
 
 
 @router.post("/generations")
@@ -57,8 +60,11 @@ async def generate_audio(
         "cot": request.cot,
         "seed": request.seed,
         "abc": request.abc,
+        "cfg_scale": request.cfg_scale,
         "id": request.output_file_name or request_id,
     }
+    if request.artifacts_dir:
+        prompt_payload["artifacts_dir"] = request.artifacts_dir
     sampling = build_sampling_params(
         request_id,
         prompt=json.dumps(prompt_payload, ensure_ascii=False),
@@ -67,6 +73,7 @@ async def generate_audio(
         cot=request.cot,
         request_abc=request.abc,
         seed=request.seed,
+        cfg_scale=request.cfg_scale,
         num_inference_steps=request.ode_steps,
         ode_steps=request.ode_steps,
         abc_max_tokens=request.abc_max_tokens,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -24,8 +24,8 @@ class Yue2SamplingParams(SamplingParams):
     top_p: float = 0.95
     top_k: int = 100
     repetition_penalty: float = 1.2
-    style: str | None = None
-    lyrics: str | None = None
+    style: str | None = field(default=None, metadata={"batch_sig_exclude": True})
+    lyrics: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     request_abc: str | None = None
     output_sample_rate: int | None = 48000
 

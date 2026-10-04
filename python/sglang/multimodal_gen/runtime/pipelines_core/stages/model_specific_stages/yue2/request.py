@@ -24,6 +24,7 @@ class Yue2Request:
     abc: str | None = None
     cfg_scale: float | None = None
     id: str = "song"
+    artifacts_dir: str = ""  # optional per-request artifact export (WSB-style scoring)
 
     @classmethod
     def from_sampling_params(cls, sampling_params) -> "Yue2Request":
@@ -66,10 +67,12 @@ class Yue2Request:
             abc=payload.get("abc"),
             cfg_scale=payload.get("cfg_scale"),
             id=str(payload.get("id", "song")),
+            artifacts_dir=str(payload.get("artifacts_dir") or ""),
         )
 
     def to_song_request(self) -> SongRequest:
-        return SongRequest(**asdict(self))
+        fields = {k: v for k, v in asdict(self).items() if k != "artifacts_dir"}
+        return SongRequest(**fields)
 
 
 class Yue2PrepareRequestStage(PipelineStage):
@@ -92,6 +95,7 @@ class Yue2PrepareRequestStage(PipelineStage):
                 "yue2_request": song_request,
                 "yue2_prefix": list(prefix),
                 "yue2_request_id": song_request.id,
+                "yue2_artifacts_dir": request.artifacts_dir,
             }
         )
         return batch

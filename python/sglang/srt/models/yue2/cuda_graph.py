@@ -17,6 +17,8 @@ from numbers import Integral
 import torch
 import torch.nn.functional as F
 
+from .fa3 import varlen_attention
+
 
 # NOTE (yiakwy) : same to 
 #   https://github.com/multimodal-art-projection/YuE/blob/main/src/yue2/cuda_graph.py
@@ -85,8 +87,8 @@ class GraphAR:
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, Integral) or max_tokens < 1:
             raise ValueError("max_tokens must be a positive integer")
         prefixes = [list(prefix) for prefix in prefixes]
-        if len(prefixes) not in {1, 2}:
-            raise ValueError("GraphAR supports one request or exactly two CFG branches")
+        if not prefixes:
+            raise ValueError("GraphAR requires at least one branch")
         config = model.config
         for prefix in prefixes:
             if not prefix or any(isinstance(token, bool) or not isinstance(token, Integral) or
@@ -193,14 +195,13 @@ class GraphAR:
             # All allocated slots are present, but only each branch's completed
             # prefix and the current token are visible. Future slots never leak.
             if self.attention_backend == "flash":
-                # seqused_k is respected by the 3D packed/varlen entrypoint.
-                # The 4D fixed-batch entrypoint ignores it in torch 2.10, so do
-                # not replace this call with an apparently equivalent 4D call.
-                h = torch.ops.aten._flash_attention_forward(
+                # seqused_k hides each branch's unfilled slots; FA3's varlen
+                # entrypoint honours it too (no custom mask needed).
+                h = varlen_attention(
                     q[:, 0], keys.view(-1, config.num_key_value_heads, config.head_dim),
                     values.view(-1, config.num_key_value_heads, config.head_dim),
-                    self.cu_q, self.cu_k, 1, self.capacity, 0.0, False, False,
-                    seqused_k=used_lengths)[0][:, None]
+                    self.cu_q, self.cu_k, 1, self.capacity,
+                    seqused_k=used_lengths)[:, None]
             elif self.attention_backend == "cudnn":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
@@ -262,10 +263,10 @@ class GraphAR:
             keys.scatter_(1, slots, k)
             values.scatter_(1, slots, v)
             if self.attention_backend == "flash":
-                h = torch.ops.aten._flash_attention_forward(
+                h = varlen_attention(
                     q[:, 0], keys.view(-1, HKV, HD), values.view(-1, HKV, HD),
-                    self.cu_q, self.cu_k, 1, self.capacity, 0.0, False, False,
-                    seqused_k=used_lengths)[0][:, None]
+                    self.cu_q, self.cu_k, 1, self.capacity,
+                    seqused_k=used_lengths)[:, None]
             elif self.attention_backend == "cudnn":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):

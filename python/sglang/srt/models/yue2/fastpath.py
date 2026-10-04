@@ -316,6 +316,156 @@ class GraphSampler:
         self.done_buf.zero_()
 
 
+class BatchedGraphSampler:
+    """Decode-graph-resident sampler"""
+
+    def __init__(self, vocab_size, device, generator, batch_size,
+                 window_buf_cap=100, max_topk=MAX_GRAPH_TOPK):
+        topk_backend = _load_topk_backend()
+        if not topk_backend:
+            raise ImportError("BatchedGraphSampler requires the DeepSelect backend")
+
+        self.backend = topk_backend
+        self.vocab = int(vocab_size)
+        self.device = device
+        self.B = int(batch_size)
+        self.window_buf_cap = int(window_buf_cap)
+        self.pad = (-self.vocab) % STRIDE_FLOATS
+        self.total = self.vocab + self.pad
+
+        self.scores = torch.empty(self.B, self.total, dtype=torch.float32, device=device)
+        self.scores[:, self.vocab:] = float("-inf")
+
+        self.mask = torch.empty(self.B, self.total, dtype=torch.float32, device=device)
+
+        self.mask.fill_(float("-inf"))
+        self.mask[:, MUSIC_END:CODEC_OFFSET + CODEC_SIZE] = 0.0
+        self.mask[:, self.vocab:] = float("-inf")
+
+        self.temp_buf = torch.ones(self.B, dtype=torch.float32, device=device)
+        self.top_p_buf = torch.ones(self.B, dtype=torch.float32, device=device)
+        self.topk_buf = torch.full((self.B,), max_topk, dtype=torch.int32, device=device)
+        self.penalty_buf = torch.ones(self.B, dtype=torch.float32, device=device)
+        self.window_len_buf = torch.full((self.B,), self.window_buf_cap,
+                                         dtype=torch.int32, device=device)
+
+        self.window_buf = torch.full((self.B, self.window_buf_cap), self.total - 1,
+                                     dtype=torch.int64, device=device)
+        self.slot_seq = torch.full((self.B, self.window_buf_cap), -(1 << 20),
+                                   dtype=torch.int32, device=device)
+        self.step_buf = torch.zeros(self.B, dtype=torch.int32, device=device)
+        self.end_buf = torch.zeros(self.B, 1, dtype=torch.int64, device=device)
+        self.token_buf = torch.zeros(self.B, 1, dtype=torch.int64, device=device)
+        self.done_buf = torch.zeros(self.B, 1, dtype=torch.bool, device=device)
+
+        self.max_steps = 24576
+        self.token_history = torch.zeros(self.B, self.max_steps, dtype=torch.int32,
+                                         device=device)
+        self.stop_step = torch.full((self.B,), -1, dtype=torch.int32, device=device)
+
+        self._end_only = torch.full((self.B, self.total), float("-inf"),
+                                    dtype=torch.float32, device=device)
+        self._end_only[:, MUSIC_END] = 0.0
+
+        self._ages = torch.empty(self.B, self.window_buf_cap, dtype=torch.int32,
+                                 device=device)
+        self._window_weights = torch.ones(self.B, self.window_buf_cap,
+                                          dtype=torch.float32, device=device)
+        self._topk_ranks = torch.arange(max_topk, device=device, dtype=torch.int32)
+        self._freq = torch.zeros(self.B, self.total, dtype=torch.float32, device=device)
+        self._mixed = torch.empty(self.B, self.total, dtype=torch.float32, device=device)
+        self._rows = torch.arange(self.B, device=device)
+
+        self.generator = generator
+        self._k = int(max_topk)
+        self.values_buf = None
+        self.idx_buf = None
+
+    def _fill_scalars(self, temperature, top_p, top_k, repetition_penalty,
+                      penalty_window, end, min_tokens):
+        self.temp_buf.fill_(max(float(temperature), 1e-5))
+        self.top_p_buf.fill_(float(top_p))
+        self.topk_buf.fill_(int(min(max(top_k, 1), self._k)))
+        self.penalty_buf.fill_(float(repetition_penalty))
+        self.window_len_buf.fill_(int(penalty_window))
+        self.end_buf.fill_(int(end))
+        self._end_only.fill_(float("-inf"))
+        self._end_only[:, int(end)] = 0.0
+        self.block_end(bool(min_tokens))
+        self.reset_state()
+
+    def configure_semantic(self, *, temperature, top_p, top_k, repetition_penalty,
+                           penalty_window, end, min_tokens):
+        """Refill the per-row semantic-phase input buffers (outside the graph)."""
+        self._fill_scalars(temperature, top_p, top_k, repetition_penalty,
+                           penalty_window, end, min_tokens)
+        self.mask.fill_(float("-inf"))
+        self.mask[:, MUSIC_END:CODEC_OFFSET + CODEC_SIZE] = 0.0
+        self.mask[:, self.vocab:] = float("-inf")
+
+    def configure_abc(self, *, temperature, top_p, top_k, repetition_penalty,
+                      penalty_window, end, min_tokens):
+        """Refill the per-row ABC-planning-phase input buffers."""
+        self._fill_scalars(temperature, top_p, top_k, repetition_penalty,
+                           penalty_window, end, min_tokens)
+        self.mask.fill_(float("-inf"))
+        self.mask[:, :EOD] = 0.0
+        self.mask[:, int(end)] = 0.0
+        self.mask[:, self.vocab:] = float("-inf")
+
+    def block_end(self, blocked: bool) -> None:
+        """Toggle the end-token block for every row (``min_tokens`` gate)."""
+        self.mask[:, int(self.end_buf[0, 0].item())] = float("-inf") if blocked else 0.0
+
+    def reset_state(self) -> None:
+        self.window_buf.fill_(self.total - 1)
+        self.slot_seq.fill_(-(1 << 20))
+        self.step_buf.zero_()
+        self.token_buf.zero_()
+        self.done_buf.zero_()
+        self.stop_step.fill_(-1)
+
+    def sample_in_graph(self, logits):
+        """Graph body: mask -> penalty -> top-k -> top-p -> multinomial (all rows)."""
+        torch.add(logits, self.mask[:, : self.vocab], out=self.scores[:, : self.vocab])
+        # Finished rows re-emit the end token, keeping it at the exact KV slot
+        # the NAR stage reads, without any host-side branch control.
+        forced = (self.stop_step >= 0)[:, None]
+        torch.where(forced, self._end_only, self.scores, out=self._mixed)
+        self._freq.zero_()
+        torch.sub(self.step_buf[:, None], self.slot_seq, out=self._ages)
+        self._window_weights.copy_(self._ages <= self.window_len_buf[:, None])
+        self._freq.scatter_add_(1, self.window_buf, self._window_weights)
+        alpha = self.penalty_buf[:, None] ** self._freq
+        scores = torch.where(self._mixed < 0, self._mixed * alpha, self._mixed / alpha)
+        scores.div_(self.temp_buf[:, None])
+
+        values, idx = self.backend.topk(scores, self._k, sorted=True,
+                                        indices_type=torch.int64, return_value=True)
+        self.values_buf, self.idx_buf = values, idx
+        probabilities = values.softmax(-1)
+        removed = probabilities.cumsum(-1) - probabilities > self.top_p_buf[:, None]
+        removed = removed | (self._topk_ranks[None, :] >= self.topk_buf[:, None])
+        removed[..., :1] = False
+        p = values.masked_fill(removed, float("-inf")).softmax(-1)
+        position = torch.multinomial(p, 1, generator=self.generator)
+        torch.gather(idx, 1, position, out=self.token_buf)
+        torch.eq(self.token_buf, self.end_buf, out=self.done_buf)
+        return self.token_buf, self.done_buf
+
+    def advance_in_graph(self):
+        """Ring-buffer bookkeeping and transcript latching for all rows."""
+        slot = self.step_buf % self.window_buf_cap
+        self.window_buf[self._rows, slot] = self.token_buf[:, 0]
+        self.slot_seq[self._rows, slot] = self.step_buf
+        index = self.step_buf.long()
+        self.token_history[self._rows, index] = self.token_buf[:, 0].to(torch.int32)
+        is_end = self.token_buf[:, 0] == self.end_buf[:, 0]
+        newly_stopped = is_end & (self.stop_step < 0)
+        torch.where(newly_stopped, self.step_buf, self.stop_step, out=self.stop_step)
+        self.step_buf += 1
+
+
 def _window_penalty_(scores: torch.Tensor, recent: torch.Tensor, penalty: float,
                      window: int) -> None:
     """In-place version of ``sampling.window_penalty`` on the scores row."""

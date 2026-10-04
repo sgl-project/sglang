@@ -3,15 +3,12 @@ from __future__ import annotations
 
 import time
 
-import torch
-
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from sglang.srt.models.yue2.protocol import (
-    CODEC_OFFSET,
     GenerationConfig,
     Sampling,
     SongRequest,
@@ -131,6 +128,34 @@ class Yue2ARStage(PipelineStage):
             }
         )
         return batch
+
+    def run_grouped_requests(self, batches, server_args):
+        """Batch the semantic AR phase across compatible requests.
+
+        Requests already share the scheduler's dynamic-batch signature (same
+        sampling params); this stage additionally requires CoT/full, no CFG, and
+        no external ABC. Anything else falls back to the per-request path.
+        """
+        if len(batches) < 2 or not self._session_path_enabled():
+            return [self(batch, server_args) for batch in batches]
+
+        from sglang.srt.models.yue2.batched import (
+            BatchedUnsupported,
+            batched_ar_enabled,
+            run_batched_ar,
+        )
+
+        if not batched_ar_enabled():
+            return [self(batch, server_args) for batch in batches]
+
+        try:
+            return run_batched_ar(self.model, self.tokenizer, batches,
+                                  self._generation_config)
+        except BatchedUnsupported as exc:
+            logger.info("Batched YuE2 AR not applicable (%s); running per request", exc)
+        except Exception:
+            logger.exception("Batched YuE2 AR failed; falling back to per request")
+        return [self(batch, server_args) for batch in batches]
 
     @staticmethod
     def _session_path_enabled() -> bool:

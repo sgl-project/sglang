@@ -51,6 +51,7 @@ class Yue2Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.yue2 import (
             Yue2ARStage,
+            Yue2ArtifactExportStage,
             Yue2NARStage,
             Yue2PrepareRequestStage,
             Yue2VAEDecodeStage,
@@ -61,6 +62,7 @@ class Yue2Pipeline(ComposedPipelineBase):
             Yue2ARStage(self.get_module("mot"), self.get_module("tokenizer"))
         )
         self.add_stage(Yue2NARStage(self.get_module("mot")))
+        self.add_stage(Yue2ArtifactExportStage())
         self.add_stage(Yue2VAEDecodeStage(self.get_module("vae")))
 
 
