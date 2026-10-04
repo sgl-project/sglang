@@ -787,9 +787,9 @@ class _PreparedBatch:
     check_status: Callable[[], None]
 
 
-def _plan_layers(backend, bindings, entries):
+def _plan_layers(backend, bindings, entries, layers_per_batch=1):
     """Cache membership, canonical offsets and apply geometry, never wire frames."""
-    key = tuple(binding.name for binding in bindings)
+    key = layers_per_batch, tuple(binding.name for binding in bindings)
     if backend.batch_plan is None or backend.batch_plan[0] != key:
         if not bindings:
             backend.batch_plan = (key, [])
@@ -797,13 +797,25 @@ def _plan_layers(backend, bindings, entries):
         from sglang.srt.weight_sync.gpu_delta_apply import plan_apply
 
         layers = {}
+        non_layers = {"embed_tokens": [], "lm_head": [], "standalone": []}
         for binding in bindings:
-            layers.setdefault(binding.layer, []).append(binding)
-        if None in layers:
-            # The standalone batch can fill slot zero before the serving pause.
-            layers = {None: layers.pop(None), **layers}
+            if binding.layer is None:
+                module = binding.name.rpartition(".")[0].rpartition(".")[2]
+                non_layers.get(module, non_layers["standalone"]).append(binding)
+            else:
+                layers.setdefault(binding.layer, []).append(binding)
+        groups = [group for group in non_layers.values() if group]
+        model_layers = list(layers.values())
+        groups.extend(
+            [
+                binding
+                for layer in model_layers[start : start + layers_per_batch]
+                for binding in layer
+            ]
+            for start in range(0, len(model_layers), layers_per_batch)
+        )
         plans = []
-        for group in layers.values():
+        for group in groups:
             outputs, size = [], 0
             for binding in group:
                 offset = (size + 15) // 16 * 16
@@ -817,7 +829,7 @@ def _plan_layers(backend, bindings, entries):
 
 
 def _plan_batch(outputs, entries, records):
-    """Map adjacent registered host spans and canonical outputs for one layer."""
+    """Map adjacent registered host spans and canonical outputs for one batch."""
     ranges, spans = [], []
     encoded_size = 0
     for binding, decoded_offset, _ in outputs:
@@ -955,6 +967,9 @@ class PreparedDelta:
         self.h2d_stages = int(os.environ.get("GPU_DELTA_H2D_STAGES", "2"))
         if self.h2d_stages < 2:
             raise ValueError("GPU_DELTA_H2D_STAGES requires at least two slots")
+        self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
+        if self.layers_per_batch < 1:
+            raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
@@ -1022,8 +1037,7 @@ class PreparedDelta:
                 continue  # Omitted XOR masks need no work.
             compressed.append(binding)
         previous_plan = backend.batch_plan
-        static_plans = _plan_layers(backend, compressed, entries)
-        self.preloaded_standalone = any(binding.layer is None for binding in compressed)
+        static_plans = _plan_layers(backend, compressed, entries, self.layers_per_batch)
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
@@ -1206,13 +1220,14 @@ class PreparedDelta:
             ]
             ready = torch.cuda.Event()
             ready.record(self.stream)
-        preloaded = self.batches[0].copies if self.preloaded_standalone else []
-        if self.preloaded_standalone:
-            # Allocation/metadata/tuning work precedes this copy. Reuse slot zero;
-            # decompression and all weight writes still wait for apply's pause.
+        preloaded = self.batches[: self.h2d_stages]
+        if preloaded:
+            # Fill the existing ring after allocation/metadata/tuning completes.
+            # Decompression and all weight writes still wait for apply's pause.
             self.copy_stream.wait_event(ready)
-            self._copy_batch(self.batches[0], 0, "prepared_standalone_h2d")
-            ready = self.copy_ready[0]
+            for index, batch in enumerate(preloaded):
+                self._copy_batch(batch, index, "prepared_h2d")
+            ready = self.copy_ready[len(preloaded) - 1]
         self.timings.update(
             host_decoder_prepare_s=time.perf_counter() - decoder_started,
             host_apply_tune_s=tune_s,
@@ -1233,11 +1248,13 @@ class PreparedDelta:
             apply_static_groups=sum(group.config[2] for group in apply_groups),
             transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
             compressed_batches=len(plans),
+            layers_per_batch=self.layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
             compressed_h2d_spans=sum(len(batch.copies) for batch in self.batches),
-            prepared_standalone_h2d_spans=len(preloaded),
-            prepared_standalone_h2d_bytes=sum(
-                source.numel() for _, source in preloaded
+            prepared_h2d_batches=len(preloaded),
+            prepared_h2d_spans=sum(len(batch.copies) for batch in preloaded),
+            prepared_h2d_bytes=sum(
+                source.numel() for batch in preloaded for _, source in batch.copies
             ),
             decoded_zero_ranges=sum(len(batch.zero_ranges) for batch in self.batches),
             decoded_zero_bytes=sum(
@@ -1253,8 +1270,8 @@ class PreparedDelta:
         )
         # This constructor runs on the preparation worker. PREPARED means
         # immutable pinned inputs, reusable arenas and decoder metadata are ready.
-        # Standalone encoded bytes are also ready in slot zero. Model-layer
-        # uploads remain on the paused copy/decode pipeline.
+        # Initial encoded ring slots are ready; later batches are uploaded as
+        # paused apply frees slots, without allocating more encoded storage.
         ready_started = time.perf_counter()
         ready.synchronize()
         self.timings["host_ready_wait_s"] = time.perf_counter() - ready_started
@@ -1299,9 +1316,7 @@ class PreparedDelta:
                         torch._foreach_copy_(targets, sources)
                 self.timings["host_raw_enqueue_s"] = time.perf_counter() - raw_started
                 matrices_started = time.perf_counter()
-                if self.batches and not self.preloaded_standalone:
-                    self._copy_batch(self.batches[0], 0)
-                prefetched = 1
+                prefetched = min(self.h2d_stages, len(self.batches))
                 for index, batch in enumerate(self.batches):
                     with self._phase("paused_copy_wait"):
                         self.stream.wait_event(self.copy_ready[index % self.h2d_stages])
@@ -1309,10 +1324,7 @@ class PreparedDelta:
                     self.copy_free[index % self.h2d_stages].record(self.stream)
                     # No new prefetch follows a synchronous decoder launch error.
                     # Device status errors keep the existing sticky apply gate.
-                    while (
-                        prefetched < len(self.batches)
-                        and prefetched < index + self.h2d_stages
-                    ):
+                    if prefetched < len(self.batches):
                         self._copy_batch(self.batches[prefetched], prefetched)
                         prefetched += 1
                     self._apply_batch(batch)

@@ -76,28 +76,34 @@ Before apply, identity checks cover live parameter roots and independent consume
 objects/storage. Feature-owned immutable views do not need separate scans, and
 the in-place apply does not repeat the walk afterward.
 
-Compressed tensors form one batch per target model layer, plus one standalone
-batch for embedding/head and other non-layer weights. Each batch must fit HBM;
-there is no intra-layer streaming. Preparation coalesces adjacent rank-owned
-ranges of the shared pinned Snappy arena into bulk transfers, without copying
-foreign experts or making a second per-rank host arena. GPU scratch fits the
+Compressed tensors form batches of adjacent active target model layers. Separate
+non-layer groups hold embeddings, the language-model head, and remaining standalone
+weights, in that order; empty groups are omitted.
+`GPU_DELTA_LAYERS_PER_BATCH` defaults to 1; positive values group that many active
+layers in model order, even when unchanged layers are absent. Each complete batch
+must fit HBM; there is no intra-layer streaming. Preparation coalesces adjacent
+rank-owned ranges of the shared pinned Snappy arena into bulk transfers, without
+copying foreign experts or making a second per-rank host arena. GPU scratch fits the
 largest batch, and one nvCOMP call decodes all retained frames in that batch.
 A copy stream prefetches upcoming batches into an encoded ring while the apply
 stream decodes and updates the current batch. `GPU_DELTA_H2D_STAGES` defaults to 2
 and accepts stage counts of at least 2; 3 or 4 provide additional lookahead at the
 cost of one maximum-batch encoded buffer per extra stage. Decoded scratch and
-decoder workspace remain single-buffered.
+decoder workspace remain single-buffered. These working buffers are allocated
+during preparation. More layers per batch can increase their capacities; the
+preparation prefill only fills existing encoded slots.
 Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
 
 Layer membership and normalized affine source/destination views are cached for
-the current active tensor set. Fresh compressed lengths, frame lists and arena
-offsets are prepared for each update. Singleton and adjacent contiguous axes are
-collapsed without changing byte order. All affine images of a layer share one
-XOR launch. Its exact uniform contracts, counts and tile intervals are compile-time
-parameters, without model-name classification or a runtime geometry table. Only
-fresh source/destination pointers are uploaded. Proven four-byte alignment and
+the current active tensor set and layer count. Fresh compressed lengths, frame
+lists and arena offsets are prepared for each update. Singleton and adjacent
+contiguous axes are collapsed without changing byte order. All affine images in
+a streaming batch share one XOR launch. Its exact uniform contracts, counts and
+tile intervals are compile-time parameters, without model-name classification or
+a runtime geometry table. Only fresh source/destination pointers are uploaded.
+Proven four-byte alignment and
 row/tail geometry select uint32 XOR; other contracts use byte XOR in the same
 kernel. Contiguous inner tiles need only scalar base-address arithmetic. Irregular
 padded scales retain their explicit transform.
@@ -110,22 +116,20 @@ in unused decoded scratch, never live weights or the decoder. One warmup and thr
 timed trials per candidate use events on the preparation stream. The sum of
 borrowed footprints is capped at 4 GiB per device; no additional weight-size
 allocation is made. Nonfitting batches or an exhausted budget use the measured
-naive policy. In the current full-model fixture the representative MoE and
-standalone batches do not fit this tuning scratch limit. Both measured and fixed
+naive policy. Fitting depends on the selected grouping and scratch capacity.
+Both measured and fixed
 choices are cached in-process by complete geometry, counts, proven alignment and
 device. Warm plan reuse performs no fitting check, occupancy query or tuning.
 Cold tuning can compete with serving for bandwidth and its cost is included in
 preparation. The winning launch is bound before pause; apply does no configuration
 selection, counter reset or dynamic work stealing.
 
-Preparation uploads the standalone batch into the first existing encoded slot
-and waits for its copy-ready event before `PREPARED`. This adds no HBM allocation
-and performs no decompression or model writes. Model-layer H2D starts during
-paused apply; without a standalone batch, all compressed uploads remain paused.
-Ready/free events protect each encoded slot. Stage 2 retains the original
-next-batch schedule; larger rings queue further lookahead only after the current
-decoder and status check have been enqueued. Reused-slot waits always refer to an
-already-recorded free event.
+Preparation uploads the first batches into every existing encoded ring slot and
+waits for the last copy-ready event before `PREPARED`. When fewer batches exist,
+only those batches are uploaded. This adds no HBM allocation and performs no
+decompression or model writes. During paused apply, each decode/status submission
+releases its encoded slot and queues the next batch into that slot. Ready/free
+events protect reuse; each wait refers to an already-recorded free event.
 Decoded scratch, status checks and updates remain ordered on the
 apply stream. Completion joins the final copy, and cancellation drains both
 streams before releasing shared host views. The existing reader fence and
@@ -252,7 +256,8 @@ worker durations must not be summed as wall time.
 `decoder_metadata_uploads` counts metadata slabs and
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
-`compressed_batches`, `compressed_h2d_spans` and `apply_groups` count layer
+`layers_per_batch` records the configured grouping. `compressed_batches`,
+`compressed_h2d_spans` and `apply_groups` count batch
 decodes, bulk copies and affine XOR launches. `apply_contracts` separately counts
 the uniform compile-time contracts within those launches. `apply_grid_ctas`
 counts the sum of chosen grid sizes, including naive launches;
@@ -267,9 +272,9 @@ actual H2D ring stage count. `decoded_zero_ranges`/`decoded_zero_bytes`
 describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.
-`prepared_standalone_h2d_bytes`/`prepared_standalone_h2d_spans` count the transfers
-moved into preparation; total `h2d_bytes` and encoded capacity are unchanged.
-With debug timing enabled, `prepared_standalone_h2d` measures that preparation
+`prepared_h2d_bytes`/`prepared_h2d_spans`/`prepared_h2d_batches` count the transfers
+moved into preparation; prefill does not increase encoded capacity.
+With debug timing enabled, `prepared_h2d` measures that preparation
 copy, while `paused_layer_h2d` measures the remaining copy-stream work and
 `paused_copy_wait` measures the apply stream waiting for ready data; these overlap
 with decode/apply and must not be added together. The nvCOMP DE backend may wait
