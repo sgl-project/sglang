@@ -83,6 +83,35 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### KV-event gap replay
+
+ZMQ drops KV events at the publisher's high-water mark, and a lost removal
+leaves the router crediting a worker with blocks it no longer holds. Give each
+engine a replay socket and the router re-fetches the batches a sequence gap
+skipped:
+
+```bash
+python -m sglang.launch_server ... \
+  --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}'
+```
+
+Rank r publishes on 5557 + r and replays on 5558 + r, so with `dp_size > 1`
+place the replay base at least dp_size ports past the PUB base. The engine keeps
+the last `buffer_steps` batches (default 10000); older gaps stay unrepaired.
+`sgl_router_kv_event_replays_total{outcome}` counts the attempts.
+
+### Pending prefixes
+
+Until the engine's KV events arrive, requests that share a cold prefix see no
+cached owner and spread across workers, each prefilling the same prefix. This
+is common with parallel sampling, RL rollouts and agent fan-out.
+`--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
+long after routing it there, so the burst stays together. It is off by default
+and needs `--policy cache_aware` with the Router-local radix tree.
+`sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
+prefix matched deeper than any confirmed one; the policy's candidate and
+admission filters still decide whether that worker is picked.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic
