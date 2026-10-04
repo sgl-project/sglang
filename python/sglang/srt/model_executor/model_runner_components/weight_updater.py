@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -79,6 +80,34 @@ def _unsupported_derived_weight_cache_error(
             "split would keep serving the old weights."
         )
     return None
+
+
+_DERIVED_WEIGHT_MODULES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _call_derived_weight_hook(model: torch.nn.Module, name: str) -> None:
+    """Derived-weight caches that can fall back in place (CUDA-graph safe) stop
+    serving before an online update writes weights and rebuild after it, including
+    for writes that skip ``post_load_weights`` (``load_format="direct"``, P2P).
+    Such modules define both ``invalidate_derived_weights`` and
+    ``refresh_derived_weights``; they are collected once per model."""
+    refs = _DERIVED_WEIGHT_MODULES.get(model)
+    if refs is None:
+        # Weak references, so the cache never keeps the model alive.
+        refs = [
+            weakref.ref(m)
+            for m in model.modules()
+            if hasattr(m, "invalidate_derived_weights")
+        ]
+        _DERIVED_WEIGHT_MODULES[model] = refs
+    for ref in refs:
+        module = ref()
+        if module is not None:
+            getattr(module, name)()
+
+
+def _invalidate_derived_weights(model: torch.nn.Module) -> None:
+    _call_derived_weight_hook(model, "invalidate_derived_weights")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -180,6 +209,7 @@ class WeightUpdater:
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
+        _invalidate_derived_weights(self.get_model())
 
         logger.info(
             f"Update engine weights online from disk begin. "
@@ -310,6 +340,7 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        _invalidate_derived_weights(self.get_model())
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
@@ -320,6 +351,10 @@ class WeightUpdater:
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
+        if not run_post_load:
+            # Loads rebuilt the caches already, but later writes in the session
+            # (e.g. P2P) may not have.
+            _call_derived_weight_hook(self.get_model(), "refresh_derived_weights")
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -328,6 +363,7 @@ class WeightUpdater:
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
+        _invalidate_derived_weights(self.get_model())
         try:
             self.get_model().load_weights(named_tensors)
         except Exception as e:
@@ -351,6 +387,7 @@ class WeightUpdater:
 
         monkey_patch_torch_reductions()
         self._assert_weight_cache_inactive("update_weights_from_tensor")
+        _invalidate_derived_weights(self.get_model())
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -418,6 +455,7 @@ class WeightUpdater:
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
+        _invalidate_derived_weights(self.get_model())
 
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (

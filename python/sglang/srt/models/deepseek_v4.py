@@ -35,9 +35,13 @@ from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKE
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
+    WO_A_FP8_MAX_ROWS,
+    quantize_wo_a_fp8,
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
+    wo_a_fp8_small_batch,
+    wo_a_fp8_small_batch_mxfp8,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -463,6 +467,7 @@ def _apply_wo_a_bf16_matmul(
     fast_path: bool = False,
     fp8_grid: bool = False,
     emit_fp8: bool = False,
+    wo_a_fp8_copy: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
@@ -511,6 +516,13 @@ def _apply_wo_a_bf16_matmul(
         and o.stride(0) >= 8192
         and wo_a.is_contiguous()
     ):
+        if wo_a_fp8_copy is not None and o.shape[0] <= WO_A_FP8_MAX_ROWS:
+            # Same products from half the weight bytes (see quantize_wo_a_fp8).
+            if fuse_mxfp8_quant:
+                return Mxfp8SwizzledInput(
+                    *wo_a_fp8_small_batch_mxfp8(o, wo_a, *wo_a_fp8_copy)
+                )
+            return wo_a_fp8_small_batch(o, wo_a, *wo_a_fp8_copy)
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
         if 2 <= o.shape[0] <= 8:
@@ -879,6 +891,11 @@ class MqaAttentionBase(nn.Module):
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
+        # Exact E4M3 copy of the BF16 wo_a and its int32 use flag, built after
+        # loading by refresh_derived_weights (SM120 decode/verify).
+        self.register_buffer("wo_a_fp8_weight", None, persistent=False)
+        self.register_buffer("wo_a_fp8_scale", None, persistent=False)
+        self.register_buffer("wo_a_fp8_enabled", None, persistent=False)
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -2610,6 +2627,15 @@ class MQALayer(MqaAttentionBase):
                             fp8_grid=_is_hip and _hip.wo_a_emits_fp8_grid(self),
                             emit_fp8=_is_hip
                             and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
+                            wo_a_fp8_copy=(
+                                None
+                                if self.wo_a_fp8_weight is None
+                                else (
+                                    self.wo_a_fp8_weight,
+                                    self.wo_a_fp8_scale,
+                                    self.wo_a_fp8_enabled,
+                                )
+                            ),
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2620,6 +2646,47 @@ class MQALayer(MqaAttentionBase):
                     )
 
         return self._project_wo_b(o, defer_all_reduce)
+
+    def refresh_derived_weights(self) -> None:
+        """SM120 decode/verify reads WO-A from an E4M3 copy of the BF16 weight when
+        the copy is exact (V4.1 checkpoints store WO-A as 32x32-block FP8)."""
+        weight = getattr(self.wo_a, "weight", None)
+        copy = enabled = None
+        if (
+            self.is_dsv41
+            and get_platform().device_sm == 120
+            and envs.SGLANG_DSV41_WO_A_FP8_COPY.get()
+            and weight is not None
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.is_contiguous()
+        ):
+            try:
+                with torch.no_grad():
+                    copy = quantize_wo_a_fp8(
+                        weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    )
+                    if copy is not None and self.wo_a_fp8_enabled is None:
+                        enabled = torch.ones(1, dtype=torch.int32, device=weight.device)
+            except torch.OutOfMemoryError:
+                copy = None  # e.g. during an online update; serve the BF16 weight
+        if self.wo_a_fp8_enabled is None:
+            if copy is not None:
+                self.wo_a_fp8_weight, self.wo_a_fp8_scale = copy
+                self.wo_a_fp8_enabled = enabled
+            return
+        # After a weight update: captured CUDA graphs read these buffers, so rewrite
+        # them in place, or switch the kernel to the BF16 weight if no exact copy.
+        if copy is not None:
+            self.wo_a_fp8_weight.copy_(copy[0])
+            self.wo_a_fp8_scale.copy_(copy[1])
+        self.wo_a_fp8_enabled.fill_(copy is not None)
+
+    def invalidate_derived_weights(self) -> None:
+        """Called before online weight updates: read the BF16 weight until
+        refresh_derived_weights rebuilds an exact copy."""
+        if self.wo_a_fp8_enabled is not None:
+            self.wo_a_fp8_enabled.zero_()
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -4790,6 +4857,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            self_attn.refresh_derived_weights()
             layer.refresh_mhc_norm_weight_cache()
         layers = self.model.layers
         for i, layer in enumerate(layers):

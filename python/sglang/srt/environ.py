@@ -1625,6 +1625,9 @@ class Envs:
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
+    # SM120: decode/verify wo_a (1-64 rows) reads an exact E4M3 copy of the bf16
+    # weight (+8 MiB per layer per rank); weights without an exact copy keep bf16.
+    SGLANG_DSV41_WO_A_FP8_COPY = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.

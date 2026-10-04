@@ -33,7 +33,8 @@ STREAMS = 4
 
 def test_wo_a_partial_quant_matches_quantize():
     torch.manual_seed(0)
-    for rows in range(2, 9):
+    # Above 32 rows the scales leave the first 32-row band of the 128x4 swizzle.
+    for rows in (*range(2, 9), 1, 31, 32, 33, 63, 64, 65, 127, 128):
         for magnitude in (0.0, 1e-37, 1e-7, 1.0, 448.0, 1e10):
             partial = torch.randn(8, rows, 2, 1024, device=DEVICE) * magnitude
             bf16 = torch.empty(rows, 2048, dtype=torch.bfloat16, device=DEVICE)
@@ -48,6 +49,8 @@ def test_wo_a_partial_quant_matches_quantize():
             )
             torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
 
+        if not 2 <= rows <= 8:
+            continue
         x = torch.randn(rows, 64, 512, device=DEVICE, dtype=torch.bfloat16)[
             :, :16
         ].view(rows, 2, 4096)
@@ -60,7 +63,10 @@ def test_wo_a_partial_quant_matches_quantize():
         )
         torch.testing.assert_close(s, expected_s, rtol=0, atol=0)
 
-    partial = torch.randn(8, 6, 2, 1024, device=DEVICE)
+
+@pytest.mark.parametrize("rows", [6, 40])
+def test_wo_a_partial_quant_graph_replay(rows):
+    partial = torch.randn(8, rows, 2, 1024, device=DEVICE)
     _quantize_partial(partial)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -70,8 +76,8 @@ def test_wo_a_partial_quant_matches_quantize():
         # The replay must regenerate scale padding as well as live rows.
         s.fill_(255)
         graph.replay()
-        bf16 = torch.empty(6, 2048, dtype=torch.bfloat16, device=DEVICE)
-        _wo_a_reduce[(48,)](partial, bf16, 6 * 2048, num_warps=4)
+        bf16 = torch.empty(rows, 2048, dtype=torch.bfloat16, device=DEVICE)
+        _wo_a_reduce[(rows * 8,)](partial, bf16, rows * 2048, num_warps=4)
         eq, es = mxfp8_quantize(bf16, True, alignment=32)
         torch.testing.assert_close(
             q.view(torch.uint8), eq.view(torch.uint8), rtol=0, atol=0
