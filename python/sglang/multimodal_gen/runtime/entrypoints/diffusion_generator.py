@@ -214,7 +214,8 @@ class DiffGenerator:
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
                 f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
-                "Please ensure the server is running."
+                "Please ensure the server is running, binds a reachable "
+                "--scheduler-host, and uses the same --scheduler-port as this client."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "

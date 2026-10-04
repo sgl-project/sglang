@@ -195,7 +195,7 @@ class _CudaPlatformTestCase(unittest.TestCase):
 
 
 class TestSchedulerEndpoints(unittest.TestCase):
-    def test_host_normalization_preserves_replica_ports(self):
+    def test_http_host_independence_preserves_replica_ports(self):
         args = _from_dict_without_model_resolution({"model_path": "test/model"})
         args.dp_size = 2
         args.scheduler_port = 23000
@@ -207,8 +207,8 @@ class TestSchedulerEndpoints(unittest.TestCase):
             ("2001:db8::1", "127.0.0.1"),
             ("0.0.0.0", "127.0.0.1"),
             ("127.0.0.1", "127.0.0.1"),
-            ("192.0.2.1", "192.0.2.1"),
-            ("scheduler.example", "scheduler.example"),
+            ("192.0.2.1", "127.0.0.1"),
+            ("scheduler.example", "127.0.0.1"),
         ):
             for ports in (None, [23100, 23200]):
                 with self.subTest(host=host, ports=ports):
@@ -3924,11 +3924,12 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
         args = self._args({"model_path": "/fake/model", "scheduler_port": 5555})
         self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
 
-    def test_explicit_host_is_honored(self):
+    def test_explicit_scheduler_host_is_honored(self):
         args = self._args(
             {
                 "model_path": "/fake/model",
-                "host": "10.1.2.3",
+                "host": "192.0.2.1",
+                "scheduler_host": "10.1.2.3",
                 "scheduler_port": 5555,
             }
         )

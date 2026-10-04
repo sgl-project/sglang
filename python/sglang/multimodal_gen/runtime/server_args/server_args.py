@@ -565,6 +565,7 @@ class ServerArgs(DisaggServerArgsMixin):
     webui: bool = False
     webui_port: int | None = 12312
 
+    scheduler_host: str = "127.0.0.1"
     scheduler_port: int = 5555
     # settled ingress ports, one per DP replica; None until ports are settled
     scheduler_ports: list[int] | None = None
@@ -2984,6 +2985,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Master port for distributed inference. If not set, a random free port will be used.",
         )
         parser.add_argument(
+            "--scheduler-host",
+            type=str,
+            default=ServerArgs.scheduler_host,
+            help="Host the scheduler binds for client requests.",
+        )
+        parser.add_argument(
             "--scheduler-port",
             type=int,
             default=ServerArgs.scheduler_port,
@@ -3283,36 +3290,21 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def scheduler_endpoint(self):
-        """
-        Internal endpoint for scheduler.
-        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
-        """
+        """Internal endpoint for scheduler."""
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
         """Ingress endpoint of one DP replica's driver rank.
 
-        The scheduler ingress is an unauthenticated pickle-RPC endpoint
-        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
-        with ``pickle.loads``), so it must never be derived from the public
-        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
-        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
-        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
-        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
-        (used for intentional cross-machine deployments) are honored.
+        This unauthenticated pickle-RPC endpoint defaults to loopback independently
+        of the public HTTP host. Cross-machine deployments opt in explicitly with
+        --scheduler-host.
         """
-        scheduler_host = self.host
-        if (
-            scheduler_host is None
-            or scheduler_host in ("localhost", "0.0.0.0")
-            or is_valid_ipv6_address(scheduler_host)
-        ):
-            scheduler_host = "127.0.0.1"
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]
         else:
             port = self.scheduler_port + replica
-        return f"tcp://{scheduler_host}:{port}"
+        return f"tcp://{self.scheduler_host}:{port}"
 
     @property
     def scheduler_endpoints(self) -> list[str]:
