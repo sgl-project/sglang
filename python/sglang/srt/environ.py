@@ -1121,6 +1121,11 @@ class Envs:
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
+    # Experimental Kimi-K3 Blackwell CuTeDSL MLA decode split count. Applied
+    # only to batch-48 single-token decode when that backend is selected.
+    # Requires a FlashInfer version that exposes the monolithic CuTeDSL
+    # ``split_kv`` override; zero preserves FlashInfer's default planner.
+    SGLANG_KIMI_K3_CUTE_DSL_MLA_SPLIT_KV = EnvInt(0)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
     # warmup. Opt-in: the extra forward needs transient activation headroom

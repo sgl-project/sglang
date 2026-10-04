@@ -222,6 +222,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         config = model_runner.model_config
+        self.is_kimi_k3 = (
+            "KimiK3ForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
+        )
 
         # Model parameters
         self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
@@ -1076,6 +1080,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        split_kv = envs.SGLANG_KIMI_K3_CUTE_DSL_MLA_SPLIT_KV.get()
+        if (
+            self.is_kimi_k3
+            and self.backend == "cute-dsl"
+            and query.shape[0] == 48
+            and (query.shape[1] if query.dim() == 4 else 1) == 1
+            and split_kv > 0
+        ):
+            extra_kwargs["split_kv"] = split_kv
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
