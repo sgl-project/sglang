@@ -1,4 +1,4 @@
-"""gfx950 small-M MXFP4 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
+"""gfx950 small-M MXFP4/FP8 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
 
 Two HIP kernels (source `smallm_moe.hip` next to this file, compiled with hipcc at first use) replace
 aiter.fused_moe for small token counts:
@@ -8,8 +8,6 @@ aiter.fused_moe for small token counts:
         up front, fp32 dot products (v_dot2_f32_bf16), one bf16 store per output element (no atomics).
 Weights/scales are consumed in aiter's production layouts (shuffle_weight(layout=(16,16)) and e8m0_shuffle), so
 the checkpoint-loading path is untouched. Activations are NOT quantized (production quantizes them to MXFP4).
-FP8 block-scale weights (e4m3fn, shuffle_weight((16,16)), unshuffled fp32 scale per 128x128 tile) are handled by
-the same kernels at per-rank intermediate 256 (TP4) and 128 (TP8).
 
 On by default; SGLANG_ROCM_SMALLM_MOE=0 turns it off. Any build/load failure disables it for the process
 (aiter path is used).
@@ -197,7 +195,7 @@ def _disable(reason):
     raise SmallMMoeUnavailable(reason)
 
 
-def _get_kernels(inter: int, pre: str = ""):
+def _get_kernels(inter: int, pre: str):
     kk = _kernels.get((pre, inter))
     if kk is None:
         global _build_dir

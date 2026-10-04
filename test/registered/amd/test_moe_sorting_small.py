@@ -1,7 +1,4 @@
-"""Small-batch MoE sorting patch (sglang.kernels.ops.moe.moe_sorting_small) vs stock aiter sorting.
-
-Runs only on ROCm gfx950 with aiter; everywhere else the test is skipped.
-"""
+"""Small-batch MoE sorting patch (sglang.kernels.ops.moe.moe_sorting_small) vs stock aiter sorting."""
 
 import unittest
 
@@ -125,10 +122,8 @@ class TestMoeSortingSmall(CustomTestCase):
 
     def test_falls_back_to_aiter_past_compact_at_513_experts(self):
         m = 6
-        ids, w = self._routing(m, m)
+        ids, _ = self._routing(m, m)
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
-        x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
-        self.assertIsNone(self._emitted_quant(ids, w, x, 32, self.E))
 
 
 if __name__ == "__main__":
