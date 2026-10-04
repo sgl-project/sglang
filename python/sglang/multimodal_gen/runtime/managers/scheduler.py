@@ -141,12 +141,17 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
         self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
+        # Port actually bound by this replica's driver rank; reported to the launcher.
+        self.actual_scheduler_port = None
         if gpu_id % gpus_per_replica == 0:
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
+            self.actual_scheduler_port = int(actual_endpoint.rsplit(":", 1)[1])
+            # Readers in this process, e.g. the metrics label, see the bound port.
+            server_args.scheduler_ports[self.dp_replica] = self.actual_scheduler_port
             logger.info(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
