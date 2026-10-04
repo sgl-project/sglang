@@ -104,6 +104,9 @@ pub struct ServerArgs {
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
+    pub enable_http2: bool,
+    pub http2_max_concurrent_streams: u32,
+    pub http2_initial_connection_window_size: u32,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -172,6 +175,9 @@ impl ServerArgs {
         host,
         port,
         grpc_port,
+        enable_http2,
+        http2_max_concurrent_streams,
+        http2_initial_connection_window_size,
         log_level,
         log_level_http,
         chat_template,
@@ -205,6 +211,9 @@ impl ServerArgs {
         host: String,
         port: u16,
         grpc_port: Option<u16>,
+        enable_http2: bool,
+        http2_max_concurrent_streams: u32,
+        http2_initial_connection_window_size: u32,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -236,6 +245,9 @@ impl ServerArgs {
             host,
             port,
             grpc_port,
+            enable_http2,
+            http2_max_concurrent_streams,
+            http2_initial_connection_window_size,
             log_level,
             log_level_http,
             chat_template,
@@ -275,6 +287,9 @@ impl Default for ServerArgs {
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
+            enable_http2: false,
+            http2_max_concurrent_streams: 200,
+            http2_initial_connection_window_size: 1024 * 1024,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -557,6 +572,17 @@ fn join_host_port(host: &str, port: u16) -> String {
 impl ServerArgs {
     /// Fail fast at startup on values the types cannot express.
     pub fn validate(&self) -> Result<(), String> {
+        if self.enable_http2 {
+            if self.http2_max_concurrent_streams == 0 {
+                return Err("http2_max_concurrent_streams must be nonzero".into());
+            }
+            if !(1024..(1 << 31)).contains(&self.http2_initial_connection_window_size) {
+                return Err(
+                    "http2_initial_connection_window_size must be between 1024 and 2147483647"
+                        .into(),
+                );
+            }
+        }
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
@@ -706,6 +732,22 @@ mod tests {
             .unwrap_err()
             .contains("must differ")
         );
+    }
+
+    #[test]
+    fn invalid_http2_settings_fail_before_startup() {
+        for (streams, window) in [(0, 1024), (1, 1023), (1, 1 << 31)] {
+            let mut sa = ServerArgs {
+                served_model_name: "m".into(),
+                enable_http2: true,
+                http2_max_concurrent_streams: streams,
+                http2_initial_connection_window_size: window,
+                ..Default::default()
+            };
+            assert!(sa.validate().is_err());
+            sa.enable_http2 = false;
+            assert!(sa.validate().is_ok());
+        }
     }
 
     /// `--log-level-http` overrides `--log-level` for the access log; unset or

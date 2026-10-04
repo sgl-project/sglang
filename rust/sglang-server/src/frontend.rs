@@ -65,6 +65,9 @@ pub(crate) struct FrontendMetadata {
     max_context_length: u64,
     max_total_num_tokens: u64,
     version: String,
+    enable_http2: bool,
+    http2_max_concurrent_streams: u32,
+    http2_initial_connection_window_size: u32,
 }
 
 impl From<&ServerArgs> for FrontendMetadata {
@@ -82,6 +85,9 @@ impl From<&ServerArgs> for FrontendMetadata {
             max_context_length: args.model_config.context_len,
             max_total_num_tokens: args.max_total_num_tokens,
             version: args.version.clone(),
+            enable_http2: args.enable_http2,
+            http2_max_concurrent_streams: args.http2_max_concurrent_streams,
+            http2_initial_connection_window_size: args.http2_initial_connection_window_size,
         }
     }
 }
@@ -212,6 +218,9 @@ impl FrontendHandle {
             max_context_length: metadata.max_context_length,
             max_total_num_tokens: metadata.max_total_num_tokens,
             version: metadata.version.clone(),
+            enable_http2: metadata.enable_http2,
+            http2_max_concurrent_streams: metadata.http2_max_concurrent_streams,
+            http2_initial_connection_window_size: metadata.http2_initial_connection_window_size,
             frontend: "rust",
             internal_states: vec![internal_state],
         })

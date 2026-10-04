@@ -215,6 +215,9 @@ mod tests {
             },
             max_total_num_tokens: 8192,
             version: "1.2.3".into(),
+            enable_http2: true,
+            http2_max_concurrent_streams: 17,
+            http2_initial_connection_window_size: 2 * 1024 * 1024,
             ..Default::default()
         });
         let request = tokio::spawn(
@@ -289,6 +292,12 @@ mod tests {
         assert_eq!(body["max_context_length"], 4096);
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
+        assert_eq!(body["enable_http2"], true);
+        assert_eq!(body["http2_max_concurrent_streams"], 17);
+        assert_eq!(
+            body["http2_initial_connection_window_size"],
+            2 * 1024 * 1024
+        );
         assert_eq!(body["frontend"], "rust");
         assert_eq!(
             body["internal_states"][0]["rust_mm_transport"]["inline_features"],

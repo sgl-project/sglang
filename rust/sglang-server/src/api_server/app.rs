@@ -13,6 +13,7 @@ use axum::{
 };
 
 use super::disaggregation::bootstrap as pd_bootstrap;
+use super::transport::{Http2Settings, serve_listener};
 use super::{common, log, native_api, openai};
 use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
@@ -108,22 +109,12 @@ pub async fn serve(
     // Apply logging and access log middleware.
     let app = log::apply(app, &server_args);
 
-    // The listener was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); adopt it into the tokio reactor here.
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to adopt pre-bound listener");
-            return;
-        }
-    };
-    // `with_connect_info` exposes the peer address to the access-log middleware.
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
+    let http2 = server_args.enable_http2.then_some(Http2Settings {
+        max_concurrent_streams: server_args.http2_max_concurrent_streams,
+        initial_connection_window_size: server_args.http2_initial_connection_window_size,
+    });
     tokio::select! {
-        r = serve => {
+        r = serve_listener(listener, app, http2) => {
             if let Err(e) = r {
                 tracing::error!(error = %e, "axum serve exited");
             }

@@ -64,6 +64,9 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        enable_http2=get_serving().enable_http2,
+        http2_max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+        http2_initial_connection_window_size=get_serving().http2_initial_connection_window_size,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,

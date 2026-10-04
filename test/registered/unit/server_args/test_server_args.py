@@ -2002,6 +2002,30 @@ class TestSSLArgs(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
+    def test_rust_server_rejects_every_tls_flag(self):
+        with envs.SGLANG_RUST_SERVER.override(True):
+            self._validate_ssl()
+            for flag, kwargs in (
+                ("--ssl-keyfile", dict(ssl_keyfile="key.pem", ssl_certfile="c.pem")),
+                ("--ssl-certfile", dict(ssl_certfile="cert.pem")),
+                ("--ssl-ca-certs", dict(ssl_ca_certs="ca.pem")),
+                ("--ssl-keyfile-password", dict(ssl_keyfile_password="secret")),
+                ("--enable-ssl-refresh", dict(enable_ssl_refresh=True)),
+            ):
+                with self.subTest(flag=flag):
+                    with self.assertRaisesRegex(
+                        ValueError, f"^{flag} is not supported by the Rust frontend"
+                    ):
+                        self._validate_ssl(**kwargs)
+
+    def test_http2_requires_granian_only_for_the_python_frontend(self):
+        with patch.dict("sys.modules", {"granian": None}):
+            with envs.SGLANG_RUST_SERVER.override(True):
+                self._validate_ssl(enable_http2=True)
+            with envs.SGLANG_RUST_SERVER.override(False):
+                with self.assertRaisesRegex(ValueError, "requires the 'granian'"):
+                    self._validate_ssl(enable_http2=True)
+
 
 class TestHiCacheArgs(CustomTestCase):
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
