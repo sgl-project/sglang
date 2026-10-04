@@ -42,6 +42,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    NCCL_EP = "nccl_ep"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
@@ -94,6 +95,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_nccl_ep(self):
+        return self == MoeA2ABackend.NCCL_EP
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -275,6 +279,39 @@ class DeepEPMode(Enum):
 
     def is_auto(self) -> bool:
         return self == DeepEPMode.AUTO
+
+
+class NcclEpMode(Enum):
+    """NCCL EP dispatch algorithm. Only LOW_LATENCY is implemented; HT is a follow-up."""
+
+    LOW_LATENCY = "low_latency"
+    HIGH_THROUGHPUT = "high_throughput"
+    AUTO = "auto"
+
+    def resolve(self, is_extend_in_batch: bool) -> NcclEpMode:
+        if self == NcclEpMode.HIGH_THROUGHPUT:
+            raise NotImplementedError(
+                "NCCL EP high-throughput (prefill) path is not implemented yet; "
+                "use --nccl-ep-mode low_latency (or auto) for decode."
+            )
+        return NcclEpMode.LOW_LATENCY
+
+    def is_low_latency(self) -> bool:
+        return self == NcclEpMode.LOW_LATENCY
+
+
+class NcclEpLayout(Enum):
+    """NCCL EP low-latency receive layout.
+
+    EXPERT_MAJOR is the historical SGLang path. RANK_MAJOR keeps NCCL's
+    source-rank slots through transport and is packed locally for expert GEMM.
+    """
+
+    EXPERT_MAJOR = "expert_major"
+    RANK_MAJOR = "rank_major"
+
+    def is_rank_major(self) -> bool:
+        return self == NcclEpLayout.RANK_MAJOR
 
 
 class DispatcherOutputDtype(Enum):
@@ -466,6 +503,11 @@ def initialize_moe_config():
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
+    moe.nccl_ep_mode = NcclEpMode(exec_moe.nccl_ep_mode)
+    moe.nccl_ep_layout = NcclEpLayout(exec_moe.nccl_ep_layout)
+    moe.nccl_ep_num_max_dispatch_tokens_per_rank = int(
+        exec_moe.nccl_ep_num_max_dispatch_tokens_per_rank or 0
+    )
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
@@ -610,6 +652,25 @@ def get_deepep_mode() -> DeepEPMode:
     return moe.deepep_mode
 
 
+def get_nccl_ep_mode() -> NcclEpMode:
+    moe = get_flags().moe
+    if moe.nccl_ep_mode is None:
+        moe.nccl_ep_mode = NcclEpMode.LOW_LATENCY
+    return moe.nccl_ep_mode
+
+
+def get_nccl_ep_layout() -> NcclEpLayout:
+    moe = get_flags().moe
+    if moe.nccl_ep_layout is None:
+        moe.nccl_ep_layout = NcclEpLayout.EXPERT_MAJOR
+    return moe.nccl_ep_layout
+
+
+def get_nccl_ep_num_max_dispatch_tokens_per_rank() -> int:
+    moe = get_flags().moe
+    return moe.nccl_ep_num_max_dispatch_tokens_per_rank or 0
+
+
 def get_deepep_config() -> str:
     moe = get_flags().moe
     if moe.deepep_config is None:
@@ -641,6 +702,7 @@ def is_deepep_class_backend() -> bool:
         or b.is_mooncake()
         or b.is_mori()
         or b.is_pplx()
+        or b.is_nccl_ep()
     )
 
 

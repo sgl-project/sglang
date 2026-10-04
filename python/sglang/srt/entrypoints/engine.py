@@ -1792,6 +1792,12 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     cfg = resolving_view(server_args)
     # Set global environments
+    # NCCL EP uses the NCCL Device API, which requires cuMem-backed windows.
+    # This must happen before the scheduler creates the EP communicator; an
+    # inherited NCCL_CUMEM_ENABLE=0 would otherwise make Group.create fail.
+    # Set it first so the symm-mem override below sees it already present.
+    if cfg.moe_a2a_backend == "nccl_ep":
+        os.environ["NCCL_CUMEM_ENABLE"] = "1"
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
     # values win; the symm-mem override below only fires when unset).

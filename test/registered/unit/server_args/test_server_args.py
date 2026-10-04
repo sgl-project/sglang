@@ -2409,6 +2409,54 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
 
 
+class TestNcclEpArgs(CustomTestCase):
+    """NCCL EP MoE A2A backend (--moe-a2a-backend nccl_ep).
+
+    Capability detection falls back to none/deepep when nccl4py is unavailable
+    (the CPU CI case). On a CUDA13 + Hopper/Blackwell box with nccl4py[cu13]
+    installed, the backend stays nccl_ep.
+    """
+
+    def test_nccl_ep_flag_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+            nccl_ep_mode="low_latency",
+            nccl_ep_num_max_dispatch_tokens_per_rank=1024,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(server_args.nccl_ep_mode, "low_latency")
+        self.assertEqual(server_args.nccl_ep_num_max_dispatch_tokens_per_rank, 1024)
+
+    def test_nccl_ep_falls_back_when_unavailable(self):
+        # On CPU CI (no nccl4py / no CUDA), is_nccl_ep_available() is False and
+        # the backend must degrade to 'none' (or 'deepep' if deep_ep importable).
+        # Resolution declares the fallback; the raw record stays pristine.
+        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            is_nccl_ep_available,
+        )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+        )
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(server_args.moe_a2a_backend, "nccl_ep")  # pristine
+        effective = resolved_view(server_args).moe_a2a_backend
+        if is_nccl_ep_available():
+            self.assertEqual(effective, "nccl_ep")
+        else:
+            self.assertIn(
+                effective,
+                ("none", "deepep"),
+                f"expected fallback to none/deepep, got {effective}",
+            )
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 

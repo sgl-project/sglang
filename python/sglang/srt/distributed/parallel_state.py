@@ -3250,7 +3250,15 @@ def get_moe_tensor_parallel_rank():
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     from sglang.srt.distributed.bootstrap import reset_parallel_initialised
+    from sglang.srt.runtime_context import get_resources
 
+    buffers = get_resources().buffers
+    if "nccl_ep_state" in buffers or "nccl_ep_graph_resources" in buffers:
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
+            destroy_nccl_ep_resources,
+        )
+
+        destroy_nccl_ep_resources()
     reset_parallel_initialised()
     get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()

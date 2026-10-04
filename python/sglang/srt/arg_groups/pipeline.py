@@ -269,6 +269,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        handle_nccl_ep_token_budget,
         validate_cutedsl_a2a_token_budget,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
@@ -339,5 +340,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    run_hook(handle_nccl_ep_token_budget, server_args)
 
     server_args._resolution_finished = True

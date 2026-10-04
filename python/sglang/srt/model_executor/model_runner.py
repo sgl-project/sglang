@@ -938,6 +938,8 @@ class ModelRunner:
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
+        self.init_nccl_ep_comm_resources()
+
         self.graph_shared_output = None
         # Set once real decode CUDA graphs are captured (makes on-flip role-switch
         # capture idempotent).
@@ -972,6 +974,23 @@ class ModelRunner:
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
+
+    def init_nccl_ep_comm_resources(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_nccl_ep():
+            return
+
+        seen = set()
+        for module in self.model.modules():
+            dispatcher = getattr(module, "dispatcher", None)
+            if not isinstance(dispatcher, NcclEpDispatcher) or id(dispatcher) in seen:
+                continue
+            seen.add(id(dispatcher))
+            dispatcher.init_comm_resources()
+            if not dispatcher.layout.is_rank_major():
+                dispatcher.init_handle_for_graph()
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
         resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
@@ -1884,6 +1903,25 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
+
+            if get_exec().moe.enable_nccl_ep_cuda_graph:
+                from sglang.srt.layers.moe.token_dispatcher.nccl_ep_admission import (
+                    NcclEpGraphAdmission,
+                )
+
+                admission = getattr(self, "_nccl_ep_graph_admission", None)
+                if admission is None:
+                    # Dispatch uses TP as its EP communicator. Vote on the
+                    # matching CPU group, including IDLE and eager prefill.
+                    admission = self._nccl_ep_graph_admission = NcclEpGraphAdmission(
+                        get_parallel().tp_group.cpu_group
+                    )
+                runner = self.decode_cuda_graph_runner
+                can_run_graph = admission.decide(
+                    eligible=can_run_graph,
+                    required_mode=forward_batch.capture_hidden_mode,
+                    captured_mode=runner.capture_hidden_mode if runner else -1,
+                ).can_run
 
             if (
                 forward_batch.forward_mode.is_decode()
