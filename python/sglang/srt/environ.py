@@ -319,6 +319,8 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # Per-rank V4 tensor-copy executor; None preserves the Python default.
+    SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS = EnvInt(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)

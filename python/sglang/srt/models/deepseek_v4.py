@@ -5578,7 +5578,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS.get()
+        ) as executor:
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
