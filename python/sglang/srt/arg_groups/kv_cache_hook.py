@@ -496,6 +496,11 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
     of its own indexes that pool directly by virtual id, so its translator is
     a passthrough and its backend has nothing to translate."""
     allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if resolving_view(server_args).dcp_size > 1:
+        # flashinfer's spec verify gathers its CSR args with no DCP read
+        # translation (`translate_dcp_read_ids`); the MLA verify family builds
+        # its DCP block table itself.
+        allowed = allowed - {"flashinfer"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (

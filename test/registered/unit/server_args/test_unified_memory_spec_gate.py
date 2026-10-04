@@ -46,6 +46,8 @@ def _accepts(
     topk: int | None = 1,
     backend: str | None = "triton",
     draft_backend: str | None = None,
+    dcp_size: int = 1,
+    mla: bool = False,
 ) -> bool:
     """Run just `handle_unified_memory_pool` against a minimal stand-in.
 
@@ -64,7 +66,7 @@ def _accepts(
         "speculative_draft_attention_backend": draft_backend,
         "enable_hierarchical_cache": False,
         "enable_lmcache": False,
-        "dcp_size": 1,
+        "dcp_size": dcp_size,
         "cuda_graph_config": None,
         "attention_backend": backend,
         "prefill_attention_backend": None,
@@ -72,7 +74,8 @@ def _accepts(
     }.items():
         msgspec.structs.force_setattr(sa, name, value)
     sa._model_config = SimpleNamespace(
-        is_hybrid_swa=True, attention_arch=AttentionArch.MHA
+        is_hybrid_swa=not mla,
+        attention_arch=AttentionArch.MLA if mla else AttentionArch.MHA,
     )
     try:
         handle_unified_memory_pool(sa)
@@ -132,6 +135,16 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 _accepts("DSPARK", draft_backend=draft_backend),
                 f"DSPARK draft backend {draft_backend} should pass",
             )
+
+    def test_dcp_keeps_flashinfer_off_the_verify_list(self):
+        """Under --dcp-size > 1 the read ids stay DCP-widened for the consumer
+        to finish; flashinfer's spec verify gathers its CSR args with no DCP
+        read translation, so it is refused there while the MLA verify family,
+        which builds its own DCP block table, still passes."""
+        self.assertTrue(_accepts("DSPARK", backend="trtllm_mla", dcp_size=2, mla=True))
+        self.assertFalse(_accepts("DSPARK", backend="flashinfer", dcp_size=2, mla=True))
+        # Without DCP flashinfer stays admitted.
+        self.assertTrue(_accepts("DSPARK", backend="flashinfer", mla=True))
 
     def test_spec_off_admitted(self):
         """The gate constrains only speculative configurations; spec-off must
