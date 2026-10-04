@@ -21,9 +21,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 def configured_codec():
     """Freeze the launch constraint when the scheduler admits a delta backend."""
-    codec = os.environ.get("WEIGHT_DELTA_CODEC", "snappy-zstd")
+    codec = os.environ.get("GPU_DELTA_CODEC", "snappy-zstd")
     if codec != "snappy-zstd":
-        raise ValueError("WEIGHT_DELTA_CODEC must be snappy-zstd")
+        raise ValueError("GPU_DELTA_CODEC must be snappy-zstd")
     return codec
 
 
@@ -235,9 +235,9 @@ def validate_zstd_frame(payload, expected_size):
 
 
 def configured_cpu_workers():
-    value = int(os.environ.get("WEIGHT_DELTA_CPU_WORKERS", "32"))
+    value = int(os.environ.get("GPU_DELTA_CPU_WORKERS", "32"))
     if not 1 <= value <= 32:
-        raise ValueError("WEIGHT_DELTA_CPU_WORKERS must be between 1 and 32")
+        raise ValueError("GPU_DELTA_CPU_WORKERS must be between 1 and 32")
     return value
 
 

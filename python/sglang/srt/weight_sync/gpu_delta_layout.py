@@ -865,7 +865,7 @@ class PreparedDelta:
         from pathlib import Path
 
         preparation_started = time.perf_counter()
-        self.timing_enabled = os.environ.get("WEIGHT_DELTA_TIMING", "0") == "1"
+        self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder

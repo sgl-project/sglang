@@ -3,6 +3,14 @@
 import json
 
 from sglang.srt.runtime_context import get_serving
+from sglang.srt.weight_sync.gpu_delta_io import (
+    AbortWeightsFromDeltaReqInput,
+    DeltaWeightsReqOutput,
+    GetWeightsDeltaInfoReqInput,
+    PrepareWeightsFromDeltaReqInput,
+    ResumeWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
+)
 from sglang.srt.weight_sync.gpu_delta_session import (
     GpuDeltaCommunicator,
     GpuDeltaConflict,
@@ -11,7 +19,6 @@ from sglang.srt.weight_sync.gpu_delta_session import (
 
 class GpuDeltaTokenizerControl:
     def __init__(self, manager, fan_out: int):
-        from sglang.srt.managers.io_struct import DeltaWeightsReqOutput
         from sglang.utils import TypeBasedDispatcher
 
         self.manager = manager
@@ -23,8 +30,6 @@ class GpuDeltaTokenizerControl:
         )
 
     def _send(self, obj):
-        from sglang.srt.managers.io_struct import PrepareWeightsFromDeltaReqInput
-
         if isinstance(obj, PrepareWeightsFromDeltaReqInput):
             if self.session_id is not None:
                 raise GpuDeltaConflict("another delta session is active")
@@ -34,11 +39,6 @@ class GpuDeltaTokenizerControl:
         self.manager._dispatch_to_scheduler(obj)
 
     async def request(self, obj, request=None):
-        from sglang.srt.managers.io_struct import (
-            ResumeWeightsFromDeltaReqInput,
-            UpdateWeightsFromDeltaReqInput,
-        )
-
         if isinstance(
             obj, (UpdateWeightsFromDeltaReqInput, ResumeWeightsFromDeltaReqInput)
         ):
@@ -62,12 +62,6 @@ class GpuDeltaTokenizerControl:
         return await self._request(obj)
 
     async def _request(self, obj):
-        from sglang.srt.managers.io_struct import (
-            AbortWeightsFromDeltaReqInput,
-            GetWeightsDeltaInfoReqInput,
-            PrepareWeightsFromDeltaReqInput,
-        )
-
         self.manager.auto_create_handle_loop()
         if get_serving().tokenizer_worker_num != 1:
             return {

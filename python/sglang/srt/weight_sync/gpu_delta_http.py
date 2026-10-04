@@ -7,7 +7,8 @@ from typing import Annotated
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.srt.managers.io_struct import (
+from sglang.srt.utils.auth import AuthLevel, auth_level
+from sglang.srt.weight_sync.gpu_delta_io import (
     AbortWeightsFromDeltaReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
@@ -15,7 +16,6 @@ from sglang.srt.managers.io_struct import (
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
-from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaConflict
 
 

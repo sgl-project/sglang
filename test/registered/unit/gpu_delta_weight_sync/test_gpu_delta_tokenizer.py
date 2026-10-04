@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.managers import io_struct as io
+from sglang.srt.weight_sync import gpu_delta_io as io
 from sglang.srt.weight_sync import gpu_delta_tokenizer as tokenizer
 from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -35,7 +35,7 @@ from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 def _cache_base():
     root = Path(
         os.environ.get(
-            "WEIGHT_DELTA_HOST_CACHE_DIR", f"/dev/shm/sglang-gpu-delta-{os.getuid()}"
+            "GPU_DELTA_HOST_CACHE_DIR", f"/dev/shm/sglang-gpu-delta-{os.getuid()}"
         )
     )
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -54,7 +54,7 @@ def _cache_base():
             if root.is_relative_to(mount):
                 mounts.append((len(mount.parts), right.split()[0]))
     if not mounts or max(mounts)[1] != "tmpfs":
-        raise ValueError("WEIGHT_DELTA_HOST_CACHE_DIR must be on host-shared tmpfs")
+        raise ValueError("GPU_DELTA_HOST_CACHE_DIR must be on host-shared tmpfs")
     return root
 
 

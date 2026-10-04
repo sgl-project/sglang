@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang.srt.weight_sync import gpu_delta_io as delta_io
+
 
 class GpuDeltaConflict(ValueError):
     """A delta control conflicts with the current engine/session state."""
@@ -333,18 +335,17 @@ class DeltaSession:
 
 def with_gpu_delta_controls(scheduler, dispatcher):
     """Register only delta requests; ordinary handlers remain unchanged."""
-    from sglang.srt.managers import io_struct as io
     from sglang.utils import TypeBasedDispatcher
 
     control = GpuDeltaSchedulerControl(scheduler)
     dispatcher += TypeBasedDispatcher(
         [
-            (io.GetWeightsDeltaInfoReqInput, control.handle),
-            (io.PrepareWeightsFromDeltaReqInput, control.handle),
-            (io.GetWeightsDeltaStatusReqInput, control.handle),
-            (io.UpdateWeightsFromDeltaReqInput, control.handle),
-            (io.AbortWeightsFromDeltaReqInput, control.handle),
-            (io.ResumeWeightsFromDeltaReqInput, control.handle),
+            (delta_io.GetWeightsDeltaInfoReqInput, control.handle),
+            (delta_io.PrepareWeightsFromDeltaReqInput, control.handle),
+            (delta_io.GetWeightsDeltaStatusReqInput, control.handle),
+            (delta_io.UpdateWeightsFromDeltaReqInput, control.handle),
+            (delta_io.AbortWeightsFromDeltaReqInput, control.handle),
+            (delta_io.ResumeWeightsFromDeltaReqInput, control.handle),
         ]
     )
     return dispatcher
@@ -431,9 +432,9 @@ class GpuDeltaSchedulerControl:
         from sglang.srt.managers import io_struct as io
 
         try:
-            if isinstance(request, io.GetWeightsDeltaInfoReqInput):
+            if isinstance(request, delta_io.GetWeightsDeltaInfoReqInput):
                 receipt = self._describe(request.engine_id)
-            elif isinstance(request, io.PrepareWeightsFromDeltaReqInput):
+            elif isinstance(request, delta_io.PrepareWeightsFromDeltaReqInput):
                 if (
                     self.identity is not None
                     and request.engine_id != self.identity["engine_id"]
@@ -465,9 +466,9 @@ class GpuDeltaSchedulerControl:
                 )
             elif self.session is None:
                 raise ValueError("no GPU delta session")
-            elif isinstance(request, io.GetWeightsDeltaStatusReqInput):
+            elif isinstance(request, delta_io.GetWeightsDeltaStatusReqInput):
                 receipt = self.session.status(request.session_id)
-            elif isinstance(request, io.UpdateWeightsFromDeltaReqInput):
+            elif isinstance(request, delta_io.UpdateWeightsFromDeltaReqInput):
                 self.scheduler._engine_paused = True
                 receipt = self.session.apply(
                     request.session_id,
@@ -477,7 +478,7 @@ class GpuDeltaSchedulerControl:
                     ),
                     lambda: self.scheduler.flush_cache(empty_cache=False),
                 )
-            elif isinstance(request, io.ResumeWeightsFromDeltaReqInput):
+            elif isinstance(request, delta_io.ResumeWeightsFromDeltaReqInput):
 
                 def resume(version):
                     self.scheduler.record_weight_version_change(str(version))
@@ -488,12 +489,12 @@ class GpuDeltaSchedulerControl:
                 receipt = self.session.resume(
                     request.session_id, request.receipts, resume
                 )
-            elif isinstance(request, io.AbortWeightsFromDeltaReqInput):
+            elif isinstance(request, delta_io.AbortWeightsFromDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
                 raise ValueError("unknown delta operation")
             success = receipt["state"] not in {"FAILED", "POISONED"}
-            return io.DeltaWeightsReqOutput(
+            return delta_io.DeltaWeightsReqOutput(
                 rid=request.rid,
                 success=success,
                 message=receipt.get("message", ""),
@@ -506,6 +507,6 @@ class GpuDeltaSchedulerControl:
                     receipt = self.session.status(request.session_id)
                 except ValueError:
                     pass
-            return io.DeltaWeightsReqOutput(
+            return delta_io.DeltaWeightsReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )

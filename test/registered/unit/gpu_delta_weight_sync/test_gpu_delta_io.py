@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.managers.io_struct import (
+from sglang.srt.weight_sync.gpu_delta_io import (
     PrepareWeightsFromDeltaReqInput,
 )
 from sglang.srt.weight_sync.gpu_delta_session import (

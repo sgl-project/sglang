@@ -93,7 +93,10 @@ The admitted topology uses ordinary globally ordered control broadcast. Local
 control broadcast and elastic EP joiners are unsupported. Delta application itself
 has no distributed collectives, and shared IPC weight storage is excluded.
 
-`WEIGHT_DELTA_CODEC=snappy-zstd` is the sole contract and the default. The
+The `GPU_DELTA_*` environment variables below are development/debug knobs,
+not a stable user-facing configuration API.
+
+`GPU_DELTA_CODEC=snappy-zstd` is the sole contract and the default. The
 receiver freezes it at backend admission, advertises it in its participant plan,
 and rejects any unsupported value. The sender and receiver must agree before a
 publication; manifest fields cannot override the launch constraint. Legacy codec
@@ -109,7 +112,7 @@ registers each process's mapping for CUDA, then streams tensor Snappy bytes for
 hardware decoding and in-place apply.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
-`WEIGHT_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
+`GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
 One creator uses that many reusable CPU workers, each with its own Zstd context;
 its other ranks attach to the completed arena. Natural tensors are grouped into
 at most four times as many tasks as workers, preserving strict per-frame checks
@@ -118,7 +121,7 @@ independent pools: up to 64 decode workers plus two SHA workers on that host.
 Workers touch only CPU buffers; CUDA setup remains on each rank's original
 preparation thread.
 
-`WEIGHT_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
+`GPU_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
 must be a private, user-owned directory on tmpfs with enough space for the wrapped
 payloads and expanded arenas during construction. Ranks of one engine on the
 same physical host must see the same directory and IPC/mount namespace; across
@@ -252,7 +255,7 @@ HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
 The paired Miles feature contains `tests/manual/bench_gpu_delta.py`, which launches
 one EP8 or two EP4 engines and measures the snappy-zstd contract using persistent
-altered checkpoint and publications. `WEIGHT_DELTA_TIMING=1` enables
+altered checkpoint and publications. `GPU_DELTA_TIMING=1` enables
 phase events without synchronizing every tensor; correctness comparisons stay
 outside timed updates.
 

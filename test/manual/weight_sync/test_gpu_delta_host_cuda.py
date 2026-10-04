@@ -93,7 +93,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 
-    os.environ["WEIGHT_DELTA_HOST_CACHE_DIR"] = cache
+    os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
     # Exercise the exact capacity-growth algorithm with small oracle tensors.
     # Production's coarser alignment is not a wire/codec requirement.
     host._CAPACITY_ALIGNMENT = 1 << 20

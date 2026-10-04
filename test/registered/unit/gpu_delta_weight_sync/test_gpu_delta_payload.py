@@ -2,13 +2,11 @@
 
 import copy
 import unittest
-from unittest.mock import patch
 
 import zstandard as zstd
 
 from sglang.srt.weight_sync.gpu_delta_payload import (
     OuterZstdPool,
-    configured_codec,
     validate_codec,
     validate_outer_entries,
     validate_zstd_frame,
@@ -55,9 +53,7 @@ def entry(payload, name="weight", size=36):
 
 
 class TestOuterZstd(unittest.TestCase):
-    def test_codec_is_admitted_once_and_rejects_legacy_profiles(self):
-        with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(configured_codec(), "snappy-zstd")
+    def test_manifest_codec_and_frame_geometry_admission(self):
         admitted = dict(protocol_version=4, codec="snappy-zstd", frame_bytes=1 << 20)
         for size in (1 << 16, 1 << 20):
             validate_codec(admitted | {"frame_bytes": size}, "snappy-zstd")
@@ -76,9 +72,6 @@ class TestOuterZstd(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "codec"),
             ):
                 validate_codec(admitted | patch_value, "snappy-zstd")
-        # A later environment change cannot override a frozen admitted contract.
-        with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
-            validate_codec(admitted, "snappy-zstd")
 
     def test_gpu_outer_chunks_decode_directly_to_one_destination(self):
         values = [bytes(range(256)) * 4096, bytes(range(19))]

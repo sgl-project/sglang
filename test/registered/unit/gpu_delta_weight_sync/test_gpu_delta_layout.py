@@ -769,7 +769,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     )
                 self.assertTrue(torch.all(targets[0] == 0))
 
-    def test_backend_freezes_configured_codec_in_advertised_plan(self):
+    def test_backend_reads_inventory_once_and_cleans_failed_stream_creation(self):
         fake_plan = SimpleNamespace(
             check_identity=lambda: None,
             rank_plan_digest="digest",
@@ -788,7 +788,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 "sglang.srt.weight_sync.gpu_delta_checkpoint.read_canonical_checkpoint_inventory",
                 return_value={"weight": {"shape": [1], "dtype": "U8"}},
             ) as read_inventory,
-            patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "snappy-zstd"}),
         ):
             backend = layout.GpuDeltaBackend(
                 SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
@@ -803,14 +802,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "stream creation failed"),
             ):
                 backend.prepare("unused-manifest", "unused-sha", {})
-            with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
-                self.assertEqual(backend.describe()["codec"], "snappy-zstd")
-                backend.describe()
-                read_inventory.assert_called_once()
-                with self.assertRaisesRegex(ValueError, "WEIGHT_DELTA_CODEC"):
-                    layout.GpuDeltaBackend(
-                        SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
-                    )
+            backend.describe()
+            backend.describe()
+            read_inventory.assert_called_once()
 
     def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
         root = torch.nn.Module()

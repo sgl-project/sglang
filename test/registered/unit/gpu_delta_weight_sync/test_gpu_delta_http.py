@@ -1,5 +1,6 @@
 """Exercise feature routing through FastAPI without starting an engine."""
 
+import pickle
 import sys
 from types import SimpleNamespace
 
@@ -9,17 +10,21 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from sglang.srt.managers.io_struct import (
-    AbortWeightsFromDeltaReqInput,
-    GetWeightsDeltaInfoReqInput,
-    GetWeightsDeltaStatusReqInput,
-    PrepareWeightsFromDeltaReqInput,
-    ResumeWeightsFromDeltaReqInput,
-    UpdateWeightsFromDeltaReqInput,
+    PauseGenerationReqInput,
     msgpack_decode,
     msgpack_encode,
 )
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta_http import register_gpu_delta_routes
+from sglang.srt.weight_sync.gpu_delta_io import (
+    AbortWeightsFromDeltaReqInput,
+    DeltaWeightsReqOutput,
+    GetWeightsDeltaInfoReqInput,
+    GetWeightsDeltaStatusReqInput,
+    PrepareWeightsFromDeltaReqInput,
+    ResumeWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
+)
 from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaConflict
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -110,11 +115,19 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         result = client.post(route.path, json=payload)
         assert result.status_code == 200 and result.json() == reply
         assert isinstance(calls[-1], request_type)
-        if request_type is ResumeWeightsFromDeltaReqInput:
-            received = msgpack_decode(msgpack_encode(calls[-1]))
-            assert isinstance(received, request_type)
-            assert received.session_id == session["session_id"]
-            assert received.receipts == receipts
+        received = msgpack_decode(msgpack_encode(calls[-1]))
+        assert type(received) is request_type
+        assert request_type.__module__ == "sglang.srt.weight_sync.gpu_delta_io"
+        assert received == calls[-1]
+        assert pickle.loads(pickle.dumps(received)) == received
+    response = DeltaWeightsReqOutput(
+        success=True, message="", participant=receipts[0], rid="control-reply"
+    )
+    received = msgpack_decode(msgpack_encode(response))
+    assert type(received) is DeltaWeightsReqOutput and received == response
+    assert pickle.loads(pickle.dumps(response)) == response
+    ordinary = PauseGenerationReqInput(mode="retract")
+    assert msgpack_decode(msgpack_encode(ordinary)) == ordinary
     assert len(calls) == len(cases)
 
 
