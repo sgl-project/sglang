@@ -536,6 +536,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     runner = SimpleNamespace(
                         spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
                         attn_backend=steps[0][0],
+                        model_config=SimpleNamespace(model_is_mrope=False),
                     )
                     graph_runner = (
                         SimpleNamespace(can_run_graph=lambda _: False)
