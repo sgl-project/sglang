@@ -3,8 +3,9 @@
 
 use anyhow::{Context, Result};
 use dynamo_tokenizers::{
-    create_tokenizer_from_file, traits, traits::DecodeResult, CacheTokenUsage, CachedTokenizer,
-    FastTokenizer, Tokenizer,
+    create_tokenizer_from_file, create_tokenizer_from_file_with_options, traits,
+    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, FastTokenizer, Tokenizer,
+    TokenizerOptions,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -25,14 +26,145 @@ pub fn load_with(
     source: &str,
     cfg: TokenizerConfig,
 ) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
+    let path = resolve(source)?;
+    build(&path, cfg).with_context(|| format!("load tokenizer for {source}"))
+}
+
+/// Local tokenizer file for a path or an HF repo id.
+fn resolve(source: &str) -> Result<String> {
     if Path::new(source).is_file() || looks_like_path(source) {
-        return build(source, cfg).with_context(|| format!("load tokenizer from {source}"));
+        return Ok(source.to_owned());
     }
-    let downloaded = download_tokenizer(source)?;
-    let path = downloaded
-        .to_str()
-        .context("downloaded tokenizer path is not valid UTF-8")?;
-    build(path, cfg).with_context(|| format!("load downloaded tokenizer for {source}"))
+    download_tokenizer(source)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("downloaded tokenizer path is not valid UTF-8"))
+}
+
+/// Tokenizer classes whose BOS SGLang restores from `add_bos_token`
+/// (`_fix_v5_add_bos_eos_token`), rebuilding their post-processor without EOS.
+const BOS_FLAG_CLASSES: [&str; 7] = [
+    "LlamaTokenizer",
+    "LlamaTokenizerFast",
+    "CodeLlamaTokenizer",
+    "CodeLlamaTokenizerFast",
+    "GemmaTokenizer",
+    "GemmaTokenizerFast",
+    "CohereTokenizerFast",
+];
+
+/// Whether SGLang keeps tokenizer.json's normalizer: transformers v5 rebuilds these
+/// classes with its own, and `_fix_v5_tokenizer_components` restores only the pre-tokenizer.
+fn engine_keeps_normalizer(class: &str, normalizer: &serde_json::Value) -> bool {
+    let steps = match &normalizer["normalizers"] {
+        serde_json::Value::Array(steps) => steps.as_slice(),
+        _ if normalizer.is_null() => &[],
+        _ => std::slice::from_ref(normalizer),
+    };
+    let gemma =
+        serde_json::json!({"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"});
+    match class.trim_end_matches("Fast") {
+        "LlamaTokenizer" => steps.is_empty(),
+        "XLMRobertaTokenizer" => steps.iter().all(|step| step["type"] == "Precompiled"),
+        "GemmaTokenizer" => *steps == [gemma],
+        // Rewritten for infilling; unverified.
+        "CodeLlamaTokenizer" => false,
+        _ => true,
+    }
+}
+
+/// Special tokens SGLang's `tokenizer(text)` puts around a prompt and [`encode`] leaves out.
+#[derive(Debug, Default, PartialEq)]
+pub struct PromptAffixes {
+    pub prefix: Vec<u32>,
+    pub suffix: Vec<u32>,
+    /// EOS that SGLang appends to an EmbeddingGemma prompt not already ending in it.
+    pub eos: Option<u32>,
+}
+
+impl PromptAffixes {
+    /// [`encode`]'s `ids` as the engine tokenizes the same text.
+    pub fn apply(&self, ids: &[u32]) -> Vec<u32> {
+        let mut ids = [self.prefix.as_slice(), ids, &self.suffix].concat();
+        if let Some(eos) = self.eos.filter(|&eos| ids.last() != Some(&eos)) {
+            ids.push(eos);
+        }
+        ids
+    }
+}
+
+/// BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`], else the
+/// tokenizer.json post-processor's, and EmbeddingGemma's EOS. Tiktoken models add
+/// none. Errs when the router cannot reproduce the engine's tokens.
+pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<PromptAffixes> {
+    let path = resolve(source)?;
+    if !path.ends_with(".json") {
+        return Ok(Default::default());
+    }
+    // Through `files`, which downloads it: a cold HF cache holds only tokenizer.json.
+    // A missing or failed download leaves the special tokens unknown, so /generate keeps text.
+    files.ensure_downloaded("tokenizer_config.json")?;
+    let config = files
+        .json("tokenizer_config.json")?
+        .context("no tokenizer_config.json beside the tokenizer")?;
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let class = config["tokenizer_class"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        engine_keeps_normalizer(class, &file["normalizer"]),
+        "transformers replaces the {class} normalizer"
+    );
+    let plain = create_tokenizer_from_file(&path)?;
+    let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
+        Ok(t.encode(text)?.token_ids().to_vec())
+    };
+    let special = |key: &str| -> Result<Option<u32>> {
+        let Some(token) = config[key].as_str().or(config[key]["content"].as_str()) else {
+            return Ok(None);
+        };
+        match ids(plain.as_ref(), token)?.as_slice() {
+            [id] => Ok(Some(*id)),
+            _ => anyhow::bail!("{key} {token:?} is not a single token"),
+        }
+    };
+    // SGLang's `is_embedding_gemma`, whose `_tokenize_texts` ends each prompt with EOS.
+    files.ensure_downloaded("config.json")?;
+    let model = files.json("config.json")?.unwrap_or_default();
+    let embedding_gemma =
+        model["model_type"] == "gemma3_text" && model["use_bidirectional_attention"] == true;
+    let eos = embedding_gemma
+        .then(|| special("eos_token")?.context("EmbeddingGemma declares no eos_token"))
+        .transpose()?;
+    if BOS_FLAG_CLASSES.contains(&class) {
+        let add_bos = config["add_bos_token"].as_bool().unwrap_or(true);
+        let bos = add_bos
+            .then(|| special("bos_token")?.context("add_bos_token is set without a bos_token"))
+            .transpose()?;
+        let prefix = bos.into_iter().collect();
+        return Ok(PromptAffixes {
+            prefix,
+            suffix: Vec::new(),
+            eos,
+        });
+    }
+    let options = TokenizerOptions {
+        add_special_tokens: true,
+    };
+    let full = ids(
+        create_tokenizer_from_file_with_options(&path, options)?.as_ref(),
+        "a",
+    )?;
+    let bare = ids(plain.as_ref(), "a")?;
+    anyhow::ensure!(!bare.is_empty(), "the tokenizer drops the probe text");
+    let start = full
+        .windows(bare.len())
+        .position(|window| window == bare)
+        .context("the post-processor rewrites the prompt")?;
+    let (prefix, suffix) = (full[..start].to_vec(), full[start + bare.len()..].to_vec());
+    Ok(PromptAffixes {
+        prefix,
+        suffix,
+        eos,
+    })
 }
 
 fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
@@ -310,6 +442,20 @@ impl ModelFiles {
         path.is_file().then_some(path)
     }
 
+    /// Fail if the model may ship `file` but it cannot be downloaded,
+    /// which the readers below only warn about and report as absent.
+    pub fn ensure_downloaded(&self, file: &str) -> Result<()> {
+        if self.local_dir.is_none()
+            && self
+                .repo_files
+                .as_ref()
+                .is_none_or(|files| files.contains(file))
+        {
+            download_repo_file(&self.source, file)?;
+        }
+        Ok(())
+    }
+
     /// Read the text `file`; `None` when the model ships no such file.
     pub fn text(&self, file: &str) -> Result<Option<String>> {
         self.path(file)
@@ -391,6 +537,109 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_affix_tests {
+    use super::{prompt_affixes, ModelFiles, PromptAffixes};
+    use anyhow::Result;
+    use serde_json::{json, Value};
+
+    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config`
+    /// (unless null) and the `model` config.
+    fn affixes(
+        normalizer: Value,
+        post_processor: Value,
+        config: Value,
+        model: Value,
+    ) -> Result<PromptAffixes> {
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        data["normalizer"] = normalizer;
+        data["post_processor"] = post_processor;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        if !config.is_null() {
+            std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        }
+        std::fs::write(dir.path().join("config.json"), model.to_string()).unwrap();
+        let path = path.to_str().unwrap();
+        prompt_affixes(path, &ModelFiles::open(path))
+    }
+
+    #[test]
+    fn matches_the_engines_special_tokens() {
+        let template = json!({"type": "TemplateProcessing", "pair": [], "single": [
+            {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {"<|endoftext|>": {"id": "<|endoftext|>", "ids": [256], "tokens": ["<|endoftext|>"]}}});
+        let llama = json!({"tokenizer_class": "LlamaTokenizerFast", "bos_token": "<|endoftext|>"});
+        let mut no_bos = llama.clone();
+        no_bos["add_bos_token"] = false.into();
+        let embedding_gemma =
+            json!({"model_type": "gemma3_text", "use_bidirectional_attention": true});
+        let eos = json!({"eos_token": {"content": "<|endoftext|>"}});
+        assert!(affixes(Value::Null, Value::Null, json!({}), embedding_gemma.clone()).is_err());
+        for (post_processor, config, model, prefix, eos) in [
+            (Value::Null, json!({}), json!({}), vec![], None),
+            (template.clone(), json!({}), json!({}), vec![256], None),
+            // SGLang adds BOS by `add_bos_token`, ignoring the post-processor.
+            (Value::Null, llama, json!({}), vec![256], None),
+            (template, no_bos, json!({}), vec![], None),
+            (Value::Null, eos, embedding_gemma, vec![], Some(256)),
+        ] {
+            let affixes = affixes(Value::Null, post_processor, config, model).unwrap();
+            let suffix = vec![];
+            assert_eq!(
+                affixes,
+                PromptAffixes {
+                    prefix,
+                    suffix,
+                    eos
+                }
+            );
+        }
+        // Without the config or its BOS, the engine's special tokens are unknown.
+        let unknown_bos = json!({"tokenizer_class": "LlamaTokenizerFast"});
+        for config in [Value::Null, unknown_bos] {
+            assert!(affixes(Value::Null, Value::Null, config, json!({})).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_normalizers_the_engine_replaces() {
+        let legacy = json!({"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "\u{2581}"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}]});
+        let collapse = json!({"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "});
+        for (class, normalizer, kept) in [
+            ("LlamaTokenizerFast", legacy.clone(), false),
+            ("PreTrainedTokenizerFast", legacy, true),
+            ("XLMRobertaTokenizer", collapse, false),
+            (
+                "GemmaTokenizer",
+                json!({"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}),
+                true,
+            ),
+        ] {
+            let config = json!({"tokenizer_class": class, "add_bos_token": false});
+            let affixes = affixes(normalizer, Value::Null, config, json!({}));
+            assert_eq!(affixes.is_ok(), kept, "{class}");
+        }
+    }
+
+    #[test]
+    fn embedding_gemma_eos_ends_the_prompt_once() {
+        let affixes = PromptAffixes {
+            eos: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            (affixes.apply(&[7]), affixes.apply(&[7, 1])),
+            (vec![7, 1], vec![7, 1])
+        );
     }
 }
 
