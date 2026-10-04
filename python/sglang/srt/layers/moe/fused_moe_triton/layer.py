@@ -464,6 +464,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            layer=self,
         )
 
         self.quant_method = quant_method
