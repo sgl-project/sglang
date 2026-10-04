@@ -43,6 +43,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.model_loader.draft_weight_loading import (
+    can_skip_vocab_loading,
+    draft_weight_sharing,
+    unloaded_shared_weight,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -78,7 +83,10 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
     stash_append_boundary_state_triton,
 )
-from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang.srt.speculative.pp_draft_embedding import (
+    resolve_draft_embed_and_head,
+    resolve_target_embed_and_head,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -161,6 +169,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         with (
+            draft_weight_sharing(self._share_embed_and_head),
             draft_pp_context(),
             speculative_moe_backend_context(),
             draft_model_build_scope(),
@@ -358,17 +367,27 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def init_lm_head(self):
+        for runner in self.draft_runner_list:
+            self._share_embed_and_head(runner.model)
+
+    def _share_embed_and_head(self, draft_model, *, before_load=False):
         target_runner = self.target_worker.model_runner
-        # Share the embedding and lm_head
-        for i in range(self.speculative_num_steps):
-            embed, head = resolve_draft_embed_and_head(
-                target_model=target_runner.model,
-                draft_model=self.draft_runner_list[i].model,
-                model_path=target_runner.model_config.model_path,
-                revision=target_runner.model_config.revision,
-                load_config=target_runner.load_config,
-            )
-            self.draft_runner_list[i].model.set_embed_and_head(embed, head)
+        if before_load and (
+            not can_skip_vocab_loading(draft_model)
+            or not can_skip_vocab_loading(target_runner.model)
+            or resolve_target_embed_and_head(target_runner.model)[0] is None
+        ):
+            return
+        embed, head = resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=draft_model,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
+        if before_load:
+            embed, head = unloaded_shared_weight(embed), unloaded_shared_weight(head)
+        draft_model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
         from sglang.srt.speculative.eagle_worker_v2 import (

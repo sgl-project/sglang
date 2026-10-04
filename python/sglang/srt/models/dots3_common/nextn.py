@@ -185,10 +185,13 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         weights = list(weights)
-        self._mtp_loaded_embed = any(
-            name.startswith("model.mtp.embed_tokens.") for name, _ in weights
-        )
+        self.prepare_draft_weight_loading(name for name, _ in weights)
         super().load_weights(weights, is_nextn=True)
+
+    def prepare_draft_weight_loading(self, checkpoint_names):
+        self._mtp_loaded_embed = any(
+            name.startswith("model.mtp.embed_tokens.") for name in checkpoint_names
+        )
 
     def set_embed_and_head(self, embed, head):
         # Preserve a checkpoint-provided MTP embedding; share the output head.

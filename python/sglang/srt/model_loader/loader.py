@@ -42,6 +42,9 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.draft_weight_loading import (
+    get_draft_weight_sharing,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -796,6 +799,30 @@ class DefaultModelLoader(BaseModelLoader):
             )
         return tuple(resolved_sources)
 
+    def _draft_checkpoint_names(self, model_config, model):
+        from safetensors import safe_open
+
+        names = set()
+        for resolved in self.resolve_model_weights(model_config, model):
+            if not resolved.use_safetensors:
+                return None
+            keys = set()
+            for path in resolved.weight_files:
+                with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                    keys.update(checkpoint.keys())
+            if self.load_config.draft_model_idx is None:
+                names.update(resolved.source.prefix + name for name in keys)
+            else:
+                names.update(
+                    name
+                    for name, _ in self._filter_mtp_weights(
+                        ((name, None) for name in keys),
+                        resolved.source.prefix,
+                        self.load_config.draft_model_idx,
+                    )
+                )
+        return names
+
     @staticmethod
     def start_checkpoint_prefetch(
         resolved_sources: Tuple[ResolvedSource, ...],
@@ -1003,9 +1030,34 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            sharing = (
+                get_draft_weight_sharing() if type(self) is DefaultModelLoader else None
+            )
+            if sharing is not None:
+                prepare = [
+                    module.prepare_draft_weight_loading
+                    for module in model.modules()
+                    if hasattr(module, "prepare_draft_weight_loading")
+                ]
+                names = (
+                    self._draft_checkpoint_names(model_config, model) if prepare else ()
+                )
+                if names is not None:
+                    for hook in prepare:
+                        hook(names)
+                    sharing(model, before_load=True)
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+            if sharing is not None:
+                sharing(model)
+                if any(
+                    getattr(p, "_shared_draft_weight", False) is True
+                    for p in model.parameters()
+                ):
+                    raise RuntimeError(
+                        "Draft shared weights were not bound after loading"
+                    )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -1075,6 +1127,11 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def postprocess_weights(model, target_device):
         for module, quant_method in _modules_with_quant_method(model):
+            if (
+                getattr(getattr(module, "weight", None), "_shared_draft_weight", False)
+                is True
+            ):
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the

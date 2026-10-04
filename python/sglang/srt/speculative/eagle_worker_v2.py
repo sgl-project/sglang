@@ -57,6 +57,11 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_loader.draft_weight_loading import (
+    can_skip_vocab_loading,
+    draft_weight_sharing,
+    unloaded_shared_weight,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -101,7 +106,10 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
-from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang.srt.speculative.pp_draft_embedding import (
+    resolve_draft_embed_and_head,
+    resolve_target_embed_and_head,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -188,7 +196,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_owns_attention = (
             get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
+        self.init_token_map()
         with (
+            draft_weight_sharing(self.init_lm_head),
             draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
             speculative_moe_backend_context(),
@@ -228,7 +238,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
@@ -307,40 +316,51 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             self.hot_token_id = None
 
-    def init_lm_head(self):
+    def init_lm_head(self, draft_model=None, *, before_load=False):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        embed, head = self._resolve_shared_embed_and_head()
+        if draft_model is None:
+            draft_model = self.draft_runner.model
+        if before_load and (
+            self.hot_token_id is not None
+            or not can_skip_vocab_loading(draft_model)
+            or not can_skip_vocab_loading(self.target_worker.model_runner.model)
+            or resolve_target_embed_and_head(self.target_worker.model_runner.model)[0]
+            is None
+        ):
+            return
+        embed, head = self._resolve_shared_embed_and_head(draft_model)
+        if before_load:
+            embed, head = unloaded_shared_weight(embed), unloaded_shared_weight(head)
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
 
         def maybe_share_target_lm_head():
             if (
-                target_lm_head is not None
+                not before_load
+                and target_lm_head is not None
                 and self.hot_token_id is None
-                and getattr(self.draft_runner.model, "hot_token_id", None) is None
-                and hasattr(self.draft_runner.model, "set_lm_head_from_target")
+                and getattr(draft_model, "hot_token_id", None) is None
+                and hasattr(draft_model, "set_lm_head_from_target")
             ):
-                self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+                draft_model.set_lm_head_from_target(target_lm_head)
 
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
-                hasattr(self.draft_runner.model, "load_lm_head_from_target")
-                and self.draft_runner.model.load_lm_head_from_target
+                hasattr(draft_model, "load_lm_head_from_target")
+                and draft_model.load_lm_head_from_target
             ):
-                self.draft_runner.model.set_embed_and_head(embed, head)
+                draft_model.set_embed_and_head(embed, head)
                 maybe_share_target_lm_head()
             else:
-                self.draft_runner.model.set_embed(embed)
+                draft_model.set_embed(embed)
 
             # grab hot token ids
-            if self.draft_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_runner.model.hot_token_id.to(
-                    embed.device
-                )
+            if not before_load and draft_model.hot_token_id is not None:
+                self.hot_token_id = draft_model.hot_token_id.to(embed.device)
 
         else:
             if self.hot_token_id is not None and head is not None:
@@ -349,14 +369,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            draft_model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
-    def _resolve_shared_embed_and_head(self):
+    def _resolve_shared_embed_and_head(self, draft_model):
         target_runner = self.target_worker.model_runner
         return resolve_draft_embed_and_head(
             target_model=target_runner.model,
-            draft_model=self.draft_runner.model,
+            draft_model=draft_model,
             model_path=target_runner.model_config.model_path,
             revision=target_runner.model_config.revision,
             load_config=target_runner.load_config,
