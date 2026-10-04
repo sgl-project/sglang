@@ -288,7 +288,9 @@ def _make_hd64_raw(batch, nheads, ngroups, state_dtype, device, seed):
     issues it: BF16 ``dt``/``D``/``dt_bias`` broadcasts, int32 slot table with
     ``pad_slot_id=-1`` padding rows, and ``x``/``B``/``C`` as views into the
     fused ``xBC`` projection (padded batch stride)."""
-    t = _make(batch, nheads, ngroups, state_dtype, device, seed, dt_softplus=True, dim=64)
+    t = _make(
+        batch, nheads, ngroups, state_dtype, device, seed, dt_softplus=True, dim=64
+    )
     width = nheads * 64 + 2 * ngroups * 128
     xbc = (torch.randn(batch, width, device=device) * 0.1).bfloat16()
     t["x"] = xbc[:, : nheads * 64].view(batch, nheads, 64)
@@ -306,7 +308,11 @@ def _make_hd64_raw(batch, nheads, ngroups, state_dtype, device, seed):
 
 @pytest.mark.parametrize(
     "batch,nheads,ngroups,state_dtype",
-    [(2, 128, 8, torch.bfloat16), (64, 128, 8, torch.bfloat16), (8, 128, 8, torch.float32)],
+    [
+        (2, 128, 8, torch.bfloat16),
+        (64, 128, 8, torch.bfloat16),
+        (8, 128, 8, torch.float32),
+    ],
 )
 def test_hd64_raw_decode_row_matches_flashinfer_and_reference(
     batch, nheads, ngroups, state_dtype, monkeypatch
@@ -349,7 +355,14 @@ def test_hd64_raw_decode_row_matches_flashinfer_and_reference(
     torch.testing.assert_close(t["out"][:-1].float(), expected_out, atol=tol, rtol=tol)
     # The padded row reads a zero state: output = dt * (x . B) . C + D * x.
     pad_out, _ = _reference(
-        dict(t, idx=live[:1], x=t["x"][-1:], B=t["B"][-1:], C=t["C"][-1:], dt=t["dt"][-1:]),
+        dict(
+            t,
+            idx=live[:1],
+            x=t["x"][-1:],
+            B=t["B"][-1:],
+            C=t["C"][-1:],
+            dt=t["dt"][-1:],
+        ),
         torch.zeros_like(state_ref),
         dt_softplus=True,
     )
@@ -364,7 +377,10 @@ def test_hd64_raw_decode_captures_into_a_cuda_graph():
     device = torch.device("cuda")
     t = _make_hd64_raw(16, 128, 8, torch.bfloat16, device, seed=7)
     kwargs = dict(
-        dt_bias=t["dt_bias"], dt_softplus=True, state_batch_indices=t["idx"], pad_slot_id=-1
+        dt_bias=t["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=t["idx"],
+        pad_slot_id=-1,
     )
     args = (t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"])
     state_ref = t["state"].clone()
@@ -405,7 +421,12 @@ def test_supports_refuses_unpromoted_forms():
     )
     # The headdim-64 raw row refuses non-dense rows (a transposed x view).
     r = _make_hd64_raw(4, 128, 8, torch.bfloat16, device, seed=11)
-    raw = dict(dt_bias=r["dt_bias"], dt_softplus=True, state_batch_indices=r["idx"], pad_slot_id=-1)
+    raw = dict(
+        dt_bias=r["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=r["idx"],
+        pad_slot_id=-1,
+    )
     raw_args = (r["state"], r["x"], r["dt"], r["A"], r["B"], r["C"], r["D"])
     assert cake_mamba.supports_selective_state_update(*raw_args, **raw)
     strided_x = r["x"].transpose(0, 1).contiguous().transpose(0, 1)
