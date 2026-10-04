@@ -60,6 +60,8 @@ class ReadState(msgspec.Struct):
     stats: object = None
     stats_stream: object = None
     call: object = None
+    # Decode and target-verify forwards (the mHC split-K slice count may differ).
+    decode: bool = False
 
 
 class HcUpdate:
@@ -94,6 +96,7 @@ class HcUpdate:
                 next=next,
                 world_size=self.layer.self_attn.attn_tp_size,
                 precomputed=state.stats,
+                decode=state.decode,
             )
         return mhc.run_moe_post(
             hc,
@@ -103,6 +106,7 @@ class HcUpdate:
             next=next if state.call.allow_cross_layer_fusion else None,
             world_size=self.layer.mlp.tp_size,
             precomputed=state.stats,
+            decode=state.decode,
         )
 
     def update(self, output, state):
@@ -236,6 +240,8 @@ class HcReadCall(HcRead):
                 stats=stats,
                 stats_stream=stream,
                 call=self.call,
+                decode=self.batch.forward_mode.is_decode_or_idle()
+                or self.batch.forward_mode.is_target_verify(),
             )
         fn, scale, base = self._parameters()
         x, post, comb, norm_fused = layer.hc_pre(
