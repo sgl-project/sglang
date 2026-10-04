@@ -153,7 +153,7 @@ def _norm_modulate(
         _LN_MODULATE.disabled
         or not _eager_fast_path_allowed(x)
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return (1 + scale) * norm(x) + shift
     sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
