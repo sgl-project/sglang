@@ -195,6 +195,39 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 else:
                     self.assertTrue(torch.equal(output.topk_weights, want_w))
 
+    def test_runner_expanded_weighting_rounds_bf16_rows_once(self):
+        # Production rows are bf16 and DeepEP's expanded weights are fp32. The
+        # weighting must round once; casting the weights to bf16 first rounds
+        # twice and costs accuracy.
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmRunnerOutput,
+            post_permute_deep_gemm_to_deepep_v2,
+        )
+
+        generator = torch.Generator(device=DEVICE).manual_seed(0)
+        rows = torch.randn(
+            (64, 128), device=DEVICE, dtype=torch.bfloat16, generator=generator
+        )
+        weights = torch.rand(64, device=DEVICE, generator=generator)
+        want = (rows.float() * weights.unsqueeze(-1)).to(torch.bfloat16)
+        weights_cast_first = rows * weights.to(torch.bfloat16).unsqueeze(-1)
+        # Otherwise the check below could not tell the two roundings apart.
+        self.assertFalse(torch.equal(want, weights_cast_first))
+
+        output = post_permute_deep_gemm_to_deepep_v2(
+            DeepGemmRunnerOutput(rows.clone()),
+            None,
+            MoeRunnerConfig(no_combine=False),
+            {
+                "deepep_v2_expanded": True,
+                "topk_weights": weights,
+                "deepep_v2_weight_prefused": False,
+            },
+        )
+        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(output.hidden_states, want))
+
     def test_runner_restores_token_topk_routes_and_masks_nonlocal_slots(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.deep_gemm import (

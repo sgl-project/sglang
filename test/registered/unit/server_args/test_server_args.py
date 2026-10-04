@@ -2999,6 +2999,17 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
+    def test_direct_mode_rejected_across_nodes(self):
+        # direct is NVLink-only; multi-node must ask for hybrid up front.
+        args = self._args(moe_runner_backend="deep_gemm", nnodes=2)
+        with self.assertRaisesRegex(ValueError, "--deepep-v2-mode hybrid"):
+            handle_a2a_moe(args)
+        handle_a2a_moe(
+            self._args(
+                moe_runner_backend="deep_gemm", nnodes=2, deepep_v2_mode="hybrid"
+            )
+        )
+
     def test_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
