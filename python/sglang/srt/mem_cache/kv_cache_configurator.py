@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
+    get_dsa_index_topk,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -88,6 +89,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
@@ -113,6 +115,159 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
+    )
+
+
+def dsa_indexer_dcp_scale(kvc: KVCacheConfigurator) -> int:
+    """CUDA RoPE DSA index keys span allocator-global, not rank-local, slots."""
+    if (
+        str(kvc.device).startswith("cuda")
+        and not _is_hip
+        and kvc.model_config.qk_rope_head_dim > 0
+        and not kvc.is_draft_worker
+    ):
+        return get_parallel().attn_dcp_size
+    return 1
+
+
+def dsa_dcp_max_query_rows(
+    model_config: ModelConfig, *, max_running_requests: Optional[int] = None
+) -> int:
+    schedule = get_schedule()
+    prefill_rows = schedule.chunked_prefill_size
+    if prefill_rows is None or prefill_rows <= 0:
+        # Without chunking the first request may fill the entire context,
+        # even when that exceeds the scheduler's soft prefill token budget.
+        prefill_rows = max(schedule.max_prefill_tokens, model_config.context_len)
+    else:
+        prefill_rows = max_prefill_buffer_tokens()
+    parallel = get_parallel()
+    if max_running_requests is None:
+        # Explicit concurrency is global, while attention buffers are per DP
+        # worker. Automatic request-pool sizing is capped at 4096 per worker.
+        max_running_requests = (
+            schedule.max_running_requests // parallel.attn_dp_size
+            if schedule.max_running_requests is not None
+            else 4096
+        )
+    decode_rows = max_running_requests
+    if get_parallel().dcp_enabled:
+        decode_rows *= max_speculative_num_draft_tokens() or 1
+    rows = max(prefill_rows, decode_rows)
+    if parallel.attn_dp_size > 1:
+        # Eager attention-DP aligns peer-local rows to attention TP width.
+        rows = math.ceil(rows / parallel.attn_tp_size) * parallel.attn_tp_size
+    return rows
+
+
+def dsa_dcp_workspace_size_bytes(
+    *, num_q_heads: int, dcp_size: int, max_query_rows: int
+) -> int:
+    scratch_bytes = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+    if dcp_size == 1:
+        return scratch_bytes
+    # flashinfer 0.7 TRTLLM reserves float2[heads * batch * round_up(q_len,256)]
+    # plus kTrtllmGenSoftmaxStatsGuardBytes (1 MiB) before its kernel scratch.
+    # DSA presents every prefill token as a separate decode row with q_len=1.
+    # Keep the original per-DCP-rank scratch budget after that stats slab.
+    widened_heads = num_q_heads * dcp_size
+    # Larger forwards reuse this workspace across bounded vendor calls.
+    rows_per_call = 65535 // dsa_dcp_head_groups(widened_heads)
+    stats_bytes = 8 * widened_heads * min(max_query_rows, rows_per_call) * 256 + (
+        1 << 20
+    )
+    return scratch_bytes * dcp_size + stats_bytes
+
+
+def dsa_dcp_head_groups(num_q_heads: int) -> int:
+    """Fold widened RoPE queries into TRTLLM's at-most-32-head kernel."""
+    groups = max(1, (num_q_heads + 31) // 32)
+    while num_q_heads % groups:
+        groups += 1
+    return groups
+
+
+def dsa_dcp_merge_size_bytes(
+    *, num_q_heads: int, dcp_size: int, max_query_rows: int, kv_lora_rank: int
+) -> int:
+    """Peak merge storage in addition to the live partial output and LSE."""
+    if dcp_size == 1:
+        return 0
+    rows_heads = max_query_rows * num_q_heads
+    # A2A keeps two full BF16 send/receive tensors; ag_rs corrects the full
+    # output in FP32. Both need four bytes per gathered output element.
+    full_outputs = rows_heads * dcp_size * kv_lora_rank * 4
+    # ag_rs also holds its local FP32 reduction and BF16 result together.
+    local_outputs = rows_heads * kv_lora_rank * 6
+    # ag_rs gathers every peer's LSE; fi_a2a has separate send/receive stats
+    # with two FP32 columns per gathered head. Include the full corrected LSE.
+    lse_bytes = rows_heads * (max(4 * dcp_size**2, 16 * dcp_size) + 4 * dcp_size)
+    return full_outputs + local_outputs + lse_bytes
+
+
+def dsa_dcp_runtime_reservation_bytes(
+    kvc: KVCacheConfigurator, *, available_bytes: Optional[int] = None
+) -> int:
+    """Additional TRTLLM and widened-query storage allocated after KV sizing."""
+    if not is_deepseek_dsa(kvc.model_config.hf_config):
+        return 0
+    dcp_size = dsa_indexer_dcp_scale(kvc)
+    if dcp_size == 1:
+        return 0
+    max_running_requests = None
+    if available_bytes is not None and available_bytes > 0:
+        # Resolve requests from an upper KV capacity before subtracting the
+        # reservation. This shares the real DP/user/capacity limits with backend
+        # allocation, without a circular or oscillating sizing calculation.
+        capacity = kvc.config_from_budget(available_bytes).max_total_num_tokens
+        max_running_requests = kvc.resolve_max_num_reqs(capacity)
+    max_rows = dsa_dcp_max_query_rows(
+        kvc.model_config, max_running_requests=max_running_requests
+    )
+    heads = kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
+    # Count the gathered BF16 Q and partial output growth over non-DCP.
+    # Merge buffers are additional live allocations, not just widened copies
+    # of a non-DCP output. These peaks are shared across layers.
+    query_dim = kvc.model_config.kv_lora_rank + kvc.model_config.qk_rope_head_dim
+    row_bytes = query_dim * 2 + kvc.model_config.kv_lora_rank * 2
+    widened_rows = max_rows * heads * (dcp_size - 1)
+    # Non-DCP does not return LSE, so reserve the entire new partial LSE.
+    partial_lse_bytes = max_rows * heads * dcp_size * 4
+    merge_bytes = dsa_dcp_merge_size_bytes(
+        num_q_heads=heads,
+        dcp_size=dcp_size,
+        max_query_rows=max_rows,
+        kv_lora_rank=kvc.model_config.kv_lora_rank,
+    )
+    workspace_bytes = (
+        dsa_dcp_workspace_size_bytes(
+            num_q_heads=heads, dcp_size=dcp_size, max_query_rows=max_rows
+        )
+        - envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+    )
+    # Conservative four-byte counter per query head; TRTLLM can pack multiple
+    # heads in one counter. Include its persistent 8192-row minimum.
+    counter_bytes = max(max_rows, 8192) * heads * (dcp_size - 1) * 4
+    # DCP produces a compact local index table and count vector. The fused
+    # remap repeats rows when heads are folded into the vendor batch axis.
+    # Include the original remap output even when no repetition is needed.
+    groups = dsa_dcp_head_groups(heads * dcp_size)
+    topk = get_dsa_index_topk(kvc.model_config.hf_config)
+    padded_topk = ((topk + 3) // 4) * 4
+    metadata_bytes = max_rows * groups * (padded_topk + 1) * 4
+    # The vendor uses batch size as grid Z. Multiple bounded calls retain
+    # their outputs until concatenation creates one additional full output.
+    concat_bytes = 0
+    if max_rows > 65535 // groups:
+        concat_bytes = max_rows * heads * dcp_size * kvc.model_config.kv_lora_rank * 2
+    return (
+        workspace_bytes
+        + widened_rows * row_bytes
+        + partial_lse_bytes
+        + merge_bytes
+        + counter_bytes
+        + metadata_bytes
+        + concat_bytes
     )
 
 
@@ -1659,6 +1814,27 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        pool_page_size = self.pool_page_size
+        if (
+            str(self.device).startswith("cuda")
+            and not _is_hip
+            and self.model_config.qk_rope_head_dim > 0
+            and self.is_draft_worker
+            and self.loc_space_scale > 1
+        ):
+            # The target allocator widens both usable slots and its padding
+            # page. Draft KV/index keys replicate that space, but all CUDA DSA
+            # kernels continue to consume the ordinary 64-token layout.
+            pool_kwargs["dcp_replicated"] = True
+            pool_kwargs["alloc_page_size"] = pool_page_size
+            pool_kwargs["index_page_size"] = pool_page_size
+            pool_page_size = get_schedule().page_size
+        indexer_scale = dsa_indexer_dcp_scale(self)
+        if indexer_scale > 1:
+            # Main KV is sharded. Index keys stay replicated because top-k
+            # scores the complete sequence on each rank, using virtual locs.
+            pool_kwargs["index_buf_size"] = max_total_num_tokens * indexer_scale
+            pool_kwargs["index_page_size"] = self.pool_page_size * indexer_scale
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1668,7 +1844,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -2234,6 +2410,15 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        dsa_dcp_reservation = dsa_dcp_runtime_reservation_bytes(
+            self, available_bytes=int(rest_memory * (1 << 30))
+        )
+        if dsa_dcp_reservation:
+            logger.info(
+                "Reserving %.2f GB for DSA DCP workspace, counters and widened queries.",
+                dsa_dcp_reservation / (1 << 30),
+            )
+            rest_memory -= dsa_dcp_reservation / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

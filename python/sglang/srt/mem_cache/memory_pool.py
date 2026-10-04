@@ -4515,6 +4515,8 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        alloc_page_size: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
         super().__init__(
             size,
@@ -4530,6 +4532,10 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        # Replicated draft KV uses global allocator slots, whose padding page
+        # widens with DCP. Kernel pages remain 64 tokens for RoPE DSA.
+        self.alloc_page_size = page_size if alloc_page_size is None else alloc_page_size
+        self.dcp_replicated = dcp_replicated
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -4564,7 +4570,7 @@ class MLATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self.size + self.alloc_page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -4617,11 +4623,16 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # `KVIndexTranslator.rebind_write_loc` and flips this.
     write_loc_is_dcp_resolved = False
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
-        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+        return (
+            1
+            if self.write_loc_is_dcp_resolved or self.dcp_replicated
+            else get_parallel().attn_dcp_size
+        )
 
     def _scatter_mla_rows(
         self,
@@ -4630,7 +4641,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
@@ -4647,14 +4658,20 @@ class MLATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._check_physical_write_loc(loc_info, "set_kv_buffer (MLA)")
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
+        maybe_detect_oob(
+            loc, 0, self.size + self.alloc_page_size, "set_kv_buffer (MLA)"
+        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
-        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+        assert (
+            self.write_loc_is_dcp_resolved
+            or self.dcp_replicated
+            or not get_parallel().dcp_enabled
+        ), (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
             "whose kernel resolves the owner rule; reaching the combined-row "
@@ -4731,7 +4748,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * self._write_loc_dcp_span,
+            (self.size + self.alloc_page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         layer_id = (
@@ -4772,7 +4789,7 @@ class MLATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
-        size_limit = self.size + self.page_size
+        size_limit = self.size + self.alloc_page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
@@ -4995,6 +5012,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        index_page_size: Optional[int] = None,
+        alloc_page_size: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5013,6 +5033,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
+            alloc_page_size=alloc_page_size,
+            dcp_replicated=dcp_replicated,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -5021,6 +5043,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size
+        # The allocator's padding page widens under DCP even though indexer
+        # kernels continue to consume packed 64-token blocks.
+        self.index_page_size = page_size if index_page_size is None else index_page_size
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
@@ -5298,7 +5323,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
+        # The MLA superclass localizes only its KV indices under DCP. Index
+        # keys are replicated and must retain the original virtual indices.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         cpu_copy = {
             "kv": kv_cache_cpu,
