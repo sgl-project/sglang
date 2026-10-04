@@ -2178,8 +2178,6 @@ def apply_fp8_linear(
         )
     output_padding = 17 if pad_output else None
 
-    if isinstance(input, tuple):  # pre-quantized per-token (fp8, x_scale [M, 1])
-        input, input_scale = input
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]

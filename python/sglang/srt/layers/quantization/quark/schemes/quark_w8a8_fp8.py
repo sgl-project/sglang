@@ -193,14 +193,15 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         # pair (Qwen3.5 SGLANG_ROCM_SMALLM_FP8_PROJ producers). Per-channel FP8 is
         # gated off the aiter fused RMSNorm+quant kernel by _is_block_scale_fp8,
         # so block-scaled tuples must never reach here.
+        input_scale = layer.input_scale
         if isinstance(x, tuple):
-            q, scale = x
+            x, input_scale = x
             assert (
                 self.per_token
                 and layer.weight_scale is not None
-                and q.dtype == torch.float8_e4m3fn
-                and scale.dtype == torch.float32
-                and scale.numel() == q.shape[0]
+                and x.dtype == torch.float8_e4m3fn
+                and input_scale.dtype == torch.float32
+                and input_scale.numel() == x.shape[0]
             ), "quark W8A8 FP8 only accepts a per-token (fp8, scale) tuple"
         if _is_hip and layer.weight_scale is None:
             # Dequantized at load; weight is [in, out] like the fp8 path's.
@@ -211,7 +212,7 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             x,
             layer.weight,
             layer.weight_scale,
-            input_scale=layer.input_scale,
+            input_scale=input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.per_token,

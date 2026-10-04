@@ -48,7 +48,10 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             cls.shapes.append((shuffle_weight(w, (16, 16)).t(), s, max_m))
 
     def linear(self, x, w, s):
-        return self.fp8_utils.apply_fp8_linear(x, w, s, use_per_token_if_dynamic=True)
+        x, xs = x if isinstance(x, tuple) else (x, None)
+        return self.fp8_utils.apply_fp8_linear(
+            x, w, s, input_scale=xs, use_per_token_if_dynamic=True
+        )
 
     def run_counted(self, *inputs):
         calls, real = [], self.fp8_utils.smallm_fp8_gemm
