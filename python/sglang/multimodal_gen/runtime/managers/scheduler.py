@@ -773,7 +773,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             with maybe_record_function("REPLY spill+pickle+send"):
                 # if the server is local, use temp file to spill the frame array
                 # instead of leaving it in OutputBatch to be pickled later
-                if is_local_endpoint(self.server_args.scheduler_endpoint):
+                if is_local_endpoint(
+                    self.server_args.scheduler_endpoint_for(self.dp_replica)
+                ):
                     with self._record_return_stage(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
@@ -781,13 +783,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                             output_batch.output
                         )
 
-                with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.spill_cuda"
-                ):
-                    # The previous reply has already been mapped: the client
-                    # only sends the next hop after materializing the last one.
-                    release_retained_producer_tensors()
-                    spill_cuda_tensors(output_batch, in_place=True)
+                    with self._record_return_stage(
+                        output_batch, "Scheduler.return_result.spill_cuda"
+                    ):
+                        # The previous reply has already been mapped: the client
+                        # only sends the next hop after materializing the last one.
+                        release_retained_producer_tensors()
+                        spill_cuda_tensors(output_batch, in_place=True)
                 with self._record_return_stage(
                     output_batch, "Scheduler.return_result.pickle"
                 ):
