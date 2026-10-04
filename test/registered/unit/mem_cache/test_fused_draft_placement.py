@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftKVGeometry,
     DraftKVProfile,
+    FusedDraftDecision,
     FusedDraftPlacement,
     draft_kv_profile,
     place_fused_draft,
@@ -294,6 +295,38 @@ class TestFusedDraftDecision(CustomTestCase):
         declined = self._decide(draft_kv_dtype="fp8_e4m3")
         self.assertIsNone(declined.placement)
         self.assertIn("KV cache dtype", declined.declined)
+
+
+class TestMambaHostPrivateDraftRefused(CustomTestCase):
+    """A mamba host's unified buffer takes the whole KV budget, so a private
+    EAGLE draft pool on top of it would overcommit; the fused arm is the only
+    EAGLE arm such a host builds."""
+
+    def _resolve(self, *, decision, eagle=True):
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc
+
+        cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
+        cfg.is_draft_worker = False
+        cfg.spec_algorithm = SimpleNamespace(is_eagle=lambda: eagle)
+        with patch.object(
+            kvc.KVCacheConfigurator, "_fused_draft_decision", return_value=decision
+        ):
+            return cfg._fused_draft_for_mamba_factory()
+
+    def test_a_declined_eagle_draft_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
+            self._resolve(
+                decision=FusedDraftDecision(
+                    declined="the draft's K/V rows are asymmetric"
+                )
+            )
+
+    def test_a_placed_draft_and_other_algorithms_pass(self):
+        placement = _place(_profile()).placement
+        self.assertIs(
+            self._resolve(decision=FusedDraftDecision(placement=placement)), placement
+        )
+        self.assertIsNone(self._resolve(decision=FusedDraftDecision(), eagle=False))
 
 
 if __name__ == "__main__":

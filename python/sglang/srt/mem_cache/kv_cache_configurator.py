@@ -798,7 +798,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
-            fused_draft=self._fused_draft_for_pool_factory(),
+            fused_draft=self._fused_draft_for_mamba_factory(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
@@ -951,7 +951,7 @@ class KVCacheConfigurator:
                 if get_disagg().disaggregation_mode == "decode"
                 else 0
             ),
-            fused_draft=self._fused_draft_for_pool_factory(),
+            fused_draft=self._fused_draft_for_mamba_factory(),
         )
 
     def _fused_draft_decision(self):
@@ -1077,6 +1077,31 @@ class KVCacheConfigurator:
             grow_direction="down",
             draft_region=region,
         )
+
+    def _fused_draft_for_mamba_factory(self):
+        """`_fused_draft_for_pool_factory` for a mamba-hybrid host. Its unified
+        buffer takes the WHOLE profiled KV budget (`unified_total_bytes`), so a
+        private EAGLE draft pool -- sized to the full virtual id span -- would
+        be allocated on top of it, unbudgeted. Until the mamba solve prices that
+        pool, an EAGLE draft that does not fuse is refused here instead of
+        overcommitting GPU memory."""
+        placement = self._fused_draft_for_pool_factory()
+        if (
+            placement is None
+            and self.spec_algorithm.is_eagle()
+            and not self.is_draft_worker
+        ):
+            reason = (
+                self._fused_draft_decision().declined or "fusion does not apply to it"
+            )
+            raise ValueError(
+                "--enable-unified-memory + EAGLE/EAGLE3 on a mamba-hybrid target "
+                "needs the draft's KV fused into the target's pages, but this "
+                f"draft would keep a private pool ({reason}). A mamba host's "
+                "unified buffer takes the whole KV budget, so a private draft "
+                "pool would overcommit GPU memory."
+            )
+        return placement
 
     def _fused_draft_for_pool_factory(self):
         """Resolve ONCE per factory call (not inline) so the boot log reports
