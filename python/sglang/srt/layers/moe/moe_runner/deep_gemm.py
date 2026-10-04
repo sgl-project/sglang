@@ -267,7 +267,6 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    hidden_states_scale_tma_aligned: bool = False
     # Number of activation elements sharing one scale along K.
     # Records the actual input quantization group, independently of weight scales.
     activation_scale_block_size: Optional[int] = None
@@ -446,10 +445,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if (
-            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
-            and not runner_input.hidden_states_scale_tma_aligned
-        ):
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
