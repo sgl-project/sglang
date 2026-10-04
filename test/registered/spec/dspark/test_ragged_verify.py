@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 import torch
 
@@ -126,6 +128,55 @@ class TestCaptureVerifyLens(CustomTestCase):
             build_capture_verify_lens(num_tokens=64, num_slots=4, num_draft_tokens=8)
         with self.assertRaises(ValueError):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
+
+
+class TestForcedUniformCaptureGraphKey(CustomTestCase):
+    def test_replay_key_finds_its_tier_capture(self):
+        from sglang.srt.speculative.ragged_verify import (
+            compute_target_verify_graph_key,
+        )
+
+        width, tiers = 6, [6, 12, 24, 36]
+        env = {
+            "SGLANG_RAGGED_VERIFY_MODE": "compact",
+            "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "1",
+        }
+        with mock.patch.dict(os.environ, env):
+            # Forced-uniform capture runs tier // width full-width requests and
+            # carries no layout; the attention backend keys its metadata by it.
+            captured = {}
+            for tier in tiers:
+                key = compute_target_verify_graph_key(
+                    bs=tier // width, num_draft_tokens=width, ragged_layout=None
+                )
+                captured[key[0]] = tier
+            for tier in tiers:
+                # Replay: one live request padded to the tier's capture slots.
+                live = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=[1],
+                    device=_DEVICE,
+                    grid=tiers,
+                    graph_num_tokens_floor=tier,
+                ).padded_to_bucket(padded_bs=tier // width)
+                key = compute_target_verify_graph_key(
+                    bs=tier // width, num_draft_tokens=width, ragged_layout=live
+                )
+                self.assertEqual(captured.get(key[0]), tier)
+
+        # Static mode, or compact without forced-uniform capture, keeps the
+        # request-count key.
+        for mode, force in (("static", "1"), ("compact", "0")):
+            env = {
+                "SGLANG_RAGGED_VERIFY_MODE": mode,
+                "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": force,
+            }
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(
+                    compute_target_verify_graph_key(
+                        bs=2, num_draft_tokens=width, ragged_layout=None
+                    ),
+                    (2, 2 * width),
+                )
 
 
 if __name__ == "__main__":
