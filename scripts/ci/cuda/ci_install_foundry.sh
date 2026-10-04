@@ -4,7 +4,10 @@
 #
 # Default: install the sglang[foundry] requirement from python/pyproject.toml
 # ("foundry-core>=...") with pip, keeping the CI torch (--no-deps).
-# Pre-release testing: set FOUNDRY_GIT_URL and/or FOUNDRY_GIT_REF to build from a repository instead:
+# Pre-release testing:
+#   FOUNDRY_WHEEL    path or URL of a built foundry-core wheel (e.g. from tools/release/build_wheel.sh); installed
+#                    as is, with --no-deps (it must match the CI torch). Takes precedence over the variables below.
+# or set FOUNDRY_GIT_URL and/or FOUNDRY_GIT_REF to build from a repository instead:
 #   FOUNDRY_GIT_URL  repository URL, without "git+" and "@ref"
 #                    (default: https://github.com/foundry-org/foundry.git)
 #   FOUNDRY_GIT_REF  branch, tag or commit (default: main)
@@ -14,7 +17,10 @@ set -euxo pipefail
 # shellcheck source=scripts/ci/cuda/ci_install_dependency.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci_install_dependency.sh" "$@"
 
-if [ -n "${FOUNDRY_GIT_URL:-}" ] || [ -n "${FOUNDRY_GIT_REF:-}" ]; then
+if [ -n "${FOUNDRY_WHEEL:-}" ]; then
+    echo "Installing foundry-core from the wheel ${FOUNDRY_WHEEL}"
+    $PIP_CMD install --no-deps "${FOUNDRY_WHEEL}" $PIP_INSTALL_SUFFIX
+elif [ -n "${FOUNDRY_GIT_URL:-}" ] || [ -n "${FOUNDRY_GIT_REF:-}" ]; then
     # Source build: Foundry's C++ build needs Boost filesystem/json with CMake configs and
     # CMake >= 4.0, and its torch extension must build against the torch installed above
     # (--no-build-isolation).
