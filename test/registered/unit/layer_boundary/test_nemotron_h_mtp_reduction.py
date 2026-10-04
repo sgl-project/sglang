@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
@@ -25,21 +25,32 @@ class _Norm(nn.Module):
         return x + residual, x + residual
 
 
+class _Partial(nn.Module):
+    def __init__(self, tp):
+        super().__init__()
+        self.tp = tp
+
+    def forward(self, x, **kwargs):
+        return x / self.tp
+
+
 class TestNemotronMTPReduction(CustomTestCase):
     def test_attention_partial_is_reduced_once(self):
         """Under DP attention, the MTP MoE layer sums the attention output over the
-        attention TP group exactly once before the residual add."""
+        attention TP group exactly once before the residual add, and its own
+        output over the MoE-TP group once at its exit."""
         for tp in (1, 2):
             with self.subTest(tp=tp):
                 reduce = Mock(side_effect=lambda x: x * tp)
                 group = SimpleNamespace(all_reduce=reduce)
+                moe_reduce = Mock(side_effect=lambda x: x * tp)
+                moe_group = SimpleNamespace(all_reduce=moe_reduce)
                 with (
-                    get_context().override_server_args(
-                        tp_size=tp, enable_dp_attention=True
-                    ),
+                    get_context().override_server_args(tp_size=tp),
                     get_flags().dp.override(enabled=True),
                     get_parallel().override(
                         attn_tp_group=group,
+                        moe_tp_group=moe_group,
                         launch_world_rank=0,
                         tp_rank=0,
                         tp_size=tp,
@@ -58,11 +69,9 @@ class TestNemotronMTPReduction(CustomTestCase):
                     ),
                     patch_communicator("get_moe_cp_size", return_value=1),
                     patch_communicator(
-                        "apply_flashinfer_allreduce_fusion", return_value=False
+                        "flashinfer_ar_fusion_applies", return_value=False
                     ),
-                    patch_communicator(
-                        "apply_aiter_all_reduce_fusion", return_value=False
-                    ),
+                    patch_communicator("aiter_ar_fusion_applies", return_value=False),
                 ):
                     layer = nemotron_h_mtp.NemotronHMTPMoEDecoderLayer.__new__(
                         nemotron_h_mtp.NemotronHMTPMoEDecoderLayer
@@ -70,7 +79,8 @@ class TestNemotronMTPReduction(CustomTestCase):
                     nn.Module.__init__(layer)
                     layer.has_start_projections = False
                     layer.has_end_norm = False
-                    layer.mixer = nn.Identity()
+                    # A MoE stand-in leaving its output's sum to the exit.
+                    layer.mixer = _Partial(tp)
                     layer.norm = _Norm()
                     layer._init_stage_boundary(
                         SimpleNamespace(hybrid_override_pattern="*E"), 1
@@ -79,8 +89,10 @@ class TestNemotronMTPReduction(CustomTestCase):
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
                     expected = partial * tp + residual
                     stream = ResidualStream(residual)
-                    hidden = stream.leave(
-                        partial, ADD, declared_sum=SumGroup.ATTN_TP if tp > 1 else None
+                    hidden = stream.record(
+                        partial,
+                        PLAIN_ADD,
+                        declared_sum=SumGroup.ATTN_TP if tp > 1 else None,
                     )
                     batch = SimpleNamespace(
                         forward_mode=ForwardMode.DECODE,
@@ -95,6 +107,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                     torch.testing.assert_close(hidden, expected)
                     torch.testing.assert_close(batch.residual_stream.residual, expected)
                     self.assertEqual(reduce.call_count, int(tp > 1))
+                    self.assertEqual(moe_reduce.call_count, int(tp > 1))
 
 
 if __name__ == "__main__":
