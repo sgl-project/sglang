@@ -102,9 +102,7 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import bootstrap
-from sglang.srt.distributed.parallel_state import (
-    abort_distributed_environment,
-)
+from sglang.srt.distributed.parallel_state import abort_distributed_environment
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -270,9 +268,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -1685,10 +1681,7 @@ class Scheduler(
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
         Use the LCM to preserve any existing deterministic-inference alignment."""
-        from sglang.srt.configs.model_config import (
-            get_dsa_index_kpool,
-            is_deepseek_dsa,
-        )
+        from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 
         if not is_deepseek_dsa(self.model_config.hf_config):
             return
@@ -3028,15 +3021,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
         )
+        # Clip against the prompt that will run, including automatic truncation.
+        self.init_req_max_new_tokens(req)
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)

@@ -7,12 +7,15 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -23,11 +26,90 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestPagedPromptAdmission(CustomTestCase):
+    def _submit(self, input_len, *, max_new_tokens=1, input_limit=1018, truncate=False):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_req_len = input_limit + 5
+        scheduler.max_req_input_len = input_limit
+        scheduler.max_total_num_tokens = 1024
+        scheduler.page_size = 16
+        scheduler.max_new_tokens_limit = None
+        scheduler.sliding_window_size = None
+        scheduler.chunked_prefill_size = 128
+        scheduler.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+            size=1024,
+            page_size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id=2, vocab_size=10)
+        scheduler.enable_session_radix_cache = False
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler.dllm_algorithm = None
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.tree_cache = SimpleNamespace(cache_controller=None)
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.process_req_with_grammar.return_value = False
+        queued = []
+        scheduler._add_request_to_queue = queued.append
+        recv_req = TokenizedGenerateReqInput(
+            rid="paged-prompt",
+            input_text=None,
+            input_ids=array("q", [1] * input_len),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+        )
+        with (
+            get_context().override_server_args(allow_auto_truncate=truncate),
+            get_parallel().override(tp_rank=0, pp_rank=0),
+        ):
+            scheduler.handle_generate_request(recv_req)
+        self.assertEqual(len(queued), 1)
+        return queued[0]
+
+    def test_prompt_that_cannot_reserve_a_page_is_rejected(self):
+        for input_len in (1008, 1009, 1017):
+            with self.subTest(input_len=input_len):
+                req = self._submit(input_len)
+                self.assertIsNotNone(req.to_finish)
+                self.assertIn("KV memory budget", req.to_finish.message)
+
+    def test_zero_output_budget_is_valid_when_the_prompt_fits(self):
+        req = self._submit(992, max_new_tokens=0)
+        self.assertIsNone(req.to_finish)
+        self.assertEqual(req.sampling_params.max_new_tokens, 0)
+
+    def test_last_admissible_prompt_keeps_its_output_budget(self):
+        req = self._submit(992, max_new_tokens=15)
+        self.assertIsNone(req.to_finish)
+        self.assertEqual(req.sampling_params.max_new_tokens, 15)
+
+    def test_auto_truncation_precedes_memory_and_context_clipping(self):
+        req = self._submit(1100, max_new_tokens=8, input_limit=256, truncate=True)
+        self.assertEqual(len(req.origin_input_ids), 256)
+        self.assertIsNone(req.to_finish)
+        self.assertEqual(req.sampling_params.max_new_tokens, 4)
 
 
 def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):

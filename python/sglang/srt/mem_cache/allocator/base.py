@@ -91,9 +91,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         distributed token scaling. Shared pools use their physical byte layout.
         """
         paged_input = -(-input_tokens // self.page_size) * self.page_size
-        return max(
-            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
-        )
+        available_output_tokens = token_capacity - paged_input - self.page_size - 1
+        if available_output_tokens < 0:
+            return None
+        return max(0, min(max_new_tokens, available_output_tokens))
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
         """Whether `prealloc_fits` answers about the state reachable AFTER
