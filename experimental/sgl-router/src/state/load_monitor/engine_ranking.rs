@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Compares prefill pressure by queue time when available, then by the V3 load tuple.
+/// Ranks prefill engines by queue time when available, then by the V3 load tuple.
 pub(crate) fn compare_prefill_engines(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
@@ -58,7 +58,7 @@ fn compare_prefill_load(
     }
 }
 
-/// Compares decode pressure from LoadStat without treating unknown capacity as zero.
+/// Ranks decode engines by LoadStat without treating unknown capacity as zero.
 pub(crate) fn compare_decode_engines(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_pressure_uses_waiting_then_running_requests() {
+    fn prefill_ranking_uses_waiting_then_running_requests() {
         let busy = worker("busy");
         let idle = worker("idle");
         let loads = snapshot(&[(&busy, 1, 8), (&idle, 9, 2)]);
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_pressure_tie_is_not_broken_by_worker_id() {
+    fn decode_ranking_tie_is_not_broken_by_worker_id() {
         let (a, z) = (worker("a"), worker("z"));
         assert_eq!(compare_decode_engines(&a, &z, None), Ordering::Equal);
     }
