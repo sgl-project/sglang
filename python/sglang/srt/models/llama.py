@@ -39,6 +39,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_QUANT_READOUT
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -89,8 +90,7 @@ class LlamaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: LinearParallelGroup = "tp",
         use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
@@ -100,8 +100,7 @@ class LlamaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -110,8 +109,7 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":

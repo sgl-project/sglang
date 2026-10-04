@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.srt.layers.linear import LinearParallelGroup
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -91,13 +92,10 @@ class InklingDenseMLP(LlamaMLP):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         fused: bool = False,
-        tp_rank: int = 0,
-        tp_size: int = 1,
+        parallel_group: LinearParallelGroup = "replicated",
         tp_group: torch.distributed.ProcessGroup | None = None,
         use_dp_attention_reduce: bool = False,
     ) -> None:
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
         self.tp_group = tp_group
 
         super().__init__(
@@ -107,8 +105,7 @@ class InklingDenseMLP(LlamaMLP):
             quant_config=quant_config,
             prefix=prefix,
             reduce_results=False,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
 

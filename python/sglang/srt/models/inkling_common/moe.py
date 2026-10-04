@@ -765,8 +765,7 @@ def _build_inkling_shared_experts(
         layer_id=layer_id,
         prefix=add_prefix("shared_experts", prefix),
         quant_config=quant_config,
-        tp_rank=parallel.tp_rank,
-        tp_size=parallel.tp_size,
+        parallel_group="tp",
         tp_group=get_parallel().tp_group,
     )
 
