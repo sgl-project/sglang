@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -574,6 +575,8 @@ def register_fused_all_reduce_comm() -> None:
         CustomAllReduceV2,
     )
 
+    if get_disagg().enable_pdmux:
+        return
     ca_comm = get_parallel().tp_group.ca_comm
     if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
         all_reduce_fusion.register_comm(ca_comm.obj)
@@ -594,6 +597,8 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
+    if get_disagg().enable_pdmux:
+        return False
     if all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is None:
         return False
     comm = get_parallel().tp_group.ca_comm
