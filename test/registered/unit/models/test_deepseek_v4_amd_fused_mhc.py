@@ -76,6 +76,52 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
                         expected,
                     )
 
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_gfx1250_supported", False)
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
+    def test_hip_disables_the_tilelang_fused_boundary(self):
+        # Regression (gfx942 GLM-5.3-Flash nightly): TileLang's HIP codegen
+        # cannot lower tl.get_lane_idx, so mhc_fused_post_pre_fma_tilelang raises
+        # "Unresolved call Op(tl.get_lane_idx)" during decode graph capture. The
+        # TileLang flags default on, so before the fix every HIP arch without an
+        # aiter or Triton fused kernel opted into a kernel that cannot compile.
+        with (
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(True),
+            override_platform(is_sm120=False),
+        ):
+            self.assertFalse(deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled())
+
+    @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=False)
+    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=False)
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_gfx1250_supported", False)
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
+    def test_cross_layer_fusion_off_without_a_hip_fused_kernel(
+        self, _mock_aiter, _mock_gfx95
+    ):
+        # gfx942 has neither the aiter (gfx95) nor the Triton (gfx95/gfx1250)
+        # fused kernel, so the boundary must stay unwired and the layer run the
+        # unfused hc_post + hc_pre sequence, which falls back to torch on HIP.
+        with (
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(True),
+            override_platform(is_sm120=False),
+        ):
+            self.assertFalse(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
+
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_gfx1250_supported", True)
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
+    def test_gfx1250_keeps_fusion_ahead_of_the_hip_guard(self):
+        # gfx1250 routes the boundary through the Triton mhc_post_pre for all
+        # sizes, so its opt-in must be evaluated before the HIP guard.
+        with (
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
+        ):
+            self.assertTrue(deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled())
+
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
