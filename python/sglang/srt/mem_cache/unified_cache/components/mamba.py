@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
@@ -584,6 +585,13 @@ class MambaComponent(TreeComponent):
                     cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
                     write_pos_buf[req.kv.mamba_pool_idx] = 0
 
+        if (
+            get_memory().radix_cache_skip_decode_insert
+            and cache_len is not None
+            and cache_len > len(req.origin_input_ids)
+        ):
+            # A retracted request may prefill generated tokens; don't publish them.
+            return 0
         if is_finished:
             if cache_len is None:
                 cache_len = 0

@@ -2261,6 +2261,10 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        if get_memory().radix_cache_skip_decode_insert:
+            # Running requests retain the live state and one protected prefix.
+            return 2
+
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
@@ -2332,7 +2336,16 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            # Keep scratch for a chunked prefill and prefix donation at the cap.
+            reserve = (
+                4
+                if (
+                    get_memory().radix_cache_skip_decode_insert
+                    and not get_memory().disable_radix_cache
+                )
+                else 0
+            )
+            mamba_cap = (get_schedule().max_mamba_cache_size - reserve) // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(

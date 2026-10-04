@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_serving,
@@ -3583,6 +3584,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        if get_memory().radix_cache_skip_decode_insert:
+            self.mamba_track_indices = self.mamba_track_mask = None
+            self.mamba_track_mask_cpu = self.mamba_track_mask_next_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3643,7 +3647,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_exec().mamba.enable_mamba_extra_buffer:
+        if (
+            get_exec().mamba.enable_mamba_extra_buffer
+            and not get_memory().radix_cache_skip_decode_insert
+        ):
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:

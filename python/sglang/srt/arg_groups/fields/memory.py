@@ -68,6 +68,9 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    radix_cache_skip_decode_insert: A[
+        bool, "Keep prefill prefixes only; skip decode insertion and Mamba checkpoints."
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Store the Mamba state and full/SWA KV caches as one entry per token "

@@ -1473,7 +1473,10 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.kv.mamba_ping_pong_track_buffer is None:
+        if (
+            get_memory().radix_cache_skip_decode_insert
+            or req.kv.mamba_ping_pong_track_buffer is None
+        ):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
