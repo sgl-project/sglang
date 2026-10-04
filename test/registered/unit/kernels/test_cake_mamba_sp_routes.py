@@ -167,6 +167,7 @@ def _ssd_inputs(seqlen=S, lengths=LENGTHS, state_dtype=torch.bfloat16):
         state_dtype=state_dtype,
         cake_chunk_indices=ci,
         cake_chunk_offsets=co,
+        extend_seq_lens_cpu=list(lengths),
     )
 
 
@@ -421,6 +422,42 @@ def test_ssd_route_on_rejected_falls_back_and_logs_once(caplog):
     cake.assert_not_called()
     assert caplog.text.count("[cake-route] mamba_ssd_prefill: fallback") == 1
     assert "adapter admission rejected" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "lengths, host_lens, admitted",
+    [
+        ((128,), True, False),
+        ((128, 128), True, False),
+        ((96, 160), True, True),
+        ((96, 160), False, False),  # no host lengths: total bounds the longest
+        ((256, 128), True, True),
+        ((128, 896), False, True),
+    ],
+)
+def test_ssd_route_single_chunk_batches_fall_back(lengths, host_lens, admitted, caplog):
+    """A call in which every sequence is one chunk-128 keeps the stock kernel
+    (the Cake runner returns NaN for that geometry); any batch with a
+    >= 2-chunk sequence is routed."""
+    caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
+    stock = mock.Mock(side_effect=_stock_ssd)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
+    inputs = _ssd_inputs(seqlen=sum(lengths), lengths=lengths)
+    if not host_lens:
+        inputs["extend_seq_lens_cpu"] = None
+    with (
+        _routes(mamba_mod, "mamba_ssd_prefill"),
+        mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
+    ):
+        mamba_mod.ssd_prefill(stock, **inputs)
+    if admitted:
+        cake.assert_called_once()
+        stock.assert_not_called()
+    else:
+        stock.assert_called_once()
+        supports.assert_not_called()
+        cake.assert_not_called()
+        assert "every sequence is a single 128-token chunk" in caplog.text
 
 
 @pytest.mark.parametrize("case", ["unaligned", "tracking", "no_metadata", "fp32_state"])

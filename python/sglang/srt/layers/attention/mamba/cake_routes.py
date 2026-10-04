@@ -307,6 +307,7 @@ def ssd_prefill(
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
+    extend_seq_lens_cpu: Optional[Sequence[int]] = None,
 ) -> tuple:
     """Run the prefill SSD scan; ``mamba_ssd_prefill`` may take the Cake kernel.
 
@@ -361,10 +362,25 @@ def ssd_prefill(
         cake_chunk_offsets=cake_chunk_offsets,
         track_states_out=track_states_out,
         cake_track_checkpoints=cake_track_checkpoints,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
     )
     if result is None:
         return stock(x, dt, A, B, C, **stock_kwargs)
     return result
+
+
+def _single_chunk_batch(
+    seqlen: int, num_seqs: int, extend_seq_lens_cpu: Optional[Sequence[int]]
+) -> bool:
+    """True when no sequence of the call spans more than one chunk-128.
+
+    Uses the host extend lengths when the metadata carries them; without them
+    the total length bounds the longest sequence (``seqlen <= 128 * num_seqs``
+    is conservative: it also covers batches like ``(64, 192)``).
+    """
+    if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) == num_seqs:
+        return max(int(n) for n in extend_seq_lens_cpu) <= SSD_CHUNK_SIZE
+    return seqlen <= SSD_CHUNK_SIZE * num_seqs
 
 
 def _cake_ssd_prefill(
@@ -386,6 +402,7 @@ def _cake_ssd_prefill(
     cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
+    extend_seq_lens_cpu: Optional[Sequence[int]] = None,
 ) -> Optional[tuple]:
     """``None`` means "use the stock call"."""
     route = CAKE_ROUTE_SSD_PREFILL
@@ -396,6 +413,20 @@ def _cake_ssd_prefill(
     if seqlen % SSD_CHUNK_SIZE:
         _log_cake_route_once(
             route, "fallback", f"seqlen {seqlen} is not a multiple of 128: {detail}"
+        )
+        return None
+    num_seqs = int(cu_seqlens.shape[0]) - 1
+    if _single_chunk_batch(seqlen, num_seqs, extend_seq_lens_cpu):
+        # The Cake runner returns a varying number of NaN outputs and final
+        # states when every sequence of the call is exactly one 128-token
+        # chunk (with random and with zero initial states; any batch holding
+        # a >= 2-chunk sequence is clean).  The radix-cache prefix-hit extend
+        # of 128 tokens is exactly this call, so keep the stock kernel for it.
+        _log_cake_route_once(
+            route,
+            "fallback",
+            f"every sequence is a single 128-token chunk (Cake SSD kernel "
+            f"returns NaN for this geometry): {detail}",
         )
         return None
     # ``track_seq_idx`` is set for every forward of a radix-cache-tracked batch
@@ -456,7 +487,6 @@ def _cake_ssd_prefill(
     if key in _cake_route_rejected:
         return None
     supports, cake_fwd = _cake_ssd_kernels()
-    num_seqs = int(cu_seqlens.shape[0]) - 1
     if initial_states is None:
         # The Cake varlen runner requires initial states; a zero buffer is the
         # "no prefix" case the stock kernel expresses with ``None``.

@@ -640,6 +640,7 @@ class MambaMixer2(torch.nn.Module):
                 cake_chunk_offsets=mixed_metadata.cake_chunk_offsets,
                 track_states_out=ssm_state,
                 cake_track_checkpoints=mixed_metadata.cake_track_checkpoints,
+                extend_seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
             )
 
             # update ssm states
