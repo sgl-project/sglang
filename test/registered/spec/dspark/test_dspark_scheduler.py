@@ -1,14 +1,17 @@
 import functools
 import types
 import unittest
+import unittest.mock
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -17,8 +20,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
+    build_uninitialized_sps_table,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -470,6 +474,48 @@ class TestGraphTierFillBudget(CustomTestCase):
             self.assertEqual(total, min(graph_num_tokens, bs * cap))
 
 
+class TestForcedBudgetRejectsSimulatedAcceptLength(CustomTestCase):
+    """A pinned budget now trims verify under verify-all, so it must not combine
+    with a constant simulated accept length above 1, which can exceed it."""
+
+    def _set(self, frac):
+        from sglang.srt.managers.io_struct import SetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        draft_worker = types.SimpleNamespace(
+            set_dspark_forced_budget_frac=unittest.mock.Mock()
+        )
+        scheduler = types.SimpleNamespace(
+            spec_algorithm=types.SimpleNamespace(is_dspark=lambda: True),
+            draft_worker=draft_worker,
+        )
+        controller = SchedulerInternalStateController(scheduler, False)
+        output = controller.set_internal_state(
+            SetInternalStateReq(server_args={"dspark_force_budget_frac": frac})
+        )
+        return output.updated, draft_worker.set_dspark_forced_budget_frac
+
+    def test_pin_rejected_with_simulated_accept_length(self):
+        with envs.SGLANG_SIMULATE_ACC_LEN.override(3.0):
+            updated, apply = self._set(0.4)
+            self.assertFalse(updated)
+            apply.assert_not_called()
+            # Clearing the pin stays allowed.
+            updated, apply = self._set(None)
+            self.assertTrue(updated)
+            apply.assert_called_once_with(None)
+
+    def test_pin_allowed_without_or_with_unit_simulated_accept_length(self):
+        for simulate_acc_len in (-1.0, 1.0):
+            with self.subTest(simulate_acc_len=simulate_acc_len):
+                with envs.SGLANG_SIMULATE_ACC_LEN.override(simulate_acc_len):
+                    updated, apply = self._set(0.4)
+                self.assertTrue(updated)
+                apply.assert_called_once_with(0.4)
+
+
 class _FakeRaggedRunner(types.SimpleNamespace):
     pass
 
@@ -551,6 +597,80 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+
+class TestForcedBudgetUnderVerifyAll(CustomTestCase):
+    """dspark_sps_profiler --fracs pins a budget fraction on a compact server whose
+    SPS table is still uninitialized (verify-all); the pinned budget must shape
+    the layout instead of the cached full-width one."""
+
+    BS = 4
+    GAMMA = 5
+
+    def _planner(self):
+        num_draft_tokens = self.GAMMA + 1
+        model_runner = _fake_model_runner(
+            [num_draft_tokens * n for n in range(1, 9)], max_bs=8
+        )
+        model_runner.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.zeros((16, 1), dtype=torch.int32)
+        )
+        cfg = DSparkScheduleConfig(gamma=self.GAMMA)
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner.model_runner = model_runner
+        planner.verify_num_draft_tokens = num_draft_tokens
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._schedule_cfg = cfg
+        planner._is_verify_all = True
+        planner._uniform_layout_cache = {}
+        planner._dynamic_graph_tier = True
+        planner._align_verify_tokens_to_graph_tier = False
+        planner._tp_sync = types.SimpleNamespace(sync=lambda *args: None)
+        planner._budget_planner = HostConfidenceBudgetPlanner(
+            sps_table=build_uninitialized_sps_table(max_batch_tokens=8 * 6),
+            cfg=cfg,
+            model_runner=model_runner,
+        )
+        return planner
+
+    def _schedule(self, planner):
+        req_pool_indices = torch.arange(self.BS)
+        generation = torch.ones(self.BS, dtype=torch.int64)
+        confidence = torch.full((self.BS, self.GAMMA), 0.9)
+        budget = planner._budget_planner.compute_budget(
+            confidence=confidence,
+            generation=generation,
+            current_generation=generation,
+            req_pool_indices_cpu=req_pool_indices,
+        )
+        layout = planner.schedule_layout(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=torch.zeros(self.BS, dtype=torch.int64),
+            device=torch.device("cpu"),
+            confidence=confidence,
+            budget=budget,
+        )
+        return budget, layout
+
+    def test_pinned_budget_shapes_the_layout(self):
+        planner = self._planner()
+        full_width = self.BS * (self.GAMMA + 1)
+
+        _, uniform = self._schedule(planner)
+        self.assertEqual(uniform.verify_lens.tolist(), [self.GAMMA + 1] * self.BS)
+        self.assertEqual(uniform.graph_num_tokens, full_width)
+
+        planner.set_forced_budget_frac(0.4)
+        budget, pinned = self._schedule(planner)
+        total = int(pinned.verify_lens.sum())
+        self.assertEqual(budget, int(0.4 * self.BS * self.GAMMA))
+        self.assertEqual(total, self.BS + budget)
+        self.assertLess(pinned.graph_num_tokens, full_width)
+        self.assertEqual(pinned.graph_num_tokens, 12)
+
+        planner.set_forced_budget_frac(None)
+        _, cleared = self._schedule(planner)
+        self.assertIs(cleared, uniform)
 
 
 if __name__ == "__main__":
