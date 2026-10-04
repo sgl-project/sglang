@@ -539,7 +539,14 @@ IONIC_EOF
     printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
 } > "$WORKDIR/stage_check.sh"
 # Same channel for the recipe's RDMA device list, which drive.sh narrows on spur
-# to the ports that are actually up (see the PORT_ACTIVE check there).
+# to the ports that are actually up (see the PORT_ACTIVE check there). That
+# check rewrites the list in place with sed, using it as the pattern, so a stray
+# "/" or regex character from a recipe typo would break the edit halfway
+# through the generated scripts. Reject it here, before anything is allocated.
+if [[ -n "$IB" && ! "$IB" =~ ^[A-Za-z0-9_,]+$ ]]; then
+    echo "ERROR: runtime.ib_devices '$IB' must be a comma-separated list of device names" >&2
+    exit 1
+fi
 printf 'IB_RECIPE=%q\n' "$IB" > "$WORKDIR/ib_check.sh"
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
@@ -1501,17 +1508,25 @@ fi
 # list into the generated server scripts before anything is launched.
 #
 # If that leaves fewer devices than the recipe asked for, top the list back up
-# with other rdma* ports that are ACTIVE on every node. The 1p1d recipes name
+# with other ports that are ACTIVE on every node. The 1p1d recipes name
 # rdma0..3, and a node can lose exactly those: on 2026-10-02 g02 had only
 # rdma4..7 up (its rdma0..3 had come back as unrenamed rocep* devices, DOWN),
 # so every pair that included it had no usable recipe port at all. A port off
 # the recipe's list may sit further from the GPU, but it works; a dead one
-# does not.
+# does not. Candidates are picked by state, not name: rdmaN vs rocep* reflects
+# whether the port was up at boot, so a rocep* port that links later is just
+# as usable. It still has to carry the same name on every node, though, and
+# the same slot is usually rdmaN elsewhere; pairing ports by PCI slot across
+# nodes would need a different list per node, which this does not do.
+#
+# A list that is still short changes the numbers (KV throughput scales with
+# HCA count), so that case is written to ib_warn for the launcher to put in
+# the job summary -- this log is only read when the leg fails.
 source "$WORKDIR/ib_check.sh"
 if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
   IFS=',' read -ra _ib_want <<< "$IB_RECIPE"
   _ib_live=("${_ib_want[@]}")
-  _ib_spare=()       # non-recipe rdma* ports ACTIVE on every node checked so far
+  _ib_spare=()       # non-recipe ports ACTIVE on every node checked so far
   _ib_spare_init=0
   # Every port on the node, not just the recipe's, so there is something to
   # fall back to. __ok__ separates "the step ran" from a flaky srun dispatch,
@@ -1541,7 +1556,7 @@ if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
       fi
     done
     _ib_live=("${_ib_keep[@]}")
-    mapfile -t _ib_active < <(sed -nE 's/^(rdma[0-9]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
+    mapfile -t _ib_active < <(sed -nE 's/^([^ ]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
     if (( ! _ib_spare_init )); then
       _ib_spare=()
       for d in "${_ib_active[@]}"; do
@@ -1566,12 +1581,16 @@ if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
   fi
   IB_LIVE="$(IFS=,; echo "${_ib_live[*]}")"
   if [[ -z "$IB_LIVE" ]]; then
-    echo "ERROR: no rdma port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
+    echo "ERROR: no RDMA port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
     exit 1
   fi
   _ib_note=""
   (( ${#_ib_added[@]} )) && _ib_note=" (off-recipe fallback: ${_ib_added[*]})"
   (( ${#_ib_unchecked[@]} )) && _ib_note="$_ib_note (unchecked: ${_ib_unchecked[*]})"
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} )); then
+    echo "WARN: running on ${#_ib_live[@]} of ${#_ib_want[@]} requested RDMA devices ($IB_LIVE; recipe $IB_RECIPE)$_ib_note -- throughput is not comparable to a full-rail run" \
+      | tee "$WORKDIR/ib_warn" >&2
+  fi
   if [[ "$IB_LIVE" != "$IB_RECIPE" ]]; then
     echo "[drive] RDMA devices changed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
     # The list appears only as a whole flag/env value, after a space or "=".
@@ -2003,13 +2022,41 @@ if [[ "$SALLOC_RC" -ne 0 ]]; then
     done
     # 30 lines was not enough: a scheduler traceback plus the shutdown that
     # follows it pushed the line naming the cause out of the window. Lead with
-    # the first error lines, since the tail is mostly teardown noise.
+    # the first error lines, then print the log from the first of them -- the
+    # traceback and what follows it -- rather than a fixed tail, which is
+    # mostly teardown noise. Capped, since an early harmless match would
+    # otherwise print the whole log; the last lines are kept either way.
     for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
         [[ -f "$f" ]] || continue
         echo "--- $f (first errors) ---"
         grep -anE 'Traceback|Error|FATAL|Killed' "$f" | head -20 || true
-        echo "--- $f (tail) ---"; tail -150 "$f"
+        _first=$(grep -anm1 -E 'Traceback|Error|FATAL|Killed' "$f" | cut -d: -f1 || true)
+        _total=$(wc -l < "$f")
+        if [[ -z "$_first" ]]; then
+            echo "--- $f (tail; no error lines) ---"; tail -60 "$f"
+        elif (( _total - _first < 150 )); then
+            echo "--- $f (from line $_first, first error) ---"; sed -n "${_first},\$p" "$f"
+        else
+            echo "--- $f (lines $_first-$((_first + 119)), from first error) ---"
+            sed -n "${_first},$((_first + 119))p" "$f"
+            echo "--- $f (last 30 of $_total lines) ---"; tail -30 "$f"
+        fi
     done
+fi
+
+# drive.sh leaves ib_warn when fewer RDMA devices were up on every node than
+# the recipe asked for. The leg can still pass, so put it where a green run's
+# numbers are read, not just in a log nobody opens.
+if [[ -s "$WORKDIR/ib_warn" ]]; then
+    echo "::warning title=RDMA devices reduced (${MATRIX_CONFIG_NAME})::$(cat "$WORKDIR/ib_warn")"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "### RDMA devices reduced — ${MATRIX_CONFIG_NAME}"
+            echo '```'
+            cat "$WORKDIR/ib_warn"
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    fi
 fi
 
 # Surface the GSM8K accuracy in the job summary -- it scrolls past in the live
