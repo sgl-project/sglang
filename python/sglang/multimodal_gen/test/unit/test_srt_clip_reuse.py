@@ -57,7 +57,7 @@ def test_clip_attention_separates_text_and_vision_semantics():
     padding_mask = torch.zeros(2, 1, 3, 3)
 
     with (
-        get_parallel().override(tp_size=1, attn_tp_size=1, attn_tp_rank=0),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
         patch.object(srt_clip, "QKVParallelLinear", return_value=_FakeQKV()),
         patch.object(srt_clip, "RowParallelLinear", return_value=_FakeProjection()),
         patch.object(

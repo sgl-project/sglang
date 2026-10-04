@@ -142,3 +142,58 @@ def test_overlay_uses_pinned_source_weights(tmp_path, monkeypatch, repair_cache)
     newer = Path(resolve())
     assert (newer / "transformer/model.safetensors").read_text() == "newer"
     assert original != newer
+
+
+def test_registry_source_revision_survives_upstream_removing_required_file(
+    tmp_path, monkeypatch
+):
+    """An overlay whose source repo later deleted a required file still resolves
+    on a host with an empty cache, because both source downloads use the pin."""
+    pinned = "4187f9a53c6eff3a76c51e79bd27f70d10f7591b"
+    monkeypatch.setenv("SGLANG_DIFFUSION_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        model_overlay,
+        "_load_model_overlay_registry",
+        lambda: {
+            "org/source": {
+                "overlay_repo_id": "org/source-overlay",
+                "overlay_revision": "overlay-sha",
+                "source_revision": pinned,
+            }
+        },
+    )
+    overlay_dir = tmp_path / "overlay"
+    (overlay_dir / "_overlay").mkdir(parents=True)
+    (overlay_dir / "_overlay" / "overlay_manifest.json").write_text(
+        '{"source_model_id": "org/source",'
+        ' "required_source_files": ["release.safetensors"]}'
+    )
+
+    def source_snapshot(revision):
+        # Upstream main no longer ships the file; the pinned commit does.
+        snapshot = tmp_path / f"source-{revision}"
+        snapshot.mkdir(exist_ok=True)
+        if revision == pinned:
+            (snapshot / "release.safetensors").write_bytes(b"w")
+        return str(snapshot)
+
+    def snapshot_download_fn(*, repo_id, revision=None, **_):
+        if repo_id == "org/source-overlay":
+            return str(overlay_dir)
+        return source_snapshot(revision)
+
+    def base_model_download_fn(model_id, *, revision=None, **_):
+        return source_snapshot(revision)
+
+    resolved = model_overlay.maybe_resolve_overlay_model_path(
+        "org/source",
+        local_dir=None,
+        download=True,
+        allow_patterns=None,
+        snapshot_download_fn=snapshot_download_fn,
+        hf_hub_download_fn=lambda **_: None,
+        verify_diffusers_model_complete_fn=lambda _: True,
+        base_model_download_fn=base_model_download_fn,
+    )
+
+    assert os.path.isdir(resolved)

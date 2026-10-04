@@ -757,6 +757,50 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
             self.assertIsNotNone(_device_value(cache, node_id, ComponentType.FULL))
         return cache, first, second, leaf
 
+    def test_swa_write_back_host_full_preserves_full_and_continues(self):
+        ct = ComponentType.SWA
+        for session in _session_radix_cache_test_values():
+            for pinned in (False, True):
+                with self.subTest(session=session, pinned=pinned):
+                    # This exercises the Rust backup barrier, independently of
+                    # the shared suite's default backend.
+                    with mock.patch(f"{__name__}._TREE_CORE_TEST_BACKEND", "rust"):
+                        cache, first, second, leaf = self._build_internal_chain(
+                            ct, session
+                        )
+                    cache.tree_core.is_write_back = True
+                    cache.tree_core.has_swa_host_pool = True
+                    cache.tree_core.enable_swa_write_back_eviction_barrier()
+                    if session:
+                        # Session caches use main's Python fallback, whose
+                        # component backup is gated by the HiCache attachment.
+                        cache.tree_core.enable_hicache = True
+                        cache.host_pool_group = mock.Mock()
+                        cache.host_pool_group.get_pool.return_value = None
+                    if pinned:
+                        receipt = cache.inc_host_lock_ref(first).to_dec_params()
+                    tracker = {ComponentType.FULL: 0, ct: 0}
+                    # Only host allocation fails; tree walking and freeing are real.
+                    with (
+                        mock.patch.object(cache, "cache_controller", mock.Mock()),
+                        mock.patch.object(
+                            cache, "_execute_and_commit_kv_backup", return_value=0
+                        ) as backup,
+                    ):
+                        cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)
+                    backup.assert_called_once()
+                    self.assertEqual(tracker[ct], 2)
+                    self.assertEqual(tracker[ComponentType.FULL], 0)
+                    for node_id in (first, second, leaf):
+                        self.assertIsNotNone(
+                            _device_value(cache, node_id, ComponentType.FULL)
+                        )
+                    if pinned:
+                        # A host pin does not pin a device-only SWA value.
+                        self.assertIsNone(_device_value(cache, first, ct))
+                        cache.dec_host_lock_ref(first, receipt)
+                    cache.sanity_check()
+
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}
@@ -1092,6 +1136,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
                 host_indices=torch.empty(0, dtype=torch.int64),
                 aux_xfers=[],
                 lock_params=lock_params,
+                occupied_units=0,
             )
         }
         cache.buffer_pipeline = pipeline
@@ -9168,6 +9213,39 @@ def _component_with_cache(component_type, cache):
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
 
+    def test_retraction_uses_engine_transfer_index_domains(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.is_swa_enabled = True
+        cache._sliding_window_size = 3
+        cache.tree_core = mock.Mock(page_size=2)
+        cache.page_size = 2
+        cache.sidecar_pool_specs = ()
+        cache.req_to_token_pool = mock.Mock()
+        cache.req_to_token_pool.req_to_token = torch.tensor(
+            [[1, 2, 3, 4, 5, 0]], dtype=torch.int64
+        )
+        cache.token_to_kv_pool_allocator = mock.Mock()
+        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.side_effect = (
+            lambda indices: indices + 100
+        )
+        req = mock.Mock(rid="req", seqlen=6)
+        req.kv.req_pool_idx = 0
+
+        full_indices, transfers = cache._retraction_device_transfers(req)
+
+        self.assertTrue(torch.equal(full_indices, torch.tensor([1, 2, 3, 4, 5, 6])))
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(transfers[0].name, PoolName.SWA)
+        self.assertTrue(
+            torch.equal(
+                transfers[0].device_indices,
+                torch.tensor([103, 104, 105, 106]),
+            )
+        )
+        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.assert_called_once()
+        cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_not_called()
+        cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_not_called()
+
     def test_backup_publish_node_ids_collects_component_nodes_once(self):
         comp_xfers = {
             ComponentType.SWA: [PoolTransfer(name=PoolName.SWA, nodes_to_load=[3, 4])],
@@ -9252,12 +9330,13 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
         source_value = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([7, 8], dtype=torch.int64)
+        alloc.translate_swa_indices_for_transfer.return_value = swa_value
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             SWARebuild(node_id=5, source_value=source_value),
         )
         # translate the source full to SWA and store it on the node (no free)
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(source_value)
+        alloc.translate_swa_indices_for_transfer.assert_called_once_with(source_value)
         alloc.free.assert_not_called()
         alloc.free_full.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
@@ -9269,7 +9348,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc = cache.token_to_kv_pool_allocator
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([7, 8], dtype=torch.int64)
+        alloc.translate_swa_indices_for_transfer.return_value = swa_value
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -9278,7 +9358,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             ),
         )
         # keep the locked full, remap it onto the incoming full's SWA translation
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
+        alloc.translate_swa_indices_for_transfer.assert_called_once_with(incoming_full)
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
@@ -10703,15 +10783,21 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
                 anchor_node_id=99,
                 prefetch_key=RadixKey(array("q", range(16))),
                 host_indices=host_indices,
-                operation=mock.Mock(),
+                operation=mock.Mock(
+                    buffer_host_occupied_units=4, pool_transfers_done=True
+                ),
                 anchor_lock_params=None,
                 comp_xfers={},
             )
         }
         cache.ongoing_backup = {}
         cache.host_memory_mode = "buffer_only"
-        cache._prefetch_occupied_span.side_effect = lambda key, indices: (
-            UnifiedRadixCache._prefetch_occupied_span(cache, key, indices)
+        cache._prefetch_occupied_span.side_effect = (
+            lambda key, indices, *, operation=None: (
+                UnifiedRadixCache._prefetch_occupied_span(
+                    cache, key, indices, operation=operation
+                )
+            )
         )
         controller = cache.cache_controller
         controller.terminate_prefetch.return_value = (4, None)
@@ -11249,7 +11335,10 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         )
         req = self._streaming_req(node, lock, session=session)
         req.finished_reason = FINISH_ABORT()
-        self.assertTrue(cache.session.try_cache_finished_req(req))
+        # The session leaves an abort to the normal release, whose unpin
+        # must not release the SWA lock a second time.
+        self.assertFalse(cache.session.try_cache_finished_req(req))
+        cache.unpin(req)
         cache.sanity_check()
 
 
