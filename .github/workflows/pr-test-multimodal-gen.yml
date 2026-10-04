@@ -74,12 +74,7 @@ jobs:
 
   multimodal-gen-test-1-gpu:
     needs: compute-diffusion-partitions
-    if: |
-      always() &&
-      needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
@@ -147,9 +142,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-1-5090:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: 1-gpu-5090
     timeout-minutes: 180
     steps:
@@ -212,9 +205,7 @@ jobs:
           artifact-suffix: 1-gpu-5090
 
   bcg-diffusion:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 90
     steps:
@@ -267,18 +258,14 @@ jobs:
           artifact-suffix: bcg-diffusion
 
   multimodal-gen-test-2-gpu:
-    needs: compute-diffusion-partitions
-    if: |
-      always() &&
-      needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    # DEBUG ltx_2_5 repro: two runners, fixed matrix, longer budget.
+    if: inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 45
+    timeout-minutes: 85
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
+      matrix:
+        part: [0, 1]
     steps:
       - name: Record retry deadline
         run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
@@ -287,8 +274,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -305,40 +290,74 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run diffusion server tests
-        timeout-minutes: 45
+      - name: Run ltx_2_5 repro
+        timeout-minutes: 62
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
-          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
-          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
-          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
-          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          OUT: ${{ github.workspace }}/ltx25-repro
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-2-gpu-h100 \
-            --timeout-per-file 14400
+          set -uo pipefail
+          mkdir -p "$OUT"
+          CASE=ltx_2_5_diffusion_decoder_2gpus
+          CASES_FILE=python/sglang/multimodal_gen/test/server/gpu_cases.py
+          {
+            echo "runner=${RUNNER_NAME:-} host=$(hostname) nproc=$(nproc)"
+            free -g; cat /proc/loadavg
+            nvidia-smi; nvidia-smi topo -m
+            python3 -c "import sys,torch,triton; print(sys.version); print('torch', torch.__version__, 'triton', triton.__version__)"
+          } > "$OUT/host.txt" 2>&1
+          cat "$OUT/host.txt"
+          nvidia-smi --query-gpu=timestamp,index,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,memory.used,clocks_throttle_reasons.active --format=csv -l 5 > "$OUT/gpu_samples.csv" 2>&1 &
+          SMI_PID=$!
+          ( while true; do echo "== $(date -u +%FT%TZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader; sleep 15; done ) > "$OUT/host_samples.txt" 2>&1 &
+          HOST_PID=$!
+          cleanup() {
+            kill "$SMI_PID" "$HOST_PID" 2>/dev/null || true
+            git checkout -- "$CASES_FILE" || true
+            pkill -f "sglang serve" 2>/dev/null || true
+            sleep 5
+            echo "GPU processes left after repro:"; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+          }
+          trap cleanup EXIT
+          printf "launch\tarm\trc\twall_s\twarmup_s\tavg_step_s\n" > "$OUT/summary.tsv"
+          i=0
+          # A = as in CI, B = expandable_segments allocator, C = transformer and text encoder resident.
+          for ARM in A C B A C B A; do
+            i=$((i+1))
+            git checkout -- "$CASES_FILE"
+            ALLOC_CONF=""
+            if [ "$ARM" = B ]; then ALLOC_CONF="expandable_segments:True"; fi
+            if [ "$ARM" = C ]; then
+              sed -i 's/transformer=component-offload,text_encoder=component-offload/transformer=resident,text_encoder=resident/' "$CASES_FILE"
+            fi
+            rm -f /tmp/sgl_server_*LTX-2.5*.log python/diffusion-results.json
+            echo "::group::launch $i arm $ARM"
+            t0=$(date +%s)
+            (cd python && PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" TRITON_PRINT_AUTOTUNING=1 timeout 840 \
+              python3 -m pytest -q -s sglang/multimodal_gen/test/server/test_server_2_gpu.py -k "$CASE") > "$OUT/launch_${i}_${ARM}.log" 2>&1
+            rc=$?
+            wall=$(( $(date +%s) - t0 ))
+            cp /tmp/sgl_server_*LTX-2.5*.log "$OUT/server_${i}_${ARM}.log" 2>/dev/null || true
+            cp python/diffusion-results.json "$OUT/results_${i}_${ARM}.json" 2>/dev/null || true
+            avg=$(cat "$OUT/launch_${i}_${ARM}.log" "$OUT/server_${i}_${ARM}.log" 2>/dev/null | grep -o "average time per step: [0-9.]*" | tail -1 | awk '{print $NF}')
+            w0=$(cat "$OUT/launch_${i}_${ARM}.log" "$OUT/server_${i}_${ARM}.log" 2>/dev/null | grep -m1 "Warmup requests: 0/1" | grep -o "[0-9][0-9]:[0-9][0-9]:[0-9][0-9]" | head -1)
+            w1=$(cat "$OUT/launch_${i}_${ARM}.log" "$OUT/server_${i}_${ARM}.log" 2>/dev/null | grep -m1 "Warmup requests: 1/1" | grep -o "[0-9][0-9]:[0-9][0-9]:[0-9][0-9]" | head -1)
+            wu=""
+            if [ -n "$w0" ] && [ -n "$w1" ]; then wu=$(( $(date -d "$w1" +%s) - $(date -d "$w0" +%s) )); fi
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$i" "$ARM" "$rc" "$wall" "$wu" "${avg:-NA}" | tee -a "$OUT/summary.tsv"
+            echo "::endgroup::"
+          done
+          echo "=== summary (runner ${RUNNER_NAME:-}) ==="; cat "$OUT/summary.tsv"
+          exit 0
 
-      - name: Upload execution report
+      - name: Upload repro artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-report-2gpu-${{ matrix.part }}
-          path: |
-            python/sglang/multimodal_gen/test/execution_report_*.json
-            python/diffusion-results.json
-          retention-days: 7
-
-      - name: Upload diffusion failure artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diffusion-failures-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
-          path: diffusion-failures/
-          if-no-files-found: ignore
+          name: ltx25-repro-${{ matrix.part }}
+          path: ltx25-repro/
           retention-days: 7
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -347,9 +366,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-component-accuracy:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     steps:
@@ -392,9 +409,7 @@ jobs:
           artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -457,9 +472,7 @@ jobs:
         if: failure()
 
   multimodal-gen-unit-test:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
@@ -495,15 +508,7 @@ jobs:
 
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
-    if: |
-      always() &&
-      inputs.multimodal_gen == 'true' &&
-      (
-        needs.multimodal-gen-test-1-gpu.result == 'success' ||
-        needs.multimodal-gen-test-1-gpu.result == 'failure' ||
-        needs.multimodal-gen-test-2-gpu.result == 'success' ||
-        needs.multimodal-gen-test-2-gpu.result == 'failure'
-      )
+    if: false  # DEBUG ltx_2_5 repro: only the 2-GPU repro job runs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
