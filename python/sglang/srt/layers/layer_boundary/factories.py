@@ -96,6 +96,7 @@ def _resolve_ffn(
     read=NORM_READOUT,
     update=PLAIN_ADD,
     dense_tp_size=None,
+    output_complete=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.tp_size):
@@ -167,7 +168,7 @@ def _resolve_ffn(
         )
     )
     # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update is REPLACE_AT_EXIT
+    complete = on_rank_rows or update is REPLACE_AT_EXIT or output_complete
     produced = (
         OutputContract(rows, update=update, transform=output_transform)
         if complete
@@ -222,6 +223,9 @@ class StageDeclaration:
         exit_rows: Required FFN output rows at the layer or branch exit.
         writes_at_handoff: Whether this FFN writes its output into the residual
             at its exit because the next stage is on another pipeline rank.
+        output_complete: Whether the FFN's compute completes its own output
+            sum, so the exit owes none. For an FFN whose output sum is fused
+            with a reduction its computation needs anyway.
         previous: Declaration whose output this stage consumes, as the stack
             records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
@@ -242,6 +246,7 @@ class StageDeclaration:
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
+    output_complete: bool = False
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -329,6 +334,7 @@ def declare_ffn(
     next_layer_sparse=False,
     dense_tp_size=None,
     exit_rows=None,
+    output_complete=False,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -343,6 +349,8 @@ def declare_ffn(
             compute, or the full TP size.
         exit_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
+        output_complete: Whether the compute completes its own output sum,
+            fused with a reduction it needs anyway; the exit then owes none.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -355,6 +363,7 @@ def declare_ffn(
         output_transform=output_transform,
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
+        output_complete=output_complete,
     )
 
 
@@ -378,6 +387,7 @@ def _resolve_stage(stage, variant, following=None):
             read=stage.read,
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
+            output_complete=stage.output_complete,
         )
         if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
             returned = attention

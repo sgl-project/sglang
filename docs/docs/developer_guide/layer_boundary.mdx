@@ -178,6 +178,8 @@ Compute never sums a stage's output: build every output projection, MLP and MoE 
 - `FfnExit` decides before compute runs whether the exit completes the sum, a reduce-scatter on the way back completes it, or the next input does. It publishes only `defer_moe_finalize` on `get_forward()`: a MoE may then return a `DeferredFinalize`.
 - `MixerExit`: before an FFN, the mixer always leaves its attention-TP sum to the FFN's input, including under attention DP. Before another mixer the exit may carry the sum to that mixer's input, but never under attention DP; otherwise it completes the sum itself.
 
+One exception: when an FFN's output sum is fused with a reduction its computation needs anyway, so the two cannot be separated without an extra collective, the computation completes it and the stage declares `declare_ffn(output_complete=True)`; the exit then owes no sum. Kimi K3's latent MoE reduces its latent before the latent norm and completes the shared experts' sum beside it.
+
 A component every TP rank computes in full (a shared expert replicated with `tp_size=1`, LoRA-B on a partial sum) is added on TP rank 0 only, so that the one sum counts it once. Model loading fails if a module under a stage boundary is built with `reduce_results=True`. Returning a handoff while `defer_moe_finalize` is false fails in `finish()`.
 
 A complete tensor after `finish()` can still have a pending **residual update**. An incomplete reduction is exposed to the model as an opaque `OwedOutput`; pass it to the next boundary or a supported access method. Do not inspect it as a tensor, slice it, or unwrap its contribution in model code.
