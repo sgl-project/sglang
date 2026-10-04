@@ -262,6 +262,27 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # Same shape as the FlashKDA guard above. chunk_kimi_delta_attn is
+    # prefill-only. AITER's fused KDA decode has its own path
+    # (SGLANG_ROCM_K3_KDA_FUSED_BACKEND), not this backend choice.
+    if decode == "aiter":
+        if cfg.linear_attn_decode_backend == "aiter":
+            raise ValueError(
+                "--linear-attn-decode-backend aiter is not supported: the AITER "
+                "linear-attention kernel is prefill-only. Use "
+                "--linear-attn-prefill-backend aiter (decode stays on triton)."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_decode_backend="triton",
+        )
+        decode = "triton"
+        logger.info(
+            "The AITER linear-attention kernel is prefill-only; using triton for "
+            "KDA decode (AITER stays on prefill)."
+        )
+
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"

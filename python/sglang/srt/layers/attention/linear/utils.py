@@ -19,6 +19,7 @@ def pp_spec_stable_rows_enabled() -> bool:
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    AITER = "aiter"
     CUTEDSL = "cutedsl"
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
@@ -35,6 +36,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_aiter(self):
+        return self == LinearAttnKernelBackend.AITER
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL
