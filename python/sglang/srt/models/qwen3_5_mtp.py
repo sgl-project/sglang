@@ -105,6 +105,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             _mtp_quant_config(quant_config),
         )
 
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     def __init__(
         self,
         config: PretrainedConfig,

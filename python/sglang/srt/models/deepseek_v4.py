@@ -173,6 +173,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_cuda,
     _is_hip,
     _is_npu,
+    _is_ppu,
     _is_xpu,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
@@ -188,6 +189,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
+
+if not _is_hip:
+    pass
+
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -4839,6 +4845,33 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        packed_modules_mapping["wqkv_a"] = ["wq_a", "wkv"]
+
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+        orig_to_new_prefix={
+            "mtp.0.self_attn": "model.decoder.self_attn",
+            "mtp.0.mlp": "model.decoder.mlp",
+            "mtp.0.e_proj": "model.e_proj",
+            "mtp.0.h_proj": "model.h_proj",
+        },
+    )
 
     def __init__(
         self,
@@ -5224,6 +5257,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> str:
         if name.startswith("vision."):
             return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
@@ -5287,6 +5321,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+
+        if _is_ppu:
+            if quant_config and quant_config.get_name() == "fp8":
+                if quant_config.is_fp4_experts and "mlp.experts" in name:
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+            else:
+                name = name.replace(".weight_scale_inv", ".weight_scale")
 
         return name
 
@@ -5448,6 +5489,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        quant_config=self.quant_config,
                     )
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
@@ -5640,8 +5682,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and ".engram." not in name
                                 and (
                                     name.endswith(".wq_a.weight")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wkv.weight_scale_inv")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")

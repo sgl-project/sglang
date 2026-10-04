@@ -221,6 +221,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
@@ -336,20 +337,13 @@ class Mxfp4Config(QuantizationConfig):
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
         fp8_channelwise_layers: Optional[list[str]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
         self.fp8_channelwise_layers = fp8_channelwise_layers
-        # TODO: better solution to confirm packed modules
-        self.packed_modules_mapping = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            "gate_up_proj": ["gate_proj", "up_proj"],
-            "fused_qkv_a_proj_with_mqa": [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ],  # for kimi-2.5
-        }
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     @classmethod
     def from_config(cls, config):
@@ -361,6 +355,9 @@ class Mxfp4Config(QuantizationConfig):
         )
         fp8_channelwise_layers = cls.get_from_keys_or(
             config, ["fp8_channelwise_layers"], None
+        )
+        packed_modules_mapping = cls.get_from_keys_or(
+            config, ["packed_modules_mapping"], None
         )
 
         if _is_hip:
@@ -378,6 +375,7 @@ class Mxfp4Config(QuantizationConfig):
             ignored_layers=ignored_layers,
             is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
             fp8_channelwise_layers=fp8_channelwise_layers,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     @classmethod
@@ -398,6 +396,14 @@ class Mxfp4Config(QuantizationConfig):
 
     def is_static_cfg(self):
         return self.is_checkpoint_mxfp4_serialized
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        if self.ignored_layers:
+            self.ignored_layers = hf_to_sglang_mapper.apply_list(self.ignored_layers)
+        if self.fp8_channelwise_layers:
+            self.fp8_channelwise_layers = hf_to_sglang_mapper.apply_list(
+                self.fp8_channelwise_layers
+            )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

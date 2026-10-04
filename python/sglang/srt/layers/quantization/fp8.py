@@ -411,6 +411,13 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8OnlineMoEMethod(self)
 
+            if self.is_fp4_experts and _is_ppu:
+                from sglang.srt.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(prefix=prefix)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
