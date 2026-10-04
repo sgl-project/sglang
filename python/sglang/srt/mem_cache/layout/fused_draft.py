@@ -51,7 +51,7 @@ from typing import List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.layout.token_major import DensePart
+from sglang.srt.mem_cache.layout.token_major import ROW_ALIGN_BYTES, DensePart
 
 
 class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
@@ -239,6 +239,14 @@ def place_fused_draft(
                 "the draft's K/V rows are asymmetric "
                 f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}), "
                 "which is not admitted yet"
+            )
+        )
+    row_bytes = geometry.head_num * geometry.head_dim * store_dtype.itemsize
+    if row_bytes % ROW_ALIGN_BYTES:
+        return FusedDraftDecision(
+            declined=(
+                f"the draft's K/V rows are {row_bytes} B, not a multiple of the "
+                f"{ROW_ALIGN_BYTES}-B row alignment a fused entry part needs"
             )
         )
     full_counts = tuple(full for full, _ in counts)

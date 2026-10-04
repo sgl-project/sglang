@@ -98,10 +98,12 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 9).placement)
 
-    def test_swa_and_asymmetric_drafts_decline(self):
+    def test_swa_asymmetric_and_misaligned_drafts_decline(self):
         for profile in (
             _profile(swa_layer_ids=(0,)),
             _profile(head_dim=64, v_head_dim=32),
+            # 4 heads x 5 dims x 2 B = 40 B: not a 16-B-aligned entry part.
+            _profile(head_dim=5, v_head_dim=5),
         ):
             decision = _place(profile)
             self.assertIsNone(decision.placement)
