@@ -78,10 +78,8 @@ class ExaoneMoEMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         *,
-        parallel_group: Optional[LinearParallelGroup] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         gateup_quant_config = quant_config
@@ -98,8 +96,6 @@ class ExaoneMoEMLP(nn.Module):
             bias=False,
             quant_config=gateup_quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
@@ -109,8 +105,6 @@ class ExaoneMoEMLP(nn.Module):
             quant_config=down_quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             parallel_group=parallel_group,
             allocation_group="tp" if parallel_group == "replicated" else None,
         )
@@ -316,7 +310,6 @@ class ExaoneMoEAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -366,8 +359,8 @@ class ExaoneMoEAttention(nn.Module):
             quant_config=o_quant_config,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
+            allocation_group="tp",
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)

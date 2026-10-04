@@ -144,6 +144,55 @@ class TestLinearParallelGroups(CustomTestCase):
                     self.assertEqual(attention.q_size, shards["q"].shape[0])
                     self.assertEqual(attention.kv_size, shards["k"].shape[0])
 
+    def test_exaone_attention_output_keeps_tp_allocation_and_partial_results(self):
+        from sglang.srt.models.exaone_moe import ExaoneMoEAttention
+
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        attn = SimpleNamespace(world_size=2, all_reduce=Mock())
+        for bias in (False, True):
+            for symmetric in (False, True):
+                with self.subTest(bias=bias, symmetric=symmetric):
+                    attention = ExaoneMoEAttention(
+                        config=SimpleNamespace(
+                            rms_norm_eps=1e-6, layer_types=["full_attention"]
+                        ),
+                        hidden_size=8,
+                        num_heads=4,
+                        num_kv_heads=1,
+                        max_position_embeddings=16,
+                        bias=bias,
+                    )
+                    row = attention.o_proj
+                    with get_parallel().override(
+                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                    ):
+                        row.weight.weight_loader(row.weight, self.weight)
+                        if bias:
+                            row.bias.weight_loader(row.bias, torch.arange(8).float())
+                    self.assertEqual((row.tp_rank, row.tp_size), (1, 2))
+                    self.assertEqual(attention.q_size, row.input_size_per_partition)
+                    self.assertFalse(row.reduce_results)
+                    # The boundary reduces this partial result. Its allocation
+                    # still uses TP and the DP-padding condition.
+                    with (
+                        get_parallel().override(tp_group=tp, attn_tp_group=attn),
+                        patch(
+                            "sglang.srt.layers.linear.is_allocation_symmetric",
+                            return_value=symmetric,
+                        ),
+                        patch(
+                            "sglang.srt.layers.linear.use_symmetric_memory",
+                            return_value=nullcontext(),
+                        ) as allocation,
+                    ):
+                        torch.testing.assert_close(
+                            row(self.x[:, 4:])[0],
+                            F.linear(self.x[:, 4:], self.weight[:, 4:]),
+                        )
+                        allocation.assert_called_once_with(tp, disabled=not symmetric)
+                    tp.all_reduce.assert_not_called()
+                    attn.all_reduce.assert_not_called()
+
     def test_model_gate_projections_reload_on_their_attention_shards(self):
         from sglang.srt.models.laguna import LagunaAttention
         from sglang.srt.models.step3p5 import Step3p5Attention
@@ -374,7 +423,10 @@ class TestLinearParallelGroups(CustomTestCase):
             Qwen2MoeMLP,
             Step3p5MLP,
         ):
-            for group, rank, size in (("tp", 3, 4), ("replicated", 0, 1)):
+            groups = [("tp", 3, 4), ("replicated", 0, 1)]
+            if cls is ExaoneMoEMLP:
+                groups.insert(0, (None, 3, 4))
+            for group, rank, size in groups:
                 with self.subTest(model=cls.__name__, group=group):
                     options = dict(
                         intermediate_size=8,
@@ -387,6 +439,8 @@ class TestLinearParallelGroups(CustomTestCase):
                         options["hidden_size"] = 8
                         if cls is not Step3p5MLP:
                             options["hidden_act"] = "silu"
+                    if group is None:
+                        options.pop("parallel_group")
                     mlp = cls(**options)
                     # Use native activation for CPU weight and layout checks.
                     mlp.act_fn._forward_method = mlp.act_fn.forward_native
