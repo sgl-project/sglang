@@ -1963,6 +1963,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             reps = torch.cat(pending)
             self.free(reps, _pages=reps // self.page_size)
 
+    def _set_capacity(
+        self, max_slots: int, *, virtual_num_pages: Optional[int] = None
+    ) -> None:
+        """Set active ranges while retaining the captured v2p/p2v storage."""
+        num_pages = int(max_slots) // self.page_size
+        num_virtual_ids = (
+            num_pages if virtual_num_pages is None else int(virtual_num_pages)
+        )
+        self.num_pages = num_pages
+        self.num_virtual_ids = num_virtual_ids
+        self.max_slots = num_pages * self.page_size
+        self.size = self.max_slots
+        self.clear()
+
     _pending_hicache_load_pages: _CapacityField[int] = _CapacityField()
 
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:

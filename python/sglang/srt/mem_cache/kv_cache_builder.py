@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -58,10 +59,7 @@ from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -253,13 +251,8 @@ def build_kv_cache(
     tp_worker: BaseTpWorker,
     page_size: int,
     spec_algorithm: SpeculativeAlgorithm,
-    attn_tp_cpu_group: ProcessGroup,
-    tp_cpu_group: ProcessGroup,
-    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    tp_group: GroupCoordinator,
-    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
@@ -345,12 +338,10 @@ def build_kv_cache(
             else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
-        tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().attn_dp_enabled else tp_cpu_group
-        ),
-        attn_cp_cache_group=attn_cp_cpu_group,
-        attn_tp_cache_group=attn_tp_cpu_group,
-        pp_cache_group=pp_group.cpu_group,
+        tp_cache_group=get_dp_tp_group().cpu_group,
+        attn_cp_cache_group=parallel.attn_cp_group.cpu_group,
+        attn_tp_cache_group=parallel.attn_tp_group.cpu_group,
+        pp_cache_group=parallel.pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
@@ -381,7 +372,7 @@ def build_kv_cache(
         model_config=model_config,
         tp_size=parallel.tp_size,
         tp_rank=parallel.tp_rank,
-        tp_group=tp_group,
+        tp_group=parallel.tp_group,
     )
     with auto_size_hicache(
         params,

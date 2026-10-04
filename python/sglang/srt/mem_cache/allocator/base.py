@@ -141,7 +141,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         shortfall = num_tokens - self.available_size()
         if shortfall > 0:

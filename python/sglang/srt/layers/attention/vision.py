@@ -83,6 +83,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1099,6 +1100,7 @@ class VisionAttention(nn.Module):
         ] = None,
         use_data_parallel: bool = False,
         use_dp_attention_reduce: bool = False,
+        allow_tp_reduce_mismatch: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
@@ -1207,6 +1209,17 @@ class VisionAttention(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+            )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        if not allow_tp_reduce_mismatch:
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=self.tp_size,
+                reduces_over_attn_tp=use_dp_attention_reduce,
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
             )
         self.proj = RowParallelLinear(
             input_size=self.dummy_dim,

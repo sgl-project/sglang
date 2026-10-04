@@ -77,7 +77,7 @@ def moe_align_block_size(
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
         if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get() and num_experts <= 8191:
-            from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+            from sglang.kernels.ops.lora.moe.virtual_experts import (
                 _align_block_size_jit,
             )
 

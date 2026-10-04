@@ -312,13 +312,14 @@ class StorageAttachment:
         """
         cache = self._cache
         controller = cache.cache_controller
+        config = controller.storage_config
         attn_cp_rank, attn_cp_size = controller.get_attn_cp_rank_and_size()
         labels = {
             "storage_backend": storage_backend,
-            "tp_rank": controller.tp_rank,
-            "dp_rank": controller.dp_rank,
-            "pp_rank": controller.pp_rank,
-            "pp_size": controller.pp_size,
+            "tp_rank": config.tp_rank,
+            "dp_rank": config.dp_rank,
+            "pp_rank": config.pp_rank,
+            "pp_size": config.pp_size,
             "attn_cp_rank": attn_cp_rank,
             "attn_cp_size": attn_cp_size,
         }

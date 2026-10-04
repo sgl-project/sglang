@@ -1399,7 +1399,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append terminal backup actions."""
+        """Refresh the LRUs and append the insert backup: a new-leaf write-through,
+        or an SWA window publish on an existing backed node."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1410,7 +1411,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self._should_backup_after_insert(state):
             state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+                self._build_backup_kv_action(
+                    state.target_node, write_back=self.is_write_back
+                )
             )
 
     def _split_node(
@@ -2509,7 +2512,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its not-yet-persisted ancestors."""
+        """Build the backup action for a node; write-through also chains its
+        unbacked ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent

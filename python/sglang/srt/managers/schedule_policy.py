@@ -662,7 +662,9 @@ class PrefillAdder:
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
             and dllm_config is None
-            and not tree_cache.supports_mamba()
+            and not (
+                tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
+            )
         )
 
         if self.dllm_config is not None:
@@ -705,8 +707,7 @@ class PrefillAdder:
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
-        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
-        # which would skip the reservation on the chunk-cache path.
+        # ALLOCATOR: the reservation holds with the radix cache disabled too.
         self._mamba_slot_cost = 0
         if isinstance(
             self.token_to_kv_pool_allocator,

@@ -1013,7 +1013,7 @@ class HybridCacheController(BaseHiCacheController):
     def get_prefetch_submission(self, rid: str) -> Optional[PrefetchSubmission]:
         if self.pp_prefetch_command_group is None:
             return None
-        if self.pp_rank != 0:
+        if self.storage_config.pp_rank != 0:
             return PrefetchSubmission()
         with self.pp_prefetch_state_lock:
             state = self.pp_prefetch_states.get(rid)
@@ -1046,7 +1046,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
             )
 
-        if self.pp_rank != 0:
+        if self.storage_config.pp_rank != 0:
             raise RuntimeError("Only PP0 can submit a PP prefetch ticket.")
 
         rid = handle.rid
@@ -1076,7 +1076,8 @@ class HybridCacheController(BaseHiCacheController):
 
         storage_hit_count = len(ticket.prefetch_key.token_ids)
         try:
-            for pp_rank in range(self.tp_rank, self.pp_size, self.tp_size):
+            config = self.storage_config
+            for pp_rank in range(config.tp_rank, config.pp_size, config.tp_size):
                 _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
                 storage_hit_count = min(storage_hit_count, rank_hit_count)
         except Exception:
@@ -1244,7 +1245,7 @@ class HybridCacheController(BaseHiCacheController):
         assert group is not None
         rank = torch.distributed.get_rank()
         source = torch.distributed.get_process_group_ranks(group)[0]
-        is_source = self.pp_rank == 0
+        is_source = self.storage_config.pp_rank == 0
 
         while True:
             objects = []
