@@ -35,7 +35,7 @@ class TestIndependentStageConstruction(CustomTestCase):
         for variant in BatchVariant:
             plan = stub_plan()
             ordinary = object()
-            plan._paths[BatchVariant.ORDINARY] = ordinary
+            plan.paths[BatchVariant.ORDINARY] = ordinary
             with (
                 self.subTest(variant=variant),
                 patch.object(
@@ -59,13 +59,13 @@ class TestIndependentStageConstruction(CustomTestCase):
                 ),
             ):
                 if variant is BatchVariant.ORDINARY:
-                    self.assertIs(plan._batch_steps(None), ordinary)
+                    self.assertIs(plan.path_for(None), ordinary)
                 else:
                     with self.assertRaisesRegex(NotImplementedError, variant.name):
-                        plan._batch_steps(None)
+                        plan.path_for(None)
                     selected = object()
-                    plan._paths[variant] = selected
-                    self.assertIs(plan._batch_steps(None), selected)
+                    plan.paths[variant] = selected
+                    self.assertIs(plan.path_for(None), selected)
 
     def test_sequences_of_one_to_four_stages(self):
         for count in range(1, 5):
@@ -146,12 +146,10 @@ class TestIndependentStageConstruction(CustomTestCase):
                         self.assertEqual(
                             independent.plan.terminal, declaration.terminal
                         )
-                        self.assertEqual(
-                            combined.plan.variants, independent.plan.variants
-                        )
-                        for variant, steps in combined.plan._paths.items():
+                        self.assertEqual(combined.plan.edges, independent.plan.edges)
+                        for variant, steps in combined.plan.paths.items():
                             self.assertEqual(
-                                steps.output, independent.plan._paths[variant].output
+                                steps.output, independent.plan.paths[variant].output
                             )
 
     def test_sequence_branch_keeps_source_lineage(self):
@@ -171,7 +169,7 @@ class TestIndependentStageConstruction(CustomTestCase):
                     (declare_ffn(sparse=True), fixture.Norm()),
                     previous=declare_ffn(sparse=True),
                 )
-                before = dict(source.plan.variants)
+                before = dict(source.plan.edges)
                 first, attn, last = make_stages(
                     (
                         declare_ffn(),
@@ -184,39 +182,33 @@ class TestIndependentStageConstruction(CustomTestCase):
                     ),
                     prepared_from=source.declaration,
                 )
-                self.assertEqual(source.plan.variants, before)
+                self.assertEqual(source.plan.edges, before)
                 self.assertIs(first.declaration.prepared_from, source.declaration)
                 self.assertIs(attn.declaration.previous, first.declaration)
                 self.assertIs(last.declaration.previous, attn.declaration)
-                for v, edge in first.plan.variants.items():
-                    source_input = source.plan.variants[v].incoming
+                for v, edge in first.plan.edges.items():
+                    source_input = source.plan.edges[v].incoming
                     self.assertEqual(
                         edge.incoming.produced.layout, source_input.need.layout
                     )
                     self.assertEqual(edge.incoming.residual, source_input.residual_to)
 
-    def test_a_replicated_tail_stays_in_compute_without_a_fusion_object(self):
-        for local_tail in (False, True):
-            with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
-                boundary = make_ffn_stage(
-                    declaration=declare_ffn(
-                        previous=declare_attn(),
-                        sparse=True,
-                        reduction=ProducerReduction.LOCAL_TAIL
-                        if local_tail
-                        else ProducerReduction.SCOPED,
-                    ),
-                    norm=fixture.Norm(),
-                )
-                self.assertIsNone(boundary.plan.fusions)
-                produced = boundary.plan._paths[BatchVariant.ORDINARY].output
-                self.assertEqual(produced.leaves_for_next_layer, not local_tail)
-                # A local compute tail does not change the existing RS alternative.
-                self.assertTrue(produced.leaves_for_reduce_scatter)
+    def test_an_ffn_without_a_fusion_object_may_defer_or_reduce_scatter(self):
+        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
+            boundary = make_ffn_stage(
+                declaration=declare_ffn(previous=declare_attn(), sparse=True),
+                norm=fixture.Norm(),
+            )
+        self.assertIsNone(boundary.plan.fusions)
+        produced = boundary.plan.paths[BatchVariant.ORDINARY].output
+        self.assertTrue(produced.may_defer_to_next)
+        self.assertTrue(produced.may_reduce_scatter)
 
     def test_mixer_successor_comes_from_the_local_sequence(self):
         for following in (
-            declare_attn(reduction=ProducerReduction.SCOPED, gathers_tp_input=False),
+            declare_attn(
+                reduction=ProducerReduction.EXIT_SCOPED, gathers_attn_tp_input=False
+            ),
             declare_ffn(),
         ):
             with (
@@ -226,23 +218,24 @@ class TestIndependentStageConstruction(CustomTestCase):
                 mixer, consumer = make_stages(
                     (
                         declare_attn(
-                            reduction=ProducerReduction.SCOPED, gathers_tp_input=False
+                            reduction=ProducerReduction.EXIT_SCOPED,
+                            gathers_attn_tp_input=False,
                         ),
                         fixture.Norm(),
                     ),
                     (following, fixture.Norm()),
                     terminal=True,
                 )
-                for variant, edge in mixer.plan.variants.items():
+                for variant, edge in mixer.plan.edges.items():
                     output = edge.outgoing.produced
                     self.assertEqual(
-                        output.always_leaves, following.kind is StageKind.FFN
+                        output.always_partial, following.kind is StageKind.FFN
                     )
                     self.assertEqual(
-                        output.leaves_for_next_layer,
+                        output.may_defer_to_next,
                         following.kind is StageKind.ATTENTION,
                     )
-                    incoming = consumer.plan.variants[variant].incoming.produced
+                    incoming = consumer.plan.edges[variant].incoming.produced
                     self.assertEqual(incoming.group, output.group)
 
 

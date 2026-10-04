@@ -67,7 +67,7 @@ fn insert_params_mamba<'k>(
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -157,6 +157,14 @@ fn set_full_host(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, slot: i64) 
 
 fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
     lru.iter().collect()
+}
+
+#[test]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+fn get_or_fill_uuid_rejects_mamba() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [node] = chain::<1>(&mut tc);
+    mamba_component().get_or_fill_uuid(&mut tc, node, /* host = */ false);
 }
 
 #[test]

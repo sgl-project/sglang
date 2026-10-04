@@ -14,8 +14,8 @@ A boundary connects a **producer output** to a **consumer input**. An attention-
 | Responsibility | Owner |
 | --- | --- |
 | Attention, projections, activation functions, expert routing, EP dispatch/combine | Model compute modules |
-| How a producer contributes to the residual | Producer's `StageUpdate` |
-| How a consumer reads the residual | Consumer's `StageRead` and norm |
+| How a producer contributes to the residual | Producer's `ResidualUpdate` |
+| How a consumer reads the residual | Consumer's `ResidualReadout` and norm |
 | Supported row transitions and reduction ordering | Bound boundary paths |
 | Actual outstanding work and residual tensors | Per-forward `ResidualStream` |
 | Hardware-specific fused completion | Fusion providers |
@@ -31,7 +31,7 @@ EP all-to-all is an operation inside MoE computation, not an input preparation s
 
 - `ATTN_DP`: different attention data-parallel token sets.
 - `ATTN_CP`: context-parallel (CP) token partitions for an active CP batch.
-- `ATTN_TP_SCATTER`: token slices distributed across attention-TP ranks.
+- `ATTN_TP`: token slices distributed across attention-TP ranks.
 
 Size-one axes are omitted. Layout is not a `DTensor` placement or a general cross-mesh redistribution engine. It does not describe arbitrary hidden-dimension sharding. The actual row ordering, padding, and per-rank counts come from batch metadata and the paired movement operations.
 
@@ -43,14 +43,13 @@ A declaration states how its compute cooperates with the boundary's reduction de
 
 | Contract or state | Meaning |
 | --- | --- |
-| `ProducerReduction.PARTIAL` | Attention only (the `declare_attn()` default): compute always returns a contribution requiring a sum and publishes it with `finish()`. Build its output projection so that it never reduces (for example `reduce_results=False`). `declare_ffn()` rejects it |
-| `ProducerReduction.SCOPED` | Compute obeys the exit's reduction decision and publishes through `exit()`: the `declare_ffn()` default, and `declare_attn(reduction=ProducerReduction.SCOPED)` for a mixer |
-| `ProducerReduction.LOCAL_TAIL` | FFN only: compute adds a replicated component after its internal sum. The boundary never defers that sum to the next layer, but reduce-scatter permissions remain, so compute that skips its sum for `mlp_reduce_scatter` must add the component exactly once. `declare_attn()` rejects it |
-| `StageOutput.leaves_for_*` | Construction-time permission to select a particular handoff |
+| `ProducerReduction.ALWAYS_PARTIAL` | Attention only (the `declare_attn()` default): compute always returns a contribution requiring a sum and publishes it with `finish()`; the next stage's input completes the sum. Build its output projection so that it never reduces (for example `reduce_results=False`) |
+| `ProducerReduction.EXIT_SCOPED` | The exit completes the sum or carries it to the next stage's input: every FFN, and `declare_attn(reduction=ProducerReduction.EXIT_SCOPED)` for a mixer |
+| `OutputContract.may_*` | Construction-time permission to leave the sum to a particular later step |
 | `Contribution.owed` | Work this specific output still requires |
 | `OwedOutput` | Model-facing handle preventing ordinary tensor use of that unfinished output |
 
-`UnreducedOutput` is an internal adapter form. `ResidualStream.leave()` converts it into an owned contribution and an opaque model handle. `HandoffOutput` represents producer-specific work such as a deferred MoE finalize; its `complete()` supplies an unfused completion path. A handoff is consumed by the next layer's input or, at the end of the stack, by a final norm that accepts it.
+`UnreducedOutput` is an internal adapter form. `ResidualStream.record()` converts it into an owned contribution and an opaque model handle. `DeferredFinalize` represents producer-specific work such as a deferred MoE finalize; its `complete()` supplies an unfused completion path. A handoff is consumed by the next layer's input or, at the end of the stack, by a final norm that accepts it.
 
 ### Residual stream
 
@@ -58,7 +57,7 @@ A declaration states how its compute cooperates with the boundary's reduction de
 
 | State | Stored data | Next preparation |
 | --- | --- | --- |
-| Initial | Neither residual nor contribution | Initialize residual through the consumer's `enter` |
+| Initial | Neither residual nor contribution | Initialize residual through the consumer's `init_residual` |
 | Written | Residual, no pending contribution | Read input without applying another update |
 | Pending | Contribution, optionally an existing residual | Complete owed work, apply the producer update, then read |
 
@@ -70,19 +69,19 @@ Communication completion and residual update are distinct steps. The `residual.b
 | --- | --- |
 | `complete_output(hidden_states, forward_batch)` | Finishes outstanding communication/finalize work and leaves the update pending |
 | `fold(hidden_states, forward_batch)` | Completes a plain contribution and folds it into the residual, leaving a written stream |
-| `written(hidden_states, forward_batch)` | Replaces the stream with a written one whose residual is `hidden_states`. Use it after compute that produced the full residual itself. It discards any pending contribution, so call `fold()` first when one may be pending |
+| `set_written(hidden_states, forward_batch)` | Replaces the stream with a written one whose residual is `hidden_states`. Use it after compute that produced the full residual itself. It discards any pending contribution, so call `fold()` first when one may be pending |
 | `take_output(hidden_states, forward_batch)` | Releases the stream at a terminal exit whose output is already written, such as Nemotron-H MTP after its internal fold and norm. It rejects a pending contribution |
 
-Always retain the returned tensor or handle after each of these calls. A stack-entry boundary accepts a written stream and skips its `enter` operation.
+Always retain the returned tensor or handle after each of these calls. A stack-entry boundary accepts a written stream and skips its `init_residual` operation.
 
 ### Residual update and input read
 
-The producer owns `StageUpdate`; the consumer owns `StageRead` and its norm. The actual update travels with the contribution. Bound paths use declared update capabilities to select valid ordering:
+The producer owns `ResidualUpdate`; the consumer owns `ResidualReadout` and its norm. The actual update travels with the contribution. Bound paths use declared update capabilities to select valid ordering:
 
 - A plain add can participate in compatible fused add+norm kernels or add the residual on one rank before summation.
 - A nonlinear update cannot generally move before reduction. The post operation of manifold-constrained hyper-connections (MHC) is one such case.
-- `at_producer` requests an update at the producer exit. A deferred update must guarantee that its parameters and state outlive that producer.
-- `StageRead.before_gather` preserves reads that must execute on the source rows before a DP gather.
+- `applied_at_exit` requests an update at the producer exit. A deferred update must guarantee that its parameters and state outlive that producer.
+- `ResidualReadout.reads_before_dp_gather` preserves reads that must execute on the source rows before a DP gather.
 
 A read returns `(compute_input, residual)`. `update_and_read()` receives the producer's update together with the read, so an implementation can fuse them: the plain add+norm read does, and keeps its FP32 accumulation instead of normalizing a separately rounded snapshot. Fusion is not guaranteed. An implementation such as MHC may run the update and the read as separate steps, provided it preserves its existing rounding order.
 
@@ -111,7 +110,7 @@ self.attn_boundary, self.ffn_boundary = make_stages(
 )
 ```
 
-`previous` describes the actual external producer. You do not need an executable object from the previous layer or another pipeline rank. For a sparse or custom preceding stage, build `previous` with the same arguments the producing layer uses for its own declaration, including `next_sparse`, for example `declare_ffn(sparse=prev_sparse, next_sparse=this_sparse)`; the two-batch overlap (TBO) handoff rows derive from that pair.
+`previous` describes the actual external producer. You do not need an executable object from the previous layer or another pipeline rank. For a sparse or custom preceding stage, build `previous` with the same arguments the producing layer uses for its own declaration, including `next_layer_sparse`, for example `declare_ffn(sparse=prev_sparse, next_layer_sparse=this_sparse)`; the two-batch overlap (TBO) exit rows derive from that pair.
 
 `terminal=True` marks the end of the model's layer stack, not every Python decoder layer. A pipeline partition that has more layers downstream is not terminal merely because its local module list ends. A NextN/multi-token-prediction (MTP) draft module is its own stack: its layer enters with `previous=None` and is terminal even when it reuses the target's decoder class. In that case, use the draft's layer count, for example `terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1`. A terminal stage leaves no work for a following layer, except the final-norm finalize handoff described in [Enter and leave the layer stack](#enter-and-leave-the-layer-stack).
 
@@ -123,9 +122,9 @@ For a single independently constructed stage, use `make_attn_stage()` or `make_f
 
 For heterogeneous layer stacks, declare the actual neighbouring stage kinds; the framework does not require an alternating attention/FFN pattern. `make_stages(..., following=declaration)` describes the external consumer after the last local stage, just as `previous` describes the producer before the first.
 
-For a single-stage `ProducerReduction.SCOPED` mixer, `following` decides whether the mixer leaves its attention-TP sum to the next stage: always before an FFN, and per batch before another mixer. The next stage makes the same decision from its own `previous`, so both must describe the same neighbours. Otherwise a pipeline handoff reduces the mixer's output twice: `to_pp()` exports it complete and the receiver's `from_pp()` declares the sum again.
+For a single-stage `ProducerReduction.EXIT_SCOPED` mixer, `following` decides whether the mixer leaves its attention-TP sum to the next stage: always before an FFN, and per batch before another mixer. The next stage makes the same decision from its own `previous`, so both must describe the same neighbours. Otherwise a pipeline handoff reduces the mixer's output twice: `to_pp()` exports it complete and the receiver's `from_pp()` declares the sum again.
 
-`models/nemotron_h_utils.py` (used by `models/nemotron_h.py`) builds each Nemotron-H stage as `make_stages((decl, norm), previous=..., following=..., terminal=...)`, with mixers declared as `declare_attn(reduction=ProducerReduction.SCOPED, gathers_tp_input=False)`.
+`models/nemotron_h_utils.py` (used by `models/nemotron_h.py`) builds each Nemotron-H stage as `make_stages((decl, norm), previous=..., following=..., terminal=...)`, with mixers declared as `declare_attn(reduction=ProducerReduction.EXIT_SCOPED, gathers_attn_tp_input=False)`.
 
 ### More than two stages and branches
 
@@ -142,7 +141,7 @@ first_ffn, second_attn, second_ffn = make_stages(
 
 This fragment assumes the source boundary and the three norms already exist. `prepared_from` means the source has already performed its read. Enter through `branch_input(source, hidden_states, forward_batch)`, not `prepare()`, to move that input and fork the residual stream without normalizing twice. The first stage's norm is therefore never applied; LongCat passes the MoE stage's norm there.
 
-The branch adapter also provides `branch_output()` to place a complete contribution on handoff rows and `merge_branch()` to combine it with another branch's output. These methods encode row movement and residual ownership; the model still determines its compute schedule. Branch transport currently supports only ordinary token rows: construction rejects context-parallel, input-scattered, and sequence-parallel variants. See `python/sglang/srt/models/longcat_flash.py` for a complete integration.
+The branch adapter also provides `branch_output()` to complete the sum a branch's contribution owes and place it on the branch's exit rows and `merge_branch()` to combine it with another branch's output. These methods encode row movement and residual ownership; the model still determines its compute schedule. Branch transport currently supports only ordinary token rows: construction rejects context-parallel, input-scattered, and sequence-parallel variants. See `python/sglang/srt/models/longcat_flash.py` for a complete integration.
 
 ### Execute a layer
 
@@ -159,21 +158,20 @@ if hidden_states.shape[0] != 0:
 hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
 
 hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-with self.ffn_boundary.exit(forward_batch) as output:
-    hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-hidden_states = output.finish(hidden_states)
+hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 ```
 
 This example uses Qwen3's compute member name `mlp`; boundary construction does not require renaming compute classes or checkpoint parameters.
 
-`prepare()` returns input in the consumer read's format, which can include quantized tensors. An attention with a `PARTIAL` output contract uses `finish()` to register its contribution. An FFN or single-stage mixer uses `exit()` to publish flags during compute, then calls the returned object's `finish()` once. The exit context restores the previous runtime flags even when compute raises; do not call `finish()` on a failed computation.
+`prepare()` returns input in the consumer read's format, which can include quantized tensors. An attention with an `ALWAYS_PARTIAL` output contract uses `finish()` to register its contribution, and an FFN or single-stage mixer uses `finish()` to complete or carry on the sum its output owes. An FFN whose boundary has fusions, which may take a MoE finalize handoff, runs its compute under `exit()` instead and calls the returned object's `finish()` once (`finish()` on the boundary rejects it); the exit context restores the previous runtime flags even when compute raises, so do not call `finish()` on a failed computation.
 
-Compute cooperates through the flags the scope publishes on `get_forward()`:
+Compute never sums a stage's output: build every output projection, MLP and MoE block of a stage with `reduce_results=False`, and leave the sum the output owes to the boundary. The boundary completes it at the exit, or carries it to the next stage's input, where a fused all-reduce + add + norm may take it:
 
-- `FfnExit` publishes `fuse_mlp_allreduce` (skip the output all-reduce), `mlp_reduce_scatter` (leave the sum to the boundary's reduce-scatter), and `defer_moe_finalize` (a MoE may return a `HandoffOutput`).
-- `MixerExit` publishes `fuse_mlp_allreduce` and exposes the same decision as `skips_reduction`. Before an FFN, the mixer always leaves its attention-TP sum to the FFN's input, including under attention DP. Before another mixer it may defer the sum to that mixer's input, but never under attention DP.
+- `FfnExit` decides before compute runs whether the exit completes the sum, a reduce-scatter on the way back completes it, or the next input does. It publishes only `defer_moe_finalize` on `get_forward()`: a MoE may then return a `DeferredFinalize`.
+- `MixerExit`: before an FFN, the mixer always leaves its attention-TP sum to the FFN's input, including under attention DP. Before another mixer the exit may carry the sum to that mixer's input, but never under attention DP; otherwise it completes the sum itself.
 
-`RowParallelLinear` and the MoE output reduction honour these flags automatically; a custom reduction reads them from the exit object. Returning a handoff while `defer_moe_finalize` is false fails in `finish()`.
+A component every TP rank computes in full (a shared expert replicated with `tp_size=1`, LoRA-B on a partial sum) is added on TP rank 0 only, so that the one sum counts it once. Model loading fails if a module under a stage boundary is built with `reduce_results=True`. Returning a handoff while `defer_moe_finalize` is false fails in `finish()`.
 
 A complete tensor after `finish()` can still have a pending **residual update**. An incomplete reduction is exposed to the model as an opaque `OwedOutput`; pass it to the next boundary or a supported access method. Do not inspect it as a tensor, slice it, or unwrap its contribution in model code.
 
@@ -188,20 +186,20 @@ residual_batch.start(forward_batch)
 hidden_states = self.embed_tokens(input_ids)
 for layer in self.layers:
     hidden_states = layer(positions, hidden_states, forward_batch)
-hidden_states = residual_batch.norm(
+hidden_states = residual_batch.final_norm(
     hidden_states, forward_batch, self.norm, skip_empty=True
 )
 ```
 
-`skip_empty=True` still completes owed work on an empty batch, which may be a collective that other ranks join, and skips only the norm kernel. `norm()` and `to_pp()` release the batch's stream after they hand on its output.
+`skip_empty=True` still completes owed work on an empty batch, which may be a collective that other ranks join, and skips only the norm kernel. `final_norm()` and `to_pp()` release the batch's stream after they hand on its output.
 
-This is a non-pipeline stack fragment. Pipeline reception uses the first boundary's `from_pp(tensors, forward_batch)` to reconstruct a stream; the sender uses `residual_batch.to_pp()`. Dynamic completion work is resolved before transport. By default, `to_pp()` preserves a statically declared partial sum for the receiver's incoming contract to reconstruct and complete. Do not call `complete_output()` before that handoff: it would complete a sum that the receiver still expects to perform.
+This is a non-pipeline stack fragment. Pipeline reception uses the first boundary's `from_pp(tensors, forward_batch)` to reconstruct a stream; the sender uses `residual_batch.to_pp()`. A stream the producer already wrote, such as MHC's expanded streams, travels as `hidden_states` alone and arrives written. Dynamic completion work is resolved before transport. By default, `to_pp()` preserves a statically declared partial sum for the receiver's incoming contract to reconstruct and complete. Do not call `complete_output()` before that handoff: it would complete a sum that the receiver still expects to perform.
 
-A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `HandoffOutput` for the final norm. Pass the handle straight to `residual_batch.norm(hidden_states, forward_batch, self.norm, handoff_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `handoff_norm`, `norm()` first completes the handoff unfused, and `capture_output` is then allowed. With `handoff_norm`, `norm()` rejects `capture_output` when a handoff arrives. Calling `complete_output()` first runs the producer's unfused finalize, and `snapshot()` raises on a handoff. See `python/sglang/srt/models/qwen3_5.py`.
+A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `DeferredFinalize` for the final norm. Pass the handle straight to `residual_batch.final_norm(hidden_states, forward_batch, self.norm, finalize_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `finalize_norm`, `final_norm()` first completes the handoff unfused, and `capture` is then allowed. With `finalize_norm`, `final_norm()` rejects `capture` when a handoff arrives. Calling `complete_output()` first runs the producer's unfused finalize, and `snapshot()` raises on a handoff. See `python/sglang/srt/models/qwen3_5.py`.
 
-`model_forward_stages()` in `python/sglang/srt/batch_overlap/two_batch_overlap.py` gives each TBO microbatch its own stream: it splits with `ResidualStream.arrive()` and merges the results afterwards. Do not share one mutable stream between interleaved microbatches or hold an `exit()` scope open across a TBO yield point.
+`model_forward_stages()` in `python/sglang/srt/batch_overlap/two_batch_overlap.py` gives each TBO microbatch its own stream: it splits with `ResidualStream.from_handoff()` and merges the results afterwards. Do not share one mutable stream between interleaved microbatches or hold an `exit()` scope open across a TBO yield point.
 
-In the operation-scheduled TBO path, the FFN runs without an `exit()` scope. No skip flags are published, so compute returns a fully reduced output. `boundary.postprocess(hidden_states, forward_batch)` applies any output transform, moves that output back to the layer's handoff rows (a plain scatter under attention DP), and leaves nothing owed.
+In the operation-scheduled TBO path, the FFN runs without an `exit()` scope and returns its partial output. `boundary.complete_now(hidden_states, forward_batch)` completes the sum it owes, applies any output transform, moves that output back to the layer's exit rows (a plain scatter under attention DP), and leaves nothing owed.
 
 ### Auxiliary capture and extra contributions
 
@@ -210,17 +208,17 @@ Choose the access method according to what the consumer needs:
 | Operation | Effect on main output |
 | --- | --- |
 | `residual_batch.snapshot()` | Produces an owned plain residual snapshot; a sum can run on a copy without consuming the main contribution |
-| Attention `boundary.prepare(..., capture_output=collector.capture)` | Completes the main output's owed communication (unfused; the add+norm kernel still runs), then captures the updated residual this read produces, moved back to the producer's rows. At stack entry it captures the input before `enter`; with `post_residual_addition` it captures output plus residual before the addition. FFN `prepare()` does not accept it |
-| Attention `boundary.prepare(..., captured_last_layer_outputs=collector)` | Captures the same updated residual on the attention's compute-input rows, after its input gather |
+| Attention `boundary.prepare(..., capture=collector.capture)` | Completes the main output's owed communication (unfused; the add+norm kernel still runs), then captures the updated residual this read produces, moved back to the producer's rows. At stack entry it captures the input before `init_residual`; with `post_residual_addition` it captures output plus residual before the addition. FFN `prepare()` does not accept it |
+| Attention `boundary.prepare(..., capture_gathered=collector)` | Captures the same updated residual on the attention's compute-input rows, after its input gather |
 | `boundary.capture_output()` | Preserves its explicit capture convention: completes dynamic work on the main contribution, but snapshots a statically declared sum on a copy; returns both updated handle and snapshot |
 | `residual_batch.add_to_output(..., extra)` | Completes the contribution before adding extra once, keeping the residual update pending |
-| `residual_batch.norm(..., capture_output=collector.capture)` | Final norm and capture of its updated residual |
+| `residual_batch.final_norm(..., capture=collector.capture)` | Final norm and capture of its updated residual |
 
 Snapshots currently require a plain residual update. Producer-specific finalize handoffs need an explicit main-output capture adapter.
 
 A separate BF16 snapshot followed by norm can change results relative to a fused add+norm kernel's FP32 accumulation. Capture from the existing update/read operation when that ordering matters.
 
-A capture callback has the signature `capture(value, *, owned=False)`, as `AuxHiddenStateList.capture` does. With `owned=False` the value may alias the mutable residual or a reusable communication buffer, and the collector must copy it before retaining it. The boundary passes `owned=True` only for storage nothing else will write: a capture move that gathers rows (`StageEntry.capture_move_allocates`), a residual sum computed only for the capture, or a residual that the following local stage's input path certifies it leaves untouched. `make_stages()` copies that certificate into the producer's entry at construction; no plan is consulted during forward. `residual_batch.norm(..., capture_output=...)` always passes a borrowed value.
+A capture callback has the signature `capture(value, *, owned=False)`, as `AuxHiddenStateList.capture` does. With `owned=False` the value may alias the mutable residual or a reusable communication buffer, and the collector must copy it before retaining it. The boundary passes `owned=True` only for storage nothing else will write: a capture move that gathers rows (`EntryPath.capture_move_allocates`), a residual sum computed only for the capture, or a residual that the following local stage's input path certifies it leaves untouched. `make_stages()` copies that certificate into the producer's entry at construction; no plan is consulted during forward. `residual_batch.final_norm(..., capture=...)` always passes a borrowed value.
 
 ### Choose a reduction policy
 
@@ -240,14 +238,14 @@ Required attention and MoE collectives are unaffected. These are permissions, no
 
 Before you open a pull request for a new model, check each item:
 
-- Every layer passes the real producer as `previous`, including `sparse`/`next_sparse`, and `previous=None` only where the stack starts.
+- Every layer passes the real producer as `previous`, including `sparse`/`next_layer_sparse`, and `previous=None` only where the stack starts.
 - `terminal` is set only on the last layer of the model's stack, using the draft's own layer count for NextN/MTP modules.
 - A single-stage mixer or FFN also passes `following`, and both neighbours describe each other consistently.
-- The model forward calls `residual_batch.start()` before the first layer, and leaves the stack through `residual_batch.norm()`, `to_pp()`, or `take_output()`.
+- The model forward calls `residual_batch.start()` before the first layer, and leaves the stack through `residual_batch.final_norm()`, `to_pp()`, or `take_output()`.
 - Pipeline reception calls `from_pp(tensors, forward_batch)` on the first local boundary.
 - Split prefill starts the stream only in the segment that runs the first layer and completes it only in the final segment.
 - Extra contributions such as deepstack embeddings go through `residual_batch.add_to_output()`, never an in-place add on the layer output.
-- Auxiliary capture uses `prepare(..., capture_output=...)` or `norm(..., capture_output=...)` with a callback that honours `owned`.
+- Auxiliary capture uses `prepare(..., capture=...)` or `final_norm(..., capture=...)` with a callback that honours `owned`.
 
 Common errors and their usual cause:
 
@@ -258,7 +256,6 @@ Common errors and their usual cause:
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
 | `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel) is not supported by this stage; add a server-argument check that rejects the configuration |
 | `a prepared branch must enter through branch_input, not prepare` | A `prepared_from` stage was entered with `prepare()` |
-| `PARTIAL is not supported for ffn stages` / `LOCAL_TAIL is not supported for attention stages` | The declaration's `reduction` does not match the stage kind |
 | `snapshot requires a plain residual update` | A snapshot was taken on a nonlinear (for example MHC) update |
 
 ## Boundary internals
@@ -273,9 +270,9 @@ flowchart TD
     F["ForwardBatch<br/>runtime facts"] --> B
     S["ResidualStream<br/>residual and<br/>pending work"] <--> B
     B --> I["prepare()<br/>complete,<br/>update, read,<br/>move rows"]
-    I -->|"FFN or mixer"| X["exit()<br/>choose<br/>completion,<br/>publish flags"]
+    I -->|"FFN or mixer"| X["exit()<br/>choose<br/>completion"]
     X --> M["Model<br/>computation"]
-    I -->|"PARTIAL"| M
+    I -->|"ALWAYS_PARTIAL"| M
     M --> O["finish()<br/>record the<br/>contribution"]
     O --> S
 ```
@@ -283,11 +280,11 @@ flowchart TD
 Construction and execution have different lifetimes:
 
 1. **At model initialization**, `declare_attn()` and `declare_ffn()` describe compute behavior. `make_stages()` connects those declarations and binds each stage's own norm and hooks.
-2. **During construction**, factories resolve token rows and reduction contracts for supported batch variants. `make_boundary()` binds consumer work; `make_output_boundary()` binds output transport. `StagePlan` retains those paths.
-3. **At each forward**, batch facts select an existing path. An exit can make a batch-dependent completion decision, but it does not rebuild the declarations. The decision publishes compute flags and supplies the matching completion action.
+2. **During construction**, factories resolve token rows and reduction contracts for supported batch variants. `bind_entry()` binds consumer work; `bind_exit()` binds output transport. `StagePlan` retains those paths.
+3. **At each forward**, batch facts select an existing path. An exit can make a batch-dependent completion decision, but it does not rebuild the declarations. The decision supplies the matching completion action; the only flag it publishes to compute is `defer_moe_finalize`, for a MoE that may hand off its finalize.
 4. **Across stages**, `ForwardBatch.residual_stream` carries residual state and the producer's actual contribution. Stages do not store forward tensors on their reusable plans.
 
-The resolved `StageDecl` is a lower-level type than `StageDeclaration`: one `StageInput` and one `StageOutput` after topology and batch variant have been applied. An `EdgeDecl` combines a producer output, consumer requirement, and the residual's source/destination layouts.
+The resolved `StageContract` is a lower-level type than `StageDeclaration`: one `InputContract` and one `OutputContract` after topology and batch variant have been applied. An `EdgeContract` combines a producer output, consumer requirement, and the residual's source/destination layouts.
 
 ### Module map
 
@@ -304,8 +301,8 @@ Paths in this table are relative to `python/sglang/srt/layers/layer_boundary/`.
 | `ops.py` | Collective and token-row movement primitives |
 | `stage.py` | Model-facing `StageBoundary` methods |
 | `exit.py` | Select output completion and publish scoped compute flags |
-| `output.py` | Internal reduction/finalize handoffs and output transforms |
-| `residual/__init__.py` | `StageUpdate`/`StageRead` protocols and `LayerResidual` |
+| `output.py` | Unreduced outputs, deferred finalizes and output transforms |
+| `residual/__init__.py` | `ResidualUpdate`/`ResidualReadout` protocols and `LayerResidualOps` |
 | `residual/stream.py` | Per-forward state and ownership of outstanding work |
 | `residual/batch.py` | Model-stack entry, final norm, pipeline-parallel (PP) transport, snapshots, and extra contributions |
 | `residual/access.py` | Tensor access and materialization helpers |
@@ -327,13 +324,13 @@ An output decision is made once. Its flags control whether compute performs redu
 
 A backend fusion provider is passed per stage as the `fusions` option, `(declaration, norm, {"fusions": provider})`; give a layer's attention and FFN stages the same provider. The boundary calls it as follows:
 
-- `attention_input(plan)` and `ffn_input(plan)` return ordered consumer candidates, tried before the built-in all-reduce fusion.
-- `can_defer_finalize(plan, forward_batch)` decides whether an FFN may return a `HandoffOutput`. It is called on every FFN exit that has a provider.
+- `attn_input_fusions(plan)` and `ffn_input_fusions(plan)` return ordered consumer candidates, tried before the built-in all-reduce fusion.
+- `can_defer_finalize(plan, forward_batch)` decides whether an FFN may return a `DeferredFinalize`. It is called on every FFN exit that has a provider.
 - `can_defer_all_reduce(plan, forward_batch)` lets a LoRA or `SGLANG_SHARED_EXPERT_TP1` FFN leave its all-reduce to the next input. Such an FFN defers only without an expert all-to-all backend or quantized communication, when its sum is over the TP group, and when the provider, FlashInfer fusion, or AITER fusion accepts the batch. Other FFNs defer when the post-expert sum is a single all-reduce.
 
 `install_cutedsl_fusion()` and `prepare_cutedsl_fusion()` find providers through the decoder layer's `attn_boundary` and `ffn_boundary` attributes.
 
-Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FusedMlpInput` declares the sum group it completes with residual add and norm. The consumer only tries compatible candidates for the declared update/read capabilities.
+Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FfnInputFusion` declares the sum group it completes with residual add and norm. The consumer only tries compatible candidates for the declared update/read capabilities.
 
 An `OutputTransform` declares contribution processing before residual update. Its explicit `before_reduce_scatter` setting preserves a supported implementation's order; it is not permission to commute arbitrary operations across a reduction.
 
@@ -344,7 +341,7 @@ Producer GEMM plus reduce-scatter fusion is not a generic implemented API here. 
 - **Attention/DeepSeek Sparse Attention (DSA) adapters:** retain `AttnTpContext` and its input-scattered/latent-input hooks. They are not a general asynchronous dependency scheduler.
 - **CP adapters:** pair gather, return-to-local-rows, and eligible reduce-scatter operations using the same token mapping.
 - **LoRA adapter:** publishes the selected compute input's rows for LoRA execution.
-- **TBO and branch adapters:** manage handoffs that cannot be represented as a normal sequential prepare call.
+- **TBO and branch adapters:** manage layer exits and entries that cannot be represented as a normal sequential prepare call.
 
 ### Extend and validate the module
 
@@ -353,7 +350,7 @@ Place changes according to their responsibility:
 1. Add model compute facts to a declaration only when they describe compute behavior. Put user policy and unsupported configuration checks in server-argument handling.
 2. Add new update/read semantics in `residual/`; declare only capabilities the implementation really supports.
 3. Add a token transition in boundary selection and movement primitives, with its padding and row-order contract. Do not duplicate that logic in each model.
-4. Put backend completion in `fusions/` and specialized handoff behavior in `adapters/`.
+4. Put backend completion in `fusions/` and specialized exit and entry behavior in `adapters/`.
 5. Keep models on stage factories and boundary methods. Avoid reading a neighbour's execution plan or reconstructing a collective decision during forward.
 
 Focused tests live in `test/registered/unit/layer_boundary/`. Cover numerical output and residual state, collective group/row correctness, and supported fallback behavior for the changed path. Relevant examples include `test_ffn_exit.py`, `test_reduction_fusion.py`, and `test_terminal_stages.py`. A declaration-only assertion cannot establish that a new parallel path moves and reduces the correct values.

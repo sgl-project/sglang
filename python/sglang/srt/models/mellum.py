@@ -187,8 +187,6 @@ class MellumAttention(Qwen3MoeAttention):
         self.rope_theta = rope_params.get("rope_theta", 10000.0)
         rope_scaling = rope_params if _get_rope_type(rope_params) != "default" else None
 
-        self.tp_rank = get_parallel().tp_rank
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -398,9 +396,6 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             alt_stream=alt_stream,
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         mlp_layer_types = cfg.mlp_layer_types
         num_experts = cfg.num_experts
 
@@ -441,6 +436,7 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 hidden_act=cfg.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
@@ -454,12 +450,12 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -530,7 +526,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
         self.capture_aux_hidden_states = False
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (

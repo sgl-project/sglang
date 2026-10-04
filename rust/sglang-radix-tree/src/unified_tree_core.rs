@@ -29,6 +29,22 @@ use crate::unified_lru_list::{
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
 const COEXIST_RECLAIM_DIGEST_MASK: i64 = (1 << 42) - 1;
+const COMPONENT_UUID_RANGE_SIZE: i64 = 100_000_000_000_000;
+
+const fn component_uuid_initial_value(component_type: ComponentType) -> i64 {
+    let range_index = match component_type {
+        ComponentType::Swa => 0,
+        ComponentType::Full => 1,
+        ComponentType::Mamba => 2,
+    };
+    (range_index + 1) * COMPONENT_UUID_RANGE_SIZE
+}
+
+const COMPONENT_UUID_INITIAL_VALUES: [i64; NUM_COMPONENT_TYPES] = [
+    component_uuid_initial_value(FULL),
+    component_uuid_initial_value(SWA),
+    component_uuid_initial_value(MAMBA),
+];
 
 fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usize) -> i64 {
     let event = (node_id as i64 + 1) * NUM_COMPONENT_TYPES as i64 + component_idx as i64;
@@ -156,8 +172,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
-    /// Whether this is a chunked-prefill insert (no hit-count bump).
-    pub chunked: bool,
+    /// The inserting request already inserted [0, here); only the nodes past it
+    /// count a hit (and get threshold-checked), so a request counts each node once.
+    pub inserted_len: usize,
     /// Eviction priority floor applied along the walked path.
     pub priority: i64,
     /// Whether the result should report which incoming ranges the tree retained.
@@ -245,7 +262,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
-    chunked: bool,
+    inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
     total_prefix_length: usize,
@@ -624,8 +641,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
 
-    /// Monotonic source for SWA lock-window uuids.
-    pub(crate) swa_uuid_counter: i64,
+    /// Per-component monotonic sources for lock-segment UUIDs.
+    pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
     /// Device the KV indices live on.
     pub(crate) device: Device,
     /// Shared empty device-index tensor (an empty match's indices).
@@ -813,7 +830,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
-            swa_uuid_counter: 1,
+            component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
@@ -893,10 +910,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         new_node_id
     }
 
-    /// Mint the next SWA lock-window uuid.
-    pub(crate) fn next_swa_uuid_(&mut self) -> i64 {
-        self.swa_uuid_counter += 1;
-        self.swa_uuid_counter
+    /// Mint the next lock-segment UUID for a component.
+    pub(crate) fn next_component_uuid_(&mut self, component_type: ComponentType) -> i64 {
+        let counter = &mut self.component_uuid_counters[component_type.idx()];
+        *counter += 1;
+        *counter
     }
 
     /// Bump the reference count on a node's component locks. Components in
@@ -1490,9 +1508,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
-    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, chunked: bool) -> bool {
+    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || chunked {
+        if node.evicted() {
             return false;
         }
         if self.is_write_back {
@@ -1609,7 +1627,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: params.chunked,
+            inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
             total_prefix_length: 0,
@@ -1771,7 +1789,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: state.chunked,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1859,7 +1877,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
-        if self.inc_hit_count_and_check_(node_id, state.chunked) {
+        // Nodes this request already inserted were counted back then.
+        let node_end = state.total_prefix_length + prefix_len;
+        if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -1928,7 +1948,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: state.chunked,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1965,7 +1985,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target_node_id: NodeIdx_,
     ) -> bool {
         if state.is_new_leaf {
-            return self.inc_hit_count_and_check_(target_node_id, state.chunked);
+            // The new leaf runs to the end of the aligned key.
+            return state.aligned_key_len > state.inserted_len
+                && self.inc_hit_count_and_check_(target_node_id);
         }
 
         let node = self.arena.node(target_node_id);
@@ -1975,7 +1997,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             && self.needs_incremental_component_backup_(target_node_id)
     }
 
-    /// Refresh the LRUs and append terminal backup actions.
+    /// Refresh the LRUs and append the insert backup: a new-leaf write-through,
+    /// or an SWA window publish on an existing backed node.
     fn insert_tail_step_(&mut self, state: &mut InsertWalkState<K>) {
         let target_node_id = state
             .target_node_id
@@ -1992,10 +2015,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         if self.should_backup_after_insert_(state, target_node_id) {
-            let backup = self.build_backup_kv_action_(
-                self.arena.node(target_node_id),
-                /* write_back = */ false,
-            );
+            let backup =
+                self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
             state.pending_actions.push(CacheAction::BackupKV(backup));
         }
     }
@@ -3922,7 +3943,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(order)
     }
 
-    /// Build the backup action for a node and its not-yet-persisted ancestors.
+    /// Build the backup action for a node; write-through also chains its
+    /// unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
         let mut chain = vec![node.id];
         if !write_back {
@@ -5088,6 +5110,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
         Ok(self.arena.node(node_id).device_lock_ref(component_type))
+    }
+
+    /// A component's host lock count on a node.
+    pub fn inspect_get_component_host_lock_ref(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<u32, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        Ok(self.arena.node(node_id).host_lock_ref(component_type))
     }
 
     /// A node's accumulated match count.
