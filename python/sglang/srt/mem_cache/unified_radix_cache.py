@@ -1008,10 +1008,7 @@ class UnifiedRadixCache(BasePrefixCache):
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : len(token_ids)
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            self.record_req_prefix(req, up_to=len(token_ids))
             if is_finished:
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)

@@ -469,6 +469,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def record_req_prefix(self, req: Req, *, up_to: int) -> None:
+        """Point ``req.prefix_indices`` at the row's first ``up_to`` slots, where
+        the request's next extend resumes. The tree, ``cache_protected_len`` and
+        the locks are left as they are."""
+        req.prefix_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :up_to
+        ].to(dtype=torch.int64, copy=True)
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
