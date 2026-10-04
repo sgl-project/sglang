@@ -415,8 +415,15 @@ def cake_minimax_h3_bf16_pre_attention(
     ulysses_degree: int,
     out: torch.Tensor,
     eps: float = 1.0e-5,
+    qk_eps: Optional[float] = None,
+    rope_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Explicit Cake entry point; callers gate on the adapter's ``supports_*``."""
+    """Explicit Cake entry point; callers gate on the adapter's ``supports_*``.
+
+    ``rope_cos_sin`` is the request cache ``[S, 96]`` and ``rope_positions`` the
+    int64 ``[M]`` row map into it (``None`` = identity rows); ``qk_eps`` is the
+    Q/K-norm epsilon (``None`` = ``eps``).
+    """
     return _k("minimax_h3_bf16_pre_attention")(
         x,
         x_norm_weight,
@@ -430,6 +437,8 @@ def cake_minimax_h3_bf16_pre_attention(
         ulysses_degree=ulysses_degree,
         out=out,
         eps=eps,
+        qk_eps=qk_eps,
+        rope_positions=rope_positions,
     )
 
 
