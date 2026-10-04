@@ -1169,6 +1169,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
+                _model_config=SimpleNamespace(is_fp4_experts=False),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -1201,6 +1202,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     ),
                     {},
                 )
+
+    def test_mimo_v2_sm100_mixed_mxfp4_selects_native_runner(self):
+        for architecture in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
+            for a2a_backend in ("none", "deepep"):
+                for runner in ("auto", "deep_gemm", "flashinfer_mxfp4"):
+                    with (
+                        self.subTest(
+                            architecture=architecture, a2a=a2a_backend, runner=runner
+                        ),
+                        override_platform(is_sm100=True),
+                    ):
+                        args = SimpleNamespace(
+                            speculative_algorithm=None,
+                            moe_runner_backend=runner,
+                            moe_a2a_backend=a2a_backend,
+                            _model_config=SimpleNamespace(is_fp4_experts=True),
+                            attention_backend=None,
+                            prefill_attention_backend=None,
+                            decode_attention_backend=None,
+                        )
+                        expected = {"attention_backend": "fa4"}
+                        if runner == "auto" and a2a_backend == "none":
+                            expected["moe_runner_backend"] = "flashinfer_mxfp4"
+                        self.assertEqual(
+                            collect_model_override_declarations(
+                                architecture, args, _hf("fp8")
+                            ),
+                            [("_mimo_v2_overrides", expected)],
+                        )
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
@@ -3481,6 +3511,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
                 dcp_size=1,
+                attn_cp_size=1,
+                moe_dense_tp_size=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -3555,18 +3587,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 "attn_cp_size": 8,
                             },
                         )
-                        # interleave CP with attention DP must assert
-                        with self.assertRaises(AssertionError):
-                            _deepseek_family_overrides(
+                        # Interleave keeps attention DP and the configured dense TP.
+                        for attn_dp_size, dense_tp_size, cp_size, expected_cp in (
+                            (1, None, 1, 8),
+                            (2, 8, 1, 4),
+                            (2, 1, 1, 4),
+                            # An explicit CP2 leaves two attention-TP ranks
+                            # within each DP group; it must not become CP4.
+                            (2, 8, 2, 2),
+                        ):
+                            result = _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
                                     cp_strategy="interleave",
                                     tp_size=8,
                                     dp_size=1,
-                                    attn_dp_size=2,
+                                    attn_dp_size=attn_dp_size,
+                                    attn_cp_size=cp_size,
+                                    moe_dense_tp_size=dense_tp_size,
+                                    ep_size=1,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
                                 ),
                                 None,
                             )
+                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
+                            self.assertEqual(result["attn_cp_size"], expected_cp)
+                            self.assertNotIn("moe_dense_tp_size", result)
+                            self.assertNotIn("ep_size", result)
+                            self.assertNotIn("moe_a2a_backend", result)
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(

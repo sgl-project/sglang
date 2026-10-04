@@ -159,16 +159,6 @@ def resolve_compressed_kv_layout(
     return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
 
 
-def flashmla_supports_v41_kv_layouts() -> bool:
-    """Whether the installed FlashMLA decode kernel reads the V41 / V41_FP4
-    formats; its docstring lists the bytes-per-token it detects."""
-    try:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-    except Exception:
-        return False
-    return "528" in (flash_mla_with_kvcache.__doc__ or "")
-
-
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
@@ -194,17 +184,9 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
                 "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
             )
         return KVLayout.V41, option
-    supported = flashmla_supports_v41_kv_layouts()
-    if mode == "auto":
-        if is_sm100 and supported:
-            return KVLayout.V41, option
+    if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    if not supported:
-        logger.warning(
-            "SGLANG_DSV4_KV_LAYOUT=v41 but the installed FlashMLA does not advertise "
-            "the V4.1 KV cache formats; the attention kernel will reject the cache."
-        )
     return KVLayout.V41, option
 
 
@@ -717,6 +699,12 @@ class DeepSeekV4IndexerPool(KVCache):
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if buf.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                gather_fp4_index_k,
+            )
+
+            return gather_fp4_index_k(buf, slots, page_size=self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
@@ -1877,6 +1865,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_layout(self) -> KVLayout:
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
+
+    def get_swa_key_page_size(self) -> int:
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
 
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention

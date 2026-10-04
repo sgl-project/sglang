@@ -2309,7 +2309,6 @@ class AiterAttnBackend(AttentionBackend):
             v2p,
             self.req_to_token.stride(0),
             q_len * num_cols,
-            translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=1,
             DCP_SIZE=self.dcp_world_size,
             DCP_RANK=get_parallel().attn_dcp_rank,
@@ -3076,7 +3075,11 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_is_vectorized_5d:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_layer(
+                            forward_batch,
+                            layer,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3120,12 +3123,17 @@ class AiterAttnBackend(AttentionBackend):
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
-                            cache_loc,
+                            KVWriteLoc.for_layer(forward_batch, layer),
                             k[..., :kv_lora_rank],
                             k[..., kv_lora_rank:],
                         )
                     else:
-                        self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            KVWriteLoc.for_layer(forward_batch, layer),
+                            k,
+                            v,
+                        )
                 elif self._use_fused_fp8_kv_write(layer):
                     # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
@@ -3147,7 +3155,11 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_layer(
+                            forward_batch,
+                            layer,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3723,6 +3735,58 @@ class AiterAttnBackend(AttentionBackend):
                 )
             )
 
+            if (
+                envs.SGLANG_AITER_ASM_PREFILL_HD128.get()
+                and is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and not layer.is_cross_attention
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == layer.v_head_dim == 128
+                and layer.tp_k_head_num == layer.tp_v_head_num
+                and self.kv_cache_dtype == fp8_dtype
+                and q.dtype == torch.bfloat16
+                and _aiter_fp8_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
+                and not self.kv_cache_is_vectorized_5d
+                and self.forward_metadata.max_kv_len is not None
+            ):
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                tok_idx, cu_k = self._asm_context_prefill_indices(
+                    forward_batch, forward_batch.batch_size, k_cache.shape[0]
+                )
+                if tok_idx is not None:
+                    # Read the already quantized cache for first and later
+                    # chunks alike. Raw K/V may come from different producers;
+                    # casting them here would skip or repeat their KV scaling.
+                    k_gather = (
+                        k_cache.view(torch.uint8)
+                        .index_select(0, tok_idx)
+                        .view(fp8_dtype)
+                    )
+                    v_gather = (
+                        v_cache.view(torch.uint8)
+                        .index_select(0, tok_idx)
+                        .view(fp8_dtype)
+                    )
+                    o = flash_attn_varlen_fp8_pertensor_func(
+                        q.contiguous().view(-1, layer.tp_q_head_num, 128).to(fp8_dtype),
+                        k_gather,
+                        v_gather,
+                        self.k_scale.reshape(1),  # Q is cast at unit scale.
+                        k_descale.reshape(1),
+                        v_descale.reshape(1),
+                        self.qo_indptr[:bs0],
+                        cu_k,
+                        self.forward_metadata.max_q_len,
+                        int(self.forward_metadata.max_kv_len),
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                    return o.to(self.input_dtype).view(-1, layer.tp_q_head_num * 128)
+
             # Context-chunk prefill (extend batches WITH a prefix) via the
             # gfx950 ASM fp8 varlen fmha. The ck_tile paged batch_prefill runs
             # at ~15% FP8 MFU at these shapes while the ASM kernel is ~3.5x
@@ -3968,9 +4032,9 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
@@ -4004,7 +4068,10 @@ class AiterAttnBackend(AttentionBackend):
             elif self.use_mla:
                 # MLA pool has its own set_kv_buffer (no scale args).
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc.for_batch(forward_batch),
+                    k,
+                    v,
                 )
             elif self._use_fused_fp8_kv_write(layer):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel.
@@ -4026,9 +4093,9 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
