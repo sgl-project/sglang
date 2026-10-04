@@ -2149,6 +2149,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
+                        grouped_moe=True,
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
