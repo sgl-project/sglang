@@ -465,6 +465,12 @@ class FlashAttentionBackend(AttentionBackend):
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
             return
+        if self.kv_index_translator.is_translating:
+            # The draft-extend runners record this call unconditionally, but a
+            # translating backend rebuilds these tables out of graph on every
+            # replay; a captured raw req_to_token gather would then overwrite
+            # them with virtual ids.
+            return
         bs = forward_batch.batch_size
         metadata = self.draft_extend_metadata[bs]
         mapping = self._in_graph_full_to_swa_index_mapping()

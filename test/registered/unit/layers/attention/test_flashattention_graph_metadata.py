@@ -126,5 +126,27 @@ class TestSpecReadSeqLenDelta(CustomTestCase):
         self.assertEqual(tree._spec_read_seq_len_delta(ForwardMode.DECODE, spec), 0)
 
 
+class TestDraftExtendInGraph(CustomTestCase):
+    """The draft-extend cuda-graph runners record
+    `init_forward_metadata_in_graph` unconditionally. Under translation fa3
+    rebuilds the draft-extend tables out of graph on every replay, so the
+    in-graph gather -- raw req_to_token, i.e. virtual ids -- must not be
+    recorded, or each replay overwrites the translated tables."""
+
+    def _run(self, *, translating):
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.kv_index_translator = SimpleNamespace(is_translating=translating)
+        b.draft_extend_metadata = {}  # any metadata access raises KeyError
+        fb = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
+        b.init_forward_metadata_in_graph(fb)
+
+    def test_translating_backend_records_nothing(self):
+        self._run(translating=True)
+
+    def test_static_backend_still_builds_in_graph(self):
+        with self.assertRaises(KeyError):
+            self._run(translating=False)
+
+
 if __name__ == "__main__":
     unittest.main()
