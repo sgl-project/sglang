@@ -968,6 +968,12 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
+        if _is_ppu:
+            # PPU FlashMLA accepts the native per-rank query width; padding to
+            # 64 heads would mismatch the backend's PPU attn_sink slice
+            # (attn_sink is sharded to n_local_heads there, not padded).
+            return self.n_local_heads
+
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:
@@ -2259,7 +2265,9 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink(kernel_num_heads)
+        attn_sink = (
+            self._local_attn_sink(kernel_num_heads) if not _is_ppu else self.attn_sink
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
