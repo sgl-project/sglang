@@ -291,14 +291,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "mori")
             or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "and CP=1 on both servers. DP attention is supported when "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or "
+                "MoRI, and CP=1 on both servers. DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
 
