@@ -1,6 +1,11 @@
 """Unit tests for diffusion model-overlay cache paths and materialized trees."""
 
+import json
 import os
+from pathlib import Path
+
+import pytest
+from filelock import FileLock
 
 from sglang.multimodal_gen.runtime.utils import model_overlay
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
@@ -63,3 +68,77 @@ def test_large_files_are_still_shared_with_the_cache(tmp_path, monkeypatch):
     _copytree_link_or_copy(str(snapshot), str(out))
 
     assert os.path.samefile(out / "model.safetensors", weights)
+
+
+@pytest.mark.parametrize("repair_cache", [False, True])
+def test_overlay_uses_pinned_source_weights(tmp_path, monkeypatch, repair_cache):
+    overlay = tmp_path / "overlay"
+    (overlay / "_overlay").mkdir(parents=True)
+    (overlay / "_overlay" / "overlay_manifest.json").write_text(
+        json.dumps(
+            {
+                "required_source_files": ["model.safetensors"],
+                "file_mappings": [
+                    {"src": "model.safetensors", "dst": "transformer/model.safetensors"}
+                ],
+            }
+        )
+    )
+    (overlay / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "TestPipeline",
+                "_diffusers_version": "0.35.0",
+                "transformer": ["diffusers", "Transformer"],
+            }
+        )
+    )
+    for revision in ("main", "original", "newer"):
+        source = tmp_path / revision
+        source.mkdir()
+        if revision != "original" or not repair_cache:
+            (source / "model.safetensors").write_text(revision)
+
+    spec = {"overlay_repo_id": "test/overlay", "source_revision": "original"}
+    monkeypatch.setattr(
+        model_overlay, "resolve_model_overlay_target", lambda _: ("test/model", spec)
+    )
+    monkeypatch.setattr(
+        model_overlay, "download_overlay_metadata", lambda *a, **kw: str(overlay)
+    )
+    monkeypatch.setattr(
+        model_overlay, "get_diffusion_cache_root", lambda: str(tmp_path / "cache")
+    )
+    monkeypatch.setattr(
+        model_overlay, "get_lock", lambda _: FileLock(tmp_path / "overlay.lock")
+    )
+
+    def cached_snapshot(*args, revision=None, **kwargs):
+        return str(tmp_path / (revision or "main"))
+
+    def download_snapshot(*args, revision=None, **kwargs):
+        source = Path(cached_snapshot(revision=revision))
+        (source / "model.safetensors").write_text(revision or "main")
+        return str(source)
+
+    def resolve():
+        return model_overlay.maybe_resolve_overlay_model_path(
+            "test/model",
+            local_dir=None,
+            download=True,
+            allow_patterns=None,
+            snapshot_download_fn=download_snapshot,
+            hf_hub_download_fn=None,
+            verify_diffusers_model_complete_fn=lambda path: os.path.isfile(
+                os.path.join(path, "model_index.json")
+            ),
+            base_model_download_fn=cached_snapshot,
+        )
+
+    original = Path(resolve())
+    assert (original / "transformer/model.safetensors").read_text() == "original"
+    # A new source revision must not reuse weights materialized from the old one.
+    spec["source_revision"] = "newer"
+    newer = Path(resolve())
+    assert (newer / "transformer/model.safetensors").read_text() == "newer"
+    assert original != newer
