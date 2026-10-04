@@ -69,7 +69,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.kernels.cake_kernels._support import (
     BLACKWELL_DATACENTER,
     cuda_tensor_on,
-    device_capability,
     flashinfer_module_available,
 )
 
@@ -133,7 +132,9 @@ def _ag_weight_admitted(w: torch.Tensor) -> bool:
     return (stride_n == 1 and stride_k == n) or (stride_k == 1 and stride_n == AG_K)
 
 
-def _ag_operands_admitted(inp: torch.Tensor, w: torch.Tensor, *, world_size: int) -> bool:
+def _ag_operands_admitted(
+    inp: torch.Tensor, w: torch.Tensor, *, world_size: int
+) -> bool:
     import torch
 
     return (

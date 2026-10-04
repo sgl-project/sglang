@@ -239,7 +239,9 @@ _CAKE_LOG_PREFIX = "[cake-route]"
 _cake_sp_logged: set[tuple[str, str]] = set()
 _cake_sp_rejected: set[tuple] = set()
 # id(linear) -> (weight storage key, capacity rows, prepared launcher)
-_cake_sp_launchers: dict[int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]] = {}
+_cake_sp_launchers: dict[
+    int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]
+] = {}
 
 
 def _cake_sp_reason_kind(detail: str) -> str:
@@ -333,7 +335,11 @@ def _cake_sp_capacity_rows(rows: int, world_size: int) -> int:
 
         schedule = get_schedule()
         chunked = int(getattr(schedule, "chunked_prefill_size", 0) or 0)
-        cap = chunked if chunked > 0 else int(getattr(schedule, "max_prefill_tokens", 0) or 0)
+        cap = (
+            chunked
+            if chunked > 0
+            else int(getattr(schedule, "max_prefill_tokens", 0) or 0)
+        )
     except Exception:  # no schedule bag published (unit tests, offline tools)
         cap = 0
     per_rank = ceil_align(cap, world_size) // world_size if cap > 0 else 0
@@ -358,13 +364,17 @@ def _cake_sp_launcher(
     if entry is not None:
         capacity = max(capacity, entry[1])
     w = _cake_sp_weight(linear)
-    if not supports_prepare(input_parallel, w, world_size=world_size, max_rows=capacity):
+    if not supports_prepare(
+        input_parallel, w, world_size=world_size, max_rows=capacity
+    ):
         return None
     try:
         launcher = prepare(input_parallel, w, group, max_rows=capacity)
     except NotImplementedError as error:  # FlashInfer host refusal
         _cake_sp_rejected.add((id(linear), rows, input_parallel.dtype, world_size))
-        _log_cake_sp_once("fallback", f"FlashInfer refused to prepare ({error}): {detail}")
+        _log_cake_sp_once(
+            "fallback", f"FlashInfer refused to prepare ({error}): {detail}"
+        )
         return None
     _cake_sp_launchers[id(linear)] = (weight_key, capacity, launcher)
     return launcher

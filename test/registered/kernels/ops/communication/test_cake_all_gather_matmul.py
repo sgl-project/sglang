@@ -88,13 +88,21 @@ def test_supports_admits_engine_operands_and_rejects_bad_inputs(monkeypatch):
     assert not cake_comm.supports_all_gather_matmul(inp, w[:4096], world_size=8)
     # A column slice of the parameter view is still a layout (the first rows of
     # the [N, K] parameter); a K-strided view is not.
-    assert cake_comm.supports_all_gather_matmul(inp, w_param.t()[:, :1024], world_size=8)
-    wide_param = torch.empty(1280, 2 * cake_comm.AG_K, device=device, dtype=torch.bfloat16)
-    assert not cake_comm.supports_all_gather_matmul(
-        inp, wide_param.t()[: cake_comm.AG_K], world_size=8  # strides (1, 2K)
+    assert cake_comm.supports_all_gather_matmul(
+        inp, w_param.t()[:, :1024], world_size=8
+    )
+    wide_param = torch.empty(
+        1280, 2 * cake_comm.AG_K, device=device, dtype=torch.bfloat16
     )
     assert not cake_comm.supports_all_gather_matmul(
-        inp.t().contiguous().t(), w, world_size=8  # strided input
+        inp,
+        wide_param.t()[: cake_comm.AG_K],
+        world_size=8,  # strides (1, 2K)
+    )
+    assert not cake_comm.supports_all_gather_matmul(
+        inp.t().contiguous().t(),
+        w,
+        world_size=8,  # strided input
     )
     assert not cake_comm.supports_all_gather_matmul(
         inp.float(), w.float(), world_size=8
@@ -120,7 +128,9 @@ def test_supports_admits_engine_operands_and_rejects_bad_inputs(monkeypatch):
 
     monkeypatch.setattr(cake_comm, "flashinfer_module_available", lambda *a: False)
     assert not cake_comm.supports_all_gather_matmul(inp, w, world_size=8)
-    assert not cake_comm.supports_prepare_all_gather_matmul(inp, w_param.t(), world_size=8)
+    assert not cake_comm.supports_prepare_all_gather_matmul(
+        inp, w_param.t(), world_size=8
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +207,9 @@ def test_all_gather_matmul_consumes_the_engine_parameter_view():
     torch.manual_seed(3000 + rank)
     inp = torch.randn(1025, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
     torch.manual_seed(13)
-    param = torch.randn(2048, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+    param = (
+        torch.randn(2048, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+    )
     assert cake_comm.supports_all_gather_matmul(inp, param.t(), world_size=world)
     out = cake_all_gather_matmul(inp, param.t(), group)
     torch.cuda.synchronize()
@@ -217,11 +229,15 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity():
         torch.manual_seed(2000 + rank)
         sample = torch.randn(512, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
         torch.manual_seed(11)
-        param = torch.randn(n, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+        param = (
+            torch.randn(n, cake_comm.AG_K, device=device, dtype=torch.bfloat16) * 0.02
+        )
         assert cake_comm.supports_prepare_all_gather_matmul(
             sample, param.t(), world_size=world, max_rows=2048
         )
-        launcher = cake_prepare_all_gather_matmul(sample, param.t(), group, max_rows=2048)
+        launcher = cake_prepare_all_gather_matmul(
+            sample, param.t(), group, max_rows=2048
+        )
         for rows in (512, 125, 1025, 2048):
             inp = torch.randn(rows, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
             out = launcher(inp)
@@ -231,7 +247,9 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity():
                 out.float(), _reference(inp, param.t(), group), atol=1e-2, rtol=1e-2
             )
         with pytest.raises(ValueError):
-            launcher(torch.randn(2049, cake_comm.AG_K, device=device, dtype=torch.bfloat16))
+            launcher(
+                torch.randn(2049, cake_comm.AG_K, device=device, dtype=torch.bfloat16)
+            )
         dist.barrier(group=group)
 
 
