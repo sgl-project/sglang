@@ -326,14 +326,11 @@ def test_dense_mqa_fp8_logits_parity():
 
     device = torch.device("cuda")
     try:
-        arch = runtime.device_arch(device)
+        runtime.device_arch(device)
     except RuntimeError as error:
         pytest.skip(str(error))
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    if sms not in runtime.supported_num_sms(arch):
-        pytest.skip(
-            f"exported {arch} schedules cover {runtime.supported_num_sms(arch)} SMs"
-        )
+    # The programs take the device's SM count as a compile-line definition
+    # (one JIT build per SM count), so any SM count is served.
     torch.manual_seed(23)
     queries, keys = 16, 4096
     q = torch.randn(queries, 32, 128, device=device).to(torch.float8_e4m3fn)

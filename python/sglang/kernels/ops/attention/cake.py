@@ -1296,6 +1296,84 @@ def cake_prepare_dense_mqa_logits(
     )
 
 
+def cake_fp8_mqa_logits(
+    q: torch.Tensor,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    clean_logits: bool = False,
+    max_seqlen_k: int = 0,
+    *,
+    sm_count: Optional[int] = None,
+) -> torch.Tensor:
+    """Explicit DeepGEMM-signature ragged indexer logits (one-shot); f32 [Q, K] view."""
+    return _k("fp8_mqa_logits")(
+        q,
+        kv,
+        weights,
+        ks,
+        ke,
+        clean_logits=clean_logits,
+        max_seqlen_k=max_seqlen_k,
+        sm_count=sm_count,
+    )
+
+
+def cake_get_paged_mqa_logits_metadata(
+    context_lens: torch.Tensor,
+    block_kv: int,
+    num_sms: int,
+    indices: Optional[torch.Tensor] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Explicit DeepGEMM-signature paged schedule metadata; int32 [num_sms + 1, 2]."""
+    return _k("get_paged_mqa_logits_metadata")(
+        context_lens, block_kv, num_sms, indices=indices, out=out
+    )
+
+
+def cake_fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_meta: torch.Tensor,
+    max_context_len: int,
+    clean_logits: bool = False,
+    indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Explicit DeepGEMM-signature paged indexer logits (one-shot); f32 [B * next_n, max_len] view."""
+    return _k("fp8_paged_mqa_logits")(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        clean_logits=clean_logits,
+        indices=indices,
+    )
+
+
+def cake_prepare_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_context_len: int,
+    **kwargs,
+):
+    """Explicit paged indexer logits prepare; returns the plan (keyword args as the adapter)."""
+    return _k("prepare_paged_mqa_logits")(
+        q, kv_cache, weights, context_lens, block_table, max_context_len, **kwargs
+    )
+
+
 def cake_prepare_sparse_mqa_metadata(sparse_indices: torch.Tensor, **kwargs):
     """Explicit sparse MQA metadata prepare; keyword args as the adapter."""
     return _k("prepare_sparse_mqa_metadata")(sparse_indices, **kwargs)
