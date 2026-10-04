@@ -446,7 +446,7 @@ def launch_pool_disagg_server(
     logger.info("All pool role instances ready")
 
     # Start DiffusionServer
-    frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
+    frontend_endpoint = server_args.scheduler_endpoint
 
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
@@ -552,7 +552,7 @@ def launch_disagg_server(server_args: ServerArgs):
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
     decoder_result_ep = f"tcp://{host}:{base_port + 3}"
 
-    frontend_endpoint = f"tcp://{host}:{base_port}"
+    frontend_endpoint = server_args.scheduler_endpoint
 
     logger.info(
         "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s)",

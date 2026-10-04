@@ -195,27 +195,26 @@ class _CudaPlatformTestCase(unittest.TestCase):
 
 
 class TestSchedulerEndpoints(unittest.TestCase):
-    def test_host_normalization_preserves_replica_ports(self):
+    def test_endpoints_follow_scheduler_host_not_http_host(self):
         args = _from_dict_without_model_resolution({"model_path": "test/model"})
         args.dp_size = 2
         args.scheduler_port = 23000
-        for host, expected_host in (
+        for host, scheduler_host in (
             (None, "127.0.0.1"),
             ("localhost", "127.0.0.1"),
             ("::", "127.0.0.1"),
-            ("::1", "127.0.0.1"),
-            ("2001:db8::1", "127.0.0.1"),
             ("0.0.0.0", "127.0.0.1"),
-            ("127.0.0.1", "127.0.0.1"),
-            ("192.0.2.1", "192.0.2.1"),
-            ("scheduler.example", "scheduler.example"),
+            ("192.0.2.1", "127.0.0.1"),
+            ("scheduler.example", "127.0.0.1"),
+            ("0.0.0.0", "192.0.2.7"),
         ):
             for ports in (None, [23100, 23200]):
-                with self.subTest(host=host, ports=ports):
+                with self.subTest(host=host, scheduler_host=scheduler_host, ports=ports):
                     args.host = host
+                    args.scheduler_host = scheduler_host
                     args.scheduler_ports = ports
                     expected = [
-                        f"tcp://{expected_host}:{port}"
+                        f"tcp://{scheduler_host}:{port}"
                         for port in (ports or [23000, 23001])
                     ]
                     self.assertEqual(args.scheduler_endpoint, expected[0])
@@ -3898,12 +3897,13 @@ class TestDirectGpuWeightLoading(_CudaPlatformTestCase):
 
 
 class TestSchedulerEndpointBinding(unittest.TestCase):
-    """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it must
-    never follow a wildcard --host (see ServerArgs.scheduler_endpoint_for)."""
+    """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it binds
+    --scheduler-host and never follows --host (see ServerArgs.scheduler_endpoint_for)."""
 
     def _args(self, kwargs):
         # Endpoint formatting does not need model resolution or port allocation.
         args = ServerArgs.__new__(ServerArgs)
+        args.scheduler_host = ServerArgs.scheduler_host
         for key, value in kwargs.items():
             setattr(args, key, value)
         return args
@@ -3924,11 +3924,22 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
         args = self._args({"model_path": "/fake/model", "scheduler_port": 5555})
         self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
 
-    def test_explicit_host_is_honored(self):
+    def test_explicit_http_host_is_not_followed(self):
         args = self._args(
             {
                 "model_path": "/fake/model",
                 "host": "10.1.2.3",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_explicit_scheduler_host_is_honored(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "0.0.0.0",
+                "scheduler_host": "10.1.2.3",
                 "scheduler_port": 5555,
             }
         )
