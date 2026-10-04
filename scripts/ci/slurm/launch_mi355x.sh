@@ -1977,15 +1977,29 @@ set -e
 # drive_*.log comes first: when drive.sh fails before starting a server -- the
 # node-local staging check is the common case -- it is the only file with the
 # reason in it, and the others are empty or absent.
+#
+# A fixed tail is the wrong unit for a server log: a Python traceback runs well
+# past 30 lines, so the dump reliably cut off the one line naming the error. The
+# 10-03 nightly had 22 of 29 failures whose log contained no error at all for
+# that reason. Print from the first traceback or ERROR instead, and only fall
+# back to a tail when there is no such marker.
+dump_log() {
+    local f="$1" start
+    [[ -f "$f" ]] || return 0
+    echo "--- $f ---"
+    start=$(grep -anE '^(Traceback|[A-Za-z_.]+(Error|Exception)\b)|\bERROR\b' "$f" \
+            2>/dev/null | head -1 | cut -d: -f1)
+    if [[ -n "$start" ]]; then
+        tail -n "+$((start > 5 ? start - 5 : 1))" "$f"
+    else
+        tail -40 "$f"
+    fi
+}
 if [[ "$SALLOC_RC" -ne 0 ]]; then
     echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + server logs:" >&2
-    for f in "$WORKDIR"/drive_*.log; do
-        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
-    done
-    echo "--- bench.log (tail) ---"; tail -40 "$WORKDIR/bench.log" 2>/dev/null || true
-    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
-        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
-    done
+    for f in "$WORKDIR"/drive_*.log; do dump_log "$f"; done
+    dump_log "$WORKDIR/bench.log"
+    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do dump_log "$f"; done
 fi
 
 # Surface the GSM8K accuracy in the job summary -- it scrolls past in the live
