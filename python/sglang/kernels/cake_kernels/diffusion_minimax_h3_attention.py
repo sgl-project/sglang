@@ -1,6 +1,7 @@
 """Cake MiniMax-H3 diffusion attention kernels via FlashInfer.
 
-Three FlashInfer families (FlashInfer ``e4f94f9484``):
+Three FlashInfer families (the BF16 packed-varlen entry at FlashInfer
+``f62ffa92a12``, the others at ``e4f94f9484``):
 
 **Packed-varlen attention, SM100a / SM103a** (public entries
 ``flashinfer.prefill.minimax_h3_varlen_attention`` /
@@ -9,14 +10,18 @@ Three FlashInfer families (FlashInfer ``e4f94f9484``):
 ``...cake_jit``: one generated program per stage shared by both targets and
 compiled per exact arch, ``load_cake_minimax_h3_varlen_attention_module(name,
 arch)``; routes are keyed ``<variant>__sm_10{0,3}a``). BF16 THD ``q, k, v
-[T, H, 128]`` contiguous, int32 CUDA
+[T, H, 128]``, int32 CUDA
 ``cu_seqlens [B+1]`` (starts at 0, non-decreasing, ends at ``T``; empty and
 unaligned segments allowed), non-causal self-attention with ``H_q == H_kv``,
 no mask / bias / window / LSE / dropout, ``softmax_scale`` default
-``1/sqrt(128)``, BF16 ``out [T, H, 128]``.
+``1/sqrt(128)``, contiguous BF16 ``out [T, H, 128]``.
 
-* ``minimax_h3_varlen_attention`` -- BF16 operands; the one-shot form syncs
-  once to read ``cu_seqlens`` unless ``cu_seqlens_host`` is given.
+* ``minimax_h3_varlen_attention`` -- BF16 operands, consumed in place as any
+  token-major view with a unit last stride and 16-byte-aligned head / token
+  strides (the engine's column chunks of the fused ``[T, 3 * H * 128]`` QKV
+  projection, the kind slices of the Cake pre-attention pack ``[T, H, 3, 128]``
+  and contiguous tensors); the one-shot form syncs once to read ``cu_seqlens``
+  unless ``cu_seqlens_host`` is given.
 * ``minimax_h3_varlen_nvfp4_attention`` -- NVFP4 QK (``pv_mode="fp8"``: E4M3 PV
   with a per-tensor V scale; ``"fp4"``: NVFP4 PV); validated by FlashInfer at
   ``atol=1.0, rtol=0.1``.
@@ -64,6 +69,7 @@ from sglang.kernels.cake_kernels._support import (
     SM121,
     cuda_tensor_on,
     flashinfer_module_available,
+    thd_view_ok,
 )
 
 if TYPE_CHECKING:
@@ -110,20 +116,29 @@ def _thd_inputs_ok(
     cu_seqlens: torch.Tensor,
     out: Optional[torch.Tensor],
     archs,
+    *,
+    strided: bool = False,
 ) -> bool:
+    """``strided=True`` (the BF16 route) admits any token-major ``[T, H, 128]``
+    view with a unit last stride and 16-byte-aligned head / token strides (the
+    fused-QKV column chunks and the pre-attention pack slices); ``False`` (the
+    NVFP4 routes, whose quantizers read contiguous operands) requires contiguity.
+    ``out`` is always contiguous."""
     import torch
 
     if not (
         cuda_tensor_on(q, archs)
         and q.ndim == 3
         and q.dtype == torch.bfloat16
-        and q.is_contiguous()
         and q.shape[2] == HEAD_DIM
         and 1 <= q.shape[1] < MAX_HEADS
     ):
         return False
-    for t in (k, v):
-        if not (
+    for t in (q, k, v):
+        if strided:
+            if not thd_view_ok(t, shape=q.shape, dtype=torch.bfloat16, device=q.device):
+                return False
+        elif not (
             t.dtype == torch.bfloat16
             and t.is_contiguous()
             and tuple(t.shape) == tuple(q.shape)
@@ -169,11 +184,18 @@ def supports_minimax_h3_varlen_attention(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Admission check mirroring the FlashInfer BF16 contract; never raises."""
+    """Admission check mirroring the FlashInfer BF16 contract; never raises.
+
+    ``query`` / ``key`` / ``value`` may be strided token-major ``[T, H, 128]``
+    views (unit last stride, 16-byte-aligned head and token strides); they are
+    consumed in place.
+    """
     try:
         return (
             flashinfer_module_available(FI_VARLEN_MODULE, FI_VARLEN_JIT_MODULE)
-            and _thd_inputs_ok(query, key, value, cu_seqlens, out, VARLEN_ARCHS)
+            and _thd_inputs_ok(
+                query, key, value, cu_seqlens, out, VARLEN_ARCHS, strided=True
+            )
             and _varlen_route_available("bf16", query.device.index)
         )
     except Exception:

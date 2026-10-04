@@ -68,3 +68,58 @@ def cuda_tensor_on(tensor, archs: Iterable[Tuple[int, int]]) -> bool:
         and torch.version.cuda is not None
         and device_in(tensor.device.index, archs)
     )
+
+
+def table_view_ok(
+    tensor, *, rows_min: int, cols: int, dtype, device, align_elements: int = 8
+) -> bool:
+    """2-D ``[rows >= rows_min, cols]`` view the Cake table kernels read in place.
+
+    Unit last stride, a row pitch that is a multiple of ``align_elements``
+    (16 bytes for BF16) and a 16-byte-aligned data pointer; column chunks of a
+    wider projection (``stride(0) > cols``) pass.
+    """
+    import torch
+
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.ndim == 2
+        and tensor.dtype == dtype
+        and tensor.device == device
+        and int(tensor.shape[0]) >= rows_min
+        and int(tensor.shape[1]) == cols
+        and tensor.stride(1) == 1
+        and tensor.stride(0) % align_elements == 0
+        and tensor.data_ptr() % (align_elements * tensor.element_size()) == 0
+    )
+
+
+def thd_view_ok(tensor, *, shape, dtype, device, align_elements: int = 8) -> bool:
+    """Token-major ``[T, H, D]`` view the Cake varlen attention reads in place.
+
+    Unit last stride, a head stride that is a multiple of ``align_elements`` of
+    at least ``D``, a token stride that is a multiple of ``align_elements`` of
+    at least ``H * head stride`` and a 16-byte-aligned data pointer: the column
+    chunks of a fused ``[T, 3 * H * D]`` projection, the kind slices of a
+    ``[T, H, 3, D]`` pack and contiguous tensors all pass.
+    """
+    import torch
+
+    if not (
+        isinstance(tensor, torch.Tensor)
+        and tensor.ndim == 3
+        and tuple(tensor.shape) == tuple(shape)
+        and tensor.dtype == dtype
+        and tensor.device == device
+    ):
+        return False
+    heads, head_dim = int(tensor.shape[1]), int(tensor.shape[2])
+    row_stride, head_stride, elem_stride = (int(s) for s in tensor.stride())
+    return (
+        elem_stride == 1
+        and head_stride >= head_dim
+        and head_stride % align_elements == 0
+        and row_stride >= heads * head_stride
+        and row_stride % align_elements == 0
+        and tensor.data_ptr() % (align_elements * tensor.element_size()) == 0
+    )

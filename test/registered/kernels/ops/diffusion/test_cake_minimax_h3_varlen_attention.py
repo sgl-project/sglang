@@ -6,8 +6,11 @@ bitwise identical to calling FlashInfer directly (and the prepared runner is
 bitwise identical to the one-shot form); and the output matches a per-segment
 FP32 torch reference within BF16 tolerance (1e-2) for the BF16 route and
 within the FP4 block-scaled tolerance (atol 1.0 / rtol 0.1) for the NVFP4
-routes. Skips when FlashInfer lacks the module, the GPU is not sm_100a /
-sm_103a, or the generated program is not registered for the arch.
+routes. The BF16 route also consumes the engine's strided token-major views
+(column chunks of the fused ``[T, 3 * H * 128]`` QKV projection and kind
+slices of the ``[T, H, 3, 128]`` pre-attention pack) in place, bitwise equal
+to the contiguous result. Skips when FlashInfer lacks the module, the GPU is
+not sm_100a / sm_103a, or the generated program is not registered for the arch.
 """
 
 import math
@@ -126,6 +129,40 @@ def test_bf16_matches_flashinfer_and_reference():
     assert torch.equal(runner.out, again)
 
 
+def _fused_views(q, k, v):
+    """Column chunks of the fused [T, 3*H*D] projection (stock q/k/v views)."""
+    t, h, d = q.shape
+    fused = torch.cat([x.reshape(t, h * d) for x in (q, k, v)], dim=-1)
+    views = [x.view(t, h, d) for x in fused.split(h * d, dim=-1)]
+    assert all(not x.is_contiguous() and x.stride(0) == 3 * h * d for x in views)
+    return views
+
+
+def _pack_views(q, k, v):
+    """Kind slices of the destination-major pre-attention pack [T, H, 3, D]."""
+    pack = torch.stack((q, k, v), dim=2)
+    views = [pack[:, :, kind, :] for kind in range(3)]
+    assert all(not x.is_contiguous() and x.stride(1) == 3 * HEAD_DIM for x in views)
+    return views
+
+
+@pytest.mark.parametrize("views", [_fused_views, _pack_views])
+def test_bf16_strided_views_match_contiguous(views):
+    _skip_unless_supported("bf16")
+    device = torch.device("cuda")
+    q, k, v, cu_seqlens = _inputs(CU, HEADS, 6091, device)
+    dense = cake_minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=CU)
+    sq, sk, sv = views(q, k, v)
+    assert torch.equal(sq, q) and torch.equal(sk, k) and torch.equal(sv, v)
+    assert cake.supports_minimax_h3_varlen_attention(sq, sk, sv, cu_seqlens)
+    out = cake_minimax_h3_varlen_attention(sq, sk, sv, cu_seqlens, cu_seqlens_host=CU)
+    torch.cuda.synchronize()
+    assert out.is_contiguous() and out.shape == q.shape
+    assert torch.equal(out, dense)
+    # The NVFP4 route quantizes contiguous operands only.
+    assert not cake.supports_minimax_h3_varlen_nvfp4_attention(sq, sk, sv, cu_seqlens)
+
+
 @pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
 def test_nvfp4_matches_flashinfer_and_reference(pv_mode):
     _skip_unless_supported("nvfp4_fp4pv" if pv_mode == "fp4" else "nvfp4_fp8pv")
@@ -159,6 +196,15 @@ def test_admission_rejects_out_of_contract():
     assert not cake.supports_minimax_h3_varlen_attention(q, k, v, cu_seqlens.long())
     assert not cake.supports_minimax_h3_varlen_attention(q, k[:, :3], v, cu_seqlens)
     assert not cake.supports_minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
+    # Strided views need a unit last stride and 16-byte head / token strides.
+    wide = torch.zeros((16, HEADS, 2 * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    assert not cake.supports_minimax_h3_varlen_attention(
+        wide[:, :, ::2], k, v, cu_seqlens
+    )
+    padded = torch.zeros((16, HEADS, HEAD_DIM + 4), dtype=torch.bfloat16, device=device)
+    assert not cake.supports_minimax_h3_varlen_attention(
+        q, padded[:, :, :HEAD_DIM], v, cu_seqlens
+    )
     assert not cake.supports_minimax_h3_varlen_nvfp4_attention(
         q, k, v, cu_seqlens, pv_mode="int8"
     )

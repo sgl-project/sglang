@@ -1,10 +1,17 @@
 """Cake MiniMax-H3 FC1+SwiGLU and gated-residual out-projection (SM100a / SM103a).
 
 FlashInfer entries (``flashinfer.diffusion_ops.minimax_h3_fc1_swiglu`` and
-``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``e4f94f9484``;
+``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``f62ffa92a12``;
 JIT loaders ``flashinfer.jit.minimax_h3_fc1_swiglu`` /
 ``flashinfer.jit.minimax_h3_out_proj`` compile the ``cake_minimax_h3_*_sm100a /
 _sm103a.cu`` sources).
+
+Both families take the diffusion engine's own table operands: BF16 AdaLN /
+gate tables ``[rows, 5376]`` with any ``rows >= 1`` and a 16-byte-aligned row
+pitch (column chunks of the ``[rows, 6 * 5376]`` modulation projection pass as
+they are), int64 row indices ``[M]`` (an index outside ``[0, rows)`` is guarded
+on the device: zero modulated row for FC1, ``out = residual`` for the
+out-projection) and a free ``eps``; nothing is copied on the host.
 
 FC1 + SwiGLU (``x [M, 5376]`` -> ``out [M, 14336]``, ``y = bf16(silu(gate) * up)``
 with ``fc1_weight`` gate rows ``[0, 14336)`` first, then up rows):
@@ -30,8 +37,9 @@ with ``fc1_weight`` gate rows ``[0, 14336)`` first, then up rows):
   / ``prepare_minimax_h3_fc1_weight_nvfp4_sm120``.
 
 Out-projection (``attn_out [P, M, 56 // P, 128]`` Ulysses receive layout,
-``o_weight [5376, 7168]``, ``gate [9, 5376]``, int32 ``gate_index [M]`` (outside
-``[0, 9)`` -> gate 0 -> ``out = residual``), ``residual [M, 5376]`` ->
+``o_weight [5376, 7168]``, ``gate [rows, 5376]`` with ``5376 <= stride(0) <
+2**32``, int64 ``gate_index [M]`` (outside ``[0, rows)`` -> gate 0 ->
+``out = residual``), ``residual [M, 5376]`` ->
 ``out = bf16(residual + bf16(gate * bf16(A @ W^T)))``):
 
 * ``minimax_h3_out_proj`` -- BF16, one persistent 2-CTA tcgen05 launch; only
@@ -47,10 +55,10 @@ Out-projection (``attn_out [P, M, 56 // P, 128]`` Ulysses receive layout,
 
 All compute entries require exact compute capability 10.0 / 10.3 (FlashInfer
 raises ``RuntimeError`` otherwise, except the NVFP4 FC1 dispatcher on 12.x),
-CUDA >= 12.9, ``1 <= M <= 2**24`` and ``eps == 1e-5``.
+CUDA >= 12.9 and ``1 <= M <= 2**24``.
 
 Not supported here: other hidden sizes, SM90, SM120 (use
-:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`), ``eps != 1e-5``.
+:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`).
 """
 
 from __future__ import annotations
@@ -63,6 +71,7 @@ from sglang.kernels.cake_kernels._support import (
     SM120,
     cuda_tensor_on,
     flashinfer_module_available,
+    table_view_ok,
 )
 
 if TYPE_CHECKING:
@@ -83,9 +92,8 @@ FC1_ROWS = 2 * FFN  # 28672
 NUM_HEADS = 56
 HEAD_DIM = 128
 ATTN_DIM = NUM_HEADS * HEAD_DIM  # 7168
-ADALN_ROWS = 9
-GATE_ROWS = 9
-EPS = 1.0e-5
+EPS = 1.0e-5  # default only; any float is admitted
+TABLE_ALIGN_ELEMENTS = 8  # 16-byte row pitch / data pointer alignment (BF16)
 MAX_ROWS = 1 << 24
 SEQUENCE_PARALLEL_DEGREES = (1, 2, 4, 8)
 MXFP8_FC1_SCALE_TILE_BYTES = 112 * 42 * 1024  # 4_816_896
@@ -153,6 +161,20 @@ def _f32_scalar(t: Scalar, device) -> bool:
     )
 
 
+def _table(t: torch.Tensor, device) -> bool:
+    """``[rows >= 1, 5376]`` BF16 table view with a 16-byte-aligned row pitch."""
+    import torch
+
+    return table_view_ok(
+        t,
+        rows_min=1,
+        cols=HIDDEN,
+        dtype=torch.bfloat16,
+        device=device,
+        align_elements=TABLE_ALIGN_ELEMENTS,
+    )
+
+
 def _fc1_common(
     x: torch.Tensor,
     x_norm_weight: torch.Tensor,
@@ -174,16 +196,15 @@ def _fc1_common(
         return False
     m = x.shape[0]
     bf16 = torch.bfloat16
+    float(eps)
     return (
-        float(eps) == EPS
-        and _shape(x_norm_weight, (HIDDEN,), bf16)
-        and _shape(adaln_scale, (ADALN_ROWS, HIDDEN), bf16)
-        and _shape(adaln_shift, (ADALN_ROWS, HIDDEN), bf16)
-        and _shape(adaln_index, (m,), torch.int32)
-        and all(
-            t.device == x.device
-            for t in (x_norm_weight, adaln_scale, adaln_shift, adaln_index)
-        )
+        _shape(x_norm_weight, (HIDDEN,), bf16)
+        and _table(adaln_scale, x.device)
+        and _table(adaln_shift, x.device)
+        and adaln_scale.shape[0] == adaln_shift.shape[0]
+        and _shape(adaln_index, (m,), torch.int64)
+        and x_norm_weight.device == x.device
+        and adaln_index.device == x.device
         and _opt(out, (m, FFN), bf16, x.device)
     )
 
@@ -545,10 +566,15 @@ def _out_proj_common(
         p in SEQUENCE_PARALLEL_DEGREES
         and 1 <= m <= MAX_ROWS
         and tuple(attn_out.shape) == (p, m, NUM_HEADS // p, HEAD_DIM)
-        and _shape(gate, (GATE_ROWS, HIDDEN), bf16)
-        and _shape(gate_index, (m,), torch.int32)
+        and _table(gate, attn_out.device)
+        # The epilogue forms the table offset as a 32x32 -> 64-bit multiply of
+        # the row index and the row pitch: rows must not overlap and the pitch
+        # must fit 32 bits.
+        and HIDDEN <= gate.stride(0) < 2**32
+        and _shape(gate_index, (m,), torch.int64)
         and _shape(residual, (m, HIDDEN), bf16)
-        and all(t.device == attn_out.device for t in (gate, gate_index, residual))
+        and gate_index.device == attn_out.device
+        and residual.device == attn_out.device
         and _opt(out, (m, HIDDEN), bf16, attn_out.device)
     )
 

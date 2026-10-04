@@ -1535,7 +1535,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             if (
                 cake_on
                 and rope_cache is not None
-                and self.norm1.eps == self.attn.q_norm.eps
+                and self.attn.q_norm.eps == self.attn.k_norm.eps
             ):
                 qkv_override = _cake_routes.pre_attention(
                     x,
@@ -1548,6 +1548,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                     k_norm_weight=self.attn.k_norm.weight,
                     rope_cache=rope_cache,
                     eps=self.norm1.eps,
+                    qk_eps=self.attn.q_norm.eps,
                 )
             if qkv_override is not None:
                 # norm1 / AdaLN / qkv_proj / qk-norm / RoPE ran fused; the

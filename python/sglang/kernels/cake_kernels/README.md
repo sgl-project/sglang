@@ -130,23 +130,23 @@ prepared weight layouts.
 
 | op id | FlashInfer entry | SM | notes (graph/prepare) |
 |---|---|---|---|
-| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | one-shot |
+| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
 | `minimax_h3_dense_attention` | `diffusion_ops.cake_minimax_h3_dense_attention:minimax_h3_dense_attention` | 9.0-10.3, 12.0-12.1 | one-shot; cc 12.1 admitted but unmeasured |
-| `minimax_h3_fc1_swiglu` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu` | 10.0-10.3 | one-shot |
+| `minimax_h3_fc1_swiglu` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
 | `minimax_h3_fc1_swiglu_fp8` | `diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu:minimax_h3_fc1_swiglu_fp8` | 12.0 | one-shot |
-| `minimax_h3_fc1_swiglu_mxfp8` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu_mxfp8` | 10.0-10.3 | one-shot |
-| `minimax_h3_fc1_swiglu_nvfp4` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu_nvfp4` | 10.0-10.3, 12.0 | arch dispatcher (SM120 route on cc 12.0) |
+| `minimax_h3_fc1_swiglu_mxfp8` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu_mxfp8` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
+| `minimax_h3_fc1_swiglu_nvfp4` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu_nvfp4` | 10.0-10.3, 12.0 | arch dispatcher (SM120 route on cc 12.0); engine operands on 10.x (`f62ffa92a12`) |
 | `minimax_h3_fp8_out_proj` | `diffusion_ops.cake_minimax_h3_sm120_quant_out_proj:minimax_h3_fp8_out_proj` | 12.0 | one-shot |
 | `minimax_h3_fp8_pre_attention` | `diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention:minimax_h3_fp8_pre_attention` | 12.0 | one-shot |
 | `minimax_h3_nvfp4_out_proj` | `diffusion_ops.cake_minimax_h3_sm120_quant_out_proj:minimax_h3_nvfp4_out_proj` | 12.0 | one-shot |
 | `minimax_h3_nvfp4_pre_attention` | `diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention:minimax_h3_nvfp4_pre_attention` | 12.0 | one-shot |
-| `minimax_h3_out_proj` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj` | 10.0-10.3 | one-shot |
-| `minimax_h3_out_proj_mxfp8` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj_mxfp8` | 10.0-10.3 | one-shot |
-| `minimax_h3_out_proj_nvfp4` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj_nvfp4` | 10.0-10.3 | one-shot |
+| `minimax_h3_out_proj` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
+| `minimax_h3_out_proj_mxfp8` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj_mxfp8` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
+| `minimax_h3_out_proj_nvfp4` | `diffusion_ops.minimax_h3_out_proj:minimax_h3_out_proj_nvfp4` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
 | `minimax_h3_qkv_quantize_pack` | `diffusion_ops.cake_minimax_h3_qkv_pack:minimax_h3_qkv_quantize_pack` | 10.0-10.3 | one-shot |
 | `minimax_h3_sm120_varlen_attention_fp8` | `diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention:minimax_h3_sm120_varlen_attention_fp8` | 12.0-12.1 | one-shot |
 | `minimax_h3_sm120_varlen_attention_nvfp4` | `diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention:minimax_h3_sm120_varlen_attention_nvfp4` | 12.0-12.1 | one-shot; experimental |
-| `minimax_h3_varlen_attention` | `prefill:minimax_h3_varlen_attention` | 10.0-10.3 | one-shot |
+| `minimax_h3_varlen_attention` | `prefill:minimax_h3_varlen_attention` | 10.0-10.3 | one-shot; strided q/k/v views (`f62ffa92a12`) |
 | `minimax_h3_varlen_nvfp4_attention` | `prefill:minimax_h3_varlen_nvfp4_attention` | 10.0-10.3 | one-shot |
 | `prepare_minimax_h3_fc1_weight_fp8` | `diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu:prepare_minimax_h3_fc1_weight_fp8` | any CUDA | offline weight prep |
 | `prepare_minimax_h3_fc1_weight_mxfp8` | `diffusion_ops.minimax_h3_fc1_swiglu:prepare_minimax_h3_fc1_weight_mxfp8` | any CUDA | offline weight prep |
@@ -323,6 +323,18 @@ project, not in this tree.
   `attention.create_sparse_mla_sm120_dsv41_mixed_wrapper`,
   `attention.dsv41_fp8_quantize_{pack,append}_sparse_mla_cache`) were read from FlashInfer
   main `e4f94f948` (PRs #5956 and #5983); their docstrings cite that commit.
+- **Re-pin to `f62ffa92a12`** (MiniMax-H3 engine operands): `minimax_h3_bf16_pre_attention`,
+  `minimax_h3_fc1_swiglu{,_mxfp8,_nvfp4}`, `minimax_h3_out_proj{,_mxfp8,_nvfp4}` and the
+  BF16 `minimax_h3_varlen_attention` were re-read from FlashInfer main `f62ffa92a12`. Their
+  AdaLN / gate tables are `[rows, 5376]` views with any `rows >= 1`, a unit last stride and a
+  16-byte row pitch (the engine's column chunks of the `[rows, 6 * 5376]` modulation
+  projection pass as they are; the out-projection additionally needs
+  `5376 <= stride(0) < 2**32`); row indices are int64 `[M]`; `eps` is free; the BF16
+  pre-attention takes `(rope_cos_sin [S, 96], rope_positions int64 [M])` and a separate
+  `qk_eps`; the BF16 attention consumes strided token-major `[T, H, 128]` views (unit last
+  stride, 16-byte head and token strides) and writes a contiguous output. The MXFP8 /
+  NVFP4 pre-attention chains and `minimax_h3_qkv_quantize_pack` keep the `e4f94f948`
+  contract (contiguous `[9, 5376]` tables, int32 index, per-row `rope_cos_sin [M, 96]`).
 - **Pinned release**: SGLang pins `flashinfer_python 0.7.0.post1`, which ships 11 of the
   117 Cake Python modules present at the baseline. For the other 106, `find_spec` returns
   `None`, `supports_*` returns `False` and callers keep their existing backend: no import
@@ -396,6 +408,11 @@ Semantic caveats:
   interchangeable with the SM120 layouts (`*_weight_fp8`, `*_nvfp4_sm120`,
   `quantize_minimax_h3_*`). Prepare on the architecture that runs, or use the
   `prepare_minimax_h3_fc1_weight_nvfp4` dispatcher.
+- **MiniMax-H3 engine operands**: the `minimax_h3_diffusion` route hands the DiT's own
+  tensors to the four fused stages (strided AdaLN / gate chunks of any row count, int64
+  `combined_indices`, the `(cos_sin_cache, positions)` RoPE pair, strided fused-QKV or
+  pre-attention-pack q/k/v views); no copy, cast or gather runs between the stages. An
+  operand outside the contract falls back to the stock kernels with one log line per reason.
 - **DSv4 sparse MLA**: reset the workspace once (`cake_dsv4_workspace_reset` or one
   eager call) before capturing `trtllm_batch_decode_sparse_mla_dsv4`.
 - **Grouped FP8 GEMM**: the first `launch()` of a prepared

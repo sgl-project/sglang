@@ -1,12 +1,20 @@
 """Cake MiniMax-H3 pre-attention projections (SM100a / SM103a) via FlashInfer.
 
-FlashInfer entries (``flashinfer.diffusion_ops``, FlashInfer ``e4f94f9484``):
+FlashInfer entries (``flashinfer.diffusion_ops``; the BF16 entry at FlashInfer
+``f62ffa92a12``, the quantized chains at ``e4f94f9484``):
 
 * ``minimax_h3_bf16_pre_attention`` -- fused input RMSNorm + indexed AdaLN +
   BF16 QKV projection + per-head Q/K RMSNorm + partial 3-D split-half NeoX
   RoPE + destination-major pack ``out [P, M, 56 // P, 3, 128]``. JIT module
   ``flashinfer.jit.cake_minimax_h3_bf16_pre_attention``. Caller-owned ``out``,
   no allocation, no host sync: CUDA-graph capturable after the first build.
+  Takes the diffusion engine's own operands: AdaLN tables ``[rows, 5376]`` with
+  any ``rows >= 1`` and a 16-byte-aligned row pitch (column chunks of the
+  ``[rows, 6 * 5376]`` modulation projection pass as they are), int64
+  ``adaln_index [M]``, RoPE as the shared ``(rope_cos_sin [S, 96],
+  rope_positions int64 [M])`` pair (``rope_positions=None`` = identity, then
+  ``S >= M``), separate ``eps`` (input norm) and ``qk_eps`` (Q/K norms, default
+  ``eps``); no host copies.
 * ``prepare_minimax_h3_mxfp8_pre_attention`` -> ``PreparedMiniMaxH3Mxfp8PreAttention``
   -- 3-launch chain (norm/AdaLN/MXFP8 quant -> CUTLASS MXFP8 GEMM with a tactic
   pinned at prepare -> QK-norm/RoPE/MXFP8 pack). One JIT loader for both
@@ -40,20 +48,22 @@ is no descriptor workspace. FlashInfer keeps the ``norm_descriptor_workspace``
 raises ``ValueError`` for any non-``None`` value; this adapter does not expose
 them.
 
-Shared contract: BF16 ``x [M, 5376]``, ``x_norm_weight [5376]``, BF16 AdaLN
-tables ``[9, 5376]``, int32 ``adaln_index [M]`` (out-of-range -> zero row,
-device-guarded), BF16 ``q/k_norm_weight [128]``, BF16 ``rope_cos_sin [M, 96]``
-(cols ``[0, 48)`` cos, ``[48, 96)`` sin; head dims ``[96, 128)`` pass through),
-``P`` (``ulysses_degree``) in ``{1, 2, 4, 8}``, ``eps == 1e-5`` exactly. Every
-output / workspace is caller-owned. Prepared runners are bound to the tensor
-objects given at prepare (contents may change between launches).
+Shared contract: BF16 ``x [M, 5376]``, ``x_norm_weight [5376]``, BF16
+``q/k_norm_weight [128]``, RoPE cols ``[0, 48)`` cos, ``[48, 96)`` sin (head
+dims ``[96, 128)`` pass through), ``P`` (``ulysses_degree``) in ``{1, 2, 4, 8}``.
+The quantized (MXFP8 / NVFP4 / quantize-and-pack) chains keep the exact-shape
+contract: contiguous BF16 AdaLN tables ``[9, 5376]``, int32 ``adaln_index [M]``
+(out-of-range -> zero row, device-guarded), BF16 per-row ``rope_cos_sin
+[M, 96]``, ``eps == 1e-5``. Every output / workspace is caller-owned. Prepared
+runners are bound to the tensor objects given at prepare (contents may change
+between launches).
 
 Built for exact compute capability 10.0 / 10.3 only (sm_100a / sm_103a).
 
 Not supported here (keep the existing SGLang path): any other hidden size or
 head configuration, SM90, SM120 (use the separate SM120 entries in
-:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`), ``eps != 1e-5``,
-MXFP8 ``(M, P)`` pairs outside the route table.
+:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`), MXFP8 ``(M, P)``
+pairs outside the route table.
 """
 
 from __future__ import annotations
@@ -65,6 +75,7 @@ from sglang.kernels.cake_kernels._support import (
     SM103,
     cuda_tensor_on,
     flashinfer_module_available,
+    table_view_ok,
 )
 
 if TYPE_CHECKING:
@@ -86,8 +97,14 @@ HEAD_DIM = 128
 QKV_KINDS = 3
 QKV_WIDTH = NUM_HEADS * QKV_KINDS * HEAD_DIM  # 21504
 ROPE_DIM = 96
+# Exact table row count of the quantized (MXFP8 / NVFP4) chains; the BF16 entry
+# takes any ``rows >= 1``.
 ADALN_ROWS = 9
+# Input-norm eps the quantized chains are compiled for; the BF16 entry takes
+# ``eps`` / ``qk_eps`` as runtime floats.
 EPS = 1.0e-5
+# BF16 tables / rope cache: row pitch in elements that keeps rows 16-byte aligned.
+TABLE_ALIGN_ELEMENTS = 8
 ULYSSES_DEGREES = (1, 2, 4, 8)
 PACK_FORMATS = ("nvfp4", "mxfp8")
 
@@ -169,6 +186,89 @@ def _common_pre_attention_inputs(
 # ---------------------------------------------------------------------------
 
 
+def _bf16_pre_attention_inputs(
+    x: torch.Tensor,
+    x_norm_weight: torch.Tensor,
+    adaln_scale: torch.Tensor,
+    adaln_shift: torch.Tensor,
+    adaln_index: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    rope_cos_sin: torch.Tensor,
+    rope_positions: Optional[torch.Tensor],
+    *,
+    P: int,
+    eps: float,
+    qk_eps: Optional[float],
+) -> bool:
+    """The engine-operand contract of the BF16 entry (FlashInfer ``f62ffa92a12``)."""
+    import torch
+
+    if not (
+        cuda_tensor_on(x, ARCHS)
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and _shape(x, (x.shape[0], HIDDEN), torch.bfloat16)
+    ):
+        return False
+    m = int(x.shape[0])
+    bf16 = torch.bfloat16
+    device = x.device
+    float(eps)
+    if qk_eps is not None:
+        float(qk_eps)
+
+    def rope_ok() -> bool:
+        # The cache is gathered on the device: identity positions need S >= M,
+        # explicit positions are an int64 [M] row map into the cache.
+        if rope_positions is None:
+            return int(rope_cos_sin.shape[0]) >= m
+        return (
+            _shape(rope_positions, (m,), torch.int64)
+            and rope_positions.device == device
+        )
+
+    return (
+        not isinstance(P, bool)
+        and P in ULYSSES_DEGREES
+        and _shape(x_norm_weight, (HIDDEN,), bf16)
+        and x_norm_weight.device == device
+        and table_view_ok(
+            adaln_scale,
+            rows_min=1,
+            cols=HIDDEN,
+            dtype=bf16,
+            device=device,
+            align_elements=TABLE_ALIGN_ELEMENTS,
+        )
+        and table_view_ok(
+            adaln_shift,
+            rows_min=1,
+            cols=HIDDEN,
+            dtype=bf16,
+            device=device,
+            align_elements=TABLE_ALIGN_ELEMENTS,
+        )
+        and adaln_scale.shape[0] == adaln_shift.shape[0]
+        and _shape(adaln_index, (m,), torch.int64)
+        and adaln_index.device == device
+        and _shape(q_norm_weight, (HEAD_DIM,), bf16)
+        and _shape(k_norm_weight, (HEAD_DIM,), bf16)
+        and q_norm_weight.device == device
+        and k_norm_weight.device == device
+        and table_view_ok(
+            rope_cos_sin,
+            rows_min=1,
+            cols=ROPE_DIM,
+            dtype=bf16,
+            device=device,
+            align_elements=TABLE_ALIGN_ELEMENTS,
+        )
+        and rope_cos_sin.is_contiguous()
+        and rope_ok()
+    )
+
+
 def supports_minimax_h3_bf16_pre_attention(
     x: torch.Tensor,
     x_norm_weight: torch.Tensor,
@@ -183,14 +283,22 @@ def supports_minimax_h3_bf16_pre_attention(
     ulysses_degree: int,
     out: torch.Tensor,
     eps: float = EPS,
+    qk_eps: Optional[float] = None,
+    rope_positions: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Admission check mirroring the FlashInfer contract; never raises."""
+    """Admission check mirroring the FlashInfer contract; never raises.
+
+    ``adaln_scale`` / ``adaln_shift`` are any ``[rows >= 1, 5376]`` BF16 views
+    with a 16-byte-aligned row pitch, ``adaln_index`` is int64, ``rope_cos_sin``
+    is the shared ``[S, 96]`` cache indexed by int64 ``rope_positions [M]``
+    (``None``: identity, ``S >= M``); ``eps`` / ``qk_eps`` are free floats.
+    """
     import torch
 
     try:
         return (
             flashinfer_module_available(FI_MODULE, FI_JIT_MODULE)
-            and _common_pre_attention_inputs(
+            and _bf16_pre_attention_inputs(
                 x,
                 x_norm_weight,
                 adaln_scale,
@@ -199,8 +307,10 @@ def supports_minimax_h3_bf16_pre_attention(
                 q_norm_weight,
                 k_norm_weight,
                 rope_cos_sin,
+                rope_positions,
                 P=ulysses_degree,
                 eps=eps,
+                qk_eps=qk_eps,
             )
             and _shape(qkv_weight, (QKV_WIDTH, HIDDEN), torch.bfloat16)
             and qkv_weight.device == x.device
@@ -235,11 +345,15 @@ def minimax_h3_bf16_pre_attention(
     ulysses_degree: int,
     out: torch.Tensor,
     eps: float = EPS,
+    qk_eps: Optional[float] = None,
+    rope_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Forward to FlashInfer; returns the caller-owned ``out``.
 
-    On SM103a the measured promotion range is ``ulysses_degree in {2, 4, 8}``;
-    callers dispatching by ``P`` may keep their segmented path for ``P=1``.
+    The tables, the index and the ``(rope_cos_sin, rope_positions)`` pair are
+    handed to the kernel as they are (no host copies).  On SM103a the measured
+    promotion range is ``ulysses_degree in {2, 4, 8}``; callers dispatching by
+    ``P`` may keep their segmented path for ``P=1``.
     """
     from flashinfer.diffusion_ops.minimax_h3 import minimax_h3_bf16_pre_attention
 
@@ -256,6 +370,8 @@ def minimax_h3_bf16_pre_attention(
         ulysses_degree=ulysses_degree,
         out=out,
         eps=eps,
+        qk_eps=qk_eps,
+        rope_positions=rope_positions,
     )
 
 

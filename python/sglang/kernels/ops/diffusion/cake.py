@@ -58,7 +58,9 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         True,
-        "BF16 x [M,5376] -> caller-owned out [P,M,56/P,3,128]; P in {1,2,4,8}",
+        "BF16 x [M,5376], AdaLN tables [rows,5376] (any rows, strided ok), int64 "
+        "index, (rope_cos_sin [S,96], rope_positions int64 [M]), eps/qk_eps -> "
+        "caller-owned out [P,M,56/P,3,128]; P in {1,2,4,8}",
         "Cake MiniMax-H3 fused RMSNorm+AdaLN+BF16 QKV+QK-norm+RoPE+pack (SM100/103).",
     ),
     (
@@ -108,7 +110,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "BF16 x [M,5376] + fc1_weight [28672,5376] -> out [M,14336]",
+        "BF16 x [M,5376] + AdaLN tables [rows,5376] (any rows, strided ok) + int64 "
+        "index + fc1_weight [28672,5376] -> out [M,14336]",
         "Cake MiniMax-H3 BF16 norm+AdaLN+FC1+SwiGLU (SM100/103 tcgen05).",
     ),
     (
@@ -157,7 +160,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "attn_out [P,M,56/P,128] receive layout + o_weight [5376,7168] -> "
+        "attn_out [P,M,56/P,128] receive layout + o_weight [5376,7168] + gate "
+        "[rows,5376] (any rows, strided ok) + int64 gate_index -> "
         "bf16(residual + bf16(gate * bf16(A@W^T)))",
         "Cake MiniMax-H3 BF16 gated-residual out-projection (SM100/103 tcgen05).",
     ),
@@ -204,8 +208,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "BF16 THD q,k,v [T,H,128] + int32 cu_seqlens [B+1] -> out [T,H,128]; "
-        "noncausal, H_q == H_kv",
+        "BF16 THD q,k,v [T,H,128] (strided token-major views ok) + int32 "
+        "cu_seqlens [B+1] -> contiguous out [T,H,128]; noncausal, H_q == H_kv",
         "Cake MiniMax-H3 packed-varlen BF16 attention (SM100/103).",
     ),
     (

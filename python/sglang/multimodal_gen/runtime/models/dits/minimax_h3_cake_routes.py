@@ -15,11 +15,10 @@
 
 Every stage is admitted per call by the adapter's ``supports_*`` on the exact
 tensors the engine is about to use; a stage that is not admitted (route off,
-other arch, TP > 1 weight shards, quantized weights, AdaLN table with a row
-count other than 9, ...) returns ``None`` and the block runs its stock code,
-unchanged.  The first "taken" and the first "fallback" of each distinct reason per
-stage are logged so
-an e2e run can prove which kernel executed.
+other arch, TP > 1 weight shards, quantized weights, an operand outside the
+kernel contract, ...) returns ``None`` and the block runs its stock code,
+unchanged.  The first "taken" and the first "fallback" of each distinct reason
+per stage are logged so an e2e run can prove which kernel executed.
 
 CUDA graphs (breakable CUDA graph runner): the three GEMM stages run inside the
 captured segments.  They are one-shot kernels with caller-owned outputs and no
@@ -30,19 +29,24 @@ in the eager break (``_minimax_h3_attention_core_bcg``); inside a captured
 region (token refiner, ``bcg_breakpoint=False``) it always falls back because
 the one-shot FlashInfer entry builds its plan tables at call time.
 
-FlashInfer-contract adaptations made here (candidates for FlashInfer issues):
+The engine's operands are handed to the kernels as they are -- no copy, cast
+or gather runs between the stages:
 
-* AdaLN / gate tables must be contiguous ``[9, 5376]``; the engine's tables are
-  ``[rows, 5376]`` column chunks of a ``[rows, 6 * 5376]`` projection (row
-  stride ``6 * 5376``).  A 94 KiB ``.contiguous()`` copy per table and block.
-* ``adaln_index`` / ``gate_index`` must be int32; the engine carries
-  ``combined_indices`` as int64.  One ``[T]`` cast per stage and block.
-* ``rope_cos_sin`` is a per-row ``[T, 96]`` table; the engine carries
-  ``(cos_sin_cache, positions)`` for ``sgl_kernel.rotary_embedding``.  One
-  ``index_select`` gather per block.
-* Attention operands must be contiguous ``[T, H, 128]``; the stock q/k/v are
-  strided views of the fused QKV projection (row stride ``3 * 7168``), which
-  FlashAttention accepts.  Three BF16 copies when the stage is admitted.
+* AdaLN / gate tables are the ``[rows, 5376]`` column chunks of the
+  ``[rows, 6 * 5376]`` modulation projection (any ``rows >= 1``, row stride
+  ``6 * 5376``); the kernels read them through the row pitch.
+* ``adaln_index`` / ``gate_index`` is the engine's int64 ``combined_indices``.
+* RoPE takes the engine's ``(cos_sin_cache [S, 96], positions int64 [T])``
+  pair and gathers the cache rows on the device.
+* Attention consumes the strided ``[T, H, 128]`` views of the fused QKV
+  projection (row stride ``3 * 7168``) or of the Cake pre-attention pack
+  ``[T, H, 3, 128]`` in place and writes a contiguous output.
+* ``norm1.eps`` and the Q/K-norm ``eps`` are passed separately.
+
+Operands outside the kernel contract (a non-unit last stride, a row pitch that
+is not a multiple of 8 elements, an int32 index, a mismatched row count, ...)
+are rejected by the adapter's admission and the stage falls back to the stock
+kernels with one log line per reason.
 
 Not covered (stock path kept): Ulysses / ring sequence parallelism (the Cake
 pack layout is the Ulysses send buffer, but the engine's all-to-all consumes
@@ -134,9 +138,10 @@ def _summary(**tensors: Optional[torch.Tensor]) -> str:
         if t is None:
             parts.append(f"{name}=None")
         else:
-            parts.append(
-                f"{name}={tuple(t.shape)}/{str(t.dtype).removeprefix('torch.')}"
-            )
+            text = f"{name}={tuple(t.shape)}/{str(t.dtype).removeprefix('torch.')}"
+            if not t.is_contiguous():
+                text += f"/stride{tuple(t.stride())}"
+            parts.append(text)
     return " ".join(parts)
 
 
@@ -193,7 +198,7 @@ def _fc1_kernels() -> Tuple[Callable[..., bool], Callable[..., object]]:
 def _tensor_key(t: Optional[torch.Tensor]) -> tuple:
     if t is None:
         return (None,)
-    return (tuple(t.shape), t.dtype, t.is_contiguous(), str(t.device))
+    return (tuple(t.shape), tuple(t.stride()), t.dtype, str(t.device))
 
 
 def _stage_open(stage: str, key: tuple, *, in_graph: bool) -> bool:
@@ -218,31 +223,20 @@ def _reject(stage: str, key: tuple, detail: str) -> None:
     _log_once(stage, "fallback", detail)
 
 
-def _table(t: torch.Tensor) -> torch.Tensor:
-    # FlashInfer wants contiguous [9, 5376] tables; the engine's AdaLN chunks
-    # are column slices of the [rows, 6 * 5376] projection (94 KiB copy).
-    return t if t.is_contiguous() else t.contiguous()
-
-
-def _index_i32(t: torch.Tensor) -> torch.Tensor:
-    # FlashInfer wants int32 row indices; the engine's combined_indices are int64.
-    return t if t.dtype == torch.int32 else t.to(torch.int32)
-
-
-def _rope_table(
-    cos_sin_cache: torch.Tensor, positions: torch.Tensor, rows: int
-) -> Optional[torch.Tensor]:
-    if (
-        not isinstance(cos_sin_cache, torch.Tensor)
-        or not isinstance(positions, torch.Tensor)
-        or cos_sin_cache.ndim != 2
-        or positions.ndim != 1
-        or int(positions.shape[0]) != rows
-    ):
-        return None
-    # FlashInfer wants the per-row [T, 96] cos|sin table; the engine carries
-    # (cache, positions) for sgl_kernel.rotary_embedding.  Gather (T x 192 B).
-    return cos_sin_cache.index_select(0, positions)
+def _rope_pair_ok(
+    cos_sin_cache: object, positions: object, rows: int, device: torch.device
+) -> bool:
+    """The engine's ``(cos_sin_cache [S, 96], positions int64 [T])`` pair."""
+    return (
+        isinstance(cos_sin_cache, torch.Tensor)
+        and isinstance(positions, torch.Tensor)
+        and cos_sin_cache.ndim == 2
+        and positions.ndim == 1
+        and positions.dtype == torch.int64
+        and int(positions.shape[0]) == rows
+        and positions.device == device
+        and cos_sin_cache.device == device
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +256,14 @@ def pre_attention(
     k_norm_weight: torch.Tensor,
     rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
     eps: float,
+    qk_eps: float,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Fused pre-attention; ``(q, k, v)`` ``[T, H, 128]`` views or ``None``.
 
     The returned tensors are already Q/K-normalised and RoPE-rotated, i.e. what
     ``MiniMaxH3Attention.forward`` hands to the attention core.  ``None`` means
     "run the stock norm1 / AdaLN / qkv_proj / qk-norm / RoPE sequence".
+    ``eps`` is ``norm1``'s epsilon, ``qk_eps`` the Q/K-norm epsilon.
     """
     stage = STAGE_PRE_ATTENTION
     if (
@@ -283,8 +279,10 @@ def pre_attention(
         _tensor_key(x),
         _tensor_key(qkv_weight),
         _tensor_key(adaln_scale),
+        _tensor_key(adaln_shift),
         _tensor_key(adaln_index),
         float(eps),
+        float(qk_eps),
     )
     if not _stage_open(stage, key, in_graph=True):
         return None
@@ -294,41 +292,39 @@ def pre_attention(
         _reject(stage, key, f"qkv weight rows {tuple(qkv_weight.shape)} not 3*H*D")
         return None
     cos_sin_cache, positions = rope_cache
-    rope_cos_sin = _rope_table(cos_sin_cache, positions, int(x.shape[0]))
-    if rope_cos_sin is None:
+    if not _rope_pair_ok(cos_sin_cache, positions, int(x.shape[0]), x.device):
         _reject(
             stage,
             key,
-            f"rope cache {_summary(cache=cos_sin_cache, positions=positions)} "
-            "is not a per-row table",
+            "rope cache is not a (cos_sin_cache [S, 96], int64 positions [T]) "
+            f"pair: {_summary(cache=cos_sin_cache, positions=positions)}",
         )
         return None
     supports, forward = _pre_attention_kernels()
-    shift = _table(adaln_shift)
-    scale = _table(adaln_scale)
-    index = _index_i32(adaln_index)
     # Destination-major pack for ulysses_degree=1: [1, T, H, 3, D].
     out = torch.empty(
         (1, int(x.shape[0]), heads, _QKV_KINDS, head_dim),
         dtype=torch.bfloat16,
         device=x.device,
     )
-    detail = _summary(x=x, qkv_weight=qkv_weight, adaln=scale, index=index)
+    detail = _summary(x=x, qkv_weight=qkv_weight, adaln=adaln_scale, index=adaln_index)
     if _verdicts.get(key) is None:
         admitted = bool(
             supports(
                 x,
                 x_norm_weight,
-                scale,
-                shift,
-                index,
+                adaln_scale,
+                adaln_shift,
+                adaln_index,
                 qkv_weight,
                 q_norm_weight,
                 k_norm_weight,
-                rope_cos_sin,
+                cos_sin_cache,
                 ulysses_degree=1,
                 out=out,
                 eps=eps,
+                qk_eps=qk_eps,
+                rope_positions=positions,
             )
         )
         if not admitted:
@@ -339,16 +335,18 @@ def pre_attention(
         forward(
             x,
             x_norm_weight,
-            scale,
-            shift,
-            index,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
             qkv_weight,
             q_norm_weight,
             k_norm_weight,
-            rope_cos_sin,
+            cos_sin_cache,
             ulysses_degree=1,
             out=out,
             eps=eps,
+            qk_eps=qk_eps,
+            rope_positions=positions,
         )
     except _CAKE_ERRORS as error:
         _reject(stage, key, f"FlashInfer rejected the call ({error}): {detail}")
@@ -396,11 +394,9 @@ def varlen_attention(
         )
         return None
     supports, forward = _attention_kernels()
-    # FlashInfer wants contiguous THD operands; the stock q/k/v are strided
-    # views of the fused QKV projection, which FlashAttention accepts as-is.
-    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    detail = _summary(q=q, cu_seqlens=cu_seqlens)
+    # The strided q/k/v views (fused QKV chunks or pre-attention pack slices)
+    # are consumed in place; the kernel writes a contiguous output.
+    detail = _summary(q=q, k=k, v=v, cu_seqlens=cu_seqlens)
     if _verdicts.get(key) is None:
         if not bool(supports(q, k, v, cu_seqlens)):
             _reject(stage, key, f"adapter admission rejected: {detail}")
@@ -459,17 +455,15 @@ def out_proj_gated_residual(
         return None
     supports, forward = _out_proj_kernels()
     packed = attn_out.unsqueeze(0)
-    gate_c = _table(gate)
-    index = _index_i32(gate_index)
-    detail = _summary(attn_out=packed, o_weight=o_weight, gate=gate_c, index=index)
+    detail = _summary(attn_out=packed, o_weight=o_weight, gate=gate, index=gate_index)
     if _verdicts.get(key) is None:
-        if not bool(supports(packed, o_weight, gate_c, index, residual)):
+        if not bool(supports(packed, o_weight, gate, gate_index, residual)):
             _reject(stage, key, f"adapter admission rejected: {detail}")
             return None
         _verdicts[key] = True
     out = torch.empty_like(residual)
     try:
-        forward(packed, o_weight, gate_c, index, residual, out=out)
+        forward(packed, o_weight, gate, gate_index, residual, out=out)
     except _CAKE_ERRORS as error:
         _reject(stage, key, f"FlashInfer rejected the call ({error}): {detail}")
         return None
@@ -506,19 +500,25 @@ def fc1_swiglu(
         _tensor_key(x),
         _tensor_key(fc1_weight),
         _tensor_key(adaln_scale),
+        _tensor_key(adaln_shift),
         _tensor_key(adaln_index),
         float(eps),
     )
     if not _stage_open(stage, key, in_graph=True):
         return None
     supports, forward = _fc1_kernels()
-    shift = _table(adaln_shift)
-    scale = _table(adaln_scale)
-    index = _index_i32(adaln_index)
-    detail = _summary(x=x, fc1_weight=fc1_weight, adaln=scale, index=index)
+    detail = _summary(x=x, fc1_weight=fc1_weight, adaln=adaln_scale, index=adaln_index)
     if _verdicts.get(key) is None:
         if not bool(
-            supports(x, x_norm_weight, scale, shift, index, fc1_weight, eps=eps)
+            supports(
+                x,
+                x_norm_weight,
+                adaln_scale,
+                adaln_shift,
+                adaln_index,
+                fc1_weight,
+                eps=eps,
+            )
         ):
             _reject(stage, key, f"adapter admission rejected: {detail}")
             return None
@@ -534,9 +534,9 @@ def fc1_swiglu(
         forward(
             x,
             x_norm_weight,
-            scale,
-            shift,
-            index,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
             fc1_weight,
             out=out,
             workspace=workspace,

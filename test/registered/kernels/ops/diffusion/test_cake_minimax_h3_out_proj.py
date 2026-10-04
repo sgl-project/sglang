@@ -6,8 +6,11 @@ facade result is bitwise identical to calling FlashInfer directly; and the
 fused result matches a pure-torch reference (unpack the Ulysses receive
 layout, FP32 GEMM, ``bf16(residual + bf16(gate[idx] * bf16(A @ W^T)))``, gate 0
 for out-of-range indices) within the precision's tolerance (BF16 1e-2; FP8
-0.1; FP4 block-scaled atol 1.0 / rtol 0.1). Skips when FlashInfer lacks the
-module or the GPU is not sm_100a / sm_103a.
+0.1; FP4 block-scaled atol 1.0 / rtol 0.1). The gate operands are the
+diffusion engine's own: a strided ``[rows, 5376]`` column chunk of a
+``[rows, 6 * 5376]`` projection (``rows`` in {3, 6, 9, 12} for the BF16 entry)
+and an int64 row index. Skips when FlashInfer lacks the module or the GPU is
+not sm_100a / sm_103a.
 """
 
 import sys
@@ -29,8 +32,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-HIDDEN, NUM_HEADS, HEAD_DIM, ATTN_DIM, GATE_ROWS = 5376, 56, 128, 7168, 9
+HIDDEN, NUM_HEADS, HEAD_DIM, ATTN_DIM = 5376, 56, 128, 7168
 ROWS, DEGREE = 129, 8
+GATE_ROWS = 9  # default gate row count; the BF16 test sweeps {3, 6, 9, 12}
 
 
 @pytest.mark.parametrize(
@@ -63,16 +67,20 @@ def _skip_unless_supported():
         pytest.skip(f"Cake MiniMax-H3 out-proj needs sm_100a/103a, device is {cc}")
 
 
-def make_model(device, seed=4616):
+def make_model(device, seed=4616, *, gate_rows=GATE_ROWS):
     g = torch.Generator(device=device).manual_seed(seed)
     o_weight = torch.empty((HIDDEN, ATTN_DIM), dtype=torch.bfloat16, device=device)
     o_weight.normal_(0.0, 0.005, generator=g)
-    gate = torch.empty((GATE_ROWS, HIDDEN), dtype=torch.bfloat16, device=device)
-    gate.uniform_(-1.0, 1.0, generator=g)
+    # The engine's [rows, 6 * 5376] modulation projection; chunk 2 is the
+    # attention gate (strided view, row pitch 6 * 5376).
+    proj = torch.empty((gate_rows, 6 * HIDDEN), dtype=torch.bfloat16, device=device)
+    proj.uniform_(-1.0, 1.0, generator=g)
+    gate = proj[:, 2 * HIDDEN : 3 * HIDDEN]
+    assert not gate.is_contiguous()
     return {"o_weight": o_weight, "gate": gate}
 
 
-def make_inputs(rows, degree, device, seed=4616):
+def make_inputs(rows, degree, device, seed=4616, *, gate_rows=GATE_ROWS):
     g = torch.Generator(device=device).manual_seed(seed + 7919 * rows + 31 * degree)
     attn_out = torch.empty(
         (degree, rows, NUM_HEADS // degree, HEAD_DIM),
@@ -82,11 +90,11 @@ def make_inputs(rows, degree, device, seed=4616):
     residual = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device).normal_(
         0.0, 0.5, generator=g
     )
-    r = torch.arange(rows, device=device)
-    idx = torch.div(r * GATE_ROWS, rows, rounding_mode="floor").clamp_max(GATE_ROWS - 1)
+    r = torch.arange(rows, device=device)  # int64, like the engine's indices
+    idx = torch.div(r * gate_rows, rows, rounding_mode="floor").clamp_max(gate_rows - 1)
     idx = torch.where(r % 101 == 50, torch.full_like(idx, -1), idx)
-    idx = torch.where(r % 103 == 60, torch.full_like(idx, GATE_ROWS), idx)
-    return attn_out, idx.to(torch.int32), residual
+    idx = torch.where(r % 103 == 60, torch.full_like(idx, gate_rows), idx)
+    return attn_out, idx, residual
 
 
 def unpack(attn_out):
@@ -105,20 +113,22 @@ def reference(attn_out, o_weight, gate, gate_index, residual):
         o = (unpack(attn_out).float() @ o_weight.float().t()).to(torch.bfloat16)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
+    gate_rows = gate.shape[0]
     idx = gate_index.long()
-    valid = (idx >= 0) & (idx < GATE_ROWS)
-    g = gate.index_select(0, idx.clamp(0, GATE_ROWS - 1))
+    valid = (idx >= 0) & (idx < gate_rows)
+    g = gate.index_select(0, idx.clamp(0, gate_rows - 1))
     g = torch.where(valid[:, None], g, torch.zeros_like(g))
     return (residual.float() + (g.float() * o.float()).to(torch.bfloat16).float()).to(
         torch.bfloat16
     )
 
 
-def test_bf16_matches_flashinfer_and_reference():
+@pytest.mark.parametrize("gate_rows", [9, 3, 6, 12])
+def test_bf16_matches_flashinfer_and_reference(gate_rows):
     _skip_unless_supported()
     device = torch.device("cuda")
-    model = make_model(device)
-    attn_out, idx, residual = make_inputs(ROWS, DEGREE, device)
+    model = make_model(device, gate_rows=gate_rows)
+    attn_out, idx, residual = make_inputs(ROWS, DEGREE, device, gate_rows=gate_rows)
     out = torch.empty((ROWS, HIDDEN), dtype=torch.bfloat16, device=device)
     assert cake.supports_minimax_h3_out_proj(
         attn_out, model["o_weight"], model["gate"], idx, residual, out=out
@@ -239,8 +249,25 @@ def test_admission_rejects_out_of_contract():
     assert not cake.supports_minimax_h3_out_proj(
         unpack(attn_out).contiguous(), model["o_weight"], model["gate"], idx, residual
     )
+    gate, w = model["gate"], model["o_weight"]
+    assert cake.supports_minimax_h3_out_proj(
+        attn_out, w, gate.contiguous(), idx, residual
+    )
+    # Index must be int64; the gate needs a unit last stride, a 16-byte row
+    # pitch and non-overlapping rows (stride(0) >= 5376).
     assert not cake.supports_minimax_h3_out_proj(
-        attn_out, model["o_weight"], model["gate"], idx.long(), residual
+        attn_out, w, gate, idx.to(torch.int32), residual
+    )
+    assert not cake.supports_minimax_h3_out_proj(
+        attn_out, w, gate.t().contiguous().t(), idx, residual
+    )
+    misaligned = torch.zeros((9, HIDDEN + 4), dtype=torch.bfloat16, device=device)
+    assert not cake.supports_minimax_h3_out_proj(
+        attn_out, w, misaligned[:, :HIDDEN], idx, residual
+    )
+    overlapping = gate.contiguous().as_strided((9, HIDDEN), (HIDDEN - 8, 1))
+    assert not cake.supports_minimax_h3_out_proj(
+        attn_out, w, overlapping, idx, residual
     )
 
 
