@@ -120,7 +120,7 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
+            target_worker.model_runner.get_decode_attn_backend().init_forward_metadata(
                 verify_forward_batch
             )
 

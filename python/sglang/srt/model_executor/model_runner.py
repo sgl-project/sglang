@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1683,6 +1684,15 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def get_decode_attn_backend(self):
+        # EAGLE publishes a specialized backend for each draft step. DSpark
+        # drafts and target verification use the selected decode-lane backend.
+        if get_disagg().enable_pdmux and not (
+            self.is_draft_worker and self.spec_algorithm.is_eagle()
+        ):
+            return self.decode_attn_backend
+        return self.attn_backend
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -1863,6 +1873,13 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            # EAGLE's dedicated draft graphs are captured on ordinary streams.
+            # DSpark uses the runner's per-stream PDMux graphs and keeps them.
+            pdmux_eagle_draft = (
+                self.is_draft_worker
+                and self.spec_algorithm.is_eagle()
+                and get_disagg().enable_pdmux
+            )
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -1870,6 +1887,7 @@ class ModelRunner:
             )
             can_run_graph = bool(
                 split_forward_count is None
+                and not pdmux_eagle_draft
                 and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
@@ -1920,7 +1938,8 @@ class ModelRunner:
                     ),
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not pdmux_eagle_draft
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

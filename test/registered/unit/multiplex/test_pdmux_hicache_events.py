@@ -102,6 +102,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
     def __init__(self, *, max_iterations, query_results, pump_interval=1):
         self.max_iterations = max_iterations
+        self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         self.iteration = -1
         self.pumps = []
         self.pump_device_work = False

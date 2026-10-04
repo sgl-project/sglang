@@ -1146,7 +1146,7 @@ def commit_mamba_states_after_verify(
         )
         return
 
-    attn_backend = model_runner.attn_backend
+    attn_backend = model_runner.get_decode_attn_backend()
 
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:

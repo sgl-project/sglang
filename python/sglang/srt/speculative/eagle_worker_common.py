@@ -391,7 +391,7 @@ def build_eagle_verify_input(
     # Write straight into the backend's buffer when it owns one and this batch
     # fits; an eager batch past the captured max_bs falls back to allocating.
     bs = batch.seq_lens.shape[0]
-    target_attn_backend = target_worker.model_runner.attn_backend
+    target_attn_backend = target_worker.model_runner.get_decode_attn_backend()
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
@@ -600,7 +600,7 @@ def run_eagle_verify(
         # Some values such as custom_mask and position depend on the output of draft,
         # so the previous plan step used the wrong values. Here, we need to run the related
         # computation again to update them to the correct values.
-        target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+        target_worker.model_runner.get_decode_attn_backend().update_verify_buffers_to_fill_after_draft(
             verify_input,
             (
                 target_worker.model_runner.decode_cuda_graph_runner.bs

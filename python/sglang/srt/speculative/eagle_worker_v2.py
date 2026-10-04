@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional
@@ -60,6 +61,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -443,7 +445,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if (
+            _is_cpu
+            or get_disagg().enable_pdmux
+            or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+        ):
             return
 
         if get_model().model_impl == "mindspore":
@@ -1316,6 +1322,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    def update_pdmux_decode_attn_backend(self, stream_idx: int) -> None:
+        self.target_worker.model_runner.update_decode_attn_backend(stream_idx)
+        # EAGLE draft decode installs a per-step backend; switch only the target.
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1446,6 +1456,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        forward_batch = batch.split_forward_batch
+        if (
+            forward_batch.split_index
+            < self.target_worker.model_runner.model_config.num_hidden_layers
+        ):
+            return batch_output
+
+        # Scheduler drops its token inputs between slices. The persistent
+        # ForwardBatch keeps the valid IDs, with possible DP padding appended.
+        # Draft token rotation and spec_info updates belong to a separate view.
+        draft_batch = copy.copy(batch)
+        draft_batch.input_ids = forward_batch.input_ids[: batch.extend_num_tokens]
+        if not draft_batch.forward_mode.is_idle():
+            draft_batch.forward_mode = ForwardMode.EXTEND
+        draft_batch.sampling_info = batch.sampling_info.copy_for_forward()
+        return self._finish_prefill_batch(draft_batch, batch_output)
+
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
@@ -1460,7 +1491,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
         )
+        return self._finish_prefill_batch(
+            batch,
+            batch_output,
+            on_publish=on_publish,
+            coordination_plan=coordination_plan,
+        )
 
+    def _finish_prefill_batch(
+        self, batch, batch_output, on_publish=None, coordination_plan=None
+    ):
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
         # Extend processed L prompt tokens; next verify iter expects same L.
         batch_output.new_seq_lens = batch.seq_lens
@@ -1485,6 +1525,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         # Draft prefill
+        logits_output = batch_output.logits_output
+        if batch.forward_mode.is_idle() and logits_output is None:
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
+            )
+            target_hidden = (
+                torch.empty((0, hidden_size), dtype=hidden_dtype, device=self.device)
+                if hidden_size is not None
+                else None
+            )
+            mm_input_embeds = None
+            batch_output.next_token_ids = torch.empty(
+                (0,), dtype=torch.int64, device=self.device
+            )
+        else:
+            target_hidden = logits_output.hidden_states
+            mm_input_embeds = logits_output.mm_input_embeds
         with (
             draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
@@ -1493,9 +1550,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 batch,
-                batch_output.logits_output.hidden_states,
+                target_hidden,
                 batch_output.next_token_ids,
-                batch_output.logits_output.mm_input_embeds,
+                mm_input_embeds,
             )
             return batch_output
 
@@ -1594,7 +1651,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
-        attn_backend = self._target_worker.model_runner.attn_backend
+        attn_backend = self._target_worker.model_runner.get_decode_attn_backend()
         verify_mask = attn_backend.verify_mask
         # Every position in a 1-node tree is visible, so an all-True fill is
         # correct under either layout.
