@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -529,6 +530,9 @@ def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
     """Reserve a separate push plane for up to 384 rows of fused MoE output."""
     global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
     global _fused_finalize_all_reduce_comm
+    # The shared push plane is keyed by world size, not by PDMux lane.
+    if get_disagg().enable_pdmux:
+        return None
     if not _fused_finalize_all_reduce_probed:
         # The eager warmup must initialize peer workspaces before capture.
         if torch.cuda.is_current_stream_capturing():
@@ -573,6 +577,8 @@ def should_use_fuse_finalize_all_reduce(
 ) -> bool:
     """Capability only; the batch-size policy cap lives at the call site. The
     kernel never rescales, so the expert weights must carry the routed scaling."""
+    if get_disagg().enable_pdmux:
+        return False
     if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
         return False
     if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":

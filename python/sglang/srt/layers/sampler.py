@@ -20,7 +20,11 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -558,10 +562,9 @@ class Sampler(nn.Module):
 
         # All replicas must make the same request-abort decision.
         if dist.is_initialized():
-            if dist.get_world_size(self.tp_sync_group) > 1:
-                dist.all_reduce(
-                    statuses, op=dist.ReduceOp.MAX, group=self.tp_sync_group
-                )
+            tp_sync_group = self.tp_sync_group
+            if dist.get_world_size(tp_sync_group) > 1:
+                dist.all_reduce(statuses, op=dist.ReduceOp.MAX, group=tp_sync_group)
             if (
                 self.cp_sync_group is not None
                 and dist.get_world_size(self.cp_sync_group) > 1
