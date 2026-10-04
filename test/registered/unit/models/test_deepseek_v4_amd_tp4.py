@@ -277,9 +277,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
         return hidden, next_pre
 
     with (
-        get_forward().scoped(
-            sp_active=False, fuse_mlp_allreduce=False, flashinfer_trtllm_bypass=False
-        ),
+        get_forward().scoped(sp_active=False, flashinfer_trtllm_bypass=False),
         patch(
             "sglang.srt.models.deepseek_v2.post_experts_all_reduce",
             side_effect=group.all_reduce,
@@ -316,11 +314,11 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             torch.testing.assert_close(unfused[1], fused[1], atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("flag", ["mlp_reduce_scatter", "fuse_mlp_allreduce"])
+@pytest.mark.parametrize("flag", ["mlp_reduce_scatter"])
 @pytest.mark.parametrize("dual", [False, True], ids=["normal", "dual-stream"])
 def test_moe_skipped_reduction_keeps_post(group, dual, flag):
-    """A reduce-scattered or elsewhere-fused MoE output must not reach the fused all-reduce
-    + mHC post: the pending post stays pending and no collective runs."""
+    """A reduce-scattered MoE output must not reach the fused all-reduce + mHC
+    post: the pending post stays pending and no collective runs."""
     from sglang.srt.layers.moe.mhc_post_fusion import (
         MhcPostFusion,
         use_mhc_post_fusion,
