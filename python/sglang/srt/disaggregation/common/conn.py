@@ -279,7 +279,6 @@ class DeferredAbortAckState(msgspec.Struct):
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
-    # Backends with staging support replace this with a mode-specific context.
     _staging_ctx = None
 
     # Wire layout of the prefill->decode terminal status message. The legacy
@@ -472,7 +471,6 @@ class CommonKVManager(BaseKVManager):
     def prepare_send_state_indices(
         self, state_indices: Optional[List]
     ) -> Optional[List]:
-        """Adapt the sender's state indices to this backend's transfer format."""
         return state_indices
 
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
@@ -751,7 +749,8 @@ class CommonKVManager(BaseKVManager):
         writer_id: str,
         targets: List[Tuple[str, int]],
     ) -> None:
-        """Notify decode only after a staging chunk's remote writes complete."""
+        """Notify decode that a staging chunk RDMA is complete (every chunk;
+        scatter is arrival-driven)."""
         parts = [
             b"CHUNK_READY",
             str(room).encode("ascii"),
@@ -766,7 +765,6 @@ class CommonKVManager(BaseKVManager):
             self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
 
     def handle_chunk_ready(self, msg: List[bytes]) -> bool:
-        """Dispatch the shared staging notification from a decode ZMQ listener."""
         if not msg or msg[0] != b"CHUNK_READY":
             return False
         try:
@@ -890,8 +888,7 @@ class CommonKVManager(BaseKVManager):
             if len(completed_ranks) < expected_response_num:
                 return
             # Tell the staging handler no more chunks are coming, before any
-            # poller can see Success. Chunk arrivals drive individual scatters;
-            # the scheduler also waits for all of their GPU events.
+            # poller can see Success.
             if self.enable_staging and self._staging_handler is not None:
                 handler = self._staging_handler
                 if handler.is_staging_room(bootstrap_room):
@@ -2075,10 +2072,9 @@ class CommonKVSender(BaseKVSender):
             return self.conclude_state
 
         status = self.kv_mgr.request_status.get(self.bootstrap_room, KVPoll.Failed)
-        # A last chunk can finish while an earlier staging chunk is waiting
-        # for space. Keep its source KV alive until every queued chunk drains.
-        # Deferred allocation also waits for worker cleanup (the zero entry is
-        # only removed after cleanup) before the room can be reused.
+        # Hold Success until all staging chunks transferred. With deferred
+        # allocation also wait for worker cleanup (the zero entry is only
+        # removed after cleanup), before permitting the room to be reused.
         if status == KVPoll.Success and (
             self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             or (
@@ -2136,7 +2132,6 @@ class CommonKVSender(BaseKVSender):
                 == KVPoll.Success,
             )
             self._owns_bootstrap_room = False
-        # Preserve a terminal result across removal from manager state.
         if getattr(self, "conclude_state", None) is None:
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
@@ -2227,8 +2222,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = KVPoll.Failed
             return
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        # Create the rank tracker before exposing the room to the listener.
-        # Notifications only look it up; they cannot recreate it after clear().
         self.kv_mgr.prefill_response_tracker.setdefault(self.bootstrap_room, set())
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -2548,8 +2541,6 @@ class CommonKVReceiver(BaseKVReceiver):
         try:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
-                # Encoding may access engine metadata or raise; keep it inside
-                # the socket lock and the same error boundary as the send.
                 sock.send_multipart(build_message())
         except zmq.ZMQError:
             if operation == "send_metadata":
@@ -2624,7 +2615,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            "waiting for KV transfer completion",
+            f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()

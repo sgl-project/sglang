@@ -384,9 +384,8 @@ def repeat_indices_over_layers(
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
-    # Both peers must use the ZMQ completion protocol: Success/Failed and
-    # CHUNK_READY replace native NIXL notifications for request accounting.
-    # The tag distinguishes statuses from the other decode control messages.
+    # The decode control socket multiplexes tagged messages, so the status
+    # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
     kv_status_msg_carries_reason = True
     # ABORT handler defers the ack until the transfer worker drains.
@@ -586,7 +585,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_receivers[room] = receiver
 
     def _start_decode_listener_thread(self):
-        """Receive completion/staging messages; the engine progresses independently."""
+        """Decode-side ZMQ listener for KV_STATUS, CHUNK_READY, STAGING_REQ and
+        ABORT_ACK.
+
+        Started unconditionally: KV_STATUS carries prefill-side transfer results,
+        which are independent of staging and deferred KV release."""
 
         def decode_listener_thread():
             while True:
@@ -1169,7 +1172,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
-        last_chunk_complete = set()
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1184,7 +1186,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
-                    last_chunk_complete.discard(room)
                     if self.enable_deferred_decode_kv_release:
                         # clear() keeps the target while a chunk is counted.
                         self._maybe_ack_drained_abort(room)
@@ -1200,7 +1201,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
-                    last_chunk_complete.discard(room)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
@@ -1214,7 +1214,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
-                    last_chunk_complete.discard(room)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
                     continue
@@ -1469,13 +1468,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # was aborted and nothing else is outstanding.
                     self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
-                    last_chunk_complete.add(room)
-                if (
-                    room in last_chunk_complete
-                    and self._staging_outstanding.get(room, 0) <= 0
-                ):
-                    # Retain transfer_infos until targets have been captured by
-                    # conclude_transfer. Success covers all earlier retries too.
                     self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
 
                 # Drop per-room state only when no chunk is still outstanding and
@@ -1490,7 +1482,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(room, None)
-                    last_chunk_complete.discard(room)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -1500,15 +1491,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
             except Exception as e:
-                # Catch all exceptions so this worker thread survives; str(e)
-                # reaches failure_exception() through failure_records below.
+                # Catch all exceptions to prevent silently killing this
+                # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
                     logger.warning(f"NIXL transport error for room {room}: {e}")
                 else:
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
-                last_chunk_complete.discard(room)
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
                 # rather than only after the barrier.
@@ -2195,8 +2185,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         Mirrors mooncake._do_staging_transfer semantics:
           - staging not ready (watermark/alloc pending) -> ``queue.put(kv_chunk)``
-            re-enqueue the chunk and return ``(None, True, chunk_idx)``. The
-            caller drains posted writes, and the retry visits every peer again.
+            re-enqueue the chunk and return ``(None, True, chunk_idx)``. Caller should
+            ``break`` out of the per-req loop and ``continue`` the worker
+            main loop without updating room status -- the chunk will be
+            retried on the next pop.
           - oversized chunk (will never fit) -> raise RuntimeError.
           - staging successfully posted -> return ``(handle, False, chunk_idx)``.
             The caller waits for DONE before reusing its staging buffer and

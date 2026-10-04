@@ -899,7 +899,7 @@ class TestNixlTransferWorker(CustomTestCase):
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue, staging_buffer=object())
 
-    def test_last_chunk_success_waits_for_earlier_deferred_staging_chunk(self):
+    def test_deferred_staging_chunk_still_transfers_after_last_chunk_success(self):
         room = 27
         mgr = self._make_staging_manager(room)
         first = self._make_chunk(room, [1], is_last_chunk=False)
@@ -926,7 +926,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self._run_staging_worker(mgr, [first, last])
         self.assertEqual(attempts, [0, 1, 0])
         self.assertEqual(
-            events, [("chunk", 1), ("chunk", 0), ("status", KVPoll.Success)]
+            events, [("chunk", 1), ("status", KVPoll.Success), ("chunk", 0)]
         )
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr._staging_outstanding)
