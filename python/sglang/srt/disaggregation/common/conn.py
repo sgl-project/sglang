@@ -1766,8 +1766,6 @@ class CommonKVSender(BaseKVSender):
         mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
@@ -1801,27 +1799,27 @@ class CommonKVSender(BaseKVSender):
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if get_parallel().num_dp_ranks > 1 and not req_has_disagg_prefill_dp_rank:
-            if get_parallel().load_balance_method != "follow_bootstrap_room":
+            if (
+                get_parallel().load_balance_method != "follow_bootstrap_room"
+                or envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+            ):
                 self._register_prefill_dp_rank()
             elif (
                 self.kv_mgr.attn_dp_rank
                 != self.bootstrap_room % get_parallel().num_dp_ranks
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
-                if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
-                    self._register_prefill_dp_rank()
-                else:
-                    self.kv_mgr.record_failure(
-                        self.bootstrap_room,
-                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
-                        f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
-                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
-                        f"to allow mixed routing.",
-                    )
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                    return
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                    f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                    f"{self.bootstrap_room} implies dp_rank "
+                    f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
+                    f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                    f"to allow mixed routing.",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""

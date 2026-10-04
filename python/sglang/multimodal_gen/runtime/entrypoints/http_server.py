@@ -347,6 +347,8 @@ async def forward_to_scheduler(
                 lambda _idx: output_file_path,
                 audio=response.audio,
                 audio_sample_rate=response.audio_sample_rate,
+                output_compression=sp.output_compression,
+                x264_preset=sp.x264_preset,
                 enable_frame_interpolation=sp.enable_frame_interpolation,
                 frame_interpolation_exp=sp.frame_interpolation_exp,
                 frame_interpolation_scale=sp.frame_interpolation_scale,
