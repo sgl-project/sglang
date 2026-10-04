@@ -587,8 +587,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
     )
     if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
-        from sglang.srt.configs.hybrid_arch import mambaish_config
-
         _mc = model_config_of(server_args)
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "

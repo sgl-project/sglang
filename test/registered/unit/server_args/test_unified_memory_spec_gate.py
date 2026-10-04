@@ -38,7 +38,7 @@ from unittest.mock import patch
 
 import msgspec
 
-import sglang.srt.configs.hybrid_arch as hybrid_arch
+import sglang.srt.arg_groups.kv_cache_hook as kv_cache_hook
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
@@ -68,6 +68,7 @@ def _accepts(
     draft_backend: str | None = None,
     dcp_size: int = 1,
     retraction_backup: str | None = None,
+    fields: dict | None = None,
 ) -> bool:
     """Run just `handle_unified_memory_pool` against a minimal stand-in.
 
@@ -92,6 +93,7 @@ def _accepts(
         "attention_backend": backend,
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
+        **(fields or {}),
     }.items():
         msgspec.structs.force_setattr(sa, name, value)
     sa._model_config = SimpleNamespace(
@@ -217,7 +219,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         """A mamba hybrid off the MLA backend provisions the region in its
         MHA full sub-pool; refusing it strands the whole mamba x EAGLE
         matrix."""
-        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+        with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
             for algorithm in ("EAGLE", "EAGLE3"):
                 self.assertTrue(_accepts(algorithm, is_hybrid_swa=False))
 
@@ -225,7 +227,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         """An MLA mamba hybrid fuses into MLA pages, so it verifies on the MLA
         backend family; the MHA-only rails and an unset backend still refuse.
         The host kind, not the algorithm, picks the set."""
-        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+        with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
             for backend in self.DSPARK_BACKENDS:
                 self.assertTrue(
                     _accepts(
@@ -269,6 +271,29 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         self.assertFalse(_accepts("EAGLE", retraction_backup="host_pool"))
         self.assertFalse(_accepts("EAGLE3", retraction_backup="host_pool"))
         self.assertTrue(_accepts(None, retraction_backup="host_pool"))
+
+    def test_pd_decode_refusals_raise_their_own_assertions(self):
+        """The PD-decode branches screen the model with `mambaish_config`. A
+        function-local import of that name further down made it local to the
+        whole handler, so these branches raised UnboundLocalError instead of
+        their refusal."""
+        pd_decode = {
+            "disaggregation_mode": "decode",
+            "disaggregation_transfer_backend": "mooncake",
+            "pp_size": 1,
+            "enable_hisparse": False,
+        }
+        for extra in (
+            {
+                "disaggregation_decode_enable_offload_kvcache": True,
+                "hicache_storage_backend": "file",
+            },
+            {"disaggregation_decode_retraction_backup": "host_pool"},
+        ):
+            with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
+                self.assertFalse(
+                    _accepts(None, is_hybrid_swa=False, fields={**pd_decode, **extra})
+                )
 
     def test_spec_off_admitted(self):
         """The gate constrains only speculative configurations; spec-off must
