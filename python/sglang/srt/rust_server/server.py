@@ -116,6 +116,15 @@ class RustServer:
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates.
         """
+        # Non-generation outputs go to the Python detokenizer, which Rust mode
+        # does not start, and the Rust server has no /encode route.
+        if not scheduler.model_config.is_generation:
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1 does not support non-generation "
+                "(embedding, reward, or classification) models. Unset "
+                "SGLANG_RUST_SERVER to serve this model."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

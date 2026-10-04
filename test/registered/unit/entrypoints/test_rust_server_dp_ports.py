@@ -85,7 +85,7 @@ def test_dp_leaders_reuse_node_local_ports(
         for dp_rank, tp_rank in enumerate(ranks):
             scheduler = SimpleNamespace(
                 server_args=SimpleNamespace(),
-                model_config=SimpleNamespace(is_multimodal=False),
+                model_config=SimpleNamespace(is_generation=True, is_multimodal=False),
             )
             with parallel.override(
                 tp_rank=tp_rank,
@@ -99,6 +99,14 @@ def test_dp_leaders_reuse_node_local_ports(
         assert [c.kwargs["port_offset"] for c in calls] == expected
         # P/D bootstrap must register against the same ports Rust binds.
         assert ports == [30000 + offset for offset in expected]
+
+
+def test_launch_rejects_non_generation_models_before_binding():
+    scheduler = SimpleNamespace(model_config=SimpleNamespace(is_generation=False))
+    with patch.object(rust_extensions, "load_rust_extension") as extension:
+        with pytest.raises(RuntimeError, match="non-generation"):
+            rust_server.RustServer.launch(scheduler)
+    extension.assert_not_called()
 
 
 @pytest.mark.parametrize(
