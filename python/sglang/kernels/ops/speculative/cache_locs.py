@@ -79,6 +79,17 @@ def assign_draft_cache_locs_contiguous(
 
 
 @triton.jit
+def _translate_token_ids(ids, v2p, mask, page_size: tl.constexpr):
+    """Virtual token ids -> physical ones through the page-level v2p table,
+    as `translate_kv_loc` does. A negative id maps to the page-0 sink instead
+    of loading before `v2p`."""
+    i64 = ids.to(tl.int64)
+    vpage = tl.where(i64 < 0, 0, i64 // page_size)
+    phys = tl.load(v2p + vpage, mask=mask, other=0)
+    return tl.where(i64 < 0, 0, tl.maximum(phys * page_size + i64 % page_size, 0))
+
+
+@triton.jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,
     req_to_token,
@@ -156,9 +167,7 @@ def generate_draft_decode_kv_indices(
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
             if TRANSLATE:
-                d64 = data.to(tl.int64)
-                phys = tl.load(v2p + d64 // page_size, mask=mask, other=0)
-                data = tl.maximum(phys * page_size + d64 % page_size, 0)
+                data = _translate_token_ids(data, v2p, mask, page_size)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
             copy_offset += BLOCK_SIZE
     else:
@@ -172,9 +181,7 @@ def generate_draft_decode_kv_indices(
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
             if TRANSLATE:
-                d64 = data.to(tl.int64)
-                phys = tl.load(v2p + d64 // page_size, mask=mask, other=0)
-                data = tl.maximum(phys * page_size + d64 % page_size, 0)
+                data = _translate_token_ids(data, v2p, mask, page_size)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
 
     # Extension entries and kv_indptr belong to token block 0 alone; other
@@ -207,9 +214,9 @@ def generate_draft_decode_kv_indices(
             )
 
         if TRANSLATE:
-            e64 = extend_data.to(tl.int64)
-            phys = tl.load(v2p + e64 // page_size, mask=extend_offset < iters, other=0)
-            extend_data = tl.maximum(phys * page_size + e64 % page_size, 0)
+            extend_data = _translate_token_ids(
+                extend_data, v2p, extend_offset < iters, page_size
+            )
 
         tl.store(
             kv_ptr + seq_len_w + extend_offset,

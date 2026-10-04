@@ -81,7 +81,7 @@ def _run_kernel(
 
 
 class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
-    def _check(self, *, page_size, num_steps=3, topk=1):
+    def _check(self, *, page_size, num_steps=3, topk=1, unused_slots=False):
         torch.manual_seed(7)
         num_seqs, max_context = 3, 64
         num_pages = max_context // page_size + 1
@@ -94,6 +94,9 @@ class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
             .flip(0)
             .repeat(num_seqs, 1)
         )
+        if unused_slots:
+            # Negative entries inside the read window must land on the sink.
+            req_to_token[:, ::3] = -1
         seq_lens = torch.tensor([5, 1, 9], dtype=torch.int64, device="cuda")[:num_seqs]
         positions = seq_lens.repeat_interleave(topk)
 
@@ -115,8 +118,11 @@ class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
         self.assertTrue(bool((out[~written] == _SENTINEL).all()))
         # Written lanes: translate_kv_loc's formula over the raw ids.
         virt = raw[written]
-        expected = torch.clamp_min(
-            v2p[virt // page_size] * page_size + virt % page_size, 0
+        page = torch.where(virt < 0, 0, virt // page_size)
+        expected = torch.where(
+            virt < 0,
+            0,
+            torch.clamp_min(v2p[page] * page_size + virt % page_size, 0),
         )
         torch.testing.assert_close(out[written], expected, rtol=0, atol=0)
 
@@ -129,6 +135,12 @@ class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA required")
         self._check(page_size=2)
+
+    def test_negative_ids_map_to_the_sink(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        for page_size in (1, 2):
+            self._check(page_size=page_size, unused_slots=True)
 
     def test_translate_false_is_a_raw_copy(self):
         """The static-pool compilation must stay byte-identical to the
