@@ -20,6 +20,7 @@ use crate::config::{
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
+use crate::policies_reorg::admission::AdmissionLimits;
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
@@ -517,6 +518,7 @@ impl Cli {
         }
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
+        let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
             .model
@@ -574,6 +576,7 @@ impl Cli {
                 dp_aware: self.routing.dp_aware,
                 bucket_config,
                 reorg_buckets,
+                reorg_admission,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -749,19 +752,26 @@ impl RoutingArgs {
             self.policy != PolicyKind::Sticky || self.filter.is_empty(),
             "--filter cannot be combined with --policy sticky"
         );
-        ensure!(
-            self.max_kv_usage.is_none_or(|u| u > 0.0 && u <= 1.0),
-            "--max-kv-usage must be in (0, 1]"
-        );
-        let eligibility =
-            (!self.filter.is_empty() || self.max_kv_usage.is_some()).then_some(EligibilityConfig {
-                filters: self.filter.clone(),
-                max_in_flight: self.max_in_flight,
-                min_prefix_share: self.prefix_cache_min_share,
-                max_kv_usage: self.max_kv_usage,
-            });
+        let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
+            filters: self.filter.clone(),
+            max_in_flight: self.max_in_flight,
+            min_prefix_share: self.prefix_cache_min_share,
+        });
 
         Ok(eligibility)
+    }
+
+    /// Reorg admission for groups without their own limits.
+    fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
+        let limits = AdmissionLimits {
+            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_kv_usage: self.max_kv_usage,
+            ..Default::default()
+        };
+        limits
+            .validate()
+            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+        Ok(limits)
     }
 }
 
@@ -1144,24 +1154,14 @@ mod tests {
             session.model.affinity.unwrap().session_id_header,
             "x-session"
         );
-        assert_eq!(
-            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
-                .unwrap()
-                .model
-                .eligibility
-                .unwrap()
-                .max_in_flight,
-            Some(2)
-        );
-        assert_eq!(
-            parse(&["--max-kv-usage", "0.9"])
-                .unwrap()
-                .model
-                .eligibility
-                .unwrap()
-                .max_kv_usage,
-            Some(0.9)
-        );
+        let overloaded = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+            .unwrap()
+            .model;
+        assert_eq!(overloaded.eligibility.unwrap().max_in_flight, Some(2));
+        assert_eq!(overloaded.reorg_admission.max_inflight_requests, Some(2));
+        let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
+        assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
+        assert!(kv.eligibility.is_none());
         let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
         assert!(legacy_kv.unwrap().into_config().is_err());
         for args in [
@@ -2952,6 +2952,15 @@ mod tests {
             json!({"buckets": [{"id": "x", "plain": {"policy": "cache_aware"}}]}),
             json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_usage": 2.0}}}]}),
             json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_tokens": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_running_usage": 0}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_waiting_requests": 0}}}]}),
+            json!({"buckets": [{"id": "", "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_input_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_context_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "max_context_tokens": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "ttft_ms": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "tokens_per_second": 0.0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": []}}]}),
         ] {
             assert!(build(&bad).is_err(), "accepted {bad}");
         }

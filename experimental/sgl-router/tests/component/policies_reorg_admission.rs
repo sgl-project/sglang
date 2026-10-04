@@ -202,10 +202,80 @@ fn usages_count_the_request_and_fail_open_without_capacity() {
     );
     assert_eq!(check(metrics(8, 101, Some(1000))), reject("max_kv_usage"));
     assert_eq!(check(metrics(9, 101, None)), Decision::Allow);
-    assert!(AdmissionLimits {
-        max_kv_usage: Some(1.5),
+    // Exactly at the share admits, even where `share * capacity` rounds below it.
+    let tight = AdmissionLimits {
+        max_kv_usage: Some(0.29),
         ..Default::default()
+    };
+    let kv = |kv_tokens| EngineMetrics {
+        kv_tokens: Some(kv_tokens),
+        kv_capacity: Some(100),
+        request_tokens: 10,
+        ..Default::default()
+    };
+    assert_eq!(tight.check(&engine(), &kv(19)).unwrap(), Decision::Allow);
+    assert_eq!(
+        tight.check(&engine(), &kv(20)).unwrap(),
+        reject("max_kv_usage")
+    );
+}
+
+#[test]
+fn validation_rejects_out_of_range_usages_and_zero_counts() {
+    for bad in [
+        json!({"max_kv_usage": 1.5}),
+        json!({"max_running_usage": 0.0}),
+        json!({"max_waiting_requests": 0}),
+        json!({"max_pending_prefill_tokens": 0}),
+        json!({"max_inflight_requests": 0}),
+    ] {
+        let limits: AdmissionLimits = serde_json::from_value(bad.clone()).unwrap();
+        assert!(limits.validate().is_err(), "accepted {bad}");
     }
-    .validate()
-    .is_err());
+    let ok: AdmissionLimits =
+        serde_json::from_value(json!({"max_kv_usage": 1.0, "max_inflight_requests": 1})).unwrap();
+    assert!(ok.validate().is_ok());
+}
+
+#[test]
+fn group_limits_override_defaults_field_by_field() {
+    let defaults = AdmissionLimits {
+        max_inflight_requests: Some(64),
+        max_kv_usage: Some(0.95),
+        ..Default::default()
+    };
+    let group = AdmissionLimits {
+        max_kv_usage: Some(0.9),
+        max_waiting_requests: Some(8),
+        ..Default::default()
+    };
+    assert_eq!(
+        group.or(&defaults),
+        AdmissionLimits {
+            max_inflight_requests: Some(64),
+            max_kv_usage: Some(0.9),
+            max_waiting_requests: Some(8),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn request_tokens_are_input_on_prefill_and_expected_peak_otherwise() {
+    let engine = engine();
+    let table = EngineReportedLoadTable::new();
+    table.set(&engine.url, 0, report(0, 0, 0, 0), Instant::now());
+    let load = table.capture_snapshot(Instant::now());
+    let model = ModelId("m".into());
+    for (stage, peak, expected) in [
+        (Stage::Prefill, Some(50), 10),
+        (Stage::Decode, Some(50), 50),
+        (Stage::Plain, Some(50), 50),
+        (Stage::Plain, None, 10),
+    ] {
+        let mut request = PickRequest::new(&model, stage, 10);
+        request.expected_peak_tokens = peak;
+        let metrics = EngineMetrics::observe(&engine, &load, &request);
+        assert_eq!(metrics.request_tokens, expected, "{stage:?} {peak:?}");
+    }
 }

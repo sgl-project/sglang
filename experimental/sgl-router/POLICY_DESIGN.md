@@ -478,13 +478,15 @@ A request with 4k input tokens and a 16k expected peak cannot fit the short
 bucket's context capacity. It selects the long bucket and both of its P/D groups.
 With a known peak of 8k or less, the same input selects both groups of the short bucket.
 
-Omitted group fields mean every engine of the group's role, `--policy`
-(power-of-two on decode), and the `--max-in-flight` / `--max-kv-usage` limits.
-A group policy is `power_of_two` or the `--policy` kind, whose affinity, cache
-and tokenizer settings are the ones resolved. Startup rejects empty or duplicate
-IDs, a bucket that is not exactly plain or P/D, inverted token ranges,
-non-positive capacity or SLO estimates, usages outside (0, 1], and a policy a
-stage cannot serve. Without the flag, reorg builds one plain and one P/D bucket
+Omitted group fields mean every engine of the group's role and `--policy`
+(power-of-two on decode). Admission limits a group leaves unset take
+`--max-in-flight` / `--max-kv-usage`, field by field. A group policy is
+`power_of_two` or the `--policy` kind, whose affinity, cache and tokenizer
+settings are the ones resolved. Startup rejects empty or duplicate IDs, a bucket
+that is not exactly plain or P/D, inverted token ranges, a minimum input above
+the context capacity, empty `worker_ids`, non-positive capacity or SLO
+estimates, usages outside (0, 1], zero count limits, and a policy a stage cannot
+serve. Without the flag, reorg builds one plain and one P/D bucket
 over all engines. The worker registry still rejects mixed plain and PD engines
 within one model.
 
@@ -512,7 +514,7 @@ do not accept and ignore them.
   four sticky fallback choices. Global modes need a bucket-first migration design.
 - Map `--filter overloaded` and `--max-in-flight` to `max_inflight_requests`;
   the existing router-local counter remains the source. `--max-kv-usage` sets
-  `max_kv_usage` for groups without their own admission.
+  `max_kv_usage` for groups that leave it unset.
 - Preserve configured capacity, pending-prefill, and in-flight checks, including
   their missing-report behavior. Power-of-two applies admission to its selected
   engine; other policies explicitly place checks in their selection logic.

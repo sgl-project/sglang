@@ -38,6 +38,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             dp_aware: false,
             bucket_config: None,
             reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
