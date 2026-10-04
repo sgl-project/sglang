@@ -636,7 +636,11 @@ def handle_model_specific_adjustments(server_args: Any):
         # The prefill attention backend default + validation moved to the
         # override registry (arg_groups/overrides.py: _moss_vl_overrides).
         pass
-    elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
+    elif model_arch in [
+        "Exaone4ForCausalLM",
+        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
+    ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
             # (arg_groups/overrides.py: _exaone_overrides).

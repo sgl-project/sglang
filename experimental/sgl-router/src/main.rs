@@ -375,6 +375,10 @@ fn build_app_context(
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
+        engine_state.tree().pending().enable(ttl);
+    }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
