@@ -81,3 +81,20 @@ tombstone recovery, including a protected prefix that ends inside the tombstone
 node. Include in-flight backup acks and post-storm output checks. The manual tests
 cover write-through; separately validate write-back and storage/buffer modes before
 relying on them in deployment.
+
+## Attention DP layer
+
+Run the same launch with `--enable-dp-attention --attn-dp-size 8` (TP8/DP8), then
+`--attn-dp-size 2` (TP8/DP2 with attention TP4). Exercise balanced and uneven prompt
+sizes, peer-only prefill/decode and all ranks IDLE. Check matching layer boundaries,
+no collective hang, correct greedy output and pad/unpad restoration across slices.
+The prefill lane switches only the full-TP handle to its duplicate communicator;
+attention and MoE group handles retain the ordinary groups, as in the reference
+branch. Stream selection uses the local running decode batch before decode's DP
+metadata gather. Peer-only work still creates IDLE participants through that
+gather. Scheduling keeps a separate global token vector even when the model
+consumes local MLP counts, and honors the ordinary scheduler's optional skip-gather
+environment setting. Each slice uses the existing DP pad/unpad path without a
+second unpadded token-count snapshot.
+
+This matrix covers TP/attention DP. EP, CP and DCP need their own validation.

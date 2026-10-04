@@ -164,6 +164,42 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         for a, e in zip(actual, expected):
             torch.testing.assert_close(a, e)
 
+    def test_dp_gather_cannot_modify_input_ids_reused_by_later_slices(self):
+        model = self.model()
+        batch = self.batch()
+        original_ids = batch.input_ids.clone()
+
+        def gather(output, local_ids, forward_batch):
+            output.copy_(local_ids)
+            # MAX_LEN's replicate gather may zero local padding in place.
+            local_ids.zero_()
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.get_parallel",
+                return_value=SimpleNamespace(attn_dp_size=2),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_global_dp_buffer_len",
+                return_value=4,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.dp_gather_replicate", side_effect=gather
+            ) as gather_call,
+        ):
+            self.assertIsNone(self.split(model, batch, (0, 1)))
+            torch.testing.assert_close(batch.input_ids, original_ids)
+            torch.testing.assert_close(
+                batch.model_specific_states["input_ids_global"], original_ids
+            )
+            self.split(model, batch, (1, 4))
+            torch.testing.assert_close(batch.input_ids, original_ids)
+            gather_call.assert_called_once()
+
     def test_fused_mhc_split_matches_ordinary_forward_and_finalizes_once(self):
         model = self.model()
         batch = self.batch()

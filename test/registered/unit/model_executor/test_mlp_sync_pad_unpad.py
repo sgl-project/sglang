@@ -52,6 +52,30 @@ def _logits_output(num_rows: int) -> SimpleNamespace:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_split_prefill_intermediate_unpads_without_logits(self):
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.SPLIT_PREFILL,
+            batch_size=2,
+            input_ids=torch.arange(7),
+            req_pool_indices=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([3, 4]),
+            out_cache_loc=torch.arange(7),
+            seq_lens_sum=7,
+            positions=torch.tensor([0, 1, 2, 0, 1, 2, 3]),
+            seq_lens_cpu=torch.tensor([3, 4]),
+            lora_ids=[None, None],
+        )
+        for _ in range(3):
+            fb._original_batch_size = fb.batch_size
+            fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=10, bs=2)
+            fb.post_forward_mlp_sync_batch(None)
+            self.assertEqual(fb.batch_size, 2)
+            torch.testing.assert_close(
+                fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3])
+            )
+            torch.testing.assert_close(fb.seq_lens, torch.tensor([3, 4]))
+            torch.testing.assert_close(fb.req_pool_indices, torch.tensor([1, 2]))
+
     def test_idle_rank_does_not_index_dummy_last_token(self):
         # MLP-sync turns an idle rank into a dummy zero-token EXTEND batch.
         empty = torch.empty(0, dtype=torch.int64)

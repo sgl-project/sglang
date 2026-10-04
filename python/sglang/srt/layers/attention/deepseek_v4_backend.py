@@ -2319,8 +2319,11 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if self.mtp_enabled and logical_forward_mode.is_idle():
+        if logical_forward_mode.is_idle():
             self.online_c128_mtp.clear()
+            self.forward_metadata = None
+            self.tail_forward_metadata = None
+            self.encoder_replay = False
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
@@ -3327,7 +3330,7 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        if _get_logical_forward_mode(forward_batch).is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
         assert k is v, "DeepseekV4 shares k and v"

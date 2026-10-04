@@ -2395,7 +2395,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
 
-    # Raw scheduler counts for rank-consistent PDMux decisions.
+    # Rank-invariant scheduler counts, independent of local model MLP counts.
     scheduler_global_num_tokens: Optional[List[int]] = None
     # For split prefill
     split_index: int = 0
