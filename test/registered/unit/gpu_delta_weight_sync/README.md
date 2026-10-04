@@ -82,29 +82,35 @@ there is no intra-layer streaming. Preparation coalesces adjacent rank-owned
 ranges of the shared pinned Snappy arena into bulk transfers, without copying
 foreign experts or making a second per-rank host arena. GPU scratch fits the
 largest batch, and one nvCOMP call decodes all retained frames in that batch.
-Two encoded slots let a copy stream prefetch the next batch while the apply
-stream decodes and updates the current batch. Decoded scratch and decoder
-workspace remain single-buffered.
+A copy stream prefetches upcoming batches into an encoded ring while the apply
+stream decodes and updates the current batch. `GPU_DELTA_H2D_STAGES` defaults to 2
+and accepts stage counts of at least 2; 3 or 4 provide additional lookahead at the
+cost of one maximum-batch encoded buffer per extra stage. Decoded scratch and
+decoder workspace remain single-buffered.
 Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
 
-Layer membership, layout groups and destination geometry are reusable. Fresh
-compressed lengths, frame lists and arena offsets are prepared for each update.
-Singleton and adjacent contiguous axes are collapsed without changing byte order.
-Expert layout metadata comes from one representative per canonical
-`.experts.<id>.<suffix>` family, retaining the layer and complete projection/suffix;
-each expert still contributes its own destination pointers. Uniform experts and
-strided layouts keep the uniform batched XOR kernel. Contiguous non-expert tensors
-with unequal lengths share one per-layer launch: a compact cumulative tile lookup
-schedules exactly the useful byte tiles, with no largest-tensor padding or expanded
-per-tile table. Equal-length groups use the uniform kernel. Irregular padded scales
-retain their explicit transform.
+Layer membership and normalized affine source/destination descriptors are cached
+for the current active tensor set. Fresh compressed lengths, frame lists and arena
+offsets are prepared for each update. Singleton and adjacent contiguous axes are
+collapsed without changing byte order. All affine tensor images in one layer
+share one persistent XOR launch, with no expert/dense name classification. A fixed
+grid of at most four CTAs per SM strides over the useful 4096-byte tiles. Each CTA
+retains its descriptor until a cumulative tile boundary is crossed; there is no
+expanded per-tile table or largest-tensor padding. Contiguous views use direct byte
+addresses. When an affine view's contiguous inner row is a whole number of tiles,
+only the scalar tile base needs stride arithmetic; other strided views map each
+byte. Irregular padded scales retain their explicit transform.
 
-The current active tensor set caches geometry and CPU prefix metadata. Fresh apply
-pointers and the small prefix/length tails share one metadata upload before pause.
+CPU geometry/prefix metadata is cached. Fresh apply pointers and descriptors share
+one metadata upload before pause. Kernel compilation and module loading finish
+before `PREPARED`.
 Bulk H2D starts only during paused apply. Ready/free events protect each
-encoded slot; decoded scratch, status checks and updates remain ordered on the
+encoded slot. Stage 2 retains the original next-batch schedule; larger rings
+queue further lookahead only after the current decoder and status check have been
+enqueued. Reused-slot waits always refer to an already-recorded free event.
+Decoded scratch, status checks and updates remain ordered on the
 apply stream. Completion joins the final copy, and cancellation drains both
 streams before releasing shared host views. The existing reader fence and
 device-side decoder failure gate remain in place.
@@ -231,9 +237,10 @@ worker durations must not be summed as wall time.
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
 `compressed_batches`, `compressed_h2d_spans` and `apply_groups` count layer
-decodes, bulk copies and grouped XOR launches. `apply_variable_groups` counts the
-mixed-length linear groups; `apply_prefix_h2d_bytes` counts their compact lookup
-rows within the apply metadata slab. `decoded_zero_ranges`/`decoded_zero_bytes`
+decodes, bulk copies and affine XOR launches. `apply_persistent_ctas` counts the
+sum of fixed launch-grid sizes; `apply_descriptor_h2d_bytes` counts cached
+affine/prefix rows within the apply metadata slab. `encoded_buffers` records the
+actual H2D ring stage count. `decoded_zero_ranges`/`decoded_zero_bytes`
 describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
 reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
 workspace byte counts describe reserved working buffers, not peak HBM usage.

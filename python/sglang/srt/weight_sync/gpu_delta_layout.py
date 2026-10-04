@@ -155,12 +155,6 @@ class TensorBinding:
         self._selection = tuple(slice(start, stop) for start, stop in self.slices)
         layer = re.search(r"(?:^|\.)layers\.(\d+)\.", self.name)
         self.layer = int(layer[1]) if layer else None
-        expert = re.search(r"\.experts\.\d+\.", self.name)
-        self.expert_family = (
-            self.name[: expert.start()] + ".experts.*." + self.name[expert.end() :]
-            if expert
-            else None
-        )
 
     @cached_property
     def view_id(self):
@@ -746,7 +740,6 @@ class GpuDeltaBackend:
         self.identity = dict(identity)
         self._canonical_plan = None
         self.batch_plan = None
-        self.expert_apply_contracts = {}
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
@@ -814,7 +807,7 @@ def _plan_layers(backend, bindings, entries):
                 nbytes = entries[binding.name]["nbytes"]
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
-            apply, transformed = plan_groups(outputs, backend.expert_apply_contracts)
+            apply, transformed = plan_groups(outputs)
             plans.append((outputs, size, apply, transformed))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
@@ -956,6 +949,9 @@ class PreparedDelta:
 
         preparation_started = time.perf_counter()
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
+        self.h2d_stages = int(os.environ.get("GPU_DELTA_H2D_STAGES", "2"))
+        if self.h2d_stages < 2:
+            raise ValueError("GPU_DELTA_H2D_STAGES requires at least two slots")
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
@@ -1037,7 +1033,7 @@ class PreparedDelta:
         frames = [
             [
                 DecodeFrame(
-                    (index % 2) * self.encoded_slot_bytes
+                    (index % self.h2d_stages) * self.encoded_slot_bytes
                     + encoded_offset
                     + frame["encoded_offset"],
                     frame["encoded_bytes"],
@@ -1051,8 +1047,8 @@ class PreparedDelta:
         ]
         if plans:
             self.copy_stream = torch.cuda.Stream(device=self.device)
-            self.copy_ready = [torch.cuda.Event(), torch.cuda.Event()]
-            self.copy_free = [torch.cuda.Event(), torch.cuda.Event()]
+            self.copy_ready = [torch.cuda.Event() for _ in range(self.h2d_stages)]
+            self.copy_free = [torch.cuda.Event() for _ in range(self.h2d_stages)]
         max_decoded = max((plan[1] for plan in static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
         # Rank-local tensor metadata; host-shared decompression is measured above.
@@ -1105,7 +1101,7 @@ class PreparedDelta:
                 targets.append(target)
                 sources.append(source)
             self.encoded = torch.empty(
-                2 * self.encoded_slot_bytes,
+                self.h2d_stages * self.encoded_slot_bytes,
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -1145,7 +1141,7 @@ class PreparedDelta:
                 (outputs, _, groups, transformed),
                 decode,
             ) in enumerate(zip(plans, static_plans, decoders)):
-                slot_offset = (index % 2) * self.encoded_slot_bytes
+                slot_offset = (index % self.h2d_stages) * self.encoded_slot_bytes
                 prepared_groups = []
                 for group in groups:
                     count = 2 * len(group.sources) + len(group.static_metadata)
@@ -1201,12 +1197,10 @@ class PreparedDelta:
             decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frames)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
             apply_groups=sum(len(batch.groups) for batch in self.batches),
-            apply_variable_groups=sum(
-                bool(group.static_metadata)
-                for batch in self.batches
-                for group, _ in batch.groups
+            apply_persistent_ctas=sum(
+                group.grid[0] for batch in self.batches for group, _ in batch.groups
             ),
-            apply_prefix_h2d_bytes=8
+            apply_descriptor_h2d_bytes=8
             * sum(
                 len(group.static_metadata)
                 for batch in self.batches
@@ -1222,7 +1216,7 @@ class PreparedDelta:
             ),
             encoded_scratch_bytes=self.encoded.numel(),
             encoded_slot_bytes=self.encoded_slot_bytes,
-            encoded_buffers=2 if plans else 0,
+            encoded_buffers=self.h2d_stages if plans else 0,
             decoded_scratch_bytes=max_decoded,
             decoder_workspace_bytes=(
                 self.workspace.temporary.numel() if self.workspace else 0
@@ -1278,15 +1272,20 @@ class PreparedDelta:
                 matrices_started = time.perf_counter()
                 if self.batches:
                     self._copy_batch(self.batches[0], 0)
+                prefetched = 1
                 for index, batch in enumerate(self.batches):
                     with self._phase("paused_copy_wait"):
-                        self.stream.wait_event(self.copy_ready[index % 2])
+                        self.stream.wait_event(self.copy_ready[index % self.h2d_stages])
                     self._decode_batch(batch)
-                    self.copy_free[index % 2].record(self.stream)
+                    self.copy_free[index % self.h2d_stages].record(self.stream)
                     # No new prefetch follows a synchronous decoder launch error.
                     # Device status errors keep the existing sticky apply gate.
-                    if index + 1 < len(self.batches):
-                        self._copy_batch(self.batches[index + 1], index + 1)
+                    while (
+                        prefetched < len(self.batches)
+                        and prefetched < index + self.h2d_stages
+                    ):
+                        self._copy_batch(self.batches[prefetched], prefetched)
+                        prefetched += 1
                     self._apply_batch(batch)
                 self.timings["host_matrix_enqueue_s"] = (
                     time.perf_counter() - matrices_started
@@ -1339,12 +1338,12 @@ class PreparedDelta:
 
     def _copy_batch(self, batch, index):
         with torch.cuda.stream(self.copy_stream):
-            if index >= 2:
-                self.copy_stream.wait_event(self.copy_free[index % 2])
+            if index >= self.h2d_stages:
+                self.copy_stream.wait_event(self.copy_free[index % self.h2d_stages])
             with self._phase("paused_layer_h2d", self.copy_stream):
                 for destination, source in batch.copies:
                     destination.copy_(source, non_blocking=True)
-            self.copy_ready[index % 2].record(self.copy_stream)
+            self.copy_ready[index % self.h2d_stages].record(self.copy_stream)
 
     def _decode_batch(self, batch):
         with self._phase("decode"):

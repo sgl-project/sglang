@@ -95,7 +95,6 @@ class TestCanonicalPlanCache(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan=None,
             batch_plan=None,
-            expert_apply_contracts={},
             layout=SimpleNamespace(
                 inventory={
                     name: {"dtype": "U8", "shape": [2, 4]}
@@ -665,7 +664,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan=None,
             batch_plan=None,
-            expert_apply_contracts={},
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
@@ -744,7 +742,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     sys.modules,
                     {
                         "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
-                            plan_groups=lambda outputs, contracts: ([], outputs),
+                            plan_groups=lambda outputs: ([], outputs),
                             prepare_status_check=lambda decoder, error: lambda: None,
                         )
                     },
@@ -983,7 +981,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan=None,
             batch_plan=None,
-            expert_apply_contracts={},
             codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(

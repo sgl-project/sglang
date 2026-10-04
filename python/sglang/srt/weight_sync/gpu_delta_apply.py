@@ -10,7 +10,6 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from itertools import accumulate
 
 import torch
 import triton
@@ -47,109 +46,105 @@ def prepare_status_check(decoder, error):
 
 
 @triton.jit
-def _xor_group(
-    pointers,
-    error,
-    COUNT: tl.constexpr,
-    SIZE: tl.constexpr,
-    SOURCE_SHAPE: tl.constexpr,
-    SOURCE_STRIDE: tl.constexpr,
-    TARGET_SHAPE: tl.constexpr,
-    TARGET_STRIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    if tl.load(error) == 0:
-        item = tl.program_id(1)
-        index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        source = tl.load(pointers + item).to(tl.pointer_type(tl.uint8))
-        target = tl.load(pointers + COUNT + item).to(tl.pointer_type(tl.uint8))
-        source_offset = tl.full((BLOCK,), 0, tl.int64)
-        target_offset = tl.full((BLOCK,), 0, tl.int64)
-        rest = index
-        for axis in tl.static_range(len(SOURCE_SHAPE) - 1, -1, -1):
-            source_offset += (rest % SOURCE_SHAPE[axis]) * SOURCE_STRIDE[axis]
-            rest //= SOURCE_SHAPE[axis]
-        rest = index
-        for axis in tl.static_range(len(TARGET_SHAPE) - 1, -1, -1):
-            target_offset += (rest % TARGET_SHAPE[axis]) * TARGET_STRIDE[axis]
-            rest //= TARGET_SHAPE[axis]
-        mask = index < SIZE
-        value = tl.load(source + source_offset, mask=mask, other=0)
-        previous = tl.load(target + target_offset, mask=mask, other=0)
-        tl.store(target + target_offset, previous ^ value, mask=mask)
+def _affine_offset(index, shape, stride):
+    offset = tl.full(index.shape, 0, tl.int64)
+    rest = index
+    for axis in tl.static_range(len(shape) - 1, 0, -1):
+        if shape[axis] != 1:
+            offset += (rest % shape[axis]) * stride[axis]
+            rest //= shape[axis]
+    return offset + rest * stride[0]
 
 
 @triton.jit
-def _xor_linear_group(
+def _xor_persistent(
     pointers,
     error,
     COUNT: tl.constexpr,
-    LOOKUP: tl.constexpr,
+    AXES: tl.constexpr,
+    TILES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     if tl.load(error) == 0:
         tile = tl.program_id(0).to(tl.int64)
-        lookup = tl.arange(0, LOOKUP)
-        # Pointer rows are followed by cumulative tile ends and byte lengths.
-        ends = tl.load(pointers + 2 * COUNT + lookup, lookup < COUNT, other=0)
-        item = tl.sum(((lookup < COUNT) & (tile >= ends)).to(tl.int32), 0)
-        first = tl.load(pointers + 2 * COUNT + item - 1, item > 0, other=0)
-        size = tl.load(pointers + 3 * COUNT + item)
-        index = (tile - first) * BLOCK + tl.arange(0, BLOCK)
-        source = tl.load(pointers + item).to(tl.pointer_type(tl.uint8))
-        target = tl.load(pointers + COUNT + item).to(tl.pointer_type(tl.uint8))
-        mask = index < size
-        value = tl.load(source + index, mask, other=0)
-        previous = tl.load(target + index, mask, other=0)
-        tl.store(target + index, previous ^ value, mask)
+        item = 0
+        first = tl.full((), 0, tl.int64)
+        metadata = pointers + 2 * COUNT
+        end = tl.load(metadata)
+        # A CTA retains its descriptor over consecutive grid-stride tiles.
+        # Only tensor boundaries walk the compact prefix; no per-tile table.
+        while tile < TILES:
+            while tile >= end:
+                first = end
+                item += 1
+                end = tl.load(metadata + item * (4 + 4 * AXES))
+            row = metadata + item * (4 + 4 * AXES)
+            size = tl.load(row + 1)
+            source_mode = tl.load(row + 2)
+            target_mode = tl.load(row + 3)
+            source = tl.load(pointers + item).to(tl.pointer_type(tl.uint8))
+            target = tl.load(pointers + COUNT + item).to(tl.pointer_type(tl.uint8))
+            source_shape, source_stride, target_shape, target_stride = (), (), (), ()
+            for axis in tl.static_range(AXES):
+                source_shape += (tl.load(row + 4 + axis),)
+                source_stride += (tl.load(row + 4 + AXES + axis),)
+                target_shape += (tl.load(row + 4 + 2 * AXES + axis),)
+                target_stride += (tl.load(row + 4 + 3 * AXES + axis),)
+            while tile < end:
+                base = (tile - first) * BLOCK
+                lanes = tl.arange(0, BLOCK)
+                index = base + lanes
+                if source_mode == 1:
+                    source_offset = index
+                elif source_mode == 2:
+                    source_offset = (
+                        _affine_offset(base, source_shape, source_stride) + lanes
+                    )
+                else:
+                    source_offset = _affine_offset(index, source_shape, source_stride)
+                if target_mode == 1:
+                    target_offset = index
+                elif target_mode == 2:
+                    target_offset = (
+                        _affine_offset(base, target_shape, target_stride) + lanes
+                    )
+                else:
+                    target_offset = _affine_offset(index, target_shape, target_stride)
+                mask = index < size
+                value = tl.load(source + source_offset, mask, other=0)
+                previous = tl.load(target + target_offset, mask, other=0)
+                tl.store(target + target_offset, previous ^ value, mask)
+                tile += tl.num_programs(0)
 
 
 @dataclass
 class ByteApplyGroup:
-    """Static geometry and live destinations; version scratch pointers stay separate."""
+    """One cached affine descriptor plan; scratch pointers stay publication-local."""
 
-    geometry: tuple | None
     sources: list[int]
     targets: list[int]
-    static_metadata: tuple[int, ...] = ()
+    static_metadata: tuple[int, ...]
+    axes: int
+    tiles: int
     kernel: object = None
 
     def compile(self, pointers, error):
         if self.kernel is None:
-            count = len(self.sources)
-            if self.geometry is None:
-                self.grid = (self.static_metadata[count - 1], 1, 1)
-                self.kernel = _xor_linear_group.warmup(
-                    pointers,
-                    error,
-                    count,
-                    triton.next_power_of_2(count),
-                    4096,
-                    grid=self.grid,
-                    num_warps=4,
-                )
-            else:
-                source_shape, source_stride, target_shape, target_stride = self.geometry
-                self.grid = (
-                    triton.cdiv(math.prod(source_shape), 4096),
-                    count,
-                    1,
-                )
-                self.kernel = _xor_group.warmup(
-                    pointers,
-                    error,
-                    count,
-                    math.prod(source_shape),
-                    source_shape,
-                    source_stride,
-                    target_shape,
-                    target_stride,
-                    4096,
-                    grid=self.grid,
-                    num_warps=4,
-                )
-            # Resolving the compiled launcher loads its CUDA module without
-            # executing a kernel or touching the live weights.
+            sms = torch.cuda.get_device_properties(
+                pointers.device
+            ).multi_processor_count
+            self.grid = (min(self.tiles, 4 * sms), 1, 1)
+            self.kernel = _xor_persistent.warmup(
+                pointers,
+                error,
+                len(self.sources),
+                self.axes,
+                self.tiles,
+                4096,
+                grid=self.grid,
+                num_warps=4,
+            )
+            # Load the module/launcher before PREPARED, without live writes.
             _ = self.kernel.run
             self.launch = self.kernel[self.grid]
 
@@ -173,45 +168,48 @@ def _normalize(shape, stride):
     return shape, stride
 
 
-def plan_groups(outputs, expert_contracts):
-    """Build once per active tensor set, using only CPU metadata/meta tensors."""
-    groups, transformed, linear_sizes = {}, [], []
+def _access_mode(shape, stride):
+    if stride == (1,):
+        return 1
+    # A tile cannot cross an affine row boundary in this geometry. Compute its
+    # base address once per CTA iteration instead of dividing every byte index.
+    return 2 if stride[-1] == 1 and shape[-1] % 4096 == 0 else 0
+
+
+def plan_groups(outputs):
+    """Cache one generic affine plan per layer; no model-name classification."""
+    sources, targets, contracts, transformed = [], [], [], []
     for binding, offset, size in outputs:
         if not binding.destinations:
             transformed.append((binding, offset, size))
             continue
-        # The admitted expert family has one layout contract. Its layer and
-        # projection/suffix remain distinct; only actual pointers vary by expert.
-        family = binding.expert_family
-        contract = expert_contracts.get(family) if family is not None else None
-        if contract is None:
-            canonical = torch.empty(size, dtype=torch.uint8, device="meta")
-            source = binding.selected_bytes(canonical)
-            contract = (
-                _normalize(source.shape, source.stride()),
-                source.storage_offset(),
-                tuple(_normalize(t.shape, t.stride()) for t in binding.destinations),
+        canonical = torch.empty(size, dtype=torch.uint8, device="meta")
+        source = binding.selected_bytes(canonical)
+        source_shape, source_stride = _normalize(source.shape, source.stride())
+        for target in binding.destinations:
+            target_shape, target_stride = _normalize(target.shape, target.stride())
+            sources.append(offset + source.storage_offset())
+            targets.append(target.data_ptr())
+            contracts.append((source_shape, source_stride, target_shape, target_stride))
+    if not contracts:
+        return [], transformed
+    axes = max(max(len(c[0]), len(c[2])) for c in contracts)
+    metadata, end = [], 0
+    for source_shape, source_stride, target_shape, target_stride in contracts:
+        size = math.prod(source_shape)
+        end += (size + 4095) // 4096
+        metadata.extend(
+            (
+                end,
+                size,
+                _access_mode(source_shape, source_stride),
+                _access_mode(target_shape, target_stride),
             )
-            if family is not None:
-                expert_contracts[family] = contract
-        (source_shape, source_stride), source_offset, destinations = contract
-        for index, target in enumerate(binding.destinations):
-            target_shape, target_stride = destinations[index]
-            geometry = source_shape, source_stride, target_shape, target_stride
-            if family is None and source_stride == target_stride == (1,):
-                geometry = None
-                linear_sizes.append(math.prod(source_shape))
-            group = groups.setdefault(geometry, ByteApplyGroup(geometry, [], []))
-            group.sources.append(offset + source_offset)
-            group.targets.append(target.data_ptr())
-    if linear_sizes:
-        group = groups[None]
-        if all(size == linear_sizes[0] for size in linear_sizes):
-            shape = (linear_sizes[0],)
-            group.geometry = shape, (1,), shape, (1,)
-        else:
-            group.static_metadata = (
-                *accumulate((size + 4095) // 4096 for size in linear_sizes),
-                *linear_sizes,
-            )
-    return list(groups.values()), transformed
+        )
+        for shape, stride in (
+            (source_shape, source_stride),
+            (target_shape, target_stride),
+        ):
+            metadata.extend((*shape, *((1,) * (axes - len(shape)))))
+            metadata.extend((*stride, *((0,) * (axes - len(stride)))))
+    return [ByteApplyGroup(sources, targets, tuple(metadata), axes, end)], transformed

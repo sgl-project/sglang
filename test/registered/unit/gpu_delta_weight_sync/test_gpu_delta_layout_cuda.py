@@ -19,7 +19,7 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _apply_prepared_masks(bindings, masks, expert_contracts):
+def _apply_prepared_masks(bindings, masks):
     """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
     from sglang.srt.weight_sync.gpu_delta_apply import plan_groups, prepare_status_check
     from sglang.srt.weight_sync.gpu_delta_layout import PreparedDelta, _PreparedBatch
@@ -36,7 +36,7 @@ def _apply_prepared_masks(bindings, masks, expert_contracts):
     prepared.error = torch.zeros(1, dtype=torch.int32, device="cuda")
     prepared.timing_enabled = False
     decoded = torch.empty_like(payload)
-    groups, transformed = plan_groups(outputs, expert_contracts)
+    groups, transformed = plan_groups(outputs)
     saved = [
         (value, value.clone()) for binding in bindings for value in binding.storage
     ]
@@ -255,9 +255,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             else:
                 bindings.append(binding)
                 masks.append(mask)
-    contracts = {}
-    _apply_prepared_masks(bindings, masks, contracts)
-    assert len(contracts) == len({binding.expert_family for binding in bindings})
+    _apply_prepared_masks(bindings, masks)
     from sglang.srt.weight_sync.gpu_delta_layout import _direct_binding
 
     for dtype in (torch.uint8, torch.bfloat16, torch.float32):
@@ -283,16 +281,23 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             live_tp,
             [[2, 10], [5, 13]],
         )
-        _apply_prepared_masks([binding], [mask.reshape(-1)], {})
+        _apply_prepared_masks([binding], [mask.reshape(-1)])
         torch.testing.assert_close(
             live_tp.view(torch.uint8), expected_tp, rtol=0, atol=0
         )
 
-    # Mixed linear lengths, a column-strided source and cached uniform experts.
+    # Mixed linear lengths, a column-strided source and strided routed targets.
     # Tiny items, exact tile ends and partial tails share only useful CTAs.
     # Guard bytes catch stores that escape an item's final mask.
     dense, guards = [], []
-    for index, size in enumerate((1, 4095, 4096, 4097, 9001)):
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    # Exceed the fixed persistent grid so a CTA crosses item boundaries after
+    # several loop iterations, as well as exercising byte-tail masking.
+    for index, size in enumerate(
+        (1, 4095, 4096, 4097, 9001, (4 * sms + 1) * 4096 + 17)
+    ):
         storage = torch.full((size + 2,), 0x5A, dtype=torch.uint8, device="cuda")
         guards.append(storage)
         target = storage[1:-1].view(1, size)
@@ -304,7 +309,6 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             )
         )
     routed = [b for b in bindings if b.name.endswith(".down_proj.weight")]
-    previous_contracts = dict(contracts)
     for dense_subset in (dense, dense[1:4]):
         selected = dense_subset + routed + [binding]
         masks = [
@@ -313,7 +317,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
                 dtype=torch.uint8,
                 device="cuda",
             )
-            if b.expert_family
+            if b.name in {item.name for item in routed}
             else torch.randint(
                 256,
                 (math.prod(b.shape) * b.torch_dtype.itemsize,),
@@ -327,12 +331,15 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             ^ b.selected_bytes(mask).reshape(b.destinations[0].shape)
             for b, mask in zip(selected, masks)
         ]
-        groups = _apply_prepared_masks(selected, masks, contracts)
-        linear = [group for group in groups if group.static_metadata]
-        assert len(groups) == 3 and len(linear) == 1
-        assert contracts == previous_contracts
-        sizes = [b.destinations[0].numel() for b in dense_subset]
-        assert linear[0].grid == (sum((size + 4095) // 4096 for size in sizes), 1, 1)
+        groups = _apply_prepared_masks(selected, masks)
+        assert len(groups) == 1
+        group = groups[0]
+        sizes = [b.destinations[0].numel() for b in selected]
+        assert group.tiles == sum((size + 4095) // 4096 for size in sizes)
+        sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        assert group.grid == (min(group.tiles, 4 * sms), 1, 1)
         for b, expected_value in zip(selected, expected_values):
             torch.testing.assert_close(
                 b.destinations[0], expected_value, rtol=0, atol=0
@@ -400,7 +407,7 @@ def test_feature_scale_permutation_matches_loader_padding():
                 "weight_scale",
             )
             mask = torch.randint(256, shape, dtype=torch.uint8, device="cuda")
-            _apply_prepared_masks([binding], [mask.reshape(-1)], {})
+            _apply_prepared_masks([binding], [mask.reshape(-1)])
             torch.testing.assert_close(
                 live[0].view(torch.uint8),
                 expected ^ swizzle_scale_bytes(mask),
