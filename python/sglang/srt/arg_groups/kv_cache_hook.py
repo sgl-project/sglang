@@ -593,10 +593,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
             "fused inside the full-attention page envelope."
         )
+        # The translated MHA rails. A fused draft is MHA-shaped on every host
+        # (its region holds dense K/V rows), and these three also serve a
+        # draft that keeps an MLA pool of its own.
+        mha_rails = {"triton", "flashinfer", "fa3"}
+        # The target verifies on its own pages: the MLA family on an MLA host.
         eagle_allowed = (
-            _SPEC_VERIFY_AUDITED_BACKENDS
-            if use_mla_backend(server_args)
-            else {"triton", "flashinfer", "fa3"}
+            _SPEC_VERIFY_AUDITED_BACKENDS if use_mla_backend(server_args) else mha_rails
         )
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
         assert (
@@ -604,18 +607,18 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             and eagle_backends
             and eagle_backends <= eagle_allowed
         ), (
-            "--enable-unified-memory + EAGLE/EAGLE3 requires the "
-            f"spec-verify-audited attention backends {sorted(eagle_allowed)}, "
-            f"set explicitly (got {sorted(eagle_backends, key=str)}). The MLA "
-            "verify family does not apply to an MHA-shaped draft."
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the target on the "
+            f"spec-verify-audited attention backends {sorted(eagle_allowed)} "
+            f"(got {sorted(eagle_backends, key=str)})."
         )
-        draft_allowed = (None,) + tuple(sorted(eagle_allowed))
-        assert cfg.speculative_draft_attention_backend in draft_allowed, (
-            "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
-            f"worker on a spec-verify-audited backend {sorted(eagle_allowed)}; "
-            "got --speculative-draft-attention-backend="
-            f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
-            "to inherit the target's."
+        # An unset draft backend inherits the target's pair.
+        draft_backend = cfg.speculative_draft_attention_backend
+        draft_backends = {draft_backend} if draft_backend else eagle_backends
+        assert draft_backends <= mha_rails, (
+            "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
+            f"{sorted(draft_backends)}, but a fused draft is MHA-shaped and "
+            f"reads its KV through the translated MHA rails {sorted(mha_rails)}. "
+            "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
