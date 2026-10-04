@@ -50,6 +50,23 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.runtime_context import get_parallel
 
 
+def attn_cp_interleave_gather(hidden_states: torch.Tensor):
+    """Gather equal padded interleave shards in rank order, not token order.
+
+    Size from the actual shard: the DP scratch length can already describe a
+    shard when dense FFNs run over TP, and is not a CP collective's output size.
+    """
+    parallel = get_parallel()
+    with use_symmetric_memory(
+        parallel.attn_cp_group, disabled=not is_allocation_symmetric()
+    ):
+        gathered = hidden_states.new_empty(
+            (hidden_states.shape[0] * parallel.attn_cp_size, *hidden_states.shape[1:])
+        )
+    attn_cp_all_gather_into_tensor(gathered, hidden_states.contiguous())
+    return gathered
+
+
 @dataclass
 class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None

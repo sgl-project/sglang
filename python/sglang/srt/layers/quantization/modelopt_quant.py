@@ -1426,10 +1426,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -3253,10 +3249,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
             return self.runner.run(dispatch_output, quant_info)
