@@ -233,13 +233,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                     )
                                     self._init_and_check(scheduler, req)
 
-    # EAGLE chain: 3 draft steps, topk 1, 4 verify tokens.
     def test_no_spec_keeps_full_context(self):
         with get_context().override_server_args(speculative_algorithm=None):
             self.assertEqual(compute_spec_context_reserve(enable_overlap=True), 0)
 
     def test_spec_overlap_tail_step_stays_within_context(self):
-        """A request run to the length cap under EAGLE + overlap: the tail step's
+        """A request run to the length cap under spec + overlap: the tail step's
         accept-then-verify KV length must not exceed context_len."""
         context_len, input_len = 4096, 25
         max_req_len = context_len - 1  # TpModelWorker.get_worker_info
@@ -249,10 +248,16 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             # included, its KV not yet written); the tail step verifies that many.
             return input_len + max_new_tokens + 2 * num_draft_tokens - 2
 
-        # 6 draft tokens: reserving num_draft_tokens once is not enough there.
-        for num_steps, num_draft_tokens in ((3, 4), (5, 6)):
+        # EAGLE chains with 4 and 6 draft tokens (reserving num_draft_tokens once
+        # is not enough at 6), and a DFLASH block of 16, which reserves nothing
+        # in TokenizerManager.
+        for algorithm, num_steps, num_draft_tokens in (
+            ("EAGLE", 3, 4),
+            ("EAGLE", 5, 6),
+            ("DFLASH", None, 16),
+        ):
             with get_context().override_server_args(
-                speculative_algorithm="EAGLE",
+                speculative_algorithm=algorithm,
                 speculative_num_steps=num_steps,
                 speculative_eagle_topk=1,
                 speculative_num_draft_tokens=num_draft_tokens,
@@ -260,7 +265,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 reserve = compute_spec_context_reserve(enable_overlap=True)
             for requested in (None, 1 << 20, context_len - 4 - input_len):
                 with self.subTest(
-                    num_draft_tokens=num_draft_tokens, requested=requested
+                    algorithm=algorithm,
+                    num_draft_tokens=num_draft_tokens,
+                    requested=requested,
                 ):
                     scheduler = self._new_scheduler(
                         max_req_len=max_req_len,

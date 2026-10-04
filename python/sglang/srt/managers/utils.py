@@ -491,8 +491,13 @@ def compute_num_reserved_tokens() -> int:
 def compute_spec_context_reserve(enable_overlap: bool) -> int:
     """Context slots kept free past a request's length cap for spec lookahead.
 
-    A step can accept up to one draft window past the cap, and under overlap the
+    A step can accept up to one verify window past the cap, and under overlap the
     already-launched next batch verifies the finished request once more; both
-    windows must stay within context_len (FA3 page table, RoPE cache).
+    windows must stay within context_len (FA3 page table, RoPE cache). Every
+    algorithm that verifies a draft window needs this, not only EAGLE, whose
+    window additionally covers the draft tokens stored in output slots.
     """
-    return compute_num_reserved_tokens() * (2 if enable_overlap else 1)
+    if SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_none():
+        return 0
+    window = max(compute_num_reserved_tokens(), max_speculative_num_draft_tokens() or 0)
+    return window * (2 if enable_overlap else 1)
