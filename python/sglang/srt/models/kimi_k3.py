@@ -1554,7 +1554,7 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
-        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
+        # using attention-TP placement, so it also supports DP attention.
         # The low-rank fused path still uses full-TP-only projection helpers.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
@@ -1577,8 +1577,7 @@ class KimiK3DeltaAttention(nn.Module):
                 ],
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
@@ -1590,8 +1589,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.b_proj",
                 # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
                 skip_block_quant_check=self._bfa_uses_block_fp8,
@@ -1608,8 +1606,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
             # Merged [f_a | b] weight, built after weight loading by
@@ -1655,7 +1652,6 @@ class KimiK3DeltaAttention(nn.Module):
                 2, self.head_dim, projection_size, dtype=_dtype
             )
         else:
-            attn_tp_rank = self.attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -1663,8 +1659,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -1681,8 +1676,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
             self.b_proj = ColumnParallelLinear(
@@ -1690,8 +1684,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.b_proj",
             )
 
@@ -1701,8 +1694,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    tp_rank=attn_tp_rank,
-                    tp_size=self.attn_tp_size,
+                    parallel_group="attn_tp",
                     prefix=f"{prefix}.g_proj",
                 )
             else:
@@ -1718,8 +1710,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    tp_rank=attn_tp_rank,
-                    tp_size=self.attn_tp_size,
+                    parallel_group="attn_tp",
                     prefix=f"{prefix}.g_b_proj",
                 )
 
@@ -1733,8 +1724,7 @@ class KimiK3DeltaAttention(nn.Module):
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
             params_dtype=torch.float32,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.qkv_conv1d",
         )
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
@@ -1778,8 +1768,7 @@ class KimiK3DeltaAttention(nn.Module):
             # comm lives there).
             reduce_results=not self.all_reduce_fusion,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             # Reduce within the attn-TP group: the default full-TP collective
             # is the wrong group at attn_tp>1 (sums across DP groups) and
             # deadlocks idle DP ranks. Off under all_reduce_fusion: the fused
@@ -2288,8 +2277,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.g_proj",
             )
             # Output gate multiplies the TP-local attention output right
