@@ -40,6 +40,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -120,12 +121,11 @@ class MistralEagleModel(nn.Module):
             )
         )
 
-        residual = None
+        residual_batch.start(forward_batch)
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
-        return hidden_states + residual
+            hidden_states = layer(positions, hidden_states, forward_batch)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return residual_batch.take_output(hidden_states, forward_batch)
 
 
 class MistralForCausalLMEagle(LlamaForCausalLMEagle):
