@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.models.encoders import clip as mmgen_clip
+from sglang.srt.layers import dp_attention
 from sglang.srt.models import clip as srt_clip
 
 
@@ -52,12 +53,13 @@ def test_mmgen_text_clip_requests_masked_srt_attention():
 
 
 def test_clip_attention_separates_text_and_vision_semantics():
-    parallel = SimpleNamespace(attn_tp_size=1, attn_tp_rank=0)
+    parallel = SimpleNamespace(attn_tp_size=1, attn_tp_rank=0, tp_size=1)
     hidden_states = torch.randn(2, 3, 16)
     padding_mask = torch.zeros(2, 1, 3, 3)
 
     with (
         patch.object(srt_clip, "get_parallel", return_value=parallel),
+        patch.object(dp_attention, "get_parallel", return_value=parallel),
         patch.object(srt_clip, "QKVParallelLinear", return_value=_FakeQKV()),
         patch.object(srt_clip, "RowParallelLinear", return_value=_FakeProjection()),
         patch.object(
