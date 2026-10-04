@@ -99,7 +99,15 @@ def _views_missing_the_rail(path: pathlib.Path):
             for target in node.targets:
                 if not (isinstance(target, ast.Name) and target.id in handed):
                     continue
-                if not any(kw.arg == _RAIL for kw in node.value.keywords):
+                # A literal None is the quiet failure: the hook zeroes the
+                # capture buffer, routing every write to the page-0 sink.
+                if not any(
+                    kw.arg == _RAIL
+                    and not (
+                        isinstance(kw.value, ast.Constant) and kw.value.value is None
+                    )
+                    for kw in node.value.keywords
+                ):
                     offenders.append((fn.name, target.id, node.lineno))
     return sorted(offenders, key=lambda o: o[2])
 
@@ -133,6 +141,19 @@ class TestHandBuiltViewWriteRail(unittest.TestCase):
             _views_missing_the_rail(self._probe(src)), [("replay", "v", 3)]
         )
 
+    def test_detector_catches_a_view_that_passes_none(self):
+        """None is accepted by `fill_capture_write_loc` and becomes the page-0
+        sink, so naming the rail with None is the omission in disguise."""
+        src = (
+            "class R:\n"
+            "    def replay(self, fb):\n"
+            "        v = SimpleNamespace(batch_size=8, out_cache_loc_virtual=None)\n"
+            "        self.backend.init_forward_metadata_out_graph(v)\n"
+        )
+        self.assertEqual(
+            _views_missing_the_rail(self._probe(src)), [("replay", "v", 3)]
+        )
+
     def test_detector_accepts_a_view_that_carries_it(self):
         """...and must NOT fire once the rail is named, else it is unfixable."""
         src = (
@@ -158,8 +179,7 @@ class TestHandBuiltViewWriteRail(unittest.TestCase):
         self.assertEqual(_views_missing_the_rail(self._probe(src)), [])
 
     def _probe(self, src):
-        # The eval container bind-mounts the source tree read-only, so a
-        # scratch path relative to the CWD raises OSError there.
+        # A temp dir, not the CWD: the checkout may be read-only.
         import shutil
         import tempfile
 
