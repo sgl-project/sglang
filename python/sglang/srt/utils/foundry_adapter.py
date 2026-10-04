@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Version of foundry.integration.sglang.api this adapter calls: same major,
 # at least this minor.
 FOUNDRY_INTEGRATION_API_MAJOR = 1
-FOUNDRY_INTEGRATION_API_MIN_MINOR = 1
+FOUNDRY_INTEGRATION_API_MIN_MINOR = 0
 # Distribution name (import name ``foundry``) and minimum version, checked
 # when the flag is set.
 FOUNDRY_PACKAGE = "foundry-core"
