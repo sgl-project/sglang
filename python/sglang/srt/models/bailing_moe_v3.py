@@ -36,6 +36,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -304,14 +305,13 @@ class BailingMLP(nn.Module):
         prefix: str = "",
         swiglu_limit: Optional[float] = None,
         padded_intermediate_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
 
         self.config = config
         self.swiglu_limit = swiglu_limit
-        self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
 
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
@@ -322,8 +322,7 @@ class BailingMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             self.padded_intermediate_size,
@@ -332,9 +331,10 @@ class BailingMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
+
+        self.tp_size = self.gate_up_proj.tp_size
 
         if self.padded_intermediate_size > self.intermediate_size:
             self.padded_size_per_partition = (
@@ -628,10 +628,8 @@ class BailingMoE(nn.Module):
             # because MoE output is already complete after EP combine.
             # Using tp_size=1 ensures shared output is also complete,
             # so no all-reduce is needed at the MoE level.
-            shared_tp_kwargs = {}
             shared_tp_size = self.tp_size
             if self._enable_a2a_moe:
-                shared_tp_kwargs = dict(tp_rank=0, tp_size=1)
                 shared_tp_size = 1
             padded_intermediate_size = self._compute_padded_intermediate_size(
                 intermediate_size, quant_config, shared_tp_size
@@ -645,7 +643,7 @@ class BailingMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=self.share_expert_swiglu_limit,
                 padded_intermediate_size=padded_intermediate_size,
-                **shared_tp_kwargs,
+                parallel_group="replicated" if self._enable_a2a_moe else "tp",
             )
         else:
             self.shared_experts = None
@@ -1091,10 +1089,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         is_next_layer_sparse = not (self.expert_num == 1) and (
             self.layer_id + 1 >= config.first_k_dense_replace
         )
-        if is_dense_ffn_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
-        else:
-            mlp_tp_rank, mlp_tp_size = None, None
+        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
 
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -1103,8 +1098,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
         else:
@@ -1124,8 +1118,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     config=config,
                     quant_config=quant_config,
                     prefix=prefix,
-                    tp_rank=mlp_tp_rank,
-                    tp_size=mlp_tp_size,
+                    parallel_group=mlp_parallel_group,
                     reduce_results=False,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
