@@ -2457,7 +2457,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(kv_chunk.room) == KVPoll.Failed
                     )
                 ):
-                    self._staging_outstanding.pop(kv_chunk.room, None)
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -2468,6 +2467,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if key[0] == kv_chunk.room:
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
+                    # Publish worker cleanup last: deferred allocation must not
+                    # acknowledge Success while this worker can still erase
+                    # bookkeeping for a subsequent transfer using the same room.
+                    self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -2810,19 +2813,14 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
-        self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
 
@@ -2864,11 +2862,15 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
-            # Hold Success until all staging chunks transferred: a deferred
-            # chunk can still be pending, and concluding now would drop it.
-            if (
-                status == KVPoll.Success
-                and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            # Hold Success until all staging chunks transferred. With deferred
+            # allocation also wait for worker cleanup (the zero entry is only
+            # removed after cleanup), before permitting the room to be reused.
+            if status == KVPoll.Success and (
+                self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+                or (
+                    self.kv_mgr.defer_decode_allocation
+                    and self.bootstrap_room in self.kv_mgr._staging_outstanding
+                )
             ):
                 return KVPoll.Transferring
             if status in (KVPoll.Success, KVPoll.Failed):
@@ -3071,20 +3073,6 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
-
-    def poll(self) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-        elif status == KVPoll.WaitingForInput:
-            timeout_result = self._check_waiting_timeout()
-            if timeout_result is not None:
-                return timeout_result
-
-        return status
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
