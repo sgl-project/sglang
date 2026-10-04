@@ -1289,3 +1289,36 @@ class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin)
 
 
 EntryClass = LTX2VideoDiffusionDecoderModel
+
+# Temporary diagnosis only; this instrumentation is not part of the follow-up PR.
+import faulthandler as _diag_fault
+import functools as _diag_functools
+import os as _diag_os
+import time as _diag_time
+
+_diag_stack_file = None
+
+def _diag_wrap(fn):
+    @_diag_functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        global _diag_stack_file
+        if _diag_stack_file is None:
+            _diag_stack_file = open(f"/tmp/ltx-stacks-{_diag_os.getpid()}.log", "w")
+            _diag_fault.dump_traceback_later(120, repeat=True, file=_diag_stack_file)
+        shapes = [tuple(a.shape) for a in args if isinstance(a, torch.Tensor)]
+        begin = _diag_time.monotonic()
+        print("LTX_DIAG_ENTER", _diag_os.getpid(), fn.__qualname__, shapes, flush=True)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            print("LTX_DIAG_EXIT", _diag_os.getpid(), fn.__qualname__, _diag_time.monotonic() - begin, flush=True)
+    return wrapped
+
+for _diag_cls, _diag_methods in (
+    (LTX2VideoVaeNeighborhoodAttention, ("build_block_mask", "forward")),
+    (LTX2VideoDiffusionDecoder3d, ("forward_stages_1_to_3", "forward_stage_4", "denoise")),
+):
+    for _diag_method in _diag_methods:
+        setattr(_diag_cls, _diag_method, _diag_wrap(getattr(_diag_cls, _diag_method)))
+_neighborhood_block_mask = _diag_wrap(_neighborhood_block_mask)
+_all_gather_tiles = _diag_wrap(_all_gather_tiles)

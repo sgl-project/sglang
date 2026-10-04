@@ -916,7 +916,7 @@ jobs:
         # choose. Two shards measured 45-65 min of case work each, inside the
         # 180 min step timeout, and halve the ~2h per-job container pull plus
         # dependency install.
-        part: [0, 1]
+        part: [1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -1015,11 +1015,7 @@ jobs:
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
             -w /sglang-checkout/python \
-            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
-              --suite 2-gpu \
-              --partition-id ${{ matrix.part }} \
-              --total-partitions 2 \
-              ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+            ci_sglang python3 /sglang-checkout/test/manual/diffusion_rocm_diagnosis.py
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
