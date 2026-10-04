@@ -86,8 +86,12 @@ def test_supports_admits_engine_operands_and_rejects_bad_inputs(monkeypatch):
     assert not cake_comm.supports_all_gather_matmul(inp, w[:, :1024], world_size=8)
     assert not cake_comm.supports_all_gather_matmul(inp, w[:, :1000], world_size=8)
     assert not cake_comm.supports_all_gather_matmul(inp, w[:4096], world_size=8)
+    # A column slice of the parameter view is still a layout (the first rows of
+    # the [N, K] parameter); a K-strided view is not.
+    assert cake_comm.supports_all_gather_matmul(inp, w_param.t()[:, :1024], world_size=8)
+    wide_param = torch.empty(1280, 2 * cake_comm.AG_K, device=device, dtype=torch.bfloat16)
     assert not cake_comm.supports_all_gather_matmul(
-        inp, w_param.t()[:, :1024], world_size=8  # strided view, not a layout
+        inp, wide_param.t()[: cake_comm.AG_K], world_size=8  # strides (1, 2K)
     )
     assert not cake_comm.supports_all_gather_matmul(
         inp.t().contiguous().t(), w, world_size=8  # strided input
