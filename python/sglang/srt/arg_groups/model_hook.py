@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
