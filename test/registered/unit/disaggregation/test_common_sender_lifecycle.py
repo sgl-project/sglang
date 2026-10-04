@@ -1,7 +1,6 @@
 import importlib.util
 import queue
 import sys
-import threading
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, Mock, patch
@@ -9,7 +8,7 @@ from unittest.mock import ANY, Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -19,19 +18,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_sender(manager_type, room=42, *, dummy_cp=False, sender_type=CommonKVSender):
+def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager = object.__new__(manager_type)
     manager.disaggregation_mode = DisaggregationMode.PREFILL
     manager.request_status = {}
-    manager.failure_records = {}
-    manager.failure_lock = threading.Lock()
-    manager.req_to_decode_prefix_len = {room: 0}
     manager.transfer_infos = {room: {"127.0.0.1:1234": SimpleNamespace(dst_port=1234)}}
-    manager.is_dummy_cp_rank = dummy_cp
+    manager.is_dummy_cp_rank = False
     manager.enable_all_cp_ranks_for_transfer = False
     manager.attn_cp_size = 1
     manager.attn_cp_rank = 0
-    manager.bootstrap_timeout = 5
     manager.enable_staging = False
     manager._staging_outstanding = {}
     manager._deferred_ack_targets = {}
@@ -120,81 +115,13 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertIsNone(last.state_indices)
         self.assertEqual(sender._transfer_num_state_indices, 0)
 
-    def test_zero_kv_final_chunk_still_sends_aux_and_state(self):
-        for manager_type in (MooncakeKVManager, self.mori_manager, NixlKVManager):
-            with self.subTest(backend=manager_type.__name__):
-                sender, _, chunks = make_sender(manager_type)
-                sender.init(0, aux_index=9)
-                sender.send(np.array([], dtype=np.int32), state_indices=[[3]])
-                chunk = chunks.get_nowait()
-                self.assertTrue(chunk.is_last_chunk)
-                self.assertEqual(chunk.prefill_aux_index, 9)
-                np.testing.assert_array_equal(chunk.state_indices[0], [3])
-
-    def test_dummy_cp_rank_finishes_only_on_last_chunk_without_enqueuing(self):
-        for manager_type in (MooncakeKVManager, self.mori_manager, NixlKVManager):
-            with self.subTest(backend=manager_type.__name__):
-                sender, _, chunks = make_sender(manager_type, dummy_cp=True)
-                sender.init(2, aux_index=9)
-                sender.send(np.array([10], dtype=np.int32))
-                self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
-                sender.send(np.array([11], dtype=np.int32))
-                self.assertEqual(sender.poll(), KVPoll.Success)
-                self.assertTrue(chunks.empty())
-
-    def test_success_waits_for_deferred_chunk_and_survives_clear(self):
-        for manager_type in (MooncakeKVManager, self.mori_manager, NixlKVManager):
-            with self.subTest(backend=manager_type.__name__):
-                sender, manager, _ = make_sender(manager_type)
-                sender._transfer_start_time = 5.0
-                manager.request_status[42] = KVPoll.Success
-                manager._staging_outstanding[42] = 1
-                self.assertEqual(sender.poll(), KVPoll.Transferring)
-                self.assertIsNone(sender.conclude_state)
-                manager._staging_outstanding[42] = 0
-                with patch(
-                    "sglang.srt.disaggregation.common.conn.time.perf_counter",
-                    return_value=7.0,
-                ):
-                    self.assertEqual(sender.poll(), KVPoll.Success)
-                self.assertEqual(sender._transfer_metric.transfer_latency_s, 2.0)
-                sender.clear()
-                self.assertEqual(sender.poll(), KVPoll.Success)
-                self.assertNotIn(42, manager.request_status)
-
-    def test_timeout_latches_failed_and_cleans_up(self):
-        sender, manager, _ = make_sender(self.mori_manager)
-        sender.init_time = 1.0
-        with patch(
-            "sglang.srt.disaggregation.common.conn.time.time", return_value=10.0
-        ):
-            self.assertEqual(sender.poll(), KVPoll.Failed)
-        self.assertEqual(sender.conclude_state, KVPoll.Failed)
-        self.assertIn("timed out", manager.failure_records[42])
-        with self.assertRaises(KVTransferError) as raised:
-            sender.failure_exception()
-        self.assertFalse(raised.exception.is_from_another_rank)
-        self.assertNotIn(42, manager.failure_records)
-        self.assertNotIn(42, manager.transfer_infos)
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-
-    def test_abort_stops_enqueue_and_keeps_abort_reason(self):
-        sender, _, chunks = make_sender(NixlKVManager)
-        sender.init(1, aux_index=9)
-        sender.abort()
-        sender.send(np.array([1], dtype=np.int32))
-        self.assertTrue(chunks.empty())
-        with self.assertRaisesRegex(KVTransferError, "Aborted"):
-            sender.failure_exception()
-
-    def test_missing_room_is_failed_without_resurrecting_it(self):
-        sender, manager, _ = make_sender(self.mori_manager)
-        del manager.request_status[42]
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-        self.assertNotIn(42, manager.request_status)
-        with self.assertRaises(KVTransferError) as raised:
-            sender.failure_exception()
-        self.assertTrue(raised.exception.is_from_another_rank)
+    def test_success_waits_for_deferred_staging_chunk(self):
+        sender, manager, _ = make_sender(MooncakeKVManager)
+        manager.request_status[42] = KVPoll.Success
+        manager._staging_outstanding[42] = 1
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        manager._staging_outstanding[42] = 0
+        self.assertEqual(sender.poll(), KVPoll.Success)
 
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)

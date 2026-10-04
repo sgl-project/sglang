@@ -16,6 +16,8 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         sender = NixlKVSender.__new__(NixlKVSender)
         sender.bootstrap_room = room
         sender.conclude_state = None
+        sender._send_failed = False
+        sender._send_error = None
         staging_ctx = SimpleNamespace(
             prefetched_rooms={room, 8},
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},

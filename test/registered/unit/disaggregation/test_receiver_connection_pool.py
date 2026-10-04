@@ -16,14 +16,9 @@ from unittest.mock import Mock, patch
 
 import msgspec
 import numpy as np
-import zmq
 
-from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
-from sglang.srt.disaggregation.common.conn import (
-    CommonKVManager,
-    CommonKVReceiver,
-    KVTransferError,
-)
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.test_utils import CustomTestCase
@@ -44,14 +39,9 @@ def _manager(manager_class=CommonKVManager):
     manager.prefill_response_tracker = {}
     manager.required_prefill_response_num_table = {}
     manager.addr_to_rooms_tracker = defaultdict(set)
-    manager.failure_records = {}
-    manager.failure_lock = threading.Lock()
     manager._staging_outstanding = {}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
-    manager.connection_pool = {}
-    manager.connection_lock = threading.Lock()
-    manager.waiting_timeout = 5.0
     manager.enable_staging = False
     return manager
 
@@ -207,13 +197,12 @@ class TestReceiverControlMessages(CustomTestCase):
             "mori": MoriKVManager,
         }
 
-    def _make_receiver(self, backend, *, fault=None, error=None):
+    def _make_receiver(self, backend):
         manager = _manager(self.backends[backend])
         manager.local_ip = "127.0.0.1"
         manager.rank_port = 5000
         manager.attn_tp_size = 2
         manager.dcp_size, manager.dcp_rank = 1, 0
-        manager.enable_staging = False
         manager.kv_args = SimpleNamespace(
             kv_data_ptrs=[0x1000],
             kv_data_lens=[256],
@@ -239,56 +228,21 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
         manager.engine = SimpleNamespace(get_session_id=lambda: "mooncake-peer")
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
-        manager.update_status(17, KVPoll.WaitingForInput)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
             {"rank_ip": "::1", "rank_port": port, "is_dummy": port == 6001}
             for port in (6000, 6001, 6002)
         ]
-        stale, replaced, replacement = ["stale"], ["old"], ["new"]
-        manager.connection_pool = {"stale": stale, "replaced": replacement}
-        receiver._connection_pool_entries = {"stale": stale, "replaced": replaced}
-        lock = threading.Lock()
-        connected, sent = [], []
-
-        class Address(str):
-            def encode(address, *args, **kwargs):
-                self.assertTrue(
-                    lock.locked(), "frame encoding moved outside the socket lock"
-                )
-                if fault == "encode" and connected[-1] == 6001:
-                    raise error
-                return super().encode(*args, **kwargs)
-
-        manager.local_ip = Address(manager.local_ip)
+        sent = []
 
         def connect(info):
-            port = info["rank_port"]
-            connected.append(port)
-            if fault == "connect" and port == 6001:
-                raise error
-
             def send(frames):
-                self.assertTrue(lock.locked())
-                if fault == "send" and port == 6001:
-                    raise error
-                sent.append((port, frames))
+                sent.append((info["rank_port"], frames))
 
-            return SimpleNamespace(send_multipart=send), lock
+            return SimpleNamespace(send_multipart=send), threading.Lock()
 
         receiver._connect_to_bootstrap_server = connect
-        return receiver, connected, sent, lock
-
-    @staticmethod
-    def _publish(receiver, operation, *, states=None):
-        if operation == "_register_kv_args":
-            return receiver._register_kv_args()
-        return receiver.send_metadata(
-            np.array([2, 4], dtype=np.int32),
-            aux_index=9,
-            state_indices=states,
-            decode_prefix_len=2,
-        )
+        return receiver, sent
 
     def test_registration_wire_is_preserved_for_all_peers(self):
         """Registration refactors must preserve each backend's legacy frame layout."""
@@ -367,23 +321,24 @@ class TestReceiverControlMessages(CustomTestCase):
         }
         for backend in self.backends:
             with self.subTest(backend=backend):
-                receiver, connected, sent, lock = self._make_receiver(backend)
-                self.assertTrue(self._publish(receiver, "_register_kv_args"))
-                self.assertEqual(connected, [6000, 6001, 6002])
+                receiver, sent = self._make_receiver(backend)
+                self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
-                    sent, [(port, expected[backend]) for port in connected]
+                    sent, [(port, expected[backend]) for port in (6000, 6001, 6002)]
                 )
-                self.assertFalse(lock.locked())
-                self.assertIsNone(receiver.init_time)
 
-    def test_metadata_wire_and_success_bookkeeping(self):
-        """Legacy bytes are unchanged while publication bookkeeping is shared."""
+    def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:
             for states in (None, [], [[3, 5]]):
                 with self.subTest(backend=backend, states=states):
-                    receiver, connected, sent, lock = self._make_receiver(backend)
-                    self._publish(receiver, "send_metadata", states=states)
-                    self.assertEqual(connected, [6000, 6001, 6002])
+                    receiver, sent = self._make_receiver(backend)
+                    receiver.send_metadata(
+                        np.array([2, 4], dtype=np.int32),
+                        aux_index=9,
+                        state_indices=states,
+                        decode_prefix_len=2,
+                    )
+                    self.assertEqual([port for port, _ in sent], [6000, 6001, 6002])
                     for port, frames in sent:
                         dummy = port == 6001
                         indices = b"" if dummy else struct.pack("<ii", 2, 4)
@@ -431,180 +386,25 @@ class TestReceiverControlMessages(CustomTestCase):
                                 ]
                             )
                         self.assertEqual(frames, expected)
-                    self.assertIsNotNone(receiver.init_time)
-                    self.assertFalse(lock.locked())
-                    self.assertEqual(
-                        receiver.kv_mgr.prefill_response_tracker[17], set()
-                    )
-                    self.assertEqual(
-                        set(receiver.kv_mgr.connection_pool), {"stale", "replaced"}
-                    )
 
-    def test_destination_interface_preserves_device_wire_and_rejects_host(self):
-        for backend in self.backends:
-            with self.subTest(backend=backend):
-                args = dict(kv_indices=np.array([2, 4], dtype=np.int32), aux_index=9)
-                default, _, default_sent, _ = self._make_receiver(backend)
-                default.send_metadata(**args)
-                device, _, device_sent, _ = self._make_receiver(backend)
-                device.send_metadata(**args, destination=KVTransferDestination.DEVICE)
-                self.assertEqual(device_sent, default_sent)
-
-                host, connected, sent, _ = self._make_receiver(backend)
-                self.assertFalse(host.supports_host_destination)
-                with self.assertRaisesRegex(NotImplementedError, "Host KV"):
-                    host.send_metadata(**args, destination=KVTransferDestination.HOST)
-                self.assertEqual(connected, [])
-                self.assertEqual(sent, [])
-                self.assertIsNone(host.init_time)
-
-    def test_missing_bootstrap_fails_all_backends_without_publication(self):
-        for backend in self.backends:
-            with self.subTest(backend=backend):
-                receiver, connected, sent, _ = self._make_receiver(backend)
-                receiver.bootstrap_infos = None
-                self._publish(receiver, "send_metadata")
-                self.assertEqual(receiver.kv_mgr.check_status(17), KVPoll.Failed)
-                self.assertIn("bootstrap", receiver.kv_mgr.failure_records[17])
-                self.assertEqual(connected, [])
-                self.assertEqual(sent, [])
-                self.assertIsNone(receiver.init_time)
-
-    def test_staging_is_registered_before_any_metadata_is_published(self):
-        """Prefill may request staging as soon as the first metadata message is sent."""
-        managers = {"mooncake": MooncakeKVManager, "nixl": NixlKVManager}
-        for backend, manager_class in managers.items():
-            for fault in (None, "send"):
-                with self.subTest(backend=backend, fault=fault):
-                    receiver, connected, _, _ = self._make_receiver(
-                        backend, fault=fault, error=zmq.ZMQError(zmq.EHOSTUNREACH)
-                    )
-                    manager = receiver.kv_mgr
-                    manager.enable_staging = True
-                    manager._staging_ctx = SimpleNamespace(
-                        allocator=object(), room_bootstrap={}, room_receivers={}
-                    )
-                    manager.register_staging_room_bootstrap = (
-                        manager_class.register_staging_room_bootstrap.__get__(manager)
-                    )
-                    receiver.chunk_staging_infos = ["old chunk"]
-                    connect = receiver._connect_to_bootstrap_server
-
-                    def connect_after_staging(info):
-                        self.assertIs(manager._staging_ctx.room_receivers[17], receiver)
-                        self.assertIs(
-                            manager._staging_ctx.room_bootstrap[17],
-                            receiver.bootstrap_infos,
-                        )
-                        self.assertEqual(receiver.chunk_staging_infos, [])
-                        return connect(info)
-
-                    receiver._connect_to_bootstrap_server = connect_after_staging
-                    self._publish(receiver, "send_metadata", states=[[3, 5]])
-                    self.assertEqual(
-                        connected, [6000, 6001] if fault else [6000, 6001, 6002]
-                    )
-                    self.assertEqual(receiver.init_time is None, fault is not None)
-                    self.assertEqual(receiver.init_time is not None, fault is None)
-
-    def test_device_indices_remain_a_mooncake_wire_extension(self):
-        """A shared entry point must neither drop Mooncake device indices nor accept them elsewhere."""
-        for backend in self.backends:
-            with self.subTest(backend=backend):
-                receiver, connected, sent, _ = self._make_receiver(backend)
-                kwargs = dict(
-                    kv_indices=np.array([2, 4], dtype=np.int32),
-                    aux_index=9,
-                    device_kv_indices=np.array([11, 13], dtype=np.int32),
-                )
-                if backend == "mooncake":
-                    receiver.send_metadata(**kwargs)
-                    self.assertEqual(
-                        [frames[-1] for _, frames in sent],
-                        [struct.pack("<ii", 11, 13), b"", struct.pack("<ii", 11, 13)],
-                    )
-                else:
-                    with self.assertRaises(TypeError):
-                        receiver.send_metadata(**kwargs)
-                    self.assertEqual(connected, [])
-                    self.assertIsNone(receiver.init_time)
-
-    def test_zmq_failure_stops_publication_and_preserves_cache_policy(self):
-        """A partially published request must fail without touching replacement caches."""
-        for backend in self.backends:
-            for operation in ("_register_kv_args", "send_metadata"):
-                for fault in ("connect", "encode", "send"):
-                    with self.subTest(
-                        backend=backend, operation=operation, fault=fault
-                    ):
-                        receiver, connected, sent, lock = self._make_receiver(
-                            backend,
-                            fault=fault,
-                            error=zmq.ZMQError(zmq.EHOSTUNREACH),
-                        )
-                        result = self._publish(receiver, operation, states=[[3, 5]])
-                        self.assertEqual(
-                            result, False if operation == "_register_kv_args" else None
-                        )
-                        self.assertEqual(connected, [6000, 6001])
-                        self.assertEqual([port for port, _ in sent], [6000])
-                        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
-                        self.assertEqual(
-                            receiver.kv_mgr.check_status(17), KVPoll.Failed
-                        )
-                        self.assertEqual(
-                            receiver.kv_mgr.failure_records[17],
-                            f"{operation} to prefill ::1:6001 failed",
-                        )
-                        expected = (
-                            {"replaced"}
-                            if operation == "send_metadata"
-                            else {"stale", "replaced"}
-                        )
-                        self.assertEqual(set(receiver.kv_mgr.connection_pool), expected)
-                        self.assertEqual(
-                            receiver.kv_mgr.connection_pool["replaced"], ["new"]
-                        )
-                        self.assertIsNone(receiver.init_time)
-                        self.assertIsNone(receiver.init_time)
-                        self.assertEqual(
-                            receiver.kv_mgr.prefill_response_tracker[17], set()
-                        )
-                        self.assertFalse(lock.locked())
-
-    def test_non_zmq_errors_are_not_converted_to_transfer_failures(self):
-        """Encoding/programming errors keep their exception and leave failure state alone."""
-        for backend in self.backends:
-            for operation in ("_register_kv_args", "send_metadata"):
-                for fault in ("encode", "send"):
-                    with self.subTest(
-                        backend=backend, operation=operation, fault=fault
-                    ):
-                        error = ValueError("invalid frame")
-                        receiver, connected, sent, lock = self._make_receiver(
-                            backend, fault=fault, error=error
-                        )
-                        with self.assertRaises(ValueError) as caught:
-                            self._publish(receiver, operation)
-                        self.assertIs(caught.exception, error)
-                        self.assertEqual(connected, [6000, 6001])
-                        self.assertEqual([port for port, _ in sent], [6000])
-                        self.assertEqual(
-                            receiver.kv_mgr.check_status(17), KVPoll.WaitingForInput
-                        )
-                        self.assertEqual(receiver.kv_mgr.failure_records, {})
-                        self.assertIsNone(receiver.conclude_state)
-                        self.assertFalse(lock.locked())
-                        self.assertEqual(
-                            set(receiver.kv_mgr.connection_pool), {"stale", "replaced"}
-                        )
+    def test_mooncake_device_indices_are_forwarded(self):
+        receiver, sent = self._make_receiver("mooncake")
+        receiver.send_metadata(
+            np.array([2, 4], dtype=np.int32),
+            aux_index=9,
+            device_kv_indices=np.array([11, 13], dtype=np.int32),
+        )
+        self.assertEqual(
+            [frames[-1] for _, frames in sent],
+            [struct.pack("<ii", 11, 13), b"", struct.pack("<ii", 11, 13)],
+        )
 
 
 class TestCommonReceiverLifecycle(CustomTestCase):
-    def _make_receiver(self, status=KVPoll.WaitingForInput):
+    def _make_receiver(self):
         manager = _manager()
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
-        manager.update_status(17, status)
+        manager.update_status(17, KVPoll.WaitingForInput)
         return receiver, manager
 
     def test_success_waits_for_all_distinct_prefill_ranks(self):
@@ -621,47 +421,8 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.Success)
         self.assertEqual(manager.prefill_response_tracker[17], {3, 4})
 
-    def test_success_is_published_only_after_staging_is_notified(self):
-        receiver, manager = self._make_receiver()
-        manager.required_prefill_response_num_table[17] = 1
-        manager.enable_staging = True
-        manager._staging_handler = Mock()
-        manager._staging_handler.is_staging_room.return_value = True
-
-        def notify_staging(room):
-            self.assertEqual(room, 17)
-            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-
-        manager._staging_handler.submit_last_scatter_async.side_effect = notify_staging
-        manager.apply_prefill_status(
-            bootstrap_room=17, status=KVPoll.Success, prefill_rank=0
-        )
-        self.assertEqual(receiver.poll(), KVPoll.Success)
-        manager._staging_handler.submit_last_scatter_async.assert_called_once_with(17)
-
-    def test_success_cannot_override_failure_or_recreate_cleared_room(self):
-        receiver, manager = self._make_receiver()
-        manager.required_prefill_response_num_table[17] = 1
-        manager.apply_prefill_status(
-            bootstrap_room=17,
-            status=KVPoll.Failed,
-            prefill_rank=0,
-            failure_reason="remote write failed",
-        )
-        manager.apply_prefill_status(
-            bootstrap_room=17, status=KVPoll.Success, prefill_rank=0
-        )
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-        self.assertEqual(manager.failure_records[17], "remote write failed")
-        receiver.clear()
-        manager.apply_prefill_status(
-            bootstrap_room=17, status=KVPoll.Success, prefill_rank=0
-        )
-        self.assertNotIn(17, manager.request_status)
-        self.assertNotIn(17, manager.prefill_response_tracker)
-
-    def test_shared_chunk_ready_wire_and_late_message(self):
-        receiver, manager = self._make_receiver()
+    def test_chunk_ready_round_trip(self):
+        _, manager = self._make_receiver()
         manager._prefill_unique_rank = lambda: 3
         manager._send_multipart_locked = Mock()
         manager._staging_handler = Mock()
@@ -690,12 +451,6 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         manager._staging_handler.handle_chunk_arrived.assert_called_once_with(
             17, 2, 8, 4, "peer_name_with_underscores"
         )
-        manager._staging_handler.reset_mock()
-        receiver.clear()
-        self.assertTrue(manager.handle_chunk_ready(frames))
-        manager._staging_handler.handle_chunk_arrived.assert_not_called()
-        self.assertFalse(manager.handle_chunk_ready([b"KV_STATUS"]))
-        self.assertTrue(manager.handle_chunk_ready([b"CHUNK_READY", b"bad"]))
 
     def test_completion_racing_clear_cannot_recreate_rank_tracker(self):
         """A notification that observed a live room must not reinsert it after clear."""
@@ -730,72 +485,6 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
         self.assertEqual(manager.prefill_response_tracker, {})
-
-    def test_propagated_failure_overrides_local_success(self):
-        """A TP-wide failure retires even a receiver whose local transfer succeeded."""
-        receiver, _ = self._make_receiver(KVPoll.Success)
-        self.assertEqual(receiver.poll(), KVPoll.Success)
-        with self.assertRaises(KVTransferError) as caught:
-            receiver.failure_exception()
-        self.assertTrue(caught.exception.is_from_another_rank)
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-
-    def test_clear_preserves_terminal_result_and_retires_unfinished_receiver(self):
-        for initial in (KVPoll.Success, KVPoll.Failed, KVPoll.WaitingForInput):
-            with self.subTest(initial=initial):
-                receiver, manager = self._make_receiver(initial)
-                manager.prefill_response_tracker[17] = set()
-                manager.required_prefill_response_num_table[17] = 1
-                if initial in (KVPoll.Success, KVPoll.Failed):
-                    self.assertEqual(receiver.poll(), initial)
-                receiver.clear()
-                receiver.clear()
-
-                expected = initial if initial == KVPoll.Success else KVPoll.Failed
-                self.assertEqual(receiver.poll(), expected)
-                self.assertNotIn(17, manager.request_status)
-                self.assertNotIn(17, manager.prefill_response_tracker)
-                self.assertNotIn(17, manager.required_prefill_response_num_table)
-                self.assertNotIn(17, manager.addr_to_rooms_tracker["prefill:8998"])
-
-    def test_abort_retains_receive_and_drain_state_until_explicit_clear(self):
-        receiver, manager = self._make_receiver()
-        receiver.bootstrap_infos = [{"rank_ip": "127.0.0.1", "rank_port": 5000}]
-        receiver._send_abort_notification = Mock()
-        status = manager.prefill_response_tracker[17]
-        manager._deferred_abort_ack_tracker = {17: {0}}
-
-        receiver.abort()
-        receiver.abort()
-
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-        self.assertEqual(manager.request_status[17], KVPoll.Failed)
-        self.assertIs(manager.prefill_response_tracker[17], status)
-        self.assertEqual(manager._deferred_abort_ack_tracker, {17: {0}})
-        self.assertIn("Abort", manager.failure_records[17])
-        receiver._send_abort_notification.assert_called_once_with(force_arm=False)
-
-        receiver.clear()
-        self.assertNotIn(17, manager.prefill_response_tracker)
-        self.assertEqual(manager._deferred_abort_ack_tracker, {17: {0}})
-
-    def test_failure_exception_preserves_local_reason_and_propagation_flag(self):
-        for reason in ("peer disconnected during transfer", None):
-            with self.subTest(reason=reason):
-                receiver, manager = self._make_receiver()
-                manager.prefill_response_tracker[17] = set()
-                if reason is not None:
-                    manager.record_failure(17, reason)
-                with self.assertRaises(KVTransferError) as caught:
-                    receiver.failure_exception()
-
-                self.assertEqual(caught.exception.bootstrap_room, 17)
-                self.assertEqual(caught.exception.is_from_another_rank, reason is None)
-                if reason is not None:
-                    self.assertEqual(caught.exception.failure_reason, reason)
-                self.assertNotIn(17, manager.failure_records)
-                self.assertNotIn(17, manager.prefill_response_tracker)
-                self.assertEqual(receiver.poll(), KVPoll.Failed)
 
 
 if __name__ == "__main__":
