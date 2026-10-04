@@ -270,7 +270,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self._backup_nodes_per_step = envs.SGLANG_HICACHE_BACKUP_NODES_PER_STEP.get()
+        self._batched_backup = envs.SGLANG_ENABLE_HICACHE_BATCHED_BACKUP.get()
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -389,7 +389,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        # Locked write-through nodes awaiting flush_pending_backups, ancestors first.
+        # Locked write-through nodes awaiting flush_pending_backups, in queue order.
         self.queued_backups: dict[NodeId, Optional[DecLockRefParams]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
@@ -1579,9 +1579,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _backup_specs(
         self, specs: list[_NodeBackupSpec], *, write_back: bool = False
     ) -> Optional[int]:
-        """Back disjoint nodes up with one host allocation per pool and one D->H
-        op, then commit and track each node. Returns the Full KV tokens written,
-        or None when the host allocation failed (the nodes' locks stay held)."""
+        """Full KV tokens written, or None if host alloc fails (locks stay held)."""
         device_value, comp_xfers, groups = self._merge_backup_transfers(specs)
         host_indices = self._execute_kv_backup(
             [spec.node_id for spec in specs],
@@ -1591,7 +1589,6 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if host_indices is None:
             return None
-        # Hand each node its slice of every merged host allocation.
         for merged, transfers in groups:
             sizes = [len(t.device_indices) for t in transfers]
             for transfer, host_slice in zip(
@@ -3529,19 +3526,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
-        """Back queued write-through nodes up (at most the per-step cap) and
-        submit them, with anything else queued, as one merged D2H operation."""
+        """Back queued write-through nodes up and submit every pending D2H backup."""
         if self.linker is not None or self.cache_controller is None:
             return
         if self.queued_backups:
-            self._drain_queued_backups(self._backup_nodes_per_step)
+            self._drain_queued_backups()
         self.cache_controller.start_writing()
 
     def _queue_write_through_backup(self, action: BackupKV) -> None:
-        """With a per-step cap, lock the action's nodes now and leave the host
-        alloc, transfer build and submit to flush_pending_backups, off the
-        request-finish path; without one, back them up right here."""
-        if self.buffer_pipeline is not None or self._backup_nodes_per_step == 0:
+        if self.buffer_pipeline is not None or not self._batched_backup:
             self._execute_and_commit_kv_backup(action)
             return
         for node_id in action.node_ids:
@@ -3549,38 +3542,79 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             self.queued_backups[node_id] = self.inc_lock_ref(node_id).to_dec_params()
 
-    def _drain_queued_backups(self, limit: int = 0) -> None:
-        """Execute queued backups oldest first, in as few batches as the SWA
-        windows allow; limit 0 runs the whole queue."""
-        remaining = limit if limit > 0 else len(self.queued_backups)
+    def _drain_queued_backups(self) -> None:
+        """Back queued nodes up ancestors first, merged as far as SWA windows allow;
+        like a failed BackupKV chain, a node whose parent stays unbacked is dropped."""
+        queued, self.queued_backups = self.queued_backups, {}
         batch: list[_NodeBackupSpec] = []
+        batch_ids: set[NodeId] = set()
         covered: set[NodeId] = set()
-        while self.queued_backups and remaining > 0:
-            node_id = next(iter(self.queued_backups))
-            lock_params = self.queued_backups.pop(node_id)
-            remaining -= 1
+        for node_id, lock_params in self._ancestors_first(queued).items():
             spec = self._build_node_backup_spec(node_id, lock_params)
             if spec is not None and not covered.isdisjoint(spec.publish_node_ids):
                 # A node already in the batch sits in this one's SWA window; commit
                 # the batch so the rebuilt spec sees it backed up, as node by node would.
                 self._backup_queued_batch(batch)
-                batch, covered = [], set()
+                batch, batch_ids, covered = [], set(), set()
                 spec = self._build_node_backup_spec(node_id, lock_params)
             if spec is None:
                 continue
+            if not self._parent_backed_up(node_id, batch_ids):
+                self._release_queued_backup(node_id, lock_params)
+                continue
             batch.append(spec)
+            batch_ids.add(node_id)
             covered.update(spec.publish_node_ids)
         self._backup_queued_batch(batch)
+
+    def _ancestors_first(
+        self, queued: dict[NodeId, Optional[DecLockRefParams]]
+    ) -> dict[NodeId, Optional[DecLockRefParams]]:
+        """Queued nodes in an order that puts every unbacked ancestor first; a split
+        can queue a parent behind its child or leave it unqueued (no lock held)."""
+        ordered: dict[NodeId, Optional[DecLockRefParams]] = {}
+        for node_id, lock_params in queued.items():
+            chain = []
+            parent = self.tree_core.get_parent_node_id(node_id)
+            while (
+                parent is not None
+                and parent not in ordered
+                and not self.tree_core.is_root(parent)
+                and not self.tree_core.is_backuped(parent)
+            ):
+                chain.append(parent)
+                parent = self.tree_core.get_parent_node_id(parent)
+            for ancestor in reversed(chain):
+                ordered[ancestor] = queued.get(ancestor)
+            ordered.setdefault(node_id, lock_params)
+        return ordered
+
+    def _parent_backed_up(self, node_id: NodeId, batch_ids: set[NodeId]) -> bool:
+        parent = self.tree_core.get_parent_node_id(node_id)
+        return (
+            parent is None
+            or parent in batch_ids
+            or self.tree_core.is_root(parent)
+            or self.tree_core.is_backuped(parent)
+        )
+
+    def _release_queued_backup(
+        self, node_id: NodeId, lock_params: Optional[DecLockRefParams]
+    ) -> None:
+        if lock_params is not None:
+            self.dec_lock_ref(node_id, lock_params)
 
     def _backup_queued_batch(self, batch: list[_NodeBackupSpec]) -> None:
         if not batch or self._backup_specs(batch) is not None:
             return
-        # The merged host allocation failed: retry node by node, as the
-        # insert-time path would, and drop whatever still does not fit.
+        # The merged host allocation failed: retry node by node, ancestors first.
         for spec in batch:
+            if not self._parent_backed_up(spec.node_id, set()):
+                self._release_queued_backup(spec.node_id, spec.lock_params)
+                continue
             retry = self._build_node_backup_spec(spec.node_id, spec.lock_params)
             if retry is not None and self._backup_specs([retry]) is None:
-                self.dec_lock_ref(spec.node_id, spec.lock_params)
+                self._release_queued_backup(spec.node_id, spec.lock_params)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

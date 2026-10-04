@@ -768,10 +768,8 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Queue write-through backups at insert time and let each scheduler step back
-    # up at most this many, batched, so a finish wave spreads over later steps.
-    # 0 (default) backs up at insert time; 16 measured on Inkling/GB300.
-    SGLANG_HICACHE_BACKUP_NODES_PER_STEP = EnvInt(0)
+    # Defer write-through backups to the end of the batch and back them up merged.
+    SGLANG_ENABLE_HICACHE_BATCHED_BACKUP = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

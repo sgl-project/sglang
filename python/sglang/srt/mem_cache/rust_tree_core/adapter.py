@@ -978,6 +978,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_root(self, node_id: NodeId) -> bool:
         return self._binding.is_root(node_id)
 
+    def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
+        return self._binding.parent_node_id(node_id)
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         return self._binding.get_last_hash_value(node_id)
 

@@ -193,6 +193,11 @@ class UnifiedTreeCoreInterface(ABC):
         """Whether the node is the tree root."""
         ...
 
+    @abstractmethod
+    def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
+        """The parent node id, or None for the root."""
+        ...
+
     # Logical-page KV sharding: whether this core stamps and honors
     # UnifiedTreeNode.rotation_base. A core that does not cannot serve a
     # sharded allocator (it would never decline a cross-base graft), and

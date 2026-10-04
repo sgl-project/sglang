@@ -8643,7 +8643,7 @@ fn inspection_rejects_stale_handles_without_panicking() {
         node_id: stale_root,
     };
 
-    assert_eq!(tc.inspect_get_parent_node_id(stale_root), Err(expected));
+    assert_eq!(tc.parent_node_id(stale_root), Err(expected));
     assert_eq!(tc.inspect_get_child_node_ids(stale_root), Err(expected));
     assert_eq!(tc.inspect_get_node_key_length(stale_root), Err(expected));
     assert_eq!(
@@ -8678,7 +8678,7 @@ fn inspection_rejects_stale_handles_without_panicking() {
     assert!(!tc.inspect_is_device_evictable_leaf(stale_root));
     assert!(!tc.inspect_is_host_evictable_leaf(stale_root));
 
-    assert_eq!(tc.inspect_get_parent_node_id(live_root), Ok(None));
+    assert_eq!(tc.parent_node_id(live_root), Ok(None));
     assert_eq!(tc.inspect_is_external_cache_stored(live_root), Ok(false));
 }
 
