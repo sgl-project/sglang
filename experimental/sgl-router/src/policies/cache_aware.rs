@@ -4,7 +4,7 @@
 //! Builds bounded cache-aware candidates from ingress Indexer results.
 
 use crate::config::AffinityConfig;
-use crate::policies::admission::FreshLoadLookup;
+use crate::policies::admission::CandidateLoads;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PrefillProposal, ProposalKind,
@@ -88,7 +88,7 @@ impl CacheAwarePolicy {
         if limit == 0 {
             return None;
         }
-        let loads = FreshLoadLookup::new(
+        let loads = CandidateLoads::new(
             ctx.load_snapshot(),
             candidates.iter().map(|candidate| &candidate.worker),
         );
@@ -139,7 +139,7 @@ impl CacheAwarePolicy {
 fn compare_candidate_seed(
     left: &CacheCandidate,
     right: &CacheCandidate,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> Ordering {
     right
         .matched_prefix_tokens

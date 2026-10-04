@@ -23,7 +23,7 @@ use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
 };
 pub(crate) use crate::state::load_monitor::pressure::{
-    compare_decode_pressure, compare_prefill_pressure, FreshLoadLookup,
+    compare_decode_pressure, compare_prefill_pressure, CandidateLoads,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -268,7 +268,7 @@ pub fn resolve_cache_candidates(
     // candidate missing native monitor data would otherwise break the
     // lookup's full-coverage check and silently downgrade every pressure
     // comparison (and `prefill_pressure_source`) to router-local.
-    let loads = FreshLoadLookup::new(
+    let loads = CandidateLoads::new(
         Some(snapshot),
         evaluated.iter().copied().map(|candidate| &candidate.worker),
     );
@@ -310,7 +310,7 @@ pub fn resolve_cache_candidates(
                 // comparison would fall back to router-local load — tie at
                 // zero for every owner, decided by worker id. The pin ranks
                 // the rejected owners, so it must see the rejected owners.
-                let pin_loads = FreshLoadLookup::new(
+                let pin_loads = CandidateLoads::new(
                     Some(snapshot),
                     queue_gate_rejected
                         .iter()
@@ -591,7 +591,7 @@ fn is_decode_admitted(
 fn is_cache_candidate_admitted(
     candidate: &CacheCandidate,
     request_input_tokens: u64,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     let Some(load) = loads.get(&candidate.worker.id) else {
         return true;
@@ -608,7 +608,7 @@ fn compare_cache_candidates(
     left: &CacheCandidate,
     right: &CacheCandidate,
     proposal: &CacheCandidateProposal,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
     enable_pressure_guard: bool,
 ) -> Ordering {
     let work_delta = left.uncached_tokens.abs_diff(right.uncached_tokens);
@@ -650,7 +650,7 @@ fn compare_cache_candidates(
 fn cache_pressure_guard_comparable(
     left: &CacheCandidate,
     right: &CacheCandidate,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     loads.comparable_get(&left.worker.id).is_some()
         && loads.comparable_get(&right.worker.id).is_some()
@@ -662,7 +662,7 @@ fn materially_more_pressured(
     absolute_threshold_tokens: u64,
     absolute_threshold_ms: Option<f64>,
     relative_threshold: f64,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     let (Some(candidate_load), Some(other_load)) = (
         loads.comparable_get(&candidate.id),
@@ -733,9 +733,9 @@ fn range_fallback(
     // Scoped to the pool actually ranked: an admitted-but-gated worker
     // missing native monitor data would otherwise downgrade the comparison
     // for the whole unqueued tier to router-local.
-    let loads = FreshLoadLookup::new(Some(snapshot), pool.iter());
+    let loads = CandidateLoads::new(Some(snapshot), pool.iter());
     loads
-        .min_by_pressure_key(pool, FreshLoadLookup::compare_prefill_keys)
+        .min_by_pressure_key(pool, CandidateLoads::compare_prefill_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -764,9 +764,9 @@ fn decode_domain_fallback(
         .filter(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot))
         .cloned()
         .collect::<Vec<_>>();
-    let loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
+    let loads = CandidateLoads::new(Some(snapshot), admitted.iter());
     loads
-        .min_by_pressure_key(admitted, FreshLoadLookup::compare_decode_keys)
+        .min_by_pressure_key(admitted, CandidateLoads::compare_decode_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 

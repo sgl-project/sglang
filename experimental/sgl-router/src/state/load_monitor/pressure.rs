@@ -103,7 +103,7 @@ fn compare_decode_load(
 ///
 /// External values are compared only when every candidate is present. Mixed
 /// candidate sets use Router-local active load to preserve ordering.
-pub(crate) struct FreshLoadLookup<'a> {
+pub(crate) struct CandidateLoads<'a> {
     by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
     basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
@@ -111,7 +111,7 @@ pub(crate) struct FreshLoadLookup<'a> {
     compare_basic_engine: bool,
 }
 
-impl<'a> FreshLoadLookup<'a> {
+impl<'a> CandidateLoads<'a> {
     pub(crate) fn new<'w>(
         snapshot: Option<&'a EngineReportedLoadSnapshot>,
         workers: impl IntoIterator<Item = &'w Arc<Worker>>,
@@ -168,8 +168,8 @@ impl<'a> FreshLoadLookup<'a> {
         self.compare_engine.then(|| self.get(worker_id)).flatten()
     }
 
-    fn pressure_key(&self, worker: &Arc<Worker>) -> PressureKey<'a> {
-        PressureKey {
+    fn pressure_key(&self, worker: &Arc<Worker>) -> LoadKey<'a> {
+        LoadKey {
             load: self.comparable_get(&worker.id),
             local_active: self
                 .local_active_by_worker_id
@@ -179,11 +179,7 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
-    pub(crate) fn compare_prefill_keys(
-        &self,
-        left: &PressureKey<'a>,
-        right: &PressureKey<'a>,
-    ) -> Ordering {
+    pub(crate) fn compare_prefill_keys(&self, left: &LoadKey<'a>, right: &LoadKey<'a>) -> Ordering {
         match (left.load, right.load) {
             (Some(left_load), Some(right_load)) => compare_prefill_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
@@ -191,11 +187,7 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
-    pub(crate) fn compare_decode_keys(
-        &self,
-        left: &PressureKey<'a>,
-        right: &PressureKey<'a>,
-    ) -> Ordering {
+    pub(crate) fn compare_decode_keys(&self, left: &LoadKey<'a>, right: &LoadKey<'a>) -> Ordering {
         match (left.load, right.load) {
             (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
@@ -256,7 +248,7 @@ impl<'a> FreshLoadLookup<'a> {
     pub(crate) fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
-        compare: impl Fn(&Self, &PressureKey<'a>, &PressureKey<'a>) -> Ordering,
+        compare: impl Fn(&Self, &LoadKey<'a>, &LoadKey<'a>) -> Ordering,
     ) -> Option<Arc<Worker>> {
         let mut candidates = candidates.into_iter();
         let mut best = candidates.next()?;
@@ -272,7 +264,7 @@ impl<'a> FreshLoadLookup<'a> {
     }
 }
 
-pub(crate) struct PressureKey<'a> {
+pub(crate) struct LoadKey<'a> {
     load: Option<&'a EngineReportedSchedulingLoad>,
     local_active: usize,
 }
