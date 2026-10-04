@@ -197,3 +197,48 @@ def build_qo_indptr_triton(*, verify_lens: torch.Tensor) -> QoIndptrResult:
         BLOCK=BLOCK,
     )
     return QoIndptrResult(qo_indptr=qo_indptr, extend_start_loc=extend_start_loc)
+
+
+@triton.jit
+def _fill_verify_padding_rows_kernel(
+    probs_ptr,
+    verify_lens_ptr,
+    uniform_ptr,
+    width,
+    vocab,
+    RESTORE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    req = row // width
+    verify_len = tl.load(verify_lens_ptr + req).to(tl.int64)
+    if row - req * width >= verify_len:
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < vocab
+        if RESTORE:
+            vals = tl.zeros([BLOCK], dtype=tl.float32) + tl.load(uniform_ptr + row)
+        else:
+            src = req * width + tl.maximum(verify_len - 1, 0)
+            vals = tl.load(probs_ptr + src * vocab + offs, mask=mask)
+        tl.store(probs_ptr + row * vocab + offs, vals, mask=mask)
+
+
+def fill_verify_padding_rows(
+    probs: torch.Tensor,
+    verify_lens: torch.Tensor,
+    uniform: torch.Tensor,
+    width: int,
+    restore: bool,
+) -> None:
+    """Requires contiguous ``[bs * width, vocab]`` probs and per-row ``uniform``."""
+    vocab = probs.shape[1]
+    block = 2048
+    _fill_verify_padding_rows_kernel[(probs.shape[0], triton.cdiv(vocab, block))](
+        probs,
+        verify_lens,
+        uniform,
+        width,
+        vocab,
+        RESTORE=restore,
+        BLOCK=block,
+    )

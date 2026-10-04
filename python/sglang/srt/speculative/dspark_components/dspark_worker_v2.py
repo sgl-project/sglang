@@ -1255,6 +1255,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                # Watermark forcing edits the logits, so padding rows may not be uniform.
+                compact_padding=(
+                    run_compact and not batch.has_grammar and watermark_rows is None
+                ),
             )
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(

@@ -29,6 +29,7 @@ _TRITON_KERNELS = [
     ("uno_tree", "build_uno_tree_proposal"),
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
+    ("ragged_verify_kernels", "fill_verify_padding_rows"),
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
