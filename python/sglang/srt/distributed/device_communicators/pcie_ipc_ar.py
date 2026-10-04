@@ -204,6 +204,7 @@ class PcieIpcCommunicator:
         self.disabled = True
         self.max_numel = 0
         self._workspace: Optional[Any] = None
+        self._adopted: list[Any] = []
         self._bound_stream: Optional[torch.cuda.Stream] = None
         self._cpu_group = cpu_group
         self._max_rows: Optional[int] = None
@@ -419,7 +420,15 @@ class PcieIpcCommunicator:
             self._bound_stream = stream
         return self._workspace.all_reduce(inp)
 
+    def adopt(self, workspace: Any) -> None:
+        """Release another PCIe-IPC workspace on this group (the all-gathers')
+        with this one, before the process groups it was built on."""
+        self._adopted.append(workspace)
+
     def destroy(self) -> None:
+        for workspace in self._adopted:
+            workspace.destroy()
+        self._adopted.clear()
         if self._workspace is not None:
             self._workspace.destroy()
             self._workspace = None

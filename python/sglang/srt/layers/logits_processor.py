@@ -492,6 +492,7 @@ class LogitsProcessor(nn.Module):
             ),
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
+            pcie_ipc=True,
         )
 
         chunking_group = None

@@ -16,6 +16,11 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.device_communicators.vocab_gather import (
+    NcclVocabGather,
+    VocabGather,
+    make_pcie_ipc_gather,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -452,7 +457,10 @@ class MultimemAllGatherer:
     first eager call, and uses the kernel only when the input fits its
     dtype/shape/alignment contract. Guards use TP-replicated quantities so all
     ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+    only safe when a cross-rank sync sits between consecutive calls. With
+    ``pcie_ipc=True``, a TP group with PCIe-IPC all-reduce enabled uses
+    FlashInfer's PCIe-IPC all-gather when multimem is unavailable (see
+    ``make_pcie_ipc_gather``); NVLink multimem still wins where it works."""
 
     _UNINIT = object()
 
@@ -462,9 +470,11 @@ class MultimemAllGatherer:
         *,
         enabled: bool = True,
         skip_entry_sync: bool = False,
+        pcie_ipc: bool = False,
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._pcie_ipc = pcie_ipc
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
@@ -498,6 +508,8 @@ class MultimemAllGatherer:
             state = self._build(x)
             if state is not self._UNINIT:
                 self._state = state
+        if isinstance(state, VocabGather):
+            return state(x)
         if (
             state is not None
             and state is not self._UNINIT
@@ -526,6 +538,18 @@ class MultimemAllGatherer:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             # Can't allocate under capture; retry later.
             return self._UNINIT
+        state = self._build_multimem(x)
+        if state is None and self._pcie_ipc:
+            # Multimem is unavailable (e.g. no multicast on a PCIe-only host);
+            # take PCIe-IPC if the operator enabled it for this group.
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            if getattr(tp_group, "pcie_ipc_comm", None) is not None:
+                return self._build_pcie_ipc(x, tp_group)
+        return state
+
+    def _build_multimem(self, x: torch.Tensor):
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
         try:
@@ -552,3 +576,17 @@ class MultimemAllGatherer:
         except Exception as e:
             logger.warning("multimem all-gather disabled (%s)", e)
             return None
+
+    def _build_pcie_ipc(self, x: torch.Tensor, tp_group):
+        """FlashInfer's PCIe-IPC all-gather, sized for decode as the PCIe-IPC
+        all-reduce is; larger inputs stay on NCCL."""
+        return make_pcie_ipc_gather(
+            tp_group,
+            local_width=x.shape[-1],
+            dtype=x.dtype,
+            max_rows=min(
+                self._max_tokens,
+                recommended_max_tokens(include_prefill=False, floor=128),
+            ),
+            fallback=NcclVocabGather(tp_group),
+        )

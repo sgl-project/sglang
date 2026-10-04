@@ -462,6 +462,7 @@ class DSparkV4MarkovHead(nn.Module):
             local_width=per_partition,
             prefer_nvlink=self._is_dsv41
             and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+            prefer_pcie_ipc=self._is_dsv41,
         )
         if shard_group.rank == 0:
             cls_name = type(self._vocab_gather).__name__
