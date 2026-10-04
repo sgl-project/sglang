@@ -30,7 +30,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHForCausalLM,
@@ -373,28 +372,18 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        has_mtp_layers = False
-        has_target_layers = False
-        head_weights = set()
+        checkpoint_names = set()
 
         def normalized_weights():
-            nonlocal has_mtp_layers, has_target_layers
             for name, weight in weights:
                 name = name.removeprefix("language_model.")
-                has_mtp_layers |= name.startswith("mtp.layers.")
-                has_target_layers |= name.startswith(
-                    ("backbone.layers.", "model.layers.")
-                )
-                if name.startswith("lm_head."):
-                    head_weights.add(name)
+                checkpoint_names.add(name)
                 yield name, weight
 
         # Inspect names while streaming: buffering a full target checkpoint here
         # would double its host-memory footprint during embedded MTP loading.
         super().load_weights(normalized_weights(), is_mtp=True)
-        self._owns_lm_head = bool(
-            has_mtp_layers and not has_target_layers and head_weights
-        )
+        head_weights = self.prepare_draft_weight_loading(checkpoint_names)
         if self._owns_lm_head:
             expected = {
                 name
@@ -412,22 +401,19 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
                     f"Incomplete standalone MTP lm_head: missing {sorted(missing)}"
                 )
 
-    def _draft_shared_weights_from_checkpoint(self, names):
-        if names is None:
-            owns_head = self._owns_lm_head
-        else:
-            names = {name.removeprefix("language_model.") for name in names}
-            owns_head = (
-                any(name.startswith("mtp.layers.") for name in names)
-                and not any(
-                    name.startswith(("backbone.layers.", "model.layers."))
-                    for name in names
-                )
-                and any(name.startswith("lm_head.") for name in names)
+    def prepare_draft_weight_loading(self, checkpoint_names):
+        """Use the same checkpoint ownership rule before and after loading."""
+        names = {name.removeprefix("language_model.") for name in checkpoint_names}
+        head_weights = {name for name in names if name.startswith("lm_head.")}
+        self._owns_lm_head = bool(
+            any(name.startswith("mtp.layers.") for name in names)
+            and not any(
+                name.startswith(("backbone.layers.", "model.layers.")) for name in names
             )
-        return True, not owns_head
+            and head_weights
+        )
+        return head_weights
 
-    @draft_shared_weight_spec(resolver="_draft_shared_weights_from_checkpoint")
     def set_embed_and_head(self, embed, head):
         if not self._owns_lm_head:
             return super().set_embed_and_head(embed, head)

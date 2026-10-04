@@ -19,7 +19,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.dots3_common.modeling import (
     Dots3DecoderLayer,
     Dots3LanguageModelForCausalLM,
@@ -186,21 +185,15 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         weights = list(weights)
-        share_embedding, _ = self._draft_shared_weights_from_checkpoint(
-            name for name, _ in weights
-        )
-        self._mtp_loaded_embed = not share_embedding
+        self.prepare_draft_weight_loading(name for name, _ in weights)
         super().load_weights(weights, is_nextn=True)
 
-    def _draft_shared_weights_from_checkpoint(self, names):
-        owns_embedding = (
-            self._mtp_loaded_embed
-            if names is None
-            else any(name.startswith("model.mtp.embed_tokens.") for name in names)
+    def prepare_draft_weight_loading(self, checkpoint_names):
+        """Resolve the existing sharing condition before allocating vocab weights."""
+        self._mtp_loaded_embed = any(
+            name.startswith("model.mtp.embed_tokens.") for name in checkpoint_names
         )
-        return not owns_embedding, True
 
-    @draft_shared_weight_spec(resolver="_draft_shared_weights_from_checkpoint")
     def set_embed_and_head(self, embed, head):
         # Preserve a checkpoint-provided MTP embedding; share the output head.
         if not self._mtp_loaded_embed:

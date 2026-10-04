@@ -43,7 +43,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weights_scope
+from sglang.srt.model_loader.draft_shared_weights import (
+    apply_draft_weight_sharing,
+    draft_shared_weights_scope,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -381,7 +384,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             revision=target_runner.model_config.revision,
             load_config=target_runner.load_config,
         )
-        draft_model.set_embed_and_head(embed, head)
+        apply_draft_weight_sharing(draft_model, embed, head)
         self._shared_draft_models.add(draft_model)
 
     def init_attention_backend(self):

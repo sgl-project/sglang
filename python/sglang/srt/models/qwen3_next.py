@@ -52,7 +52,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -1063,7 +1062,6 @@ class Qwen3NextForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -1075,7 +1073,6 @@ class Qwen3NextForCausalLM(nn.Module):
     def get_embed(self):
         return self.model.embed_tokens.weight
 
-    @draft_shared_weight_spec(lm_head=None, check_hidden_size=True)
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
         if (

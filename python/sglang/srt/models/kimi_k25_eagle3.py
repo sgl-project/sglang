@@ -36,7 +36,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.runtime_context import get_parallel
@@ -399,9 +398,6 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec(
-        lm_head=None, check_hidden_size=True, allow_none_hidden_size=True
-    )
     def set_embed(self, embed: torch.Tensor) -> None:
         # If draft hidden size != target hidden size, embeddings can't be shared.
         if (
@@ -415,7 +411,6 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         del self.model.embed_tokens.weight
         del self.lm_head.weight

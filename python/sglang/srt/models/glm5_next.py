@@ -77,7 +77,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -1860,7 +1859,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         if self.model is None or self.lm_head is None:
             raise AttributeError(

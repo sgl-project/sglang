@@ -81,7 +81,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -1399,7 +1398,6 @@ class Glm4MoeForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight

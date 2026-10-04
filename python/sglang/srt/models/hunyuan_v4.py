@@ -17,7 +17,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
 )
@@ -708,7 +707,6 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight

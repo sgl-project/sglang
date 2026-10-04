@@ -1,7 +1,8 @@
-"""Plan draft weight sharing without allocating duplicate vocabulary storage."""
+"""Reuse the model's sharing setters before allocating draft vocabulary weights."""
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
@@ -9,81 +10,66 @@ import torch
 from torch import nn
 
 
-@dataclass(frozen=True)
-class DraftSharedWeightSpec:
-    embedding: Optional[str] = "model.embed_tokens"
-    lm_head: Optional[str] = "lm_head"
-    resolver: Optional[str] = None
-    delegate: Optional[str] = None
-    check_hidden_size: bool = False
-    allow_none_hidden_size: bool = False
+def apply_draft_weight_sharing(model, embed, head, *, is_eagle3=False):
+    """The worker and loading planner use the same model sharing interface."""
+    if is_eagle3 and not getattr(model, "load_lm_head_from_target", False):
+        model.set_embed(embed)
+    else:
+        model.set_embed_and_head(embed, head)
 
 
-def draft_shared_weight_spec(**kwargs):
-    """Declare the module paths a sharing setter replaces.
+def plan_draft_weight_sharing(model, embed, head, *, is_eagle3=False):
+    """Record the existing setters' bindings without changing either model.
 
-    A resolver returns (share_embedding, share_head). It receives checkpoint
-    names before loading, or None to inspect the model's state after loading.
-    Overriding a setter does not inherit its declaration automatically.
+    Copy only module registrations, not tensor storage. Meta markers stand in
+    for the target parameters, so the setters cannot expose target weights to
+    draft loading or postprocessing. Delegation, overridden setters and custom
+    module paths are resolved by the same code used for final sharing.
     """
-    spec = DraftSharedWeightSpec(**kwargs)
+    copies = {}
 
-    def decorate(setter):
-        setter._draft_shared_weight_spec = spec
-        return setter
-
-    return decorate
-
-
-def _resolve_spec(model, is_eagle3, setter_name=None):
-    if setter_name is None:
-        setter_name = (
-            "set_embed"
-            if is_eagle3 and not getattr(model, "load_lm_head_from_target", False)
-            else "set_embed_and_head"
-        )
-    setter = getattr(model, setter_name, None)
-    spec = getattr(setter, "_draft_shared_weight_spec", None)
-    if spec is None:
-        return None
-    if spec.delegate is not None:
-        child = model.get_submodule(spec.delegate)
-        child_setter = setter_name
-        if not hasattr(child, child_setter):
-            child_setter = "set_embed"
-        resolved = _resolve_spec(child, is_eagle3, child_setter)
-        if resolved is None:
+    def copy_modules(module):
+        if module is None:
             return None
-        owner, prefix, child_spec = resolved
-        return owner, spec.delegate + "." + prefix, child_spec
-    return model, "", spec
+        if id(module) not in copies:
+            cloned = copy(module)
+            copies[id(module)] = cloned
+            cloned._parameters = module._parameters.copy()
+            cloned._buffers = module._buffers.copy()
+            cloned._modules = {
+                name: copy_modules(child) for name, child in module._modules.items()
+            }
+        return copies[id(module)]
 
+    markers = {}
+    sources = {}
 
-def draft_shared_weight_paths(model, is_eagle3=False, checkpoint_names=None):
-    resolved = _resolve_spec(model, is_eagle3)
-    if resolved is None:
-        return None
-    owner, prefix, spec = resolved
-    embedding, head = spec.embedding, spec.lm_head
-    config = getattr(owner.config, "text_config", owner.config)
-    if spec.check_hidden_size:
-        target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
-        if target_hidden_size != config.hidden_size and not (
-            spec.allow_none_hidden_size and target_hidden_size is None
-        ):
-            embedding = None
-    if spec.resolver is not None:
-        share_embedding, share_head = getattr(owner, spec.resolver)(checkpoint_names)
-        embedding = embedding if share_embedding else None
-        head = head if share_head else None
-    # A tied head uses the input embedding's storage and cannot be skipped
-    # independently when the draft needs its own local embedding under PP.
-    if getattr(config, "tie_word_embeddings", False):
-        head = None
-    return (
-        prefix + embedding if embedding is not None else None,
-        prefix + head if head is not None else None,
+    def marker(source):
+        if source is None:
+            return None
+        if id(source) not in markers:
+            value = nn.Parameter(
+                torch.empty_like(source, device="meta"), requires_grad=False
+            )
+            markers[id(source)] = value
+            sources[id(value)] = source
+        return markers[id(source)]
+
+    planned_model = copy_modules(model)
+    apply_draft_weight_sharing(
+        planned_model, marker(embed), marker(head), is_eagle3=is_eagle3
     )
+    return {
+        name: sources[id(parameter)]
+        for name, parameter in planned_model.named_parameters(remove_duplicate=False)
+        if id(parameter) in sources
+    }
+
+
+def draft_shares_embedding(model, embedding, *, is_eagle3=False):
+    """Ask the existing setter whether it replaces the draft's input embedding."""
+    bindings = plan_draft_weight_sharing(model, embedding, None, is_eagle3=is_eagle3)
+    return any(source is embedding for source in bindings.values())
 
 
 @dataclass(frozen=True)
@@ -91,6 +77,8 @@ class DraftSharingContext:
     target: nn.Module
     is_eagle3: bool
     token_map: bool
+    embed: Optional[torch.Tensor]
+    head: Optional[torch.Tensor]
 
 
 def _skip_shared_weight(*args, **kwargs):
@@ -104,25 +92,30 @@ class DraftWeightLoading:
     deferred_modules: set[nn.Module] = field(default_factory=set)
     shared_modules: set[nn.Module] = field(default_factory=set)
     bindings: dict = field(default_factory=dict)
+    sources: tuple = (None, None)
 
     def needs_checkpoint_names(self, model):
-        resolved = _resolve_spec(model, self.context.is_eagle3)
-        return resolved is not None and resolved[2].resolver is not None
+        return any(
+            callable(getattr(module, "prepare_draft_weight_loading", None))
+            for module in model.modules()
+        )
 
     def _compatible(self, module, source):
+        device_index = self.device.index
+        if device_index is None and self.device.type == "cuda":
+            device_index = torch.cuda.current_device()
         if (
             source is None
             or source.is_meta
             or source.device.type != self.device.type
-            or source.device.index != torch.cuda.current_device()
+            or source.device.index != device_index
             or source.shape != module.weight.shape
             or source.dtype != module.weight.dtype
         ):
             return False
-        from sglang.srt.lora.layers import unwrap_lora_layer
 
+        # Wrapped layers expose their base layer through modules() as well.
         for target_module in self.context.target.modules():
-            target_module = unwrap_lora_layer(target_module)
             if getattr(target_module, "weight", None) is not source:
                 continue
             if type(getattr(target_module, "quant_method", None)) is not type(
@@ -138,30 +131,46 @@ class DraftWeightLoading:
         return False
 
     def prepare(self, model, checkpoint_names=None):
-        paths = draft_shared_weight_paths(
-            model, self.context.is_eagle3, checkpoint_names
-        )
-        # Formats without readable key metadata use normal device allocation.
-        if self.needs_checkpoint_names(model) and checkpoint_names is None:
-            paths = None
-        selected = {}
-        if paths is not None:
-            from sglang.srt.speculative.pp_draft_embedding import (
-                resolve_target_embed_and_head,
-            )
+        # These hooks calculate the same state that load_weights() otherwise
+        # learns while reading checkpoint keys. No second sharing policy exists.
+        ready = not self.needs_checkpoint_names(model) or checkpoint_names is not None
+        if checkpoint_names is not None:
+            for module in model.modules():
+                prepare = getattr(module, "prepare_draft_weight_loading", None)
+                if callable(prepare):
+                    prepare(checkpoint_names)
 
-            sources = resolve_target_embed_and_head(self.context.target)
-            for index, (path, source) in enumerate(zip(paths, sources)):
-                # A token-mapped output head needs new sliced storage.
-                if path is None or (index == 1 and self.context.token_map):
-                    continue
-                module = model.get_submodule(path)
-                if module not in self.deferred_modules or not self._compatible(
-                    module, source
-                ):
-                    continue
-                selected[id(module.weight)] = source
-                self.bindings[path] = source
+        self.sources = (self.context.embed, self.context.head)
+        if self.context.token_map:
+            # A sliced output head needs its own storage. Do not offer it as a
+            # shared source, even when the target ties it to the embedding.
+            self.sources = (self.sources[0], None)
+        planned = (
+            plan_draft_weight_sharing(
+                model, *self.sources, is_eagle3=self.context.is_eagle3
+            )
+            if ready
+            else {}
+        )
+        modules = dict(model.named_modules(remove_duplicate=False))
+        selected = {}
+        conflicting = set()
+        for path, source in planned.items():
+            module_path, _, parameter_name = path.rpartition(".")
+            module = modules.get(module_path)
+            if (
+                parameter_name != "weight"
+                or module not in self.deferred_modules
+                or not self._compatible(module, source)
+            ):
+                continue
+            parameter_id = id(module.weight)
+            if parameter_id in selected and selected[parameter_id] is not source:
+                conflicting.add(parameter_id)
+            selected[parameter_id] = source
+            self.bindings[path] = source
+        for parameter_id in conflicting:
+            selected.pop(parameter_id, None)
 
         # A tied parameter can also belong to a separately quantized head. That
         # consumer still needs real storage for its own loading/postprocessing.
@@ -175,7 +184,7 @@ class DraftWeightLoading:
         self.bindings = {
             path: source
             for path, source in self.bindings.items()
-            if id(model.get_submodule(path).weight) in selected
+            if id(model.get_parameter(path)) in selected
         }
 
         # Allocate only draft-owned weights, directly on the final device.
@@ -201,11 +210,18 @@ class DraftWeightLoading:
                     module.register_parameter(name, replacement)
 
     def finish(self, model):
-        paths = draft_shared_weight_paths(model, self.context.is_eagle3)
-        if self.bindings and (paths is None or not self.bindings.keys() <= set(paths)):
-            raise RuntimeError("Draft sharing changed after reading checkpoint weights")
+        if self.bindings:
+            actual = plan_draft_weight_sharing(
+                model, *self.sources, is_eagle3=self.context.is_eagle3
+            )
+            if any(
+                actual.get(path) is not source for path, source in self.bindings.items()
+            ):
+                raise RuntimeError(
+                    "Draft sharing changed after reading checkpoint weights"
+                )
         replacements = {
-            id(model.get_submodule(path).weight): source
+            id(model.get_parameter(path)): source
             for path, source in self.bindings.items()
         }
         # Target parameters enter the draft tree only after all loading and
@@ -234,7 +250,12 @@ _draft_loading: ContextVar[Optional[DraftWeightLoading]] = ContextVar(
 def draft_shared_weights_scope(
     target: nn.Module, *, is_eagle3=False, token_map=False
 ) -> Iterator[None]:
-    token = _draft_context.set(DraftSharingContext(target, is_eagle3, token_map))
+    from sglang.srt.speculative.pp_draft_embedding import resolve_target_embed_and_head
+
+    embed, head = resolve_target_embed_and_head(target)
+    token = _draft_context.set(
+        DraftSharingContext(target, is_eagle3, token_map, embed, head)
+    )
     try:
         yield
     finally:

@@ -101,7 +101,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -2306,7 +2305,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight
@@ -2503,7 +2501,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight

@@ -52,7 +52,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -830,7 +829,6 @@ class LagunaForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight

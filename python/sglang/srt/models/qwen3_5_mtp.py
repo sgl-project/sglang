@@ -31,7 +31,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.platforms import current_platform
@@ -168,7 +167,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         # A last-stage draft can share only the target lm_head under PP; retain its
         # own embedding for the first-stage half it cannot receive.

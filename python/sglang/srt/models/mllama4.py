@@ -34,7 +34,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cpu
 
@@ -992,7 +991,6 @@ class Llama4ForConditionalGeneration(nn.Module):
             # For EAGLE3, head might not be needed
             return embed, None
 
-    @draft_shared_weight_spec(delegate="language_model")
     def set_embed_and_head(self, embed, head):
         if hasattr(self.language_model, "set_embed_and_head"):
             return self.language_model.set_embed_and_head(embed, head)
@@ -1003,7 +1001,6 @@ class Llama4ForConditionalGeneration(nn.Module):
     def get_embed(self):
         return self.language_model.get_embed()
 
-    @draft_shared_weight_spec(delegate="language_model")
     def set_embed(self, embed):
         return self.language_model.set_embed(embed)
 

@@ -19,7 +19,7 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.utils.common import PPMissingLayer
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_paths
+from sglang.srt.model_loader.draft_shared_weights import draft_shares_embedding
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
@@ -237,12 +237,11 @@ def resolve_draft_embed_and_head(
     loads the draft's own from the checkpoint."""
     embed, head = resolve_target_embed_and_head(target_model)
     if embed is None:
-        paths = draft_shared_weight_paths(draft_model, is_eagle3)
-        owned_embedding = (
-            find_draft_embedding_param(draft_model)
-            if paths is not None and paths[0] is None
-            else None
-        )
+        owned_embedding = find_draft_embedding_param(draft_model)
+        if owned_embedding is not None and draft_shares_embedding(
+            draft_model, owned_embedding[1], is_eagle3=is_eagle3
+        ):
+            owned_embedding = None
         if owned_embedding is not None:
             # A checkpoint-provided MTP embedding (or an EAGLE embedding with
             # a different width) must not be overwritten with target weights.

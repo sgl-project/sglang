@@ -57,7 +57,10 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weights_scope
+from sglang.srt.model_loader.draft_shared_weights import (
+    apply_draft_weight_sharing,
+    draft_shared_weights_scope,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -347,14 +350,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(draft_model, "load_lm_head_from_target")
-                and draft_model.load_lm_head_from_target
-            ):
-                draft_model.set_embed_and_head(embed, head)
+            apply_draft_weight_sharing(draft_model, embed, head, is_eagle3=True)
+            if getattr(draft_model, "load_lm_head_from_target", False):
                 maybe_share_target_lm_head()
-            else:
-                draft_model.set_embed(embed)
 
             # grab hot token ids
             if draft_model.hot_token_id is not None:
@@ -367,7 +365,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            draft_model.set_embed_and_head(embed, head)
+            apply_draft_weight_sharing(draft_model, embed, head)
             maybe_share_target_lm_head()
         self._shared_draft_model = draft_model
 

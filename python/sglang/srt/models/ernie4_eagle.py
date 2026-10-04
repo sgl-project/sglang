@@ -30,7 +30,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
 from sglang.srt.utils import add_prefix
@@ -189,7 +188,6 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed

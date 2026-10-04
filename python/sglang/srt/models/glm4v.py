@@ -54,7 +54,6 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -811,7 +810,6 @@ class Glm4vForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed

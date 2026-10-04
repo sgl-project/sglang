@@ -28,7 +28,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -82,7 +81,6 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
-    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight

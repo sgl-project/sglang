@@ -37,7 +37,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
@@ -970,7 +969,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return self.language_model.get_embed_and_head()
 
-    @draft_shared_weight_spec(delegate="language_model")
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         """Set embedding and LM head weights for speculative decoding."""
         if self.language_model is None or not hasattr(
