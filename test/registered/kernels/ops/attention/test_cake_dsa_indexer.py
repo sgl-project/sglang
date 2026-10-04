@@ -200,11 +200,11 @@ def test_ragged_fp8_mqa_logits_matches_deep_gemm(queries, keys, heads):
     torch.cuda.synchronize()
     assert tuple(got.shape) == (queries, keys) == tuple(ref.shape)
     assert got.dtype == torch.float32 and got.stride(1) == 1 and got.stride(0) % 4 == 0
-    # Compare inside the windows (DeepGEMM clean_logits=False leaves the rest
-    # unspecified); the Cake output is -inf there.
+    # Compare inside the windows: clean_logits=False leaves the rest unspecified
+    # on both sides (the shipped 32-head programs write -inf there, the 64-head
+    # programs store raw tiles like DeepGEMM).
     position = torch.arange(keys, device=device)[None, :]
     inside = (position >= ks[:, None]) & (position < ke[:, None])
-    assert bool(torch.isneginf(got[~inside]).all())
     _assert_logits_close(
         got.masked_fill(~inside, float("-inf")), ref.masked_fill(~inside, float("-inf"))
     )
@@ -453,10 +453,6 @@ def test_indexer_ragged_helper_switches_on_route():
                 out = indexer._fp8_mqa_logits_cuda(q, (kv, kv_scales), weights, ks, ke)
             torch.cuda.synchronize()
             assert kernels.call_count == (1 if route_on else 0)
-            if route_on:
-                assert bool(
-                    torch.isneginf(out[~inside]).all()
-                )  # Cake writes every cell
             _assert_logits_close(
                 out.masked_fill(~inside, float("-inf")),
                 stock.masked_fill(~inside, float("-inf")),

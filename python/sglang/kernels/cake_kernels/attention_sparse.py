@@ -1206,6 +1206,7 @@ def get_paged_mqa_logits_metadata(
     context_lens: torch.Tensor,
     block_kv: int,
     num_sms: int,
+    indices: Optional[torch.Tensor] = None,
     *,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1216,7 +1217,9 @@ def get_paged_mqa_logits_metadata(
     """
     from flashinfer.paged_mqa import get_paged_mqa_logits_metadata
 
-    return get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, out=out)
+    return get_paged_mqa_logits_metadata(
+        context_lens, block_kv, num_sms, indices=indices, out=out
+    )
 
 
 def fp8_paged_mqa_logits(
@@ -1228,6 +1231,7 @@ def fp8_paged_mqa_logits(
     schedule_meta: torch.Tensor,
     max_context_len: int,
     clean_logits: bool = False,
+    indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Forward to ``flashinfer.paged_mqa.fp8_paged_mqa_logits`` (DeepGEMM signature).
 
@@ -1244,6 +1248,7 @@ def fp8_paged_mqa_logits(
         schedule_meta,
         max_context_len,
         clean_logits=clean_logits,
+        indices=indices,
     )
 
 
