@@ -197,6 +197,7 @@ from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_lora,
@@ -647,6 +648,7 @@ class DeepseekV2MoE(nn.Module):
         self.is_deepseek_v4 = is_deepseek_v4
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
+            and not get_disagg().enable_pdmux
             and getattr(config, "hc_pre_from_prev_sublayer", False)
             and get_platform().is_blackwell
             and self.tp_size == 4
@@ -1037,6 +1039,13 @@ class DeepseekV2MoE(nn.Module):
             if use_flashinfer_trtllm_bypass
             else self._maybe_quant_moe_input_once(hidden_states)
         )
+        # Routed in-place output must not overwrite the shared expert's input
+        # on the helper stream after the fork.
+        shared_expert_input = (
+            hidden_states.clone()
+            if self.experts.moe_runner_config.inplace
+            else hidden_states
+        )
         self.alt_stream.wait_stream(current_stream)
         should_quant_routed_input_mxfp8 = (
             not use_flashinfer_trtllm_bypass
@@ -1150,7 +1159,7 @@ class DeepseekV2MoE(nn.Module):
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
-                hidden_states,
+                shared_expert_input,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
