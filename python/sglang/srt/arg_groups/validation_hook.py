@@ -172,9 +172,6 @@ def check_server_args(server_args: Any):
         assert cfg.speculative_algorithm is None, (
             "PD-Multiplexing speculative decoding requires the split-prefill worker adapter."
         )
-        assert not cfg.enable_dp_attention, (
-            "PD-Multiplexing attention DP requires rank-aligned split-prefill support."
-        )
         if cfg.chunked_prefill_size > 0:
             assert not cfg.enable_mixed_chunk, (
                 "PD-Multiplexing does not support mixed prefill/decode chunks."

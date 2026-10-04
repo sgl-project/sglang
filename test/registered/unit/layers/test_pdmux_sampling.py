@@ -39,6 +39,21 @@ class TestPDMuxSampling(unittest.TestCase):
             self.assertEqual(instance._get_tp_sync_group(), "cached")
             parallel.assert_not_called()
 
+    def test_attention_dp_sampling_uses_lane_subgroup(self):
+        instance = sampler.Sampler.__new__(sampler.Sampler)
+        instance._resolve_tp_sync_group_per_call = True
+        instance.tp_sync_group = "cached"
+        with (
+            patch.object(sampler, "is_dp_attention_enabled", return_value=True),
+            patch.object(sampler, "get_parallel") as parallel,
+        ):
+            for lane in ("prefill-attn-tp", "decode-attn-tp"):
+                parallel.return_value = SimpleNamespace(
+                    tp_group=SimpleNamespace(device_group="full-tp"),
+                    attn_tp_group=SimpleNamespace(device_group=lane),
+                )
+                self.assertEqual(instance._get_tp_sync_group(), lane)
+
     def test_pdmux_does_not_enable_shared_logits_workspace(self):
         parallel = SimpleNamespace(
             enable_dp_lm_head=False,

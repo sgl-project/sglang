@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
@@ -252,6 +253,13 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    # Preserve the raw gather for scheduling even if the model needs only
+    # local counts. Split bounds and stream selection must agree on IDLE ranks.
+    batch.scheduler_global_num_tokens = (
+        list(mlp_sync_info.global_num_tokens)
+        if mlp_sync_info.global_num_tokens is not None
+        else [mlp_sync_info.num_tokens]
+    )
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -307,7 +315,11 @@ def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
     DP1.
     """
 
-    return num_dp_ranks == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    if num_dp_ranks == 1:
+        return True
+    # PDMux depends on both lanes' global counts even when the model does not
+    # gather MLP tokens. A local-only override can mismatch layer collectives.
+    return not is_pdmux_enabled() and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
 def _local_decode_cuda_graph_vote(

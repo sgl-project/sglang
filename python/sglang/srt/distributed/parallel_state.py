@@ -2196,6 +2196,8 @@ _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
+# Attention TP may be a proper subgroup of TP when attention DP is enabled.
+_PDMUX_PREFILL_ATTN_TP_GROUP: Optional[GroupCoordinator] = None
 
 
 @contextmanager
@@ -2203,12 +2205,34 @@ def pdmux_prefill_tp_group():
     """Use the duplicate TP communicator for the prefill stream.
 
     PD multiplexing keeps prefill and decode on separate communicators with
-    the same ranks. Only the TP handle changes within this scope.
+    the same ranks. TP aliases follow the prefill handle, and an independent
+    attention-TP subgroup uses its own duplicate rather than the full TP group.
     """
     assert _PDMUX_PREFILL_TP_GROUP is not None, (
         "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
     )
-    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
+    parallel = get_parallel()
+    decode_tp_group = parallel.tp_group
+    decode_attn_tp_group = parallel.attn_tp_group
+    overrides = {"tp_group": _PDMUX_PREFILL_TP_GROUP}
+    for name in (
+        "attn_tp_group",
+        "attn_cp_group",
+        "moe_ep_group",
+        "moe_dp_group",
+        "moe_tp_group",
+        "shared_experts_tp_group",
+        "dcp_group",
+    ):
+        try:
+            group = getattr(parallel, name)
+        except (AttributeError, RuntimeError):
+            continue
+        if group is decode_tp_group:
+            overrides[name] = _PDMUX_PREFILL_TP_GROUP
+        elif _PDMUX_PREFILL_ATTN_TP_GROUP is not None and group is decode_attn_tp_group:
+            overrides[name] = _PDMUX_PREFILL_ATTN_TP_GROUP
+    with parallel.override(**overrides):
         yield
 
 
@@ -2816,6 +2840,28 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+        if duplicate_tp_group and attn_tp_size > 1:
+            global _PDMUX_PREFILL_ATTN_TP_GROUP
+            assert _PDMUX_PREFILL_ATTN_TP_GROUP is None, (
+                "attention tensor parallel group for PDMux prefill is already initialized"
+            )
+            _PDMUX_PREFILL_ATTN_TP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+                use_custom_allreduce=None,
+                use_torch_symm_mem_allreduce=False,
+                use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+                group_name="pdmux_prefill_attention_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
+            if _ATTN_TP.pynccl_comm:
+                _ATTN_TP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_ATTN_TP_GROUP.pynccl_comm.disabled = False
+
     global _SHARED_EXPERTS_TP
     assert _SHARED_EXPERTS_TP is None, "shared-expert TP group already initialized"
     if (
@@ -3317,6 +3363,11 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
+
+    global _PDMUX_PREFILL_ATTN_TP_GROUP
+    if _PDMUX_PREFILL_ATTN_TP_GROUP:
+        _PDMUX_PREFILL_ATTN_TP_GROUP.destroy()
+    _PDMUX_PREFILL_ATTN_TP_GROUP = None
 
 
 def destroy_distributed_environment():

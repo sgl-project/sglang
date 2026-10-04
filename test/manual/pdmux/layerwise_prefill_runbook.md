@@ -58,8 +58,8 @@ appropriate MoE runner/dequantization settings for the hardware.
 Record TTFT, ITL p50/p99, output tokens/s and per-rank peak memory under the same
 load. No GPU accuracy or throughput result is implied by passing CPU tests.
 
-This core layer supports plain TP. Attention DP and speculative decoding are
-enabled by the later stack layers and are rejected at startup in the core branch.
+The core branch supports plain TP. The third layer enables attention DP; the
+fourth adds speculative decoding. Earlier branches reject unsupported combinations.
 
 ## HiCache/SWA layer
 
@@ -80,3 +80,17 @@ tombstone recovery, including a protected prefix that ends inside the tombstone
 node. Include in-flight backup acks and post-storm output checks. The manual tests
 cover write-through; separately validate write-back and storage/buffer modes before
 relying on them in deployment.
+
+## Attention DP layer
+
+Run the same launch with `--enable-dp-attention --attn-dp-size 8` (TP8/DP8), then
+`--attn-dp-size 2` (TP8/DP2 with attention TP4). Exercise balanced and uneven prompt
+sizes, peer-only prefill/decode and all ranks IDLE. Check matching layer boundaries,
+no collective hang, correct greedy output and pad/unpad restoration across slices.
+The prefill lane owns duplicate full-TP and attention-TP communicators, including
+the independent attention subgroups in TP8/DP2. Scheduling keeps a separate global
+token vector even when the model consumes local MLP counts. PDMux always gathers
+that vector across multiple attention DP ranks, including when the optional
+ordinary-scheduler skip-gather environment setting is enabled.
+
+This matrix covers TP/attention DP. EP, CP and DCP need their own validation.
