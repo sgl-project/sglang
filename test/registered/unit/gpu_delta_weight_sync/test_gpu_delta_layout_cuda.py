@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 def _apply_prepared_masks(bindings, masks):
     """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
-    from sglang.srt.weight_sync.gpu_delta_apply import plan_groups
+    from sglang.srt.weight_sync.gpu_delta_apply import plan_groups, prepare_status_check
     from sglang.srt.weight_sync.gpu_delta_layout import PreparedDelta, _PreparedBatch
 
     outputs, size = [], 0
@@ -64,24 +64,31 @@ def _apply_prepared_masks(bindings, masks):
     )
     batch = _PreparedBatch(
         [],
-        decoded,
         decoder,
         compiled,
         [
             (binding.xor, binding.selected_bytes(decoded[offset : offset + length]))
             for binding, offset, length in transformed
         ],
+        [],
+        prepare_status_check(decoder, prepared.error),
     )
-    # An earlier decode error suppresses all mappings, including transformed
-    # padded scales. Reset only in this oracle, then exercise the successful XOR.
-    prepared.error.fill_(1)
-    prepared._decode_batch(batch)
-    prepared._apply_batch(batch)
-    for value, before in saved:
-        torch.testing.assert_close(
-            value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
-        )
+    # Prior errors, a new decoder error and a wrong decoded size must suppress
+    # every mapping, including the explicit transformed padded scale path.
+    for prior, status, actual in ((1, 0, size), (0, 1, size), (0, 0, size - 1)):
+        prepared.error.fill_(prior)
+        decoder.statuses.fill_(status)
+        decoder.actual_sizes.fill_(actual)
+        prepared._decode_batch(batch)
+        prepared._apply_batch(batch)
+        assert prepared.error.item() == 1
+        for value, before in saved:
+            torch.testing.assert_close(
+                value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
+            )
     prepared.error.zero_()
+    decoder.statuses.zero_()
+    decoder.actual_sizes.fill_(size)
     prepared._decode_batch(batch)
     prepared._apply_batch(batch)
 

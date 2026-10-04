@@ -9,10 +9,40 @@
 
 import math
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _check_decode(
+    statuses, actual_sizes, expected_sizes, error, count, BLOCK: tl.constexpr
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = index < count
+    status = tl.load(statuses + index, active, other=0)
+    actual = tl.load(actual_sizes + index, active, other=0)
+    expected = tl.load(expected_sizes + index, active, other=0)
+    if tl.sum(((status != 0) | (actual != expected)).to(tl.int32), 0) != 0:
+        tl.atomic_or(error, 1)
+
+
+def prepare_status_check(decoder, error):
+    """Compile/load before PREPARED; the returned call only enqueues validation."""
+    count = decoder.statuses.numel()
+    arguments = (
+        decoder.statuses,
+        decoder.actual_sizes,
+        decoder.expected_sizes,
+        error,
+        count,
+    )
+    grid = (triton.cdiv(count, 1024), 1, 1)
+    kernel = _check_decode.warmup(*arguments, 1024, grid=grid, num_warps=4)
+    _ = kernel.run
+    return partial(kernel[grid], *arguments)
 
 
 @triton.jit

@@ -264,10 +264,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 pinned = torch.empty_like(canonical)
                 batch = layout._PreparedBatch(
                     [(prepared.encoded, pinned)],
-                    prepared.decoded,
                     decoder,
                     [],
                     [(binding.xor, payload)],
+                    [],
+                    lambda: prepared.error.bitwise_or_(
+                        (decoder.statuses != 0).any().to(torch.int32)
+                    ),
                 )
                 expected = _bytes(target).clone()
                 pointer, stride = target.data_ptr(), target.stride()
@@ -415,6 +418,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+        shared.down_proj.weight = torch.nn.Parameter(
+            shared.down_proj.weight.clone(), requires_grad=False
+        )
+        with self.assertRaisesRegex(RuntimeError, "parameter identity changed"):
+            plan.check_identity()
 
     def test_derived_refresh_preserves_rank_and_decoder_error_gate(self):
         for shape in ((), (2,), (2, 2)):
@@ -734,7 +742,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     sys.modules,
                     {
                         "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
-                            plan_groups=lambda outputs: ([], outputs)
+                            plan_groups=lambda outputs: ([], outputs),
+                            prepare_status_check=lambda decoder, error: lambda: None,
                         )
                     },
                 ),
@@ -752,9 +761,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.h2d_bytes, 50)
                 self.assertEqual(prepared.timings["compressed_batches"], 3)
                 self.assertEqual(prepared.timings["compressed_h2d_spans"], 3)
+                self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
+                self.assertEqual(prepared.timings["decoded_zero_ranges"], 0)
                 self.assertEqual(len(prepared.batches[0].decoder.statuses), 2)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
                 pointer = prepared.encoded.data_ptr()
+                prepared.decoded.fill_(0xA5)
                 for batch in prepared.batches:
                     for _, source in batch.copies:
                         self.assertEqual(

@@ -408,11 +408,6 @@ class GpuDeltaLayout:
             self._add_moe_derived(prefix, layer)
         for prefix, attn in self._mla_layers.items():
             self._add_mla_derived(prefix, attn)
-        self._pointers = [
-            (tensor, _tensor_identity(tensor))
-            for binding in self.bindings
-            for tensor in binding.storage
-        ] + [(d.destination, _tensor_identity(d.destination)) for d in self.derived]
         self._parameter_roots = [
             (module, name, tensor, _tensor_identity(tensor))
             for module in self._modules.values()
@@ -420,8 +415,26 @@ class GpuDeltaLayout:
             if tensor is not None
         ]
         self._moe_consumers = [
-            (layer, layer._cutedsl_wrapper, layer._cutedsl_scales)
+            (
+                layer,
+                layer._cutedsl_wrapper,
+                layer._cutedsl_scales,
+                [
+                    (tensor, _tensor_identity(tensor))
+                    for tensor in (layer._cutedsl_scales[0], layer._cutedsl_scales[2])
+                ],
+            )
             for layer in self._moe_layers.values()
+        ]
+        self._mla_consumers = [
+            (
+                attn,
+                [
+                    (tensor, _tensor_identity(tensor))
+                    for tensor in (attn.w_kc, attn.w_vc)
+                ],
+            )
+            for attn in self._mla_layers.values()
         ]
         self._reject_overlaps()
         self.rank_plan_digest = _digest(
@@ -441,7 +454,7 @@ class GpuDeltaLayout:
                 raise RuntimeError(
                     "GPU delta parameter identity changed; readmission required"
                 )
-        for layer, wrapper, scales in self._moe_consumers:
+        for layer, wrapper, scales, tensors in self._moe_consumers:
             if (
                 layer._cutedsl_wrapper is not wrapper
                 or layer._cutedsl_scales is not scales
@@ -449,11 +462,9 @@ class GpuDeltaLayout:
                 raise RuntimeError(
                     "GPU delta CuTe DSL consumer changed; readmission required"
                 )
-        for tensor, expected in self._pointers:
-            if _tensor_identity(tensor) != expected:
-                raise RuntimeError(
-                    "GPU delta buffer identity changed; readmission required"
-                )
+            _check_consumer_tensors((scales[0], scales[2]), tensors)
+        for attn, tensors in self._mla_consumers:
+            _check_consumer_tensors((attn.w_kc, attn.w_vc), tensors)
 
     def _bind(self, name, meta):
         layer_id = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
@@ -684,6 +695,14 @@ def _tensor_identity(tensor):
     )
 
 
+def _check_consumer_tensors(current, admitted):
+    for tensor, (original, expected) in zip(current, admitted):
+        if tensor is not original or _tensor_identity(tensor) != expected:
+            raise RuntimeError(
+                "GPU delta consumer storage changed; readmission required"
+            )
+
+
 def _require_fixed_moe_topology(moe):
     # The canonical expert map is valid only while physical expert ownership is
     # the trivial EP partition. EPLB/custom/elastic maps can change ownership
@@ -761,10 +780,11 @@ class GpuDeltaBackend:
 @dataclass
 class _PreparedBatch:
     copies: list[tuple[torch.Tensor, torch.Tensor]]
-    decoded: torch.Tensor
     decoder: object
     groups: list
     transformed: list[tuple[Callable, torch.Tensor]]
+    zero_ranges: list[torch.Tensor]
+    check_status: Callable[[], None]
 
 
 def _plan_layers(backend, bindings, entries):
@@ -810,6 +830,21 @@ def _plan_batch(outputs, entries, records):
         encoded_size = encoded_offset + size
         ranges.append((entry["frames"], encoded_offset, decoded_offset))
     return ranges, spans, encoded_size
+
+
+def _decoded_gaps(outputs, entries):
+    """Publication-specific omitted bytes; alignment padding is never consumed."""
+    gaps = []
+    for binding, offset, size in outputs:
+        cursor = 0
+        for frame in entries[binding.name]["frames"]:
+            start = frame["decoded_offset"]
+            if cursor < start:
+                gaps.append((offset + cursor, start - cursor))
+            cursor = start + frame["decoded_bytes"]
+        if cursor < size:
+            gaps.append((offset + cursor, size - cursor))
+    return gaps
 
 
 def _canonical_views(views):
@@ -1078,6 +1113,9 @@ class PreparedDelta:
                 if plans
                 else []
             )
+            if decoders:
+                from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
+
             host = self.backend.host_arena.tensor
             pointer_rows = []
             for _, _, groups, _ in static_plans:
@@ -1096,7 +1134,7 @@ class PreparedDelta:
             position = 0
             for index, (
                 (_, spans, _),
-                (_, decoded_size, groups, transformed),
+                (outputs, _, groups, transformed),
                 decode,
             ) in enumerate(zip(plans, static_plans, decoders)):
                 slot_offset = (index % 2) * self.encoded_slot_bytes
@@ -1118,7 +1156,6 @@ class PreparedDelta:
                             )
                             for source, target, size in spans
                         ],
-                        self.decoded[:decoded_size],
                         decode,
                         prepared_groups,
                         [
@@ -1130,6 +1167,11 @@ class PreparedDelta:
                             )
                             for binding, offset, size in transformed
                         ],
+                        [
+                            self.decoded[offset : offset + size]
+                            for offset, size in _decoded_gaps(outputs, entries)
+                        ],
+                        prepare_status_check(decode, self.error),
                     )
                 )
             changed_bindings = compressed + [binding for binding, _ in direct]
@@ -1155,6 +1197,10 @@ class PreparedDelta:
             compressed_batches=len(plans),
             compressed_tensors=self.matrix_tensor_count,
             compressed_h2d_spans=sum(len(batch.copies) for batch in self.batches),
+            decoded_zero_ranges=sum(len(batch.zero_ranges) for batch in self.batches),
+            decoded_zero_bytes=sum(
+                span.numel() for batch in self.batches for span in batch.zero_ranges
+            ),
             encoded_scratch_bytes=self.encoded.numel(),
             encoded_slot_bytes=self.encoded_slot_bytes,
             encoded_buffers=2 if plans else 0,
@@ -1255,10 +1301,7 @@ class PreparedDelta:
             raise RuntimeError(
                 "direct GPU delta decompression failed; session is poisoned"
             )
-        backend.layout.check_identity()
-        self.timings["host_apply_status_identity_s"] = (
-            time.perf_counter() - final_started
-        )
+        self.timings["host_apply_status_s"] = time.perf_counter() - final_started
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         if self.timing_enabled:
             self.timings["cuda_event_ms"] = {
@@ -1288,12 +1331,10 @@ class PreparedDelta:
         with self._phase("decode"):
             # Raw targets have a separate prepared arena and foreach-copy
             # pass. Every tensor here is XOR; absent frames are zero deltas.
-            batch.decoded.zero_()
+            if batch.zero_ranges:
+                torch._foreach_zero_(batch.zero_ranges)
             batch.decoder.enqueue()
-            invalid = (batch.decoder.statuses != 0).any() | (
-                batch.decoder.actual_sizes != batch.decoder.expected_sizes
-            ).any()
-            self.error.bitwise_or_(invalid.to(torch.int32))
+            batch.check_status()
 
     def _apply_batch(self, batch):
         # No gather of current weights, canonical reconstruction or weight hash.
