@@ -88,7 +88,7 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
                 joiner_skip_all_gather=False,
             ),
             get_parallel().override(
-                dp_size=3,
+                num_dp_ranks=3,
                 tp_rank=0,
                 ep_join_rank_offset=4,
                 attn_tp_size=2,

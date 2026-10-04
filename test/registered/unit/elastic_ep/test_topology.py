@@ -94,7 +94,7 @@ def test_attention_tp_scale_requires_moe_dense_tp_one():
         max_ep_size=8,
         tp_size=4,
         elastic_ep_initial_size=4,
-        dp_size=2,
+        attn_dp_size=2,
         moe_dense_tp_size=None,
     )
     resolved = SimpleNamespace(attn_cp_size=1)

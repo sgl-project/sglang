@@ -12,7 +12,6 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.runtime_context import (
-    get_context,
     get_exec,
     get_parallel,
 )
@@ -79,7 +78,7 @@ def validate_scale_cohort_topology(cohort: ScaleCohort) -> None:
 
 
 def update_dp_attention_for_elastic_ep(
-    *, physical_ep_size: int, physical_ep_rank: int, override_scope: str
+    *, physical_ep_size: int, physical_ep_rank: int
 ) -> int:
     """Apply a physical EP topology to the logical DP-attention runtime."""
     from sglang.srt.elastic_ep.topology import (
@@ -95,7 +94,7 @@ def update_dp_attention_for_elastic_ep(
         new_dp_size=dp_size,
         new_dp_rank=physical_ep_rank_to_dp_rank(physical_ep_rank, replica_size),
     )
-    get_context().override(override_scope, dp_size=dp_size)
+    get_parallel().override_permanently(num_dp_ranks=dp_size)
     return dp_size
 
 
