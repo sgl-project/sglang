@@ -222,7 +222,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    IdlePrefillSyncGate,
+    SchedulerDPAttnAdapter,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -2331,6 +2334,7 @@ class Scheduler(
             if isinstance(self.tp_worker, BaseSpecWorker)
             else self.tp_worker
         )
+        self.idle_prefill_sync_gate = IdlePrefillSyncGate()
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=target_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,
@@ -2341,6 +2345,10 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_has_waiting_prefill=lambda: (
+                len(self.waiting_queue) > 0 or self.chunked_req is not None
+            ),
+            idle_prefill_sync_gate=self.idle_prefill_sync_gate,
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -3725,22 +3733,31 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        need_mlp_sync = self.require_mlp_sync
+        prefill_first_sync = (
+            need_mlp_sync
+            and not self.spec_algorithm.is_none()
+            and not get_spec().speculative_skip_dp_mlp_sync
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        )
+        # No rank had prefill work at the last sync: skip prefill planning and the
+        # prefill-first sync for this step (see IdlePrefillSyncGate).
+        skip_idle_prefill = (
+            prefill_first_sync
+            and self.dllm_config is None
+            and self.idle_prefill_sync_gate.should_skip()
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif self._should_defer_prefill() or skip_idle_prefill:
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
-        need_mlp_sync = self.require_mlp_sync
-        if (
-            need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
-            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-        ):
+        if prefill_first_sync and not skip_idle_prefill:
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).

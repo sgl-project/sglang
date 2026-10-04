@@ -213,5 +213,71 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             self.assertFalse(info.can_run_prefill_cuda_graph)
 
 
+class TestIdlePrefillSyncGate(CustomTestCase):
+    @staticmethod
+    def _info(has_waiting_prefill):
+        return dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=4,
+            num_tokens_for_logprob=4,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.DECODE.value,
+            has_waiting_prefill=has_waiting_prefill,
+        )
+
+    def test_syncs_until_an_idle_gather_is_observed(self):
+        gate = dp_attn.IdlePrefillSyncGate()
+        self.assertFalse(gate.should_skip())
+        gate.observe(False)
+        self.assertTrue(gate.should_skip())
+        gate.observe(True)
+        self.assertFalse(gate.should_skip())
+
+    def test_forces_a_sync_every_n_idle_steps(self):
+        gate = dp_attn.IdlePrefillSyncGate(force_sync_every=4)
+        gate.observe(False)
+        decisions = [gate.should_skip() for _ in range(8)]
+        self.assertEqual(decisions, [True, True, True, False] * 2)
+
+    def test_ranks_make_the_same_decision(self):
+        # Each rank has different local queues, but all observe the same reduced bit.
+        local_waiting = [
+            [False, False, False],
+            [False, True, False],
+            [False, False, False],
+            [True, False, False],
+        ] + [[False, False, False]] * 40
+        gates = [dp_attn.IdlePrefillSyncGate(force_sync_every=8) for _ in range(3)]
+        for bits in local_waiting:
+            decisions = {gate.should_skip() for gate in gates}
+            self.assertEqual(len(decisions), 1)
+            for gate in gates:
+                gate.observe(any(bits))
+
+    @patch.object(dp_attn, "get_parallel")
+    @patch.object(dp_attn, "all_gather_single")
+    def test_gather_reduces_waiting_bit(self, gather, parallel):
+        parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
+        for bits, expected in (((False, False), False), ((False, True), True)):
+            infos = [self._info(b) for b in bits]
+            values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
+            gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+            infos[0].all_gather(device="cpu", group=None)
+            self.assertEqual(infos[0].any_waiting_prefill, expected)
+
+    def test_fallback_row_reports_no_waiting_prefill(self):
+        info = self._info(True)
+        local = info._get_local_tensor(device="cpu")
+        fallback = info._get_fallback_tensor(device="cpu")
+        self.assertEqual(local.shape, fallback.shape)
+        self.assertEqual(int(fallback[-1]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

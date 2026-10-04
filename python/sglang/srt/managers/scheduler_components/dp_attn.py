@@ -46,6 +46,39 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+class IdlePrefillSyncGate:
+    """Skip the spec + DP prefill-first MLP sync while no rank has prefill work.
+
+    With speculative decoding and DP attention, the scheduler gathers once before
+    every step to keep prefill and decode from mixing across ranks. When no rank has
+    prefill work queued, that gather is a pure barrier. Every MLP sync gathers each
+    rank's has_waiting_prefill bit; `observe` records the reduced value, and
+    `should_skip` reads it on the next step. All ranks see the same gathered bits in
+    the same order, so they make the same decision and enter the same collectives.
+
+    The sync still runs every `force_sync_every` idle steps, so prefill work the bit
+    does not report is delayed by at most that many steps, never stranded.
+    """
+
+    def __init__(self, force_sync_every: int = 32):
+        self.force_sync_every = force_sync_every
+        self.any_waiting_prefill = True
+        self.idle_steps = 0
+
+    def observe(self, any_waiting_prefill: bool) -> None:
+        self.any_waiting_prefill = any_waiting_prefill
+
+    def should_skip(self) -> bool:
+        if self.any_waiting_prefill:
+            self.idle_steps = 0
+            return False
+        self.idle_steps += 1
+        if self.idle_steps >= self.force_sync_every:
+            self.idle_steps = 0
+            return False
+        return True
+
+
 def _spec_input_cuda_graph_compatible(
     local_batch: Optional[ScheduleBatch],
 ) -> bool:
@@ -118,6 +151,8 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    # This rank has prefill work queued (waiting requests or an unfinished chunk).
+    has_waiting_prefill: bool = True
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -126,6 +161,7 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    any_waiting_prefill: bool = True
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -139,6 +175,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
+                int(self.has_waiting_prefill),
             ],
             device=device,
             dtype=dtype,
@@ -156,6 +193,7 @@ class MLPSyncBatchInfo:
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
+                0,  # has_waiting_prefill
             ],
             device=device,
             dtype=dtype,
@@ -166,6 +204,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.any_waiting_prefill = self.has_waiting_prefill
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -239,6 +278,7 @@ class MLPSyncBatchInfo:
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
+        self.any_waiting_prefill = bool(tp0_info_cpu[:, 9].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -423,6 +463,8 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
+    has_waiting_prefill: bool = True,
+    idle_prefill_sync_gate: Optional[IdlePrefillSyncGate] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -523,6 +565,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        has_waiting_prefill=has_waiting_prefill,
     )
 
     if num_dp_ranks == 1:
@@ -535,6 +578,8 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if metadata_ready and idle_prefill_sync_gate is not None:
+        idle_prefill_sync_gate.observe(mlp_sync_info.any_waiting_prefill)
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -591,6 +636,8 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_has_waiting_prefill: Callable[[], bool] = lambda: True
+    idle_prefill_sync_gate: Optional[IdlePrefillSyncGate] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         draft_require_mlp_tp_gather = None
@@ -612,6 +659,8 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            has_waiting_prefill=self.get_has_waiting_prefill(),
+            idle_prefill_sync_gate=self.idle_prefill_sync_gate,
         )
 
     def maybe_prepare_mlp_sync_batch(
