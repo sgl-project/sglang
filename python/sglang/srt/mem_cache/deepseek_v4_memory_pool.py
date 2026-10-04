@@ -545,6 +545,13 @@ class DeepSeekV4IndexerPool(KVCache):
             self.index_head_dim, self.use_fp4_indexer
         )
 
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
         num_pages = (self.size + self.page_size + 1) // self.page_size
@@ -624,6 +631,29 @@ class DeepSeekV4IndexerPool(KVCache):
         max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
+        if self.use_fp4_indexer:
+            # FP4 layout: per-token = 64 packed bytes + 4 ue8m0 bytes. The
+            # accessor is byte-stride agnostic; pass the FP4 K-byte width as
+            # `index_head_dim`. NOTE: this path requires the
+            # (seq_len_sum, max_seq_len) calling convention — the legacy
+            # single-sequence form is unused on the FP4 path.
+            assert seq_len_sum is not None and max_seq_len is not None, (
+                "FP4 indexer cache requires the (seq_len_sum, max_seq_len) gather form"
+            )
+            from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
+                _get_k_and_s_triton,
+            )
+
+            return _get_k_and_s_triton(
+                buf=buf,
+                page_indices=page_indices,
+                seq_lens=seq_len_tensor,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+                page_size=self.page_size,
+                index_head_dim=self.packed_bytes_per_token,
+            )
+
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,

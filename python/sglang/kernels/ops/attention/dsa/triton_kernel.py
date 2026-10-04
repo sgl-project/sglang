@@ -1,8 +1,23 @@
+from __future__ import annotations
+
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+
+@lru_cache(maxsize=1)
+def _supports_fp8() -> bool:
+    """Check if current GPU supports FP8 compute (requires SM89+ for CUDA, or HIP)."""
+    if not torch.cuda.is_available():
+        return False
+
+    from sglang.srt.utils import get_device_sm
+
+    cc = get_device_sm()
+    return cc >= 89
 
 
 # Triton implementation

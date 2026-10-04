@@ -101,6 +101,19 @@ def topk_transform_bf16_small(
     )
 
 
+@cache_once
+def _jit_topk_prefill_module(topk: int):
+    return load_jit(
+        make_name("topk_prefill"),
+        str(topk),
+        cuda_files=["deepseek_v4/topk_prefill.cuh"],
+        cuda_wrappers=[
+            ("top_k_per_row_prefill", "TopKPrefillKernel::transform"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -340,4 +353,25 @@ def topk_transform_sparse(
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+    )
+
+
+def top_k_per_row_prefill(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    module = _jit_topk_prefill_module(out_page_indices.shape[1])
+    module.top_k_per_row_prefill(
+        scores,
+        row_starts,
+        row_ends,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
     )

@@ -990,5 +990,234 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
 
 // The JIT module names and wrappers spell the layouts as bare enumerators.
 using enum deepseek_v4::KVLayout;
+// ============================================================================
+// Indexer Q kernel (int8): warp-per-(token, head) RoPE + Hadamard + int8 per-head quant.
+// ============================================================================
+
+struct FusedQIndexerRopeHadamardInt8Params {
+  const void* __restrict__ q_input;     // (B, num_heads, 128) DType
+  void* __restrict__ q_int8;            // (B, num_heads, 128) int8
+  const void* __restrict__ weight;      // (B, num_heads) DType
+  float* __restrict__ weights_out;      // (B, num_heads) fp32
+  float weight_scale;                   // scalar c4_indexer.weight_scale
+  const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
+  const void* __restrict__ positions;   // (B,) PosT
+  uint32_t batch_size;
+  uint32_t num_heads;
+};
+
+// Symmetric per-head int8 quantization: scale = max(|x|) / 127.0f
+// Dequantize: x = int8_val * scale
+template <typename DType, typename PosT, bool kUsePDL>
+Q_KERNEL void fused_q_indexer_rope_hadamard_int8(const __grid_constant__ FusedQIndexerRopeHadamardInt8Params params) {
+  using namespace device;
+
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = 4;
+  constexpr uint32_t kRopeSize = kRopeDim / kVecSize;  // = 16
+  constexpr float kInt8Max = 127.0f;
+
+  static_assert(kHeadDim == kWarpThreads * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * 2);
+  static_assert(kRopeSize <= kWarpThreads);
+
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float4 = AlignedVector<float, kVecSize>;
+  using OutStorage = AlignedVector<int8_t, kVecSize>;
+
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
+
+  // Last kRopeSize lanes own the rope tail.
+  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+
+  const uint32_t total_works = params.batch_size * params.num_heads;
+  if (work_id >= total_works) return;
+
+  const uint32_t batch_id = work_id / params.num_heads;
+  const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  // ---- Part 1: Load (no norm) ----
+  PDLWaitPrimary<kUsePDL>();
+  Float4 data, freq;
+  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+
+  {
+    Storage input_vec;
+    input_vec.load(input_ptr, lane_id);
+    if (is_rope_lane) {
+      freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+    }
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      data[i] = cast<float>(input_vec[i]);
+    }
+  }
+
+  // ---- Part 2: RoPE (rope lanes only) ----
+  if (is_rope_lane) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto y_real = data[2];
+    const auto y_imag = data[3];
+    const auto fxr = freq[0];
+    const auto fxi = freq[1];
+    const auto fyr = freq[2];
+    const auto fyi = freq[3];
+    data[0] = x_real * fxr - x_imag * fxi;
+    data[1] = x_real * fxi + x_imag * fxr;
+    data[2] = y_real * fyr - y_imag * fyi;
+    data[3] = y_real * fyi + y_imag * fyr;
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  // ---- Part 3: 128-point Hadamard ----
+  {
+    // 2 local butterfly stages
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+      data[2] = a2 + a3;
+      data[3] = a2 - a3;
+    }
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a2;
+      data[1] = a1 + a3;
+      data[2] = a0 - a2;
+      data[3] = a1 - a3;
+    }
+    // 5 cross-lane shfl_xor butterfly stages
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+      }
+    }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
+  }
+
+  // ---- Part 4: int8 per-head symmetric quantization ----
+  {
+    // Step 4a: compute per-head abs_max
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = warp::reduce_max(local_max);
+
+    // Step 4b: scale = abs_max / 127, clip to avoid division by zero
+    const auto scale = fmaxf(1e-4f, abs_max) / kInt8Max;
+    const auto inv_scale = 1.0f / scale;
+
+    // Step 4c: quantize to int8 with round-to-nearest and clamp
+    OutStorage result;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      float qval = data[i] * inv_scale;
+      qval = rintf(qval);
+      qval = fmaxf(qval, -kInt8Max);
+      qval = fminf(qval, kInt8Max);
+      result[i] = static_cast<int8_t>(qval);
+    }
+
+    // Step 4d: write int8 output -- each lane writes 4 int8 values
+    auto out_row = static_cast<int8_t*>(params.q_int8) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+
+    // Step 4e: lane 0 writes weights_out; scale is internal only (same as fp8 version).
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
+  }
+}
+
+// Host wrapper for the int8 indexer Q kernel.
+template <typename DType, bool kUsePDL>
+struct FusedQIndexerRopeHadamardInt8Kernel {
+  template <typename PosT>
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_int8<DType, PosT, kUsePDL>;
+
+  static void forward(
+      const tvm::ffi::TensorView q_input,
+      const tvm::ffi::TensorView q_int8,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView weights_out,
+      double weight_scale,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions) {
+    using namespace host;
+    constexpr int64_t kHeadDim = 128;
+    constexpr int64_t kRopeDim = 64;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_heads"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, H, kHeadDim})
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_input);
+    TensorMatcher({B, H, kHeadDim})
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<int8_t>()
+        .with_device(device_)
+        .verify(q_int8);
+    TensorMatcher({B, H}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({B, H, 1}).with_dtype<float>().with_device(device_).verify(weights_out);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto num_heads = static_cast<uint32_t>(H.unwrap());
+    if (batch_size == 0) return;
+
+    // Kernel uses flat row pointers: base + work_id * kHeadDim.
+    // Both inputs must be contiguous in (batch, head, elem) order.
+    const int64_t expected_batch_stride = static_cast<int64_t>(num_heads) * kHeadDim;
+    RuntimeCheck(
+        q_input.stride(0) == expected_batch_stride,
+        "q_input must be contiguous (B, H, kHeadDim); got stride[0]=",
+        q_input.stride(0));
+    RuntimeCheck(
+        q_int8.stride(0) == expected_batch_stride,
+        "q_int8 must be contiguous (B, H, kHeadDim); got stride[0]=",
+        q_int8.stride(0));
+
+    const auto params = FusedQIndexerRopeHadamardInt8Params{
+        .q_input = q_input.data_ptr(),
+        .q_int8 = q_int8.data_ptr(),
+        .weight = weight.data_ptr(),
+        .weights_out = static_cast<float*>(weights_out.data_ptr()),
+        .weight_scale = static_cast<float>(weight_scale),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .batch_size = batch_size,
+        .num_heads = num_heads,
+    };
+
+    const auto total_works = batch_size * num_heads;
+    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
+    const auto k_int32 = kernel<int32_t>;
+    const auto k_int64 = kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
+  }
+};
 
 }  // namespace sglang

@@ -15,11 +15,15 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_int8_quant,
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
+    top_k_per_row_prefill,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -57,7 +61,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_ppu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -68,6 +72,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sglang.kernels.ops.attention.dsa.triton_kernel import (
+    _supports_fp8,
+)
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -76,6 +83,144 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+# Determine which quant dtype to use based on hardware capability
+_USE_INT8 = not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get()
+
+
+def split_indexer_prefill_chunks(
+    seq_lens_cpu: List[int],
+    query_lens_cpu: List[int],
+    workspace_size: int,
+    max_logits_bytes: int,
+) -> List[Tuple[slice, slice]]:
+    chunks: List[Tuple[slice, slice]] = []
+    n = len(seq_lens_cpu)
+    max_logits_elems = max(1, max_logits_bytes // 4)
+    end = 0
+
+    while end < n:
+        start, chunk_m, chunk_n = end, 0, 0
+
+        while end < n:
+            q, s = query_lens_cpu[end], seq_lens_cpu[end]
+            new_m, new_n = chunk_m + q, chunk_n + s
+            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+                chunk_m, chunk_n = new_m, new_n
+                end += 1
+            else:
+                break
+
+        if end == start:
+            chunk_m, chunk_n = query_lens_cpu[end], seq_lens_cpu[end]
+            end += 1
+
+        req_slice = slice(start, end)
+        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
+        for q_off in range(0, chunk_m, max_q):
+            chunks.append((req_slice, slice(q_off, min(q_off + max_q, chunk_m))))
+
+    return chunks
+
+
+@triton.jit
+def _build_prefill_c4_logits_metadata_kernel(
+    seq_lens_ptr,
+    extend_lens_ptr,
+    per_row_c4_seq_lens_ptr,
+    page_table_ptr,
+    c4_seq_lens_ptr,
+    page_indices_ptr,
+    row_starts_ptr,
+    row_ends_ptr,
+    page_table_stride: tl.constexpr,
+    page_index_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_REQS: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    seq_len = tl.load(seq_lens_ptr + req_id)
+    c4_seq_len = seq_len // 4
+    tl.store(c4_seq_lens_ptr + req_id, c4_seq_len, mask=block_id == 0)
+
+    req_offsets = tl.arange(0, BLOCK_REQS)
+    before_req = req_offsets < req_id
+    kv_offset = tl.sum(
+        tl.load(seq_lens_ptr + req_offsets, mask=before_req, other=0) // 4
+    )
+    query_offset = tl.sum(
+        tl.load(extend_lens_ptr + req_offsets, mask=before_req, other=0)
+    )
+
+    extend_len = tl.load(extend_lens_ptr + req_id)
+    mask_q = offs < extend_len
+    out_q = query_offset + offs
+    per_row_c4_seq_len = tl.load(per_row_c4_seq_lens_ptr + out_q, mask=mask_q, other=0)
+    tl.store(row_starts_ptr + out_q, kv_offset, mask=mask_q)
+    tl.store(row_ends_ptr + out_q, kv_offset + per_row_c4_seq_len, mask=mask_q)
+
+    num_pages = tl.cdiv(c4_seq_len, 64)
+    page_mask = offs < num_pages
+    pages = tl.load(
+        page_table_ptr + query_offset * page_table_stride + offs,
+        mask=page_mask,
+    )
+    tl.store(
+        page_indices_ptr + req_id * page_index_stride + offs, pages, mask=page_mask
+    )
+
+
+def _build_prefill_c4_logits_metadata(
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    per_row_c4_seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_c4_seq_len: int,
+    num_q_tokens: int,
+    total_kv_len: int,
+    max_extend_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    num_reqs = seq_lens.shape[0]
+    c4_seq_lens = torch.empty((num_reqs,), dtype=torch.int32, device=seq_lens.device)
+    row_starts = torch.empty((num_q_tokens,), dtype=torch.int32, device=seq_lens.device)
+    row_ends = torch.empty((num_q_tokens,), dtype=torch.int32, device=seq_lens.device)
+
+    num_pages = triton.cdiv(max_c4_seq_len, 64)
+    page_indices = torch.empty(
+        (num_reqs, num_pages),
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+
+    block_size = 1024
+    max_blocks = max(
+        triton.cdiv(max_extend_len, block_size),
+        triton.cdiv(num_pages, block_size),
+    )
+    _build_prefill_c4_logits_metadata_kernel[(num_reqs, max_blocks)](
+        seq_lens,
+        extend_lens,
+        per_row_c4_seq_lens,
+        page_table,
+        c4_seq_lens,
+        page_indices,
+        row_starts,
+        row_ends,
+        page_table.stride(0),
+        page_indices.stride(0),
+        BLOCK_SIZE=block_size,
+        BLOCK_REQS=triton.next_power_of_2(num_reqs),
+    )
+
+    return (
+        c4_seq_lens,
+        page_indices,
+        row_starts,
+        row_ends,
+        total_kv_len,
+    )
 
 
 def fp8_paged_mqa_logits_torch(
@@ -614,6 +759,9 @@ class C4IndexerBackendMixin:
         c4_seq_lens: torch.Tensor,
         query_rows: int,
     ) -> Optional[NonPagedIndexerPlan]:
+        # Bypass upstream non-paged indexer for PPU, use PPU-specific path
+        if is_ppu():
+            return None
         if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
             return None
         if not self._can_use_nonpaged_indexer(
@@ -739,6 +887,212 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def _use_prefill_logits(self, forward_batch: ForwardBatch) -> bool:
+        forward_mode = forward_batch.forward_mode
+        return (
+            not is_hip()
+            and forward_mode.is_extend()
+            and not forward_mode.is_mixed()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend_v2()
+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not _USE_INT8
+        )
+
+    def _get_prefill_c4_logits(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        indexer_metadata: PagedIndexerMetadata,
+        request_slice: Optional[slice] = None,
+        query_slice: Optional[slice] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        import deep_gemm
+
+        assert forward_batch.seq_lens_cpu is not None
+        assert forward_batch.extend_seq_lens_cpu is not None
+        assert forward_batch.extend_seq_lens is not None
+
+        use_fp4 = c4_indexer.use_fp4_indexer
+        if use_fp4:
+            q_packed, q_sf = q_fp8
+            num_q_tokens = q_packed.shape[0]
+            device = q_packed.device
+        else:
+            num_q_tokens = q_fp8.shape[0]
+            device = q_fp8.device
+
+        c4_page_size = indexer_metadata.compressed_page_size
+        assert c4_page_size == 64
+
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if isinstance(extend_lens_cpu, torch.Tensor):
+            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+        if request_slice is None:
+            request_slice = slice(0, len(extend_lens_cpu))
+        req_start = 0 if request_slice.start is None else request_slice.start
+        req_stop = (
+            len(extend_lens_cpu) if request_slice.stop is None else request_slice.stop
+        )
+        global_query_start = sum(extend_lens_cpu[:req_start])
+        local_extend_lens_cpu = extend_lens_cpu[req_start:req_stop]
+        local_seq_lens_cpu = seq_lens_cpu[req_start:req_stop]
+        local_num_q_tokens = sum(local_extend_lens_cpu)
+        if query_slice is None:
+            query_slice = slice(0, local_num_q_tokens)
+        query_start = 0 if query_slice.start is None else query_slice.start
+        query_stop = (
+            local_num_q_tokens if query_slice.stop is None else query_slice.stop
+        )
+        global_token_start = global_query_start + query_start
+        global_token_end = global_query_start + query_stop
+
+        final_c4_lens_cpu = [int(seq_len) // 4 for seq_len in local_seq_lens_cpu]
+        total_kv_len = sum(final_c4_lens_cpu)
+        max_c4_seq_len = max(final_c4_lens_cpu) if final_c4_lens_cpu else 0
+        max_extend_len = max(local_extend_lens_cpu) if local_extend_lens_cpu else 0
+        assert sum(extend_lens_cpu) <= num_q_tokens
+
+        if total_kv_len == 0:
+            logits = torch.empty(
+                (
+                    global_token_end - global_token_start,
+                    indexer_metadata.max_compressed_seq_len,
+                ),
+                device=device,
+                dtype=torch.float32,
+            )
+            row_starts = torch.zeros(logits.shape[0], dtype=torch.int32, device=device)
+            row_ends = torch.zeros(logits.shape[0], dtype=torch.int32, device=device)
+            return logits, row_starts, row_ends
+
+        c4_seq_lens, page_indices, ks, ke, total_kv_len = (
+            _build_prefill_c4_logits_metadata(
+                forward_batch.seq_lens[req_start:req_stop],
+                forward_batch.extend_seq_lens[req_start:req_stop],
+                indexer_metadata.compressed_seq_lens[
+                    global_query_start : global_query_start + local_num_q_tokens
+                ],
+                indexer_metadata.page_table[
+                    global_query_start : global_query_start + local_num_q_tokens
+                ],
+                max_c4_seq_len,
+                local_num_q_tokens,
+                total_kv_len,
+                max_extend_len,
+            )
+        )
+        k_buf, k_scale_buf = token_to_kv_pool.get_index_k_scale_buffer(
+            c4_indexer.layer_id,
+            c4_seq_lens,
+            page_indices,
+            total_kv_len,
+            max_c4_seq_len,
+        )
+
+        weights = weights[global_token_start:global_token_end]
+        ks = ks[query_start:query_stop]
+        ke = ke[query_start:query_stop]
+
+        if use_fp4:
+            # FP4 path: K values are 64 packed bytes/token (uint8); SF is 4
+            # ue8m0 bytes/token reinterpreted as int32 to match DeepGEMM's
+            # `fp8_fp4_mqa_logits` contract.
+            kv_packed = k_buf.contiguous().view(torch.int8)
+            kv_sf = k_scale_buf.contiguous().view(torch.int32).squeeze(-1)
+            q_packed_chunk = q_packed[global_token_start:global_token_end]
+            q_sf_chunk = q_sf[global_token_start:global_token_end]
+            q_packed_int8 = q_packed_chunk.contiguous().view(torch.int8)
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                (q_packed_int8, q_sf_chunk),
+                (kv_packed, kv_sf),
+                weights,
+                ks,
+                ke,
+                clean_logits=False,
+            )
+        else:
+            q_fp8 = q_fp8[global_token_start:global_token_end]
+            kv_fp8 = k_buf.view(FP8_DTYPE)
+            kv_scale = k_scale_buf.view(torch.float32).squeeze(-1)
+            kv = (kv_fp8, kv_scale)
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8,
+                kv,
+                weights,
+                ks,
+                ke,
+                clean_logits=False,
+            )
+        return logits, ks, ke
+
+    def _forward_prefill_c4_topk_chunked(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        indexer_metadata: PagedIndexerMetadata,
+        core_metadata: Any,
+        raw_indices: Optional[torch.Tensor],
+    ) -> None:
+        assert forward_batch.seq_lens_cpu is not None
+        assert forward_batch.extend_seq_lens_cpu is not None
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+        if isinstance(extend_lens_cpu, torch.Tensor):
+            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
+
+        c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in seq_lens_cpu]
+        workspace_size = indexer_metadata.max_seq_len * 40
+        max_logits_bytes = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get() * 1024 * 1024
+        chunk_specs = split_indexer_prefill_chunks(
+            c4_seq_lens_cpu,
+            extend_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+        )
+
+        for req_slice, query_slice in chunk_specs:
+            req_start = 0 if req_slice.start is None else req_slice.start
+            global_query_start = sum(extend_lens_cpu[:req_start])
+            query_start = 0 if query_slice.start is None else query_slice.start
+            query_stop = query_slice.stop
+            assert query_stop is not None
+            token_start = global_query_start + query_start
+            token_end = global_query_start + query_stop
+
+            logits, row_starts, row_ends = self._get_prefill_c4_logits(
+                q_fp8,
+                weights,
+                c4_indexer,
+                forward_batch,
+                token_to_kv_pool,
+                indexer_metadata,
+                request_slice=req_slice,
+                query_slice=query_slice,
+            )
+            top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                core_metadata.page_table[token_start:token_end],
+                core_metadata.c4_sparse_page_indices[token_start:token_end],
+                indexer_metadata.c4_page_size,
+                None if raw_indices is None else raw_indices[token_start:token_end],
+            )
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -801,48 +1155,61 @@ class C4IndexerBackendMixin:
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
+        use_prefill_logits = self._use_prefill_logits(forward_batch)
         if use_aiter_fp4:
             q = q_indexer
         elif use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
             assert len(q_sf.shape) == 2
-            q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+            if not use_prefill_logits:
+                q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+            else:
+                q = (q_fp4, q_sf)
         else:
             assert len(q_indexer.shape) == 3
-            q = q_indexer.unsqueeze(1)
+            if not use_prefill_logits:
+                q = q_indexer.unsqueeze(1)
+            else:
+                q = q_indexer
 
         if use_aiter_fp4:
             weights = weights.contiguous()
         else:
             assert len(weights.shape) == 3
             weights = weights.squeeze(2)
-        if use_fp4_indexer and not use_aiter_fp4:
-            weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
-        elif use_aiter_fp4:
-            fn = None
-        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
-            fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if get_platform().is_sm120:
-                fn = fp8_paged_mqa_logits_torch_sm120
+
+        # upstream use paged interface for both prefill and decode
+        # ppu use non-paged interface for prefill and paged interface for decode
+        if not use_prefill_logits:
+            if _USE_INT8:
+                from deep_gemm import int8_paged_mqa_logits as fn
+            elif use_fp4_indexer and not use_aiter_fp4:
+                weights = weights.float()
+                if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                    raise RuntimeError(
+                        "DeepSeek V4 FP4 indexer requires DeepGEMM indexer."
+                    )
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            elif use_aiter_fp4:
+                fn = None
+            elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits as fn,
+                )
+            elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+                fn = _aiter_fp8_paged_mqa_logits
+            elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                if get_platform().is_sm120:
+                    fn = fp8_paged_mqa_logits_torch_sm120
+                else:
+                    fn = fp8_paged_mqa_logits_torch
+            elif is_xpu():
+                from sgl_kernel import fp8_paged_mqa_logits_triton
+
+                fn = fp8_paged_mqa_logits_triton
             else:
-                fn = fp8_paged_mqa_logits_torch
-        elif is_xpu():
-            from sgl_kernel import fp8_paged_mqa_logits_triton
-
-            # TODO: switch from triton to SYCL when OOM is resolved
-
-            fn = fp8_paged_mqa_logits_triton
-        else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+                from deep_gemm import fp8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
@@ -887,6 +1254,8 @@ class C4IndexerBackendMixin:
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
             )
+
+        assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
 
@@ -962,7 +1331,20 @@ class C4IndexerBackendMixin:
                     row_raw_indices,
                 )
 
-        if nonpaged_plan is not None:
+        if use_prefill_logits:
+            # Memory-bounded chunked prefill: score and reduce each chunk
+            # before the next one materializes its logits.
+            self._forward_prefill_c4_topk_chunked(
+                q,
+                weights,
+                c4_indexer,
+                forward_batch,
+                token_to_kv_pool,
+                indexer_metadata,
+                core_metadata,
+                raw_indices,
+            )
+        elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             # K is gathered once; each row chunk's logits are reduced to top-k
             # and dropped before the next chunk allocates, so only one chunk
@@ -1193,6 +1575,10 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        elif _USE_INT8:
+            return fused_q_indexer_rope_hadamard_int8_quant(
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         return fused_q_indexer_rope_hadamard_quant(
             q, weight, self.weight_scale, self.freqs_cis, positions

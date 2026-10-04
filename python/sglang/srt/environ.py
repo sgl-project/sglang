@@ -1952,6 +1952,8 @@ class Envs:
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_SAIL_FLA_CUDA = EnvBool(False)
+    SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
+    SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
 
 
 envs = Envs()
