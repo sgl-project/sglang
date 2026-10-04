@@ -119,6 +119,21 @@ class SamplingMaskOutput:
             self.num_accept_tokens = fn(self.num_accept_tokens)
 
 
+def bf16_lm_head_matmul(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """hidden @ weight.T for an unquantized LM head; decode-sized BF16 batches can use
+    a weight-streaming kernel (SGLANG_ENABLE_BF16_SKINNY_LM_HEAD)."""
+    hidden = hidden.to(weight.dtype)
+    if envs.SGLANG_ENABLE_BF16_SKINNY_LM_HEAD.get():
+        from sglang.kernels.ops.gemm.bf16_skinny_gemm import (
+            bf16_skinny_gemm,
+            bf16_skinny_supported,
+        )
+
+        if bf16_skinny_supported(hidden, weight):
+            return bf16_skinny_gemm(hidden, weight)
+    return torch.matmul(hidden, weight.T)
+
+
 def _trace_e2e_logits(stage: str, **fields) -> None:
     if not envs.SGLANG_TRACE_LOGITS_E2E.get():
         return
@@ -1014,9 +1029,7 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                logits = bf16_lm_head_matmul(hidden_states, lm_head.weight)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
