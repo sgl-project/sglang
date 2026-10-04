@@ -2336,6 +2336,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(node_access_error)
     }
 
+    fn inspect_get_component_host_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<u32> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_host_lock_ref(node_id, component_type)
+        })
+        .map_err(node_access_error)
+    }
+
     fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
         py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
             .map_err(node_access_error)
@@ -3563,6 +3577,19 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .inspect_get_component_device_lock_ref(py, node_id, component_type)
+                })
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_get_component_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_host_lock_ref(py, node_id, component_type)
                 })
             }
 
