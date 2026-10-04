@@ -499,15 +499,17 @@ PY
 
 # Drop IB devices that are absent or down on the node the server lands on.
 #
-# A recipe names its HCAs statically (ib_devices: rdma0,rdma1,...), but the name
-# is not stable: the ionic driver calls a device rdmaN only while its tw-ethN
-# link is up, and falls back to the PCI name (rocep9s0 etc.) when it is down. So
-# a dead port does not merely go DOWN -- rdmaN stops existing. pit2-p03-g02 has
-# lost tw-eth0..3 this way, which left every rdma0..3 recipe naming four devices
-# that are not there, and mori refused to start with
+# A recipe names its HCAs statically (ib_devices: rdma0,rdma1,...), and on pit2
+# that list has drifted out of date in two different ways. A port whose link
+# dropped while the node was running stays named rdmaN but reports DOWN; a port
+# already dead at boot never gets the rdmaN name at all and keeps its PCI name
+# (rocep9s0 etc.). pit2-p03-g02 has lost tw-eth0..3 the second way, so every
+# rdma0..3 recipe named four devices that do not exist there and mori refused to
+# start with
 #   RuntimeError: no active RDMA device on this host
-# Filtering here (in the container, which has /dev/infiniband and the host ionic
-# userspace) keeps a test on whatever is actually up instead of failing outright.
+# Checking port state covers both: an absent device reads as empty, a dead one
+# as DOWN. Done in the container, which has /dev/infiniband and the host ionic
+# userspace, so a test runs on whatever is up instead of failing outright.
 cat > "$WORKDIR/ib_filter.sh" <<'IBF_EOF'
 # Usage: IB_FILTERED=$(ib_filter "$IB")
 #
