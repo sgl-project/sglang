@@ -257,6 +257,8 @@ class BeamMoE(nn.Module):
         # deterministic inference. Never cache or downcast router weights.
         self.use_fp32_router = (
             _is_cuda
+            # Full-model validation covers the BF16 MoE runner.
+            and quant_config is None
             and config.hidden_size == 5120
             and config.num_experts == 256
             and torch.cuda.get_device_capability()[0] in (9, 10)
