@@ -103,6 +103,8 @@ ${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
 ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 ${PROJ_ROOT}/csrc/common_extension_rocm.cc
 ${PROJ_ROOT}/csrc/elementwise/activation.hip
+${PROJ_ROOT}/csrc/elementwise/deepseek_v4_topk.hip
+${PROJ_ROOT}/csrc/elementwise/dsv4_norm_rope.hip
 ${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
 ${PROJ_ROOT}/csrc/elementwise/topk.hip
 ${PROJ_ROOT}/csrc/grammar/apply_token_bitmask_inplace_hip.hip
