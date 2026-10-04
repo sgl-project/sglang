@@ -89,9 +89,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     for member, buf, ids, tag in _views(
                         bundle, allocator, slots, states
                     ):
-                        buf[member.translate_kv_loc_for_kernel(ids)] = _payload(
-                            ids, buf, tag
-                        )
+                        buf[member.translate_kv_loc(ids)] = _payload(ids, buf, tag)
                     member = (
                         allocator.full_attn_allocator
                         if owner == "full"
@@ -120,7 +118,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         ):
                             self.assertTrue(
                                 torch.equal(
-                                    buf[current.translate_kv_loc_for_kernel(ids)],
+                                    buf[current.translate_kv_loc(ids)],
                                     _payload(ids, buf, tag),
                                 ),
                                 (current.sub_pool_name, tag),
@@ -201,7 +199,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                             all_sources,
                         )
                         for current, buf, ids, tag in fresh_views:
-                            buf[current.translate_kv_loc_for_kernel(ids)] = _payload(
+                            buf[current.translate_kv_loc(ids)] = _payload(
                                 ids, buf, tag, generation=1
                             )
                         assert_payload()
