@@ -497,6 +497,65 @@ with open(sys.argv[2], "w") as f:
     f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
 PY
 
+# Drop IB devices that are absent or down on the node the server lands on.
+#
+# A recipe names its HCAs statically (ib_devices: rdma0,rdma1,...), but the name
+# is not stable: the ionic driver calls a device rdmaN only while its tw-ethN
+# link is up, and falls back to the PCI name (rocep9s0 etc.) when it is down. So
+# a dead port does not merely go DOWN -- rdmaN stops existing. pit2-p03-g02 has
+# lost tw-eth0..3 this way, which left every rdma0..3 recipe naming four devices
+# that are not there, and mori refused to start with
+#   RuntimeError: no active RDMA device on this host
+# Filtering here (in the container, which has /dev/infiniband and the host ionic
+# userspace) keeps a test on whatever is actually up instead of failing outright.
+cat > "$WORKDIR/ib_filter.sh" <<'IBF_EOF'
+# Usage: IB_FILTERED=$(ib_filter "$IB")
+#
+# Treats the recipe's list as a preference, not a requirement: keeps the entries
+# that are present and ACTIVE, then tops the set back up to the requested COUNT
+# from whatever else on the node is ACTIVE. Holding the count fixed matters --
+# KV-transfer throughput scales with the number of HCAs, so silently running a
+# 4-NIC recipe on 2 would quietly rebase every number it reports.
+#
+# Echoes the input unchanged when sysfs is unreadable, so a cluster without this
+# failure mode behaves exactly as before.
+ib_filter() {
+    local want="$1" keep="" extra="" n_want=0 n_keep=0 d state
+    [ -d /sys/class/infiniband ] || { printf '%s' "$want"; return 0; }
+
+    for d in ${want//,/ }; do
+        n_want=$((n_want + 1))
+        state=$(cat "/sys/class/infiniband/$d/ports/1/state" 2>/dev/null)
+        case "$state" in
+            *ACTIVE*) keep="${keep:+$keep,}$d"; n_keep=$((n_keep + 1)) ;;
+            *) echo "[ib-filter] $d unusable (${state:-absent})" >&2 ;;
+        esac
+    done
+    [ "$n_keep" -eq "$n_want" ] && { printf '%s' "$keep"; return 0; }
+
+    for d in /sys/class/infiniband/*; do
+        [ "$n_keep" -lt "$n_want" ] || break
+        d=$(basename "$d")
+        case ",$want," in *",$d,"*) continue ;; esac
+        case "$(cat "/sys/class/infiniband/$d/ports/1/state" 2>/dev/null)" in
+            *ACTIVE*) keep="${keep:+$keep,}$d"; extra="${extra:+$extra,}$d"
+                      n_keep=$((n_keep + 1)) ;;
+        esac
+    done
+
+    if [ -z "$keep" ]; then
+        echo "[ib-filter] ERROR: no ACTIVE RDMA device on $(hostname)" >&2
+        printf '%s' "$want"
+        return 1
+    fi
+    [ -n "$extra" ] && echo "[ib-filter] substituted $extra" >&2
+    [ "$n_keep" -lt "$n_want" ] && \
+        echo "[ib-filter] WARN: $(hostname) has $n_keep of $n_want HCAs; throughput will be low" >&2
+    echo "[ib-filter] using $keep" >&2
+    printf '%s' "$keep"
+}
+IBF_EOF
+
 # Resolve host ionic userspace mounts on each compute node. This keeps server,
 # benchmark, and wide-EP containers compatible with the host RDMA ABI.
 cat > "$WORKDIR/ionic_mounts.sh" <<'IONIC_EOF'
@@ -592,12 +651,12 @@ if [[ "$HAS_MODEL" == "1" ]]; then
 $ATTN_FLAGS --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $PCHUNK \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device \$IB_FILTERED$KV_FLAG$PREFILL_TAIL"
     DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
 $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device \$IB_FILTERED$KV_FLAG$DECODE_TAIL"
 else
     # DSV4 path: for EP<=8 recipes (PTP==DTP, no wide_ep) both role strings equal
     # the pre-Kimi launcher's COMMON_FLAGS exactly.
@@ -606,13 +665,13 @@ else
 --mem-fraction-static $PMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $PCHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device \$IB_FILTERED$KV_FLAG$PREFILL_TAIL"
     DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
 --attention-backend $ATTN --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device \$IB_FILTERED$KV_FLAG$DECODE_TAIL"
 fi
 
 # /it-share is the mi355x cluster's model NFS. Mount it only where it exists --
@@ -974,6 +1033,12 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
+# The recipe's ib_devices list is static; the node's may be short of it (see
+# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
+# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+source "\$CIDIR/ib_filter.sh"
+IB_FILTERED=\$(ib_filter "$IB") || exit 1
+if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -998,6 +1063,12 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
+# The recipe's ib_devices list is static; the node's may be short of it (see
+# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
+# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+source "\$CIDIR/ib_filter.sh"
+IB_FILTERED=\$(ib_filter "$IB") || exit 1
+if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -1053,6 +1124,12 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
+# The recipe's ib_devices list is static; the node's may be short of it (see
+# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
+# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+source "\$CIDIR/ib_filter.sh"
+IB_FILTERED=\$(ib_filter "$IB") || exit 1
+if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
@@ -1069,6 +1146,12 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
+# The recipe's ib_devices list is static; the node's may be short of it (see
+# ib_filter.sh). Resolve it here, inside the container, and keep NCCL on the
+# same set -- NCCL_IB_HCA naming a device that is gone hangs ncclCommInitRank.
+source "\$CIDIR/ib_filter.sh"
+IB_FILTERED=\$(ib_filter "$IB") || exit 1
+if [[ -n "\${NCCL_IB_HCA:-}" ]]; then export NCCL_IB_HCA="\$IB_FILTERED"; fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
