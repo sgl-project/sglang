@@ -72,6 +72,7 @@ def build_kv_read_indices_kernel(
     out_stride,  # runtime: uniform row stride, used when row_starts is null
     item_stride,  # runtime: items one program advances per loop trip
     seq_len_delta,  # runtime: verify widening added to every row's live prefix
+    max_row_items,  # runtime: uniform row width; a longer window stops there
     PAGE_SIZE: tl.constexpr,
     EMIT_PER_TOKEN: tl.constexpr,
     OUT_INT64: tl.constexpr,
@@ -94,6 +95,9 @@ def build_kv_read_indices_kernel(
         row_out = out_ptr + tl.load(row_starts_ptr + bid).to(tl.int64)
     else:
         row_out = out_ptr + bid.to(tl.int64) * out_stride
+        # A widened window can outrun a fixed-width row (a verify near the
+        # context limit); writing past it would land in the next row.
+        n_items = tl.minimum(n_items, max_row_items)
 
     for start in range(tl.program_id(1) * BLOCK, n_items, item_stride):
         item = start + tl.arange(0, BLOCK)
@@ -151,6 +155,7 @@ def _launch(
         out_stride,
         item_programs * _BLOCK_ITEMS,
         seq_len_delta,
+        max_items,
         PAGE_SIZE=page_size,
         EMIT_PER_TOKEN=emit_per_token,
         OUT_INT64=out.dtype == torch.int64,
@@ -191,8 +196,9 @@ def build_kv_read_table(
     region's live prefix is written -- never rebound, never tail-cleared.
 
     ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
-    verify contract (draft KV read back from the pool). ``max_pages`` must
-    already cover the delta; columns past it are never launched.
+    verify contract (draft KV read back from the pool). Every row stops at
+    ``max_pages``: a widened window that outruns the row is cut there rather
+    than spilling into the next row, on CUDA as on CPU.
     """
     bs = int(req_pool_indices.numel())
     assert out.dtype == torch.int32, (
