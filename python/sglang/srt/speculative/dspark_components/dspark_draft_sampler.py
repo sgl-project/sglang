@@ -21,15 +21,6 @@ logger = logging.getLogger(__name__)
 _CAPTURE_HEADROOM_GB = 1.0
 
 
-def _base_logits_dtype(model) -> torch.dtype:
-    """Dtype of the block logits; a quantized head's packed `weight` carries no
-    logits dtype, its kernel emits the activation (draft param) dtype instead."""
-    weight = model.lm_head.weight
-    if weight.is_floating_point():
-        return weight.dtype
-    return next(model.markov_head.parameters()).dtype
-
-
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
     return torch.argmax(step_logits, dim=-1)
@@ -85,9 +76,12 @@ class DsparkDraftSampler:
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
+            # Acceptance rebuilds the draft distribution from these logits, so
+            # keep the precision they were sampled at (FP32 when the Markov
+            # bias is FP32, e.g. DeepSeek-V4).
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=_base_logits_dtype(model),
+                dtype=torch.float32,
                 device=device,
             )
 
@@ -200,7 +194,7 @@ def _resolve_folded_sampling(
         return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+    logits_bytes = max_bs * gamma * vocab * 4
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
