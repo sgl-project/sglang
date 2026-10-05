@@ -121,11 +121,10 @@ def block_scaled_contract_available() -> bool:
     and the release method of the prepared class; never raises."""
     try:
         from flashinfer.gemm.cake_grouped_fp8_gemm import (
-            prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare,
-        )
-
-        from flashinfer.gemm.cake_grouped_fp8_gemm import (
             PreparedGroupGemmFp8NtGroupwiseContiguous as prepared_cls,
+        )
+        from flashinfer.gemm.cake_grouped_fp8_gemm import (
+            prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare,
         )
 
         params = inspect.signature(prepare).parameters

@@ -452,7 +452,7 @@ class _CakeContigOperands:
     act: Optional[torch.Tensor] = None
 
 
-def _cake_fused_activation(req: "_CakeContigRequest") -> bool:
+def _cake_fused_activation(req: _CakeContigRequest) -> bool:
     """Mirror of ``DeepGemmRunnerCore._run_contiguous_gemm``'s activation-stage
     choice for the layouts the route admits (never swizzled): the fused FP32
     ``silu_and_mul_contig_post_quant`` only with ``silu_mul_keep_fp32``,

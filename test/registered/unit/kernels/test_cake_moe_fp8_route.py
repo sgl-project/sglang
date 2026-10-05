@@ -266,7 +266,9 @@ def fake_silu_quant(monkeypatch, fake_fused_silu_quant):
             x_shape=tuple(x.shape), device=x.device, group_size=group_size, **kwargs
         )
         x_s.fill_(1)
-        calls.quant.append(dict(input=x, group_size=group_size, output=x_q, scale=x_s, **kwargs))
+        calls.quant.append(
+            dict(input=x, group_size=group_size, output=x_q, scale=x_s, **kwargs)
+        )
         return x_q, x_s
 
     monkeypatch.setattr(dg, "_legacy_silu_and_mul", legacy_silu)
