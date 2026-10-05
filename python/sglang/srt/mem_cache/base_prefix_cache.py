@@ -525,9 +525,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0

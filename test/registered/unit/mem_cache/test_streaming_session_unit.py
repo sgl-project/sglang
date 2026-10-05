@@ -95,7 +95,7 @@ class _FakeInnerCache:
                 req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
             )
 
-    def on_release(self, req, *, inserted):
+    def on_release(self, req, *, checkpointed):
         pass
 
     def match_prefix(self, params):
@@ -265,7 +265,7 @@ def test_first_mid_abort_releases_like_any_request(published_config):
     assert tree_cache.session.slots["session-a"].last_node is lock_node
     req.finished_reason = FINISH_ABORT("input too long")
 
-    release_kv_cache(req, tree_cache)
+    release_kv_cache(req, tree_cache, checkpoint=True)
 
     assert "session-a" not in tree_cache.session.slots
     assert inner.dec_lock_ref_calls == [lock_node]
@@ -300,7 +300,7 @@ def test_nth_mid_abort_drops_session_slot(published_config):
         swa_prefix_lock_released=True,
     )
 
-    release_kv_cache(req, tree_cache)
+    release_kv_cache(req, tree_cache, checkpoint=True)
 
     assert "session-a" not in tree_cache.session.slots
     assert inner.dec_lock_ref_calls == [lock_node]

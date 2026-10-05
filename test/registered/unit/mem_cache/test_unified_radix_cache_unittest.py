@@ -1930,7 +1930,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache, checkpoint=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -11441,18 +11441,15 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.session.release_session("s")
         cache.sanity_check()
 
-    def test_later_turn_borrows_without_publishing(self):
-        """A later turn runs on the slot's record: its allocation hands nothing
-        over, and its checkpoints neither insert nor move the slot's lock."""
-        cache, allocator, pool = build_fixture(self.cfg)
+    def _later_turn(self, cache, allocator, pool):
+        """A finished first turn, then a second turn running on the slot's
+        record with four new tokens."""
         session = self._session("s")
         first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
         cache.maybe_hand_to_session(first)
         cache.checkpoint(first, up_to=8)
         first.finished_reason = FINISH_LENGTH(length=0)
         self.assertTrue(cache.session.try_cache_finished_req(first))
-        slot = cache.session.slots["s"]
-        slot_lock_node = slot.last_node
 
         tokens = list(range(1, 13))
         req = self._turn(tokens, session)
@@ -11464,11 +11461,54 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         req.kv.kv_committed_len = 12
         req.kv.kv_allocated_len = 12
         cache.maybe_hand_to_session(req)
+        return cache.session.slots["s"], req
+
+    def test_later_turn_borrows_without_publishing(self):
+        """A later turn runs on the slot's record: its allocation hands nothing
+        over, and its checkpoints neither insert nor move the slot's lock."""
+        cache, allocator, pool = build_fixture(self.cfg)
+        slot, req = self._later_turn(cache, allocator, pool)
+        slot_lock_node = slot.last_node
+
         cache.checkpoint(req, up_to=12)
         self.assertIs(slot.last_node, slot_lock_node)
 
         req.finished_reason = FINISH_LENGTH(length=0)
         self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_later_turn_abort_releases_like_any_request(self):
+        """An aborted turn gets its record and the slot's lock back before its
+        KV is checkpointed, then releases like any request."""
+        cache, allocator, pool = build_fixture(self.cfg)
+        _, req = self._later_turn(cache, allocator, pool)
+
+        req.finished_reason = FINISH_ABORT()
+        release_kv_cache(req, cache, checkpoint=True)
+        self.assertNotIn("s", cache.session.slots)
+        cache.sanity_check()
+
+    def test_finished_first_turn_keeps_its_output_out_of_the_tree(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        cache.checkpoint(req, up_to=8)
+
+        req.output_ids = array("q", range(9, 13))
+        req.refresh_fill_ids()
+        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
+        req.kv.kv_committed_len = 12
+        req.kv.kv_allocated_len = 12
+        req.finished_reason = FINISH_LENGTH(length=4)
+        release_kv_cache(req, cache, checkpoint=True)
+
+        self.assertIn("s", cache.session.slots)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(1, 13))))
+        )
+        self.assertEqual(len(match.device_indices), len(tokens))
         cache.session.release_session("s")
         cache.sanity_check()
 
