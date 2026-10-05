@@ -65,12 +65,7 @@ GROUP_SIZE = 32  # MXFP4 block size
 
 @pytest.fixture
 def stated_tp_group():
-    """A TP group for a test that runs in a process without one.
-
-    The production call passes the group *into* `use_symmetric_memory`, so
-    stubbing that context manager does not stop the read -- the argument is
-    evaluated first. Stating it on the context answers every spelling.
-    """
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):
@@ -178,7 +173,7 @@ def _round_up(x, base):
     return ((x + base - 1) // base) * base
 
 
-def _build_method(num_experts, hidden, inter, *, use_humming=False):
+def _build_method(num_experts, hidden, inter, *, layer=None, use_humming=False):
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
@@ -193,16 +188,17 @@ def _build_method(num_experts, hidden, inter, *, use_humming=False):
     method._padded_hidden = _round_up(hidden, 128)
     method._padded_intermediate = _round_up(inter, 128)
     method.use_flashinfer = True
-    method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
+    method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter, layer)
     return method
 
 
-def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
+def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter, layer=None):
     """Construct a real MoeRunner bound to the flashinfer_mxfp4 fused func.
 
     Bypasses ``create_moe_runner`` (which needs a live server arg context)
     and wires the runner with a minimal MoeRunnerConfig sufficient for the
-    cutlass SM90 fused func, which only reads dispatch_output / quant_info.
+    cutlass SM90 fused func. The func reads the layer's MoE placement off the
+    config, so the layer states itself here the way `FusedMoE` does.
     """
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -217,6 +213,7 @@ def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
         top_k=None,
         activation="silu",
         is_gated=True,
+        layer=layer,
     )
     return MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, cfg)
 
@@ -304,7 +301,7 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter)
+    method = _build_method(num_experts, hidden, inter, layer=layer)
     method._process_weights_for_sm90_cutlass(layer)
 
     N_pad = _round_up(inter, 128)
@@ -380,7 +377,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter)
+    method = _build_method(num_experts, hidden, inter, layer=layer)
     method._process_weights_for_sm90_cutlass(layer)
 
     out_sglang = method._apply_sm90_cutlass(
@@ -449,7 +446,7 @@ def test_process_weights_humming_matches_flashinfer_direct():
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method = _build_method(num_experts, hidden, inter, layer=layer, use_humming=True)
     method._process_weights_for_sm90_cutlass(layer)
 
     # GPT-OSS loads pair-wise [gate, up]; FlashInfer consumes halved [up; gate].
@@ -489,7 +486,7 @@ def test_humming_padding_preserves_per_expert_residual():
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method = _build_method(num_experts, hidden, inter, layer=layer, use_humming=True)
     method._process_weights_for_sm90_cutlass(layer)
 
     assert torch.equal(layer.w13_humming_residual_scale, expected_w13_residual * 64.0)
@@ -577,7 +574,7 @@ def test_humming_range_ignores_prerounded_hidden_tail():
         layer = _build_mock_layer(
             E, hidden_rounded, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
         )
-        method = _build_method(E, hidden_rounded, inter, use_humming=True)
+        method = _build_method(E, hidden_rounded, inter, layer=layer, use_humming=True)
         # What create_weights records from layer.hidden_size_unpadded.
         method._unpadded_hidden = hidden_real
         method._process_weights_for_sm90_cutlass(layer)
@@ -632,7 +629,7 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
     )
     layer.moe_ep_size = ep_size
     layer.moe_ep_rank = ep_rank
-    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method = _build_method(num_experts, hidden, inter, layer=layer, use_humming=True)
     method._process_weights_for_sm90_cutlass(layer)
     out_sglang = method._apply_sm90_cutlass(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
@@ -789,6 +786,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
     layer.moe_tp_rank = 0
     layer.moe_ep_size = 1
     layer.moe_ep_rank = 0
+    method.runner.config.layer = layer
 
     method.process_weights_after_loading(layer)
 

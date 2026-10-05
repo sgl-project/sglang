@@ -23,8 +23,9 @@ from transformers import PretrainedConfig
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.srt.configs.gigachat35 import GigaChat35Config
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,8 +39,8 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
-from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import BumpAllocator, add_prefix, make_pp_layers
 
 _GATED_NORM_LOW_RANK = 16
 
@@ -129,11 +130,12 @@ def build_norm(
 
 
 class GigaChat35PassthroughNorm(nn.Module):
-    """Identity norm with the fused residual-add convention.
+    """Identity norm with the norm calling convention: ``forward(x)`` returns
+    ``x``, ``forward(x, residual)`` returns ``(residual + x, residual + x)``.
 
     Used as the ``input_layernorm`` slot when a layer has no pre-norm
     (``layernorm_type="post"``); it only folds the residual so the
-    LayerCommunicator's prepare-step bookkeeping still works.
+    attention boundary receives the folded residual.
     """
 
     def forward(
@@ -145,29 +147,21 @@ class GigaChat35PassthroughNorm(nn.Module):
         if post_residual_addition is not None:
             x = x + post_residual_addition
         if residual is None:
-            return x, x
+            return x
         merged = x + residual
         return merged, merged
 
 
 class GigaChat35MlpPrepNorm(nn.Module):
-    """Pre-MLP norm wrapper that folds the post-attention (sandwich) norm.
-
-    Replaces the LayerCommunicator's ``post_attention_layernorm`` slot so the
-    optional ``post_self_attn_layernorm`` (applied to the attention output,
-    before the residual add) and the pre-MLP ``post_attention_layernorm`` are
-    both threaded through ``prepare_mlp`` -- matching the per-layer math of the
-    ``pre_post`` sandwich exactly.
+    """Pre-MLP norm wrapper: adds the residual, then runs the optional pre-MLP
+    ``post_attention_layernorm`` on the sum, unfused. The attention's own
+    ``post_self_attn_layernorm`` is its declared output transform, which the
+    FFN input runs before this.
     """
 
-    def __init__(
-        self,
-        pre_layernorm: Optional[nn.Module],
-        post_layernorm: Optional[nn.Module],
-    ) -> None:
+    def __init__(self, pre_layernorm: Optional[nn.Module]) -> None:
         super().__init__()
         self.pre_layernorm = pre_layernorm
-        self.post_layernorm = post_layernorm
 
     def forward(
         self,
@@ -175,14 +169,11 @@ class GigaChat35MlpPrepNorm(nn.Module):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
-        if self.post_layernorm is not None:
-            x = self.post_layernorm(x)
         if post_residual_addition is not None:
             x = x + post_residual_addition
         if residual is None:
-            merged = x
-        else:
-            merged = x + residual
+            return x if self.pre_layernorm is None else self.pre_layernorm(x)
+        merged = x + residual
         if self.pre_layernorm is None:
             return merged, merged
         return self.pre_layernorm(merged), merged
@@ -374,6 +365,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             is_nextn=is_nextn,
             prefix=prefix,
             alt_stream=alt_stream,
+            build_stages=False,
         )
 
         attn_layer_id = config.num_hidden_layers if is_nextn else layer_id
@@ -389,7 +381,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             )
             if hasattr(self.self_attn, "out_proj"):
                 self.self_attn.out_proj.reduce_results = False
-            self.layer_communicator.qkv_latent_func = None
+            qkv_latent_func = None
         else:
             self.self_attn = GigaChat35AttentionMLA(
                 config=config,
@@ -409,7 +401,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 prefix=add_prefix("self_attn", prefix),
                 alt_stream=alt_stream,
             )
-            self.layer_communicator.qkv_latent_func = self.self_attn.prepare_qkv_latent
+            qkv_latent_func = self.self_attn.prepare_qkv_latent
 
         self.is_sparse = self.is_layer_sparse
 
@@ -437,10 +429,23 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         )
         mlp_prepare_layernorm = GigaChat35MlpPrepNorm(
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
-            post_layernorm=self.post_self_attn_layernorm,
         )
-        self.layer_communicator.input_layernorm = attn_prepare_layernorm
-        self.layer_communicator.post_attention_layernorm = mlp_prepare_layernorm
+        # The stage boundaries choose their fused steps from their norms when built.
+        self.attn_boundary, self.ffn_boundary = self._build_stages(
+            input_layernorm=attn_prepare_layernorm,
+            post_attention_layernorm=mlp_prepare_layernorm,
+            qkv_latent_func=qkv_latent_func,
+            attn_output=(
+                OutputTransform(self.post_self_attn_layernorm)
+                if self.post_self_attn_layernorm is not None
+                else None
+            ),
+            output=(
+                OutputTransform(self.post_feedforward_layernorm)
+                if self.post_feedforward_layernorm is not None
+                else None
+            ),
+        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         if is_nextn:
@@ -456,13 +461,10 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if self.use_linear_attn:
             hidden_states = self.self_attn(
@@ -475,33 +477,21 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
-                layer_scatter_modes=self.layer_scatter_modes,
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
             )
         get_attn_tp_context().clear_attn_inputs()
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
         # Unlike deepseek_v2, no moe_output_buffer_ctx here: non-inplace MoE
         # runners then allocate their output per forward instead of recycling
         # the layer-input buffer. The default (inplace) runners are unaffected.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if self.post_feedforward_layernorm is not None:
-            hidden_states = self.post_feedforward_layernorm(hidden_states)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        return hidden_states, residual
+        hidden_states = ffn_exit.finish(hidden_states)
+        return hidden_states
 
 
 class GigaChat35Model(nn.Module):
@@ -515,7 +505,7 @@ class GigaChat35Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -528,7 +518,7 @@ class GigaChat35Model(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: GigaChat35DecoderLayer(
                 config=config,
@@ -537,8 +527,6 @@ class GigaChat35Model(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -560,11 +548,12 @@ class GigaChat35Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         zero_allocator = BumpAllocator(
@@ -574,24 +563,18 @@ class GigaChat35Model(nn.Module):
         )
 
         for i in range(self.start_layer, self.end_layer):
-            hidden_states, residual = self.layers[i](
+            hidden_states = self.layers[i](
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                residual=residual,
                 zero_allocator=zero_allocator,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
-
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return hidden_states
 
 
@@ -605,8 +588,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
-        self.tp_size = get_parallel().tp_size
+        self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
 
         self.model = GigaChat35Model(

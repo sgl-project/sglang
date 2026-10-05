@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -42,12 +43,23 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
 
 
 class LayerLoadingEvent:
@@ -601,6 +613,7 @@ class HiCacheController:
                     "nixl",
                     "simm",
                     "mori",
+                    "tensorcast",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -692,17 +705,15 @@ class HiCacheController:
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
 
+        parallel = get_parallel()
         if is_dp_attention_enabled():
-            self.tp_rank = get_parallel().attn_tp_rank
-            self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_parallel().attn_dp_rank
+            tp_rank = parallel.attn_tp_rank
+            tp_size = parallel.attn_tp_size
+            dp_rank = parallel.attn_dp_rank
         else:
-            self.tp_rank = get_parallel().tp_rank
-            self.tp_size = get_parallel().tp_size
-            self.dp_rank = 0
-
-        self.pp_rank = get_parallel().pp_rank
-        self.pp_size = get_parallel().pp_size
+            tp_rank = parallel.tp_rank
+            tp_size = parallel.tp_size
+            dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -719,22 +730,23 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
+            assert tp_lcm_size % tp_size == 0, (
                 "tp_lcm_size must be divisible by tp_size."
             )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
-                and tp_lcm_size > self.tp_size
+                and tp_lcm_size > tp_size
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
@@ -744,22 +756,20 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
-            dp_rank=self.dp_rank,
+            dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
         )
 
     def reset(self):
-        self.storage_stop_event.set()
+        # Reuse detach's queue wakeups and bounded joins, and fail if any
+        # storage thread remains alive before clearing shared state.
+        self._stop_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.prefetch_io_aux_thread.join()
-            self.prefetch_sync_thread.join()
-            self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_buffer.queue.clear()
@@ -790,15 +800,27 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
+    def has_inflight_device_transfers(self) -> bool:
+        """Whether queued or unacknowledged L2 transfers still use device rows."""
+        return bool(
+            self.write_queue
+            or self.load_queue
+            or self.ack_write_queue
+            or self.ack_load_queue
+        )
+
     def write(
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """
+        if extra_pools:
+            raise ValueError("Side-pool transfers require HybridCacheController.")
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -818,6 +840,10 @@ class HiCacheController:
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
+        )
+
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "write"), completion.finish_event
         )
 
         self.ack_write_queue.append(
@@ -964,6 +990,10 @@ class HiCacheController:
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "load"), completion.finish_event
+        )
+
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -976,10 +1006,6 @@ class HiCacheController:
             )
         )
         return producer_id
-
-    def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
@@ -1090,13 +1116,22 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    if not get_memory().enable_unified_memory:
+                        raise
+                    logger.exception(
+                        "HiCache prefetch transfer failed for request %s",
+                        operation.request_id,
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
@@ -1157,10 +1192,13 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
                 self._page_transfer(operation)
-
+            finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1168,8 +1206,6 @@ class HiCacheController:
                         operation=operation,
                     )
                 )
-            except Empty:
-                continue
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1190,6 +1226,24 @@ class HiCacheController:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def alloc_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate the host bounce for a storage hit."""
+        return self.mem_pool_host.alloc(need_size)
+
+    def can_fit_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> bool:
+        """Whether a prefetch bounce can fit when its host pools are empty."""
+        return need_size <= self.mem_pool_host.size
+
+    def free_prefetch_host_buffers(
+        self, operation: StorageOperation, host_indices: torch.Tensor
+    ) -> None:
+        """Roll back a hit-sized host bounce before transfer ownership moves."""
+        self.mem_pool_host.free(host_indices)
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -1225,10 +1279,22 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
+                try:
+                    if operation.is_terminated():
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                except Exception:
+                    if not get_memory().enable_unified_memory:
+                        raise
+                    logger.exception(
+                        "HiCache storage query failed for request %s",
+                        operation.request_id,
+                    )
                     hash_value, storage_hit_count = [], 0
-                else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
