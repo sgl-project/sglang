@@ -51,6 +51,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -305,8 +306,7 @@ class KimiK3MLP(nn.Module):
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ) -> None:
         super().__init__()
         # The Ascend path shards the dense MLP inside each attention-TP
@@ -317,22 +317,17 @@ class KimiK3MLP(nn.Module):
         self._dense_attn_tp = (
             get_parallel().enable_dense_mlp_attn_tp
             and is_dp_attention_enabled()
-            and tp_rank is None
-            and tp_size is None
+            and parallel_group is None
         )
-        if self._dense_attn_tp:
-            tp_rank = get_parallel().attn_tp_rank
-            tp_size = get_parallel().attn_tp_size
-        _tp_kwargs = (
-            dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
-        )
+        if parallel_group is None:
+            parallel_group = "attn_tp" if self._dense_attn_tp else "tp"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            **_tp_kwargs,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -342,7 +337,7 @@ class KimiK3MLP(nn.Module):
             reduce_results=reduce_results,
             use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
-            **_tp_kwargs,
+            parallel_group=parallel_group,
         )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
@@ -586,9 +581,9 @@ class KimiK3MoE(nn.Module):
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
         self._shared_experts_tp_group = None
-        shared_experts_tp_kwargs = {}
+        shared_experts_parallel_group = None
         if self._shared_experts_tp1:
-            shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
+            shared_experts_parallel_group = "replicated"
         elif self._shared_experts_tp_comm:
             group = (
                 parallel.shared_experts_tp_group
@@ -597,8 +592,8 @@ class KimiK3MoE(nn.Module):
             )
             assert group.world_size == shared_tp
             self._shared_experts_tp_group = group
-            shared_experts_tp_kwargs = dict(
-                tp_rank=group.rank_in_group, tp_size=group.world_size
+            shared_experts_parallel_group = (
+                "shared_experts_tp" if requested_shared_tp is not None else "attn_tp"
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -616,7 +611,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                **shared_experts_tp_kwargs,
+                parallel_group=shared_experts_parallel_group,
             )
         else:
             self.shared_experts = None

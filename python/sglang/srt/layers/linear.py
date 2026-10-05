@@ -75,7 +75,10 @@ class ReplicatedParallelGroup:
             raise ValueError("replica_size must be a positive integer")
 
 
-LinearParallelGroup = Literal["tp", "attn_tp", "replicated"] | ReplicatedParallelGroup
+LinearParallelGroup = (
+    Literal["tp", "attn_tp", "replicated", "shared_experts_tp"]
+    | ReplicatedParallelGroup
+)
 
 
 def resolve_linear_parallel_group(
@@ -89,6 +92,13 @@ def resolve_linear_parallel_group(
         )
     if parallel_group == "replicated":
         return 0, 1
+    if parallel_group == "shared_experts_tp":
+        group = get_parallel().shared_experts_tp_group
+        if group is None:
+            raise ValueError(
+                "The shared-expert TP group must exist before construction"
+            )
+        return group.rank_in_group, group.world_size
     if parallel_group not in ("tp", "attn_tp"):
         raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
     parallel = get_parallel()
