@@ -1505,6 +1505,22 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        mamba2_replay = getattr(mamba_pool, "enable_mamba2_spec_replay", False)
+        if mamba2_replay:
+            from sglang.kernels.ops.mamba.mamba2_spec_replay import commit_mamba2_replay
+
+            assert mamba_caches.intermediate_ssm is None
+            # Verify and acceptance/commit are enqueued on the worker's forward
+            # stream (run_eagle_verify). The next verify cannot overwrite these
+            # slot-keyed records before this commit, even with plan overlap.
+            commit_mamba2_replay(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1512,6 +1528,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
+            skip_ssm=mamba2_replay,
         )
 
         self._update_ple_state_after_mtp_verify(

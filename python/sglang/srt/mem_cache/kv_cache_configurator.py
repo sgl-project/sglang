@@ -295,10 +295,34 @@ class KVCacheConfigurator:
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        if self._mamba2_spec_replay_enabled:
+            from sglang.srt.configs.mamba2_spec_replay import (
+                validate_mamba2_spec_replay,
+            )
+
+            validate_mamba2_spec_replay(
+                resolving_view(self.server_args),
+                getattr(self.model_config.hf_text_config, "model_type", None),
+                is_cuda=self.device == "cuda",
+                resolved=True,
+            )
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self.is_hybrid_swa_mtp_draft = self.layer_info.is_hybrid_swa_mtp_draft
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
             self.layer_info.swa_attention_layer_ids
+        )
+
+    @property
+    def _mamba2_spec_replay_enabled(self):
+        from sglang.srt.configs.mamba2_spec_replay import mamba2_spec_replay_enabled
+
+        return (
+            not self.is_draft_worker
+            and get_exec().mamba.enable_linear_replayssm_spec
+            and mamba2_spec_replay_enabled(
+                get_exec().mamba,
+                getattr(self.model_config.hf_text_config, "model_type", None),
+            )
         )
 
     def hybrid_swa_token_capacity(
@@ -1150,6 +1174,8 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            enable_mamba2_spec_replay=self._mamba2_spec_replay_enabled,
+            mamba2_replay_dtype=self.model_config.dtype,
             **self._get_ple_req_pool_kwargs(),
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
@@ -1167,8 +1193,8 @@ class KVCacheConfigurator:
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
             # fold); activate the pool machinery only for those, so any other
-            # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
-            # flag set stays byte-identical to flag-off.
+            # mamba-ish model stays on its own pool path. Mamba2's dispatch
+            # above must not also allocate a GDN/KDA replay ring.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
@@ -2455,6 +2481,44 @@ class KVCacheConfigurator:
         )
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        if self._mamba2_spec_replay_enabled:
+            from sglang.srt.configs.mamba2_spec_replay import Mamba2ReplaySizing
+
+            width = get_spec().speculative_num_draft_tokens
+            costs = Mamba2ReplaySizing.from_params(
+                config.mamba2_cache_params,
+                layers=max_stage_mamba_layers,
+                width=width,
+                activation_bytes=self.model_config.dtype.itemsize,
+            )
+            request_cap = get_schedule().max_running_requests // self.attn_dp_size
+            ratio = self._calculate_mamba_ratio()
+            if get_schedule().max_mamba_cache_size is not None:
+                slots = get_schedule().max_mamba_cache_size // self.attn_dp_size
+            elif get_memory().disable_radix_cache:
+                slots = request_cap
+            else:
+                split = get_schedule().mamba_full_memory_ratio
+                budget = total_rest_memory * (1 << 30) * split / (1 + split)
+                slots = costs.solve(budget, request_cap, ratio)
+            if slots < ratio:
+                raise RuntimeError(
+                    "Insufficient memory for one Mamba2 speculative replay request"
+                )
+            get_context().override(
+                "mamba_pool.mamba2_replay", max_mamba_cache_size=slots
+            )
+            reserved = costs.bytes_for(slots, request_cap, ratio)
+            logger.info(
+                "Mamba2 replay sizing: K=%d, R=%d, record_bytes_per_slot=%d, "
+                "conv_bytes_per_row=%d, reserved_bytes=%d",
+                slots,
+                min(request_cap, slots // ratio),
+                costs.record_per_slot,
+                costs.conv_per_row,
+                reserved,
+            )
+            return total_rest_memory - reserved / (1 << 30)
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the

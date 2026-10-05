@@ -92,7 +92,6 @@ def mamba_v2_sharded_weight_loader(
     """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 
@@ -714,7 +713,16 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
             if is_target_verify:
-                selective_state_update(
+                verify_fn = selective_state_update
+                verify_kwargs = {}
+                if getattr(layer_cache, "mamba2_replay_x", None) is not None:
+                    from sglang.kernels.ops.mamba.mamba2_spec_replay import (
+                        verify_mamba2_replay,
+                    )
+
+                    verify_fn = verify_mamba2_replay
+                    verify_kwargs["layer_cache"] = layer_cache
+                verify_fn(
                     ssm_state,
                     hidden_states_d.view(
                         num_decodes,
@@ -747,6 +755,7 @@ class MambaMixer2(torch.nn.Module):
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
                     intermediate_state_indices=self.intermediate_state_indices,
+                    **verify_kwargs,
                 )
             else:
                 selective_state_update(

@@ -7,9 +7,11 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    model_config_of,
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
+from sglang.srt.configs.mamba2_spec_replay import mamba2_spec_replay_enabled
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -17,6 +19,29 @@ logger = logging.getLogger(__name__)
 
 def handle_mamba_backend(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_linear_replayssm_spec and mamba2_spec_replay_enabled(
+        cfg, getattr(model_config_of(server_args).hf_text_config, "model_type", None)
+    ):
+        from sglang.srt.configs.mamba2_spec_replay import validate_mamba2_spec_replay
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        model = model_config_of(server_args)
+        if not get_platform().is_sm100:
+            raise ValueError(
+                "--enable-linear-replayssm-spec for Mamba2 requires SM100."
+            )
+        validate_mamba2_spec_replay(
+            cfg,
+            getattr(model.hf_text_config, "model_type", None),
+            is_cuda=get_platform().is_cuda,
+        )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-linear-replayssm-spec for Mamba2 requires static-width verify."
+            )
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
