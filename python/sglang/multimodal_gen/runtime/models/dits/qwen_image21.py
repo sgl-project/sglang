@@ -751,6 +751,49 @@ class QwenImage21OutputNorm(nn.Module):
         )
 
 
+_FUSED_GATE_UP = ".img_mlp.gate_up"
+
+
+def _split_fused_gate_up_lora(adapter, *, ffn_dim):
+    """Map ComfyUI/ai-toolkit ``img_mlp.gate_up`` LoRAs onto ``gate_layer`` and ``proj``.
+
+    ComfyUI's native checkpoint fuses the SwiGLU inputs row-wise as [gate; up],
+    so one shared A feeds both halves of B.
+    """
+    fused_bases = [
+        key[: -len(".lora_A")]
+        for key in adapter
+        if key.endswith(f"{_FUSED_GATE_UP}.lora_A")
+    ]
+    if not fused_bases:
+        return adapter
+    split = dict(adapter)
+    for fused in fused_bases:
+        lora_a = split.pop(f"{fused}.lora_A")
+        lora_b = split.pop(f"{fused}.lora_B", None)
+        alpha = split.pop(f"{fused}.alpha", None)
+        if lora_b is None:
+            raise ValueError(f"Qwen-Image 2.1 LoRA is missing {fused}.lora_B")
+        if lora_b.dim() != 2 or lora_b.shape[0] != 2 * ffn_dim:
+            raise ValueError(
+                f"Qwen-Image 2.1 LoRA {fused}.lora_B must be [{2 * ffn_dim}, rank], "
+                f"got {list(lora_b.shape)}"
+            )
+        mlp = fused[: -len(".gate_up")]
+        halves = (("gate_layer", lora_b[:ffn_dim]), ("proj", lora_b[ffn_dim:]))
+        for name, rows in halves:
+            target = f"{mlp}.{name}"
+            if f"{target}.lora_A" in split or f"{target}.lora_B" in split:
+                raise ValueError(
+                    f"Qwen-Image 2.1 LoRA has both {fused} and {target} weights"
+                )
+            split[f"{target}.lora_A"] = lora_a
+            split[f"{target}.lora_B"] = rows.contiguous()
+            if alpha is not None:
+                split[f"{target}.alpha"] = alpha
+    return split
+
+
 class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
@@ -799,6 +842,11 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         super().post_load_weights()
         for block in self.transformer_blocks:
             block.attn.pack_qkv_weights()
+
+    def prepare_lora_adapter(self, adapter):
+        return _split_fused_gate_up_lora(
+            adapter, ffn_dim=self.config.hidden_size * self.config.mlp_ratio
+        )
 
     def prepare_modulation(self, temb):
         # All blocks share these gates. Preserve the native tanh and its dtype,
