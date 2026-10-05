@@ -299,34 +299,56 @@ class TestFusedDraftDecision(CustomTestCase):
 
 class TestMambaHostPrivateDraftRefused(CustomTestCase):
     """A mamba host's unified buffer takes the whole KV budget, so a private
-    EAGLE draft pool on top of it would overcommit; the fused arm is the only
-    EAGLE arm such a host builds."""
+    draft pool on top of it would overcommit; the fused arm is the only
+    EAGLE-family or DFLASH arm such a host builds. DSPARK keeps the private
+    pool it booted with on these hosts before it could fuse."""
 
-    def _resolve(self, *, decision, eagle=True):
+    _DECLINED = "the draft's K/V rows are asymmetric"
+
+    def _resolve(self, *, decision, algorithm="EAGLE"):
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         cfg.is_draft_worker = False
-        cfg.spec_algorithm = SimpleNamespace(is_eagle=lambda: eagle)
+        cfg.spec_algorithm = SpeculativeAlgorithm[algorithm]
         with patch.object(
             kvc.KVCacheConfigurator, "_fused_draft_decision", return_value=decision
         ):
             return cfg._fused_draft_for_mamba_factory()
 
     def test_a_declined_eagle_draft_is_refused(self):
+        for algorithm in ("EAGLE", "EAGLE3"):
+            with self.subTest(algorithm=algorithm):
+                with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
+                    self._resolve(
+                        decision=FusedDraftDecision(declined=self._DECLINED),
+                        algorithm=algorithm,
+                    )
+
+    def test_a_declined_dflash_draft_is_refused_and_dspark_keeps_its_pool(self):
+        """DFLASH is new on the unified pool, so its decliner is refused like
+        EAGLE's. DSPARK already booted here with a private pool, so its
+        decliner still gets one instead of a boot failure."""
+        declined = FusedDraftDecision(declined=self._DECLINED)
         with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
-            self._resolve(
-                decision=FusedDraftDecision(
-                    declined="the draft's K/V rows are asymmetric"
-                )
-            )
+            self._resolve(decision=declined, algorithm="DFLASH")
+        self.assertIsNone(self._resolve(decision=declined, algorithm="DSPARK"))
 
     def test_a_placed_draft_and_other_algorithms_pass(self):
         placement = _place(_profile()).placement
-        self.assertIs(
-            self._resolve(decision=FusedDraftDecision(placement=placement)), placement
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                self.assertIs(
+                    self._resolve(
+                        decision=FusedDraftDecision(placement=placement),
+                        algorithm=algorithm,
+                    ),
+                    placement,
+                )
+        self.assertIsNone(
+            self._resolve(decision=FusedDraftDecision(), algorithm="NONE")
         )
-        self.assertIsNone(self._resolve(decision=FusedDraftDecision(), eagle=False))
 
 
 class TestSWAHostPrivateDraftRefused(CustomTestCase):

@@ -1094,23 +1094,25 @@ class KVCacheConfigurator:
     def _fused_draft_for_mamba_factory(self):
         """`_fused_draft_for_pool_factory` for a mamba-hybrid host. Its unified
         buffer takes the WHOLE profiled KV budget (`unified_total_bytes`), so a
-        private EAGLE draft pool -- sized to the full virtual id span -- would
-        be allocated on top of it, unbudgeted. Until the mamba solve prices that
-        pool, an EAGLE draft that does not fuse is refused here instead of
-        overcommitting GPU memory."""
+        private draft pool -- sized to the full virtual id span -- would be
+        allocated on top of it, unbudgeted. Until the mamba solve prices that
+        pool, an EAGLE-family or DFLASH draft that does not fuse is refused here
+        instead of overcommitting GPU memory. A DSPARK draft that does not fuse
+        keeps its private pool: DSPARK booted that way on these hosts before it
+        could fuse, and refusing it would break those deployments."""
         placement = self._fused_draft_for_pool_factory()
         if (
             placement is None
-            and self.spec_algorithm.is_eagle()
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
             and not self.is_draft_worker
         ):
             reason = (
                 self._fused_draft_decision().declined or "fusion does not apply to it"
             )
             raise ValueError(
-                "--enable-unified-memory + EAGLE/EAGLE3 on a mamba-hybrid target "
-                "needs the draft's KV fused into the target's pages, but this "
-                f"draft would keep a private pool ({reason}). A mamba host's "
+                "--enable-unified-memory + EAGLE/EAGLE3/DFLASH on a mamba-hybrid "
+                "target needs the draft's KV fused into the target's pages, but "
+                f"this draft would keep a private pool ({reason}). A mamba host's "
                 "unified buffer takes the whole KV budget, so a private draft "
                 "pool would overcommit GPU memory."
             )
