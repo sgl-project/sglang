@@ -19,6 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -1489,30 +1490,47 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight)
 
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
+
+
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group: Optional["LinearParallelGroup"] = None,
 ) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+    """Create a weight loader with placement frozen in its construction scope.
 
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    Without a group selection, retain the attention rank and legacy CPU padding
+    width. An explicit rank getter is evaluated once when creating the loader.
+    """
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
+    else:
         tp_rank = (
             tp_rank_getter()
             if tp_rank_getter is not None
             else get_parallel().attn_tp_rank
         )
+        tp_size = get_parallel().tp_size
 
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):

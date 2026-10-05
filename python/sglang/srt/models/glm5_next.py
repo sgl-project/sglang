@@ -520,7 +520,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0)},
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -540,7 +540,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2)},
+            {"weight_loader": sharded_weight_loader(2, parallel_group="attn_tp")},
         )
 
         self.o_norm = FusedRMSNormGated(
