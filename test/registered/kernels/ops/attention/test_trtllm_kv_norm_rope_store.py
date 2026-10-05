@@ -1,5 +1,7 @@
 """Byte-level parity with the existing norm/RoPE -> cast -> index_put path."""
 
+import sys
+
 import pytest
 import torch
 
@@ -97,3 +99,7 @@ def test_large_cache_offset():
     fused_k_norm_rope_uniform_fp8(x, weight, 1e-6, freq, pos, loc, cache)
     torch.cuda.synchronize()
     assert torch.equal(cache.view(torch.uint8)[loc], expected.view(torch.uint8))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
