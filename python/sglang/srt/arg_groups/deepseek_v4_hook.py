@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -178,7 +179,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
-    from sglang.srt.model_executor.cuda_graph_config import Backend
 
     cfg = resolving_view(server_args)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
@@ -276,8 +276,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DP=1 and CP=1. Both servers must enable DSpark with the same "
                 "block size and TP size."
             )
-
-    from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 
     prefill_graph = cfg.cuda_graph_config.prefill
     if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:

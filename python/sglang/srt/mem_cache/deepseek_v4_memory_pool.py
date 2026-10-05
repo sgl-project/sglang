@@ -20,6 +20,9 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
+    fused_k_norm_rope_uniform_fp8,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -2041,10 +2044,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
-            from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
-                fused_k_norm_rope_uniform_fp8,
-            )
-
             fused_k_norm_rope_uniform_fp8(
                 kv,
                 kv_weight,

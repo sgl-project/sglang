@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
@@ -1342,8 +1343,6 @@ class MQALayer(MqaAttentionBase):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
-                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
-
                 q_rope_store(q, q_out, self.freqs_cis, positions)
                 return q_out
             if (
@@ -1364,8 +1363,6 @@ class MQALayer(MqaAttentionBase):
                 and q.stride(1) == q_out.stride(1) == 512
                 and q.stride(2) == q_out.stride(2) == 1
             ):
-                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
-
                 q_rope_store(q, q_out, self.freqs_cis, positions)
                 return q_out
             fused_rope_inplace(

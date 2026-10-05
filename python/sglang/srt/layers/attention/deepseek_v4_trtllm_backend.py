@@ -19,12 +19,21 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4MultiStepBackend,
 )
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_exec,
     get_parallel,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
 )
+
+try:
+    import flashinfer.mla._core as _fi_core
+    from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+except ImportError as exc:
+    _flashinfer_import_error = exc
+else:
+    _flashinfer_import_error = None
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
@@ -39,8 +48,6 @@ _TRTLLM_GEN_WORKSPACE_SIZE_MB = 128
 
 
 def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
-    from sglang.srt.runtime_context import get_buffer
-
     return get_buffer(
         "trtllm_dsv4_zero_workspace",
         lambda: torch.zeros(
@@ -85,11 +92,13 @@ def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
     FlashInfer accepts a caller-owned buffer.
     """
     global _trtllm_semaphore_installed, _trtllm_semaphore_rows
+    if _flashinfer_import_error is not None:
+        raise ImportError(
+            "--dsv4-attn-backend trtllm requires FlashInfer sparse MLA support"
+        ) from _flashinfer_import_error
     _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
     if _trtllm_semaphore_installed:
         return
-    import flashinfer.mla._core as _fi_core
-
     _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
     # Allocate once outside graph capture. Stream ordering and the kernel's
     # counter reset make one shared buffer safe across launches.
@@ -263,8 +272,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     ) -> torch.Tensor:
         """Run sparse MLA decode with preallocated metadata tables."""
 
-        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
-
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
 
@@ -380,8 +387,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         ``seq_lens`` includes cached prefixes; the kernel derives causal SWA
         validity from it. This path runs eagerly.
         """
-
-        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
