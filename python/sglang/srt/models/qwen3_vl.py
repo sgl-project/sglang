@@ -41,6 +41,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -147,6 +148,16 @@ class Qwen3_VisionMLP(nn.Module):
             use_data_parallel=use_data_parallel,
             tp_size=tp_size,
             tp_rank=tp_rank,
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=self.tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
         )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
@@ -316,6 +327,16 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
                 use_data_parallel=use_data_parallel,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
+            )
+            # TODO: this layer shards over attention TP but reduces over the full TP
+            # group without attention DP; reduce over the attention-TP group so
+            # attention CP narrower than TP can run it.
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=self.tp_size,
+                reduces_over_attn_tp=is_dp_attention_enabled(),
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
             )
             self.linear_fc1 = ColumnParallelLinear(
                 self.hidden_size,

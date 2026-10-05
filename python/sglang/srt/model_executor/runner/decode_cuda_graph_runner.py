@@ -526,8 +526,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # TODO: this lands EARLIER than declared; POST_REPLAY is the sound one.
-            return SharedReadEnds.PRE_REPLAY
+            # no in-graph marker (e.g. HIP): only a post-replay event covers its reads
+            return SharedReadEnds.POST_REPLAY
         return declared
 
     def _publish_read_done(self, in_graph: bool):
@@ -1021,6 +1021,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
