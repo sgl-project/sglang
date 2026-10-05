@@ -148,6 +148,27 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+repair_stale_nvidia_dkms() {
+    # GDRCopy used to install nvidia-dkms-580, whose nvidia-firmware-580
+    # dependency collides with the host firmware the NVIDIA container runtime
+    # mounts in. The failed install leaves packages unpacked but unconfigured,
+    # and apt then refuses every later install. Drop those packages and finish
+    # configuring the rest. Removable once no runner still has them.
+    local -a stale_nvidia_packages
+    mapfile -t stale_nvidia_packages < <(
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
+            awk 'substr($1, 2, 1) !~ /[nci]/ || substr($1, 3, 1) != "" {print $2}'
+    )
+    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
+        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
+        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
+        dpkg --configure -a
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 is_apt_package_installed() {
     local name
     # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
@@ -195,7 +216,7 @@ install_apt_packages() {
 
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
-    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
     local gpu_count=0
     if command -v nvidia-smi >/dev/null 2>&1; then
         gpu_count=$(
@@ -217,10 +238,10 @@ install_gdrcopy() {
 
     local gdrcopy_root=/opt/gdrcopy
     local gdrcopy_version=2.5.1
-    local -a gdrcopy_packages=(
-        nvidia-dkms-580 devscripts debhelper fakeroot dkms
-        check libsubunit0 libsubunit-dev python3-venv
-    )
+    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host
+    # and must be exposed to the container, and the gdrcopy test tools are
+    # unused.
+    local -a gdrcopy_packages=(devscripts debhelper fakeroot)
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
@@ -237,11 +258,8 @@ install_gdrcopy() {
     git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
+        CUDA=/usr/local/cuda ./build-deb-packages.sh -k -t
         dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
     )
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
@@ -571,8 +589,8 @@ install_sglang() {
 }
 
 install_nccl() {
-    # PyTorch pins 2.29.7, so this override must run after every command
-    # that resolves Python dependencies (including lmms-eval).
+    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # after every command that resolves Python dependencies (including lmms-eval).
     $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
@@ -897,6 +915,7 @@ main() {
     detect_host
     kill_existing_processes
     cleanup_stale_shm
+    repair_stale_nvidia_dkms
     install_apt_packages
     install_gdrcopy
     clean_site_packages

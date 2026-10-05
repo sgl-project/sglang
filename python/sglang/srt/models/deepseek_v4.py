@@ -61,7 +61,6 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -791,7 +790,6 @@ class MqaAttentionBase(nn.Module):
     ) -> None:
         super().__init__()
         self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.attn_tp_rank: int = get_parallel().attn_tp_rank
         self.attn_tp_size: int = get_parallel().attn_tp_size
 
@@ -1793,7 +1791,7 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_cp = is_cp_active(forward_batch)
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -1916,6 +1914,9 @@ class MQALayer(MqaAttentionBase):
                     token_to_kv_pool.swa_page_size,
                     False,
                 )
+                if use_cp:
+                    # Store globally ordered KV after the CP gather.
+                    swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -1956,18 +1957,19 @@ class MQALayer(MqaAttentionBase):
                 # which has no second return slot here. Prefill's write lands
                 # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
-            elif not (unified and fuse_verify):
-                kv = None
-
-            if not unified and use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            elif not unified and use_cp:
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
+            elif not (unified and fuse_verify):
+                kv = None
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -2018,6 +2020,13 @@ class MQALayer(MqaAttentionBase):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                if use_cp:
+                    # 2-source attention reads the whole logical chunk.
+                    kv = cp_materialize_global_token_order(
+                        kv.contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             elif use_cp and not self.is_dsv41:
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 kv = cp_materialize_global_token_order(
@@ -2156,7 +2165,7 @@ class MQALayer(MqaAttentionBase):
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not is_cp_active(forward_batch)
             and not (_is_hip and self.compressor is None)
             and self.compress_ratio not in (1, 2)
         ) or (
@@ -2229,8 +2238,7 @@ class MQALayer(MqaAttentionBase):
         if (
             unified
             and is_unified_kv_fp8()
-            and self.dsa_enable_prefill_cp
-            and dsa_use_prefill_cp(forward_batch)
+            and is_cp_active(forward_batch)
             and not forward_batch.forward_mode.is_decode_or_idle()
         ):
             # The gather hands back bf16 kv in global token order *after*
@@ -3868,7 +3876,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        _use_cp = is_cp_active(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -4698,7 +4706,7 @@ class DeepseekV4Model(nn.Module):
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
-        path_ok = not dsa_use_prefill_cp(forward_batch) and (
+        path_ok = not is_cp_active(forward_batch) and (
             not _is_hip
             or not get_moe_a2a_backend().is_none()
             or get_parallel().attn_dp_size > 1
