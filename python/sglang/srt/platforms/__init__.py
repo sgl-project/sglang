@@ -21,8 +21,8 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
-from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
@@ -61,6 +61,7 @@ def _is_musa_available() -> bool:
     except ImportError:
         return False
     return True
+
 
 def _is_mps_available() -> bool:
     return bool(getattr(torch, "mps", None) is not None and torch.mps.is_available())
