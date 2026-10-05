@@ -1,16 +1,13 @@
 """Native MLA prefix merging and breakable-graph replay regressions."""
 
+import unittest
 from types import SimpleNamespace as NS
-from unittest import main, skipUnless
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-    TRTLLMMLAPrefillMetadata,
-)
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_tokenspeed_mla_available
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -32,18 +29,7 @@ def _backend(cls=TRTLLMMLABackend):
     return backend
 
 
-def _extend_batch():
-    return NS(
-        forward_mode=ForwardMode.EXTEND,
-        seq_lens=torch.tensor([8, 6], dtype=torch.int32, device="cuda"),
-        extend_prefix_lens=torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
-        extend_prefix_lens_cpu=[3, 3],
-        extend_seq_lens_cpu=[5, 3],
-        batch_size=2,
-    )
-
-
-@skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class PrefillCpuLensTest(CustomTestCase):
     def test_native_prefix_merge_matches_dense_reference(self):
         from sglang.srt.layers.attention.merge_state import merge_state
@@ -70,8 +56,24 @@ class PrefillCpuLensTest(CustomTestCase):
             head_dim=192,
             v_head_dim=128,
         )
-        cpu_q_lens = torch.tensor([tokens], dtype=torch.int32)
-        cum_q = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+        cpu_prefix_lens = torch.tensor([prefix], dtype=torch.int32)
+        batch = NS(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            seq_lens=torch.tensor([prefix + tokens], dtype=torch.int32, device="cuda"),
+            extend_prefix_lens=cpu_prefix_lens.cuda(),
+            extend_prefix_lens_cpu=[prefix],
+            extend_seq_lens_cpu=[tokens],
+            mha_return_lse=True,
+            prefix_chunk_idx=0,
+            prefix_chunk_has_zero_kv=[False],
+            prefix_chunk_seq_lens=[cpu_prefix_lens.cuda()],
+            prefix_chunk_seq_lens_cpu=[cpu_prefix_lens],
+            prefix_chunk_cu_seq_lens=[
+                torch.tensor([0, prefix], dtype=torch.int32, device="cuda")
+            ],
+            prefix_chunk_max_seq_lens=[prefix],
+        )
         for cls, dtype in (
             (TRTLLMMLABackend, torch.bfloat16),
             (TRTLLMMLABackend, torch.float8_e4m3fn),
@@ -82,6 +84,8 @@ class PrefillCpuLensTest(CustomTestCase):
                     self.skipTest("Tokenspeed MLA unavailable")
                 backend = _backend(cls)
                 backend.data_type = dtype
+                backend.init_forward_metadata(batch)
+                cpu_q_lens = backend.forward_prefill_metadata.seq_lens_cpu
                 q_ref, k_ref, v_ref = (x.to(dtype).float() for x in (q, k, v))
                 scores = torch.einsum("qhd,khd->hqk", q_ref, k_ref) * layer.scaling
                 mask = (
@@ -95,25 +99,7 @@ class PrefillCpuLensTest(CustomTestCase):
                     (0, prefix, False),
                     (prefix, prefix + tokens, True),
                 ):
-                    length = end - start
-                    cpu_kv_lens = torch.tensor([length], dtype=torch.int32)
-                    backend.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
-                        tokens, cum_q, cpu_q_lens.cuda(), seq_lens_cpu=cpu_q_lens
-                    )
-                    batch = NS(
-                        forward_mode=ForwardMode.EXTEND,
-                        batch_size=1,
-                        attn_attend_prefix_cache=not causal,
-                        mha_return_lse=True,
-                        prefix_chunk_idx=0,
-                        prefix_chunk_has_zero_kv=[False],
-                        prefix_chunk_seq_lens=[cpu_kv_lens.cuda()],
-                        prefix_chunk_seq_lens_cpu=[cpu_kv_lens],
-                        prefix_chunk_cu_seq_lens=[
-                            torch.tensor([0, length], dtype=torch.int32, device="cuda")
-                        ],
-                        prefix_chunk_max_seq_lens=[length],
-                    )
+                    batch.attn_attend_prefix_cache = not causal
                     import flashinfer.prefill
 
                     with patch(
@@ -136,7 +122,7 @@ class PrefillCpuLensTest(CustomTestCase):
                         self.assertIs(
                             kernel.call_args.kwargs["q_seq_lens_cpu"], cpu_q_lens
                         )
-                        expected_kv_lens = cpu_q_lens if causal else cpu_kv_lens
+                        expected_kv_lens = cpu_q_lens if causal else cpu_prefix_lens
                         self.assertIs(
                             kernel.call_args.kwargs["kv_seq_lens_cpu"], expected_kv_lens
                         )
@@ -155,6 +141,14 @@ class PrefillCpuLensTest(CustomTestCase):
                 )
 
     def test_metadata_cpu_lengths_and_dcp(self):
+        batch = NS(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([8, 6], dtype=torch.int32, device="cuda"),
+            extend_prefix_lens=torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+            extend_prefix_lens_cpu=[3, 3],
+            extend_seq_lens_cpu=[5, 3],
+            batch_size=2,
+        )
         for dcp in (False, True):
             with (
                 self.subTest(dcp=dcp),
@@ -164,7 +158,7 @@ class PrefillCpuLensTest(CustomTestCase):
                 ),
             ):
                 backend = _backend()
-                backend.init_forward_metadata(_extend_batch())
+                backend.init_forward_metadata(batch)
                 lengths = backend.forward_prefill_metadata.seq_lens_cpu
                 self.assertEqual(
                     (lengths.dtype, lengths.device.type, lengths.tolist()),
@@ -242,12 +236,11 @@ class BreakableGraphDispatchTest(CustomTestCase):
             self.assertEqual(super_init.called, expect_super, cls.__name__)
 
 
-@skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class BreakableChunkedPrefixReplayTest(CustomTestCase):
     def test_live_prefix_topology_and_padding_across_replays(self):
         from sglang.srt.layers.radix_attention import (
             _force_eager_attn,
-            force_eager_attention,
         )
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -258,8 +251,7 @@ class BreakableChunkedPrefixReplayTest(CustomTestCase):
             forward_mha as mha,
         )
 
-        # Exercise the real core's prefix control flow with tiny deterministic
-        # attention operations. The serving harness covers the actual kernels.
+        # Deterministic attention isolates prefix control flow from kernel numerics.
         class Attention(mha.DeepseekMHAForwardMixin):
             num_local_heads = 1
             v_head_dim = 2
@@ -280,8 +272,7 @@ class BreakableChunkedPrefixReplayTest(CustomTestCase):
                 return output * gate
 
             def o_proj(self, output):
-                # K3 consumes this Python attribute during capture, not replay.
-                # Moving o_proj inside the eager callback would drop its gate.
+                # Match K3's consumption of Python gate state during capture.
                 gate_input = self.gate_hidden_states
                 self.gate_hidden_states = None
                 if gate_input is not None:
@@ -350,18 +341,9 @@ class BreakableChunkedPrefixReplayTest(CustomTestCase):
                 gate.fill_(i + 1)
                 graph.replay()
                 n = sum(lens)
-                q = (source + 1)[:n]
-                with (
-                    force_eager_attention(),
-                    patch.object(mha, "is_in_breakable_cuda_graph", return_value=False),
-                ):
-                    reference_batch = batch(lens, prefixes)
-                    reference_batch.out_cache_loc = reference_batch.out_cache_loc[:n]
-                    reference_batch.positions = reference_batch.positions[:n]
-                    attn.gate_hidden_states = gate[:n]
-                    expected = attn.forward_normal_chunked_kv_core(
-                        q, q, q, reference_batch, gate[:n]
-                    )
+                expected = (3 * (source[:n] + 1).reshape(n, 2) + sum(prefixes)) * gate[
+                    :n
+                ].square()
                 torch.testing.assert_close(output[:n], expected, atol=0, rtol=0)
                 self.assertFalse(output[n:].any())
                 self.assertIs(live.out_cache_loc, original_loc)
@@ -383,4 +365,4 @@ class BreakableChunkedPrefixReplayTest(CustomTestCase):
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

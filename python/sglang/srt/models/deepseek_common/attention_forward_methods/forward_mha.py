@@ -178,8 +178,7 @@ def forward_dsa_indexer_for_mha(
 
 @eager_on_graph(True)
 def _breakable_chunked_kv_core(attn, q, k, v):
-    # Prefix topology is Python control flow: replay the entire core, not just
-    # its suffix attention call. Never retain the capture-time ForwardBatch.
+    # Replay prefix control flow with the live batch, not the capture-time batch.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     n = forward_batch.global_num_token_non_padded_cpu
     original_out_cache_loc = forward_batch.out_cache_loc
@@ -199,8 +198,7 @@ def _breakable_chunked_kv_core(attn, q, k, v):
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
         forward_batch.positions = original_positions
-    # eager_on_graph keeps this bridge's address stable. Clear padding on every
-    # replay so a shorter batch cannot leak old rows into residual/MoE kernels.
+    # Clear stale rows when replay uses fewer tokens than the captured bucket.
     padded = output.new_zeros((q.shape[0], *output.shape[1:]))
     padded[:n].copy_(output)
     return padded
@@ -385,8 +383,7 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        # K3's o_proj wrapper consumes Python gate state set during capture.
-        # Keep it (and the gate GEMM/multiply) captured, outside the eager break.
+        # K3's o_proj consumes Python gate state during capture.
         output, _ = self.o_proj(attn_output)
         return output
 

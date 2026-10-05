@@ -162,9 +162,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    # BCG replays the entire chunked-KV core eagerly with live prefix metadata.
-    # With chunked prefixes disabled, pin absorbed MLA even at prefix-free
-    # capture: a later prefix hit must use the same projection/head layout.
+    # Without chunking, BCG must retain the absorbed layout for later prefix hits.
     if is_in_tc_piecewise_cuda_graph() or (
         is_in_breakable_cuda_graph() and attn.disable_chunked_prefix_cache
     ):

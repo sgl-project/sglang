@@ -163,9 +163,9 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    # CPU mirrors avoid synchronization in FlashInfer's empty-row check.
+    seq_lens_cpu: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
-    # CPU lengths keep FlashInfer empty-row validation asynchronous.
-    seq_lens_cpu: Optional[torch.Tensor] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -848,15 +848,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
             # DCP gathers prefix KV back to global lengths before prefill.
-            seq_lens_cpu = torch.tensor(
-                forward_batch.extend_seq_lens_cpu, dtype=torch.int32
-            )
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32),
                 fallback_to_flashinfer_impl,
-                seq_lens_cpu,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1791,12 +1788,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out_buffer=out,
                 o_sf_scale=-1.0,
                 q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
-                # FlashInfer requires both CPU length tensors or neither.
-                kv_seq_lens_cpu=(
-                    forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx]
-                    if self.forward_prefill_metadata.seq_lens_cpu is not None
-                    else None
-                ),
+                kv_seq_lens_cpu=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
