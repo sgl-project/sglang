@@ -991,6 +991,7 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: data.json_bytes.unwrap_or_default(),
                             finished: false,
+                            status_code: None,
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -999,6 +1000,10 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: bytes,
                             finished: true,
+                            status_code: data
+                                .meta_info
+                                .contains_key("status_code")
+                                .then(|| openai_status_code(&data.meta_info, 200)),
                         });
                         break;
                     }

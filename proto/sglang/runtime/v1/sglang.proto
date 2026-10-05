@@ -336,6 +336,8 @@ message OpenAIRequest {
 message OpenAIStreamChunk {
   bytes json_chunk = 1;
   bool finished = 2;
+  // HTTP status of a non-streaming response, set on its single finished chunk.
+  optional int32 status_code = 3;
 }
 
 message OpenAIResponse {
