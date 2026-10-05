@@ -346,9 +346,15 @@ class TestSm90Block32Linear(_LinearBackendCheck):
 
     def test_deepgemm_and_auto_use_native_blocks(self):
         for backend in ("deep_gemm", "auto"):
-            with self.subTest(backend=backend), mock.patch.object(
-                fp8_utils, "triton_w8a8_block_fp8_linear",
-                side_effect=AssertionError("native block32 unexpectedly fell back to Triton"),
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(
+                    fp8_utils,
+                    "triton_w8a8_block_fp8_linear",
+                    side_effect=AssertionError(
+                        "native block32 unexpectedly fell back to Triton"
+                    ),
+                ),
             ):
                 self._check_backend(backend, [backend], self._shapes, self._build_layer)
 
@@ -357,15 +363,21 @@ class TestSm90Block32Linear(_LinearBackendCheck):
 
     def test_preserves_checkpoint_and_prequantized_input(self):
         torch.manual_seed(7)
-        with mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM):
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
             layer, _ = self._build_layer(96, 288)
             original_weight = layer.weight.detach().clone()
             layer.quant_method.process_weights_after_loading(layer)
             self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
-            torch.testing.assert_close(layer.weight.float(), original_weight.float(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                layer.weight.float(), original_weight.float(), rtol=0, atol=0
+            )
             self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
             x = torch.randn(5, 288, device="cuda", dtype=torch.bfloat16) / 10
-            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(
+                x, 32, scale_ue8m0=True
+            )
             bias = torch.randn(96, device="cuda", dtype=torch.bfloat16)
             plain = layer.quant_method.apply(layer, x, bias)
             quantized = layer.quant_method.apply(layer, (q, scales), bias)

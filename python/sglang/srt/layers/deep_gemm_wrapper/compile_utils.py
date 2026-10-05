@@ -283,7 +283,10 @@ class _BaseWarmupExecutor:
     ) -> int:
         # Return the required memory space in GB for warmup executor
         _GB = 1 << 30
-        if kernel_type in (DeepGemmKernelType.GEMM_NT_F8F8BF16, DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32):
+        if kernel_type in (
+            DeepGemmKernelType.GEMM_NT_F8F8BF16,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
+        ):
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
