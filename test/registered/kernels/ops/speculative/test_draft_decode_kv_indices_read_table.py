@@ -11,18 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`generate_draft_decode_kv_indices` under the unified pool's translation.
+"""`generate_draft_decode_kv_indices` over either kind of read table.
 
-BUG REGRESSION. The multi-step draft-decode kernel copied req_to_token values
-verbatim into the per-step kv_indices. Under `--enable-unified-memory` those
-values are VIRTUAL ids while the fused draft pool is indexed by physical
-ids, so with `speculative_num_steps > 1` every draft decode step read the
-wrong KV rows -- silently: bad drafts only depress acceptance, verify stays
-correct. Pinned here: TRANSLATE=True must emit exactly `translate_kv_loc`'s
-physical ids, and TRANSLATE=False must stay byte-identical to the historical
-raw copy.
+The multi-step draft-decode kernel gathers each step's kv_indices from a read
+table. On a static pool that is `req_to_token` itself (token-granular, and the
+emitted ids must stay byte-identical to the historical raw copy); on the
+unified pool it is the iteration plan's page table, whose entries are already
+physical pages, and the kernel rebuilds token ids as `entry * ps + pos % ps`.
+Pinned here: over a physical page table the kernel emits exactly the ids
+`translate_kv_loc` would give the raw virtual ones, and the same kv_indptr.
 
-    python -m pytest test/registered/kernels/test_generate_draft_decode_kv_indices_translate.py -v
+    python -m pytest test/registered/kernels/ops/speculative/test_draft_decode_kv_indices_read_table.py -v
 """
 
 import unittest
@@ -38,15 +37,7 @@ _SENTINEL = -7
 
 
 def _run_kernel(
-    *,
-    req_to_token,
-    seq_lens,
-    positions,
-    num_steps,
-    topk,
-    page_size,
-    v2p,
-    translate,
+    *, table, entry_page_size, seq_lens, positions, num_steps, topk, page_size
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
         generate_draft_decode_kv_indices,
@@ -62,68 +53,56 @@ def _run_kernel(
     kv_indptr = torch.zeros((num_steps, bs + 1), dtype=torch.int32, device="cuda")
     generate_draft_decode_kv_indices[(num_steps, num_seqs, topk)](
         torch.arange(num_seqs, dtype=torch.int64, device="cuda"),
-        req_to_token,
+        table,
         seq_lens,
         kv_indices,
         kv_indptr,
         positions,
-        v2p if translate else None,
-        req_to_token.shape[1],
+        table.stride(0),
         width,
         kv_indptr.shape[1],
         next_power_of_2(num_seqs),
         next_power_of_2(num_steps),
         next_power_of_2(bs),
         page_size,
-        TRANSLATE=translate,
+        ENTRY_PAGE_SIZE=entry_page_size,
     )
     return kv_indices, kv_indptr
 
 
-class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
-    def _check(self, *, page_size, num_steps=3, topk=1, unused_slots=False):
+class TestDraftDecodeKVIndicesReadTable(CustomTestCase):
+    def _check(self, *, page_size, num_steps=3, topk=1):
         torch.manual_seed(7)
         num_seqs, max_context = 3, 64
-        num_pages = max_context // page_size + 1
-        # Virtual ids: a shuffled page layout so translation is not identity.
-        perm = torch.randperm(num_pages, device="cuda")
-        v2p = torch.empty(num_pages, dtype=torch.int64, device="cuda")
-        v2p[perm] = torch.arange(num_pages, device="cuda")
-        req_to_token = (
-            torch.arange(max_context, dtype=torch.int64, device="cuda")
-            .flip(0)
-            .repeat(num_seqs, 1)
-        )
-        if unused_slots:
-            # Negative entries inside the read window must land on the sink.
-            req_to_token[:, ::3] = -1
-        seq_lens = torch.tensor([5, 1, 9], dtype=torch.int64, device="cuda")[:num_seqs]
+        num_pages = max_context // page_size
+        # Each row holds whole virtual pages in a shuffled order, and the
+        # virtual->physical table is a shuffle too, so nothing is identity.
+        v2p = torch.randperm(num_pages, device="cuda")
+        rows = []
+        for _ in range(num_seqs):
+            vpages = torch.randperm(num_pages, device="cuda")
+            offsets = torch.arange(page_size, device="cuda")
+            rows.append((vpages[:, None] * page_size + offsets).reshape(-1))
+        req_to_token = torch.stack(rows)
+        # The plan's table: one physical page per virtual page of the row.
+        table = v2p[req_to_token[:, ::page_size] // page_size].to(torch.int32)
+        seq_lens = torch.tensor([5, 1, 9], dtype=torch.int64, device="cuda")
         positions = seq_lens.repeat_interleave(topk)
-
         common = dict(
-            req_to_token=req_to_token,
             seq_lens=seq_lens,
             positions=positions,
             num_steps=num_steps,
             topk=topk,
             page_size=page_size,
-            v2p=v2p,
         )
-        raw, raw_indptr = _run_kernel(translate=False, **common)
-        out, out_indptr = _run_kernel(translate=True, **common)
+        raw, raw_indptr = _run_kernel(table=req_to_token, entry_page_size=1, **common)
+        out, out_indptr = _run_kernel(table=table, entry_page_size=page_size, **common)
 
         torch.testing.assert_close(raw_indptr, out_indptr, rtol=0, atol=0)
         written = raw != _SENTINEL
-        # Unwritten lanes stay untouched in both compilations.
         self.assertTrue(bool((out[~written] == _SENTINEL).all()))
-        # Written lanes: translate_kv_loc's formula over the raw ids.
         virt = raw[written]
-        page = torch.where(virt < 0, 0, virt // page_size)
-        expected = torch.where(
-            virt < 0,
-            0,
-            torch.clamp_min(v2p[page] * page_size + virt % page_size, 0),
-        )
+        expected = v2p[virt // page_size] * page_size + virt % page_size
         torch.testing.assert_close(out[written], expected, rtol=0, atol=0)
 
     def test_page_size_one(self):
@@ -136,36 +115,28 @@ class TestGenerateDraftDecodeKVIndicesTranslate(CustomTestCase):
             self.skipTest("CUDA required")
         self._check(page_size=2)
 
-    def test_negative_ids_map_to_the_sink(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA required")
-        for page_size in (1, 2):
-            self._check(page_size=page_size, unused_slots=True)
-
-    def test_translate_false_is_a_raw_copy(self):
-        """The static-pool compilation must stay byte-identical to the
-        historical kernel: the emitted indices ARE the req_to_token values."""
+    def test_token_table_is_a_raw_copy(self):
+        """The static-pool compilation stays byte-identical to the historical
+        kernel: the emitted indices ARE the req_to_token values."""
         if not torch.cuda.is_available():
             self.skipTest("CUDA required")
         torch.manual_seed(11)
-        num_seqs, max_context, page_size = 2, 32, 1
+        num_seqs, max_context = 2, 32
         req_to_token = torch.randint(
             0, 1 << 20, (num_seqs, max_context), dtype=torch.int64, device="cuda"
         )
         seq_lens = torch.tensor([4, 7], dtype=torch.int64, device="cuda")
         raw, _ = _run_kernel(
-            req_to_token=req_to_token,
+            table=req_to_token,
+            entry_page_size=1,
             seq_lens=seq_lens,
             positions=seq_lens,
             num_steps=2,
             topk=1,
-            page_size=page_size,
-            v2p=None,
-            translate=False,
+            page_size=1,
         )
         written = raw != _SENTINEL
-        emitted = raw[written]
-        self.assertTrue(bool(torch.isin(emitted, req_to_token.flatten()).all()))
+        self.assertTrue(bool(torch.isin(raw[written], req_to_token.flatten()).all()))
 
 
 if __name__ == "__main__":

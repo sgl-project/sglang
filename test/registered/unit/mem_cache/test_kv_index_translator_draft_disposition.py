@@ -435,12 +435,11 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         passthrough = _source(allocator, _FakeKVCache(64))
         self.assertIsNone(passthrough.full_flat_v2p())
 
-    def test_multi_step_containers_pass_the_v2p_table_to_the_kernel(self):
-        """Every `generate_draft_decode_kv_indices` launch must thread the
-        runner's v2p table and a matching TRANSLATE flag. A launch
-        without them emits raw req_to_token values, which under the unified
-        pool are VIRTUAL ids the fused draft pool cannot address — the exact
-        silent-garbage bug this series fixed."""
+    def test_multi_step_containers_read_the_plans_table(self):
+        """Every `generate_draft_decode_kv_indices` launch must gather from
+        `read_source` with its entry granularity. A launch over raw
+        req_to_token emits VIRTUAL ids, which the fused draft pool cannot
+        address -- silent garbage drafts."""
         import pathlib
         import re
 
@@ -454,23 +453,20 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             if launches:
                 launching[path.name] = (
                     launches,
-                    len(re.findall(r"TRANSLATE=v2p is not None", text)),
-                    "full_flat_v2p" in text,
+                    len(re.findall(r"ENTRY_PAGE_SIZE=src\.entry_page_size", text)),
+                    "kv_index_translator.read_source(" in text,
                 )
         self.assertGreaterEqual(
             len(launching), 4, f"launch sites disappeared: {sorted(launching)}"
         )
-        for name, (launches, translated, has_accessor) in launching.items():
+        for name, (launches, granular, has_source) in launching.items():
             self.assertEqual(
                 launches,
-                translated,
-                f"{name}: {launches} kernel launch(es) but only {translated} "
-                "carry TRANSLATE=v2p is not None",
+                granular,
+                f"{name}: {launches} kernel launch(es) but only {granular} "
+                "pass the read table's entry granularity",
             )
-            self.assertTrue(
-                has_accessor,
-                f"{name} launches the kernel without full_flat_v2p",
-            )
+            self.assertTrue(has_source, f"{name} launches without read_source")
 
 
 class TestDispositionBranchesAgree(unittest.TestCase):

@@ -2435,18 +2435,21 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
-        v2p = self.kv_index_translator.full_flat_v2p()
+        src = self.kv_index_translator.read_source(
+            forward_batch.kv_loc_plan,
+            req_pool_indices=forward_batch.req_pool_indices,
+            bs=num_seqs,
+        )
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
-            forward_batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
+            src.row_ids,
+            src.ids,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            v2p,
-            self.pool_len,
+            src.row_stride,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
@@ -2455,7 +2458,7 @@ class TritonMultiStepDraftBackend:
             self.page_size,
             self.draft_window_size,
             self.draft_sink_size,
-            TRANSLATE=v2p is not None,
+            ENTRY_PAGE_SIZE=src.entry_page_size,
         )
 
         if call_fn is None:
