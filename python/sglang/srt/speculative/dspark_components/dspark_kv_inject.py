@@ -70,8 +70,9 @@ class TargetHiddenKvInjector:
                 device=device, dtype=torch.int64, non_blocking=True
             )
 
-        # The translate returns a fresh tensor (identity on a plain pool), so
-        # the callers' locs stay virtual.
+        # On a translating pool the translate writes a new tensor, so the
+        # callers' locs stay virtual; on a plain pool it returns `cache_loc`
+        # itself.
         translator = self.draft_model_runner.kv_index_translator
         cache_loc = translator.translate_full_attn_ids(cache_loc)
         if cache_loc_2d is not None:

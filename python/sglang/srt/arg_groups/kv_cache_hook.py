@@ -505,16 +505,18 @@ def _assert_spec_verify_backends(
     draft indexes its own pool by virtual id."""
     if allowed is None:
         allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    dcp_note = ""
     if resolving_view(server_args).dcp_size > 1:
         # flashinfer's spec verify gathers its CSR args with no DCP read
         # translation (`translate_dcp_read_ids`); the MLA verify family builds
         # its DCP block table itself.
         allowed = allowed - {"flashinfer"}
+        dcp_note = " (flashinfer is excluded under --dcp-size > 1)"
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
         f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
-        f"attention backends {sorted(allowed)} for both prefill "
+        f"attention backends {sorted(allowed)}{dcp_note} for both prefill "
         f"and decode; got {sorted(backends)}. Other backends do "
         "not translate speculative verify indices to the unified "
         "pool's physical ids yet."
@@ -674,20 +676,21 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
     assert not (
         cfg.speculative_algorithm is not None
-        and (
-            (
-                cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
-                and cfg.enable_hierarchical_cache
-            )
-            or cfg.disaggregation_decode_retraction_backup == "host_pool"
-        )
+        and cfg.disaggregation_decode_retraction_backup == "host_pool"
     ), (
         "--enable-unified-memory with a draft model does not support "
-        "--disaggregation-decode-retraction-backup=host_pool, nor an "
-        "EAGLE/EAGLE3 draft with --enable-hierarchical-cache: both build host "
-        "pools off the draft's device pool, and a draft fused into the "
-        "target's entries has no transfer surface of its own (the page "
-        "envelope host pool refuses per-layer draft loads)."
+        "--disaggregation-decode-retraction-backup=host_pool: it builds the "
+        "draft's host pool off a device pool of its own, which a draft fused "
+        "into the target's entries does not have."
+    )
+    assert not (
+        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.enable_hierarchical_cache
+    ), (
+        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--enable-hierarchical-cache: HiCache keeps the draft on a private "
+        "pool, and would pack an MTP head's KV into the target's "
+        "page-envelope host pool, which refuses per-layer draft loads."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)

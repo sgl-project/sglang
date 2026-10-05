@@ -328,11 +328,11 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
     def test_hierarchical_cache_refused_with_an_eagle_draft(self):
-        """HiCache builds a draft host pool off the draft's device pool, and a
-        fused draft view has no transfer surface of its own: the page-envelope
-        host pool refuses per-layer draft loads. Without a draft HiCache is
-        not this gate's to refuse, and with DSPARK HiCache declines draft
-        fusion, so the draft keeps its private pool."""
+        """Under HiCache an EAGLE draft keeps a private pool, and an MTP
+        head's KV would be packed into the target's page-envelope host pool,
+        which refuses per-layer draft loads. Without a draft HiCache is not
+        this gate's to refuse, and with DSPARK HiCache declines draft fusion,
+        so the draft keeps its private pool."""
         hicache = {"enable_hierarchical_cache": True}
         for algorithm in ("EAGLE", "EAGLE3"):
             self.assertFalse(_accepts(algorithm, fields=hicache))
@@ -340,10 +340,8 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         self.assertTrue(_accepts("DSPARK", fields=hicache))
 
     def test_pd_decode_refusals_raise_their_own_assertions(self):
-        """The PD-decode branches screen the model with `mambaish_config`. A
-        function-local import of that name further down made it local to the
-        whole handler, so these branches raised UnboundLocalError instead of
-        their refusal."""
+        """The PD-decode branches screen the model with `mambaish_config` and
+        refuse with their own assertion, not an error from the screen."""
         pd_decode = {
             "disaggregation_mode": "decode",
             "disaggregation_transfer_backend": "mooncake",

@@ -735,8 +735,9 @@ class KVCacheConfigurator:
     def _fused_draft_from_target_buffer(self, alloc):
         """The placement this draft binds to, or None for the private-pool
         fallback (the draft then owns a raw-virtual-indexed pool of its own).
-        Target boot declines a placement for legitimate geometry, so the
-        private arm is the rollback lever, not a boot-order bug."""
+        Target boot declines a placement whenever the fused region cannot
+        serve the draft (`_fused_draft_decision`), so the private arm is the
+        rollback lever, not a boot-order bug."""
         if not (
             self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
@@ -959,12 +960,14 @@ class KVCacheConfigurator:
         )
 
     def _fused_draft_decision(self):
-        """Whether, and where, the EAGLE draft's layers fuse into the target's
+        """Whether, and where, the draft's layers fuse into the target's
         sub-pools. Fusion applies only for: unified memory ON, a unified target
         (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
         or DFLASH/DSPARK algorithm whose draft config was loaded at target
-        boot; `place_fused_draft` then admits or declines the draft's layer
-        kinds."""
+        boot. It declines, keeping the draft's private pool, for a non-MHA
+        draft, a draft backend off the translated MHA rails, DCP, HiCache, or
+        an explicit draft KV dtype unlike the host's; `place_fused_draft` then
+        admits or declines the draft's layer kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,

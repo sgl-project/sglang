@@ -1845,9 +1845,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
-        # The translate returns a fresh tensor (identity on a plain pool), so
-        # the callers' locs stay virtual: the post-verify 2-D buffer is re-read
-        # as virtual ids by the compact req_to_token rebuild.
+        # On a translating pool the translate writes a new tensor, so the
+        # callers' locs stay virtual: the post-verify 2-D buffer is re-read as
+        # virtual ids by the compact req_to_token rebuild. On a plain pool it
+        # returns `cache_loc` itself.
         translator = self.draft_model_runner.kv_index_translator
         cache_loc = translator.translate_full_attn_ids(cache_loc)
         if cache_loc_2d is not None:
