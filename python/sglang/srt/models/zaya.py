@@ -53,9 +53,9 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
@@ -1320,12 +1320,8 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.attn_boundary,) = make_stages(
+        (self.attn_boundary,) = append_stages(
             (declare_attn(read=_ResidualMergeRead(self.res_scale)), self.input_norm),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.entry_boundary = self.attn_boundary
 
@@ -1375,7 +1371,7 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.ffn_boundary,) = make_stages(
+        (self.ffn_boundary,) = append_stages(
             (
                 declare_ffn(
                     sparse=True,
@@ -1384,8 +1380,6 @@ class ZayaDecoderMLPLayer(nn.Module):
                 ),
                 self.input_norm,
             ),
-            previous=declare_attn(),
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.entry_boundary = self.ffn_boundary
 

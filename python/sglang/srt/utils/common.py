@@ -233,7 +233,7 @@ def is_musa() -> bool:
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -535,7 +535,23 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -595,7 +611,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -862,6 +883,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -914,6 +945,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -932,6 +965,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -1032,6 +1068,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -1095,6 +1137,10 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1496,6 +1542,33 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
+# Set while a layer another pipeline stage holds is built, only for the stage
+# boundaries it declares.
+_building_neighbour_layer = False
+
+
+def is_building_neighbour_layer() -> bool:
+    """Whether the layer under construction belongs to another pipeline stage
+    and is built here only to read the stage boundaries it declares. It is
+    built on the meta device and never loaded or run, so its constructor skips
+    the host and device resources a running layer needs: tables, streams,
+    engines and communicators."""
+    return _building_neighbour_layer
+
+
+@contextmanager
+def building_neighbour_layer():
+    """Build a pipeline neighbour layer: on the meta device, with
+    is_building_neighbour_layer() true."""
+    global _building_neighbour_layer
+    outer, _building_neighbour_layer = _building_neighbour_layer, True
+    try:
+        with torch.device("meta"):
+            yield
+    finally:
+        _building_neighbour_layer = outer
+
+
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1509,9 +1582,16 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across
+    a pipeline stage boundary the stack learns the neighbouring stage from the
+    layer itself, built again on the meta device.
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import layer_stack
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1525,20 +1605,30 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        return functools.partial(
+            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+    ):
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (
+                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    for idx in range(start_layer, end_layer)
+                ),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
+        )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
@@ -1565,6 +1655,21 @@ def make_pp_layers(
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
     )
+
+
+def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
+    """Build a layer another pipeline stage holds, only for the stage
+    boundaries it declares (see building_neighbour_layer). RoPE modules it
+    adds to the shared cache are meta, so they are dropped again."""
+    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+    cached = set(_ROPE_DICT)
+    try:
+        with building_neighbour_layer():
+            layer_fn(idx=idx, prefix=prefix)
+    finally:
+        for key in set(_ROPE_DICT) - cached:
+            del _ROPE_DICT[key]
 
 
 def set_random_seed(seed: int) -> None:

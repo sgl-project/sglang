@@ -68,10 +68,43 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+# Route supported decode shapes that are absent from the tuned table.
+_A16W16_TRITON_MAX_K = 2048
+_A16W16_TRITON_MAX_M = 64
+_A16W16_TRITON_NARROW_K = 512
+_A16W16_TRITON_NARROW_K_MAX_M = 512
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
+    return (
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.shape[1] == k
+        and 0 < k <= _A16W16_TRITON_MAX_K
+        and 0 < x.shape[0] <= max_m
+        and weight.shape[0] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
 
 
 class Bf16GemmBackend(Enum):
@@ -479,6 +512,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (

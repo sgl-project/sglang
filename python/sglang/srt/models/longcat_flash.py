@@ -52,9 +52,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -412,7 +413,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_boundary, self.moe_boundary = make_stages(
+        self.attn_boundary, self.moe_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm[0],
@@ -422,13 +423,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm[0],
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if self.layer_id != 0
-            else None,
-            terminal=self.layer_id == config.num_hidden_layers - 1,
         )
         self.first_ffn_boundary, self.second_attn_boundary, self.second_ffn_boundary = (
-            make_stages(
+            append_stages(
                 (
                     declare_ffn(),
                     self.post_attention_layernorm[0],
@@ -562,18 +559,19 @@ class LongcatFlashModel(nn.Module):
             )
 
         self.alt_stream = get_stream("alt")
-        self.layers = nn.ModuleList(
-            [
-                LongcatFlashDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LongcatFlashDecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        alt_stream=self.alt_stream,
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
