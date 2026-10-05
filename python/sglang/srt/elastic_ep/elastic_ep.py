@@ -580,18 +580,21 @@ def clear_expert_map_inbox(group_rank: int) -> None:
 
 
 def share_expert_map_via_store(
-    tensor: torch.Tensor, *, is_src: bool, cohort_size: int, group_rank: int
+    tensor: torch.Tensor, *, is_src: bool, cohort_ranks: Sequence[int], group_rank: int
 ) -> bool:
     """Hand the expert map to the cohort over the store, one inbox per reader. False = no
     store, caller falls back to the collective. Not a broadcast: Mooncake drives one through
     putTaskCuda, which syncs the stream from inside the collective. An inbox, not a shared
-    round, since a round keyed on participant count desyncs when the width changes."""
+    round, since a round keyed on participant count desyncs when the width changes.
+
+    Addressed by rank id, not by position: a reader waits on the inbox named for its own
+    rank, and after a fault the live ids are no longer 0..n-1."""
     store = _store_or_none("[Elastic EP][expert map]")
-    if store is None or cohort_size <= 1:
+    if store is None or len(cohort_ranks) <= 1:
         return False
     if is_src:
         blob = tensor.cpu().numpy().tobytes()
-        for peer in range(cohort_size):
+        for peer in cohort_ranks:
             if peer != group_rank:
                 store.set(_EXPERT_MAP_INBOX_KEY.format(peer), blob)
         return True
@@ -715,17 +718,30 @@ def assert_shrink_supported() -> None:
         ) from exc
 
 
+def live_cohort_ranks() -> Tuple[int, ...]:
+    """The live ranks themselves, for anything that addresses a peer rather than counts
+    them.
+
+    A shrink retires the top slots, so there the live ranks are 0..n-1 and the count
+    doubles as the id range. A fault clears any bit, so after one the two part ways: at
+    width 6 with rank 4 down the count is 5 while the ids are 0,1,2,3,5. Addressing
+    ``range(count)`` there writes to the rank that just died and skips a live one."""
+    inst = ElasticEPStateManager.instance()
+    if inst is None or inst.active_ranks_cpu is None or not inst.effective_ep_size:
+        if torch.distributed.is_initialized():
+            return tuple(range(torch.distributed.get_world_size()))
+        return (0,)
+    return tuple(
+        i for i in range(inst.effective_ep_size) if int(inst.active_ranks_cpu[i])
+    )
+
+
 def live_cohort_size() -> int:
     """Live rank count, for scoping collectives that WORLD would run past retirees.
 
     ``effective_ep_size`` follows the commit, so this is the post-scale width once a
     shrink lands; WORLD still counts the ranks that have since called sys.exit()."""
-    inst = ElasticEPStateManager.instance()
-    if inst is None or inst.active_ranks_cpu is None or not inst.effective_ep_size:
-        if torch.distributed.is_initialized():
-            return torch.distributed.get_world_size()
-        return 1
-    return int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
+    return len(live_cohort_ranks())
 
 
 def seed_barrier_epochs() -> None:
@@ -1443,6 +1459,19 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
+    # Snapshot first, then stand down: a rank whose own bit the cohort cleared is not in
+    # the cohort any more, so every rendezvous below is addressed to the ranks that are.
+    # It waits to be recovered instead. Taking part would be a peer the others never
+    # expect, and the expert map it blocks on is one nobody sends. Reachable because the
+    # combine timeout that clears a bit is a liveness guess: a rank that merely stalled
+    # for a forward is still running to see the verdict land on itself.
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() not in live_cohort_ranks():
+            logger.warning(
+                "[Elastic EP] this rank was marked inactive by the cohort; "
+                "standing down from the fault rebalance and awaiting recovery"
+            )
+            return False
     logger.info("EPLB due to rank faults")
     gen = eplb_manager.rebalance()
     while True:

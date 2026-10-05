@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 
 import torch.cuda
 import torch.distributed as dist
@@ -285,7 +285,9 @@ class EPLBManager:
             return False
 
         p2l = proposed if is_owner else torch.empty_like(current_p2l)
-        self._share_p2l(p2l, is_owner=is_owner, cohort_size=cohort_size)
+        # A scale cohort is dense: a shrink retires the top slots and a grow fills them,
+        # so here the count is also the id range. The fault path takes live ids instead.
+        self._share_p2l(p2l, is_owner=is_owner, cohort_ranks=range(cohort_size))
         new_metadata = None
         try:
             new_metadata = ExpertLocationMetadata.init_by_mapping(
@@ -361,23 +363,26 @@ class EPLBManager:
 
     @staticmethod
     def _share_p2l(
-        p2l: torch.Tensor, *, is_owner: bool, cohort_size: Optional[int] = None
+        p2l: torch.Tensor,
+        *,
+        is_owner: bool,
+        cohort_ranks: Optional[Sequence[int]] = None,
     ) -> None:
         """Hand rank 0's layout to the cohort, scoped to the ranks still running.
 
         Not dist.broadcast on the default group: that is WORLD, which keeps counting
         retirees after a shrink commits, so the owner would wait on exited ranks."""
         from sglang.srt.elastic_ep.elastic_ep import (
-            live_cohort_size,
+            live_cohort_ranks,
             share_expert_map_via_store,
         )
 
-        if cohort_size is None:
-            cohort_size = live_cohort_size()
+        if cohort_ranks is None:
+            cohort_ranks = live_cohort_ranks()
         if not share_expert_map_via_store(
             p2l,
             is_src=is_owner,
-            cohort_size=cohort_size,
+            cohort_ranks=cohort_ranks,
             group_rank=dist.get_rank(),
         ):
             # No store configured: the old path, as in expert_location.py.
