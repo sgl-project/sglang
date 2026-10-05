@@ -28,7 +28,7 @@ prices. Pinned:
     declines: it would read the fused rows without the KV-index translator;
   - so does a draft under --dcp-size > 1, where each rank's host rows hold
     only its share of the tokens the replicated draft reads, and a draft
-    under a host-pool-backed cache, which needs a device pool of its own;
+    under HiCache, which builds its host pool off a device pool of its own;
   - an explicit draft KV dtype unlike the host's declines;
   - the profile divides the draft's heads by attn_tp, as the target does;
   - a placement whose runner lane counts do not fill its region is refused;
@@ -256,8 +256,6 @@ class TestFusedDraftDecision(CustomTestCase):
         target_backends=("triton", "triton"),
         dcp_size=1,
         hicache=False,
-        external_linker=False,
-        retraction_backup="none",
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
@@ -290,12 +288,7 @@ class TestFusedDraftDecision(CustomTestCase):
             ),
         )
         memory = SimpleNamespace(
-            enable_unified_memory=True,
-            enable_hierarchical_cache=hicache,
-            enable_unified_cache_external_linker=external_linker,
-        )
-        disagg = SimpleNamespace(
-            disaggregation_decode_retraction_backup=retraction_backup
+            enable_unified_memory=True, enable_hierarchical_cache=hicache
         )
         spec = SimpleNamespace(
             speculative_num_steps=1,
@@ -305,7 +298,6 @@ class TestFusedDraftDecision(CustomTestCase):
         with (
             patch.object(kvc, "get_memory", return_value=memory),
             patch.object(kvc, "get_spec", return_value=spec),
-            patch.object(kvc, "get_disagg", return_value=disagg),
             patch.object(
                 kvc,
                 "get_model",
@@ -381,18 +373,13 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertIsNone(declined.placement, algorithm)
             self.assertIn("--dcp-size 2", declined.declined)
 
-    def test_a_host_pool_backed_cache_keeps_the_private_pool(self):
-        """HiCache, the external linker and host-pool retraction build the
-        draft's host pool off its own device pool, which a fused draft does
-        not have; DSPARK + HiCache keeps working on the private pool."""
-        for kwargs, flag in (
-            (dict(hicache=True), "--enable-hierarchical-cache"),
-            (dict(external_linker=True), "--enable-unified-cache-external-linker"),
-            (dict(retraction_backup="host_pool"), "host_pool"),
-        ):
-            declined = self._decide(algorithm="DSPARK", **kwargs)
-            self.assertIsNone(declined.placement, flag)
-            self.assertIn(flag, declined.declined)
+    def test_hierarchical_cache_keeps_the_private_pool(self):
+        """HiCache builds the draft's host pool off its own device pool, which
+        a fused draft does not have; DSPARK + HiCache keeps working on the
+        private pool."""
+        declined = self._decide(algorithm="DSPARK", hicache=True)
+        self.assertIsNone(declined.placement)
+        self.assertIn("--enable-hierarchical-cache", declined.declined)
 
 
 class TestMambaHostPrivateDraftRefused(CustomTestCase):

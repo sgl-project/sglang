@@ -1035,21 +1035,15 @@ class KVCacheConfigurator:
                     "rows, but the replicated draft reads every token"
                 )
             )
-        # These build the draft's host pool off its own device pool, which a
-        # fused draft does not have.
+        # HiCache builds the draft's host pool off its own device pool, which a
+        # fused draft does not have. The external linker and host-pool
+        # retraction would too; the gate refuses the linker on the unified
+        # pool and host-pool retraction with any draft.
         if get_memory().enable_hierarchical_cache:
-            host_pool_flag = "--enable-hierarchical-cache"
-        elif get_memory().enable_unified_cache_external_linker:
-            host_pool_flag = "--enable-unified-cache-external-linker"
-        elif get_disagg().disaggregation_decode_retraction_backup == "host_pool":
-            host_pool_flag = "--disaggregation-decode-retraction-backup=host_pool"
-        else:
-            host_pool_flag = None
-        if host_pool_flag is not None:
             return FusedDraftDecision(
                 declined=(
-                    f"{host_pool_flag} builds the draft's host pool off a device "
-                    "pool of its own"
+                    "--enable-hierarchical-cache builds the draft's host pool "
+                    "off a device pool of its own"
                 )
             )
         profile = draft_kv_profile(
