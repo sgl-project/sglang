@@ -34,6 +34,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
@@ -735,6 +736,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
+        self._shared_vocab_parallel_layout = resolve_linear_parallel_group("tp")
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -919,27 +921,39 @@ class Gemma3ForCausalLM(PreTrainedModel):
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
+    def _shard_weight(
+        self, weight: torch.Tensor, *, draft_embedding=None
+    ) -> torch.Tensor:
+        """Shard a full embedding/lm_head using its export or recipient draft layout.
 
         Gemma3 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
         VocabParallelEmbedding (sharded). This method extracts the correct
         shard so the weights can be shared.
         """
-        tp_size = get_parallel().tp_size
+        tp_rank, tp_size = self._shared_vocab_parallel_layout
+        if draft_embedding is not None:
+            tp_size = draft_embedding.tp_size
+            indices = draft_embedding.shard_indices
+            tp_rank = (
+                indices.padded_org_vocab_start_index // indices.num_org_elements_padded
+            )
         if tp_size <= 1:
             return weight
-        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
     def get_embed(self):
         return self._shard_weight(self.model.embed_tokens.weight)
 
-    def get_embed_and_head(self):
-        embed = self._shard_weight(self.model.embed_tokens.weight)
-        head = self._shard_weight(self.lm_head.weight)
+    def get_embed_and_head(self, *, draft_embedding=None):
+        embed = self._shard_weight(
+            self.model.embed_tokens.weight, draft_embedding=draft_embedding
+        )
+        head = self._shard_weight(self.lm_head.weight, draft_embedding=draft_embedding)
         return embed, head
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.get_embed_and_head(draft_embedding=draft_embedding)
 
 
 class EmbeddingGemmaModel(Gemma3ForCausalLM):
@@ -957,6 +971,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         PreTrainedModel.__init__(self, config=config)
         self.config = config
         self.quant_config = quant_config
+        self._shared_vocab_parallel_layout = resolve_linear_parallel_group("tp")
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
