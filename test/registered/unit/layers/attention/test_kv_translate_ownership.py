@@ -164,7 +164,7 @@ def _build_wrappers(translator):
 class TestWrapperBackendsForwardTranslator(CustomTestCase):
     """Bug regression: `AttentionBackend.kv_index_translator` defaults to None,
     so a wrapper that does not re-expose its inner's copy makes producers skip
-    the virtual->kernel-facing translation instead of failing."""
+    the virtual->physical translation instead of failing."""
 
     def test_every_wrapper_is_constructed_here(self):
         self.assertEqual(

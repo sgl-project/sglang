@@ -17,6 +17,13 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
 )
 from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.cp.utils import (
+    ContextParallelStrategyKind,
+    cp_materialize_global_token_order,
+    cp_shard_hidden_states,
+    cp_shard_position_ids,
+    get_cp_strategy,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -193,6 +200,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
+                out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
@@ -200,6 +208,8 @@ class QSAIndexer(MultiPlatformOp):
             -1, self.index_n_heads, self.index_head_dim
         )
         q = self.apply_rope(positions, q)
+        if pool is not None:
+            q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
 
     def normalize_compressed_keys(
@@ -522,12 +532,96 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
+    def forward_cuda_cp(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+        global_rope_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill CP: score only this rank's zigzag query rows.
+
+        ``hidden_states``/``positions`` are the local (padded) rows and their
+        RoPE positions. Index q/k are projected for the local rows only; the raw
+        keys are all-gathered into global token order so the pending-group ring
+        store and the block compression run on the batch's global write plan
+        exactly as without CP (every rank ends up with the complete compressed-K
+        cache). Selection then scores the local rows against all compressed
+        blocks of their request, position-driven, so the output rows line up
+        with the local query rows the sparse attention consumes."""
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+            strategy_name = strategy.name if strategy is not None else "none"
+            raise NotImplementedError(
+                "QSA prefill CP only supports the zigzag strategy; "
+                f"got {strategy_name}."
+            )
+        meta = forward_batch.attn_cp_metadata
+        num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        global_logical = getattr(forward_batch, "positions", None)
+        global_logical = (
+            global_logical[0] if global_logical.ndim == 2 else global_logical
+        ).flatten()
+        num_global = indexer_metadata.get_token_to_batch_idx().numel()
+        global_logical = global_logical[:num_global]
+        local_logical = cp_shard_position_ids(global_logical, forward_batch)[:num_local]
+        local_sequence_ids = cp_shard_hidden_states(
+            indexer_metadata.get_token_to_batch_idx(), forward_batch
+        )[:num_local]
+        hidden_states = hidden_states[:num_local]
+        positions = (
+            positions[:, :num_local] if positions.ndim == 2 else positions[:num_local]
+        )
+        # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
+        # the ring store until raw local K has been gathered into global order.
+        q, token_k, _ = self.project_qk(
+            hidden_states, positions, pool=indexer_metadata.token_to_kv_pool
+        )
+        # Raw keys of all new tokens in global packed order: the ring store
+        # and compression use the global write plan unchanged. Cached prefix
+        # groups already reside in the compressed-K pool on every rank.
+        token_k_local = token_k.reshape(num_local, -1).contiguous()
+        token_k_full = cp_materialize_global_token_order(
+            token_k_local, forward_batch
+        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        global_rope = (
+            global_rope_positions[:, :num_global]
+            if global_rope_positions.ndim == 2
+            else global_rope_positions[:num_global]
+        )
+        self.update_key_state_and_compress(
+            token_k_full,
+            global_logical,
+            global_rope,
+            indexer_metadata,
+            state_slots=indexer_metadata.pending_ring_slots,
+            state_stored=False,
+        )
+        compressed_keys, row_starts, row_ends, sequence_lengths = (
+            indexer_metadata.get_prefill_mqa_inputs(
+                self.layer_id, local_logical, query_sequence_ids=local_sequence_ids
+            )
+        )
+        row_sequence_lengths = sequence_lengths.index_select(
+            0, local_sequence_ids.long()
+        )
+        return self.select_prefill_tokens(
+            q,
+            compressed_keys,
+            row_starts,
+            row_ends,
+            local_logical,
+            row_sequence_lengths,
+        )
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
+        cp_global_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Portable orchestration shared by different platforms.
         Fast paths are gated per platforms inside kernel calls.
@@ -535,6 +629,16 @@ class QSAIndexer(MultiPlatformOp):
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+        if cp_global_rope_positions is not None and not (
+            forward_mode.is_decode() or is_target_verify or is_draft_extend
+        ):
+            return self.forward_cuda_cp(
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                cp_global_rope_positions,
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
             # from the physical paged-KV position.  Compression and sparse
@@ -641,9 +745,14 @@ class QSAIndexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
+        cp_global_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._forward_impl(
-            hidden_states, positions, forward_batch, indexer_metadata
+            hidden_states,
+            positions,
+            forward_batch,
+            indexer_metadata,
+            cp_global_rope_positions,
         )
 
     def forward_xpu(
