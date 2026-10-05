@@ -898,6 +898,40 @@ def test_sp_route_on_prepared_launcher_is_prepared_once_and_reused(sp_env, caplo
     assert "[cake-route] sp_all_gather_matmul: Cake kernel selected" in caplog.text
 
 
+def test_sp_route_call_counts_and_debug_log_per_call(sp_env, caplog, monkeypatch):
+    """Every decision is counted per (event, N); with SGLANG_CAKE_DEBUG each call
+    is logged, so admission can be read off the engine log (one prepare, two
+    prepared launches here)."""
+    from sglang.srt.environ import envs
+
+    monkeypatch.setenv(envs.SGLANG_CAKE_DEBUG.name, "1")
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, _ = _sp_kernels()
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp.clone(), None)
+    assert sp_mod.cake_sp_call_counts() == {
+        ("prepare", N): 1,
+        ("taken-prepared", N): 2,
+    }
+    calls = [
+        line
+        for line in caplog.text.splitlines()
+        if "sp_all_gather_matmul call:" in line
+    ]
+    assert len(calls) == 3
+    assert (
+        f"event=prepare rows={ROWS} N={N} world_size={TP} capacity={ROWS}" in calls[0]
+    )
+    assert (
+        calls[1].count(f"event=taken-prepared rows={ROWS} N={N} world_size={TP}") == 1
+    )
+    sp_mod.reset_cake_sp_state_for_tests()
+    assert sp_mod.cake_sp_call_counts() == {}
+
+
 def test_sp_route_on_functional_kernel_when_prepared_not_admitted(sp_env):
     kernels, launchers = _sp_kernels(prepare_ok=False)
     supports_ag, supports_prepare, ag, prepare = kernels

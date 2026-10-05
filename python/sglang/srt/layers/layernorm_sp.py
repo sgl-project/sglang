@@ -38,11 +38,13 @@ from __future__ import annotations
 import functools
 import logging
 import re
+from collections import Counter
 from typing import Callable, Optional
 
 import torch
 
 from sglang.kernels.cake_kernels._routes import cake_route_enabled
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -242,6 +244,10 @@ _cake_sp_rejected: set[tuple] = set()
 _cake_sp_launchers: dict[
     int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]
 ] = {}
+# (event, N) -> calls; events: taken-prepared, taken, fallback, prepare. Read by
+# ``cake_sp_call_counts`` (tests, offline tools); with ``SGLANG_CAKE_DEBUG`` every
+# call is also logged, so admission can be counted from the engine log.
+_cake_sp_calls: Counter = Counter()
 
 
 def _cake_sp_reason_kind(detail: str) -> str:
@@ -271,10 +277,33 @@ def _log_cake_sp_once(event: str, detail: str) -> None:
         )
 
 
+def _count_cake_sp_call(
+    event: str, rows: int, n: int, world_size: int, **extra
+) -> None:
+    _cake_sp_calls[(event, int(n))] += 1
+    if envs.SGLANG_CAKE_DEBUG.get():
+        logger.info(
+            "%s %s call: event=%s rows=%d N=%d world_size=%d%s",
+            _CAKE_LOG_PREFIX,
+            CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+            event,
+            rows,
+            n,
+            world_size,
+            "".join(f" {k}={v}" for k, v in extra.items()),
+        )
+
+
+def cake_sp_call_counts() -> dict[tuple[str, int], int]:
+    """Per-(event, N) call counts of the SP all-gather matmul route so far."""
+    return dict(_cake_sp_calls)
+
+
 def reset_cake_sp_state_for_tests() -> None:
     _cake_sp_logged.clear()
     _cake_sp_rejected.clear()
     _cake_sp_launchers.clear()
+    _cake_sp_calls.clear()
 
 
 @functools.lru_cache(maxsize=None)
@@ -370,6 +399,7 @@ def _cake_sp_launcher(
         return None
     try:
         launcher = prepare(input_parallel, w, group, max_rows=capacity)
+        _count_cake_sp_call("prepare", rows, w.shape[1], world_size, capacity=capacity)
     except NotImplementedError as error:  # FlashInfer host refusal
         _cake_sp_rejected.add((id(linear), rows, input_parallel.dtype, world_size))
         _log_cake_sp_once(
@@ -399,20 +429,37 @@ def cake_column_parallel_g_matmul(
         _log_cake_sp_once(
             "fallback", f"inside CUDA-graph capture (no eager preparation): {detail}"
         )
+        _count_cake_sp_call(
+            "fallback",
+            int(input_parallel.shape[0]),
+            int(linear.weight.shape[0]),
+            world_size,
+            reason="capture",
+        )
         return None
     key = (id(linear), int(input_parallel.shape[0]), input_parallel.dtype, world_size)
     if key in _cake_sp_rejected:
+        _count_cake_sp_call(
+            "fallback",
+            int(input_parallel.shape[0]),
+            int(linear.weight.shape[0]),
+            world_size,
+            reason="rejected",
+        )
         return None
     supports_ag, _supports_prepare, ag_matmul, _prepare = _cake_sp_kernels()
     group = tp_group.device_group
     launcher = _cake_sp_launcher(
         linear, input_parallel, group, world_size=world_size, detail=detail
     )
+    rows, n_out = int(input_parallel.shape[0]), int(linear.weight.shape[0])
     if launcher is not None:
         output = launcher(input_parallel)
         _log_cake_sp_once("taken-prepared", f"prepared launcher: {detail}")
+        _count_cake_sp_call("taken-prepared", rows, n_out, world_size)
         return output
     if key in _cake_sp_rejected:
+        _count_cake_sp_call("fallback", rows, n_out, world_size, reason="rejected")
         return None
     w = _cake_sp_weight(linear)
     if supports_ag(input_parallel, w, world_size=world_size):
@@ -421,10 +468,13 @@ def cake_column_parallel_g_matmul(
         except NotImplementedError as error:  # FlashInfer host refusal
             _cake_sp_rejected.add(key)
             _log_cake_sp_once("fallback", f"FlashInfer refused ({error}): {detail}")
+            _count_cake_sp_call("fallback", rows, n_out, world_size, reason="refused")
             return None
         _log_cake_sp_once("taken", f"functional all_gather_matmul: {detail}")
+        _count_cake_sp_call("taken", rows, n_out, world_size)
         return output
     _log_cake_sp_once("fallback", f"adapter admission rejected: {detail}")
+    _count_cake_sp_call("fallback", rows, n_out, world_size, reason="admission")
     return None
 
 
