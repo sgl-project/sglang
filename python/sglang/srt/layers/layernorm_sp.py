@@ -206,9 +206,14 @@ def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the torch symm_mem fused matmul+collective fast-path applies: the
     ops are available and ``linear`` is unquantized, bias-free, bf16/fp16 (the
     case the fused ops support). Depends only on static layer properties, so the
-    decision is identical across TP ranks.
+    decision is identical across TP ranks. Once the Cake route has selected the
+    NVSHMEM symmetric-memory backend (``_cake_sp_symmetric_backend_ready``) the
+    torch fused ops are off: their allocator rejects a process group under that
+    backend, so the non-admitted participants take the plain collective + GEMM.
     """
     if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
+        return False
+    if _cake_sp_symm_backend:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
@@ -244,6 +249,9 @@ _cake_sp_rejected: set[tuple] = set()
 _cake_sp_launchers: dict[
     int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]
 ] = {}
+# torch symmetric-memory backend selection for the route: None = not attempted,
+# True = NVSHMEM selected (FlashInfer's Cake backend requires it), False = unavailable.
+_cake_sp_symm_backend: Optional[bool] = None
 # (event, N) -> calls; events: taken-prepared, taken, fallback, prepare. Read by
 # ``cake_sp_call_counts`` (tests, offline tools); with ``SGLANG_CAKE_DEBUG`` every
 # call is also logged, so admission can be counted from the engine log.
@@ -294,16 +302,51 @@ def _count_cake_sp_call(
         )
 
 
+def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
+    """Select torch's NVSHMEM symmetric-memory backend once per process.
+
+    FlashInfer's Cake all-gather matmul allocates its scratch and flags through
+    ``torch.distributed._symmetric_memory`` and refuses any other backend. The
+    selection happens on the first eligible call (eager prefill, before any
+    symmetric allocation of this process); when it fails the route falls back
+    for the rest of the process with one logged reason.
+    """
+    global _cake_sp_symm_backend
+    if _cake_sp_symm_backend is None:
+        try:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            if str(symm_mem.get_backend(device) or "").upper() != "NVSHMEM":
+                symm_mem.set_backend("NVSHMEM")
+            _cake_sp_symm_backend = (
+                str(symm_mem.get_backend(device) or "").upper() == "NVSHMEM"
+            )
+            if not _cake_sp_symm_backend:
+                _log_cake_sp_once(
+                    "fallback",
+                    "NVSHMEM symmetric-memory backend not selected: "
+                    f"get_backend returned {symm_mem.get_backend(device)!r}",
+                )
+        except Exception as exc:  # backend missing in this torch / no NVSHMEM
+            _cake_sp_symm_backend = False
+            _log_cake_sp_once(
+                "fallback", f"NVSHMEM symmetric-memory backend unavailable ({exc!r})"
+            )
+    return _cake_sp_symm_backend
+
+
 def cake_sp_call_counts() -> dict[tuple[str, int], int]:
     """Per-(event, N) call counts of the SP all-gather matmul route so far."""
     return dict(_cake_sp_calls)
 
 
 def reset_cake_sp_state_for_tests() -> None:
+    global _cake_sp_symm_backend
     _cake_sp_logged.clear()
     _cake_sp_rejected.clear()
     _cake_sp_launchers.clear()
     _cake_sp_calls.clear()
+    _cake_sp_symm_backend = None
 
 
 @functools.lru_cache(maxsize=None)
@@ -400,7 +443,7 @@ def _cake_sp_launcher(
     try:
         launcher = prepare(input_parallel, w, group, max_rows=capacity)
         _count_cake_sp_call("prepare", rows, w.shape[1], world_size, capacity=capacity)
-    except NotImplementedError as error:  # FlashInfer host refusal
+    except (NotImplementedError, ValueError) as error:  # FlashInfer host refusal
         _cake_sp_rejected.add((id(linear), rows, input_parallel.dtype, world_size))
         _log_cake_sp_once(
             "fallback", f"FlashInfer refused to prepare ({error}): {detail}"
@@ -437,6 +480,15 @@ def cake_column_parallel_g_matmul(
             reason="capture",
         )
         return None
+    if not _cake_sp_symmetric_backend_ready(input_parallel.device):
+        _count_cake_sp_call(
+            "fallback",
+            int(input_parallel.shape[0]),
+            int(linear.weight.shape[0]),
+            world_size,
+            reason="no-nvshmem",
+        )
+        return None
     key = (id(linear), int(input_parallel.shape[0]), input_parallel.dtype, world_size)
     if key in _cake_sp_rejected:
         _count_cake_sp_call(
@@ -465,7 +517,7 @@ def cake_column_parallel_g_matmul(
     if supports_ag(input_parallel, w, world_size=world_size):
         try:
             output = ag_matmul(input_parallel, w, group)
-        except NotImplementedError as error:  # FlashInfer host refusal
+        except (NotImplementedError, ValueError) as error:  # FlashInfer host refusal
             _cake_sp_rejected.add(key)
             _log_cake_sp_once("fallback", f"FlashInfer refused ({error}): {detail}")
             _count_cake_sp_call("fallback", rows, n_out, world_size, reason="refused")

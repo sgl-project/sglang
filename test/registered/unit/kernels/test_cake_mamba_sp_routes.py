@@ -795,6 +795,7 @@ def sp_env():
             sp_mod, "get_parallel", lambda: SimpleNamespace(tp_group=tp_group)
         ),
         mock.patch.object(sp_mod, "_HAS_TORCH_SYMM_MEM_FUSED", False),
+        mock.patch.object(sp_mod, "_cake_sp_symm_backend", True),
         mock.patch.object(
             sp_mod,
             "sp_exit_gather",
@@ -820,7 +821,9 @@ def _linear(sp_env, bias=None, quantized=False):
     return linear
 
 
-def _sp_kernels(*, prepare_ok=True, ag_ok=True, prepare_raises=False):
+def _sp_kernels(
+    *, prepare_ok=True, ag_ok=True, prepare_raises=False, refusal=NotImplementedError
+):
     supports_ag = mock.Mock(return_value=ag_ok)
     supports_prepare = mock.Mock(return_value=prepare_ok)
     ag = mock.Mock(
@@ -832,7 +835,7 @@ def _sp_kernels(*, prepare_ok=True, ag_ok=True, prepare_raises=False):
 
     def _prepare(inp, w, group, *, max_rows=None):
         if prepare_raises:
-            raise NotImplementedError("unsupported operands")
+            raise refusal("unsupported operands")
         capacity = inp.shape[0] if max_rows is None else max_rows
 
         def _launch(x):
@@ -930,6 +933,78 @@ def test_sp_route_call_counts_and_debug_log_per_call(sp_env, caplog, monkeypatch
     )
     sp_mod.reset_cake_sp_state_for_tests()
     assert sp_mod.cake_sp_call_counts() == {}
+
+
+def test_sp_route_value_error_refusal_falls_back_and_is_cached(sp_env):
+    """FlashInfer refuses with ValueError (host validation, e.g. backend or
+    shape); the route falls back and caches the rejection like NotImplementedError."""
+    kernels, _ = _sp_kernels(prepare_raises=True, ag_ok=False, refusal=ValueError)
+    _, _, ag, prepare = kernels
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+    prepare.assert_called_once()
+    ag.assert_not_called()
+    assert linear.quant_method.apply.call_count == 2
+    assert torch.all(out == 1.0)
+    assert sp_mod.cake_sp_call_counts()[("fallback", N)] == 1
+
+
+def test_sp_route_selects_nvshmem_backend_once_and_falls_back_without_it(
+    sp_env, caplog
+):
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, launchers = _sp_kernels()
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    fake_symm = types.SimpleNamespace(
+        backend=None,
+        get_backend=lambda device: fake_symm.backend,
+        set_backend=lambda name: setattr(fake_symm, "backend", name),
+    )
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
+        mock.patch.dict(
+            sys.modules, {"torch.distributed._symmetric_memory": fake_symm}
+        ),
+    ):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+        assert fake_symm.backend == "NVSHMEM"
+        assert sp_mod._cake_sp_symm_backend is True
+        # the torch fused symm_mem ops are off once the process runs NVSHMEM
+        with mock.patch.object(sp_mod, "_HAS_TORCH_SYMM_MEM_FUSED", True):
+            assert not sp_mod.sp_fused_matmul_eligible(linear)
+    assert len(launchers) == 1 and launchers[0].call_count == 2
+    assert torch.all(out == 2.0)
+
+    def _no_backend(name):
+        raise RuntimeError("NVSHMEM not available")
+
+    fake_symm.backend = None
+    fake_symm.set_backend = _no_backend
+    sp_mod.reset_cake_sp_state_for_tests()
+    kernels, launchers = _sp_kernels()
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
+        mock.patch.dict(
+            sys.modules, {"torch.distributed._symmetric_memory": fake_symm}
+        ),
+    ):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+        assert sp_mod._cake_sp_symm_backend is False
+    assert not launchers
+    assert torch.all(out == 1.0)
+    assert sp_mod.cake_sp_call_counts()[("fallback", N)] == 2
+    assert "NVSHMEM symmetric-memory backend unavailable" in caplog.text
+    assert caplog.text.count("fallback to stock") == 1
 
 
 def test_sp_route_on_functional_kernel_when_prepared_not_admitted(sp_env):
