@@ -1,0 +1,102 @@
+---
+title: "Explicit cache_id and load_cache_id"
+metatags:
+    description: "Save and load KV-cache prefixes by an explicit id instead of relying on automatic prefix matching."
+---
+
+SGLang's radix cache automatically reuses prefixes when two requests share the same tokens. In some workloads you want to pin a prefix to a caller-controlled identifier so it can be reused even when unrelated traffic would otherwise branch or evict the shared tree. The `cache_id` and `load_cache_id` request parameters provide that control.
+
+## How it works
+
+`cache_id` and `load_cache_id` namespace the radix-tree lookup. A request with `cache_id="foo"` stores its reusable KV under the `foo` namespace. A later request with `load_cache_id="foo"` looks up the prefix in the same namespace and reuses the cached KV when the token sequences match.
+
+This is useful when:
+
+- A long image or document prompt is preprocessed once and then queried many times.
+- You want to guarantee isolation between tenants that happen to send similar prompts.
+- You want to reuse a prefix without relying on the automatic LRU/eviction behavior of the shared radix tree.
+
+## Limitations
+
+- The two requests must still tokenize to the same token sequence for a cache hit to occur. `load_cache_id` cannot load KV for mismatched tokens.
+- The cached KV is kept only while it remains in the radix cache. It can still be evicted under memory pressure, in which case the load request falls back to a normal prefill.
+- `cache_id` and `load_cache_id` are not compatible with `session_id` / `session_params`.
+
+## Usage
+
+Use `cache_id` on the request that should save its prefix:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "extra_body": {"cache_id": "doc-42"}
+  }'
+```
+
+Use `load_cache_id` on later requests that should reuse the saved prefix:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "extra_body": {"load_cache_id": "doc-42"}
+  }'
+```
+
+The same parameters work with `/v1/completions` and the Responses API.
+
+## Check that the cache was reused
+
+When cache reporting is enabled (`--enable-cache-report`), the response `usage.prompt_tokens_details.cached_tokens` shows how many prompt tokens were served from cache:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "extra_body": {"load_cache_id": "doc-42"}
+  }' | jq '.usage.prompt_tokens_details.cached_tokens'
+```
+
+The second request should report a non-zero number of cached tokens when the prefix is still resident.
+
+## Python client example
+
+```python
+import openai
+
+client = openai.Client(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+prompt = "Describe this image in detail. <image_url>"
+
+# Save the prefix.
+client.chat.completions.create(
+    model="MODEL_PATH",
+    messages=[{"role": "user", "content": prompt}],
+    max_tokens=128,
+    extra_body={"cache_id": "image-7"},
+)
+
+# Reuse the prefix.
+response = client.chat.completions.create(
+    model="MODEL_PATH",
+    messages=[{"role": "user", "content": prompt}],
+    max_tokens=128,
+    extra_body={"load_cache_id": "image-7"},
+)
+
+print(response.usage.prompt_tokens_details.cached_tokens)
+```
+
+## Relationship to cache_salt
+
+`cache_id` and `load_cache_id` are higher-level wrappers around the existing `cache_salt` mechanism. Internally, SGLang sets `cache_salt` to the provided id so the radix tree namespaces the prefix. If you already use `cache_salt`, you do not need to change anything; `cache_id` and `load_cache_id` are provided for callers who want explicit save/load semantics.

@@ -559,6 +559,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        cache_id=request.cache_id,
+                        load_cache_id=request.load_cache_id,
                         bootstrap_host=request.bootstrap_host,
                         bootstrap_port=request.bootstrap_port,
                         bootstrap_room=request.bootstrap_room,
