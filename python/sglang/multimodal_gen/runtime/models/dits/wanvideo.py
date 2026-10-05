@@ -653,8 +653,10 @@ class WanTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
+        # The fused residual-norm kernels need one dtype across gate, shift, scale and
+        # affine params (fp32 here); bf16 zeros send XPU to the triton fallback.
         null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            (1,), device=hidden_states.device, dtype=gate_msa.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
