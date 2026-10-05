@@ -237,9 +237,13 @@ def native_rope_cache(
         and cache.shape[0] == query.shape[1]
         and cache.shape[1] <= query.shape[-1]
         and positions.is_cuda
-        and positions.shape == (query.shape[0] * query.shape[1],)
+        and positions.shape in ((query.shape[1],), (query.shape[0] * query.shape[1],))
     ):
         return None
+    # Accept both main's shared sequence positions and the pre-expanded
+    # batch-major positions used by the decoder cache and fused fast path.
+    if positions.shape == (query.shape[1],) and query.shape[0] > 1:
+        positions = positions.repeat(query.shape[0])
     return cache, positions
 
 
