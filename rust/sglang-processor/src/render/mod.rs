@@ -17,7 +17,9 @@ mod thinking;
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
-use self::models::{deep_sort, dynamo_reasoning_effort, encode_tools_to_typescript};
+use self::models::{
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
+};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
 
@@ -40,11 +42,7 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
-    DeepSeekV4 {
-        formatter: PromptFormatter,
-        profile: DeepSeekV4Profile,
-        environment_effort: Option<String>,
-    },
+    DeepSeekV4(DeepSeekV4Profile),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -80,25 +78,31 @@ impl ChatFormatter {
                 }
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
-            ChatFormatter::DeepSeekV4 {
-                formatter,
-                profile,
-                environment_effort,
-            } => {
-                let mut args = request.chat_template_args().cloned().unwrap_or_default();
-                let requested = args
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .or(environment_effort.as_deref());
-                let mapped = dynamo_reasoning_effort(*profile, requested);
-                let thinking =
-                    dynamo_renderer::thinking_bool_from_args(Some(&args)).unwrap_or(false);
-                args.insert("thinking".into(), Value::Bool(thinking));
-                args.insert("reasoning_effort".into(), Value::String(mapped.into()));
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+            ChatFormatter::DeepSeekV4(_) => {
+                let request = serde_json::json!({
+                    "messages": request.messages(),
+                    "tools": request.tools(),
+                    "reasoning_effort": request.reasoning_effort(),
+                    "chat_template_kwargs": request.chat_template_args(),
+                    "continue_final_message": !request.should_add_generation_prompt(),
+                });
+                let (prompt, prefix) = self.render_request(&request)?;
+                Ok(RenderedPrompt::text(prompt + &prefix))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
+    }
+
+    /// Render an SGLang chat request body, returning the prompt and the
+    /// `continue_final_message` prefix SGLang tokenizes separately.
+    /// Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
+    pub fn render_request(&self, request: &Value) -> Result<(String, String), TemplateError> {
+        let ChatFormatter::DeepSeekV4(profile) = self else {
+            return Err(TemplateError::Renderer {
+                message: "render_request supports DeepSeek-V4 only".into(),
+            });
+        };
+        render_deepseek_v4(*profile, request).map_err(|message| TemplateError::Renderer { message })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -109,7 +113,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
-            | ChatFormatter::DeepSeekV4 { .. } => None,
+            | ChatFormatter::DeepSeekV4(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -127,9 +131,9 @@ impl ChatFormatter {
             | ChatFormatter::KimiK25 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4 { .. } => {
+            ChatFormatter::DeepSeekV4(_) => {
                 let enabled =
-                    dynamo_renderer::thinking_bool_from_args(args.as_ref()).unwrap_or(false);
+                    deepseek_v4_thinking(&serde_json::json!({ "chat_template_kwargs": args }));
                 args.get_or_insert_default()
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)
