@@ -383,8 +383,8 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = (
-            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
-            or (storage_config.extra_config or {}).get("file_storage_path")
+            (storage_config.extra_config or {}).get("file_storage_path")
+            or envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
             or file_path
         )
 
