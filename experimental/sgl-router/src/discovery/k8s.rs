@@ -152,6 +152,15 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 url,
                 mode,
                 model_ids: Vec::new(),
+                services: es
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kubernetes.io/service-name"))
+                    .filter(|service| !ns.is_empty() && !service.is_empty())
+                    .map(|service| format!("{ns}/{service}"))
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             });
         }
@@ -202,10 +211,15 @@ async fn emit_diff(
     per_slice: &HashMap<String, HashMap<WorkerId, WorkerSpec>>,
     prev_union: &mut HashMap<WorkerId, WorkerSpec>,
 ) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
-    let union: HashMap<WorkerId, WorkerSpec> = per_slice
-        .values()
-        .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .collect();
+    // A pod can be selected by several Services or temporarily appear in
+    // overlapping slices. Keep every membership until its last slice leaves.
+    let mut union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+    for (id, spec) in per_slice.values().flat_map(|slice| slice.iter()) {
+        union
+            .entry(id.clone())
+            .and_modify(|worker| worker.services.extend(spec.services.iter().cloned()))
+            .or_insert_with(|| spec.clone());
+    }
 
     for (id, spec) in &union {
         match prev_union.get(id) {
@@ -223,6 +237,12 @@ async fn emit_diff(
                 {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                } else if prev.services != spec.services {
+                    tx.send(DiscoveryEvent::ServicesChanged {
+                        id: id.clone(),
+                        services: spec.services.clone(),
+                    })
+                    .await?;
                 }
             }
             None => {
@@ -1179,6 +1199,112 @@ mod tests {
         );
         // Same URL across both, confirming the IP didn't change.
         assert_eq!(added[0].url, added[1].url);
+    }
+
+    /// Service pools must survive pod replacement, and a shared pod must retain
+    /// its other Service when one EndpointSlice disappears.
+    #[tokio::test]
+    async fn service_membership_survives_replacement_and_merges_slices() {
+        use crate::buckets_reorg::{Bucket, BucketGroups, EngineGroup};
+        use crate::discovery::ModelId;
+        use crate::policies_reorg::{power_of_two::PowerOfTwoPolicy, PickRequest, Stage};
+        use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+        use crate::workers::WorkerRegistry;
+        use std::sync::Arc;
+
+        let slice = |uid: &str, pod: &str, namespace: &str, service: &str| {
+            let mut es = with_uid(make_slice_with_uids(&["10.0.0.1"], 30000, &[pod]), uid);
+            es.metadata.namespace = Some(namespace.into());
+            es.metadata.labels = Some(BTreeMap::from([(
+                "kubernetes.io/service-name".into(),
+                service.into(),
+            )]));
+            es
+        };
+        let old = slice("slice", "old", "ns", "short");
+        let new = slice("slice", "new", "ns", "short");
+        let other = slice("other-slice", "new", "ns", "other");
+        let overlapping = slice("overlapping-slice", "new", "ns", "short");
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(vec![
+                Ok(watcher::Event::Apply(old)),
+                Ok(watcher::Event::Apply(new.clone())),
+                Ok(watcher::Event::Apply(other)),
+                Ok(watcher::Event::Apply(overlapping.clone())),
+                Ok(watcher::Event::Delete(new)),
+                Ok(watcher::Event::Delete(overlapping)),
+            ]),
+            tx,
+            plain_mode(),
+            None,
+        )
+        .await;
+        let mut group = EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(
+            EngineReportedLoadTable::new(),
+        )));
+        group.worker_services = Some(["ns/short".into()].into());
+        let bucket = Bucket::new("short", BucketGroups::Plain(group));
+        let BucketGroups::Plain(group) = &bucket.groups else {
+            unreachable!()
+        };
+        let registry = WorkerRegistry::default();
+        let model = ModelId("m".into());
+        let request = PickRequest::new(&model, Stage::Plain, 1);
+        // Same Service name in another namespace must not leak into the pool.
+        let mut foreign = extract_workers(
+            &slice("foreign", "foreign", "elsewhere", "short"),
+            Stage::Plain,
+        )
+        .remove(0);
+        foreign.model_ids = vec![model.clone()];
+        registry.add(foreign).unwrap();
+        assert!(!bucket.has_ready_workers(&registry, &model));
+        let mut selected = Vec::new();
+        let mut membership_updates = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                DiscoveryEvent::Added(mut spec) => {
+                    spec.model_ids = vec![model.clone()];
+                    let spec_id = spec.id.0.clone();
+                    registry.add(spec).unwrap();
+                    selected.push(spec_id.clone());
+                    if spec_id == "ns/old" {
+                        assert_eq!(
+                            group.pick(&registry, &request).await.unwrap().engine.id.0,
+                            "ns/old"
+                        );
+                    }
+                    assert!(bucket.has_ready_workers(&registry, &model));
+                }
+                DiscoveryEvent::Removed { id } => {
+                    registry.remove(&id);
+                    assert_eq!(
+                        group.pick(&registry, &request).await.unwrap().engine.id.0,
+                        "ns/new"
+                    );
+                }
+                DiscoveryEvent::ServicesChanged { id, services } => {
+                    membership_updates.push(services.clone());
+                    let worker = registry.get(&id).unwrap();
+                    worker.set_services(services);
+                }
+                _ => panic!("unexpected discovery event"),
+            }
+        }
+        assert_eq!(selected, ["ns/old", "ns/new"]);
+        assert_eq!(
+            membership_updates,
+            vec![
+                ["ns/short".into(), "ns/other".into()].into(),
+                ["ns/other".into()].into(),
+            ]
+        );
+        assert!(registry.get(&WorkerId("ns/old".into())).is_none());
+        let worker = registry.get(&WorkerId("ns/new".into())).unwrap();
+        assert_eq!(worker.services(), ["ns/other".into()].into());
+        assert!(!bucket.has_ready_workers(&registry, &model));
+        assert!(group.pick(&registry, &request).await.is_err());
     }
 
     /// End-to-end reconcile: an EndpointSlice flips `ready=true` while the

@@ -467,6 +467,13 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
     if [[ -n "$DIST_SOCK" ]]; then
         MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK -e MORI_SOCKET_IFNAME=$DIST_SOCK"
     fi
+    # sglang hands --disaggregation-ib-device to mori only for the KV transfer
+    # engine; the MoE all-to-all picks its own NICs. On spur drive.sh may drop
+    # dead ports from $IB, so name the list here too or the a2a can still land
+    # on a port that never linked.
+    if [[ "$CLUSTER" == "spur" ]]; then
+        MORI_ENV="$MORI_ENV -e MORI_RDMA_DEVICES=$IB"
+    fi
 fi
 
 # Model-specific docker `-e` env + sglang server args from the recipe's optional
@@ -531,6 +538,16 @@ IONIC_EOF
     printf 'STAGE_LOCAL_PATH=%q\n' "${MODEL_LOCAL_ROOT:+$MODEL_PATH}"
     printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
 } > "$WORKDIR/stage_check.sh"
+# Same channel for the recipe's RDMA device list, which drive.sh narrows on spur
+# to the ports that are actually up (see the PORT_ACTIVE check there). That
+# check rewrites the list in place with sed, using it as the pattern, so a stray
+# "/" or regex character from a recipe typo would break the edit halfway
+# through the generated scripts. Reject it here, before anything is allocated.
+if [[ -n "$IB" && ! "$IB" =~ ^[A-Za-z0-9_,]+$ ]]; then
+    echo "ERROR: runtime.ib_devices '$IB' must be a comma-separated list of device names" >&2
+    exit 1
+fi
+printf 'IB_RECIPE=%q\n' "$IB" > "$WORKDIR/ib_check.sh"
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
@@ -1483,6 +1500,107 @@ if [[ -n "$STAGE_LOCAL_PATH" ]]; then
   fi
   echo "[drive] node-local snapshot present on all ${#NODES[@]} nodes"
 fi
+# The recipe's ib_devices is a fixed list, but a pit2 port can stay down for
+# days (some never link after a reboot). Handing a dead port to NCCL or mori
+# fails init with a network error that names neither the node nor the port.
+# Keep only the devices whose port is ACTIVE on EVERY allocated node -- the
+# same set on both ends, so no transfer has to cross rails -- and patch that
+# list into the generated server scripts before anything is launched.
+#
+# If that leaves fewer devices than the recipe asked for, top the list back up
+# with other ports that are ACTIVE on every node. The 1p1d recipes name
+# rdma0..3, and a node can lose exactly those: on 2026-10-02 g02 had only
+# rdma4..7 up (its rdma0..3 had come back as unrenamed rocep* devices, DOWN),
+# so every pair that included it had no usable recipe port at all. A port off
+# the recipe's list may sit further from the GPU, but it works; a dead one
+# does not. Candidates are picked by state, not name: rdmaN vs rocep* reflects
+# whether the port was up at boot, so a rocep* port that links later is just
+# as usable. It still has to carry the same name on every node, though, and
+# the same slot is usually rdmaN elsewhere; pairing ports by PCI slot across
+# nodes would need a different list per node, which this does not do.
+#
+# A list that is still short changes the numbers (KV throughput scales with
+# HCA count), so that case is written to ib_warn for the launcher to put in
+# the job summary -- this log is only read when the leg fails.
+source "$WORKDIR/ib_check.sh"
+if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
+  IFS=',' read -ra _ib_want <<< "$IB_RECIPE"
+  _ib_live=("${_ib_want[@]}")
+  _ib_spare=()       # non-recipe ports ACTIVE on every node checked so far
+  _ib_spare_init=0
+  # Every port on the node, not just the recipe's, so there is something to
+  # fall back to. __ok__ separates "the step ran" from a flaky srun dispatch,
+  # as in container_state(); sysfs reads e.g. "4: ACTIVE" or "1: DOWN".
+  _ib_probe='for p in /sys/class/infiniband/*/ports/1/state; do [ -e "$p" ] || continue; d=${p#/sys/class/infiniband/}; echo "${d%%/*} $(cat "$p" 2>/dev/null)"; done; echo __ok__'
+  _ib_unchecked=()
+  for n in "${NODES[@]}"; do
+    _ib_out=""
+    for _try in 1 2 3; do
+      _ib_out="$(srun_local_or_step "$n" bash -c "$_ib_probe" 2>/dev/null | tr -d '\r')"
+      [[ "$_ib_out" == *__ok__* ]] && break
+      _ib_out=""
+      sleep 2
+    done
+    if [[ -z "$_ib_out" ]]; then
+      echo "[drive] WARN: could not read RDMA port state on $n; not filtering on it" >&2
+      _ib_unchecked+=("$n")
+      continue
+    fi
+    _ib_keep=()
+    for d in "${_ib_live[@]}"; do
+      if grep -qxE "$d [0-9]+: ACTIVE" <<< "$_ib_out"; then
+        _ib_keep+=("$d")
+      else
+        _st="$(grep -m1 "^$d " <<< "$_ib_out" | cut -d' ' -f2-)"
+        echo "[drive] $n: dropping $d (${_st:-missing})" >&2
+      fi
+    done
+    _ib_live=("${_ib_keep[@]}")
+    mapfile -t _ib_active < <(sed -nE 's/^([^ ]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
+    if (( ! _ib_spare_init )); then
+      _ib_spare=()
+      for d in "${_ib_active[@]}"; do
+        [[ ",$IB_RECIPE," == *",$d,"* ]] || _ib_spare+=("$d")
+      done
+      _ib_spare_init=1
+    else
+      _ib_keep=()
+      for d in "${_ib_spare[@]}"; do
+        printf '%s\n' "${_ib_active[@]}" | grep -qx "$d" && _ib_keep+=("$d")
+      done
+      _ib_spare=("${_ib_keep[@]}")
+    fi
+  done
+  _ib_added=()
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} && ${#_ib_spare[@]} )); then
+    mapfile -t _ib_spare < <(printf '%s\n' "${_ib_spare[@]}" | sort -V)
+    for d in "${_ib_spare[@]}"; do
+      (( ${#_ib_live[@]} < ${#_ib_want[@]} )) || break
+      _ib_live+=("$d"); _ib_added+=("$d")
+    done
+  fi
+  IB_LIVE="$(IFS=,; echo "${_ib_live[*]}")"
+  if [[ -z "$IB_LIVE" ]]; then
+    echo "ERROR: no RDMA port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
+    exit 1
+  fi
+  _ib_note=""
+  (( ${#_ib_added[@]} )) && _ib_note=" (off-recipe fallback: ${_ib_added[*]})"
+  (( ${#_ib_unchecked[@]} )) && _ib_note="$_ib_note (unchecked: ${_ib_unchecked[*]})"
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} )); then
+    echo "WARN: running on ${#_ib_live[@]} of ${#_ib_want[@]} requested RDMA devices ($IB_LIVE; recipe $IB_RECIPE)$_ib_note -- throughput is not comparable to a full-rail run" \
+      | tee "$WORKDIR/ib_warn" >&2
+  fi
+  if [[ "$IB_LIVE" != "$IB_RECIPE" ]]; then
+    echo "[drive] RDMA devices changed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
+    # The list appears only as a whole flag/env value, after a space or "=".
+    for f in prefill.sh decode.sh prefill_entry.sh decode_entry.sh; do
+      sed -i -E "s/(^|[ =])$IB_RECIPE( |$)/\1$IB_LIVE\2/g" "$WORKDIR/$f"
+    done
+  else
+    echo "[drive] RDMA devices $IB_RECIPE are PORT_ACTIVE on all nodes$_ib_note"
+  fi
+fi
 if (( DW > 1 )); then
   echo "[drive] NOTE: router + bench use the first decode engine only;"
   echo "[drive]       multi-decode fan-out is not wired yet (LB work)."
@@ -1891,11 +2009,54 @@ set -e
 # whatever raw results the completed concurrencies produced -- partial perf data
 # is worth uploading -- and propagate the failure via the exit code at the end.
 if [[ "$SALLOC_RC" -ne 0 ]]; then
-    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + server logs:" >&2
+    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + driver + server logs:" >&2
     echo "--- bench.log (tail) ---"; tail -40 "$WORKDIR/bench.log" 2>/dev/null || true
-    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
-        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
+    # On spur drive.sh's own output goes only to drive_<host>.log, so a leg that
+    # fails before any server starts (a missing snapshot, no live RDMA port)
+    # otherwise reports nothing at all. It runs under set -x; drop the trace
+    # lines so the tail is the messages, not the commands.
+    for f in "$WORKDIR"/drive_*.log; do
+        [[ -f "$f" ]] || continue
+        echo "--- $f (tail, xtrace removed) ---"
+        grep -av '^+' "$f" | tail -60 || true
     done
+    # 30 lines was not enough: a scheduler traceback plus the shutdown that
+    # follows it pushed the line naming the cause out of the window. Lead with
+    # the first error lines, then print the log from the first of them -- the
+    # traceback and what follows it -- rather than a fixed tail, which is
+    # mostly teardown noise. Capped, since an early harmless match would
+    # otherwise print the whole log; the last lines are kept either way.
+    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
+        [[ -f "$f" ]] || continue
+        echo "--- $f (first errors) ---"
+        grep -anE 'Traceback|Error|FATAL|Killed' "$f" | head -20 || true
+        _first=$(grep -anm1 -E 'Traceback|Error|FATAL|Killed' "$f" | cut -d: -f1 || true)
+        _total=$(wc -l < "$f")
+        if [[ -z "$_first" ]]; then
+            echo "--- $f (tail; no error lines) ---"; tail -60 "$f"
+        elif (( _total - _first < 150 )); then
+            echo "--- $f (from line $_first, first error) ---"; sed -n "${_first},\$p" "$f"
+        else
+            echo "--- $f (lines $_first-$((_first + 119)), from first error) ---"
+            sed -n "${_first},$((_first + 119))p" "$f"
+            echo "--- $f (last 30 of $_total lines) ---"; tail -30 "$f"
+        fi
+    done
+fi
+
+# drive.sh leaves ib_warn when fewer RDMA devices were up on every node than
+# the recipe asked for. The leg can still pass, so put it where a green run's
+# numbers are read, not just in a log nobody opens.
+if [[ -s "$WORKDIR/ib_warn" ]]; then
+    echo "::warning title=RDMA devices reduced (${MATRIX_CONFIG_NAME})::$(cat "$WORKDIR/ib_warn")"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "### RDMA devices reduced — ${MATRIX_CONFIG_NAME}"
+            echo '```'
+            cat "$WORKDIR/ib_warn"
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    fi
 fi
 
 # Surface the GSM8K accuracy in the job summary -- it scrolls past in the live

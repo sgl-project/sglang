@@ -84,7 +84,8 @@ pub struct TokenizerConfig {
 }
 
 /// Routing strategies accepted by `--policy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     #[default]
     #[value(name = "round_robin")]
@@ -345,6 +346,11 @@ pub struct ModelConfig {
     pub dp_aware: bool,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
+    /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
+    pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
+    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// and `--max-kv-usage`.
+    pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -448,6 +454,9 @@ pub struct CacheAwareConfig {
     /// delays a failed seed's replica and a fleet-wide restart is a delay, not
     /// an outage.
     pub bootstrap_seed_required: bool,
+    /// How long a routed prompt credits its worker before KV events confirm
+    /// it; 0 disables.
+    pub pending_prefix_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -458,6 +467,7 @@ impl Default for CacheAwareConfig {
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
             bootstrap_seed_required: false,
+            pending_prefix_ttl_ms: 0,
         }
     }
 }
