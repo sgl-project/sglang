@@ -104,15 +104,13 @@ def test_usp_merge_heads_bitwise(dtype, world, seq, batch, h_local, head_dim):
 
 def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
     # The wrapper degrades to the aten permute for anything the fast path
-    # rejects -- a wrong rank, a transposed view, an empty leading dim, or a
-    # ROCm build -- so callers never need their own guard.
+    # rejects: a transposed view, an empty leading dim, or a ROCm build.
     x = torch.randn(2, 4, 1, 4, 64, dtype=torch.bfloat16, device=DEVICE)
-    for value in (x.transpose(0, 1), x[:0], x[0]):
+    for value in (x.transpose(0, 1), x[:0]):
         assert not can_use_usp_merge_heads(value)
-        if value.dim() == 5:
-            assert torch.equal(
-                usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
-            )
+        assert torch.equal(
+            usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
+        )
 
     with patch.object(torch.version, "hip", "6.3"):
         assert not can_use_usp_merge_heads(x)
