@@ -86,6 +86,10 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
 
     models: list[Any] = [EmbeddingGemma2Model]  # type: ignore[assignment]  # noqa: RUF012
 
+    # Plain nvJPEG skips fancy chroma upsampling and drifts from the PIL decode the
+    # checkpoint was validated with (embedding cos ~0.99 vs HF); nvjpeg_fancy matches it.
+    gpu_image_decode = "nvjpeg_fancy"
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.disable_fast_image_processor = True
