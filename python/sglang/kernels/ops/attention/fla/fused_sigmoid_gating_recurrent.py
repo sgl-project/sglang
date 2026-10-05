@@ -428,11 +428,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if MATCH_CUTEDSL_DECODE:
                 q_sum_sq = _cutedsl_qk_sum_squares(b_q, BK)
                 k_sum_sq = _cutedsl_qk_sum_squares(b_k, BK)
-                b_q *= tl.rsqrt(q_sum_sq + 1e-6)
-                b_k *= tl.rsqrt(k_sum_sq + 1e-6)
+                q_rsqrt = tl.rsqrt(q_sum_sq + 1e-6)
+                k_rsqrt = tl.rsqrt(k_sum_sq + 1e-6)
             else:
-                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+                q_sum_sq = tl.sum(b_q * b_q)
+                k_sum_sq = tl.sum(b_k * b_k)
+                q_rsqrt = 1.0 / tl.sqrt(q_sum_sq + 1e-6)
+                k_rsqrt = 1.0 / tl.sqrt(k_sum_sq + 1e-6)
+            b_q *= q_rsqrt
+            b_k *= k_rsqrt
 
         b_q = b_q * scale
 
