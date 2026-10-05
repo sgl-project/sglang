@@ -50,13 +50,6 @@ class SessionSlot:
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
 
-    def restore_to_req(self, req: Req):
-        """Lend the record to an incoming turn; the slot keeps the tree lock."""
-        req.kv = self.kv
-
-        # The slot keeps sharing the record: a rejected chunked request calls
-        # match_prefix -> restore_to_req again next cycle.
-
 
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
@@ -139,7 +132,9 @@ class StreamingSession:
                 self.release_session(req.session.session_id)
                 return None
 
-        slot.restore_to_req(req)
+        # Lend the record; the slot keeps the tree lock. A rejected chunked
+        # request matches again next cycle and borrows the same record.
+        req.kv = slot.kv
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
@@ -189,7 +184,9 @@ class StreamingSession:
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
         if isinstance(req.finished_reason, FINISH_ABORT):
-            self._hand_back(slot, req)
+            # Hand the record and the tree lock back; the caller releases them.
+            del self.slots[req.session.session_id]
+            _move_tree_lock(slot, req)
             req.session.abort_req()
             return False
 
@@ -251,11 +248,6 @@ class StreamingSession:
         slot = self.slots.get(req.session.session_id)
         return slot if slot is not None and slot.kv is req.kv else None
 
-    def lock_holder(self, req: Req) -> Any:
-        """Whoever holds the tree lock on the request's prefix: its slot for a
-        session turn, else the request itself."""
-        return self.borrowed_slot(req) or req
-
     # -- Session lifecycle --
 
     def release_session(self, session_id: str) -> None:
@@ -297,12 +289,6 @@ class StreamingSession:
             slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
-
-    def _hand_back(self, slot: SessionSlot, req: Req) -> None:
-        """Drop the slot and give its record and tree lock back to the request,
-        which then releases like any request."""
-        del self.slots[req.session.session_id]
-        _move_tree_lock(slot, req)
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         """Move the request's tree lock to the slot; the request is left on the

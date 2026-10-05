@@ -1018,7 +1018,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_swa_prefix_lock(self, req: Req) -> None:
         """The request's window has moved past its prefix: leave the prefix's
         SWA evictable. A session turn releases its slot's lock, once per session."""
-        holder = self.session.lock_holder(req)
+        holder = self.session.borrowed_slot(req) or req
         if (
             holder.swa_prefix_lock_released
             or holder.last_node is None

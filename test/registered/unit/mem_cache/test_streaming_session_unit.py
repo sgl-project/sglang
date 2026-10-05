@@ -180,32 +180,22 @@ def _finished_turn(tree_cache, req):
     return tree_cache.session.slots[req.session.session_id]
 
 
-def test_session_slot_round_trip_preserves_component_state():
-    # The mamba state rides in the shared ReqKvInfo record. mamba_branching_seqlen
-    # is a per-turn match observation on the Req and is not preserved by the slot.
+def test_finished_turn_leaves_its_record_in_the_slot():
+    # Component cursors ride in the record the slot keeps; the request is
+    # detached, and its per-turn SWA branch observation is dropped.
     req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
-    req.kv.mamba_next_track_idx = 1
-    req.kv.mamba_last_track_idx = 0
-    req.kv.mamba_last_track_seqlen = 3
-    req.kv.set_evicted_seqlen(ComponentType.SWA, 2)
-    req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 3)
+    record = req.kv
+    record.mamba_next_track_idx = 1
+    record.set_evicted_seqlen(ComponentType.SWA, 2)
+    req.swa_branching_seqlen = 8
 
     slot = _finished_turn(_single_row_cache(), req)
 
-    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
-    slot.restore_to_req(next_req)
-
-    assert next_req.kv.mamba_next_track_idx == 1
-    assert next_req.kv.mamba_last_track_idx == 0
-    assert next_req.kv.mamba_last_track_seqlen == 3
-    assert next_req.kv.component_evicted_seqlens == {
-        ComponentType.SWA: 2,
-        ComponentType.AUXILIARY_SWA: 3,
-    }
-    assert req.kv.component_evicted_seqlens == {}
-    next_req.kv.mark_kv_released()
-    assert next_req.kv.is_kv_released
-    assert next_req.kv.component_evicted_seqlens == {}
+    assert slot.kv is record
+    assert slot.kv.mamba_next_track_idx == 1
+    assert slot.kv.component_evicted_seqlens == {ComponentType.SWA: 2}
+    assert req.kv is not record
+    assert req.swa_branching_seqlen is None
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -297,7 +287,7 @@ def test_nth_mid_abort_drops_session_slot(published_config):
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = inner
 
-    # restore_to_req ran, so the req runs on the slot's record.
+    # match_prefix lent the slot's record, so the req runs on it.
     req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
     lock_node = SimpleNamespace(id=42)
@@ -402,19 +392,6 @@ def test_release_session_skips_swa_after_early_release():
     assert inner.dec_lock_ref_calls == [lock_node]
     assert inner.dec_lock_ref_params[0].component_lock_uuids[ComponentType.SWA] == 7
     assert inner.dec_lock_ref_skip_swa == [True]
-
-
-def test_session_slot_does_not_restore_swa_branching_seqlen():
-    req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
-    req.swa_branching_seqlen = 8
-
-    slot = _finished_turn(_single_row_cache(), req)
-
-    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
-    slot.restore_to_req(next_req)
-
-    assert req.swa_branching_seqlen is None
-    assert next_req.swa_branching_seqlen is None
 
 
 # Shrink tests removed: streaming sessions are append-only after the
