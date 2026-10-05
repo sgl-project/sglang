@@ -1389,8 +1389,7 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             self.num_values,
             config.hidden_size,
             self.total_num_kv_heads * self.head_dim,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
 
     def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:

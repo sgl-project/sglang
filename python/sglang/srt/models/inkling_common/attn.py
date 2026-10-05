@@ -269,7 +269,6 @@ class InklingQKVRLinear(MergedColumnParallelLinear):
         inkling_head_dim: int,
         inkling_num_heads: int,
         inkling_d_rel: int,
-        inkling_tp_size: int,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -277,7 +276,7 @@ class InklingQKVRLinear(MergedColumnParallelLinear):
         self.inkling_head_dim = inkling_head_dim
         self.inkling_num_heads = inkling_num_heads
         self.inkling_d_rel = inkling_d_rel
-        self.inkling_tp_size = inkling_tp_size
+        self.inkling_tp_size = self.tp_size
 
 
 class InklingAttention(nn.Module):
@@ -305,7 +304,6 @@ class InklingAttention(nn.Module):
         self.hidden_size = hidden_size
         self.alt_stream = alt_stream
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.tp_size = attn_tp_size
@@ -339,14 +337,12 @@ class InklingAttention(nn.Module):
             output_sizes=output_sizes,
             bias=q_bias,
             prefix=add_prefix("qkvr", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             quant_config=quant_config,
             inkling_num_kv_heads=self.num_total_kv_heads,
             inkling_head_dim=self.head_dim,
             inkling_num_heads=self.num_total_heads,
             inkling_d_rel=self.d_rel,
-            inkling_tp_size=attn_tp_size,
         )
         self.wo_ud = RowParallelLinear(
             input_size=self.head_dim * self.num_total_heads,
