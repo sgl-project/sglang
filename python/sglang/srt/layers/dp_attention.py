@@ -356,12 +356,17 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    real_counts_gpu = getattr(forward_batch, "global_num_tokens_unpadded_gpu", None)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
-        forward_batch.global_num_tokens_gpu,
+        (
+            real_counts_gpu
+            if real_counts_gpu is not None
+            else forward_batch.global_num_tokens_gpu
+        ),
     )
 
 
