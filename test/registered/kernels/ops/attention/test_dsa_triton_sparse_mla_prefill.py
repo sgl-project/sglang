@@ -109,16 +109,19 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
 
     def test_union_is_exact_on_overlapping_selections(self):
         # The union tile is only exercised when neighbouring tokens share rows;
-        # each token must still see exactly its own set through the mask.
-        for group in (2, 4):
-            T, topk, S = (2048 // group) * group, 2048, 4096
+        # each token must still see exactly its own set through the mask. T=1023
+        # at G=4 leaves a 3-row tail that the per-token kernel must write into
+        # out[T_main:]; skipped or misplaced tail rows would come back as
+        # uninitialised memory or another token's output.
+        for group, T in ((2, 2048), (4, 2048), (4, 1023)):
+            topk, S = 2048, 4096
             q, kv, g = _qkv(T, S, 8, seed=100 + group)
             idx = _overlapping_indices(T, topk, S, g)
             _assert_matches(
                 self,
                 sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=group),
                 _reference(q, kv, idx),
-                f"union G={group}",
+                f"union G={group} T={T}",
             )
 
     def test_large_head_count_steps_down_instead_of_oom(self):

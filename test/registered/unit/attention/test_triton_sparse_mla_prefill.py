@@ -38,8 +38,9 @@ class TestTritonSparseMLAValidator(CustomTestCase):
         return _validate_triton_sparse_mla_backend(**defaults)
 
     def test_sm_major_boundary_is_hopper(self):
-        # The kernel is validated on SM90+ only (tiles swept on SM90 and SM120);
-        # SM80 and below are refused at startup rather than run unmeasured.
+        # SM80 and below are refused at startup. SM90+ is admitted: SM90 and
+        # SM120 run tuned tiles, other architectures the untuned default with a
+        # startup warning (see _PINNED in the kernel module).
         with self.assertRaisesRegex(ValueError, "SM90"):
             self._validate(device_sm_major=8)
         for sm in (9, 10, 12):
