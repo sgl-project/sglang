@@ -391,12 +391,19 @@ class Req:
             return
 
         # Prefer true_cfg_scale when it is explicitly provided.
+        # guidance_scale may be a None sentinel on models that resolve their
+        # recipe per served variant (e.g. HiDream); treat None as CFG-off,
+        # matching the convention in server_args and the HiDream stage.
         cfg_scale = (
             self.true_cfg_scale
             if self.true_cfg_scale is not None
             else self.guidance_scale
         )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        ):
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
