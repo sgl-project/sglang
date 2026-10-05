@@ -22,6 +22,8 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 import triton
+from safetensors.torch import load_file
+from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -31,6 +33,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 # Configs
+from sglang.srt.configs.model_config import load_decision_config
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -51,9 +54,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 
 # Layers - Attention
@@ -118,6 +121,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
+    get_model,
     get_parallel,
     get_stream,
 )
@@ -524,7 +528,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
             dtype=torch.get_default_dtype(),
             **(
                 {"activation": self.output_gate_type}
@@ -1142,6 +1145,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1166,9 +1170,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
@@ -1177,10 +1182,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1196,46 +1202,42 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # The bf16 sidecar is only needed when in_proj_ba cannot take the tuple.
         ba_reads_tuple = _linear_accepts_quant_tuple(self.linear_attn.in_proj_ba)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (
-                declare_attn(
-                    read=NormQuantReadout(
-                        fp8_input=(
-                            (
-                                Fp8Input.TUPLE
-                                if ba_reads_tuple
-                                else Fp8Input.TUPLE_AND_BF16
-                            )
-                            if accepts_fp8_input
-                            else None
-                        ),
-                        # GDN has two parallel input projections. Match the
-                        # epilogue to in_proj_qkvz (it dominates the bytes).
-                        quant_format=_detect_fused_ar_quant_format(
-                            self.linear_attn.in_proj_qkvz
-                        ),
-                    )
+        # A subclass that brings its own residual builds the stages itself.
+        if build_stages:
+            self.attn_boundary, self.ffn_boundary = append_stages(
+                (
+                    declare_attn(
+                        read=NormQuantReadout(
+                            fp8_input=(
+                                (
+                                    Fp8Input.TUPLE
+                                    if ba_reads_tuple
+                                    else Fp8Input.TUPLE_AND_BF16
+                                )
+                                if accepts_fp8_input
+                                else None
+                            ),
+                            # GDN has two parallel input projections. Match the
+                            # epilogue to in_proj_qkvz (it dominates the bytes).
+                            quant_format=_detect_fused_ar_quant_format(
+                                self.linear_attn.in_proj_qkvz
+                            ),
+                        )
+                    ),
+                    self.input_layernorm,
+                    {
+                        "fusions": boundary_fusions,
+                    },
                 ),
-                self.input_layernorm,
-                {
-                    "fusions": boundary_fusions,
-                },
-            ),
-            (
-                declare_ffn(
-                    sparse=is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
+                (
+                    declare_ffn(
+                        sparse=is_layer_sparse,
+                        next_layer_sparse=is_next_layer_sparse,
+                    ),
+                    self.post_attention_layernorm,
+                    {"fusions": boundary_fusions},
                 ),
-                self.post_attention_layernorm,
-                {"fusions": boundary_fusions},
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
-        )
 
     def forward(
         self,
@@ -1286,6 +1288,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1380,9 +1383,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
@@ -1397,9 +1401,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1416,35 +1421,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_quant_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (
-                declare_attn(
-                    read=NormQuantReadout(
-                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None,
-                        # A single consumer, so the epilogue follows qkv_proj.
-                        quant_format=_detect_fused_ar_quant_format(self.qkv_proj),
-                    )
+        # A subclass that brings its own residual builds the stages itself.
+        if build_stages:
+            self.attn_boundary, self.ffn_boundary = append_stages(
+                (
+                    declare_attn(
+                        read=NormQuantReadout(
+                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                            # A single consumer, so the epilogue follows qkv_proj.
+                            quant_format=_detect_fused_ar_quant_format(self.qkv_proj),
+                        )
+                    ),
+                    self.input_layernorm,
+                    {
+                        "fusions": boundary_fusions,
+                    },
                 ),
-                self.input_layernorm,
-                {
-                    "fusions": boundary_fusions,
-                },
-            ),
-            (
-                declare_ffn(
-                    sparse=is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
+                (
+                    declare_ffn(
+                        sparse=is_layer_sparse,
+                        next_layer_sparse=is_next_layer_sparse,
+                    ),
+                    self.post_attention_layernorm,
+                    {"fusions": boundary_fusions},
                 ),
-                self.post_attention_layernorm,
-                {"fusions": boundary_fusions},
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
-        )
 
         self.alt_stream = alt_stream
 
@@ -2453,11 +2454,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        bare_backbone = False
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
                 continue
+            if name.startswith("language_model."):
+                # A bare Qwen3_5Model save, which has no LM head of its own.
+                name = "model." + name
+                bare_backbone = True
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -2529,7 +2535,28 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
+        if bare_backbone and self.pp_group.is_last_rank:
+            self._load_decision_readout()
+            loaded_params.add("lm_head.weight")
         return loaded_params
+
+    def _load_decision_readout(self) -> None:
+        """Place the checkpoint's decision readout in the LM head rows of its codes."""
+        model = get_model()
+        config = load_decision_config(model.model_path, model.revision)
+        if config is None:
+            raise ValueError(
+                "This Qwen3_5Model checkpoint has no LM head and no "
+                "decision_config.json readout to serve in its place"
+            )
+        readout = load_file(
+            cached_file(
+                model.model_path, "readout.safetensors", revision=model.revision
+            )
+        )["weight"]
+        head = readout.new_zeros(self.lm_head.org_vocab_size, readout.shape[1])
+        head[config["token_ids"]] = readout
+        self.lm_head.weight_loader(self.lm_head.weight, head)
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
