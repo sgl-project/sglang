@@ -66,6 +66,7 @@ mod tests {
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,
+            grpc_port: None,
         };
         Worker::with_cb_config(spec, None, profile)
     }

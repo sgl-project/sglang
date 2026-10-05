@@ -64,6 +64,7 @@ fn router(
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,
+            grpc_port: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }

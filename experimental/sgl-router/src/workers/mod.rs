@@ -10,4 +10,4 @@ pub use introspect::{ServerInfo, WorkerIntrospector};
 pub use registry::WorkerRegistry;
 pub use worker::WireProtocol;
 pub use worker::{paired_prefills, Worker};
-pub use worker::{DpRankGuard, EngineProfile, LoadGuard};
+pub use worker::{DpRankGuard, EngineProfile, LoadGuard, GRPC_MAX_MESSAGE_BYTES};
