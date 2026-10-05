@@ -28,28 +28,45 @@ impl RadixTreePrefixProvider {
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
         for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
-            let depth = u32::try_from(depth).unwrap_or(u32::MAX);
-            depth_by_url
-                .entry(worker.url)
-                .and_modify(|current| *current = (*current).max(depth))
-                .or_insert(depth);
+            merge_depth(&mut depth_by_url, worker.url, depth);
         }
-        let best_prefix_blocks = depth_by_url.values().copied().max()?;
-        let matches = depth_by_url
-            .into_iter()
-            .map(|(address, matched_prefix_blocks)| PrefixMatch {
-                worker_id: address.clone(),
-                address,
-                matched_prefix_blocks,
-            })
-            .collect();
+        let confirmed = depth_by_url.values().copied().max();
+        for (url, depth) in self.tree.pending().depths(&hashes) {
+            merge_depth(&mut depth_by_url, url.to_string(), depth);
+        }
+        let outcome = match depth_by_url.values().copied().max() {
+            None => PrefixOutcome::Empty,
+            Some(best_prefix_blocks) => {
+                if confirmed < Some(best_prefix_blocks) {
+                    self.tree.pending().record_hit();
+                }
+                let matches = depth_by_url
+                    .into_iter()
+                    .map(|(address, matched_prefix_blocks)| PrefixMatch {
+                        worker_id: address.clone(),
+                        address,
+                        matched_prefix_blocks,
+                    })
+                    .collect();
+                PrefixOutcome::Matched {
+                    matches,
+                    best_prefix_blocks,
+                }
+            }
+        };
+        // Empty is still returned so routing can record where this prompt went.
         Some(ExternalPrefixSignal {
-            outcome: PrefixOutcome::Matched {
-                matches,
-                best_prefix_blocks,
-            },
+            outcome,
             query_blocks: hashes.len(),
+            block_hashes: self.tree.pending().is_enabled().then(|| hashes.into()),
         })
+    }
+
+    /// Remember that `signal`'s prompt was just routed to `url`.
+    pub fn record_route(&self, signal: &ExternalPrefixSignal, url: &str) {
+        if let Some(hashes) = &signal.block_hashes {
+            self.tree.pending().record(url, hashes);
+        }
     }
 
     /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
@@ -74,4 +91,12 @@ impl RadixTreePrefixProvider {
         };
         (!hashes.is_empty()).then_some(hashes)
     }
+}
+
+fn merge_depth(depth_by_url: &mut BTreeMap<String, u32>, url: String, depth: usize) {
+    let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+    depth_by_url
+        .entry(url)
+        .and_modify(|current| *current = (*current).max(depth))
+        .or_insert(depth);
 }

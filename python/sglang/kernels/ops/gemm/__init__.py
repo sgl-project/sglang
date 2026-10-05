@@ -399,33 +399,6 @@ __all__ = [
 # Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
 from sglang.kernels.ops.gemm import cake as _cake  # noqa: E402, F401
 
-# LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
-# registered for inventory. Import them from their modules.
-_TRITON_KERNELS = [
-    ("chunked_embedding_lora_a", "chunked_embedding_lora_a_forward"),
-    ("chunked_sgmv_expand", "chunked_sgmv_lora_expand_forward"),
-    ("chunked_sgmv_shrink", "chunked_sgmv_lora_shrink_forward"),
-    ("embedding_lora_a", "embedding_lora_a_fwd"),
-    ("gate_up_lora_b", "gate_up_lora_b_fwd"),
-    ("qkv_lora_b", "qkv_lora_b_fwd"),
-    ("sgemm_lora_a", "sgemm_lora_a_fwd"),
-    ("sgemm_lora_b", "sgemm_lora_b_fwd"),
-    ("kv_b_lora_absorbed", "step_a_q_fwd"),
-    ("kv_b_lora_absorbed", "step_b_q_fwd"),
-    ("kv_b_lora_absorbed", "step_a_v_fwd"),
-    ("kv_b_lora_absorbed", "step_b_v_fwd"),
-]
-for _mod, _fn in _TRITON_KERNELS:
-    register_kernel(
-        KernelSpec(
-            op=f"gemm.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
-        )
-    )
-del _mod, _fn
-
-
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(

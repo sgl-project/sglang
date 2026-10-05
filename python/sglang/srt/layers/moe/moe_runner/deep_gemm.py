@@ -851,7 +851,6 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    hidden_states_scale_tma_aligned: bool = False
     # Number of activation elements sharing one scale along K.
     # Records the actual input quantization group, independently of weight scales.
     activation_scale_block_size: Optional[int] = None
@@ -1073,10 +1072,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if (
-            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
-            and not runner_input.hidden_states_scale_tma_aligned
-        ):
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -1216,6 +1212,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
+
+        deepep_v2_expanded = running_state.get("deepep_v2_expanded", False)
+        # Folding the row weight into down_input_scale needs a non-power-of-two
+        # scale; ue8m0 is a power of two, so it weights down_output before combine.
+        # no_combine asks for raw rows, so the fold must not pre-apply the weight.
+        fuse_weight_into_scale = (
+            deepep_v2_expanded
+            and not self.config.no_combine
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and running_state.get("topk_weights") is not None
+        )
+        if fuse_weight_into_scale:
+            from sglang.kernels.ops.moe.ep_moe_kernels import scale_expanded_rows_
+
+            scale_expanded_rows_(down_input_scale, running_state["topk_weights"])
+            running_state["deepep_v2_weight_prefused"] = True
 
         down_output = self._allocate_down_output(all_tokens, K, hidden_states_device)
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
@@ -2319,8 +2331,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state: dict,
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
-        ep_expand_init_m_indices_from_psum,
         ep_scatter_from_psum,
+        fill_m_indices_from_psum,
     )
 
     hidden_states = dispatch_output.hidden_states
@@ -2329,7 +2341,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
     topk_weights = dispatch_output.topk_weights
     psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
     is_expanded = dispatch_output.is_expanded
-    hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
     deepep_v2_use_masked = dispatch_output.use_masked_gemm
     deepep_v2_expected_m = dispatch_output.expected_m
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
@@ -2387,17 +2398,18 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 ),
             )
 
-        # Mark aligned expert rows and leave the unused receive tail at -1.
-        m_indices = torch.full(
-            (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
+        num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
+        m_indices = fill_m_indices_from_psum(
+            psum_num_recv_tokens_per_expert,
+            num_local_experts,
+            all_tokens,
+            deepep_v2_expert_alignment,
         )
-        ep_expand_init_m_indices_from_psum(psum_num_recv_tokens_per_expert, m_indices)
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             use_masked_gemm=False,
             m_indices=m_indices,
-            hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
             activation_scale_block_size=dispatch_output.activation_scale_block_size,
         )
 
@@ -2504,11 +2516,14 @@ def post_permute_deep_gemm_to_deepep_v2(
             return DeepEPv2CombineInput(
                 hidden_states, topk_weights, RoutewiseLayout.EXPANDED
             )
-        if topk_weights is not None:
-            # Expanded combine does not consume top-k weights.
-            hidden_states = hidden_states * topk_weights.to(
-                hidden_states.dtype
-            ).unsqueeze(-1)
+        if topk_weights is not None and not running_state.get(
+            "deepep_v2_weight_prefused", False
+        ):
+            # Expanded combine does not consume top-k weights;
+            # skip when fold-into-scale already applied them before down_proj.
+            # In-place with fp32 weights rounds once; casting the weights to
+            # bf16 first costs measurable accuracy.
+            hidden_states.mul_(topk_weights.unsqueeze(-1))
         return DeepEPv2CombineInput(hidden_states, None)
 
     hidden_states = runner_output.hidden_states
