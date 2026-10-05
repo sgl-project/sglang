@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_index_translator import KVReadTables
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -54,6 +53,7 @@ from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -625,6 +625,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return
 
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -676,6 +677,7 @@ class FlashAttentionBackend(AttentionBackend):
             # A stale non-None seq_lens_cpu buffer would under-size max_seq_pages
             # (stale page-table rows -> OOB); force None under sync-free.
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -753,20 +755,13 @@ class FlashAttentionBackend(AttentionBackend):
         translating = self.kv_index_translator.is_translating
         max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
         if translating:
-            # Unified pool: the block table is a TRANSLATED page table, built
-            # straight into these capture-stable buffers from the LIVE v2p, so
-            # a page relocated by compaction since capture is picked up. Same
-            # substitution the eager extend branch makes in its `_unified_read`
-            # fixup; `build_index_table` emits page-granular physical ids
-            # directly, so there is no `// page_size` to undo.
-            self.kv_index_translator.build_index_table(
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
-                into=KVReadTables(
-                    full=m.page_table,
-                    sliding_window=(
-                        m.swa_page_table if self.use_sliding_window_kv_pool else None
-                    ),
+            # Unified pool: the plan's page table, physical page ids from this
+            # iteration's v2p, copied into these capture-stable buffers.
+            self.kv_index_translator.copy_page_table(
+                forward_batch.kv_loc_plan,
+                out=m.page_table,
+                sliding_window_out=(
+                    m.swa_page_table if self.use_sliding_window_kv_pool else None
                 ),
             )
         elif max_seq_len_k > 0:
@@ -1226,15 +1221,10 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
         if _unified_read:
-            delta = self._spec_read_seq_len_delta(
-                forward_batch.forward_mode, forward_batch.spec_info
-            )
-            if delta:
-                kv_view = self.kv_index_translator.widened_index_table(
-                    forward_batch, seq_len_delta=delta
-                )
-            else:
-                kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
+            # The plan's table covers this forward's reads, a verify's and a
+            # draft decode's window included; the kernels bound each row by
+            # `cache_seqlens`.
+            kv_view = forward_batch.kv_loc_plan.read_table()
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
@@ -2840,6 +2830,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _set_decode_page_metadata(
         self,
+        plan: KVLocPlan,
         metadata,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -2847,9 +2838,8 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> None:
         """Fill `cache_seqlens_int32`, `cu_seqlens_k` and the page table(s).
 
-        Under the unified pool the translator writes the page tables in place,
-        so the fused kernel is left with the prefix sum alone -- one pass over
-        the rows instead of a translated build plus a verbatim copy of it.
+        Under the unified pool the page tables are the plan's, copied in, so
+        the fused kernel is left with the prefix sum alone.
         """
         translated = self.kv_index_translator.reads_are_translated
         normal_decode_set_metadata(
@@ -2867,17 +2857,22 @@ class FlashAttentionBackend(AttentionBackend):
             skip_page_table=translated,
         )
         if translated:
-            # Fill to `cache_seqlens_int32`, which the kernels bound their reads
-            # by: a draft decode reads `seq_len_delta` past `seq_lens`.
-            self.kv_index_translator.fill_read_table(
-                out=metadata.page_table,
-                sliding_window_out=metadata.swa_page_table,
-                req_pool_indices=req_pool_indices,
-                seq_lens=metadata.cache_seqlens_int32,
+            # The plan's table reaches `cache_seqlens_int32`, which the kernels
+            # bound their reads by: a draft decode reads past `seq_lens`.
+            bs = int(req_pool_indices.numel())
+            self.kv_index_translator.copy_page_table(
+                plan,
+                out=metadata.page_table[:bs],
+                sliding_window_out=(
+                    None
+                    if metadata.swa_page_table is None
+                    else metadata.swa_page_table[:bs]
+                ),
             )
 
     def _apply_cuda_graph_metadata(
         self,
+        plan: KVLocPlan,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -2913,6 +2908,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # max_seq_len_k left unset -- unread here (scheduler_metadata
                     # is normal-decode-only).
                     self._set_decode_page_metadata(
+                        plan,
                         metadata,
                         req_pool_indices,
                         seq_lens,
@@ -3017,6 +3013,7 @@ class FlashAttentionBackend(AttentionBackend):
                         else self.max_context_len
                     )
                     self._set_decode_page_metadata(
+                        plan,
                         metadata,
                         req_pool_indices,
                         seq_lens,
@@ -3068,7 +3065,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # max_seq_len_k left unset -- unread here (scheduler_metadata is
                 # normal-decode-only).
                 self._set_decode_page_metadata(
-                    metadata, req_pool_indices, verify_lens, verify_delta
+                    plan, metadata, req_pool_indices, verify_lens, verify_delta
                 )
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
@@ -3201,21 +3198,17 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
             if self.kv_index_translator.reads_are_translated:
-                # The translator writes kernel-facing page ids straight into
-                # the captured tables; `sliding_window_out` fills the swa twin
-                # in the same pass.
-                self.kv_index_translator.fill_read_table(
-                    out=metadata.page_table,
+                # The plan's page ids, copied into the captured tables with
+                # their sliding-window twin.
+                rows = int(req_pool_indices.numel())
+                self.kv_index_translator.copy_page_table(
+                    plan,
+                    out=metadata.page_table[:rows],
                     sliding_window_out=(
-                        metadata.swa_page_table
+                        metadata.swa_page_table[:rows]
                         if self.use_sliding_window_kv_pool
                         and metadata.swa_page_table is not None
                         else None
-                    ),
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                    seq_len_delta=self._spec_read_seq_len_delta(
-                        forward_mode, spec_info
                     ),
                 )
             else:

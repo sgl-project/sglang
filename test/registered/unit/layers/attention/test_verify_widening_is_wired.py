@@ -21,10 +21,11 @@ page_size 256, where the un-widened `ceil(seq/ps)` pages still cover a few
 draft tokens, and at page_size 1 observed as accept length collapsing
 (6.20 -> 1.37) or wrong tokens (gsm8k 0.905 -> 0.730).
 
-These tests drive fa3's two verify builds -- the eager one and the captured
-one a cuda-graph replay runs -- through a translating KV-index translator
-over a non-identity virtual->physical page map, and check the page table the
-kernel reads: every row translated, and filled through the draft tail.
+These tests build a verify's own plan through a translating KV-index
+translator over a non-identity virtual->physical page map, drive fa3's two
+verify builds -- the eager one and the captured one a cuda-graph replay runs --
+from it, and check the page table the kernel reads: every row translated, and
+filled through the draft tail.
 
     python -m pytest test/registered/unit/layers/attention/test_verify_widening_is_wired.py -v
 """
@@ -67,6 +68,9 @@ def _translator(req_to_token, page_size, n_pages):
     t.defer_read_translate = False
     t._capture_page_size = page_size
     t._full_v2p_table = v2p.to(_DEV)
+    t._translate_write_full = lambda ids: (
+        t._full_v2p_table[ids // page_size] * page_size + ids % page_size
+    )
     t._swa_v2p_table = None
     t._rows = torch.arange(req_to_token.shape[0], dtype=torch.int64, device=_DEV)
     t._index_table_memo = None
@@ -97,6 +101,25 @@ def _expected(req_to_token, live, v2p, page_size):
         toks = req_to_token[r, torch.arange(n_pages, device=_DEV) * page_size].long()
         rows.append(v2p[toks // page_size].to(torch.int32).cpu())
     return rows
+
+
+def _verify_plan(translator, req_to_token, live, host_lens=None):
+    """The plan a verify forward builds for itself: it writes the draft window
+    past `live`, so it reads that far."""
+    bs = live.numel()
+    rows = torch.arange(bs, device=_DEV)
+    cols = live.to(_DEV)[:, None] + torch.arange(_NUM_DRAFT, device=_DEV)[None, :]
+    return translator.own_plan(
+        SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(draft_token_num=_NUM_DRAFT),
+            batch_size=bs,
+            req_pool_indices=rows,
+            seq_lens=live.to(_DEV),
+            seq_lens_cpu=live if host_lens is None else host_lens,
+            out_cache_loc=req_to_token[rows[:, None], cols].long().reshape(-1),
+        )
+    )
 
 
 def _backend(translator, req_to_token, page_size):
@@ -153,6 +176,7 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
             metadata.swa_page_table = None
             b.target_verify_metadata = {bs: metadata}
             b._apply_cuda_graph_metadata(
+                _verify_plan(translator, req_to_token, live),
                 bs,
                 torch.arange(bs, device=_DEV),
                 live.to(_DEV),
@@ -193,6 +217,7 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
                     spec_info=spec_info,
                     encoder_lens=None,
                     out_cache_loc=None,
+                    kv_loc_plan=_verify_plan(translator, req_to_token, live, host_lens),
                 )
                 b.init_forward_metadata(fb)
                 self._check(
