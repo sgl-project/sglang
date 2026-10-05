@@ -1744,7 +1744,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         try:
             parallel = get_parallel()
-            info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+            info["attn_dp_enabled"] = self._dp_attn.is_dp_attention_enabled()
             info["attn_tp_rank"] = parallel.attn_tp_rank
             info["attn_tp_size"] = parallel.attn_tp_size
             info["attn_dp_rank"] = parallel.attn_dp_rank
@@ -1779,6 +1779,18 @@ class _SGLangPlugin(_FrameworkPlugin):
             return result
         if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
+
+        from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+        from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
+
+        # Observe rank-local storage without completing the deferred reduction or
+        # consuming the residual stream. Opaque handoffs and consumed handles have
+        # no tensor to dump.
+        if isinstance(value, UnreducedOutput):
+            return {"": value.partial}
+        if isinstance(value, OwedOutput):
+            tensor = value.contribution.value
+            return {"": tensor} if tensor is not None else {}
 
         return None
 

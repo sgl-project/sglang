@@ -221,8 +221,10 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    // Pro Official agentic + DSpark PD + UMBP pairs ran end-to-end on this build.
-    "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
+    // Pro Official agentic + DSpark PD + UMBP pairs ran end-to-end on this build,
+    // which is also the first one carrying the Aiter MegaMoEv2 kernels the
+    // high-throughput prefill role needs.
+    "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001",
     mi300x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926",
     mi355x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926",
   },
@@ -235,11 +237,11 @@ sgl-eval run mmmu_pro \\
   playgroundFeatures: {
 
     // ----- Card 1: "Attention Parallelism" -----
-    // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // DP-Attention is a single knob: value is the attention DP size, emitted as `--attn-dp-size N`.
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream). No `cpStrategy`
     // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
@@ -250,8 +252,10 @@ sgl-eval run mmmu_pro \\
           { value: 2, hide: { variant: ["pro"] } },
           4,
           8,
-          { value: 16, disable: { nodes: ["single"] },
-            disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+          // 16 needs 16 ranks, so it is absent on single-node rather than
+          // listed as "(n/a)". Switch the Deploy panel's Nodes to Multi-Nodes
+          // to get it back.
+          { value: 16, hide: { nodes: ["single"] } },
         ]},
         { id: "cp", label: "CP",
           values: [null, { value: 1, label: "Off" }, 2, 4, 8],
@@ -263,7 +267,7 @@ sgl-eval run mmmu_pro \\
           // The low-latency and balanced PD roles run TP-only. That is what lets
           // their decode ladders run to the full ceiling (8, 32 on Pro Official
           // low-latency, and 96): the ceiling
-          // is server-wide and floor-divided by attn_dp_size, so only at dp_size
+          // is server-wide and floor-divided by attn_dp_size, so only at attn_dp_size
           // 1 is it also the per-rank batch. Forced rather than left to the
           // reader, because switching DP on would cut the slots per rank without
           // changing either flag in the command — the ladder would still read 96
@@ -285,8 +289,8 @@ sgl-eval run mmmu_pro \\
             { value: 2, hide: { variant: ["pro"] } },
             4,
             8,
-            { value: 16, disable: { nodes: ["single"] },
-              disableReason: "DP-Attention=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+            // Multi-node only; hidden rather than shown as "(n/a)".
+            { value: 16, hide: { nodes: ["single"] } },
           ],
           labels: { "auto": "Auto", "false": "Off" } },
       ],
@@ -297,20 +301,65 @@ sgl-eval run mmmu_pro \\
       backend: {
         options: [
           { id: null,                label: "Inherited" },
+          // ROCm offers only the two MORI entries below. DeepEP, FlashInfer and
+          // Marlin stay hidden there: no ROCm recipe in this cookbook uses them,
+          // and no ROCm cell carries a MoE backend flag, so nothing a reader can
+          // select loses its derived value.
           { id: "deepep",            label: "DeepEP",
-            flags: ["--moe-a2a-backend deepep"] },
-          // Blackwell-only; no strategy gate — the Playground allows MegaMoE on any
-          // strategy for experimentation (docs recommend it on high-throughput).
+            flags: ["--moe-a2a-backend deepep"],
+            hide: { hw: ["mi300x", "mi355x"] } },
+          // MORI's expert all-to-all — the dispatch/combine backend the AMD
+          // recipes use, and what the §3.8 decode role runs. Hidden on every
+          // non-ROCm platform, the same way the MORI transfer backend is in the
+          // PD card.
+          { id: "mori",              label: "MORI",
+            flags: ["--moe-a2a-backend mori"],
+            hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300",
+                         "rtx6000", "rtx5090", "dgx-spark"] } },
+          // No strategy gate — the Playground allows MegaMoE on any strategy for
+          // experimentation (docs recommend it on high-throughput).
+          //
+          // Two implementations sit behind one option. On Blackwell it is the
+          // DeepGEMM MegaMoE, tuned through the Quantization knob below. On
+          // MI355X it is Aiter MegaMoEv2 (sgl-project/sglang#35619), and the
+          // a2a backend alone only selects the hook: without
+          // SGLANG_AMD_USE_FLYDSL_MEGA_MOE the call falls through to the
+          // DeepGEMM path, which has no ROCm kernel. MTPR has to cover the
+          // per-rank prefill chunk (--chunked-prefill-size / dp_size, i.e.
+          // 65536 / 8 on the DP8 recipes); tokens past it silently fall back to
+          // fused MoE. MegaMoEv2 also addresses its dispatch/combine buffers
+          // through MORI's symmetric heap, whose 4 GiB default overflows at the
+          // ~4.2 GiB MegaMoEv2 wants at MTPR 8192 — hence the size here. The
+          // MODE is deliberately NOT emitted: STATIC_HEAP is MORI's own default,
+          // so on this card it would be pure noise. The PD prefill role sets it
+          // because the recipe it mirrors runs under a launcher that exports
+          // ISOLATION. See cookbook §3.7 / §3.8.
           { id: "megamoe",           label: "MegaMoE",
+            // Same flag, two implementations. On ROCm it is Aiter MegaMoEv2,
+            // which reaches its dispatch/combine buffers through MORI's
+            // symmetric heap, so the label says MORI there.
+            labelWhen: [{ when: { hw: ["mi300x", "mi355x"] },
+                          label: "MORI MegaMoE" }],
             flags: ["--moe-a2a-backend megamoe"],
-            requiresHw: ["b200", "b300", "gb200", "gb300"] },
+            requiresHw: ["b200", "b300", "gb200", "gb300", "mi355x"],
+            env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
+                  "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
+                  "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
+                  "MORI_SHMEM_HEAP_SIZE=8G"],
+            envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
-            flags: ["--moe-runner-backend flashinfer_mxfp4"] },
+            flags: ["--moe-runner-backend flashinfer_mxfp4"],
+            hide: { hw: ["mi300x", "mi355x"] } },
           { id: "marlin",            label: "Marlin (W4A16)",
-            flags: ["--moe-runner-backend marlin"] },
+            flags: ["--moe-runner-backend marlin"],
+            hide: { hw: ["mi300x", "mi355x"] } },
         ],
       },
+      // DeepGEMM MegaMoE only: the ROCm build is quantized through the backend
+      // option's own SGLANG_AMD_FLYDSL_MEGA_QUANT, so neither the knob nor its
+      // per-rank token budget applies there.
       megamoeQuant: {
+        hideHw: ["mi300x", "mi355x"],
         stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
         options: [
           { id: "w4a8", label: "W4A8",
@@ -326,8 +375,8 @@ sgl-eval run mmmu_pro \\
         { value: 2, hide: { variant: ["pro"] } },
         4,
         8,
-        { value: 16, disable: { nodes: ["single"] },
-          disableReason: "EP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+        // Multi-node only; hidden rather than shown as "(n/a)".
+        { value: 16, hide: { nodes: ["single"] } },
       ]},
     },
 
@@ -344,14 +393,14 @@ sgl-eval run mmmu_pro \\
       options: [
         { id: "current",    label: "Inherited from base" },
         { id: "off",        label: "Off (greedy)" },
-        // Shown on pro-official as well as the originals: the 0813 checkpoint
-        // bundles a DSpark head but keeps its MTP head, so this shape stays
-        // available as the MTP fallback. The 1-1-2 shape stays hidden there —
-        // DSpark is the better pick, so only one fallback is offered.
+        // Both EAGLE/MTP shapes are for the original Flash / Pro checkpoints,
+        // which bundle an MTP head. Pro Official (0813) ships a DSpark head
+        // and no MTP head, so neither shape is offered there — the same reason
+        // they are hidden on Flash Official and Flash Vision.
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official", "flash-vision"] } },
+          hide: { variant: ["flash-official", "flash-vision", "pro-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
@@ -388,14 +437,11 @@ sgl-eval run mmmu_pro \\
         // small batch ladder and dispatches at most a step's worth of tokens.
         { id: "prefill", label: "Prefill role",
           when: { hw: ["mi355x"], strategy: ["low-latency"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
           flags: [
             "--load-balance-method round_robin",
             "--tokenizer-worker-num 8",
             "--stream-interval 20",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 8",
-            "--swa-full-tokens-ratio 0.1",
             "--disable-cuda-graph",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
@@ -403,21 +449,37 @@ sgl-eval run mmmu_pro \\
           ] },
         { id: "decode",  label: "Decode role",
           when: { hw: ["mi355x"], strategy: ["low-latency"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
           flags: [
             "--load-balance-method round_robin",
             "--tokenizer-worker-num 8",
             "--stream-interval 20",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 8",
-            "--swa-full-tokens-ratio 0.1",
             "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
             "--enable-metrics",
           ] },
       ],
+      // MORI is listed first because it is the transport every ROCm recipe in
+      // this cookbook uses. It is hidden on non-ROCm platforms, and the engine
+      // picks the first VISIBLE entry as the default, so Mooncake stays the
+      // default there.
       transferBackends: [
+        // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
+        { id: "mori",     label: "MORI",
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300",
+                       "rtx6000", "rtx5090", "dgx-spark"] },
+          defaultWhen: { hw: ["mi300x", "mi355x"] },
+          // MORI-IO transport tuning only — this card moves KV between the two
+          // workers. The per-rank dispatch budget is sized per role (see
+          // `modes` above). SGLANG_MORI_COMBINE_DTYPE is not here: it is read
+          // by the MoE MORI dispatcher (token_dispatcher/moriep.py), not by
+          // MORI-IO, and `auto` is what that code does when it is unset.
+          env: [
+            "MORI_IO_SQ_BACKOFF_TIMEOUT_US=500000",
+            "MORI_IO_QP_MAX_SEND_WR=32767",
+          ],
+          envWhen: { hw: ["mi300x", "mi355x"] } },
         { id: "mooncake", label: "Mooncake",
           env: [
             "NCCL_MNNVL_ENABLE=1",
@@ -427,18 +489,6 @@ sgl-eval run mmmu_pro \\
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
         { id: "nixl",     label: "NiXL" },
-        // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
-        { id: "mori",     label: "MORI",
-          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] },
-          defaultWhen: { hw: ["mi300x", "mi355x"] },
-          // Transport-wide only. The per-rank dispatch budget is sized per role
-          // (see `modes` above), so it lives on the role, not here.
-          env: [
-            "SGLANG_MORI_COMBINE_DTYPE=auto",
-            "MORI_IO_SQ_BACKOFF_TIMEOUT_US=500000",
-            "MORI_IO_QP_MAX_SEND_WR=32767",
-          ],
-          envWhen: { hw: ["mi300x", "mi355x"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       // The mlx5 names are ConnectX; ROCm nodes enumerate their NICs as rdmaN,
@@ -477,31 +527,35 @@ sgl-eval run mmmu_pro \\
       // The balanced point sits between the two: TP-only like low-latency, but
       // with a 96-request ceiling and a HiCache tier under the prefill role
       // (see the hicache roleOverride below) instead of low-latency's bare KV
-      // pool or high-throughput's UMBP. It re-sizes more of the base cell than
-      // the other two because the balanced cell is a DP recipe for aggregated
-      // serving — its 0.90 / 0.15 / 65536 sizing does not carry over.
-      // Low-latency on Pro Official (0813) is its own pair: an asymmetric TP4
-      // prefill / TP8 decode that keeps the bundled DSpark head on both roles
-      // (gamma 6; steps / topk / draft tokens are derived from it), with a
-      // 32-request ceiling and a UMBP tier under the prefill role (see the umbp
-      // roleOverride below). The base cell's --prefill-decode-interval and the
-      // decode role's --chunked-prefill-size are aggregated-serving knobs, so
-      // the roles drop them.
+      // pool or high-throughput's linker. Its prefill role is the one that
+      // still re-sizes --tp and --chunked-prefill-size, because the balanced
+      // base cell is a DP recipe for aggregated serving.
+      //
+      // Low-latency on Pro Official (0813) keeps the base cell's TP8 on both
+      // roles and adds the bundled DSpark head at block size 6 (steps / topk /
+      // draft tokens are derived from it), a 32-request ceiling, and the linker
+      // under the prefill role (see the umbp roleOverride below).
+      //
+      // None of these roles re-value --mem-fraction-static or
+      // --swa-full-tokens-ratio: the base cell's values stand, so the rendered
+      // command differs from the Deploy command only where the ROLE differs.
+      // High-throughput is the exception and still sets 0.92, which the §3.8
+      // MegaMoE heap sizing depends on.
+      //
+      // The base cell's --prefill-decode-interval and the decode role's
+      // --chunked-prefill-size are aggregated-serving knobs, so the roles drop
+      // them.
       roleOverrides: [
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
-            "--tp 4",
             "--load-balance-method round_robin",
             "--tokenizer-worker-num 8",
             "--stream-interval 20",
             "--speculative-dspark-block-size 6",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 32",
-            "--swa-full-tokens-ratio 0.1",
             "--chunked-prefill-size 16384",
             "--disable-cuda-graph",
             "--context-length 1048576",
@@ -513,16 +567,13 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
             "--tokenizer-worker-num 8",
             "--stream-interval 20",
             "--speculative-dspark-block-size 6",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 32",
-            "--swa-full-tokens-ratio 0.1",
             "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
@@ -535,16 +586,13 @@ sgl-eval run mmmu_pro \\
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--tp 4",
             "--load-balance-method round_robin",
             "--speculative-algorithm DSPARK",
             "--speculative-dspark-block-size 3",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 96",
-            "--swa-full-tokens-ratio 0.1",
             "--chunked-prefill-size 16384",
             "--disable-cuda-graph",
             "--context-length 1048576",
@@ -556,15 +604,12 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
             "--speculative-algorithm DSPARK",
             "--speculative-dspark-block-size 3",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 96",
-            "--swa-full-tokens-ratio 0.1",
             "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
@@ -572,12 +617,9 @@ sgl-eval run mmmu_pro \\
           ] },
         { mode: "prefill",
           when: { hw: ["mi355x"], strategy: ["balanced"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
           flags: [
             "--load-balance-method round_robin",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 96",
-            "--swa-full-tokens-ratio 0.1",
             "--chunked-prefill-size 16384",
             "--disable-cuda-graph",
             "--context-length 1048576",
@@ -588,30 +630,82 @@ sgl-eval run mmmu_pro \\
         // the graph ladder runs all the way to 96.
         { mode: "decode",
           when: { hw: ["mi355x"], strategy: ["balanced"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
           flags: [
             "--load-balance-method round_robin",
-            "--mem-fraction-static 0.86",
             "--max-running-requests 96",
-            "--swa-full-tokens-ratio 0.1",
             "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
             "--enable-metrics",
           ] },
-        // High-throughput on Pro Official keeps the base cell's TP8 / DP8 on both
-        // roles and adds DSpark at gamma 3, as balanced does. A 512-request
-        // ceiling is 64 per DP rank, which is where the decode ladder stops.
+        // High-throughput on Pro Official is the DP-attention arm of the agentic
+        // PD recipe. Both roles keep the base cell's TP8 / DP8 and add DSpark at
+        // gamma 3, as balanced does. The arm runs one shape from concurrency 192
+        // to 512; only admission and the decode graph ladder move with the point,
+        // and those live in the "Target Concurrency" select below. The ceiling
+        // here is the 256 point, so an untouched render keeps that sizing.
+        //
+        // The roles use DIFFERENT MoE parallelism, each matched to its work.
+        // Prefill goes EP8 on Aiter MegaMoEv2 (sgl-project/sglang#35619): at a
+        // 65536-token chunk, splitting the experts across ranks is what makes
+        // the batch affordable, and the all-to-all it costs is amortized over
+        // that many tokens. Decode stays TP8 (no --ep, no --moe-a2a-backend),
+        // because an all-to-all over a few tokens per step costs more than the
+        // replicated-expert path it would replace. The a2a backend follows from
+        // that choice rather than being a separate one: it names the dispatch
+        // path for expert parallelism, so at EP1 there is nothing for it to name.
+        //
+        // The four DP comm vars drive the all_gatherv / reduce_scatterv path —
+        // exactly what decode's TP-MoE uses and what prefill's all-to-all
+        // replaces — so they go to 0 on prefill and stay as the base cell sets
+        // them on decode. Both on at once is two comm schemes over the same
+        // tokens. Shared-expert fusion stays as the base cell sets it.
+        //
+        // SGLANG_DSV4_UNIFIED_KV_FP8 splits the single bf16 unified KV pool into
+        // parallel nope-fp8 and rope-bf16 pools, a layout that only matches the
+        // unified_kv_triton kernels the base cell already selects. Both roles
+        // carry it because the PD handshake rejects disagreeing KV layouts; the
+        // DSpark draft worker stays bf16 either way.
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1",
+                "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
+                // Must cover the per-rank prefill chunk — SGLang divides
+                // --chunked-prefill-size by dp_size, 65536 / 8 here. Tokens past
+                // it silently fall back to fused MoE.
+                "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
+                "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
+                // MegaMoEv2 addresses its dispatch/combine buffers through MORI's
+                // symmetric heap. STATIC_HEAP is MORI's default and is emitted
+                // only to survive a harness that sets ISOLATION, which builds no
+                // heap at all — the InferenceX agentic recipe base does exactly
+                // that, so the MegaMoE role there has to set it back. The size is
+                // the part that has to be chosen: the heap is hipMalloc'd in full
+                // on the first MegaMoE forward, after the KV pool is sized, so
+                // every byte comes out of the headroom that
+                // --mem-fraction-static 0.92 leaves. MegaMoEv2 places ~0.51 GiB
+                // per 1024 MTPR in it, i.e. ~4.2 GiB at MTPR 8192; MORI's 4 GiB
+                // default overflows at graph capture.
+                "MORI_SHMEM_MODE=STATIC_HEAP",
+                "MORI_SHMEM_HEAP_SIZE=8G",
+                "SGLANG_SHARED_EXPERT_TP1=0",
+                "SGLANG_DP_SHARED_EXPERT_LOCAL=0",
+                "SGLANG_DP_USE_GATHERV=0",
+                "SGLANG_DP_USE_REDUCE_SCATTER=0"],
+          // The base cell sets all four to 1 for the DP comm path; re-value them
+          // rather than emitting both assignments.
+          stripEnv: ["SGLANG_SHARED_EXPERT_TP1", "SGLANG_DP_SHARED_EXPERT_LOCAL",
+                     "SGLANG_DP_USE_GATHERV", "SGLANG_DP_USE_REDUCE_SCATTER"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--load-balance-method round_robin",
             "--speculative-algorithm DSPARK",
             "--speculative-dspark-block-size 3",
             "--enable-dp-lm-head",
+            "--ep 8",
+            "--moe-a2a-backend megamoe",
+            "--moe-dense-tp-size 1",
             "--mem-fraction-static 0.92",
             "--max-running-requests 512",
             "--disable-cuda-graph",
@@ -624,7 +718,8 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          // Same value as prefill — the handshake compares KV layouts.
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -640,7 +735,6 @@ sgl-eval run mmmu_pro \\
           ] },
         { mode: "prefill",
           when: { hw: ["mi355x"], strategy: ["high-throughput"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
           flags: [
             "--load-balance-method round_robin",
             "--mem-fraction-static 0.92",
@@ -653,7 +747,6 @@ sgl-eval run mmmu_pro \\
           ] },
         { mode: "decode",
           when: { hw: ["mi355x"], strategy: ["high-throughput"] },
-          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
           flags: [
             "--load-balance-method round_robin",
             "--mem-fraction-static 0.92",
@@ -673,7 +766,32 @@ sgl-eval run mmmu_pro \\
       // enabled here (unlike the default's 999999s interval) because a long
       // agentic run should notice a wedged worker, but it is slack enough that
       // a multi-minute prefill is not mistaken for a failure.
+      //
+      // The DP-attention arm additionally needs --request-timeout-secs raised:
+      // the 1800 s default aborts every request still queued behind an
+      // overloaded prefill at once, and an abort landing mid-RDMA-write strands
+      // the MORI TransferStatus and wedges that prefill DP's transfers for good.
+      // That value is the router's per-request HTTP deadline, NOT a queue-only
+      // limit, so raising it also delays the abort of a genuinely wedged worker
+      // from 30 minutes to 4 hours. It therefore stays scoped to the pair that
+      // needs it instead of riding on every MI355X pair. First match wins, so
+      // the narrower entry goes first.
       routerOverrides: [
+        { when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["high-throughput"] },
+          command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --policy consistent_hashing --dp-aware \\
+  --decode-policy round_robin \\
+  --cache-threshold 0.3 \\
+  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
+  --disable-circuit-breaker --health-failure-threshold 100 \\
+  --health-check-timeout-secs 600 --health-check-interval-secs 30 \\
+  --request-timeout-secs 14400` },
         { when: { hw: ["mi355x"] },
           command:
 `python3 -m sglang_router.launch_router \\
@@ -767,7 +885,9 @@ sgl-eval run mmmu_pro \\
       ],
     },
 
-    // ----- Card 7: "UMBP" (unified cache external linker) -----
+    // ----- Card 7: "Unified Cache External Linker" -----
+    // Named for the flags it owns. UMBP is one backend of this feature
+    // (--unified-cache-external-linker-backend mori), not the feature itself.
     // Sits beside HiCache rather than inside it. HiCache is a tiered cache
     // (GPU -> pinned host -> optional storage); UMBP links the unified radix
     // tree DIRECTLY to an external store with no host tier at all, so the two
@@ -778,14 +898,15 @@ sgl-eval run mmmu_pro \\
     // transport the PD roles use, and there is no CUDA recipe for it yet.
     umbp: {
       onlyHw: ["mi300x", "mi355x"],
-      // Under pure TP the linker keys by rank, so an 8-rank prefill worker
-      // opens eight keyspaces and the pool holds eight copies of the same MLA
-      // KV — a tier an eighth the size its byte budget suggests. DP attention
-      // collapses the keys onto one shared keyspace.
-      requiresDpAttention: true,
-      // The Pro Official prefill roles ship with UMBP on. Low-latency and
-      // balanced are TP-only: at TP4 the store holds four copies rather than
-      // eight, and that shape is the one that ran end-to-end. The tier lives
+      // No `requiresDpAttention`: the linker runs under pure TP as well, and the
+      // TP-only Pro Official prefill roles below are that shape.
+      // DP attention is a sizing question, not a prerequisite — the linker keys
+      // by rank, so an 8-rank worker under pure TP opens eight keyspaces holding
+      // eight copies of the same MLA KV, and the tier holds an eighth of the
+      // distinct tokens its byte budget suggests. DP attention collapses the
+      // keys onto one shared keyspace. Cookbook §3.9 explains the trade.
+      //
+      // The Pro Official prefill roles ship with the linker on. The tier lives
       // in a standalone umbp_standalone_server on the prefill node (cookbook
       // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
       roleOverrides: [
@@ -793,7 +914,6 @@ sgl-eval run mmmu_pro \\
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency", "balanced", "high-throughput"] },
           enable: true,
-          allowTp: true,
           env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
           flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
           note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
@@ -836,6 +956,49 @@ sgl-eval run mmmu_pro \\
           { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
           { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
           { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"] },
+        ],
+      },
+      // The MI355X Pro Official DP-attention PD arm (§3.8 high-throughput) runs
+      // ONE shape from concurrency 192 to 512. The point only moves two numbers,
+      // and both are derived rather than tuned: admission is 2x the target
+      // concurrency on both roles, and decode captures graphs up to admission /
+      // dp_size — 8 here, since --max-running-requests is server-wide and
+      // floor-divided by attn_dp_size. Sizing admission at N instead of 2N caps
+      // the served batch below the concurrency being aimed for, which is why the
+      // ladder tops out at a quarter of the label and not at the label itself.
+      //
+      // Emitted as a function of the live role: prefill has no decode ladder,
+      // and off the two PD roles the whole select is hidden and emits nothing.
+      {
+        id: "targetConcurrency",
+        title: "Target Concurrency",
+        showWhen: (base) =>
+          base.hw === "mi355x" && base.variant === "pro-official"
+          && base.quant === "fp4" && base.strategy === "high-throughput"
+          && (base.pdMode === "prefill" || base.pdMode === "decode"),
+        default: "c256",
+        stripPrefixes: ["--max-running-requests", "--cuda-graph-bs-decode"],
+        options: [
+          { id: "c192", label: "192",
+            flags: (v, b) => b.pdMode === "decode"
+              ? ["--max-running-requests 384",
+                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48"]
+              : ["--max-running-requests 384"] },
+          { id: "c256", label: "256",
+            flags: (v, b) => b.pdMode === "decode"
+              ? ["--max-running-requests 512",
+                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64"]
+              : ["--max-running-requests 512"] },
+          { id: "c384", label: "384",
+            flags: (v, b) => b.pdMode === "decode"
+              ? ["--max-running-requests 768",
+                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96"]
+              : ["--max-running-requests 768"] },
+          { id: "c512", label: "512",
+            flags: (v, b) => b.pdMode === "decode"
+              ? ["--max-running-requests 1024",
+                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128"]
+              : ["--max-running-requests 1024"] },
         ],
       },
     ],
@@ -889,8 +1052,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -905,8 +1067,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -927,8 +1088,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -944,8 +1104,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -982,8 +1141,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -1007,8 +1165,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1063,8 +1220,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1079,8 +1235,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1101,8 +1256,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1118,8 +1272,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1154,8 +1307,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
@@ -1181,8 +1333,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1408,8 +1559,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1424,8 +1574,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1446,8 +1595,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1463,8 +1611,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1507,8 +1654,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1533,8 +1679,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -1673,8 +1818,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1689,8 +1833,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1711,8 +1854,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1728,8 +1870,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1764,8 +1905,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1789,8 +1929,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.9",
         "--cuda-graph-max-bs-decode 128",
@@ -1833,8 +1972,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1855,8 +1993,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.9",
         "--cuda-graph-max-bs-decode 128",
@@ -1898,8 +2035,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -1917,8 +2053,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1962,8 +2097,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
@@ -1983,8 +2117,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -2028,8 +2161,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -2046,8 +2178,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -2195,8 +2326,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -2223,8 +2353,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -2356,8 +2485,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -2381,8 +2509,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 256",
@@ -2402,8 +2529,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--cuda-graph-max-bs-decode 8",
         "--max-running-requests 32",
@@ -2427,8 +2553,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -2452,8 +2577,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.88",
         "--cuda-graph-max-bs-decode 128",
@@ -2857,8 +2981,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-prefill-delayer",
         "--prefill-delayer-max-delay-ms 5000",
         "--attention-backend dsv4",
@@ -2890,8 +3013,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-prefill-delayer",
         "--prefill-delayer-max-delay-ms 5000",
         "--attention-backend dsv4",
@@ -2983,8 +3105,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3019,8 +3140,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3059,8 +3179,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3095,8 +3214,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3166,8 +3284,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3206,8 +3323,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3278,8 +3394,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3318,8 +3433,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3389,8 +3503,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3429,8 +3542,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
@@ -3606,8 +3718,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3625,8 +3736,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3661,8 +3771,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3681,8 +3790,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3713,8 +3821,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3733,8 +3840,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3763,8 +3869,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3782,8 +3887,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
