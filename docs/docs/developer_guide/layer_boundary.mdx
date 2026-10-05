@@ -97,41 +97,48 @@ The following constructor fragment assumes the model has already initialized its
 
 ```python
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 
-self.attn_boundary, self.ffn_boundary = make_stages(
+self.attn_boundary, self.ffn_boundary = append_stages(
     (declare_attn(), self.input_layernorm),
     (declare_ffn(), self.post_attention_layernorm),
-    previous=declare_ffn() if layer_id != 0 else None,
-    terminal=layer_id == config.num_hidden_layers - 1,
 )
 ```
 
-`previous` describes the actual external producer. You do not need an executable object from the previous layer or another pipeline rank. For a sparse or custom preceding stage, build `previous` with the same arguments the producing layer uses for its own declaration, including `next_layer_sparse`, for example `declare_ffn(sparse=prev_sparse, next_layer_sparse=this_sparse)`; the two-batch overlap (TBO) exit rows derive from that pair.
+`append_stages()` extends the open layer stack: the stack records the last stage appended, and the next append takes it as its producer, so a layer needs no description of its neighbours. `make_layers()` (and `make_pp_layers()`, which calls it) opens a stack around the layers it builds. A model that builds its layers another way, such as a hand-written `nn.ModuleList` or a NextN/multi-token-prediction (MTP) draft, opens the stack itself; appending outside an open stack raises:
 
-`terminal=True` marks the end of the model's layer stack, not every Python decoder layer. A pipeline partition that has more layers downstream is not terminal merely because its local module list ends. A NextN/multi-token-prediction (MTP) draft module is its own stack: its layer enters with `previous=None` and is terminal even when it reuses the target's decoder class. In that case, use the draft's layer count, for example `terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1`. A terminal stage leaves no work for a following layer, except the final-norm finalize handoff described in [Enter and leave the layer stack](#enter-and-leave-the-layer-stack).
+```python
+from sglang.srt.layers.layer_boundary import layer_stack
 
-`make_stages()` returns independent boundaries and retains no runtime sequence object. Each item may include a third element containing constructor options: an attention stage accepts `qkv_latent_func` (for example `{"qkv_latent_func": self.self_attn.prepare_qkv_latent}`) and `fusions`; an FFN stage accepts only `fusions` (see [Fusion providers](#fusion-providers-and-output-decisions)). Declarations passed into this assembler must not already carry `previous`, `prepared_from`, or `terminal`; provide those to the assembler.
+with layer_stack():
+    self.layers = nn.ModuleList(
+        DecoderLayer(config, layer_id) for layer_id in range(config.num_hidden_layers)
+    )
+```
 
-For a single independently constructed stage, use `make_attn_stage()` or `make_ffn_stage()`. Their declaration includes its source; an optional `following` declaration describes the local consumer and must name that producer in its `previous` field.
+Every stage binds when the stack closes, once its producer and its consumer are known: the stage appended before it and the one appended after it. The last stage ends the model's layer stack and is marked terminal, unless a later layer declares a stage. A boundary's `declaration` is usable at once; when the stack closes, it is replaced by the declaration with its place in the stack (its `previous` and `terminal`), and the plan is bound. An error raised while binding carries a note naming the `append_stages()` call it came from. A terminal stage leaves no work for a following layer, except the final-norm finalize handoff described in [Enter and leave the layer stack](#enter-and-leave-the-layer-stack). A NextN/MTP draft module is its own stack: its layer enters the stack and ends it, even when it reuses the target's decoder class.
+
+Pipeline parallelism splits one layer stack across ranks, so the first and last local stages have neighbours that another rank builds. `make_layers()` finds them without communicating: when its stack closes, it builds the layer before the rank's first local layer and the one after its last again, with the model's own layer function inside `building_neighbour_layer()` (on the meta device), reads the stages they declare and discards them. A stage's declaration depends only on the config and the global layer index, so both ranks see the same boundary. A layer that declares no stage is passed over in favour of the next one out. These neighbours are built only if the stack appended stages, and after the local layers. A neighbour is never loaded or run, so a layer constructor must run on the meta device, must skip the host and device resources only a running layer needs (tables, streams, engines, communicators) when `is_building_neighbour_layer()` is true, and must not depend on which pipeline rank builds it. The meta device alone does not stop a constructor that names a device explicitly.
+
+Each item may include a third element containing constructor options: an attention stage accepts `qkv_latent_func` (for example `{"qkv_latent_func": self.self_attn.prepare_qkv_latent}`) and `fusions`; an FFN stage accepts only `fusions` (see [Fusion providers](#fusion-providers-and-output-decisions)). An option a stage does not take is rejected when appended. Pass declarations fresh from `declare_attn()` / `declare_ffn()`: one taken from a bound boundary already has its place in a stack, and is rejected.
 
 ### Single-stage mixers and heterogeneous stacks
 
-For heterogeneous layer stacks, declare the actual neighbouring stage kinds; the framework does not require an alternating attention/FFN pattern. `make_stages(..., following=declaration)` describes the external consumer after the last local stage, just as `previous` describes the producer before the first.
+For heterogeneous layer stacks, append the actual stages in order; the framework does not require an alternating attention/FFN pattern, and a layer may append a single stage.
 
-For a single-stage `ProducerReduction.EXIT_SCOPED` mixer, `following` decides whether the mixer leaves its attention-TP sum to the next stage: always before an FFN, and per batch before another mixer. The next stage makes the same decision from its own `previous`, so both must describe the same neighbours. Otherwise a pipeline handoff reduces the mixer's output twice: `to_pp()` exports it complete and the receiver's `from_pp()` declares the sum again.
+A single-stage `ProducerReduction.EXIT_SCOPED` mixer's consumer decides whether the mixer leaves its attention-TP sum to the next stage: always before an FFN, and per batch before another mixer. The stack binds the mixer only once its consumer is known, so the two stages always agree, across a pipeline boundary too: there the consumer is the next rank's first stage, which `make_layers()` reads from the neighbouring layer. Bound without its consumer, the mixer would complete the sum before `to_pp()`, and the receiving FFN's `from_pp()` would declare the sum again.
 
-`models/nemotron_h_utils.py` (used by `models/nemotron_h.py`) builds each Nemotron-H stage as `make_stages((decl, norm), previous=..., following=..., terminal=...)`, with mixers declared as `declare_attn(reduction=ProducerReduction.EXIT_SCOPED, gathers_attn_tp_input=False)`.
+`models/nemotron_h_utils.py` (used by `models/nemotron_h.py`) builds each Nemotron-H stage as `append_stages((decl, norm))`, with mixers declared as `declare_attn(reduction=ProducerReduction.EXIT_SCOPED, gathers_attn_tp_input=False)`.
 
 ### More than two stages and branches
 
 There is no two-stage limit. For example, LongCat constructs a dense FFN, attention, and another dense FFN from an input already prepared for its MoE branch:
 
 ```python
-first_ffn, second_attn, second_ffn = make_stages(
+first_ffn, second_attn, second_ffn = append_stages(
     (declare_ffn(), first_ffn_norm),
     (declare_attn(), second_attn_norm),
     (declare_ffn(), second_ffn_norm),
@@ -139,7 +146,7 @@ first_ffn, second_attn, second_ffn = make_stages(
 )
 ```
 
-This fragment assumes the source boundary and the three norms already exist. `prepared_from` means the source has already performed its read. Enter through `branch_input(source, hidden_states, forward_batch)`, not `prepare()`, to move that input and fork the residual stream without normalizing twice. The first stage's norm is therefore never applied; LongCat passes the MoE stage's norm there.
+This fragment assumes the source boundary and the three norms already exist. `prepared_from` means the source has already performed its read. A branch is a side path that the model merges back explicitly: it neither extends the stack nor waits for a consumer, so the next append still follows the source. Enter through `branch_input(source, hidden_states, forward_batch)`, not `prepare()`, to move that input and fork the residual stream without normalizing twice. The first stage's norm is therefore never applied; LongCat passes the MoE stage's norm there.
 
 The branch adapter also provides `branch_output()` to complete the sum a branch's contribution owes and place it on the branch's exit rows and `merge_branch()` to combine it with another branch's output. These methods encode row movement and residual ownership; the model still determines its compute schedule. Branch transport currently supports only ordinary token rows: construction rejects context-parallel, input-scattered, and sequence-parallel variants. See `python/sglang/srt/models/longcat_flash.py` for a complete integration.
 
@@ -218,7 +225,7 @@ Snapshots currently require a plain residual update. Producer-specific finalize 
 
 A separate BF16 snapshot followed by norm can change results relative to a fused add+norm kernel's FP32 accumulation. Capture from the existing update/read operation when that ordering matters.
 
-A capture callback has the signature `capture(value, *, owned=False)`, as `AuxHiddenStateList.capture` does. With `owned=False` the value may alias the mutable residual or a reusable communication buffer, and the collector must copy it before retaining it. The boundary passes `owned=True` only for storage nothing else will write: a capture move that gathers rows (`EntryPath.capture_move_allocates`), a residual sum computed only for the capture, or a residual that the following local stage's input path certifies it leaves untouched. `make_stages()` copies that certificate into the producer's entry at construction; no plan is consulted during forward. `residual_batch.final_norm(..., capture=...)` always passes a borrowed value.
+A capture callback has the signature `capture(value, *, owned=False)`, as `AuxHiddenStateList.capture` does. With `owned=False` the value may alias the mutable residual or a reusable communication buffer, and the collector must copy it before retaining it. The boundary passes `owned=True` only for storage nothing else will write: a capture move that gathers rows (`EntryPath.capture_move_allocates`), a residual sum computed only for the capture, or a residual that the following local stage's input path certifies it leaves untouched. `append_stages()` copies that certificate into the producer's entry at construction; no plan is consulted during forward. `residual_batch.final_norm(..., capture=...)` always passes a borrowed value.
 
 ### Choose a reduction policy
 
@@ -238,9 +245,8 @@ Required attention and MoE collectives are unaffected. These are permissions, no
 
 Before you open a pull request for a new model, check each item:
 
-- Every layer passes the real producer as `previous`, including `sparse`/`next_layer_sparse`, and `previous=None` only where the stack starts.
-- `terminal` is set only on the last layer of the model's stack, using the draft's own layer count for NextN/MTP modules.
-- A single-stage mixer or FFN also passes `following`, and both neighbours describe each other consistently.
+- Every decoder layer appends its stages inside a layer stack: `make_layers()`, or `layer_stack()` around any other construction, including a NextN/MTP draft's own layer.
+- The layer constructor runs on the meta device, allocates nothing when `is_building_neighbour_layer()` is true, and declares the same stages whichever pipeline rank builds it: `make_layers()` builds the layers next to a rank's own that way to read their stages.
 - The model forward calls `residual_batch.start()` before the first layer, and leaves the stack through `residual_batch.final_norm()`, `to_pp()`, or `take_output()`.
 - Pipeline reception calls `from_pp(tensors, forward_batch)` on the first local boundary.
 - Split prefill starts the stream only in the segment that runs the first layer and completes it only in the final segment.
@@ -255,6 +261,7 @@ Common errors and their usual cause:
 | `output does not belong to this residual stream; change layer outputs through boundary accessors` | The model replaced a layer's output object (for example rebinding it to a new tensor) or passed another microbatch's output. This check compares object identity, so it does not catch in-place changes; the interface still forbids modifying layer outputs in place |
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
 | `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel) is not supported by this stage; add a server-argument check that rejects the configuration |
+| `append_stages needs an open layer stack` | The layers are built outside `make_layers()`; wrap their construction in `layer_stack()` |
 | `a prepared branch must enter through branch_input, not prepare` | A `prepared_from` stage was entered with `prepare()` |
 | `snapshot requires a plain residual update` | A snapshot was taken on a nonlinear (for example MHC) update |
 
@@ -279,7 +286,7 @@ flowchart TD
 
 Construction and execution have different lifetimes:
 
-1. **At model initialization**, `declare_attn()` and `declare_ffn()` describe compute behavior. `make_stages()` connects those declarations and binds each stage's own norm and hooks.
+1. **At model initialization**, `declare_attn()` and `declare_ffn()` describe compute behavior. `append_stages()` connects those declarations in stack order and binds each stage's own norm and hooks.
 2. **During construction**, factories resolve token rows and reduction contracts for supported batch variants. `bind_entry()` binds consumer work; `bind_exit()` binds output transport. `StagePlan` retains those paths.
 3. **At each forward**, batch facts select an existing path. An exit can make a batch-dependent completion decision, but it does not rebuild the declarations. The decision supplies the matching completion action; the only flag it publishes to compute is `defer_moe_finalize`, for a MoE that may hand off its finalize.
 4. **Across stages**, `ForwardBatch.residual_stream` carries residual state and the producer's actual contribution. Stages do not store forward tensors on their reusable plans.
@@ -353,4 +360,4 @@ Place changes according to their responsibility:
 4. Put backend completion in `fusions/` and specialized exit and entry behavior in `adapters/`.
 5. Keep models on stage factories and boundary methods. Avoid reading a neighbour's execution plan or reconstructing a collective decision during forward.
 
-Focused tests live in `test/registered/unit/layer_boundary/`. Cover numerical output and residual state, collective group/row correctness, and supported fallback behavior for the changed path. Relevant examples include `test_ffn_exit.py`, `test_reduction_fusion.py`, and `test_terminal_stages.py`. A declaration-only assertion cannot establish that a new parallel path moves and reduces the correct values.
+Focused tests live in `test/registered/unit/layer_boundary/`. Cover numerical output and residual state, collective group/row correctness, and supported fallback behavior for the changed path. Relevant examples include `test_ffn_exit.py`, `test_reduction_fusion.py`, and `test_append_stages.py`. A declaration-only assertion cannot establish that a new parallel path moves and reduces the correct values.

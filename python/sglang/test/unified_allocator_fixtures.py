@@ -79,6 +79,7 @@ def build_tri_pool(*, page_size=1):
         extra_max_context_len=1,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
+        enable_mamba_extra_buffer_lazy=False,
         disable_overlap_schedule=True,
         sliding_window_size=32,
     )
