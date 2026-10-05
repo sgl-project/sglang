@@ -27,6 +27,8 @@ from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
     top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
+    topk_transform_512_bf16,
     topk_transform_paged,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -53,8 +55,10 @@ __all__ = [
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",
     "topk_transform_paged",
+    "topk_transform_512_bf16",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
     "top_k_per_row_prefill",
+    "top_k_per_row_prefill_bf16",
     "plan_topk_v2",
 ]

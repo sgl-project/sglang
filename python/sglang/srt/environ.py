@@ -1953,7 +1953,11 @@ class Envs:
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_SAIL_FLA_CUDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
-    SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
+    SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
+    # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
+    SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
+    # Enable NaN check on logits valid range before topk_transform (debug/diag).
+    SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
 
 
 envs = Envs()

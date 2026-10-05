@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
     top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -1017,6 +1018,7 @@ class C4IndexerBackendMixin:
                 ks,
                 ke,
                 clean_logits=False,
+                logits_dtype=torch.bfloat16,
             )
         else:
             q_fp8 = q_fp8[global_token_start:global_token_end]
@@ -1083,15 +1085,26 @@ class C4IndexerBackendMixin:
                 request_slice=req_slice,
                 query_slice=query_slice,
             )
-            top_k_per_row_prefill(
-                logits,
-                row_starts,
-                row_ends,
-                core_metadata.page_table[token_start:token_end],
-                core_metadata.c4_sparse_page_indices[token_start:token_end],
-                indexer_metadata.c4_page_size,
-                None if raw_indices is None else raw_indices[token_start:token_end],
-            )
+            if logits.dtype == torch.bfloat16:
+                top_k_per_row_prefill_bf16(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    core_metadata.page_table[token_start:token_end],
+                    core_metadata.c4_sparse_page_indices[token_start:token_end],
+                    indexer_metadata.compressed_page_size,
+                    None if raw_indices is None else raw_indices[token_start:token_end],
+                )
+            else:
+                top_k_per_row_prefill(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    core_metadata.page_table[token_start:token_end],
+                    core_metadata.c4_sparse_page_indices[token_start:token_end],
+                    indexer_metadata.compressed_page_size,
+                    None if raw_indices is None else raw_indices[token_start:token_end],
+                )
 
     def forward_c4_indexer(
         self,

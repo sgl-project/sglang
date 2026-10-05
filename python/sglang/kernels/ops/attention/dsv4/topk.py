@@ -114,6 +114,30 @@ def _jit_topk_prefill_module(topk: int):
     )
 
 
+@cache_once
+def _jit_topk_prefill_bf16_module(topk: int):
+    return load_jit(
+        make_name("topk_prefill_bf16"),
+        str(topk),
+        cuda_files=["deepseek_v4/topk_prefill_bf16.cuh"],
+        cuda_wrappers=[
+            ("top_k_per_row_prefill_bf16", "TopKPrefillBF16Kernel::transform"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
+@cache_once
+def _jit_topk_bf16_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk_bf16"),
+        *args,
+        cuda_files=["deepseek_v4/topk_bf16.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopK512BF16Kernel<{args}>::transform")],
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -367,6 +391,45 @@ def top_k_per_row_prefill(
 ) -> None:
     module = _jit_topk_prefill_module(out_page_indices.shape[1])
     module.top_k_per_row_prefill(
+        scores,
+        row_starts,
+        row_ends,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
+def topk_transform_512_bf16(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    module = _jit_topk_bf16_module()
+    module.topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+def top_k_per_row_prefill_bf16(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Top-K per row for prefill with bf16 scores input.
+
+    Uses streaming cp.async pipeline for long sequences (>16K).
+    """
+    module = _jit_topk_prefill_bf16_module(out_page_indices.shape[1])
+    module.top_k_per_row_prefill_bf16(
         scores,
         row_starts,
         row_ends,

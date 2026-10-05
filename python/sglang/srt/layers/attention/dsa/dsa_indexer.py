@@ -83,6 +83,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 _FUSED_FP8_WRITER_LOGGED = False
 
+# Cached env flag: enable NaN check on logits before topk_transform.
+_enable_logits_nan_check = envs.SGLANG_BF16_TOPK_DEBUG.get()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -163,6 +165,46 @@ if _is_cuda or _is_hip:
         logits_head_gate_graph,
         scale_head_gate_graph,
     )
+
+
+def _check_logits_nan_in_valid_range(
+    logits: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    row_offset: int = 0,
+) -> None:
+    """Fail fast if *logits* contains NaN within valid range [ks, ke).
+
+    Gated by SGLANG_BF16_TOPK_DEBUG env var (default off).
+    Only the diagnostic branch (.sum / .where) runs when NaN is detected;
+    the fast-path check is a single fused isnan+mask+any.
+    """
+    col_idx = torch.arange(logits.shape[1], device=logits.device)
+    valid_mask = (col_idx.unsqueeze(0) >= ks.unsqueeze(1)) & (
+        col_idx.unsqueeze(0) < ke.unsqueeze(1)
+    )
+    if (torch.isnan(logits) & valid_mask).any().item():
+        nan_in_valid = (torch.isnan(logits) & valid_mask).sum().item()
+        total_valid = valid_mask.sum().item()
+        nan_rows = torch.where((torch.isnan(logits) & valid_mask).any(dim=1))[0]
+        if nan_rows.numel() > 0:
+            r = nan_rows[0].item()
+            ks_v, ke_v = ks[r].item(), ke[r].item()
+            raise RuntimeError(
+                f"NaN detected in valid range of logits! "
+                f"shape={logits.shape}, dtype={logits.dtype}, "
+                f"NaN in valid={nan_in_valid}/{total_valid}, "
+                f"first NaN row={row_offset + r}, valid range [{ks_v},{ke_v}). "
+                f"Likely upstream mqa_logits kernel bug."
+            )
+        raise RuntimeError(
+            f"NaN detected in valid range of logits! "
+            f"shape={logits.shape}, dtype={logits.dtype}, "
+            f"NaN in valid={nan_in_valid}/{total_valid}. "
+            f"Likely upstream mqa_logits kernel bug."
+        )
+
+
 if is_ppu():
     print("<SAIL>: skipping dsa indexer optimization, fallback to original path")
     SKIP_OPT_PATH = True
@@ -703,6 +745,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         cu_seq_len_k_start: torch.Tensor,
         cu_seq_len_k_end: torch.Tensor,
         clean_logits: bool = True,
+        force_unfused_topk: bool = False,
     ):
         if self.use_fp4:
             # FP4 path: q = (q_packed_uint8, q_sf_int32), kv = (k_packed_uint8, k_sf_int32_byte).
@@ -721,6 +764,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
+                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
+                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
             )
 
         assert isinstance(q, torch.Tensor)
@@ -733,6 +778,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.bf16_indexer:
             kv_cache = kv[0].view(torch.bfloat16)
+            # bf16 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
             return deep_gemm.bf16_mqa_logits(
                 q,
                 kv_cache,
@@ -743,6 +789,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif self.use_fp8:
             kv_cache = (kv[0].view(torch.float8_e4m3fn), kv[1])
+            # fp8 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
             return deep_gemm.fp8_mqa_logits(
                 q,
                 kv_cache,
@@ -760,6 +807,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
+                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
+                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
             )
         raise NotImplementedError
 
@@ -825,6 +874,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
+                # Decode path must NOT emit bf16 logits to avoid entering the prefill-only DSV4 BF16 topk kernel.
             )
         raise NotImplementedError
 
@@ -1667,11 +1717,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks,
                         ke,
                         clean_logits=False,
+                        force_unfused_topk=getattr(
+                            metadata, "force_unfused_topk", False
+                        ),
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+
+            # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
+            if _enable_logits_nan_check:
+                _check_logits_nan_in_valid_range(logits, ks, ke)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -1733,6 +1790,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
+                        force_unfused_topk=getattr(
+                            metadata, "force_unfused_topk", False
+                        ),
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
@@ -1749,6 +1809,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_offset_chunk = None
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
+
+            # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
+            if _enable_logits_nan_check:
+                _check_logits_nan_in_valid_range(
+                    logits_chunk, ks[start:end], ke[start:end], row_offset=start
+                )
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
@@ -1967,6 +2033,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
+                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
                 )
             topk_result = metadata.topk_transform(
                 logits,
@@ -2023,6 +2090,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
+                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
                 )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
