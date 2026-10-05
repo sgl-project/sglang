@@ -942,6 +942,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             req_rows=torch.arange(num_rows),
             paged_metadata=metadata,
             is_verify=True,
+            out_page_indices=torch.full((num_rows, 4), -1, dtype=torch.int32),
         )
         data = DeepGEMMDecodeData(
             q_fp4=torch.zeros((num_rows, 1, 2, 64), dtype=torch.int8),
@@ -950,12 +951,6 @@ class TestChunkedPagedDecode(CustomTestCase):
             k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
         )
         return inputs, data
-
-    def _selection(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import Selection
-
-        page_indices = torch.full((self.num_rows, 4), -1, dtype=torch.int32)
-        return Selection(page_indices=page_indices, raw_indices=page_indices.clone())
 
     def _mocks(self):
         width = self.width
@@ -1019,7 +1014,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod.torch.cuda, "Event", return_value=event),
             patch.object(mod.torch.cuda, "current_stream", return_value=stream),
         ):
-            table = backend.publish_decode(inputs, self._selection())
+            table = backend.publish_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
@@ -1040,7 +1035,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
             patch.object(mod, "topk_transform_paged_from_metadata", topk),
         ):
-            indexer.topk_decode(inputs, self._selection())
+            indexer.topk_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
 
