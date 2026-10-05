@@ -676,13 +676,15 @@ class TransformersBase(nn.Module):
 
     def _init_parameters(self, module: nn.Module):
         """Materialize any parameters still on the meta device."""
+        target_dtype = torch.get_default_dtype()
         for name, param in module.named_parameters(recurse=False):
             if param.device == torch.device("meta"):
+                new_dtype = (
+                    target_dtype if torch.is_floating_point(param) else param.dtype
+                )
                 new_param = nn.Parameter(
-                    torch.empty_like(
-                        param.data,
-                        device=get_device(),
-                    )
+                    torch.empty(param.shape, dtype=new_dtype, device=get_device()),
+                    requires_grad=param.requires_grad,
                 )
                 setattr(module, name, new_param)
         for child in module.children():
