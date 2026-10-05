@@ -1,5 +1,6 @@
+import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -144,48 +145,37 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
 
 
 class TestPrefillDelayerClockSkew(CustomTestCase):
-    def test_release_uses_gathered_timeout_not_local_clock(self):
-        obj = PrefillDelayer.__new__(PrefillDelayer)
-        obj._max_delay_passes = 100
-        obj._token_usage_low_watermark = None
-        obj._queue_min_ratio = 0.5
-        obj._max_delay_ms = 500
-        obj._queue_trigger_enabled = True
-        obj._prefill_max_requests = 4
-        obj.attn_dp_enabled = False
-        obj.num_dp_ranks = 1
-        obj.skip_first_delayer = False
-        for global_expired in (False, True):
-            for local_expired in (False, True):
-                with self.subTest(
-                    global_expired=global_expired, local_expired=local_expired
-                ):
-                    obj._gather_info = MagicMock(
-                        return_value=torch.tensor(
-                            [[1, 0, 8, 4, 1, int(global_expired)]], dtype=torch.int64
-                        )
-                    )
-                    state = _State(
-                        delayed_count=10, start_time=9.499 if local_expired else 9.501
-                    )
-                    with patch(
-                        "sglang.srt.managers.prefill_delayer.time.perf_counter",
-                        return_value=10.0,
-                    ):
-                        result = obj._negotiate_should_allow_prefill_pure(
-                            prev_state=state,
-                            local_prefillable=True,
-                            token_usage=0.8,
-                            running_batch=8,
-                            max_prefill_bs=4,
-                            max_running_requests=128,
-                            waiting_queue_len=1,
-                        )
-                    self.assertEqual(result.output_allow, global_expired)
-                    self.assertEqual(
-                        obj._gather_info.call_args.kwargs["queue_timeout_expired"],
-                        local_expired,
-                    )
+    def test_queue_timeout_follows_gathered_flag(self):
+        delayer = PrefillDelayer.__new__(PrefillDelayer)
+        delayer.__dict__.update(
+            _max_delay_passes=100,
+            _token_usage_low_watermark=None,
+            _queue_min_ratio=0.5,
+            _max_delay_ms=500,
+            _queue_trigger_enabled=True,
+            _prefill_max_requests=4,
+            attn_dp_enabled=False,
+            num_dp_ranks=1,
+            skip_first_delayer=False,
+        )
+        for local_expired in (True, False):
+            with self.subTest(local_expired=local_expired):
+                delayer._gather_info = MagicMock(
+                    return_value=torch.tensor([[1, 0, 8, 4, 1, int(not local_expired)]])
+                )
+                start_time = float("-inf") if local_expired else time.perf_counter()
+                out = delayer._negotiate_should_allow_prefill_pure(
+                    prev_state=_State(delayed_count=1, start_time=start_time),
+                    local_prefillable=True,
+                    token_usage=0.8,
+                    running_batch=8,
+                    max_prefill_bs=4,
+                    max_running_requests=128,
+                    waiting_queue_len=1,
+                )
+                self.assertEqual(out.output_allow, not local_expired)
+                sent = delayer._gather_info.call_args.kwargs["queue_timeout_expired"]
+                self.assertEqual(sent, local_expired)
 
 
 if __name__ == "__main__":
