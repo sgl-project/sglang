@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -1284,6 +1284,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # both enabled architectures. Keep the ring path conservative until
             # other batch/architecture combinations are measured. The snapshot
             # path and the separate CuTe path are unchanged.
+            return False
+        if is_hip() and not (
+            is_gfx95_supported()
+            and 1 <= batch_size <= 16
+            and draft_token_num in (6, 8)
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.conv_weights.dtype == torch.float32
+        ):
+            # measured gfx950 wins only: larger batches lose the launch saving to
+            # duplicated convolution work
             return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim

@@ -110,6 +110,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
                 mode,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .unwrap();
     }
@@ -356,7 +357,7 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(policy.calls.lock().unwrap().len(), 2);
+    assert!(policy.calls.lock().unwrap().is_empty());
     assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
@@ -365,6 +366,27 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
             .router_inflight_load(),
         0
     );
+}
+
+/// A `/generate` batch fits by each prompt's own peak, not max(input) + max(output) = 120.
+#[tokio::test]
+async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    for (first_output, status) in [(1, StatusCode::OK), (5, StatusCode::BAD_REQUEST)] {
+        let body = serde_json::json!({
+            "input_ids": [vec![1; 60], vec![1]],
+            "sampling_params": [{"max_new_tokens": first_output}, {"max_new_tokens": 60}]
+        });
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), status);
+    }
 }
 
 #[tokio::test]
@@ -536,7 +558,10 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
                 .router_inflight_load(),
             0
         );
-        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            first.calls.lock().unwrap().len(),
+            usize::from(reject_decode)
+        );
         let calls = accepted.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!((&*calls[0].0, calls[0].1), ("b-second", Stage::Prefill));
@@ -759,7 +784,7 @@ async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
             url: prefill.url.clone(),
             mode: Stage::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         };
         ctx.registry.add(spec.clone()).unwrap();
         let app = build_router(ctx.clone());
@@ -855,5 +880,188 @@ async fn only_prefix_reading_routing_needs_request_tokens() {
             needs,
             "reorg {policy:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn reorg_readiness_cannot_pair_workers_across_buckets() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![
+            Bucket::new(
+                "prefill-only",
+                BucketGroups::Pd {
+                    prefill: group("p", policy.clone()),
+                    decode: group("missing", policy.clone()),
+                },
+            ),
+            Bucket::new(
+                "decode-only",
+                BucketGroups::Pd {
+                    prefill: group("missing", policy.clone()),
+                    decode: group("d", policy.clone()),
+                },
+            ),
+        ],
+    );
+    ctx.mark_ready();
+    let app = build_router(ctx);
+    assert_eq!(
+        app.clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.oneshot(request(body("hello"))).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(policy.calls.lock().unwrap().is_empty());
+}
+
+/// Rejects every engine in one version group.
+#[derive(Debug)]
+struct RejectGroup(&'static str);
+
+impl EngineAdmission for RejectGroup {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
+        Ok(match engine.version_group() == Some(self.0) {
+            true => Decision::Reject("full".into()),
+            false => Decision::Allow,
+        })
+    }
+}
+
+/// A version group whose decodes are full falls back to another group.
+#[tokio::test]
+async fn full_decode_group_falls_back_to_another_version_group() {
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let decode_policy = Arc::new(FirstPolicy {
+        admission: Arc::new(RejectGroup("v1")),
+        ..FirstPolicy::default()
+    });
+    let ctx = context(
+        &[],
+        vec![Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
+                decode: EngineGroup::new(decode_policy),
+            },
+        )],
+    );
+    for ((id, mode, group), worker) in [
+        ("p-v1", Stage::Prefill, "v1"),
+        ("p-v2", Stage::Prefill, "v2"),
+        ("d-v1", Stage::Decode, "v1"),
+        ("d-v2", Stage::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8998),
+                version_group: Some(group.into()),
+            })
+            .unwrap();
+    }
+    let response = build_router(ctx)
+        .oneshot(request(body("hello")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
+}
+
+#[tokio::test]
+async fn rerank_instructions_count_toward_bucket_context_limits() {
+    let short_worker = MockWorker::start(vec![]).await;
+    let long_worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut short = Bucket::new("short", BucketGroups::Plain(group("short", policy.clone())));
+    short.max_context_tokens = Some(1024);
+    let long = Bucket::new("long", BucketGroups::Plain(group("long", policy)));
+    let app = build_router(context(
+        &[
+            ("short", Stage::Plain, &short_worker),
+            ("long", Stage::Plain, &long_worker),
+        ],
+        vec![long, short],
+    ));
+
+    // Qwen rerankers include the instruction in every query-document prompt.
+    for (instruct, worker) in [
+        ("Rank relevant documents.".to_owned(), &short_worker),
+        ("instruction ".repeat(8192), &long_worker),
+    ] {
+        let body = serde_json::json!({"query": "hi", "documents": ["yo"], "instruct": instruct});
+        let req = Request::post("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(worker.captured_json().await, body);
+    }
+}
+
+#[tokio::test]
+async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("small", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(128);
+    let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![bucket]))
+        .unwrap_or_else(|_| panic!("context is shared"));
+    // A loadable tokenizer whose engine tokenization cannot be reproduced.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &path).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        r#"{"tokenizer_class":"CodeLlamaTokenizerFast"}"#,
+    )
+    .unwrap();
+    ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
+    ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+    assert!(ctx.tokenizers.encode_prompt("tiny", "hello").is_none());
+    let app = build_router(Arc::new(ctx));
+    for (input, expected) in [
+        (serde_json::json!("hello"), StatusCode::OK),
+        (serde_json::json!(vec!["hello"; 128]), StatusCode::OK),
+        (
+            serde_json::json!(["hello", "x".repeat(600)]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let req = Request::post("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model":"tiny", "input":input}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let body = crate::common::streaming::collect_body(response.into_body()).await;
+        assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
     }
 }

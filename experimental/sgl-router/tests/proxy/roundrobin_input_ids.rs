@@ -47,6 +47,7 @@ fn config() -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -80,7 +81,7 @@ fn build_ctx_with_config(url: String, cfg: Config) -> Arc<AppContext> {
         url,
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
@@ -429,6 +430,32 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
 
 #[path = "../fixtures/kimi_k3.rs"]
 mod kimi_fixture;
+
+#[tokio::test]
+async fn generate_kimi_ids_preserve_engine_chunk_boundaries() {
+    let mock = MockWorker::start(vec![]).await;
+    let fixture = kimi_fixture::tokenizer();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = Some(fixture.path().join("tiktoken.model").display().to_string());
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    // Kimi's engine tokenizer splits a non-whitespace run after 25,000 chars,
+    // cutting through a BPE merge here. Encoding the whole prompt changes its IDs.
+    let text = "message".repeat(4_000);
+    let tokenizer = ctx.tokenizers.get(MODEL).unwrap();
+    let encode = |text| sgl_router::tokenizer::adapter::encode(&tokenizer, text).unwrap();
+    let expected = [encode(&text[..25_000]), encode(&text[25_000..])].concat();
+    assert_ne!(encode(&text), expected);
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"text": text}).to_string()))
+        .unwrap();
+    let response = build_router(ctx).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        without_minted_rid(captured(&mock)),
+        json!({"input_ids": expected})
+    );
+}
 
 #[tokio::test]
 async fn kimi_ids_forward_with_engine_rendering_fallback() {

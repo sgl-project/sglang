@@ -23,6 +23,12 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -107,6 +113,7 @@ class DeciLMDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
                 bias=attention_bias,
+                reduce_results=False,
             )
             self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -121,41 +128,56 @@ class DeciLMDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
             self.post_attention_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+
+        # A layer whose attention and FFN are both no-ops has no stages.
+        stages = []
+        if not self._is_no_op_attention:
+            stages.append((declare_attn(), self.input_layernorm))
+        if not self._is_no_op_ffn:
+            stages.append(
+                (
+                    declare_ffn(sparse=False, next_layer_sparse=False),
+                    self.post_attention_layernorm,
+                )
+            )
+        self.entry_boundary = None
+        if stages:
+            boundaries = append_stages(
+                *stages,
+            )
+            self.entry_boundary = boundaries[0]
+            if not self._is_no_op_attention:
+                self.attn_boundary = boundaries[0]
+            if not self._is_no_op_ffn:
+                self.ffn_boundary = boundaries[-1]
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-
-        if self._is_no_op_attention:
-            pass
-        else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if not self._is_no_op_attention:
+            hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
 
         # Fully Connected
         if not self._is_no_op_ffn:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+            hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
             hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+            hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
 
 class DeciModel(nn.Module):
@@ -223,32 +245,23 @@ class DeciModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            entry = next(
+                self.layers[i].entry_boundary
+                for i in range(self.start_layer, self.end_layer)
+                if self.layers[i].entry_boundary is not None
+            )
+            hidden_states = entry.from_pp(pp_proxy_tensors, forward_batch)
 
-        kv_cache_index = 0
         for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if not layer._is_no_op_attention:
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
-                kv_cache_index += 1
-            else:
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
 
         if not get_parallel().pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return residual_batch.final_norm(hidden_states, forward_batch, self.norm)
 
 
 class DeciLMForCausalLM(nn.Module):
