@@ -544,6 +544,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def is_write_through_compatible(self) -> bool:
+        for node in self._node_arena.values():
+            if node is self.root_node:
+                continue
+            full_host = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if full_host is None:
+                if any(
+                    node.component_data[ct].host_value is not None
+                    for ct in self.component_types
+                    if ct != BASE_COMPONENT_TYPE
+                ):
+                    return False
+            elif node.parent is not self.root_node and not node.parent.backuped:
+                return False
+        return True
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
@@ -1053,11 +1069,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
-        self, node: UnifiedTreeNode, chunked: bool = False
-    ) -> bool:
+    def _inc_hit_count_and_check(self, node: UnifiedTreeNode) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
@@ -1307,7 +1321,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        # Nodes this request already inserted were counted back then.
+        node_end = state.total_prefix_length + prefix_len
+        if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1368,8 +1384,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
-            return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+            leaf_end = state.total_prefix_length + len(state.target_node.key)
+            return (
+                leaf_end > state.params.inserted_len
+                and self._inc_hit_count_and_check(state.target_node)
             )
 
         node = state.target_node
@@ -1381,7 +1399,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append terminal backup actions."""
+        """Refresh the LRUs and append the insert backup: a new-leaf write-through,
+        or an SWA window publish on an existing backed node."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1392,7 +1411,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self._should_backup_after_insert(state):
             state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+                self._build_backup_kv_action(
+                    state.target_node, write_back=self.is_write_back
+                )
             )
 
     def _split_node(
@@ -1751,14 +1772,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+        if node.load_back_pending_id is not None or any(
+            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+        ):
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
             descendants.append(cur)
@@ -2270,11 +2297,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         child_key = key.child_key(self.page_size)
         matched_length = 0
+        host_prefix_len = 0
+        refilled_host_node = None
         cache_actions: list[CacheAction | ComponentAction] = []
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
+
+            matched_host_value = host_value[:prefix_len]
+            matched_hash_value = hash_value[: prefix_len // self.page_size]
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -2286,18 +2318,37 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if action is not None:
                     cache_actions.append(action)
 
+            if not self.is_write_back:
+                full_data = node.component_data[BASE_COMPONENT_TYPE]
+                if full_data.host_value is None:
+                    full_data.host_value = matched_host_value.clone()
+                    if node.hash_value is None:
+                        node.hash_value = list(matched_hash_value)
+                    self.kv_events.record_store(node, medium=StorageMedium.CPU)
+                    self._update_evictable_leaf_sets(node)
+                    if node.parent is not None:
+                        self._update_evictable_leaf_sets(node.parent)
+                    self._update_duplicate_tracking(node)
+                    refilled_host_node = node
+                else:
+                    assert refilled_host_node is None, (
+                        "write-through host-prefix invariant broken: encountered "
+                        f"backed node {node.id} below a refilled host tombstone"
+                    )
+                    host_prefix_len += prefix_len
+
             if len(key):
                 child_key = key.child_key(self.page_size)
 
         result = InsertResult(
-            prefix_len=matched_length,
+            prefix_len=(matched_length if self.is_write_back else host_prefix_len),
             total_len=total_len,
             cache_actions=cache_actions,
         )
         if len(key) == 0:
-            if (
-                node is not self.root_node
-                and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+            if node is not self.root_node and (
+                refilled_host_node is not None
+                or node.component_data[BASE_COMPONENT_TYPE].host_value is not None
             ):
                 result.inserted_host_node = node.id
             return result
@@ -2461,7 +2512,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its not-yet-persisted ancestors."""
+        """Build the backup action for a node; write-through also chains its
+        unbacked ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent

@@ -65,6 +65,7 @@ fn build_app_context(
             tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
             cache_aware: None,
