@@ -10,17 +10,17 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
-    ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
-    CachePrefixProvider, Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig,
+    AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig, CachePrefixProvider,
+    Config, DiscoveryBackend, InflightLoadConfig, KvIndexerEndpointConfig, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,13 +55,17 @@ fn build_app_context(
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
             cache_aware: None,
@@ -69,12 +73,14 @@ fn build_app_context(
             affinity,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -201,6 +207,7 @@ fn build_cache_ctx_with_affinity(
             query_timeout_ms: 100,
             query_max_inflight: 32,
         }),
+        ..Default::default()
     });
     context.prefix_index = Some(prefix_index);
     context.block_size_oracle.try_set(1).unwrap();
@@ -214,6 +221,7 @@ fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+        ..Default::default()
     }
 }
 
@@ -223,7 +231,17 @@ fn set_native_load(
     num_total_tokens: u64,
     max_total_num_tokens: u64,
 ) {
-    ctx.engine_load.set(
+    set_native_load_with_waiting(ctx, worker_url, num_total_tokens, max_total_num_tokens, 0);
+}
+
+fn set_native_load_with_waiting(
+    ctx: &AppContext,
+    worker_url: &str,
+    num_total_tokens: u64,
+    max_total_num_tokens: u64,
+    num_waiting_uncached_tokens: u64,
+) {
+    ctx.engine_reported_load.set(
         worker_url,
         0,
         LoadStat {
@@ -232,7 +250,7 @@ fn set_native_load(
             num_tokens: num_total_tokens,
             max_total_num_tokens,
             native_cache: Some(NativeCacheRankLoad {
-                num_waiting_uncached_tokens: 0,
+                num_waiting_uncached_tokens,
                 num_total_tokens,
                 max_running_requests: 64,
                 total_prefill_uncached_tokens: 1,
@@ -694,17 +712,14 @@ async fn cache_winner_uses_target_uncached_work_before_prompt_length_bucket() {
 }
 
 #[tokio::test]
-async fn cache_candidate_bucket_binding_happens_before_candidate_limit() {
+async fn unbucketed_global_cache_winner_remains_eligible() {
     let best = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let lower_ranked = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    let mut best_bucket = bucket("p-best", BucketStage::Prefill, 10, "p-best");
-    best_bucket.min_extend_tokens = Some(32);
     let mut lower_ranked_bucket = bucket("p-lower", BucketStage::Prefill, 20, "p-lower");
     lower_ranked_bucket.min_extend_tokens = Some(32);
     let bucket_config = BucketConfig {
         buckets: vec![
-            best_bucket,
             lower_ranked_bucket,
             bucket("d-catch-all", BucketStage::Decode, 30, "d"),
         ],
@@ -736,16 +751,203 @@ async fn cache_candidate_bucket_binding_happens_before_candidate_limit() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    wait_for_prefill(&lower_ranked).await;
+    wait_for_prefill(&best).await;
     assert!(
-        best.captured.lock().unwrap().last_body.is_none(),
-        "the top Indexer hit is Bucket-incompatible and must not consume K=1"
+        lower_ranked.captured.lock().unwrap().last_body.is_none(),
+        "an admitted unbucketed cache holder must remain globally eligible"
     );
     assert!(
         ctx.metrics.render().contains(
             r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
         ),
-        "the compatible lower-ranked cache holder must remain a cache candidate"
+        "the global cache winner must remain a cache candidate"
+    );
+}
+
+#[tokio::test]
+async fn cache_candidate_over_context_limit_falls_back_to_compatible_bucket() {
+    let cached = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let fallback = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut short_bucket = bucket("p-short", BucketStage::Prefill, 10, "p-cached");
+    short_bucket.max_context_tokens = Some(32);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            short_bucket,
+            bucket("p-long", BucketStage::Prefill, 20, "p-fallback"),
+            bucket("d-catch-all", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let prefix_index: Arc<dyn PrefixIndex> = FakePrefixIndex::matched(cached.url.clone());
+    let ctx = build_cache_ctx(
+        vec![
+            worker_spec("p-cached", cached.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-fallback", fallback.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        prefix_index,
+    );
+
+    let content = "context limit ".repeat(128);
+    let response = build_router(ctx)
+        .oneshot(chat_request_with_content(&content, None, Some(8), None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&fallback).await;
+    assert!(
+        cached.captured.lock().unwrap().last_body.is_none(),
+        "a cache holder that cannot serve the full context must not receive the request"
+    );
+}
+
+#[tokio::test]
+async fn cache_candidate_outside_slo_first_tier_falls_back_to_eligible_bucket() {
+    let cached = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let fallback = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut slow_bucket = bucket("p-slow", BucketStage::Prefill, 10, "p-cached");
+    slow_bucket.ttft_p95_at_capacity_ms = Some(400);
+    let mut fast_bucket = bucket("p-fast", BucketStage::Prefill, 20, "p-fallback");
+    fast_bucket.ttft_p95_at_capacity_ms = Some(100);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            slow_bucket,
+            fast_bucket,
+            bucket("d-catch-all", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::SloFirst,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let prefix_index: Arc<dyn PrefixIndex> = FakePrefixIndex::matched(cached.url.clone());
+    let ctx = build_cache_ctx(
+        vec![
+            worker_spec("p-cached", cached.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-fallback", fallback.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        prefix_index,
+    );
+
+    let content = "ttft tier ".repeat(128);
+    let response = build_router(ctx)
+        .oneshot(chat_request_with_content(
+            &content,
+            Some(200),
+            Some(8),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&fallback).await;
+    assert!(
+        cached.captured.lock().unwrap().last_body.is_none(),
+        "SloFirst must exclude a cache holder outside the request's TTFT tier"
+    );
+}
+
+#[tokio::test]
+async fn cache_candidate_respects_its_bucket_pending_prefill_budget() {
+    let cached = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let fallback = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut limited_bucket = bucket("p-limited", BucketStage::Prefill, 10, "p-cached");
+    limited_bucket.max_pending_prefill_tokens = Some(64);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            limited_bucket,
+            bucket("p-fallback", BucketStage::Prefill, 20, "p-fallback"),
+            bucket("d-catch-all", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let prefix_index: Arc<dyn PrefixIndex> = FakePrefixIndex::matched(cached.url.clone());
+    let ctx = build_cache_ctx(
+        vec![
+            worker_spec("p-cached", cached.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-fallback", fallback.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        prefix_index,
+    );
+    set_native_load_with_waiting(&ctx, &cached.url, 0, 100_000, 64);
+
+    let content = "pending budget ".repeat(128);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(chat_request_with_content(&content, None, Some(8), None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&fallback).await;
+    assert!(
+        cached.captured.lock().unwrap().last_body.is_none(),
+        "a cache holder beyond its Bucket pending-prefill budget must not receive the request"
+    );
+    assert!(ctx
+        .metrics
+        .render()
+        .contains("sgl_router_cache_admission_rejected_total 1"));
+}
+
+#[tokio::test]
+async fn rejected_global_cache_candidate_falls_back_to_prompt_length_bucket() {
+    let cached = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let fallback = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut short_bucket = bucket("p-short", BucketStage::Prefill, 10, "p-cached");
+    short_bucket.max_extend_tokens = Some(8);
+    let mut long_bucket = bucket("p-long", BucketStage::Prefill, 20, "p-fallback");
+    long_bucket.min_extend_tokens = Some(9);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            short_bucket,
+            long_bucket,
+            bucket("d-catch-all", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let prefix_index: Arc<dyn PrefixIndex> = FakePrefixIndex::matched(cached.url.clone());
+    let ctx = build_cache_ctx(
+        vec![
+            worker_spec("p-cached", cached.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-fallback", fallback.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        prefix_index,
+    );
+    set_native_load(&ctx, &cached.url, 1, 1);
+
+    let content = "admission fallback ".repeat(128);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(chat_request_with_content(&content, None, Some(8), None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&fallback).await;
+    assert!(
+        cached.captured.lock().unwrap().last_body.is_none(),
+        "an admission-rejected cache holder must not receive the request"
+    );
+    let metrics = ctx.metrics.render();
+    assert!(metrics.contains("sgl_router_cache_admission_rejected_total 1"));
+    assert!(
+        !metrics.contains(
+            r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
+        ),
+        "Bucket fallback must not be reported as a cache-candidate decision"
     );
 }
 
@@ -791,4 +993,122 @@ async fn cache_no_signal_restarts_normal_prompt_length_bucket_fallback() {
         "without a cache winner the request must restart the normal full-input Bucket path"
     );
     assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+}
+
+/// A version group with no decode bucket that fits falls back to another group,
+/// without a discarded prefill pick.
+#[tokio::test]
+async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
+    use crate::common::mock_worker::MockWorker;
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let mut short = bucket("d-v1", BucketStage::Decode, 20, "d-v1");
+    short.max_sequence_tokens = Some(1_024);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            bucket("p-v1", BucketStage::Prefill, 10, "p-v1"),
+            bucket("p-v2", BucketStage::Prefill, 11, "p-v2"),
+            short,
+            bucket("d-v2", BucketStage::Decode, 30, "d-v2"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let specs = [
+        ("p-v1", WorkerMode::Prefill, "v1"),
+        ("p-v2", WorkerMode::Prefill, "v2"),
+        ("d-v1", WorkerMode::Decode, "v1"),
+        ("d-v2", WorkerMode::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    .map(|((id, mode, group), worker)| WorkerSpec {
+        version_group: Some(group.into()),
+        ..worker_spec(id, worker.url.clone(), mode)
+    })
+    .collect();
+    let ctx = build_ctx(specs, bucket_config, PolicyKind::PowerOfTwo, None);
+    let response = build_router(ctx.clone())
+        .oneshot(chat_request(None, Some(2_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
+    let prefill_picks: u64 = ctx
+        .metrics
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("sgl_router_policy_decisions_total{"))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(prefill_picks, 1);
+}
+
+/// Prefer a group with decode capacity, but retain capacity fallback when all
+/// groups are full, without relaxing their token-length limits.
+#[tokio::test]
+async fn version_group_capacity_fallback_preserves_decode_limits() {
+    use crate::common::mock_worker::MockWorker;
+    for (short_first, second_full) in [(false, false), (false, true), (true, true)] {
+        let workers: Vec<_> =
+            futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+        let specs = [
+            ("p1", WorkerMode::Prefill, "v1"),
+            ("p2", WorkerMode::Prefill, "v2"),
+            ("d1", WorkerMode::Decode, "v1"),
+            ("d2", WorkerMode::Decode, "v2"),
+        ]
+        .into_iter()
+        .zip(&workers)
+        .map(|((id, mode, group), worker)| WorkerSpec {
+            version_group: Some(group.into()),
+            ..worker_spec(id, worker.url.clone(), mode)
+        })
+        .collect();
+        let mut first_decode = bucket("d-first", BucketStage::Decode, 0, "d1");
+        if short_first {
+            first_decode.max_sequence_tokens = Some(10);
+        }
+        let ctx = build_ctx(
+            specs,
+            BucketConfig {
+                buckets: vec![
+                    bucket("p-first", BucketStage::Prefill, 0, "p1"),
+                    bucket("p-second", BucketStage::Prefill, 1, "p2"),
+                    first_decode,
+                    bucket("d-second", BucketStage::Decode, 1, "d2"),
+                ],
+                ttft_slo_policy: SloBucketPolicy::Disabled,
+                tps_slo_policy: SloBucketPolicy::Disabled,
+            },
+            PolicyKind::PowerOfTwo,
+            None,
+        );
+        set_native_load(&ctx, &workers[2].url, 1_000, 1_000);
+        set_native_load(
+            &ctx,
+            &workers[3].url,
+            if second_full { 1_000 } else { 0 },
+            1_000,
+        );
+        let response = build_router(ctx)
+            .oneshot(chat_request(None, Some(100)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let dispatched: Vec<_> = workers
+            .iter()
+            .map(|w| w.captured.lock().unwrap().last_body.is_some())
+            .collect();
+        let use_first = second_full && !short_first;
+        assert_eq!(
+            dispatched,
+            [use_first, !use_first, use_first, !use_first],
+            "short_first={short_first}, second_full={second_full}"
+        );
+    }
 }

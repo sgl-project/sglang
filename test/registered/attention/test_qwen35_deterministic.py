@@ -30,7 +30,7 @@ class TestQwen35Fa3Deterministic(TestDeterministicBase):
             "--attention-backend",
             "fa3",
             "--skip-server-warmup",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
             "--enable-flashinfer-allreduce-fusion",
             "--tokenizer-worker-num",

@@ -34,10 +34,11 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.srt.lora.utils import auto_detect_lora_target_modules
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=56, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
 
 BASE_MODEL = "Qwen/Qwen3-8B"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"
@@ -54,14 +55,19 @@ def attention_backend_kwargs():
     """Engine attention-backend kwargs for the current platform.
 
     fa4 and flashinfer are CUDA-only: fa4 dispatches into the CUTLASS CUTE DSL
-    kernel, which cannot import off CUDA. On XPU the equivalent fused path is
-    the intel_xpu backend, so select it there instead of forcing a backend the
-    device has no kernels for.
+    kernel, which cannot import off CUDA. Use Triton on ROCm and the equivalent
+    intel_xpu fused path on XPU.
     """
-    from sglang.srt.utils import is_xpu
+    from sglang.srt.utils import is_hip, is_xpu
 
     if is_xpu():
         return {"attention_backend": "intel_xpu"}
+    if is_hip():
+        return {
+            "attention_backend": "triton",
+            "prefill_attention_backend": "triton",
+            "decode_attention_backend": "triton",
+        }
     return {
         "attention_backend": "flashinfer",
         "prefill_attention_backend": PREFILL_ATTENTION_BACKEND,

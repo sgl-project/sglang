@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
@@ -227,6 +227,20 @@ def _pad_hopper_mxfp4_scale(scale, k_size):
     return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
 
 
+@lru_cache(maxsize=1)
+def _mx_block_kwargs():
+    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
+    # absent in 3.7, which ROCm still ships, so probe before importing the value.
+    from triton_kernels.matmul import PrecisionConfig
+
+    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
+        return {}
+
+    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_details.opt_flags as opt_flags
@@ -253,6 +267,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
         k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
         scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
+        # No scale layout carries the warp count below Hopper, and the tile
+        # formula gives the batch-1 decode tile a single warp.
+        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -677,9 +695,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # (keeping both layouts OOMs: 92 layers double the experts).
                 from deep_gemm import transform_weights_for_mega_moe
 
-                from sglang.srt.layers.moe.mega_moe import _mega_moe_mma_type
+                from sglang.srt.layers.moe.mega_moe import (
+                    _mega_moe_mma_type,
+                    check_mega_moe_shapes,
+                )
 
                 mma_type = _mega_moe_mma_type()
+                check_mega_moe_shapes(
+                    hidden=layer.w13_weight.shape[2] * 2,
+                    intermediate=layer.w13_weight.shape[1] // 2,
+                    mma_type=mma_type,
+                )
                 l1_pair, l2_pair = transform_weights_for_mega_moe(
                     (layer.w13_weight.data, layer.w13_weight_scale.data),
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
@@ -1030,11 +1056,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            mx_block = _mx_block_kwargs()
             self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
             )
             self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
             )
 
             self.w13_weight_triton_tensor = w13_weight
@@ -1067,21 +1094,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         elif _is_xpu:
             # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
-            # layout: packed e2m1 [E, N, K/2] plus N-outer ue8m0 scales
-            # [E, N, K/32] uint8, with GPT-OSS's interleaved
+            # layout as-is: packed e2m1 [E, N, K/2] uint8 plus N-outer ue8m0
+            # scales [E, N, K/32] uint8, with GPT-OSS's interleaved
             # [gate_0, up_0, gate_1, up_1, ...] w13 row order (which is exactly
-            # what the swiglu epilogue expects). Scales and biases are already in
-            # the expected dtypes (uint8 / bf16 -- the launcher promotes bias to
-            # fp32 since the kernel accumulates it in fp32), so the only step is
-            # reinterpreting the packed nibbles as int8, matching the dtype the
-            # kernel keys the 4-bit path on. That is a free view, and crucially
-            # there is no bf16 upcast -- the whole point of MXFP4 on XPU.
-            layer.w13_weight = Parameter(
-                layer.w13_weight.data.view(torch.int8), requires_grad=False
-            )
-            layer.w2_weight = Parameter(
-                layer.w2_weight.data.view(torch.int8), requires_grad=False
-            )
+            # what the swiglu epilogue expects). A packed byte holds two e2m1
+            # nibbles rather than an integer, so the torch dtype is only a
+            # container label: the op accepts int8 or uint8, always casts to
+            # uint8_t*, and decodes each nibble (sign bit included) as
+            # float_e2m1_t -- a path selected by the explicit
+            # use_mxfp4_w4a16=True that apply() passes, not by the weight dtype.
+            # Biases stay bf16 (the launcher promotes them to fp32, which is how
+            # the kernel accumulates them). Crucially there is no bf16 upcast of
+            # the weights -- the whole point of MXFP4 on XPU.
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -1473,10 +1497,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
@@ -1520,10 +1540,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)

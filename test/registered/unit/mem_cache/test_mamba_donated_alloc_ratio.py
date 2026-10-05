@@ -1,7 +1,7 @@
 """CPU-only unit tests for the mamba pool ratio vs the prefill->decode peak.
 
 Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
-at the first cache_unfinished_req, a request still holds its admission-locked
+at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
@@ -16,11 +16,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -182,36 +183,45 @@ class _RecordingComp:
 
 class TestDecSwaLockSkip(unittest.TestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
-    locks. On a full-only-locked node (decode skip) it must thread the skip set
-    into that lower-tier release, else it drops a mamba lock it never took --
-    another request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the
-    contract without booting a 3-component model."""
+    locks. On a node whose acquire skipped Mamba (decode hold), the release
+    must skip it too, else it drops a mamba lock it never took -- another
+    request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the contract
+    without booting a 3-component model."""
 
-    def test_threads_skip_ids_into_lower_tier_release(self):
+    def _run(self, skipped_lock_components):
         # internal-node priority: full=2 > swa=1 > mamba=0
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
         tree_core = SimpleNamespace(
+            root_node=object(),
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
+            _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )
-
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            swa_uuid_for_lock=None,
-            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+            DecLockRefParams(
+                node_id=node.id,
+                skipped_lock_components=skipped_lock_components,
+                component_lock_uuids={ComponentType.SWA: None},
+            ),
         )
+        return full, mamba
 
-        # mamba (below swa) is released, honoring the skip set
-        self.assertEqual(len(mamba.released), 1)
-        self.assertEqual(
-            mamba.released[0].skip_lock_node_ids.get(ComponentType.MAMBA), {7}
-        )
+    def test_unlocked_mamba_is_not_released(self):
+        full, mamba = self._run(skipped_lock_components=(ComponentType.MAMBA,))
+        # mamba took no lock at acquire, so the early release skips it too
+        self.assertEqual(mamba.released, [])
         # full (above swa) is never touched
+        self.assertEqual(full.released, [])
+
+    def test_lower_tier_released_when_locked(self):
+        full, mamba = self._run(skipped_lock_components=())
+        self.assertEqual(len(mamba.released), 1)
         self.assertEqual(full.released, [])
 
 
@@ -289,10 +299,12 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+            extra_mamba_cache_bytes_per_req=0,
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
-            ps=SimpleNamespace(attn_dp_size=1, pp_size=pp_size),
+            attn_dp_size=1,
+            pp_size=pp_size,
             hybrid_gdn_config=None,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
@@ -321,6 +333,65 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         self.assertEqual(
             len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
         )
+
+
+class TestExtraMambaCacheSizing(unittest.TestCase):
+    @staticmethod
+    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
+                )
+            ),
+            extra_mamba_cache_bytes_per_req=extra_bytes,
+            spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
+            attn_dp_size=dp_size,
+            pp_size=pp_size,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+            _calculate_mamba_ratio=lambda: 2,
+        )
+        args = dict(
+            disable_radix_cache=False,
+            max_mamba_cache_size=None,
+            max_running_requests=256 if draft_tokens is not None else None,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+            speculative_num_draft_tokens=draft_tokens,
+        )
+        args.update(schedule)
+        with rc.get_context().override_server_args(**args):
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+            return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
+
+    def test_auto_capacity_reserves_backend_state(self):
+        self.assertEqual(self._size(0), (9, 80 << 20))
+        self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+
+    def test_fixed_capacity_charges_padding_and_partitioned_state(self):
+        for pp_size in (1, 2):
+            for dp_size in (1, 2):
+                for schedule in (
+                    dict(max_mamba_cache_size=8),
+                    dict(disable_radix_cache=True, max_running_requests=8),
+                ):
+                    with self.subTest(pp=pp_size, dp=dp_size, **schedule):
+                        slots, remaining = self._size(
+                            8 << 20, pp_size=pp_size, dp_size=dp_size, **schedule
+                        )
+                        self.assertEqual(slots, 8 // dp_size)
+                        self.assertEqual(
+                            remaining,
+                            (120 << 20) - (slots + 1) * (12 << 20) // pp_size,
+                        )
+
+    def test_speculative_auto_capacity_keeps_scratch_separate(self):
+        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
+        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
 
 
 if __name__ == "__main__":

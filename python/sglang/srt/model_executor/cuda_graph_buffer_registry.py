@@ -35,6 +35,7 @@ from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -55,6 +56,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         else:
             for dst, src in zip(group_dsts, group_srcs):
                 dst.copy_(src)
+
+    if dsts and dsts[0].is_cuda:
+        from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if try_small_copy(dsts, srcs):
+            return
 
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
@@ -523,7 +530,7 @@ def build_decode_registry(
     require_mlp_tp_gather: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    dp_size: int = 1,
+    num_dp_ranks: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -693,7 +700,7 @@ def build_decode_registry(
                 buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (
-            (lambda _bs, _mt: (dp_size,))
+            (lambda _bs, _mt: (num_dp_ranks,))
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )
@@ -760,7 +767,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # .get(): a proxy entry can be absent (e.g. topk_indices
+                    # when a DSA model runs a dense attention backend);
+                    # returning None skips the copy for that slot.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
@@ -828,16 +838,17 @@ def build_prefill_registry(
     enable_prefill_cp: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    register_input_embeds: bool = True,
+    register_input_embeds: Optional[bool] = None,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable / full (prefill) cuda-graph runners.
 
-    ``register_input_embeds`` (default ``True``) registers the multimodal
-    ``input_embeds`` slot; the eager extend path passes ``False`` so it is
-    carried from the batch (a read input) rather than written in-graph.
+    ``register_input_embeds`` defaults to ``is_multimodal``. The EAGLE3 draft
+    passes True because the draft model itself is text-only. The eager extend
+    path passes ``False`` so embeddings are carried from the batch rather
+    than written in-graph.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
@@ -890,6 +901,9 @@ def build_prefill_registry(
             padding_policy=PaddingPolicy.ZERO,
         ),
     ]
+    if register_input_embeds is None:
+        register_input_embeds = is_multimodal
+
     if is_multimodal:
         slots.append(
             GraphSlot(
@@ -901,28 +915,28 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        if register_input_embeds:
+    if register_input_embeds:
+        slots.append(
+            GraphSlot(
+                "input_embeds",
+                lambda _bs2, mt: (mt, hidden_size),
+                embed_dtype,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+                copy_from_fb=False,
+            )
+        )
+        if is_multimodal and deepstack_replay_width > 0:
             slots.append(
                 GraphSlot(
-                    "input_embeds",
-                    lambda _bs2, mt: (mt, hidden_size),
+                    "input_deepstack_embeds",
+                    lambda _bs2, mt: (mt, deepstack_replay_width),
                     embed_dtype,
                     axis="tokens",
                     padding_policy=PaddingPolicy.ZERO,
                     copy_from_fb=False,
                 )
             )
-            if deepstack_replay_width > 0:
-                slots.append(
-                    GraphSlot(
-                        "input_deepstack_embeds",
-                        lambda _bs2, mt: (mt, deepstack_replay_width),
-                        embed_dtype,
-                        axis="tokens",
-                        padding_policy=PaddingPolicy.ZERO,
-                        copy_from_fb=False,
-                    )
-                )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
@@ -1020,7 +1034,6 @@ def build_eager_registry(
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
-    dp_size: int = 1,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
     decode and eager prefill.
@@ -1051,7 +1064,7 @@ def build_eager_registry(
         register_global_num_tokens=False,
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
-        dp_size=dp_size,
+        num_dp_ranks=get_parallel().num_dp_ranks,
         share_pool=True,
         source=None,
     )

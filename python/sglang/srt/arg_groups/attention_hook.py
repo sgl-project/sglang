@@ -9,7 +9,6 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
-    _attention_backend_dual_chunk,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
@@ -28,8 +27,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -175,6 +176,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
+            # Check whether the operator supplied a memory fraction using
+            # the raw input snapshot; resolution may have filled the value in.
             explicit_mem_fraction = (
                 getattr(server_args, "_raw_input", None) or {}
             ).get("mem_fraction_static") is not None
@@ -203,23 +206,6 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
-
-    # Dual chunk flash attention backend
-    run_post_process_pass(server_args, _attention_backend_dual_chunk)
-    if resolved_view(server_args).attention_backend == "dual_chunk_flash_attn":
-        logger.warning(
-            "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            enable_mixed_chunk=False,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            disable_radix_cache=True,
-        )
 
 
 def handle_linear_attn_backend(server_args: Any):
@@ -291,6 +277,23 @@ def handle_linear_attn_backend(server_args: Any):
     verify = cfg.linear_attn_verify_backend
     if verify is None and decode == "flashinfer":
         verify = "flashinfer"
+    if (
+        pp_spec_stable_rows_enabled()
+        and verify == "flashinfer"
+        and uses_kda_attention(model_config_of(server_args).hf_config)
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_verify_backend="triton",
+        )
+        verify = "triton"
+        logger.warning(
+            "SGLANG_ENABLE_PP_SPEC with KDA does not support the FlashInfer "
+            "target-verify row layout; falling back "
+            "--linear-attn-verify-backend to triton. FlashInfer decode is "
+            "unchanged."
+        )
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"

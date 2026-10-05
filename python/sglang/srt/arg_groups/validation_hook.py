@@ -17,11 +17,75 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
+
+
+def check_pipeline_parallel_compat(cfg: Any) -> None:
+    """Validate features used with pipeline parallelism."""
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.disaggregation_mode == "prefill", (
+            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+        )
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+        )
+    elif cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+        if envs.SGLANG_ENABLE_PP_SPEC.get():
+            # The aggregate relay carries an EAGLE-shaped tree and only
+            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
+            # topk_index / hidden states through RelayPayload; the gated
+            # flow replaces that relay with its own and does not carry
+            # those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The PP relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every stage rebuilds the same verify input from the relayed
+            # per-request state, so all stages must see the same batch.
+            # DP attention partitions it per DP rank.
+            assert not attn_dp_enabled_of(cfg), (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
+                "(--attn-dp-size)"
+            )
+        else:
+            assert cfg.disaggregation_mode == "prefill", (
+                "PP + speculative decoding (MTP) is only supported on prefill nodes "
+                "(disaggregation-mode=prefill)"
+            )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
 
 
 def check_server_args(server_args: Any):
@@ -49,17 +113,11 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-            "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-        )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+        check_pipeline_parallel_compat(cfg)
 
-    assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
-        "multi-node data parallel is not supported unless dp attention!"
+    assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
+        "multi-node data-parallel replicas are not supported; use attention DP "
+        "(--attn-dp-size) across nodes"
     )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -206,6 +264,8 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
+    validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
     if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
@@ -317,11 +377,23 @@ def check_load_publish_args(server_args: Any):
     _, reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
         replay_endpoint=cfg.replay_endpoint,
-        dp_size=server_cfg.dp_size,
+        dp_size=num_dp_ranks_of(server_cfg),
         load_publish_endpoint=mode,
     )
     if reason:
         raise ValueError(reason)
+
+
+def validate_device_sampling_backend(
+    sampling_backend: Optional[str], device: str
+) -> None:
+    # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
+    # device the backend either aliases to flashinfer's names or NameErrors on
+    # the first non-greedy decode.
+    if sampling_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
 
 
 def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:
@@ -413,10 +485,118 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_mps_model_config(
+    model_config: Any,
+    *,
+    lora_enabled: bool = False,
+) -> None:
+    """Validate checkpoint-derived MPS constraints."""
+    quantization = getattr(model_config, "quantization", None)
+    if quantization not in (None, "unquant"):
+        raise ValueError(
+            "Torch MPS currently supports only unquantized model weights; "
+            "the resolved model configuration detected "
+            f"quantization={quantization!r}"
+        )
+    if bool(getattr(model_config, "is_multimodal", False)):
+        raise ValueError(
+            "Torch MPS multimodal serving does not yet have a model-specific "
+            "end-to-end contract; use a text-only model until its encoder, "
+            "processor, and decoder paths are validated on MPS"
+        )
+    if lora_enabled:
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            if config is None:
+                continue
+            for field_name in (
+                "num_experts",
+                "num_local_experts",
+                "n_routed_experts",
+            ):
+                value = getattr(config, field_name, None)
+                if value is not None and int(value) > 0:
+                    raise ValueError(
+                        "Torch MPS LoRA currently supports dense models only; "
+                        f"the model config declares {field_name}={value!r}"
+                    )
+
+
+def validate_standard_mps_server_args(server_args: Any):
+    """Validate execution modes supported by the Torch MPS path."""
+
+    cfg = resolving_view(server_args)
+    supported_attention_backends = {None, "torch_native"}
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        value = getattr(cfg, field, None)
+        normalized = getattr(value, "value", value)
+        normalized = None if normalized is None else str(normalized).lower()
+        if normalized not in supported_attention_backends:
+            raise ValueError(
+                "The standard Torch MPS path currently supports only the "
+                f"torch_native attention backend; got {field}={value!r}"
+            )
+
+    sampling_backend = getattr(cfg, "sampling_backend", None)
+    normalized_sampling = getattr(sampling_backend, "value", sampling_backend)
+    normalized_sampling = (
+        None if normalized_sampling is None else str(normalized_sampling).lower()
+    )
+    if normalized_sampling not in {None, "pytorch"}:
+        raise ValueError(
+            "The standard Torch MPS path currently supports only the "
+            f"pytorch sampling backend; got sampling_backend={sampling_backend!r}"
+        )
+
+    if (
+        getattr(cfg, "tp_size", 1) != 1
+        or getattr(cfg, "pp_size", 1) != 1
+        or getattr(cfg, "dp_size", 1) != 1
+    ):
+        raise ValueError(
+            "The standard Torch MPS path requires tp_size=1, pp_size=1, and dp_size=1"
+        )
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.prefill_decode_interval < 0:
+    if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def default_unset_prefill_decode_interval(server_args: Any):
+    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_decode_interval is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_default",
+            prefill_decode_interval=0,
+        )
+
+
+def validate_sampling_mask_max_tokens(server_args: Any):
+    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
+            "Unset it. To enable sampling masks for disaggregated serving, set "
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
+            "--sampling-mask-max-tokens value on both prefill and decode servers."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
+        )
 
 
 def check_two_batch_overlap(server_args: Any):
@@ -429,10 +609,10 @@ def check_two_batch_overlap(server_args: Any):
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
-        and not cfg.enable_dp_attention
+        and not attn_dp_enabled_of(cfg)
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
-            "(moe_a2a_backend='none'), --enable-dp-attention is required "
+            "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )

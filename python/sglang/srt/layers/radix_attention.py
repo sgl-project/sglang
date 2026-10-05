@@ -117,6 +117,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        use_prefill_attention_wrapper: bool = True,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -131,6 +132,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.use_prefill_attention_wrapper = use_prefill_attention_wrapper
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
@@ -175,7 +177,8 @@ class RadixAttention(nn.Module):
 
         context = get_tc_piecewise_forward_context()
         if (
-            forward_batch.forward_mode.is_extend()
+            self.use_prefill_attention_wrapper
+            and forward_batch.forward_mode.is_extend()
             and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading
@@ -234,12 +237,13 @@ class RadixAttention(nn.Module):
                     "q_descale",
                     "k_descale",
                     "v_descale",
+                    "mxfp8_norm_rope_positions",
                 )
             ):
-                # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
-                # tensors can't cross the unified_attention_with_output custom-op
-                # schema; route this backend's extend attention through the plain
-                # eager path.
+                # A score_mod callable, aux_tensors, rel_bias, mxfp8 descale
+                # tensors, or the mxfp8 deferred norm/RoPE operands can't cross
+                # the unified_attention_with_output custom-op schema; route this
+                # backend's extend attention through the plain eager path.
                 if is_in_breakable_cuda_graph():
                     lse = breakable_attention_with_output_extra_kwargs(
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
@@ -314,7 +318,7 @@ def _unified_attention_with_output_impl(
     sinks: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
-    # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
+    # they must appear in the schema when --cuda-graph-backend-prefill=tc_piecewise is on.
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -601,7 +605,8 @@ def attention_with_output_extra_kwargs(
     """Breakable/tc_piecewise attention for backends whose forward needs kwargs
     that cannot cross the ``unified_attention_with_output`` custom-op schema --
     a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
-    fa4 attention). Plain (not a custom op) so the callable passes through; still
+    fa4 attention), or the per-token mxfp8 deferred norm/RoPE operands. Plain
+    (not a custom op) so the callable passes through; still
     runs eagerly between graph segments under BCG via the wrapper below. Mirrors
     the real-token narrowing + padded-output write of
     ``unified_attention_with_output``, and narrows per-token ``aux_tensors`` too.
@@ -625,7 +630,14 @@ def attention_with_output_extra_kwargs(
     aux_tensors = kwargs.get("aux_tensors")
     if aux_tensors is not None:
         kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
-    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+    for per_token_key in (
+        "rel_bias",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+        "mxfp8_norm_rope_positions",
+        "mxfp8_norm_rope_temp_scale",
+    ):
         t = kwargs.get(per_token_key)
         if t is not None:
             kwargs[per_token_key] = t[:real_num_tokens]

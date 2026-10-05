@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncGenerator
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -59,7 +60,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
-    def _validate_request(self, request: CompletionRequest) -> Optional[str]:
+    def _validate_request(self, request: CompletionRequest) -> str | None:
         """Validate that the input is valid."""
         prompt = request.prompt
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
@@ -74,7 +75,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
-        if request.echo and request.logprobs:
+        if request.echo and request.logprobs is not None:
             logger.warning(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
@@ -143,7 +144,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
+    def _build_sampling_params(self, request: CompletionRequest) -> dict[str, Any]:
         """Build sampling parameters for the request"""
         # Start with common parameters
         sampling_params = {
@@ -196,7 +197,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse]:
+    ) -> StreamingResponse | ErrorResponse:
         """Handle streaming completion request"""
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
@@ -274,6 +275,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         content["meta_info"]
                     )
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
@@ -286,11 +290,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if is_first_chunk and request.echo:
+                    if is_first_chunk and request.echo and request.logprobs:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
-                        input_top_logprobs = content["meta_info"]["input_top_logprobs"]
+                        input_top_logprobs = content["meta_info"].get(
+                            "input_top_logprobs", None
+                        )
                     else:
                         input_token_logprobs = None
                         input_top_logprobs = None
@@ -321,6 +327,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             input_top_logprobs=input_top_logprobs,
                             output_token_logprobs=output_token_logprobs,
                             output_top_logprobs=output_top_logprobs,
+                            tokenizer=self.tokenizer_manager.tokenizer,
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
@@ -343,8 +350,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 else:
                     delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
                 # (timeout, OOM, validation): emit a streaming error chunk.
@@ -501,7 +506,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
+    ) -> CompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
@@ -525,7 +530,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _build_completion_response(
         self,
         request: CompletionRequest,
-        ret: List[Dict[str, Any]],
+        ret: list[dict[str, Any]],
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
@@ -575,9 +580,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle logprobs
             logprobs = None
             if request.logprobs is not None:
-                if echo:
+                if echo and request.logprobs:
                     input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
-                    input_top_logprobs = ret_item["meta_info"]["input_top_logprobs"]
+                    input_top_logprobs = ret_item["meta_info"].get(
+                        "input_top_logprobs", None
+                    )
                 else:
                     input_token_logprobs = None
                     input_top_logprobs = None
@@ -591,6 +598,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     output_top_logprobs=ret_item["meta_info"].get(
                         "output_top_logprobs", []
                     ),
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
 
             # Handle hidden states
@@ -660,7 +668,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
         return ""
 
-    def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
+    def _prepare_echo_prompts(self, request: CompletionRequest) -> list[str]:
         """Prepare echo prompts for non-streaming response"""
         # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):

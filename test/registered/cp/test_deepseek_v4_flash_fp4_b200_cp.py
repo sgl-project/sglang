@@ -68,7 +68,6 @@ class TestDSV4FlashFP4B200Balanced_CP_DeepEP(
                 "4",
                 "--attn-cp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--speculative-algorithm",
@@ -119,7 +118,6 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "4",
                 "--attn-cp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--enable-w4a4-mxfp4-megamoe",
@@ -203,7 +201,7 @@ class TestDSV4FlashFP4B200_CP_DSpark(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """DSPARK speculation + prefill CP (interleave, CP_V2, attn_cp=tp)."""
+    """DSPARK speculation + prefill CP (interleave, CP, attn_cp=tp)."""
 
     gsm8k_accuracy_thres = 0.90
 

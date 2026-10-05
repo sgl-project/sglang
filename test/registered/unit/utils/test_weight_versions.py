@@ -1,5 +1,6 @@
 import random
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,7 +16,11 @@ from sglang.srt.utils.weight_versions import (
     truncate_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    published_topology,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -291,6 +296,7 @@ class _ContextStub:
 
 
 class _SchedulerStub:
+    _collect_inflight_batches = Scheduler._collect_inflight_batches
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
 
     def __init__(
@@ -300,11 +306,11 @@ class _SchedulerStub:
         waiting,
         chunked=None,
         last_batch=None,
-        pp_size=1,
         hisparse=None,
     ):
         self.serving = _ServingStub(version)
-        self.ps = SimpleNamespace(pp_size=pp_size)
+        self.enable_continuous_input_polling = False
+        self.result_queue = deque()
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting
@@ -313,7 +319,8 @@ class _SchedulerStub:
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _scheduler(self, *args, **kwargs):
+    def _scheduler(self, *args, pp_size=1, **kwargs):
+        enter_scope(self, published_topology(pp_size=pp_size))
         scheduler = _SchedulerStub(*args, **kwargs)
         for name, value in (
             ("get_serving", scheduler.serving),

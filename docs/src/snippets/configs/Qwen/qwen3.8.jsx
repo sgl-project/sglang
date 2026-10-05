@@ -233,8 +233,8 @@ export const config = {
     // ----- Card: "PD Disaggregation" -----
     // Role flags follow the P/D bundle's own prefill and decode workers. Two
     // flags those recipes carry are deliberately not emitted:
-    // --prefill-round-robin-balance is a DeprecatedAction on current SGLang and
-    // does nothing, and --mamba-track-interval is context-dependent (the source
+    // --prefill-round-robin-balance no longer exists on current SGLang (it was
+    // a deprecated no-op), and --mamba-track-interval is context-dependent (the source
     // recipes set it equal to their context cap) so a fixed value here would be
     // wrong for cells serving the native window.
     pdDisagg: {
@@ -367,9 +367,8 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--ep-size 16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
@@ -452,9 +451,8 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--ep-size 16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
@@ -540,8 +538,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
