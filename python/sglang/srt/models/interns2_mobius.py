@@ -494,7 +494,9 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        accepts_fp8_input = _linear_accepts_fp8_group_tuple(
+            self.linear_attn.in_proj_qkvz
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
@@ -622,7 +624,7 @@ class InternS2MobiusAttentionDecoderLayer(
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
+        accepts_fp8_input = _linear_accepts_fp8_group_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(

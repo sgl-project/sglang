@@ -1427,7 +1427,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 (
                     declare_attn(
                         read=NormQuantReadout(
-                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None,
                             # A single consumer, so the epilogue follows qkv_proj.
                             quant_format=_detect_fused_ar_quant_format(self.qkv_proj),
                         )
