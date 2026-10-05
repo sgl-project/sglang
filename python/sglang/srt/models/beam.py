@@ -703,7 +703,7 @@ class BeamModel(nn.Module):
         # Keep the existing collective above the measured one-shot crossover.
         # Attention and MoE have different savings: only MoE removes a local sum.
         attention_max_tokens, moe_max_tokens = (
-            {2: (32, 32), 4: (32, 64), 8: (8, 16)}[parallel.tp_size]
+            {2: (32, 32), 4: (32, 64), 8: (1, 16)}[parallel.tp_size]
             if architecture == 9
             else (64, 64)
         )
