@@ -646,6 +646,24 @@ def test_alignment_policy_keeps_deepgemm_choice_when_route_cannot_run(policy_env
         assert _policy(32) == 32
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [("deepgemm", 32), ("64", 64), ("128", 128), (" 256 ", 256), ("", 128)],
+)
+def test_alignment_policy_env_override(policy_env, value, expected):
+    with mock.patch.dict(os.environ, {dg._CAKE_LAYOUT_ALIGNMENT_ENV: value}):
+        assert _policy(32) == expected
+        # Non-admitted layers always keep DeepGEMM's choice.
+        assert _policy(32, activation="situ") == 32
+
+
+@pytest.mark.parametrize("value", ["48", "0", "fast", "-32"])
+def test_alignment_policy_env_override_rejects_bad_values(policy_env, value):
+    with mock.patch.dict(os.environ, {dg._CAKE_LAYOUT_ALIGNMENT_ENV: value}):
+        with pytest.raises(ValueError, match="SGLANG_CAKE_MOE_FP8_LAYOUT_ALIGNMENT"):
+            _policy(32)
+
+
 def test_alignment_policy_ignores_non_cuda_devices(policy_env):
     assert (
         dg._cake_contiguous_layout_alignment(

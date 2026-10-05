@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
@@ -208,6 +209,31 @@ def _cake_weights_reject_reason(
     return None
 
 
+_CAKE_LAYOUT_ALIGNMENT_ENV = "SGLANG_CAKE_MOE_FP8_LAYOUT_ALIGNMENT"
+
+
+def _cake_layout_alignment_override() -> Optional[Any]:
+    """Tuning knob for the compact-layout alignment the Cake route asks for:
+    unset -> the policy below; ``deepgemm`` -> keep DeepGEMM's own choice;
+    a multiple of 32 -> that alignment.  Anything else is a configuration
+    error and raises."""
+    raw = os.environ.get(_CAKE_LAYOUT_ALIGNMENT_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw == "deepgemm":
+        return raw
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0 or value % _CAKE_ALIGNMENT_MULTIPLE:
+        raise ValueError(
+            f"{_CAKE_LAYOUT_ALIGNMENT_ENV}={raw!r}: expected 'deepgemm' or a "
+            f"positive multiple of {_CAKE_ALIGNMENT_MULTIPLE}"
+        )
+    return value
+
+
 def _cake_contiguous_layout_alignment(
     default: int,
     *,
@@ -225,8 +251,14 @@ def _cake_contiguous_layout_alignment(
     same static admission as the route (``_cake_weights_reject_reason`` plus the
     adapter's device-level probe); the dynamic per-call admission can still
     fall back to DeepGEMM, which then runs on the 128-aligned layout.
+    :data:`_CAKE_LAYOUT_ALIGNMENT_ENV` overrides the choice for admitted layers
+    (``deepgemm`` or a multiple of 32).
     """
-    if default == _CAKE_LAYOUT_ALIGNMENT or not cake_route_enabled(_CAKE_ROUTE):
+    override = _cake_layout_alignment_override()
+    target = _CAKE_LAYOUT_ALIGNMENT if override is None else override
+    if target == "deepgemm":
+        target = default
+    if default == target or not cake_route_enabled(_CAKE_ROUTE):
         return default
     if device.type != "cuda":
         return default
@@ -259,10 +291,11 @@ def _cake_contiguous_layout_alignment(
         return default
     _cake_log_once(
         "alignment",
-        f"Cake {_CAKE_ROUTE}: compact layout alignment {_CAKE_LAYOUT_ALIGNMENT} "
-        f"(DeepGEMM would pick {default})",
+        f"Cake {_CAKE_ROUTE}: compact layout alignment {target} "
+        f"(DeepGEMM would pick {default}"
+        f"{'' if override is None else f', {_CAKE_LAYOUT_ALIGNMENT_ENV}={override}'})",
     )
-    return _CAKE_LAYOUT_ALIGNMENT
+    return target
 
 
 def _cake_debug_sync(stage: str) -> None:
