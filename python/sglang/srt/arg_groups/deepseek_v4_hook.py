@@ -178,6 +178,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
+    from sglang.srt.model_executor.cuda_graph_config import Backend
 
     cfg = resolving_view(server_args)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
@@ -186,9 +187,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+        )
     if cfg.enable_encoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -271,7 +277,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "block size and TP size."
             )
 
-    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 
     prefill_graph = cfg.cuda_graph_config.prefill
     if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
@@ -290,8 +296,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (

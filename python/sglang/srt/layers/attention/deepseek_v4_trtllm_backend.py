@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -151,13 +150,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         assert self.token_to_kv_pool.uniform_fp8, (
             "the trtllm backend requires the uniform-FP8 DSv4 KV pool."
-        )
-        assert (
-            not self.is_dsv41
-            or get_exec().graph.cuda_graph_config.prefill.backend == Backend.DISABLED
-        ), (
-            "the experimental V4.1 trtllm path requires "
-            "--cuda-graph-backend-prefill disabled"
         )
         assert not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(), (
             "--dsv4-attn-backend trtllm does not support "
