@@ -91,12 +91,13 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -143,6 +144,10 @@ _KV_POOL_BASE_FOR_KIND: dict[str, type] = {
     "mla": MLATokenToKVPool,
     "dsa": DSATokenToKVPool,
 }
+
+# The draft attention backends that read a fused draft's rows through the
+# KV-index translator on every path a draft forward takes.
+_TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3"})
 
 
 def _pd_prefill_skips_mamba_spec_state() -> bool:
@@ -994,6 +999,35 @@ class KVCacheConfigurator:
                 declined=(
                     f"the draft's attention is {aux.draft_model_config.attention_arch.name}; "
                     "the fused region holds dense MHA K/V rows"
+                )
+            )
+        # The backend(s) the draft runner will run. The published draft
+        # backend carries model-hook declarations; without one, a DFLASH-family
+        # draft takes the target's prefill backend as `build_draft_tp_worker`
+        # does (the platform default when that is unset or not a draft
+        # backend), and an EAGLE draft runs the target's prefill/decode pair.
+        draft_backend = get_spec().speculative_draft_attention_backend
+        if self.spec_algorithm.is_dflash_family():
+            if draft_backend is None:
+                draft_backend, _ = attention_backends()
+            if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
+                platform = get_platform()
+                draft_backend = (
+                    "triton" if (platform.is_xpu or platform.is_hip) else "flashinfer"
+                )
+        draft_backends = (
+            {draft_backend} if draft_backend else set(attention_backends()) - {None}
+        )
+        # A fused draft reads its rows through the KV-index translator, which
+        # other backends miss on some draft path: trtllm_mha's graph replay
+        # refills its page table from stale lengths, and its eager build does
+        # not widen the table by the draft block.
+        if not draft_backends <= _TRANSLATED_MHA_RAILS:
+            return FusedDraftDecision(
+                declined=(
+                    f"the draft runs on {', '.join(sorted(draft_backends))}, "
+                    "off the translated MHA rails "
+                    f"({', '.join(sorted(_TRANSLATED_MHA_RAILS))})"
                 )
             )
         profile = draft_kv_profile(

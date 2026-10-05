@@ -24,6 +24,8 @@ prices. Pinned:
   - a draft with SWA or recurrent-state layers of its own, or asymmetric K/V
     rows, declines: the fused arm binds one dense pool over the host's full
     slots;
+  - a draft whose attention backend is off the translated MHA rails
+    declines: it would read the fused rows without the KV-index translator;
   - the profile divides the draft's heads by attn_tp, as the target does;
   - a placement whose runner lane counts do not fill its region is refused;
   - the priced entry counts the layers THIS runner owns, not the whole model's.
@@ -46,7 +48,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     draft_kv_profile,
     place_fused_draft,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -238,7 +240,15 @@ class TestFusedEntryPricing(CustomTestCase):
 class TestFusedDraftDecision(CustomTestCase):
     """The target's boot decision over a host whose full sub-pool fuses."""
 
-    def _decide(self, *, draft_kv_dtype=None, attention_arch=None):
+    def _decide(
+        self,
+        *,
+        algorithm="EAGLE",
+        draft_kv_dtype=None,
+        attention_arch=None,
+        draft_backend=None,
+        target_backends=("triton", "triton"),
+    ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
 
@@ -247,12 +257,16 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.is_draft_worker = False
-        cfg.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
+        cfg.spec_algorithm = SimpleNamespace(
+            is_eagle=lambda: algorithm == "EAGLE",
+            is_dflash_family=lambda: algorithm in ("DFLASH", "DSPARK"),
+        )
         cfg.model_config = SimpleNamespace(is_multi_layer_eagle=False)
         cfg.kv_cache_dtype = _DTYPE
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,
+            dflash_draft_num_layers=1,
             draft_model_config=SimpleNamespace(
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,
@@ -266,13 +280,17 @@ class TestFusedDraftDecision(CustomTestCase):
         )
         memory = SimpleNamespace(enable_unified_memory=True)
         spec = SimpleNamespace(
-            speculative_num_steps=1, speculative_draft_kv_cache_dtype=draft_kv_dtype
+            speculative_num_steps=1,
+            speculative_draft_kv_cache_dtype=draft_kv_dtype,
+            speculative_draft_attention_backend=draft_backend,
         )
         with (
             patch.object(kvc, "get_memory", return_value=memory),
             patch.object(kvc, "get_spec", return_value=spec),
+            patch.object(kvc, "attention_backends", return_value=target_backends),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
             get_parallel().override(attn_tp_size=1),
+            override_platform(is_xpu=False, is_hip=False),
         ):
             return cfg._fused_draft_decision()
 
@@ -295,6 +313,27 @@ class TestFusedDraftDecision(CustomTestCase):
         declined = self._decide(draft_kv_dtype="fp8_e4m3")
         self.assertIsNone(declined.placement)
         self.assertIn("KV cache dtype", declined.declined)
+
+    def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
+        """A fused draft reads its rows through the KV-index translator, which
+        only triton, flashinfer and fa3 carry on every draft path. The draft's
+        backend is the published one, a model hook's declaration included;
+        otherwise it is what the draft runner inherits from the target."""
+        # Kimi-Linear + DSPARK on SM100, where a model hook declares trtllm_mha.
+        declined = self._decide(algorithm="DSPARK", draft_backend="trtllm_mha")
+        self.assertIsNone(declined.placement)
+        self.assertIn("trtllm_mha", declined.declined)
+        # A DFLASH-family draft runs the target's prefill backend, or the
+        # platform default when that is not a draft backend.
+        for target_backends, fuses in (
+            (("fa4", "fa4"), False),
+            (("fa3", "flashmla"), True),
+            (("flashmla", "flashmla"), True),
+        ):
+            decision = self._decide(algorithm="DSPARK", target_backends=target_backends)
+            self.assertEqual(decision.placement is not None, fuses, target_backends)
+        # An EAGLE draft with no backend of its own runs the target's pair.
+        self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
 
 
 class TestMambaHostPrivateDraftRefused(CustomTestCase):
