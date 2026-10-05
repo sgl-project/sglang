@@ -187,4 +187,10 @@ metatags:
     href="/cookbook/autoregressive/Poolside/Laguna-S-2.1"
     img="/cards/logos/poolside.png"
   />
+  <Card
+    title="Perplexity"
+    mode="card"
+    href="/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b"
+    img="/cards/logos/perplexity.png"
+  />
 </CardGroup>
