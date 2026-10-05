@@ -1944,12 +1944,16 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         )
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
 
         def shard_g_proj_for_attention_tp(
-            weight: torch.Tensor, cat_dim: int, is_scale: bool
+            weight: torch.Tensor,
+            cat_dim: int,
+            is_scale: bool,
+            *,
+            q_b_proj: ColumnParallelLinear,
         ):
+            attn_tp_rank = q_b_proj.tp_rank
+            attn_tp_size = q_b_proj.tp_size
             assert weight.ndim > cat_dim, (
                 f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
             )
@@ -1998,7 +2002,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
             g_proj_weight = cached_a_proj[g_proj_name]
             g_proj_shard = shard_g_proj_for_attention_tp(
-                g_proj_weight, cat_dim, is_scale
+                g_proj_weight,
+                cat_dim,
+                is_scale,
+                q_b_proj=self.get_submodule(param_name.rsplit(".", 2)[0]).q_b_proj,
             )
             scale_block_n = _get_scale_block_n(self.quant_config)
             kv_a_proj_weight_aligned = (
