@@ -144,7 +144,9 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -446,8 +448,7 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
 
 def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
     """o_proj under SP-MoE."""
-    # o_proj emits TP-partial sums; _finish_attn_reduce completes the
-    # reduction (RS on the clean attn-res path, AR on fallbacks).
+    # o_proj emits TP-partial sums, which the stage boundary completes.
     o_proj.reduce_results = False
     if k3_sp_collective.enabled():
         # The table selects NVLS pull RS for larger token buckets.
@@ -2496,18 +2497,34 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
-    """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. The attention-residual carry, which keeps the bank and
-    the stream on each rank's attention-TP shard across SP-MoE layers, still
-    runs the layer's own communication."""
-    return not (
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
+    """Whether consecutive SP-MoE layers keep the stream and the
+    attention-residual bank on each rank's attention-TP shard of the rows
+    (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
+    gathers what it read. A rank then holds only its own rows of the bank, so
+    neither a later pipeline rank nor a draft model's capture of the target's
+    hidden states can take them; it is decided at construction. Nor can a
+    dense layer after an SP-MoE one, whose FFN reads every row of the bank:
+    every layer from the first MoE layer on must be one."""
+    if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
         and k3_sp_collective.enabled()
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
-    )
+    ):
+        return False
+    moe = [_is_moe_layer(config, idx) for idx in range(config.num_hidden_layers)]
+    if True not in moe or not all(moe[moe.index(True) :]):
+        return False
+    spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    return not (spec.is_eagle3() or spec.is_dflash_family())
+
+
+def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
+    """Whether the layers build stage boundaries, which every configuration
+    does."""
+    return True
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2646,6 +2663,11 @@ class KimiK3DecoderLayer(nn.Module):
         # once the attention's sum is complete, then gathered.
         attn_ops = {}
         ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
+        carries = _carries_bank_slices(config)
+        bank_sp_moe = self._sp_moe and self.use_attn_residuals
+        tuned_gather = (
+            k3_sp_collective.all_gather if k3_sp_collective.enabled() else None
+        )
         if self.use_attn_residuals:
             bank_ops = AttnBankState(
                 attn_bank,
@@ -2655,8 +2677,21 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
                 ffn_input_fusions=self._ffn_input_fusions(),
+                fuses_slice_collectives=self._sp_moe
+                and k3_sp_collective.enabled()
+                and envs.SGLANG_K3_SP_ATTN_RES.get(),
             ).residual_ops()
-            attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
+            attn_ops = dict(
+                read=bank_ops.attn_readout,
+                update=bank_ops.attn_update,
+                # An input read on the shard an SP-MoE layer left is gathered
+                # in K3's tuned all-gather when it takes the batch.
+                attn_tp_gather=(
+                    tuned_gather
+                    if carries and _is_moe_layer(config, layer_idx - 1)
+                    else None
+                ),
+            )
             ffn_ops = dict(
                 read=bank_ops.ffn_readout,
                 update=(
@@ -2678,10 +2713,11 @@ class KimiK3DecoderLayer(nn.Module):
                     ),
                     # SP-MoE runs on this rank's attention-TP shard of the
                     # rows; on the bank path, whose reads write the bank on
-                    # every row, its output returns to all of them.
+                    # every row, its output returns to all of them, unless
+                    # the bank stays on the shard, read there to the end.
                     exit_rows=(
-                        ExitRows.ATTENTION
-                        if self._sp_moe and self.use_attn_residuals
+                        (ExitRows.SLICE if carries else ExitRows.ATTENTION)
+                        if bank_sp_moe
                         else None
                     ),
                     # A latent MoE completes its output sum together with
@@ -2690,11 +2726,7 @@ class KimiK3DecoderLayer(nn.Module):
                     # The bank path's gather back to every row, in K3's
                     # tuned all-gather when it takes the batch.
                     attn_tp_gather=(
-                        k3_sp_collective.all_gather
-                        if self._sp_moe
-                        and self.use_attn_residuals
-                        and k3_sp_collective.enabled()
-                        else None
+                        tuned_gather if bank_sp_moe and not carries else None
                     ),
                 ),
                 self.post_attention_layernorm,
@@ -3001,6 +3033,7 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._stage_boundaries = _uses_stage_boundaries(config)
+        self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3068,6 +3101,11 @@ class KimiK3LinearModel(nn.Module):
                     self.output_attn_res_proj,
                     self.output_attn_res_norm,
                     self.norm,
+                    attn_tp_gather=(
+                        k3_sp_collective.all_gather
+                        if self.carries_bank_slices
+                        else None
+                    ),
                 )
             )
         else:
@@ -3410,6 +3448,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        if self.model.carries_bank_slices:
+            raise RuntimeError(
+                "the model keeps each rank's shard of the rows across SP-MoE "
+                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
+                "to capture whole"
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)

@@ -470,5 +470,120 @@ class TestAttnBankSpMoeStages(CustomTestCase):
             torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
+class TestAttnBankOnShards(CustomTestCase):
+    """With the stream kept on this rank's attention-TP shard across MoE
+    layers, a write layer snapshots only this rank's rows of the bank. Reads
+    take the matching rows to the end, where the final read gathers what it
+    read; a read of every row after such a write is refused, since the other
+    ranks' rows of this bank are stale."""
+
+    def setUp(self):
+        for patcher in (
+            patch.object(attn_residual, "_mix_fused", _mix),
+            # The second of two attention-TP ranks: rows 2 and 3 of 4.
+            patch.object(
+                attn_bank,
+                "get_parallel",
+                lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=1),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.hidden = torch.randn(
+            4, HIDDEN, generator=torch.Generator().manual_seed(11)
+        )
+
+    def open(self):
+        holder = AttnBank()
+        # One snapshot of every row, as after the first block.
+        holder.open(self.hidden, 3).write(self.hidden * 0.5)
+        return holder
+
+    @staticmethod
+    def final_read(holder, gather=None):
+        return AttnBankOutputRead(
+            holder, OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM, attn_tp_gather=gather
+        )
+
+    def test_the_final_read_of_a_shard_gathers_what_it_read(self):
+        holder = self.open()
+        every_row = self.final_read(holder)(self.hidden)
+
+        def all_gather(shard, *, owned=False):
+            # The output outlives the stack: it may not share a buffer.
+            self.assertTrue(owned)
+            return torch.cat([torch.zeros_like(shard), shard])
+
+        tuned = torch.full((4, HIDDEN), 3.0)
+        with (
+            patch.object(
+                attn_residual.AttnResidual, "forward_sp_all_gather", return_value=None
+            ),
+            patch.object(comm_moves, "attn_tp_gather", all_gather),
+        ):
+            for gather in (None, lambda h: None):
+                got = self.final_read(holder, gather)(self.hidden[2:])
+                torch.testing.assert_close(got[2:], every_row[2:], rtol=0, atol=0)
+            got = self.final_read(holder, lambda h: tuned)(self.hidden[2:])
+            self.assertIs(got, tuned)
+        fused = torch.full((4, HIDDEN), 5.0)
+        with patch.object(
+            attn_residual.AttnResidual,
+            "forward_sp_all_gather",
+            return_value=(fused, None),
+        ) as kernel:
+            got = self.final_read(holder, lambda h: tuned)(self.hidden[2:])
+        self.assertIs(got, fused)
+        self.assertEqual(kernel.call_args.kwargs["rows"], slice(2, 4))
+
+    def test_a_read_of_every_row_after_a_shard_write_is_refused(self):
+        holder = self.open()
+        layer = LAYER_LIST[2]
+        self.assertTrue(layer.writes_block)
+        layer.ops(holder).attn_readout.read(self.hidden[2:], layer.input_norm)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            self.final_read(holder)(self.hidden)
+        with (
+            patch.object(
+                attn_residual.AttnResidual, "forward_sp_all_gather", return_value=None
+            ),
+            patch.object(
+                comm_moves,
+                "attn_tp_gather",
+                lambda shard, owned=False: torch.cat([shard, shard]),
+            ),
+        ):
+            self.final_read(holder)(self.hidden[2:])
+
+    def test_the_fused_reads_are_offered_on_request(self):
+        def scatter_add(hidden_states, residual, forward_batch):
+            return None
+
+        scatter = ReadoutFusion(SumGroup.ATTN_TP, scatter_add, scatters=True)
+        for fuses in (False, True):
+            with self.subTest(fuses_slice_collectives=fuses):
+                ops = AttnBankState(
+                    AttnBank(),
+                    LAYER_LIST[1].attn_proj,
+                    LAYER_LIST[1].attn_score_norm,
+                    LAYER_LIST[1].ffn_proj,
+                    LAYER_LIST[1].ffn_score_norm,
+                    ffn_input_fusions=(scatter,),
+                    fuses_slice_collectives=fuses,
+                ).residual_ops()
+                gathers = ops.attn_readout.gathering_reads
+                fusions = ops.ffn_readout.completing_fusions
+                if not fuses:
+                    self.assertEqual(gathers, ())
+                    self.assertEqual(fusions, (scatter,))
+                    continue
+                self.assertEqual(len(gathers), 1)
+                # The fused reduce-scatter and read first, then the
+                # reduce-scatter with the residual add alone.
+                self.assertEqual([f.reads for f in fusions], [True, False])
+                self.assertTrue(fusions[0].scatters)
+                self.assertIs(fusions[1], scatter)
+
+
 if __name__ == "__main__":
     unittest.main()
