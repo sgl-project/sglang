@@ -106,7 +106,7 @@ class TestForwardBatchWiring(CustomTestCase):
 
     def test_init_new_binds_the_plan(self):
         names = _call_names(ForwardBatch.init_new.__func__)
-        for call in ("translator.plan", "kv_loc_plan.bind"):
+        for call in ("translator.own_plan", "kv_loc_plan.bind"):
             self.assertIn(
                 call,
                 names,

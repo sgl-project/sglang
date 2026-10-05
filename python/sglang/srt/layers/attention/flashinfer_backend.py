@@ -863,9 +863,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.sliding_window_write_loc_for(
-                        forward_batch.out_cache_loc
-                    )
+                    forward_batch.out_cache_loc_swa
                 )
             if in_capture:
                 self.forward_metadata.swa_out_cache_loc = (
@@ -955,9 +953,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
-                forward_batch.out_cache_loc
-            )
+            swa_out_cache_loc = forward_batch.out_cache_loc_swa
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(

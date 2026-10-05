@@ -19,11 +19,17 @@
   both spaces;
 - the sliding-window write ids come from the virtual window and agree with
   the derivation from the physical one;
+- a forward whose `seq_lens` do not yet count the window it writes (a
+  verify, a speculative draft decode, a draft extend) reads that window past
+  them;
 - the read table covers `seq_lens + read_extent`, is built once, and grows
   for a captured graph's padded lanes by copying (sink rows), never by
   building again;
 - `bind` gives a batch its ids, with the virtual mirror only when they were
-  translated.
+  translated;
+- a runner's own write buffer (graph capture, warmup) is used as it is, its
+  sliding-window ids naming the sink; a replayed graph's batch writes through
+  the runner's padded buffer, its sliding-window ids padded with the sink.
 
   python -m pytest test/registered/unit/mem_cache/test_kv_loc_plan.py -v
 """
@@ -45,6 +51,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -210,6 +217,34 @@ class TestKVLocPlan(unittest.TestCase):
             )
         )
 
+    def test_a_verify_reads_the_window_it_writes(self):
+        def own_plan(mode, spec_info):
+            return self.target.own_plan(
+                SimpleNamespace(
+                    forward_mode=mode,
+                    spec_info=spec_info,
+                    batch_size=int(self.rpi.numel()),
+                    req_pool_indices=self.rpi,
+                    seq_lens=self.seq_lens,
+                    seq_lens_cpu=self.seq_lens.clone(),
+                    out_cache_loc=self.window,
+                )
+            )
+
+        width = self.window.numel() // self.rpi.numel()
+        # A verify's rows read up to `draft_token_num` past their lengths, more
+        # than the window when the verify is ragged.
+        spec = SimpleNamespace(draft_token_num=width + 1)
+        self.assertEqual(
+            own_plan(ForwardMode.TARGET_VERIFY, spec).read_extent, width + 1
+        )
+        self.assertEqual(own_plan(ForwardMode.DECODE, spec).read_extent, width)
+        # A draft extend's lengths take its window after its batch is built.
+        self.assertEqual(own_plan(ForwardMode.DRAFT_EXTEND_V2, spec).read_extent, width)
+        # Their lengths already count what an extend or a plain decode writes.
+        self.assertEqual(own_plan(ForwardMode.EXTEND, spec).read_extent, 0)
+        self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
+
     def test_read_table_is_built_once_and_padded_by_copy(self):
         builds = []
         real = kv_index_translator.build_kv_read_table
@@ -268,6 +303,41 @@ class TestKVLocPlan(unittest.TestCase):
         plan.bind(private, self.private_draft)
         self.assertIs(private.out_cache_loc, self.window)
         self.assertIsNone(private.out_cache_loc_virtual)
+
+    def test_runner_slots_are_used_as_they_are(self):
+        for translator, writes_swa in (
+            (self.target, True),
+            (self.private_draft, False),
+        ):
+            slots = torch.zeros(2, dtype=torch.int64)
+            batch = SimpleNamespace(
+                req_pool_indices=self.rpi,
+                seq_lens=self.seq_lens,
+                seq_lens_cpu=self.seq_lens.clone(),
+                out_cache_loc=slots,
+            )
+            translator.bind_runner_slots(batch)
+            # Kept by address: a captured graph writes this buffer on replay.
+            self.assertIs(batch.out_cache_loc, slots)
+            self.assertIsNone(batch.out_cache_loc_virtual)
+            self.assertTrue(batch.out_cache_loc_is_physical)
+            if writes_swa:
+                self.assertTrue(torch.equal(batch.out_cache_loc_swa, slots))
+            else:
+                self.assertIsNone(batch.out_cache_loc_swa)
+
+    def test_a_replay_batch_writes_the_padded_slots(self):
+        plan = self._plan()
+        n = plan.write_physical.numel()
+        slots = torch.zeros(n + 2, dtype=torch.int64)
+        slots[:n].copy_(plan.write_physical)
+        batch = SimpleNamespace()
+        plan.bind_replay(batch, self.target, slots=slots)
+        self.assertIs(batch.kv_loc_plan, plan)
+        self.assertIs(batch.out_cache_loc, slots)
+        self.assertIsNone(batch.out_cache_loc_virtual)
+        self.assertTrue(torch.equal(batch.out_cache_loc_swa[:n], plan.swa_write_ids()))
+        self.assertEqual(int(batch.out_cache_loc_swa[n:].abs().sum()), 0)
 
 
 if __name__ == "__main__":

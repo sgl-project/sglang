@@ -766,14 +766,21 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_token_num=self.speculative_num_draft_tokens,
                 device=batch.device,
             )
+        seq_lens = batch.seq_lens + self.speculative_num_draft_tokens
         runner.stage_shared_reads(
-            seq_lens=batch.seq_lens + self.speculative_num_draft_tokens,
+            seq_lens=seq_lens,
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
             # Both loc sources read req_to_token untranslated, so `locs` is the
             # PRE-translate write loc the capture rail needs.
             out_cache_loc_virtual=locs,
+            kv_loc_plan=self.draft_runner_list[0].kv_index_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=locs,
+            ),
         )
         return True
 

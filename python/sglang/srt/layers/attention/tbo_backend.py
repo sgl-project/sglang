@@ -251,6 +251,7 @@ def _build_tbo_child_replay_fb_view(
     child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
     parent_input_ids = getattr(fb_view, "input_ids", None)
     parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
+    parent_out_cache_loc_swa = getattr(fb_view, "out_cache_loc_swa", None)
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
@@ -270,6 +271,14 @@ def _build_tbo_child_replay_fb_view(
             if parent_out_cache_loc is not None
             else None
         ),
+        out_cache_loc_swa=(
+            parent_out_cache_loc_swa[tok_slice]
+            if parent_out_cache_loc_swa is not None
+            else None
+        ),
+        # Unified memory refuses two-batch overlap, so the plan's reads stay in
+        # `req_to_token`, which each child indexes at its own rows.
+        kv_loc_plan=getattr(fb_view, "kv_loc_plan", None),
         spec_info=child_spec_info,
         max_seq_len_override=fb_view.max_seq_len_override,
     )

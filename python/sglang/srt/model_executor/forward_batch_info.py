@@ -542,6 +542,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
     # split, state capture.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
+    # The same columns' ids in the sliding-window sub-pool, None when this
+    # runner's pool has no sliding-window space.
+    out_cache_loc_swa: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
@@ -1089,12 +1092,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         translator = model_runner.kv_index_translator
         if kv_loc_plan is None:
-            kv_loc_plan = translator.plan(
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=batch.seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                write_virtual=batch.out_cache_loc,
-            )
+            kv_loc_plan = translator.own_plan(ret)
         kv_loc_plan.bind(ret, translator, cols=write_cols)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -2166,6 +2164,7 @@ def build_inner_fb_view(
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
+        out_cache_loc_swa=getattr(forward_batch, "out_cache_loc_swa", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,

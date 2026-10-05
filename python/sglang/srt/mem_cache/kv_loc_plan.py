@@ -32,7 +32,8 @@ static pool the plan does no work at all.
 Who builds the plan: `ForwardBatch.init_new` for a forward that is the only one
 in its iteration; a speculative worker, once per iteration, as soon as the
 iteration's slots are allocated, handing the same plan to the draft and target
-forwards and to the direct KV writers.
+forwards and to the direct KV writers; a graph runner, for a batch it builds
+over its own buffers to capture or warm up with (`write_slots`).
 """
 
 from __future__ import annotations
@@ -48,6 +49,34 @@ if TYPE_CHECKING:
     )
 
 
+def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> int:
+    """How far past ``seq_lens`` a forward reads: the window it writes, when
+    its ``seq_lens`` do not count that window yet -- a verify, whose rows read
+    at most ``draft_token_num`` past them (a ragged verify writes fewer for
+    some rows); a speculative draft decode, which reads back its own earlier
+    steps; and a draft extend, whose lengths take its window only after its
+    batch is built. Zero for every other forward, whose ``seq_lens`` already
+    include what it writes."""
+    if spec_info is None or write_ids is None or not batch_size:
+        return 0
+    if forward_mode.is_target_verify():
+        return spec_info.draft_token_num
+    if forward_mode.is_decode() or forward_mode.is_draft_extend_v2():
+        return write_ids.numel() // batch_size
+    return 0
+
+
+def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]:
+    """``ids`` padded to ``n`` entries with the sink (id 0 in every space), for
+    a view whose write ids are a runner's padded buffer: its other write ids
+    must cover the same lanes."""
+    if ids is None or ids.shape[0] >= n:
+        return ids
+    padded = ids.new_zeros(n)
+    padded[: ids.shape[0]].copy_(ids)
+    return padded
+
+
 class KVLocPlan:
     """The ids of one iteration, both spaces, each computed once."""
 
@@ -60,6 +89,7 @@ class KVLocPlan:
         seq_lens_cpu: Optional[torch.Tensor],
         write_virtual: Optional[torch.Tensor],
         read_extent: int = 0,
+        write_slots: Optional[torch.Tensor] = None,
     ):
         self._source = source
         self.req_pool_indices = req_pool_indices
@@ -68,14 +98,23 @@ class KVLocPlan:
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
         self.read_extent = read_extent
-        # Aliases the ScheduleBatch's tensor, which stays virtual for the radix
-        # tree, the accept path and lazy compaction's in-flight write set.
-        self.write_virtual = write_virtual
-        self.write_physical = (
-            source._translate_write_full(write_virtual)
-            if source.is_translating and write_virtual is not None
-            else write_virtual
-        )
+        if write_slots is not None:
+            # A runner's own write buffer, for a graph capture or a warmup run:
+            # physical by construction, naming the sink until a replay fills
+            # it, and kept by address in a captured graph. Used as it is.
+            assert write_virtual is None
+            self.write_virtual = None if source.is_translating else write_slots
+            self.write_physical = write_slots
+        else:
+            # Aliases the ScheduleBatch's tensor, which stays virtual for the
+            # radix tree, the accept path and lazy compaction's in-flight write
+            # set.
+            self.write_virtual = write_virtual
+            self.write_physical = (
+                source._translate_write_full(write_virtual)
+                if source.is_translating and write_virtual is not None
+                else write_virtual
+            )
         self._swa_write: Optional[torch.Tensor] = None
         self._read_table: Optional[KVIndexTable] = None
 
@@ -93,8 +132,22 @@ class KVLocPlan:
             if self.is_translated_for(reader)
             else None
         )
+        batch.out_cache_loc_swa = (
+            self.swa_write_ids(cols=cols) if reader.writes_sliding_window else None
+        )
         # A forward with no write loc writes nothing and stays unmarked.
         batch.out_cache_loc_is_physical = batch.out_cache_loc is not None
+
+    def bind_replay(self, batch, reader: KVIndexTranslator, *, slots: torch.Tensor):
+        """`bind`, for the batch a captured graph replays this iteration's
+        forward with. Its write ids are ``slots``, the runner's capture-stable
+        buffer that already holds this plan's write ids and names the sink past
+        them; its sliding-window ids are padded the same way. The virtual
+        mirror stays with the live batch."""
+        self.bind(batch, reader)
+        batch.out_cache_loc_swa = pad_with_sink(batch.out_cache_loc_swa, slots.shape[0])
+        batch.out_cache_loc = slots
+        batch.out_cache_loc_virtual = None
 
     def write_ids(
         self, reader: KVIndexTranslator, *, cols: Optional[slice] = None
@@ -125,8 +178,8 @@ class KVLocPlan:
         """The sliding-window sub-pool's write ids for the same columns, or
         None when the pool has no sliding-window space. Derived once for the
         whole window, from its virtual ids: one lookup, not an inverse lookup
-        of the physical ones."""
-        if self._swa_write is None and self.write_virtual is not None:
+        of the physical ones. A runner's own slots name the sink here too."""
+        if self._swa_write is None and self.write_physical is not None:
             self._swa_write = self._source._swa_write_ids(
                 virtual=self.write_virtual, physical=self.write_physical
             )

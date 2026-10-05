@@ -9,6 +9,7 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -29,6 +30,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _static_pool_translator():
+    """A static pool's translator: its plans hand every batch its own ids."""
+    return KVIndexTranslator(
+        req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+        token_to_kv_pool_allocator=None,
+        token_to_kv_pool=object(),
+        page_size=1,
+        device="cpu",
+    )
 
 
 class _FakeAttentionBackend:
@@ -168,6 +180,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             prepare_dummy_forward_batch=lambda batch: prepared.append(batch) or batch,
             attn_tp_sequence_sharded=lambda _: False,
             attn_backend=attention_backend,
+            kv_index_translator=_static_pool_translator(),
         )
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = model_runner
@@ -321,9 +334,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_context_size = None
         runner._capture_chunked_prefix = False
         runner.buffer_registry = _FakeBatchRegistry()
+        translator = _static_pool_translator()
         runner.model_runner = SimpleNamespace(
             attn_tp_sequence_sharded=lambda _: False,
             prepare_dummy_forward_batch=lambda batch: batch,
+            kv_index_translator=translator,
         )
         runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
@@ -357,6 +372,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
+        translator.rebind_write_loc(forward_batch)
 
         static_batch = runner.load_batch(forward_batch)
 

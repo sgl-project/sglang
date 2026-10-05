@@ -543,7 +543,9 @@ class FlashAttentionBackend(AttentionBackend):
             self._init_full_cg_decode_metadata(forward_batch, in_capture)
 
     def _get_swa_write_locations(self, forward_batch: ForwardBatch):
-        locations = getattr(forward_batch, "out_cache_loc", None)
+        """This step's sliding-window write ids: the plan's, sliced per
+        draft step the way `out_cache_loc` is."""
+        locations = getattr(forward_batch, "out_cache_loc_swa", None)
         if (
             locations is not None
             and forward_batch.forward_mode.is_decode_or_idle()
@@ -586,11 +588,7 @@ class FlashAttentionBackend(AttentionBackend):
             if in_capture:
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
-                self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.sliding_window_write_loc_for(
-                        swa_out_cache_loc
-                    )
-                )
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_out_cache_loc)
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -797,22 +795,13 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc.shape[0],
                 "full-CG prefill SWA write-location buffer",
             )
-            # Under the unified pool `out_cache_loc` was rebound to FULL-side
-            # physical ids at ForwardBatch construction, so the full->swa map
-            # cannot be re-run on it: a full physical page number is also a
-            # valid virtual page of the swa v2p, so the map would silently
-            # resolve it to an unrelated token's swa slot. Phase 2 of the write
-            # contract derives the swa loc from them instead.
-            swa_write_loc = (
-                self.kv_index_translator.sliding_window_write_loc_for(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                # The runner-built capture batch writes the page-0 sink.
+                self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
+            else:
+                self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
+                    forward_batch.out_cache_loc_swa
                 )
-                if translating
-                else self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
@@ -1249,15 +1238,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
-                if swa_out_cache_loc is not None:
-                    # The swa write loc was computed from the still-VIRTUAL
-                    # loc at ForwardBatch construction; re-running the
-                    # full->swa map on the physical loc would be garbage.
-                    metadata.swa_out_cache_loc = (
-                        self.kv_index_translator.sliding_window_write_loc_for(
-                            swa_out_cache_loc
-                        )
-                    )
+                metadata.swa_out_cache_loc = swa_out_cache_loc
         elif self.use_sliding_window_kv_pool:
             # FA3 requires an int32 page_table.
             metadata.swa_page_table = (
@@ -1265,12 +1246,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
-            if swa_out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        swa_out_cache_loc
-                    )
-                )
+            metadata.swa_out_cache_loc = swa_out_cache_loc
 
         # Logical-page KV sharding: capture the batch's gather plan and swap the
         # page table to scratch rows. During a sharded extend, attention reads

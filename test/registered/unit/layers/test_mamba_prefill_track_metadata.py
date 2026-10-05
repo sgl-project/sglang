@@ -227,7 +227,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
             ),
             # A pass-through runner: its plan hands the batch its ids untouched.
             kv_index_translator=SimpleNamespace(
-                plan=lambda **kwargs: SimpleNamespace(
+                own_plan=lambda batch: SimpleNamespace(
                     bind=lambda batch, reader, cols=None: None
                 )
             ),

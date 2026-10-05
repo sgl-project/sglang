@@ -71,7 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan, window_read_extent
 from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 
@@ -179,6 +179,15 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
+    @property
+    def writes_sliding_window(self) -> bool:
+        """Whether this runner's pool has a sliding-window space a forward
+        writes besides the full one."""
+        return (
+            self._swa_write_from_virtual is not None
+            or self._swa_write_loc_from_full is not None
+        )
+
     def capture_token_capacity(self, max_token_pool_size: int) -> int:
         """Host capture rows are indexed by request-token IDs, not kernel IDs.
 
@@ -207,11 +216,13 @@ class KVIndexTranslator:
         seq_lens_cpu: Optional[torch.Tensor],
         write_virtual: Optional[torch.Tensor],
         read_extent: int = 0,
+        write_slots: Optional[torch.Tensor] = None,
     ) -> KVLocPlan:
         """This iteration's ids, translated once. ``write_virtual`` is the
         iteration's write window (``[batch, window]`` flattened when its
         forwards write columns of it); ``read_extent`` is how far past
-        ``seq_lens`` the iteration's reads reach."""
+        ``seq_lens`` the iteration's reads reach. ``write_slots`` replaces
+        ``write_virtual`` for a runner's own buffer (`bind_runner_slots`)."""
         return KVLocPlan(
             source=self,
             req_pool_indices=req_pool_indices,
@@ -219,14 +230,45 @@ class KVIndexTranslator:
             seq_lens_cpu=seq_lens_cpu,
             write_virtual=write_virtual,
             read_extent=read_extent,
+            write_slots=write_slots,
         )
 
+    def own_plan(self, forward_batch, *, runner_slots: bool = False) -> KVLocPlan:
+        """The plan of a forward that is its own iteration, from its own
+        fields: its ``out_cache_loc`` is the write window (virtual, or with
+        ``runner_slots`` a runner's own buffer), and its reads reach
+        `window_read_extent` past its lengths."""
+        write_ids = forward_batch.out_cache_loc
+        return self.plan(
+            req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
+            seq_lens=getattr(forward_batch, "seq_lens", None),
+            seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
+            write_virtual=None if runner_slots else write_ids,
+            write_slots=write_ids if runner_slots else None,
+            read_extent=window_read_extent(
+                getattr(forward_batch, "forward_mode", None),
+                getattr(forward_batch, "spec_info", None),
+                write_ids,
+                getattr(forward_batch, "batch_size", 0),
+            ),
+        )
+
+    def bind_runner_slots(self, forward_batch) -> None:
+        """Bind a batch a runner builds over its own buffers, to capture a
+        graph or to warm up with. Its write ids are the runner's buffer, used
+        as it is; its reads plan over the runner's own rows and lengths."""
+        self.own_plan(forward_batch, runner_slots=True).bind(forward_batch, self)
+
     def _swa_write_ids(
-        self, *, virtual: torch.Tensor, physical: torch.Tensor
+        self, *, virtual: Optional[torch.Tensor], physical: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """The sliding-window write ids of a plan's window: on the unified pool
         straight from the virtual ids through the swa side's own table; on a
-        static SWA pool through its full->swa table (virtual == physical)."""
+        static SWA pool through its full->swa table (virtual == physical).
+        A runner's own slots on the unified pool (no virtual ids) name the
+        sink, id 0 in the sliding-window space as in the full one."""
+        if virtual is None:
+            return torch.zeros_like(physical) if self.writes_sliding_window else None
         if self._swa_write_from_virtual is not None:
             return self._swa_write_from_virtual(virtual)
         if not self.is_translating and self._swa_write_loc_from_full is not None:
@@ -600,46 +642,7 @@ class KVIndexTranslator:
         reads it.
         """
         self._index_table_memo = None
-        self.plan(
-            req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
-            seq_lens=getattr(forward_batch, "seq_lens", None),
-            seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
-            write_virtual=forward_batch.out_cache_loc,
-        ).bind(forward_batch, self)
-
-    def fill_capture_write_loc(
-        self,
-        *,
-        out: torch.Tensor,
-        forward_batch,
-        width: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        """Translate this batch's WRITE loc straight into ``out``, a backend's
-        capture-stable buffer, and return the live ``[:n]`` view. One launch
-        fills the live prefix and clears the tail a shorter replay leaves;
-        None when this pool needs no translation.
-
-        Must run at metadata-init time: `out` is reused every step, so filling
-        it sooner would race a still-pending previous step under overlap
-        scheduling.
-        """
-        if not self.is_translating:
-            return None
-        virtual = forward_batch.out_cache_loc_virtual
-        if virtual is None:
-            loc = forward_batch.out_cache_loc
-            if loc is None:
-                return None
-            # The runner builds the capture batch outside `init_new`, so no
-            # rebind marked its virtual source; bake it holding sink ids.
-            width = int(loc.numel()) if width is None else int(width)
-            out[:width].zero_()
-            return out[: int(loc.numel())]
-        n = int(virtual.numel())
-        width = n if width is None else int(width)
-        buf = out[:width]
-        self._translate_write_full(virtual, out=buf, out_width=width)
-        return buf[:n]
+        self.own_plan(forward_batch).bind(forward_batch, self)
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]

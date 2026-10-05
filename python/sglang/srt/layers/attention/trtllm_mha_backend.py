@@ -1110,9 +1110,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                        self.kv_index_translator.sliding_window_write_loc_for(
-                            forward_batch.out_cache_loc
-                        )
+                        forward_batch.out_cache_loc_swa
                     )
 
     def _assert_ragged_verify_supported(self) -> None:
@@ -1300,11 +1298,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = (
-                self.kv_index_translator.sliding_window_write_loc_for(
-                    forward_batch.out_cache_loc
-                )
-            )
+            metadata.swa_out_cache_loc = forward_batch.out_cache_loc_swa
 
         self.forward_metadata = metadata
 
