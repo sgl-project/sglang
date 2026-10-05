@@ -8,7 +8,6 @@ __all__ = [
     "QSAIndexer",
     "QSAIndexerMetadata",
     "QSAProfile",
-    "QwenDSAIndexer",
     "build_qsa_indexer",
     "get_qsa_indexer_metadata",
     "is_qwen_qsa",
@@ -21,10 +20,6 @@ def __getattr__(name):
         from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
         return QSAIndexer
-    if name == "QwenDSAIndexer":
-        from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
-
-        return QwenDSAIndexer
     if name == "QSAIndexerMetadata":
         from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
 

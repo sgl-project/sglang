@@ -14,8 +14,9 @@ export const FluxDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
-          { id: 'a2', label: 'A2', default: false },
-          { id: 'a3', label: 'A3', default: false }
+          { id: 'a2', label: 'A2 Series', default: false },
+          { id: 'a3', label: 'A3 Series', default: false },
+          { id: 'arc_b', label: 'BMG', default: false },
         ]
       },
       version: {
@@ -51,11 +52,20 @@ export const FluxDeployment = () => {
       }
 
       if (hardware === 'a3') {
-        return `#One A3 card has 2 npu chips
+        return `#One A3 Series card has 2 npu chips
 sglang serve \\
   --tp-size 2 \\
   --model-path ${config.repoId} \\
   --num-gpus 2`;
+      }
+
+      if (hardware === 'arc_b') {
+        return `sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 4 \\
+  --tp-size 4 \\
+  --component-residency dit=resident,text_encoder=layerwise-offload \\
+  --dit-cpu-offload False`;
       }
 
       return `sglang serve \\
@@ -133,7 +143,7 @@ sglang serve \\
 
   useEffect(() => {
     const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
-    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+    const targetTabName = isAscend ? 'Ascend A3 Series' : 'NVIDIA B200';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
     allTabs.forEach((tab) => {
@@ -145,7 +155,17 @@ sglang serve \\
   }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (prev.hardware === 'arc_b' && optionName === 'version' && value === 'flux1-dev') {
+        return prev;
+      }
+
+      const nextValues = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b' && nextValues.version === 'flux1-dev') {
+        nextValues.version = 'flux2-dev';
+      }
+      return nextValues;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -322,7 +342,11 @@ sglang serve \\
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isArcBVersionLocked =
+                    values.hardware === 'arc_b' &&
+                    option.name === 'version' &&
+                    item.id === 'flux1-dev';
+                  const isDisabled = Boolean(item.disabled || isArcBVersionLocked);
 
                   return (
                     <label

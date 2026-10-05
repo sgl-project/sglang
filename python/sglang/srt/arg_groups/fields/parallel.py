@@ -1,11 +1,4 @@
-"""Config fields of the ``parallel`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``parallel`` bag, which is what ``get_parallel()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``parallel`` namespace."""
 
 from __future__ import annotations
 
@@ -80,8 +73,19 @@ class Parallel(msgspec.Struct):
     dp_size: A[
         int,
         Arg(
-            help="The data parallelism size.",
+            help="The number of data-parallel replicas of the model.",
             aliases=["--data-parallel-size"],
+            resolvable=True,
+        ),
+    ] = 1
+    attn_dp_size: A[
+        int,
+        Arg(
+            help="The attention data parallelism size: the number of "
+            "data-parallel attention groups inside the TP group, one scheduler "
+            "each, while the FFN stays tensor parallel.",
+            aliases=["--attention-data-parallel-size"],
+            resolvable=True,
         ),
     ] = 1
     load_balance_method: A[
@@ -166,14 +170,9 @@ class Parallel(msgspec.Struct):
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
     ] = False
-    # DP attention
-    enable_dp_attention: A[
-        bool,
-        Arg(
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
-            resolvable=True,
-        ),
-    ] = False
+    # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
+    # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
+    enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
@@ -191,7 +190,7 @@ class Parallel(msgspec.Struct):
             help="Use all-to-all instead of TP all-gather followed by DP scatter "
             "for the TP-sharded LM head under DP attention. By default this is "
             "enabled only on decode-only PD nodes with pure DP attention "
-            "(tp_size == dp_size > 1 and attn_cp_size == 1), and disabled on "
+            "(tp_size == attn_dp_size > 1 and attn_cp_size == 1), and disabled on "
             "prefill-only and colocated nodes. Pass "
             "--no-enable-tp-lm-head-all-to-all to opt out. The path is "
             "incompatible with --enable-dp-lm-head; batches without an equal "
@@ -202,12 +201,21 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_attn_tp_input_scattered: A[
         bool,
-        "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        Arg(
+            help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+            resolvable=True,
+        ),
     ] = False
     enable_shared_experts_attn_tp: A[
         bool,
         "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
     ] = False
+    shared_experts_tp_size: A[
+        Optional[int],
+        "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
+        "backend. Must divide attention TP size. Overrides "
+        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+    ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
@@ -274,27 +282,24 @@ class Parallel(msgspec.Struct):
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
 
-    # ---- derived: the quotients of the leaves above -------------------------
-    #
-    # Declared here, beside what they are computed from, because a namespace is
-    # one file and one class. They are not annotated, so they are not dataclass
-    # fields and `collect_input_fields` does not put them on the record -- which
-    # is right: a quotient has no operator input to preserve, and the record is
-    # what crosses a process boundary, so a width put there would be a stale
-    # copy the moment an elastic scale-up restamps one. Every input is a leaf
-    # above, so all six are fixed once the configuration is: `publish` computes
-    # them through `parallel_widths_of` and stores them as ordinary bag leaves,
-    # and `ParallelContext` answers with the stamp when a scale-up has moved
-    # one.
+    # Derived fields are computed at publication and are not stored in ServerArgs.
     attn_tp_size = Derived(
         fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
     )
-    attn_dp_size = Derived(
-        fn="sglang.srt.runtime_context.attn_dp_size_of",
-        doc="Attention data-parallel width: `dp_size` when DP attention is "
-        "on, otherwise one.",
+    attn_dp_enabled = Derived(
+        fn="sglang.srt.runtime_context.attn_dp_enabled_of",
+        doc="Whether attention runs data parallel: `attn_dp_size` is wider "
+        "than one, or this process is an elastic EP scale joiner, which joins "
+        "an attention-DP deployment with a group of its own that may be one "
+        "rank wide.",
+    )
+    num_dp_ranks = Derived(
+        fn="sglang.srt.runtime_context.num_dp_ranks_of",
+        doc="How many data-parallel ranks the deployment serves with, one "
+        "scheduler each: `dp_size * attn_dp_size`. Elastic EP scale-up widens "
+        "it as ranks join.",
     )
     attn_dcp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dcp_size_of",
@@ -314,3 +319,67 @@ class Parallel(msgspec.Struct):
         doc="Whether decode context parallelism is in play: `dcp_size` is "
         "wider than one rank, which is exactly when the group gets built.",
     )
+
+    # Runtime fields: publish sets ranks; distributed initialization sets groups.
+    tp_rank = Derived(doc="This process's place in the tensor-parallel group.")
+    pp_rank = Derived(doc="This process's place in the pipeline group.")
+    moe_ep_rank = Derived(doc="This process's place in the expert-parallel group.")
+    moe_dp_rank = Derived(doc=("This process's place in the MoE data-parallel group."))
+    moe_tp_rank = Derived(
+        doc=("This process's place in the MoE tensor-parallel group.")
+    )
+    attn_tp_rank = Derived(
+        doc=("This process's place in the attention tensor-parallel group.")
+    )
+    attn_cp_rank = Derived(
+        doc=("This process's place in the attention context-parallel group.")
+    )
+    dcp_rank = Derived(
+        doc=("This process's place in the decode context-parallel group.")
+    )
+    attn_dcp_rank = Derived(
+        doc=(
+            "Decode context-parallel rank inside the attention TP group, "
+            "zero where decode context parallelism is off."
+        )
+    )
+    attn_dp_rank = Derived(
+        doc=(
+            "This process's index in the attention-DP group, computed from "
+            "`tp_rank` when `initialize_dp_attention` runs."
+        )
+    )
+    dp_rank = Derived(
+        doc=(
+            "Which data-parallel replica this process serves, as the data "
+            "parallel controller numbered them at spawn. `None` when there "
+            "is no controller: unlike the other ranks it is a position in "
+            "no group, which is why the spawn states it."
+        )
+    )
+    launch_world_rank = Derived(
+        doc=(
+            "This process's rank in the WORLD group as built. A scale-up "
+            "does not renumber it."
+        )
+    )
+    launch_world_size = Derived(
+        fn="sglang.srt.runtime_context.launch_world_size_of",
+        doc="Width the WORLD group was built at -- what a scale-up leaves "
+        "behind rather than updates.",
+    )
+    max_world_size = Derived(
+        fn="sglang.srt.runtime_context.max_world_size_of",
+        doc="Ranks the WORLD group has room for: `--max-ep-size` when set, "
+        "otherwise the launch width.",
+    )
+    world_group = Derived(doc="The WORLD group.")
+    tp_group = Derived(doc="The tensor-parallel group.")
+    pp_group = Derived(doc="The pipeline group.")
+    moe_ep_group = Derived(doc="The expert-parallel group.")
+    moe_dp_group = Derived(doc="The MoE data-parallel group.")
+    moe_tp_group = Derived(doc="The MoE tensor-parallel group.")
+    attn_tp_group = Derived(doc="The attention tensor-parallel group.")
+    attn_cp_group = Derived(doc="The attention context-parallel group.")
+    shared_experts_tp_group = Derived(doc=("The shared-expert tensor-parallel group."))
+    dcp_group = Derived(doc="The decode context-parallel group.")

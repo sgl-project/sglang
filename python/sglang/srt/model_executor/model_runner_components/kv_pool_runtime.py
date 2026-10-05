@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
@@ -17,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_mm,
+    get_parallel,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
@@ -43,6 +43,7 @@ class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     full_max_total_num_tokens: Optional[int]
     swa_max_total_num_tokens: Optional[int]
+    unified_memory_pool_bytes: Optional[int]
     capped_max_running_requests: Optional[int]
 
 
@@ -59,8 +60,8 @@ def compute_post_capture_kv_resize(
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_world_group().world_size > 1,
-        cpu_group=get_world_group().cpu_group,
+        distributed=get_parallel().launch_world_size > 1,
+        cpu_group=get_parallel().world_group.cpu_group,
     )
     headroom_gb = model_runner.pre_model_load_memory * (
         1 - model_runner.mem_fraction_static
@@ -169,5 +170,6 @@ def compute_post_capture_kv_resize(
         max_total_num_tokens=config.max_total_num_tokens,
         full_max_total_num_tokens=config.full_max_total_num_tokens,
         swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        unified_memory_pool_bytes=config.unified_memory_pool_bytes,
         capped_max_running_requests=capped_max_running_requests,
     )
