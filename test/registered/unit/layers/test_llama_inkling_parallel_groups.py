@@ -9,9 +9,10 @@ import torch.nn.functional as F
 
 from sglang.srt.models.inkling_common import dense_mlp
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -109,7 +110,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                                 "attn_tp": (1, 2),
                                 "replicated": (0, 1),
                             }[expected_group]
-                            with get_parallel().override(
+                            with parallel_scope(
                                 tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
                             ):
                                 a, b = load_projection(up), load_projection(down)
@@ -129,9 +130,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                             tp.all_reduce.reset_mock()
                             attn.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=False,
@@ -190,7 +189,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
             module.act_fn.forward = function._torchdynamo_orig_callable
             module.scattered_sconv = True
             with (
-                get_parallel().override(tp_group=Mock()),
+                parallel_scope(tp_group=Mock()),
                 patch(
                     "sglang.srt.layers.linear.use_symmetric_memory",
                     return_value=nullcontext(),

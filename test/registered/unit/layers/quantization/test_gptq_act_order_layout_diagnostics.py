@@ -12,9 +12,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
 from sglang.srt.layers.quantization.gptq.schemes.gptq_linear import GPTQXPULinearScheme
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
@@ -23,7 +24,7 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 def loading_scope(changed):
     if not changed:
         return nullcontext()
-    return get_parallel().override(
+    return parallel_scope(
         tp_size=1,
         tp_rank=0,
         tp_group=None,

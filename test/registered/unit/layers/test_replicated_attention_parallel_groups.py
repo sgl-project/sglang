@@ -9,9 +9,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers import linear
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -78,7 +79,7 @@ def values(rows, columns, layer, offset=0):
 
 def load_projection(layer):
     rank, size = layer.tp_rank, layer.tp_size
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, linear.QKVParallelLinear):
             shards = []
             for i, name in enumerate(("q", "k", "v")):
@@ -157,9 +158,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                                 x = values(2, shard.shape[1], layer, 7)
                                 tp, attn = Mock(), Mock()
                                 with (
-                                    get_parallel().override(
-                                        tp_group=tp, attn_tp_group=attn
-                                    ),
+                                    parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
                                         "use_symmetric_memory",

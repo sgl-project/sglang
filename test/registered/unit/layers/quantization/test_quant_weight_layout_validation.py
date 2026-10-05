@@ -26,9 +26,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -82,7 +83,7 @@ def quant_config(kind, block=(128, 128)):
 def loading_scope(changed):
     if not changed:
         return nullcontext()
-    return get_parallel().override(
+    return parallel_scope(
         tp_size=1,
         tp_rank=0,
         tp_group=None,

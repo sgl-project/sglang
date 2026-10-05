@@ -9,9 +9,10 @@ import torch
 
 from sglang.srt.layers.linear import ReplicatedParallelGroup
 from sglang.srt.model_loader import weight_utils
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -30,9 +31,7 @@ def values(shape, *, device="cpu", dtype=torch.float32, offset=0):
 
 def loading_scope(changed):
     return (
-        get_parallel().override(
-            tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0
-        )
+        parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0)
         if changed
         else nullcontext()
     )
@@ -184,7 +183,7 @@ class TestShardedLoaderParallelGroups(CustomTestCase):
         loader = weight_utils.sharded_weight_loader(0, parallel_group="tp")
         param = torch.nn.Parameter(torch.full((3,), -1.0), requires_grad=False)
         with (
-            get_parallel().override(
+            parallel_scope(
                 tp_size=1,
                 tp_rank=0,
                 tp_group=None,
