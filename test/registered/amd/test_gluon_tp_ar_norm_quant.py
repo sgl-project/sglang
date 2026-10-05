@@ -150,10 +150,56 @@ def reference(x_local, residual, weight, group_size=128):
     return q.view(-1, HIDDEN), scales, residual_out, normed_bf16
 
 
+def _stress_multi_cta(state, weight, device, rank, rounds: int):
+    """Hammer the multi-CTA shapes back-to-back while the CUs are contended.
+
+    M>=16 launches NCTA = 16..32 workgroups that must all agree on one epoch.
+    If a CTA can observe a word-2 value from a neighbouring epoch, the elected
+    CTA waits on a target no peer will ever signal and the rank hangs. The race
+    needs the CTAs of one launch to be spread over time, so a background stream
+    is kept busy to deny them simultaneous residency, and the shapes are issued
+    back-to-back so consecutive epochs overlap in flight.
+    """
+    pressure = torch.cuda.Stream()
+    hog_a = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+    hog_b = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+    shapes = [m for m in G.SUPPORTED_M if m >= 16]
+    ok = True
+    for r in range(rounds):
+        with torch.cuda.stream(pressure):
+            for _ in range(8):
+                hog_a = torch.mm(hog_a, hog_b)
+        for m in shapes:
+            x = (torch.randn(m, HIDDEN, device=device) * 0.5).to(torch.bfloat16)
+            residual = (torch.randn(m, HIDDEN, device=device) * 0.5).to(torch.bfloat16)
+            dist.broadcast(residual, src=0)
+            ref_q, ref_s, ref_r, _ = reference(x, residual, weight)
+            # No barrier between shapes: consecutive epochs must stay in flight.
+            q, s, res, _ = G.fused_tp_ar_add_gemma_rmsnorm_group_fp8_quant(
+                state, x, residual, weight
+            )
+            if r == rounds - 1:
+                dq = (q.to(torch.float32) - ref_q).abs().max().item()
+                dr = (
+                    (res.to(torch.float32) - ref_r.to(torch.float32)).abs().max().item()
+                )
+                if not (dq <= 1.001 and dr <= 3e-2):
+                    ok = False
+                    if rank == 0:
+                        print(f"  stress M={m}: MISMATCH dq={dq} dr={dr}")
+    torch.cuda.current_stream().wait_stream(pressure)
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 0:
+        print(f"  stress: {rounds} rounds x {shapes} completed, no hang")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--stress-rounds", type=int, default=60)
     args = ap.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -202,6 +248,9 @@ def main():
                 f"M={m:3d}  dq={dq:8.4f} ds={ds:10.3e} dres={dr:8.4f} dnorm={dn:8.4f}"
                 f"  {'OK' if good else 'MISMATCH'}"
             )
+
+    if ok:
+        ok = _stress_multi_cta(state, weight, device, rank, rounds=args.stress_rounds)
 
     if args.bench and ok:
         if rank == 0:

@@ -1,5 +1,6 @@
 import enum
 import logging
+from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -121,11 +122,18 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
     """MoE block that can consume the fused AR+norm+quant tuple.
 
-    With ``Fp8Input.TUPLE_AND_BF16`` declared on the FFN stage, the boundary
-    hands down ``(bf16, fp8, scale)``. Only the shared expert's FP8
-    ``gate_up_proj`` consumes ``(fp8, scale)``; the router gate, the
-    shared-expert gate and the MoE runner all stay on bf16. Subclassing keeps
-    ``qwen2_moe.py``, which several models share, byte-identical to upstream.
+    With ``Fp8Input.TUPLE_AND_BF16`` declared on the FFN stage the boundary
+    hands down ``(bf16, fp8, scale)``. Where the fp8 goes depends on whether
+    the shared expert was fused into the routed experts:
+
+      * fusion off -- the separate shared expert's FP8 ``gate_up_proj`` takes
+        ``(fp8, scale)``;
+      * fusion on  -- the routed experts take it via ``pre_quant_input``,
+        which covers every expert rather than just the shared one.
+
+    The router gate, the shared-expert gate and the MoE's own bf16 inputs are
+    untouched. Subclassing keeps ``qwen2_moe.py``, shared by several models,
+    byte-identical to upstream.
     """
 
     def forward(
@@ -139,36 +147,84 @@ class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
 
         hs_bf16, hs_fp8, hs_scale = hidden_states
         shared = getattr(self, "shared_expert", None)
-        if shared is None or not _linear_accepts_fp8_tuple(
-            getattr(shared, "gate_up_proj", None)
-        ):
-            # Nothing downstream can take the fp8; drop it rather than requantize.
+        restore = []
+
+        if shared is not None:
+            if not _linear_accepts_fp8_tuple(getattr(shared, "gate_up_proj", None)):
+                return super().forward(hs_bf16, forward_batch, defer_finalize)
+            original = self._forward_shared_experts
+
+            def shared_with_fp8(hidden, apply_gate: bool = True):
+                # Gates stay on bf16; only the FP8 projection sees (fp8, scale).
+                shared_output = self.shared_expert((hs_fp8, hs_scale))
+                if self.shared_expert_gate is not None and apply_gate:
+                    shared_output = (
+                        torch.sigmoid(self.shared_expert_gate(hidden)) * shared_output
+                    )
+                return shared_output
+
+            self._forward_shared_experts = shared_with_fp8
+            restore.append(("_forward_shared_experts", original))
+        elif _routed_experts_accept_pre_quant(self):
+            # The runner declines the hand-off (wrong quant layout, router
+            # weights pre-applied) by ignoring pre_quant_input, so this is safe
+            # to offer unconditionally once the backend is known to read it.
+            experts = self.experts
+            for name in ("forward", "forward_deferred_finalize"):
+                bound = getattr(experts, name, None)
+                if bound is None:
+                    continue
+                restore.append((name, bound, experts))
+                setattr(
+                    experts,
+                    name,
+                    partial(bound, pre_quant_input=(hs_fp8, hs_scale)),
+                )
+        else:
             return super().forward(hs_bf16, forward_batch, defer_finalize)
 
-        original = self._forward_shared_experts
-
-        def shared_with_fp8(hidden, apply_gate: bool = True):
-            # Gates stay on bf16; only the FP8 projection sees (fp8, scale).
-            shared_output = self.shared_expert((hs_fp8, hs_scale))
-            if self.shared_expert_gate is not None and apply_gate:
-                shared_output = (
-                    torch.sigmoid(self.shared_expert_gate(hidden)) * shared_output
-                )
-            return shared_output
-
-        self._forward_shared_experts = shared_with_fp8
         try:
             return super().forward(hs_bf16, forward_batch, defer_finalize)
         finally:
-            self._forward_shared_experts = original
+            for entry in restore:
+                if len(entry) == 2:
+                    setattr(self, entry[0], entry[1])
+                else:
+                    setattr(entry[2], entry[0], entry[1])
+
+
+def _routed_experts_accept_pre_quant(mlp) -> bool:
+    """Whether the routed-expert runner can take caller-quantized activations.
+
+    Always False for now. The plumbing works -- FusedMoE.pre_quant_input reaches
+    the runner and the aiter standard pre-permute can forward it -- but aiter's
+    heuristic then selects an asm kernel that this gfx950 build does not carry:
+
+        fmoe_fp8_blockscale_g1u1 failed: get_heuristic_kernel not find kernel
+        gfx950_..._fmoe_bf16_blockscaleBf16_g1u1_vs_pf2_silu_16x128
+
+    aiter's own mori path carries an upscale fallback for exactly this class of
+    gap. Until a build ships that kernel, declining keeps the fp8 unproduced
+    rather than produced and discarded, which measured as a net regression.
+    """
+    return False
 
 
 def _moe_accepts_fp8_tuple(mlp) -> bool:
-    """True when this MLP is the subclass that unpacks (bf16, fp8, scale)."""
+    """True when this MLP can consume (bf16, fp8, scale) somewhere downstream.
+
+    Two shapes, depending on shared-expert fusion:
+      * fusion off -- a separate ``shared_expert`` whose FP8 ``gate_up_proj``
+        takes ``(fp8, scale)`` directly;
+      * fusion on  -- no separate shared expert, so the fp8 goes to the routed
+        experts via ``pre_quant_input``.
+    """
+    if not isinstance(mlp, Qwen3NextSparseMoeBlock):
+        return False
     shared = getattr(mlp, "shared_expert", None)
-    return isinstance(mlp, Qwen3NextSparseMoeBlock) and _linear_accepts_fp8_tuple(
-        getattr(shared, "gate_up_proj", None)
-    )
+    if shared is not None:
+        return _linear_accepts_fp8_tuple(getattr(shared, "gate_up_proj", None))
+    return _routed_experts_accept_pre_quant(mlp)
 
 
 class Qwen3GatedDeltaNet(nn.Module):

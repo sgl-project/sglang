@@ -193,68 +193,6 @@ def _finish(local, target, last):
 
 
 @gluon.jit
-def _finish_late(local, target, thread, step: gl.constexpr):
-    gl.inline_asm_elementwise(
-        """
-        v_cmp_eq_u32 vcc, 0, $6
-        s_and_saveexec_b64 $0, vcc
-        s_cbranch_execz 3f
-        global_atomic_add $1, $3, $4, off offset:8 sc0
-        s_waitcnt vmcnt(0)
-        v_add_u32 $1, $4, $1
-        v_mul_lo_u32 $1, 3, $1
-        v_cmp_eq_u32 vcc, $1, $5
-        s_cbranch_vccz 3f
-        2:
-        global_load_dword $2, $3, off offset:4 sc1
-        s_waitcnt vmcnt(0)
-        v_sub_u32 $2, $2, $5
-        v_cmp_ge_i32 vcc, $2, 0
-        s_cbranch_vccz 2b
-        3:
-        s_or_saveexec_b64 $0, $0
-        """,
-        "=&s,=&v,=&v,v,v,v,v,~{vcc},~{scc},~{memory}",
-        [local, step, target, thread],
-        dtype=(gl.uint64, gl.uint32, gl.uint32),
-        is_pure=False,
-        pack=1,
-    )
-
-
-# Only the final CTA polls. Earlier CTAs remain free to retire on a single CU.
-@gluon.jit
-def _finish_uniform_late(local, target, thread, step: gl.constexpr):
-    gl.inline_asm_elementwise(
-        """
-        v_cmp_eq_u32 vcc, 0, $6
-        s_and_saveexec_b64 $0, vcc
-        s_cbranch_execz 3f
-        global_atomic_add $1, $3, $4, off offset:8 sc0
-        s_waitcnt vmcnt(0)
-        v_add_u32 $1, $4, $1
-        v_mul_lo_u32 $1, 3, $1
-        v_cmp_eq_u32 vcc, $1, $5
-        s_cbranch_vccz 3f
-        v_readfirstlane_b32 s0, $5
-        2:
-        s_load_dword $2, $7, 0x4 glc
-        s_waitcnt lgkmcnt(0)
-        s_sub_u32 $2, $2, s0
-        s_cmp_ge_i32 $2, 0
-        s_cbranch_scc0 2b
-        3:
-        s_or_saveexec_b64 $0, $0
-        """,
-        "=&s,=&v,=&s,v,v,v,v,s,~{s0},~{vcc},~{scc},~{memory}",
-        [local, step, target, thread, local.to(gl.uint64)],
-        dtype=(gl.uint64, gl.uint32, gl.uint32),
-        is_pure=False,
-        pack=1,
-    )
-
-
-@gluon.jit
 def _load_pointer(table):
     return gl.inline_asm_elementwise(
         "s_load_dwordx2 $0, $1, 0x0\n s_waitcnt lgkmcnt(0)",
@@ -336,7 +274,11 @@ def _fused(
 ):
     PAIR: gl.constexpr = M == 64
     NCTA: gl.constexpr = M // 2 if PAIR else M
-    TICKET: gl.constexpr = M >= 2 and M <= 8
+    # Every multi-CTA shape reserves its epoch atomically. Sampling word 2
+    # with a plain load instead (as M>=16 used to) races the finish-time
+    # writes: a CTA can observe a counter from a neighbouring epoch and
+    # wait on a target that is never signalled.
+    TICKET: gl.constexpr = M >= 2
     NW: gl.constexpr = 16 if PAIR else 8
     pid = gl.program_id(0)
     if TICKET:
@@ -479,12 +421,7 @@ def _fused(
             scales,
             M <= 2 or M == 16,
         )
-    if M <= 8:
-        _finish(local, target, last)
-    elif M == 16 or M == 32:
-        _finish_uniform_late(local, target, thread, 128 // NCTA)
-    else:
-        _finish_late(local, target, thread, 128 // NCTA)
+    _finish(local, target, last)
 
 
 def tp4_allreduce_add_gemma_rmsnorm_group_fp8_quant_gluon(

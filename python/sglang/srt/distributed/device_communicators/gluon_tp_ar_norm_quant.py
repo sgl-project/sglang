@@ -52,7 +52,10 @@ _is_hip = is_hip()
 TP_SIZE = 4
 HIDDEN_SIZE = 2048
 EPS = 1.0e-6
-SUPPORTED_M = (1, 2, 4, 8, 16, 32, 64)
+# Tuned decode shapes. Above M=16 aiter's allreduce_fusion_kernel_1stage_per_group
+# is faster than this kernel (measured -0.1% at M=32, -2.0% at M=64), so those
+# shapes are declined and the caller keeps the existing path.
+SUPPORTED_M = (1, 2, 4, 8, 16)
 GROUP_SIZE = 128
 # Words 0/1 count arrivals / completed reads; word 2 is local CTA progress;
 # word 3 is unused. They must start at zero and persist across calls.
