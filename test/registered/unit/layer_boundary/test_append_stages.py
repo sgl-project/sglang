@@ -19,6 +19,8 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary import prepare as boundary_prepare
+from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_gather_input,
     keep_output,
@@ -395,6 +397,34 @@ class TestPipelineHandoff(CustomTestCase):
         self.assertIs(batch.residual_stream.pending.value, hidden)
         with self.assertRaises(KeyError):
             attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
+
+
+class TestDenseFfnOverAttentionTp(CustomTestCase):
+    """A dense FFN sharded over attention TP under attention DP computes on
+    the attention's rows and sums over attention TP, with no DP move."""
+
+    def test_the_ffn_stays_on_the_attention_rows(self):
+        parallel = fixture.parallel_of(attn_dp=2, attn_tp=2)
+        with fixture.planning(parallel, boundary_reduction="ar"), layer_stack():
+            stages = [
+                stage
+                for _ in range(2)
+                for stage in append_stages(
+                    (declare_attn(), fixture.Norm()),
+                    (declare_ffn(dense_tp_size=2), fixture.Norm()),
+                )
+            ]
+        for ffn in stages[1::2]:
+            path = ffn.plan.paths[BatchVariant.ORDINARY]
+            # The attention's sum completes on this rank's rows, ungathered.
+            self.assertIs(
+                path.entry.prepare.keywords["step"].func,
+                boundary_prepare._reduce_update_read,
+            )
+            self.assertEqual(path.output.layout.sharded, {TokenAxis.ATTN_DP})
+            self.assertIs(path.output.group, SumGroup.ATTN_TP)
+            self.assertFalse(path.returns_over_dp)
+            self.assertIs(path.output_move, keep_output)
 
 
 if __name__ == "__main__":
