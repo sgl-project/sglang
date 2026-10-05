@@ -23,11 +23,11 @@ unused_qualifications = "warn"
 
 [dependencies]
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
-dynamo-tokenizers = "=1.8.1"
+dynamo-tokenizers = "=3.0.0"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=5.2.0"
+dynamo-renderer = "=7.0.0"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
