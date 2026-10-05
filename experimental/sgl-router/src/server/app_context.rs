@@ -11,7 +11,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::{BlockSizeOracle, KvIndexMetrics};
+use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
@@ -38,6 +38,16 @@ pub enum ChatRouting {
     Reorg(HashMap<ModelId, BucketResolver>),
 }
 
+impl ChatRouting {
+    /// Whether the built routing reads request tokens; `legacy` holds the legacy policies.
+    pub fn needs_request_tokens(&self, legacy: &PolicyRegistry) -> bool {
+        match self {
+            Self::Legacy => legacy.needs_request_tokens(),
+            Self::Reorg(resolvers) => resolvers.values().any(BucketResolver::needs_request_tokens),
+        }
+    }
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -60,6 +70,8 @@ pub struct AppContext {
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
+    /// Local KV tree for `--dp-aware` rank selection, under any policy.
+    pub dp_rank_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
@@ -70,6 +82,9 @@ pub struct AppContext {
     /// is actually waiting on during the drain — `router_inflight_load` sees only the
     /// proxied subset.
     pub inflight_http: Arc<InflightHttp>,
+    /// The local KV-event index; `None` in metadata-only mode, which makes
+    /// `/internal/kv_snapshot` a 404. See [`KvEventIndex::snapshot_source`].
+    pub kv_index: Option<Arc<KvEventIndex>>,
     readiness: AtomicU8,
 }
 
@@ -125,12 +140,23 @@ impl AppContext {
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
+    }
+
+    /// Readiness conditions 3 and 4, via
+    /// [`BootstrapTracker::admit_ready`](crate::state::kv_events::BootstrapTracker::admit_ready).
+    /// Always true when this router holds no KV index.
+    pub fn kv_bootstrap_admit_ready(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().admit_ready())
     }
 
     /// Report bootstrap as finished, unless the pod has already begun draining.
@@ -184,10 +210,12 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
+                    tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
+                    dp_aware: false,
                     bucket_config: None,
                     circuit_breaker: None,
                     cache_aware: None,
@@ -216,8 +244,10 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
