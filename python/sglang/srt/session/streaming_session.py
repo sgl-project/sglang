@@ -184,8 +184,7 @@ class StreamingSession:
     def take(self, req: Req) -> None:
         """A streaming turn's first row allocation: the session takes the
         request's record and the tree lock it took at admission, and the
-        request borrows them from here on. A turn already on a slot's record
-        has nothing to hand over."""
+        request borrows them from here on."""
         if not _is_streaming(req) or self.borrowed_slot(req) is not None:
             return
         session_id = req.session.session_id

@@ -11289,10 +11289,9 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
 
 
 class TestStreamingSessionLockLifecycle(CustomTestCase):
-    """A streaming session owns its record and the tree lock on its prefix from
-    the first turn's row allocation: the slot publishes the first prompt, keeps
-    the lock across turns, releases its SWA part once, and hands both back to
-    an aborted turn, all without leaving a lock unbalanced."""
+    """A streaming session owns its record and the tree lock on its prefix
+    from the first turn's row allocation; every move of that lock keeps the
+    tree's lock counts balanced."""
 
     cfg = CacheConfig(
         page_size=1,

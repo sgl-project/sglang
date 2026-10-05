@@ -517,9 +517,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             self.dec_lock_ref(req.last_node)
 
     def maybe_hand_to_session(self, req: Req) -> None:
-        """The request's KV row was just allocated. A cache that keeps a record
-        across requests (a streaming session) takes it here with the request's
-        tree lock; the request runs on it as a borrower."""
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
 
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
