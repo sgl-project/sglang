@@ -820,7 +820,9 @@ def _linear(sp_env, bias=None, quantized=False):
     return linear
 
 
-def _sp_kernels(*, prepare_ok=True, ag_ok=True, prepare_raises=False):
+def _sp_kernels(
+    *, prepare_ok=True, ag_ok=True, prepare_raises=False, raise_type=NotImplementedError
+):
     supports_ag = mock.Mock(return_value=ag_ok)
     supports_prepare = mock.Mock(return_value=prepare_ok)
     ag = mock.Mock(
@@ -832,7 +834,7 @@ def _sp_kernels(*, prepare_ok=True, ag_ok=True, prepare_raises=False):
 
     def _prepare(inp, w, group):
         if prepare_raises:
-            raise NotImplementedError("no packed-QKV row")
+            raise raise_type("no packed-QKV row")
         launcher = mock.Mock(
             side_effect=lambda x: torch.full(
                 (x.shape[0] * TP, w.shape[1]), 2.0, dtype=x.dtype
@@ -922,6 +924,72 @@ def test_sp_route_on_rejected_falls_back_and_logs_once(sp_env, caplog):
     assert torch.all(out == 1.0)
     assert caplog.text.count("[cake-route] sp_all_gather_matmul: fallback") == 1
     assert "adapter admission rejected" in caplog.text
+
+
+def test_sp_prepare_valueerror_is_a_refusal_not_a_crash(sp_env, caplog):
+    # FlashInfer validates the host contract (symmetric-memory backend, K/N,
+    # world size) with ValueError; the route must fall back, not raise.
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, _ = _sp_kernels(prepare_raises=True, ag_ok=False, raise_type=ValueError)
+    _, _, ag, prepare = kernels
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+    assert prepare.call_count == 1 and ag.call_count == 0
+    assert linear.quant_method.apply.call_count == 2
+    assert torch.all(out == 1.0)
+    assert caplog.text.count("[cake-route] sp_all_gather_matmul: fallback") == 1
+    assert "FlashInfer refused to prepare" in caplog.text
+
+
+def _fake_symm_mem(*, backend="CUDA", available=True, set_raises=None):
+    state = {"backend": backend}
+
+    def _set(name):
+        if set_raises is not None:
+            raise set_raises
+        state["backend"] = name
+
+    return SimpleNamespace(
+        get_backend=lambda device: state["backend"],
+        is_nvshmem_available=lambda: available,
+        set_backend=mock.Mock(side_effect=_set),
+        state=state,
+    )
+
+
+@pytest.mark.parametrize(
+    "fake, expected, text",
+    [
+        (_fake_symm_mem(backend="CUDA"), True, "set to NVSHMEM"),
+        (_fake_symm_mem(backend="NVSHMEM"), True, ""),
+        (_fake_symm_mem(available=False), False, "unavailable"),
+        (
+            _fake_symm_mem(set_raises=RuntimeError("already allocated")),
+            False,
+            "cannot select the NVSHMEM",
+        ),
+    ],
+)
+def test_sp_symm_mem_backend_selection(sp_env, caplog, fake, expected, text):
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    sp_mod.reset_cake_sp_state_for_tests()
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        mock.patch.object(sp_mod, "_symm_mem_module", lambda: fake),
+        mock.patch.object(torch.cuda, "current_device", lambda: 0),
+    ):
+        assert sp_mod.select_cake_sp_symm_mem_backend() is expected
+    assert (fake.state["backend"] == "NVSHMEM") is expected
+    assert sp_mod._cake_sp_nvshmem_backend is expected
+    if expected:
+        # torch's fused symm-mem ops cannot allocate under NVSHMEM: stock fused
+        # path off for the process, plain gather/scatter + matmul instead.
+        assert sp_mod.sp_fused_matmul_eligible(_linear(sp_env)) is False
+    sp_mod.reset_cake_sp_state_for_tests()
+    assert text in caplog.text
 
 
 def test_sp_prepare_refusal_falls_back_and_is_cached(sp_env):

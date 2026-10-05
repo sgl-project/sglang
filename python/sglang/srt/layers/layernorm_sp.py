@@ -86,6 +86,67 @@ def initialize_layernorm_sp(*, model_config) -> None:
     )
 
 
+def _symm_mem_module():
+    """``torch.distributed._symmetric_memory`` (indirection for tests)."""
+    import importlib
+
+    return importlib.import_module("torch.distributed._symmetric_memory")
+
+
+def select_cake_sp_symm_mem_backend() -> bool:
+    """Choose torch's NVSHMEM symmetric-memory backend for the Cake route.
+
+    FlashInfer's push-wait all-gather matmul allocates its flags and scratch
+    through ``torch.distributed._symmetric_memory`` and refuses any backend but
+    NVSHMEM. The backend is process-global and cannot change once the allocator
+    has been used (an allocation, or even a backend query resolves it), so it is
+    selected here right after distributed setup, before any query. sglang's own
+    all-reduce buffers do not go through torch symmetric memory unless the
+    torch-symm-mem all-reduce is enabled; when the switch is refused the route
+    falls back to the stock path on every call (the adapter admission checks
+    the backend). Called from ``distributed.bootstrap.init_parallel_runtime``
+    right after the device is selected. Returns whether NVSHMEM is now the
+    backend.
+    """
+    global _cake_sp_nvshmem_backend
+    try:
+        symm_mem = _symm_mem_module()
+    except ImportError as error:
+        _log_cake_sp_once("fallback", f"torch symmetric memory unavailable ({error})")
+        return False
+    available = getattr(symm_mem, "is_nvshmem_available", lambda: False)()
+    if not available:
+        _log_cake_sp_once(
+            "fallback", "NVSHMEM symmetric-memory backend unavailable in this torch"
+        )
+        return False
+    try:
+        symm_mem.set_backend("NVSHMEM")
+    except Exception as error:  # noqa: BLE001 - allocator already in use
+        device = torch.device("cuda", torch.cuda.current_device())
+        try:
+            current = str(symm_mem.get_backend(device))
+        except Exception:  # noqa: BLE001
+            current = "unknown"
+        if current.upper() == "NVSHMEM":
+            _cake_sp_nvshmem_backend = True
+            return True
+        _log_cake_sp_once(
+            "fallback",
+            f"cannot select the NVSHMEM symmetric-memory backend ({error}); "
+            f"torch backend stays {current}",
+        )
+        return False
+    _cake_sp_nvshmem_backend = True
+    logger.info(
+        "%s %s: torch symmetric-memory backend set to NVSHMEM "
+        "(torch fused symm-mem SP ops disabled for this process)",
+        _CAKE_LOG_PREFIX,
+        CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+    )
+    return True
+
+
 def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
@@ -207,6 +268,8 @@ def sp_fused_matmul_eligible(linear) -> bool:
     case the fused ops support). Depends only on static layer properties, so the
     decision is identical across TP ranks.
     """
+    if _cake_sp_nvshmem_backend:
+        return False
     if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -237,6 +300,12 @@ _CAKE_LOG_PREFIX = "[cake-route]"
 _CAKE_SP_MAX_LAUNCHERS_PER_WEIGHT = 8
 
 _cake_sp_logged: set[tuple[str, str]] = set()
+# True once select_cake_sp_symm_mem_backend() made NVSHMEM the torch
+# symmetric-memory backend. torch's own fused symm-mem ops
+# (fused_all_gather_matmul / fused_matmul_reduce_scatter) allocate their
+# workspace with a group name, which the NVSHMEM allocator rejects, so the
+# stock fused fast path is disabled for the whole process in that case.
+_cake_sp_nvshmem_backend = False
 _cake_sp_rejected: set[tuple] = set()
 # id(linear) -> (weight storage key, K-major weight copy)
 _cake_sp_weights: dict[int, tuple[tuple, torch.Tensor]] = {}
@@ -272,6 +341,8 @@ def _log_cake_sp_once(event: str, detail: str) -> None:
 
 
 def reset_cake_sp_state_for_tests() -> None:
+    global _cake_sp_nvshmem_backend
+    _cake_sp_nvshmem_backend = False
     _cake_sp_logged.clear()
     _cake_sp_rejected.clear()
     _cake_sp_weights.clear()
@@ -452,7 +523,7 @@ def cake_column_parallel_g_matmul(
             if prepared_here < _CAKE_SP_MAX_LAUNCHERS_PER_WEIGHT:
                 try:
                     launcher = prepare(input_parallel, w_kn, group)
-                except NotImplementedError as error:  # FlashInfer host refusal
+                except (NotImplementedError, ValueError) as error:  # FI host refusal
                     _cake_sp_rejected.add(key)
                     _log_cake_sp_once(
                         "fallback", f"FlashInfer refused to prepare ({error}): {detail}"
@@ -468,7 +539,7 @@ def cake_column_parallel_g_matmul(
     if supports_ag(input_parallel, w_kn, world_size=world_size):
         try:
             output = ag_matmul(input_parallel, w_kn, group)
-        except NotImplementedError as error:  # FlashInfer host refusal
+        except (NotImplementedError, ValueError) as error:  # FI host refusal
             _cake_sp_rejected.add(key)
             _log_cake_sp_once("fallback", f"FlashInfer refused ({error}): {detail}")
             return None
@@ -497,7 +568,9 @@ def column_parallel_g_matmul(
         output = cake_column_parallel_g_matmul(linear, input_parallel)
         if output is not None:
             if _CAKE_SP_CHECK:
-                _cake_sp_check(linear, input_parallel, bias, output[:num_tokens], num_tokens)
+                _cake_sp_check(
+                    linear, input_parallel, bias, output[:num_tokens], num_tokens
+                )
             return output[:num_tokens]
     if sp_fused_matmul_eligible(linear):
         group_name = get_parallel().tp_group.device_group.group_name

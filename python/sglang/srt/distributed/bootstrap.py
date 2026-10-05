@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
@@ -28,7 +29,11 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention,
 )
-from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
+from sglang.srt.layers.layernorm_sp import (
+    CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+    initialize_layernorm_sp,
+    select_cake_sp_symm_mem_backend,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
@@ -134,6 +139,13 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
+    if get_parallel().enable_layernorm_sp and cake_route_enabled(
+        CAKE_ROUTE_SP_ALL_GATHER_MATMUL
+    ):
+        # The Cake all-gather matmul needs torch's NVSHMEM symmetric-memory
+        # backend, which is process-global and frozen by the first symmetric
+        # allocation (the custom all-reduce buffers below): select it here.
+        select_cake_sp_symm_mem_backend()
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()

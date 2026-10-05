@@ -52,8 +52,9 @@ dtype, shapes, hidden size, the ``world_size`` argument and FlashInfer module
 availability. They do not verify the symmetric-memory backend, peer access,
 or that every rank selected the same backend.
 
-Not supported here (keep the existing SGLang path): other hidden sizes,
-world sizes outside the sets above, FP8 inputs, ``allreduce_fusion(
+Not supported here (keep the existing SGLang path): a torch symmetric-memory
+backend other than NVSHMEM (all-gather matmul; the engine selects it before the
+first allocation), other hidden sizes, world sizes outside the sets above, FP8 inputs, ``allreduce_fusion(
 moe_finalize_backend="cake")`` on a non-TRT-LLM workspace, and the private
 ``_all_gather_matmul_cake_packed_qkv_sm103_tp4`` experiment.
 """
@@ -104,6 +105,23 @@ MOE_AR_HIDDEN = 7168
 MOE_AR_WORLD_SIZES = (2, 4, 8)
 
 
+def symm_mem_backend_is_nvshmem(device: torch.device) -> bool:
+    """Whether torch's symmetric-memory allocator for ``device`` is NVSHMEM.
+
+    The Cake all-gather matmul (push-wait) allocates its flags / scratch through
+    ``torch.distributed._symmetric_memory`` and FlashInfer refuses any other
+    backend (``ValueError``). The backend is a process-global setting that must
+    be chosen before the first symmetric-memory allocation; this helper only
+    reads it. Returns ``False`` when the module or the query is unavailable.
+    """
+    try:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        return str(symm_mem.get_backend(device)).upper() == "NVSHMEM"
+    except Exception:  # noqa: BLE001 - unavailable module / older torch: not admitted
+        return False
+
+
 def _same_cuda_pair(a: torch.Tensor, b: torch.Tensor) -> bool:
     return (
         cuda_tensor_on(a, ARCHS)
@@ -137,6 +155,7 @@ def supports_all_gather_matmul(
         and inp.shape[1] == AG_K
         and tuple(w.shape) == (AG_K, AG_N)
         and world_size in AG_WORLD_SIZES
+        and symm_mem_backend_is_nvshmem(inp.device)
     )
 
 
@@ -159,7 +178,11 @@ def supports_prepare_all_gather_matmul(
     ):
         return False
     archs = AG_PACKED_QKV_ROUTES.get((world_size, int(w.shape[1])))
-    return archs is not None and device_capability(inp.device.index) in archs
+    return (
+        archs is not None
+        and device_capability(inp.device.index) in archs
+        and symm_mem_backend_is_nvshmem(inp.device)
+    )
 
 
 def all_gather_matmul(
