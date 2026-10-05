@@ -57,6 +57,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        logical_token_capacity: Optional[int] = None,
     ):
         full_max = unified_buffer.max_slots("full")
         dcp_size = get_parallel().attn_dcp_size
@@ -73,6 +74,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Widened under DCP, matching the full sub-allocator; see its __init__.
         self.page_size = page_size * dcp_size
         self.lazy_compaction = lazy_compaction
+        # The shared byte buffer can represent more full-attention tokens while
+        # Mamba state slots are idle. That elasticity must not widen the
+        # scheduler-visible capacity beyond max_total_num_tokens. FULL token ids
+        # are widened under DCP, so widen the configured per-rank row count too.
+        self.logical_token_capacity = (
+            None
+            if logical_token_capacity is None
+            else logical_token_capacity * dcp_size
+        )
 
         # Only FULL shards under DCP; the mamba state is replicated on every rank
         # and stays page_size=1, orthogonal to the full side's per-token paging.
@@ -155,6 +165,56 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
+
+    def logical_available_size(self) -> Optional[int]:
+        """Unallocated FULL tokens within the configured scheduler limit.
+
+        This deliberately excludes evictable cache entries. Callers that may
+        reclaim them add that credit separately, matching ``available_size``.
+        The physical shared-byte budget remains exposed by ``available_size``.
+        """
+        if self.logical_token_capacity is None:
+            return None
+        return self.logical_token_capacity - self.full_attn_allocator.allocated_count()
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
+        """Reclaim for both the physical byte pool and the logical token cap."""
+        super().evict_to_free_tokens(tree_cache, num_tokens)
+        logical_available = self.logical_available_size()
+        if logical_available is None:
+            return self.available_size() >= num_tokens
+        shortfall = num_tokens - logical_available
+        if (
+            shortfall > 0
+            and tree_cache is not None
+            and tree_cache.supports_prefix_sharing()
+        ):
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            self.flush_deferred_full_frees()
+            logical_available = self.logical_available_size()
+        return self.available_size() >= num_tokens and logical_available >= num_tokens
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        if not super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        ):
+            return False
+        logical_available = self.logical_available_size()
+        if logical_available is None:
+            return True
+        return logical_available >= num_tokens
 
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
         return self
