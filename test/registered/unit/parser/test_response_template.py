@@ -1208,19 +1208,25 @@ class TestResponseTemplateAdapters(CustomTestCase):
             "json_schema",
         )
 
-        # A tool the native format cannot carry keeps forced calls on the JSON
-        # array, and the parser must then expect it too.
+        # A strict tool the native format cannot hold to its schema keeps forced
+        # calls on the JSON array, and the parser must then expect it too.
         untyped = _tool()
         untyped.function.parameters["properties"]["days"] = {
             "$ref": "https://example.com/days.json"
         }
-        parser = FunctionCallParser(
-            tools=[untyped],
-            tool_call_parser="response_template",
-            tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
-        )
-        self.assertEqual(parser.get_structure_constraint("required")[0], "json_schema")
-        self.assertFalse(parser.detector.supports_structural_tag())
+        for strict, native in ((False, True), (True, False)):
+            with self.subTest(strict=strict):
+                untyped.function.strict = strict
+                parser = FunctionCallParser(
+                    tools=[untyped],
+                    tool_call_parser="response_template",
+                    tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
+                )
+                self.assertEqual(
+                    parser.get_structure_constraint("required")[0],
+                    "structural_tag" if native else "json_schema",
+                )
+                self.assertIs(parser.detector.supports_structural_tag(), native)
 
 
 if __name__ == "__main__":

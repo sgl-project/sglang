@@ -1073,7 +1073,8 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 
         # A forced tool-call array is not an answer; a native call must not
-        # replace it.
+        # replace it. No grammar writes this JSON dialect, so forced calls take
+        # the array.
         fields = _DELIMITED_RESPONSE_TEMPLATE["fields"]
         self._use_delimited_response_template(
             "response_template",
@@ -1083,20 +1084,13 @@ class ServingChatTestCase(CustomTestCase):
                     **fields,
                     "tool_calls": {
                         **fields["tool_calls"],
-                        "content": "xml-inline",
-                        "content_args": {
-                            "tag_pattern": r"<arg:(?P<key>\w+)>(?P<value>.*?)</arg>"
-                        },
+                        "content_args": {"unquoted_keys": True},
                     },
                 },
             },
         )
-        untyped_tool = copy.deepcopy(_WEATHER_TOOL)
-        untyped_tool["function"]["parameters"]["properties"]["days"] = {
-            "$ref": "https://example.com/days.json"
-        }
         adapted, request = self._convert_rendered_as(
-            "<assistant>", tools=[untyped_tool], tool_choice="required"
+            "<assistant>", tools=[_WEATHER_TOOL], tool_choice="required"
         )
 
         self.assertNotIn("structural_tag", adapted.sampling_params)

@@ -40,7 +40,16 @@ _ANY_TEXT = {"type": "any_text"}
 _BLANKS = {" ": " ", "\t": r"\t", "\n": r"\n", "\r": r"\r"}
 # Keywords that describe a schema without constraining its values.
 _ANNOTATIONS = frozenset(
-    {"title", "description", "default", "examples", "deprecated", "$comment"}
+    {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "$comment",
+        "$schema",
+        "$id",
+    }
 )
 _OBJECT_KEYWORDS = frozenset(
     {"type", "properties", "required", "additionalProperties", "$defs", "definitions"}
@@ -462,7 +471,7 @@ def _xml_arguments_format(
         and (json_values or all(map(_typed_by_parser, properties.values())))
     )
     # Other schema shapes cannot be typed by the XML parser.
-    if set(parameters) - _ANNOTATIONS - _OBJECT_KEYWORDS or not typed:
+    if strict and (set(parameters) - _ANNOTATIONS - _OBJECT_KEYWORDS or not typed):
         return None
     required = parameters.get("required") or []
     names = ()

@@ -320,13 +320,15 @@ class TestToolCallStructuralTag(CustomTestCase):
 
     def test_schemas_text_values_cannot_hold_are_not_derived(self):
         """Untyped arguments, or text a strict schema cannot hold, must not get a native
-        grammar."""
+        grammar for a strict tool."""
         pattern = {"type": "string", "pattern": "^[a-z]+$"}
+        remote = {"$ref": "https://example.com/level.json"}
         cases = [
             ({"enum": [1, 2]}, True, True),
             ({"enum": [1, "two"]}, True, False),
             ({"$ref": "#/$defs/level"}, False, True),
-            ({"$ref": "https://example.com/level.json"}, False, False),
+            (remote, True, False),
+            (remote, False, True),
             # Raw text cannot hold its closer, and XGrammar rejects the value.
             ({"enum": ["a</arg>b"]}, True, False),
             ({"type": "object", "properties": {"x": {"$ref": "#/x"}}}, True, False),
@@ -397,6 +399,20 @@ class TestToolCallStructuralTag(CustomTestCase):
         self.assertTrue(_accepts(color, _call(("v", "red"))))
         self.assertFalse(_accepts(color, _call(("v", "blue"))))
         self.assertIsNone(build({"$ref": "#/$defs/c", "nullable": True}))
+
+    def test_only_strict_tools_need_a_schema_shape_the_parser_types(self):
+        """Metadata such as a generator's `$schema` must not matter, and a tool
+        that takes any arguments must not need its schema understood."""
+        parameters = WEATHER["function"]["parameters"]
+        dialect = {"$schema": "http://json-schema.org/draft-07/schema#", **parameters}
+        conditional = {**parameters, "if": {"required": ["days"]}}
+
+        tag = _build(tools=[_tool(dialect)])
+        self.assertTrue(_accepts(tag, _call(("city", "Paris"))))
+        self.assertFalse(_accepts(tag, _call(("days", "soon"))))
+        self.assertIsNone(_build(tools=[_tool(conditional)]))
+        loose = _build(tools=[_tool(conditional, strict=False)])
+        self.assertTrue(_accepts(loose, _call(("days", "soon"))))
 
     def test_only_strict_tools_follow_their_schema(self):
         off_schema = _call(("days", "soon"))
