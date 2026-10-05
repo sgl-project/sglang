@@ -87,7 +87,7 @@ pub(super) fn frame_value(out: &FrontendOutput, rid: &str) -> serde_json::Value 
         "meta_info": meta_info_value(out, rid),
     });
     if !out.token_ids.is_empty() {
-        v["output_ids"] = serde_json::json!(out.token_ids);
+        v["output_ids"] = serde_json::json!(out.token_ids.as_slice());
     }
     v
 }
@@ -463,28 +463,36 @@ mod tests {
     #[test]
     fn accumulator_snapshot_is_cumulative() {
         let mut acc = OutputAccumulator::default();
+        acc.fold(&FrontendOutput::default());
+        assert!(acc.snapshot().token_ids.is_empty());
+        assert!(!acc.snapshot().token_ids.spilled());
         acc.fold(&FrontendOutput {
             text: "he".into(),
-            token_ids: vec![1, 2].into(),
-            completion_tokens: 2,
-            ..Default::default()
-        });
-        {
-            let s = acc.snapshot();
-            assert_eq!(s.text, "he");
-            assert_eq!(s.token_ids.as_slice(), vec![1, 2]);
-        }
-        acc.fold(&FrontendOutput {
-            text: "llo".into(),
-            token_ids: vec![3].into(),
+            token_ids: vec![1].into(),
             completion_tokens: 1,
             ..Default::default()
         });
+        let capacity = acc.snapshot().token_ids.capacity();
+        assert!(capacity >= 4);
+        {
+            let s = acc.snapshot();
+            assert_eq!(s.text, "he");
+            assert_eq!(s.token_ids.as_slice(), vec![1]);
+        }
+        for (id, text) in [(2, "l"), (3, "l"), (4, "o")] {
+            acc.fold(&FrontendOutput {
+                text: text.into(),
+                token_ids: vec![id].into(),
+                completion_tokens: 1,
+                ..Default::default()
+            });
+            assert_eq!(acc.snapshot().token_ids.capacity(), capacity);
+        }
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "hello"); // cumulative
-            assert_eq!(s.token_ids.as_slice(), vec![1, 2, 3]);
-            assert_eq!(s.completion_tokens, 3);
+            assert_eq!(s.token_ids.as_slice(), vec![1, 2, 3, 4]);
+            assert_eq!(s.completion_tokens, 4);
         }
         let out = acc.into_output();
         assert_eq!(out.text, "hello");

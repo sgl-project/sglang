@@ -571,8 +571,8 @@ pub struct ChunkEvent {
     /// drops it), so carrying it costs no allocation. The frontend strips this
     /// field before exposing semantic output; the shard routes it via `Rid::shard`.
     pub rid: Rid,
-    /// New token ids for this step, widened from the scheduler's int32 wire
-    /// width at parse time. Empty allowed (e.g. metadata-only frames).
+    /// New token ids for this step, read as i64 values from the scheduler's
+    /// `array("q")` buffer. Empty allowed (e.g. metadata-only frames).
     pub token_ids: OutputTokenIds,
     /// `None` while streaming, the [`FinishReason`] on the final chunk.
     pub finish_reason: Option<FinishReason>,
@@ -649,6 +649,18 @@ impl ChunkExtras {
 mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
+
+    #[test]
+    fn output_token_storage_preserves_empty_inline_and_spilled_chunks() {
+        for ids in [vec![], vec![7], vec![7, 8, 9]] {
+            let data: Vec<u8> = ids.iter().flat_map(|id: &i64| id.to_le_bytes()).collect();
+            let mut offset = 0;
+            let tokens = take_i64(&data, &mut offset, ids.len()).unwrap();
+            assert_eq!(tokens.as_slice(), ids.as_slice());
+            assert_eq!(offset, data.len());
+            assert_eq!(tokens.spilled(), ids.len() > 1);
+        }
+    }
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {
@@ -1226,18 +1238,6 @@ mod rid_recovery_tests {
                 vec![Rid::from("a"), Rid::from("b")],
                 "arity {extra_cols}: rids must survive so the caller can fail them"
             );
-        }
-    }
-
-    #[test]
-    fn output_token_storage_preserves_empty_inline_and_spilled_chunks() {
-        for ids in [vec![], vec![7], vec![7, 8, 9]] {
-            let data: Vec<u8> = ids.iter().flat_map(|id: &i64| id.to_le_bytes()).collect();
-            let mut offset = 0;
-            let tokens = take_i64(&data, &mut offset, ids.len()).unwrap();
-            assert_eq!(tokens.as_slice(), ids.as_slice());
-            assert_eq!(offset, data.len());
-            assert_eq!(tokens.spilled(), ids.len() > 1);
         }
     }
 

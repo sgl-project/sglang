@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// (or a broadcast) and a list of lists is per-prompt.
 pub type TokenIds = Vec<i64>;
 
-/// Output chunks usually contain one token; larger outputs spill to the heap.
+/// Stores single-token output chunks inline; larger chunks use heap storage.
 pub type OutputTokenIds = smallvec::SmallVec<[i64; 1]>;
 
 /// A field taking a bare `T` **or** `[T,…]` (`text: "hi"` or `text: ["a","b"]`).

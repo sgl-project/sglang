@@ -27,8 +27,8 @@ futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 socket2 = { workspace = true }
-smallvec = { version = "=1.15.2", features = ["serde", "union"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
