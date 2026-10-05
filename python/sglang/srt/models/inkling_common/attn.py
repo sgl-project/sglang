@@ -6,9 +6,6 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-    is_batch_invariant,
-)
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
@@ -39,7 +36,20 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+from sglang.srt.utils import add_prefix, get_current_device_stream_fast, is_xpu
+
+try:
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant,
+    )
+except ImportError:
+    # cute/__init__ eagerly imports .interface -> `import cutlass`, and
+    # nvidia-cutlass-dsl is CUDA-only (absent from pyproject_xpu.toml). The flag is
+    # only ever set True by the fa4 backend, which needs cutlass itself, so False is
+    # what the real module would return wherever this fallback can be reached.
+    def is_batch_invariant() -> bool:
+        return False
+
 
 try:
     import cutlass.cute as cute
@@ -53,6 +63,24 @@ except Exception as _import_error:
     _cute_import_error = _import_error
 else:
     _cute_import_error = None
+
+_xpu_rmsnorm_heads_inplace = _xpu_rmsnorm_heads_inplace_supported = None
+if is_xpu():
+    try:
+        from sgl_kernel import rmsnorm_heads_inplace as _xpu_rmsnorm_heads_inplace
+        from sgl_kernel import (
+            rmsnorm_heads_inplace_supported as _xpu_rmsnorm_heads_inplace_supported,
+        )
+    except ImportError:
+        # The installed sgl-kernel-xpu predates the op; apply_qk_norm is the fallback.
+        pass
+
+
+def xpu_qkvr_width(
+    *, head_dim: int, num_tp_heads: int, num_tp_kv_heads: int, d_rel: int
+) -> int:
+    """Width of one packed [q | k | v | r] row, as split by _project_qkvr."""
+    return (head_dim + d_rel) * num_tp_heads + 2 * head_dim * num_tp_kv_heads
 
 
 @cache
@@ -380,6 +408,23 @@ class InklingAttention(nn.Module):
         self._fused_log_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
+        # XPU norms q in place on the packed QKVR row, skipping the compaction
+        # copy the (T, H*D) -> (T*H, D) reshape of the strided q slice forces.
+        self._xpu_qkvr_width = xpu_qkvr_width(
+            head_dim=self.head_dim,
+            num_tp_heads=self.num_tp_heads,
+            num_tp_kv_heads=self.num_tp_kv_heads,
+            d_rel=self.d_rel,
+        )
+        self._xpu_q_norm_ok = (
+            _xpu_rmsnorm_heads_inplace is not None
+            and _xpu_rmsnorm_heads_inplace_supported(
+                row_width=self._xpu_qkvr_width,
+                num_heads=self.num_tp_heads,
+                head_dim=self.head_dim,
+                dtype=torch.bfloat16,
+            )
+        )
 
         self.kv_conv = kv_conv
         self.sconv_kernel_size = sconv_kernel_size
@@ -430,6 +475,27 @@ class InklingAttention(nn.Module):
         ]
         q, k, v, r = qkvr.split(split_sizes, dim=-1)
         return q, k, v, r
+
+    def _xpu_norm_q_inplace(self, q: torch.Tensor) -> bool:
+        """RMSNorm q in place on the packed QKVR row; False if q is not on it.
+
+        q must still be the leading slice of the contiguous [q | k | v | r] row
+        from _project_qkvr, which is recovered from q's own storage.
+        """
+        if q.dtype not in (torch.bfloat16, torch.float16) or q.stride() != (
+            self._xpu_qkvr_width,
+            1,
+        ):
+            return False
+        qkvr = q.as_strided((q.size(0), self._xpu_qkvr_width), q.stride())
+        _xpu_rmsnorm_heads_inplace(
+            qkvr,
+            num_heads=self.num_tp_heads,
+            head_dim=self.head_dim,
+            weight=self.q_norm.weight,
+            eps=self.q_norm.variance_epsilon,
+        )
+        return True
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
@@ -873,6 +939,8 @@ class InklingAttention(nn.Module):
         # with v_sconv + rel_logits_proj. (The fused prologue already normed.)
         if fused_prologue:
             pass
+        elif self._xpu_q_norm_ok and self._xpu_norm_q_inplace(q):
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
         else:
             q, k = apply_qk_norm(
                 q=q,
