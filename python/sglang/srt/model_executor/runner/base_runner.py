@@ -721,6 +721,8 @@ class BaseRunner(ABC):
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
                 global_num_tokens_cpu,
+                buffers.global_num_tokens_gpu,
+                buffers.global_num_tokens_gpu,
             )
             set_is_extend_in_batch(False)
 

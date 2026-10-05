@@ -215,6 +215,8 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
+    _global_num_tokens_live_gpu: Optional[torch.Tensor] = None
+    _global_num_tokens_live_buffers: dict[tuple, torch.Tensor] = {}
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -286,6 +288,30 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens_gpu
 
     @classmethod
+    def activate_dp_global_num_tokens_live_gpu(
+        cls, counts: torch.Tensor
+    ) -> torch.Tensor:
+        key = (counts.device, tuple(counts.shape))
+        buffer = cls._global_num_tokens_live_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(counts.shape, dtype=torch.int32, device=counts.device)
+            cls._global_num_tokens_live_buffers[key] = buffer
+            buffer.copy_(counts)
+        cls._global_num_tokens_live_gpu = buffer
+        return cls._global_num_tokens_live_gpu
+
+    @classmethod
+    def update_dp_global_num_tokens_live_gpu(cls, counts: torch.Tensor) -> torch.Tensor:
+        buffer = cls.activate_dp_global_num_tokens_live_gpu(counts)
+        if buffer.data_ptr() != counts.data_ptr():
+            buffer.copy_(counts)
+        return buffer
+
+    @classmethod
+    def get_dp_global_num_tokens_live_gpu(cls) -> Optional[torch.Tensor]:
+        return cls._global_num_tokens_live_gpu
+
+    @classmethod
     def get_dp_hidden_size(cls) -> int:
 
         return get_flags().dp.buffer_hidden_size
@@ -311,6 +337,7 @@ def set_dp_buffer_len(
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
     global_num_tokens_gpu: Optional[torch.Tensor] = None,
+    global_num_tokens_live_gpu: Optional[torch.Tensor] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len,
@@ -319,6 +346,13 @@ def set_dp_buffer_len(
         global_num_tokens,
         global_num_tokens_gpu,
     )
+    if (
+        global_num_tokens_live_gpu is not None
+        and envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
+    ):
+        _DpGatheredBufferWrapper.activate_dp_global_num_tokens_live_gpu(
+            global_num_tokens_live_gpu
+        )
 
 
 def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
@@ -362,11 +396,31 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
         forward_batch.global_num_tokens_gpu,
+        forward_batch.global_num_tokens_live_gpu,
     )
 
 
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
+
+
+def get_dp_global_num_tokens_gpu() -> Optional[torch.Tensor]:
+    return _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+
+
+def update_dp_global_num_tokens_live_gpu(
+    counts: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Publish replay-updated, pre-padding DP token counts for MoE routing."""
+    if not envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.get():
+        return None
+    return _DpGatheredBufferWrapper.update_dp_global_num_tokens_live_gpu(counts)
+
+
+def get_dp_global_num_tokens_live_gpu() -> Optional[torch.Tensor]:
+    if not envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.get():
+        return None
+    return _DpGatheredBufferWrapper.get_dp_global_num_tokens_live_gpu()
 
 
 def get_dp_hidden_size() -> int:

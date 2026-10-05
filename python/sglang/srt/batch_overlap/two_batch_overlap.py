@@ -343,6 +343,7 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded = torch.zeros(
             (2,), dtype=torch.int32, device=get_device().device
         )
+        self._tbo_children_global_num_tokens_live_gpu = None
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not is_tbo_enabled():
@@ -363,10 +364,19 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
         )
+        self._tbo_children_global_num_tokens_live_gpu = (
+            TboForwardBatchPreparer.compute_tbo_children_global_num_tokens_live_gpu(
+                batch,
+                out=self._tbo_children_global_num_tokens_live_gpu,
+            )
+        )
 
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
+            tbo_children_global_num_tokens_live_gpu=(
+                self._tbo_children_global_num_tokens_live_gpu
+            ),
         )
 
     def replay_prepare(
@@ -393,6 +403,17 @@ class TboCudaGraphRunnerPlugin:
                 num_token_non_padded=num_token_non_padded,
             )
         )
+        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens_live_gpu
+
+        parent_counts = get_dp_global_num_tokens_live_gpu()
+        if parent_counts is not None:
+            self._tbo_children_global_num_tokens_live_gpu = (
+                TboForwardBatchPreparer.split_global_num_tokens_live_gpu(
+                    parent_counts,
+                    tbo_split_token_index=tbo_split_token_index,
+                    out=self._tbo_children_global_num_tokens_live_gpu,
+                )
+            )
 
 
 class TboDPAttentionPreparer:
@@ -515,6 +536,9 @@ class TboForwardBatchPreparer:
         cls.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=tbo_children_num_token_non_padded,
+            tbo_children_global_num_tokens_live_gpu=(
+                cls.compute_tbo_children_global_num_tokens_live_gpu(batch)
+            ),
             # Eager split: the children can carry a CPU count too, so the
             # attention 0-token skip (which reads global_num_token_non_padded_cpu)
             # survives the split. The cuda-graph plugin path below leaves this
@@ -530,6 +554,7 @@ class TboForwardBatchPreparer:
         cls,
         batch: ForwardBatch,
         tbo_children_num_token_non_padded: torch.Tensor,
+        tbo_children_global_num_tokens_live_gpu: Optional[torch.Tensor] = None,
         tbo_children_num_token_non_padded_cpu: Optional[tuple[int, int]] = None,
     ):
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -576,6 +601,11 @@ class TboForwardBatchPreparer:
             ),
             out_num_token_non_padded=out_num_token_non_padded_a,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_a,
+            global_num_tokens_live_gpu=(
+                tbo_children_global_num_tokens_live_gpu[0]
+                if tbo_children_global_num_tokens_live_gpu is not None
+                else None
+            ),
         )
         child_b = cls.filter_batch(
             batch,
@@ -585,6 +615,11 @@ class TboForwardBatchPreparer:
             end_seq_index=batch.batch_size,
             out_num_token_non_padded=out_num_token_non_padded_b,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_b,
+            global_num_tokens_live_gpu=(
+                tbo_children_global_num_tokens_live_gpu[1]
+                if tbo_children_global_num_tokens_live_gpu is not None
+                else None
+            ),
         )
 
         if is_enable_two_chunk:
@@ -673,6 +708,7 @@ class TboForwardBatchPreparer:
         end_seq_index: int,
         out_num_token_non_padded: torch.Tensor,
         out_num_token_non_padded_cpu: Optional[int] = None,
+        global_num_tokens_live_gpu: Optional[torch.Tensor] = None,
     ):
         assert end_token_index >= start_token_index, (
             f"{end_token_index=}, {start_token_index=}, batch={batch}"
@@ -826,6 +862,7 @@ class TboForwardBatchPreparer:
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                global_num_tokens_live_gpu=global_num_tokens_live_gpu,
                 # Children publish no per-rank list of their own; the parent
                 # published the gather sizes before it was split.
                 global_num_tokens_padded_cpu=None,
@@ -874,6 +911,39 @@ class TboForwardBatchPreparer:
             # batches that intentionally leave the CPU mirror unset.
             num_token_non_padded=cls._get_num_token_non_padded_cpu(batch),
         )
+
+    @classmethod
+    def compute_tbo_children_global_num_tokens_live_gpu(
+        cls, batch: ForwardBatch, out: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        counts = batch.global_num_tokens_live_gpu
+        if counts is None:
+            from sglang.srt.layers.dp_attention import (
+                get_dp_global_num_tokens_live_gpu,
+            )
+
+            counts = get_dp_global_num_tokens_live_gpu()
+            if counts is None:
+                return None
+        return cls.split_global_num_tokens_live_gpu(
+            counts,
+            tbo_split_token_index=cls._compute_split_token_index(batch),
+            out=out,
+        )
+
+    @staticmethod
+    def split_global_num_tokens_live_gpu(
+        counts: torch.Tensor,
+        *,
+        tbo_split_token_index: int,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        expected_shape = (2, counts.shape[0])
+        if out is None or out.shape != expected_shape or out.device != counts.device:
+            out = torch.empty(expected_shape, dtype=counts.dtype, device=counts.device)
+        out[0].copy_(torch.clamp(counts, max=tbo_split_token_index))
+        out[1].copy_(torch.clamp(counts - tbo_split_token_index, min=0))
+        return out
 
     @staticmethod
     def _get_num_token_non_padded_cpu(batch: ForwardBatch) -> int:

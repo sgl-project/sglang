@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     dp_slot_in,
     set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
+    update_dp_global_num_tokens_live_gpu,
     world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -666,6 +667,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    global_num_tokens_live_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -917,6 +919,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
+        if envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.get():
+            self.global_num_tokens_live_gpu = update_dp_global_num_tokens_live_gpu(
+                self.global_num_tokens_gpu
+            )
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob,

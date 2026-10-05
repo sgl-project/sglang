@@ -71,6 +71,13 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         self.assertEqual(eager.dtype, torch.int32)
         self.assertEqual(eager.tolist(), [3, 5])
 
+    def test_live_dp_counts_are_split_per_child(self):
+        counts = torch.tensor([5, 2, 0], dtype=torch.int32)
+        children = TboForwardBatchPreparer.split_global_num_tokens_live_gpu(
+            counts, tbo_split_token_index=3
+        )
+        self.assertTrue(torch.equal(children, torch.tensor([[3, 2, 0], [2, 0, 0]])))
+
 
 if __name__ == "__main__":
     unittest.main()

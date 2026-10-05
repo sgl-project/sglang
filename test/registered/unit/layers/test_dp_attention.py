@@ -5,15 +5,18 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     _DpGatheredBufferWrapper,
     get_dp_global_num_tokens,
+    get_dp_global_num_tokens_live_gpu,
     get_global_dp_buffer_len,
     get_local_dp_buffer_len,
     is_dp_max_padding,
     set_dp_buffer_len,
     set_dp_buffer_len_from_batch,
+    update_dp_global_num_tokens_live_gpu,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +30,7 @@ def _batch(**overrides):
         global_num_tokens_cpu=[3, 1],
         global_num_tokens_padded_cpu=[4, 4],
         global_num_tokens_gpu=torch.tensor([3, 1]),
+        global_num_tokens_live_gpu=None,
         dp_padding_mode=DpPaddingMode.MAX_LEN,
     )
     fields.update(overrides)
@@ -73,6 +77,32 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
         with get_parallel().override(attn_dp_rank=1):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
+
+    def test_live_counts_are_kept_separate_from_padded_counts(self):
+        with envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.override(True):
+            live = update_dp_global_num_tokens_live_gpu(torch.tensor([3, 1]))
+            batch = _batch(
+                global_num_tokens_gpu=torch.tensor([4, 4]),
+                global_num_tokens_live_gpu=live,
+            )
+            with get_parallel().override(attn_dp_rank=0):
+                set_dp_buffer_len_from_batch(batch)
+
+            published = get_dp_global_num_tokens_live_gpu()
+            self.assertIs(published, live)
+            self.assertTrue(torch.equal(published, torch.tensor([3, 1])))
+
+            replay_address = published.data_ptr()
+            updated = update_dp_global_num_tokens_live_gpu(torch.tensor([2, 2]))
+            self.assertEqual(updated.data_ptr(), replay_address)
+            self.assertTrue(torch.equal(updated, torch.tensor([2, 2])))
+
+    def test_disabled_flag_does_not_expose_live_counts(self):
+        with envs.SGLANG_SIMULATE_PERFECT_BALANCED_EXPERTS.override(False):
+            self.assertIsNone(
+                update_dp_global_num_tokens_live_gpu(torch.tensor([3, 1]))
+            )
+            self.assertIsNone(get_dp_global_num_tokens_live_gpu())
 
 
 if __name__ == "__main__":

@@ -338,6 +338,8 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 expanded_bs,
                 forward_batch.dp_padding_mode.is_max_len(),
                 global_num_tokens_cpu,
+                global_num_tokens,
+                global_num_tokens,
             )
             set_is_extend_in_batch(False)
 

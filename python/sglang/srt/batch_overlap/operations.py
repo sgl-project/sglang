@@ -14,7 +14,10 @@ from typing import (
     Union,
 )
 
-from sglang.srt.layers.dp_attention import set_dp_buffer_len
+from sglang.srt.layers.dp_attention import (
+    set_dp_buffer_len,
+    update_dp_global_num_tokens_live_gpu,
+)
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
@@ -128,6 +131,7 @@ class _StageExecutor:
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
+        self._global_num_tokens_live_gpu = forward_batch.global_num_tokens_live_gpu
         self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
     def next(self):
@@ -138,6 +142,8 @@ class _StageExecutor:
         # TODO: We currently always call set_dp_buffer_len here because sub-batches
         # may have different padded lengths. It can likely be removed after TBO slice &
         # pad logic is refactored.
+        if self._global_num_tokens_live_gpu is not None:
+            update_dp_global_num_tokens_live_gpu(self._global_num_tokens_live_gpu)
         set_dp_buffer_len(
             self._global_dp_buffer_len,
             self._local_dp_buffer_len,

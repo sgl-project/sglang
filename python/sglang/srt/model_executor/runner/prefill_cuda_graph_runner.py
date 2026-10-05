@@ -790,6 +790,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens,
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
+            forward_batch.global_num_tokens_gpu,
+            forward_batch.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(False)
 
@@ -875,6 +877,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens,
             fb.dp_padding_mode.is_max_len(),
             fb.global_num_tokens_cpu,
+            fb.global_num_tokens_gpu,
+            fb.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(False)
 

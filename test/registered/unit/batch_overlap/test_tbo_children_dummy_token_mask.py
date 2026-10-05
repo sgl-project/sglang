@@ -50,6 +50,7 @@ def _make_decode_capture_batch(*, num_tokens: int):
         extend_seq_lens_cpu=None,
         input_ids=torch.zeros(num_tokens, dtype=torch.long),
         global_num_token_non_padded_cpu=None,
+        global_num_tokens_live_gpu=None,
     )
 
 
