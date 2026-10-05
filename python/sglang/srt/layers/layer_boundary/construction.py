@@ -145,8 +145,11 @@ class StagePlan:
         finishes_directly: Attention can publish its output with finish instead of
             an exit scope and output transport.
         qkv_latent_func: Optional hook for prepared attention input.
-        fusions: Optional backend provider of ordered consumer fusion candidates
-            and the producer deferral policies (see make_attn_stage).
+        fusions: Optional backend provider. Consumer side: ordered
+            attention_input(plan) and ffn_input(plan) candidates. Producer side
+            (FFN exit): can_defer_finalize(plan, batch), called on every exit,
+            and can_defer_all_reduce(plan, batch), called when LoRA or TP1
+            shared experts are enabled.
 
     The plan owns static paths, not per-forward tensors or a neighbour's norm.
     Runtime residual state belongs to the ForwardBatch's ResidualStream.
