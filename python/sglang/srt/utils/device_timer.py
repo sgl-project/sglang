@@ -45,6 +45,17 @@ class DeviceTimer:
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
 
+    def is_active(self) -> bool:
+        """Observe whether any timed interval has started but not completed.
+
+        This is a nonblocking snapshot, not a GPU completion timestamp or proof
+        of continuous kernel execution. Reuse the existing forward events.
+        """
+        for interval in self._intervals:
+            if interval.is_active():
+                return True
+        return False
+
     @contextmanager
     def wrap(self, metadata: Dict):
         # Not re-entrant: a nested wrap would end the wrong interval and leave
@@ -66,7 +77,7 @@ class DeviceTimer:
     def _report(self):
         while len(self._intervals) > 0:
             interval = self._intervals[0]
-            if not interval.end_event.query():
+            if not interval.is_complete():
                 break
 
             self._intervals.popleft()
@@ -116,6 +127,22 @@ class _TimingInterval:
     metadata: Optional[Dict] = None
     observer: Optional[TimingObserver] = None
     stream: Optional[torch.cuda.Stream] = None
+    _started: bool = False
+    _completed: bool = False
+
+    def is_complete(self) -> bool:
+        # Once observed, the end event stays complete; avoid polling it again.
+        if not self._completed and self.end_event is not None:
+            self._completed = self.end_event.query()
+        return self._completed
+
+    def is_active(self) -> bool:
+        if self.is_complete():
+            return False
+        # Once observed, an event stays complete; avoid polling its start again.
+        if not self._started:
+            self._started = self.start_event.query()
+        return self._started
 
     @staticmethod
     def create(track_stream: bool = False):

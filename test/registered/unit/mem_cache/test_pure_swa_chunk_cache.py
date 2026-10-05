@@ -61,7 +61,7 @@ class TestPureSWAChunkCache(CustomTestCase):
 
         # protected 2, floor 3, cursor 6: [2, 3) and [6, 8) go back, [3, 6) is dead
         req = _make_req()
-        cache.insert_req(req, up_to=8)
+        cache.checkpoint(req, up_to=8)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
         cache.unpin(req)
 
