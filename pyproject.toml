@@ -1,0 +1,20 @@
+[tool.ruff]
+# Apply exclusions to explicitly passed files as well as editor diagnostics.
+force-exclude = true
+
+[tool.ruff.lint]
+# Shared by editors and the Ruff pre-commit hook.
+select = ["F401", "F821", "F823", "UP037"]
+exclude = [
+  "__init__.py",
+  "*.ipynb",
+  "python/sglang/kernels/aot/**",
+  "python/sglang/srt/grpc/**/*_pb2.py",
+  "python/sglang/srt/grpc/**/*_pb2_grpc.py",
+  "python/sglang/srt/grpc/**/*_pb2.pyi",
+  "python/sglang/srt/grpc/**/*_pb2_grpc.pyi",
+  # Mirror the global pre-commit exclusions for editor linting.
+  "python/sglang/multimodal_gen/csrc/**",
+  "python/sglang/kernels/ops/diffusion/render/**",
+  "python/sglang/kernels/ops/attention/flash_attn/cute/**",
+]
