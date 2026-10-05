@@ -9,13 +9,22 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.linear import (
+    ColumnParallelBatchedLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    derive_parallel_widths,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -644,7 +653,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         layer(self.x)[0], F.linear(self.x, self.weight)
                     )
 
-    def test_legacy_arguments_remain_available_and_mixing_is_rejected(self):
+    def test_constructor_placement_accepts_groups_and_rejects_integer_arguments(self):
         constructors = (
             lambda **kwargs: ColumnParallelLinear(8, 8, bias=False, **kwargs),
             lambda **kwargs: MergedColumnParallelLinear(
@@ -652,13 +661,21 @@ class TestLinearParallelGroups(CustomTestCase):
             ),
             lambda **kwargs: QKVParallelLinear(8, 2, 4, bias=False, **kwargs),
             lambda **kwargs: RowParallelLinear(8, 8, bias=False, **kwargs),
+            lambda **kwargs: MergedColumnParallelRepeatedLinear(
+                8, [8, 4], [2], **kwargs
+            ),
+            lambda **kwargs: ColumnParallelBatchedLinear(
+                2, 8, 8, torch.float32, **kwargs
+            ),
         )
         for build in constructors:
             self.assertEqual((build().tp_rank, build().tp_size), (3, 4))
-            explicit = build(tp_rank=0, tp_size=1)
-            self.assertEqual((explicit.tp_rank, explicit.tp_size), (0, 1))
+            replicated = build(parallel_group="replicated")
+            self.assertEqual((replicated.tp_rank, replicated.tp_size), (0, 1))
             for kwargs in (dict(tp_rank=0), dict(tp_size=1)):
-                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+                    build(**kwargs)
+                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
                     build(parallel_group="replicated", **kwargs)
             with self.assertRaisesRegex(ValueError, "Unknown linear parallel_group"):
                 build(parallel_group="unknown")
@@ -668,12 +685,115 @@ class TestLinearParallelGroups(CustomTestCase):
             )
             self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
             self.assertEqual(layer.use_dp_attention_reduce, old_reduce)
-        legacy = RowParallelLinear(
-            8, 8, tp_rank=1, tp_size=2, use_dp_attention_reduce=True
+        layer = RowParallelLinear(
+            8, 8, parallel_group="attn_tp", use_dp_attention_reduce=True
         )
-        self.assertTrue(legacy.use_dp_attention_reduce)
-        legacy.use_dp_attention_reduce = False
-        self.assertFalse(legacy.use_dp_attention_reduce)
+        self.assertTrue(layer.use_dp_attention_reduce)
+        layer.use_dp_attention_reduce = False
+        self.assertFalse(layer.use_dp_attention_reduce)
+
+    def test_quant_initialization_keeps_the_entry_scope_partition(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        observed = []
+
+        class ScopeChangingConfig:
+            def get_quant_method(config, layer, prefix):
+                observed.append((layer.tp_rank, layer.tp_size, layer.parallel_group))
+                scope = get_parallel().override(
+                    tp_size=1,
+                    tp_rank=0,
+                    attn_tp_rank=0,
+                    attn_dp_rank=0,
+                    moe_tp_rank=0,
+                    **derive_parallel_widths(
+                        tp_size=1,
+                        attn_cp_size=1,
+                        attn_dp_size=1,
+                        moe_ep_size=1,
+                        moe_dp_size=1,
+                        dcp_size=1,
+                        dcp_enabled=False,
+                    ),
+                )
+                scope.__enter__()
+                method = UnquantizedLinearMethod()
+                native_create = method.create_weights
+
+                def create_weights(**kwargs):
+                    try:
+                        native_create(**kwargs)
+                    finally:
+                        scope.__exit__(None, None, None)
+
+                method.create_weights = create_weights
+                return method
+
+        for group, rank, size in (
+            (None, 3, 4),
+            ("attn_tp", 1, 2),
+            ("replicated", 0, 1),
+        ):
+            config = ScopeChangingConfig()
+            options = dict(bias=False, quant_config=config, parallel_group=group)
+            layers = (
+                ColumnParallelLinear(8, 8, **options),
+                MergedColumnParallelLinear(8, [8, 4], **options),
+                QKVParallelLinear(
+                    8,
+                    2,
+                    4,
+                    1,
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                    **options,
+                ),
+                RowParallelLinear(8, 8, reduce_results=False, **options),
+                MergedColumnParallelRepeatedLinear(
+                    8, [8, 4], [2], quant_config=config, parallel_group=group
+                ),
+            )
+            self.assertEqual(observed[-5:], [(rank, size, group)] * 5)
+            self.assertEqual(get_parallel().tp_size, 4)
+            for layer in layers:
+                with self.subTest(group=group, layer=type(layer).__name__):
+                    self.assertEqual((layer.tp_rank, layer.tp_size), (rank, size))
+                    if isinstance(layer, RowParallelLinear):
+                        expected = self.weight.chunk(size, dim=1)[rank]
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                    elif isinstance(layer, QKVParallelLinear):
+                        pieces = (
+                            ("q", self.weight),
+                            ("k", self.weight[:2] + 2),
+                            ("v", self.weight[:2] + 4),
+                        )
+                        for shard, weight in pieces:
+                            layer.weight.weight_loader(layer.weight, weight, shard)
+                        expected = torch.cat(
+                            (self.weight.chunk(size)[rank], pieces[1][1], pieces[2][1])
+                        )
+                        self.assertEqual((layer.kv_tp_rank, layer.kv_tp_size), (0, 1))
+                    elif isinstance(
+                        layer,
+                        (
+                            MergedColumnParallelLinear,
+                            MergedColumnParallelRepeatedLinear,
+                        ),
+                    ):
+                        pieces = [self.weight, self.weight[:4] + 2]
+                        if isinstance(layer, MergedColumnParallelRepeatedLinear):
+                            pieces.append(self.weight[:2] + 4)
+                        for shard, weight in enumerate(pieces):
+                            layer.weight.weight_loader(layer.weight, weight, shard)
+                        expected = torch.cat(
+                            [
+                                weight.chunk(size)[rank] if i < 2 else weight
+                                for i, weight in enumerate(pieces)
+                            ]
+                        )
+                    else:
+                        expected = self.weight.chunk(size)[rank]
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                    torch.testing.assert_close(layer.weight, expected)
 
 
 if __name__ == "__main__":

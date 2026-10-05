@@ -1,6 +1,5 @@
 """Custom projections retain frozen checkpoint shards and native math."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -93,23 +92,7 @@ def load_projection(layer):
 
 
 def build_batch(group=None, *, width=16, linearized=False, execution_group=None):
-    kwargs = {}
-    if group is not None:
-        if (
-            "parallel_group"
-            in inspect.signature(dense_mlp.InklingBatchDenseMLP).parameters
-        ):
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            rank, size = (
-                (0, 1)
-                if group == "replicated"
-                else (parallel.attn_tp_rank, parallel.attn_tp_size)
-                if group == "attn_tp"
-                else (parallel.tp_rank, parallel.tp_size)
-            )
-            kwargs.update(tp_rank=rank, tp_size=size)
+    kwargs = {} if group is None else dict(parallel_group=group)
     return dense_mlp.InklingBatchDenseMLP(
         2,
         width,
@@ -159,18 +142,7 @@ def batch_reference(x, gamma, shards):
 
 
 def build_values(group="attn_tp", *, width=16):
-    kwargs = dict(parallel_group=group)
-    if "parallel_group" not in inspect.signature(mova.RoutedValueExperts).parameters:
-        parallel = get_parallel()
-        rank, size = (
-            (0, 1)
-            if group == "replicated"
-            else (parallel.attn_tp_rank, parallel.attn_tp_size)
-            if group == "attn_tp"
-            else (parallel.tp_rank, parallel.tp_size)
-        )
-        kwargs = dict(tp_rank=rank, tp_size=size)
-    return mova.RoutedValueExperts(2, width, width, **kwargs)
+    return mova.RoutedValueExperts(2, width, width, parallel_group=group)
 
 
 def load_values(module, rank, size):

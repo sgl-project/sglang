@@ -1,6 +1,5 @@
 """Dense MLP placement stays frozen while reduction uses its own policy."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -44,18 +43,7 @@ def build_mlp(
             use_global_scale=True, layer_id=0, fused=fused, tp_group=execution_group
         )
     if group is not None:
-        if "parallel_group" in inspect.signature(cls).parameters:
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            rank, size = (
-                (0, 1)
-                if group == "replicated"
-                else (parallel.attn_tp_rank, parallel.attn_tp_size)
-                if group == "attn_tp"
-                else (parallel.tp_rank, parallel.tp_size)
-            )
-            kwargs.update(tp_rank=rank, tp_size=size)
+        kwargs["parallel_group"] = group
     with patch.object(dense_mlp, "lora_compatible_layout_enabled", return_value=lora):
         module = cls(**kwargs)
     return module

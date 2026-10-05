@@ -109,26 +109,10 @@ def resolve_linear_parallel_group(
 
 def _resolve_linear_partition(
     parallel_group: Optional[LinearParallelGroup],
-    tp_rank: Optional[int],
-    tp_size: Optional[int],
 ) -> Tuple[int, int]:
-    """Resolve a layer's partition in its construction scope.
-
-    Explicit integers remain available for layouts that do not correspond to a
-    process group. A group selection and explicit integers cannot be combined.
-    The returned values belong to the layer, including during later reloads.
-    """
-    if parallel_group is not None:
-        if tp_rank is not None or tp_size is not None:
-            raise ValueError(
-                "parallel_group cannot be combined with tp_rank or tp_size"
-            )
-        return resolve_linear_parallel_group(parallel_group)
-    if tp_rank is None:
-        tp_rank = get_parallel().tp_rank
-    if tp_size is None:
-        tp_size = get_parallel().tp_size
-    return tp_rank, tp_size
+    return resolve_linear_parallel_group(
+        "tp" if parallel_group is None else parallel_group
+    )
 
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -403,7 +387,6 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: list of output sizes packed into one output, like for QKV
                        the list would be size 3.
         parallel_group: Select TP, attention TP, or an unsharded partition.
-                        Mutually exclusive with explicit tp_rank and tp_size.
         prefix: The name of the layer in the state dict, including all parents
                         (e.g. model.layers.0.qkv_proj)
     """
@@ -419,13 +402,48 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
-        *,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
+        self._initialize_partition(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            gather_output=gather_output,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=output_sizes,
+            prefix=prefix,
+            use_presharded_weights=use_presharded_weights,
+            skip_block_quant_check=skip_block_quant_check,
+            parallel_group=parallel_group,
+            partition=_resolve_linear_partition(parallel_group),
+        )
+
+    def _initialize_partition(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        gather_output: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        output_sizes: Optional[List[int]] = None,
+        prefix: str = "",
+        *,
+        partition: Tuple[int, int],
+        use_presharded_weights: bool = False,
+        skip_block_quant_check: bool = False,
+        parallel_group: Optional[LinearParallelGroup] = None,
+    ):
+        # Packed subclasses pass their already frozen layout through unchanged.
+        self.tp_rank, self.tp_size = partition
+        self.parallel_group = parallel_group
+        tp_rank, tp_size = partition
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
@@ -435,9 +453,6 @@ class ColumnParallelLinear(LinearBase):
         self.use_presharded_weights = use_presharded_weights
 
         # Divide the weight matrix along the last dimension.
-        tp_rank, tp_size = _resolve_linear_partition(parallel_group, tp_rank, tp_size)
-        self.parallel_group = parallel_group
-        self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -637,19 +652,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
-        use_presharded_weights: bool = False,
         *,
+        use_presharded_weights: bool = False,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
         self.with_bias = bias
         self.output_sizes = output_sizes
-        tp_rank, tp_size = _resolve_linear_partition(parallel_group, tp_rank, tp_size)
+        partition = _resolve_linear_partition(parallel_group)
+        tp_rank, tp_size = partition
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
-        super().__init__(
+        super()._initialize_partition(
             input_size=input_size,
             output_size=sum(output_sizes),
             bias=bias,
@@ -658,11 +672,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            partition=partition,
+            parallel_group=parallel_group,
             use_presharded_weights=use_presharded_weights,
         )
-        self.parallel_group = parallel_group
         self.prefix = prefix
 
     def weight_loader(
@@ -1069,14 +1082,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
-        kv_tp_rank: Optional[int] = None,
-        kv_tp_size: Optional[int] = None,
-        *,
         parallel_group: Optional[LinearParallelGroup] = None,
         kv_parallel_group: Optional[LinearParallelGroup] = None,
     ):
@@ -1089,17 +1098,14 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        tp_rank, tp_size = _resolve_linear_partition(parallel_group, tp_rank, tp_size)
+        partition = _resolve_linear_partition(parallel_group)
+        tp_rank, tp_size = partition
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        if kv_parallel_group is not None:
-            kv_tp_rank, kv_tp_size = _resolve_linear_partition(
-                kv_parallel_group, kv_tp_rank, kv_tp_size
-            )
-        else:
-            if kv_tp_rank is None:
-                kv_tp_rank = tp_rank
-            if kv_tp_size is None:
-                kv_tp_size = tp_size
+        kv_tp_rank, kv_tp_size = (
+            resolve_linear_parallel_group(kv_parallel_group)
+            if kv_parallel_group is not None
+            else partition
+        )
         self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if kv_tp_size >= self.total_num_kv_heads:
@@ -1125,7 +1131,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.use_presharded_weights = load_presharded_attn
         quant_config = None if _disable_hip_linear_quant else quant_config
 
-        super().__init__(
+        super()._initialize_partition(
             input_size=input_size,
             output_size=output_size,
             bias=bias,
@@ -1134,12 +1140,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            partition=partition,
+            parallel_group=parallel_group,
             use_presharded_weights=self.use_presharded_weights,
             skip_block_quant_check=skip_block_quant_check,
         )
-        self.parallel_group = parallel_group
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -1534,7 +1539,6 @@ class RowParallelLinear(LinearBase):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
         parallel_group: Select TP, attention TP, or an unsharded weight partition.
-                        Mutually exclusive with explicit tp_rank and tp_size.
                         Reduction and allocation policies remain independent.
     """
 
@@ -1549,13 +1553,13 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
-        *,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
+        self.tp_rank, self.tp_size = _resolve_linear_partition(parallel_group)
+        self.parallel_group = parallel_group
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -1564,12 +1568,9 @@ class RowParallelLinear(LinearBase):
         self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
-        self.parallel_group = parallel_group
         self.use_dp_attention_reduce = use_dp_attention_reduce
 
         # Divide the weight matrix along the last dimension.
-        tp_rank, tp_size = _resolve_linear_partition(parallel_group, tp_rank, tp_size)
-        self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1823,10 +1824,11 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
+        self.tp_rank, self.tp_size = _resolve_linear_partition(parallel_group)
+        self.parallel_group = parallel_group
         output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
         super().__init__(
             input_size=input_size,
@@ -1837,9 +1839,6 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        self.tp_rank, self.tp_size = _resolve_linear_partition(
-            parallel_group, tp_rank, tp_size
-        )
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1894,14 +1893,11 @@ class ColumnParallelBatchedLinear(nn.Module):
         input_size: int,
         output_size: int,
         dtype: torch.dtype,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
-        self.tp_rank, self.tp_size = _resolve_linear_partition(
-            parallel_group, tp_rank, tp_size
-        )
+        self.tp_rank, self.tp_size = _resolve_linear_partition(parallel_group)
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

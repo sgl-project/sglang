@@ -234,7 +234,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
         )
         with self.assertRaises(AssertionError):
             linear.resolve_linear_parallel_group(ReplicatedParallelGroup("tp", 3))
-        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
             linear.QKVParallelLinear(8, 2, 8, 4, kv_parallel_group="tp", kv_tp_size=4)
 
 

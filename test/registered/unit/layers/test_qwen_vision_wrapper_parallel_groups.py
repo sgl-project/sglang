@@ -1,6 +1,5 @@
 """Qwen vision wrappers and generation helpers retain their placement policies."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -24,19 +23,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def group_kwargs(cls, group):
-    if group is None:
-        return {}
-    if "parallel_group" in inspect.signature(cls).parameters:
-        return dict(parallel_group=group)
-    p = get_parallel()
-    rank, size = (
-        (0, 1)
-        if group == "replicated"
-        else (p.tp_rank, p.tp_size)
-        if group == "tp"
-        else (p.attn_tp_rank, p.attn_tp_size)
-    )
-    return dict(tp_rank=rank, tp_size=size)
+    return {} if group is None else dict(parallel_group=group)
 
 
 def build_qwen(model, group=None, *, replicated=False, width=32, quant_config=None):

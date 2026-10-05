@@ -1,6 +1,5 @@
 """Kimi dense and shared MLPs freeze placement without changing row policy."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -21,22 +20,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def build_mlp(group=None, *, width=16, quant_config=None, reduce=True):
-    kwargs = {}
-    if group is not None:
-        if "parallel_group" in inspect.signature(kimi_k3.KimiK3MLP).parameters:
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            if group == "replicated":
-                rank, size = 0, 1
-            elif group == "shared_experts_tp":
-                rank = parallel.shared_experts_tp_group.rank_in_group
-                size = parallel.shared_experts_tp_group.world_size
-            elif group == "attn_tp":
-                rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-            else:
-                rank, size = parallel.tp_rank, parallel.tp_size
-            kwargs.update(tp_rank=rank, tp_size=size)
+    kwargs = {} if group is None else dict(parallel_group=group)
     return kimi_k3.KimiK3MLP(
         width,
         2 * width,

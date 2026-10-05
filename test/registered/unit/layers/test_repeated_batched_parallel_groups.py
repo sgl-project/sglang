@@ -1,6 +1,5 @@
 """Repeated and batched projections retain native checkpoint partitions."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -167,13 +166,7 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                 linear.MergedColumnParallelRepeatedLinear,
                 linear.ColumnParallelBatchedLinear,
             ):
-                kwargs = {}
-                if group is not None:
-                    kwargs = (
-                        dict(parallel_group=group)
-                        if "parallel_group" in inspect.signature(cls).parameters
-                        else dict(tp_rank=rank, tp_size=size)
-                    )
+                kwargs = {} if group is None else dict(parallel_group=group)
                 layer = (
                     cls(8, [16, 8], [4], **kwargs)
                     if cls is linear.MergedColumnParallelRepeatedLinear
