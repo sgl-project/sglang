@@ -20,6 +20,7 @@ use serde_json::{json, Number, Value};
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
+const COMPLETIONS_PATH: &str = "/v1/completions";
 const GENERATE_PATH: &str = "/generate";
 pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
@@ -60,15 +61,57 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        // Validate configured sampling rules and collect missing defaults for forwarding.
-        let sampling_defaults =
-            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
         let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
             ForwardingScope::Never
         } else {
             ctx.tokenizers.forwarding_scope(&model.0)
         };
-        let can_forward_input_ids = forwarding_scope != ForwardingScope::Never;
+        let scope = Some(forwarding_scope);
+        Self::openai(
+            ctx,
+            CHAT_PATH,
+            model,
+            fields,
+            body,
+            policy_needs_request_tokens,
+            scope,
+        )
+    }
+
+    /// OpenAI completions: chat's sampling and routing, with the prompt forwarded as sent.
+    pub(super) fn completion(
+        ctx: &AppContext,
+        model: ModelId,
+        fields: RoutingFields,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+    ) -> Result<Self, ApiError> {
+        let needs_tokens = policy_needs_request_tokens;
+        Self::openai(
+            ctx,
+            COMPLETIONS_PATH,
+            model,
+            fields,
+            body,
+            needs_tokens,
+            None,
+        )
+    }
+
+    fn openai(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        fields: RoutingFields,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+        forwarding_scope: Option<ForwardingScope>,
+    ) -> Result<Self, ApiError> {
+        // Validate configured sampling rules and collect missing defaults for forwarding.
+        let sampling_defaults =
+            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let can_forward_input_ids =
+            forwarding_scope.is_some_and(|scope| scope != ForwardingScope::Never);
         let needs_tokens = should_tokenize_request(
             can_forward_input_ids,
             policy_needs_request_tokens,
@@ -85,7 +128,7 @@ impl PreparedRequest {
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
-            path: CHAT_PATH,
+            path,
             model,
             streaming: fields.stream.unwrap_or(false),
             output_tokens,
@@ -97,7 +140,7 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            forwarding_scope: Some(forwarding_scope),
+            forwarding_scope,
             parsed_body,
             sampling_defaults,
         })

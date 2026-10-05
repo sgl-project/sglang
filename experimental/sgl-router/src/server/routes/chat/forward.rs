@@ -9,8 +9,8 @@ use super::preparation::{
 };
 use crate::discovery::WorkerMode;
 use crate::policies::dp_rank::select_dp_rank;
-use crate::proxy::grpc::GrpcResponse;
-use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
+use crate::proxy::grpc::{EngineRpc, GrpcResponse};
+use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -67,16 +67,30 @@ pub(super) async fn forward_request(
     Ok(response)
 }
 
-/// [`forward_request`] for a gRPC client: the engines are called over gRPC too.
+/// [`forward_request`] for a gRPC client: the engines are called with `rpc`.
 /// The log context is `None` when the request failed before dispatch.
-pub(super) async fn forward_request_grpc(
+pub(super) async fn forward_request_grpc<R: EngineRpc>(
+    rpc: R,
     ctx: &AppContext,
     request: PreparedRequest,
     workers: SelectedWorkers,
     headers: HeaderMap,
     request_started_at: Instant,
-) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
-    match dispatch(Grpc, ctx, request, workers, headers, request_started_at).await {
+) -> (
+    Result<GrpcResponse<R::Reply>, ApiError>,
+    Option<RequestLogContext>,
+) {
+    let transport = Grpc(Arc::new(rpc));
+    match dispatch(
+        transport,
+        ctx,
+        request,
+        workers,
+        headers,
+        request_started_at,
+    )
+    .await
+    {
         Ok(dispatched) => (dispatched.result, Some(dispatched.log_context)),
         Err(error) => (Err(error), None),
     }
@@ -172,7 +186,7 @@ async fn dispatch<T: Transport>(
     let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
-                transport,
+                transport.clone(),
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
@@ -247,7 +261,7 @@ async fn dispatch<T: Transport>(
 }
 
 /// How the selected workers are reached: HTTP clients over HTTP, gRPC clients over gRPC.
-trait Transport: Copy + Send + 'static {
+trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
@@ -340,14 +354,19 @@ impl Transport for Http {
     }
 }
 
-/// Reaches engines through their native `ChatComplete`, the only RPC routed so far.
-#[derive(Clone, Copy)]
-struct Grpc;
+/// Reaches engines through the native RPC the client called.
+struct Grpc<R>(Arc<R>);
 
-impl Transport for Grpc {
-    type Response = GrpcResponse;
+impl<R> Clone for Grpc<R> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
-    fn status(response: &GrpcResponse) -> u16 {
+impl<R: EngineRpc> Transport for Grpc<R> {
+    type Response = GrpcResponse<R::Reply>;
+
+    fn status(response: &Self::Response) -> u16 {
         response.status.as_u16()
     }
 
@@ -358,12 +377,13 @@ impl Transport for Grpc {
         _path: &'static str,
         headers: &HeaderMap,
         body: Bytes,
-        engine_rid: Option<&str>,
+        _engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
-    ) -> Result<GrpcResponse, ApiError> {
+    ) -> Result<Self::Response, ApiError> {
+        // A dropped call aborts the engine request, so the rid needs no abort hook.
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
@@ -375,11 +395,11 @@ impl Transport for Grpc {
                 (Box::new(load_guards), None, None)
             };
         ctx.proxy
-            .chat_complete_grpc(
+            .forward_grpc(
                 worker,
+                &*self.0,
                 headers,
                 body,
-                engine_rid,
                 metrics.streaming,
                 Some(guards),
                 on_first_byte,
@@ -397,19 +417,20 @@ impl Transport for Grpc {
         _path: &'static str,
         headers: HeaderMap,
         body: Bytes,
-    ) -> PrefillFailure<GrpcResponse> {
+    ) -> PrefillFailure<Self::Response> {
         let result = proxy
-            .chat_complete_grpc(
-                &worker, &headers, body, None, false, None, None, None, None, None,
+            .forward_grpc(
+                &worker, &*self.0, &headers, body, false, None, None, None, None, None,
             )
             .await;
         let status = match result {
             Ok(response) if response.status.is_success() => {
-                let chunks: Vec<_> = response.chunks.collect().await;
-                let clean = chunks.iter().all(|chunk| {
-                    chunk
+                let replies: Vec<_> = response.replies.collect().await;
+                let mut scanner = ErrorEventScanner::default();
+                let clean = replies.iter().all(|reply| {
+                    reply
                         .as_ref()
-                        .is_ok_and(|chunk| !sse::is_error_payload(&chunk.json_chunk))
+                        .is_ok_and(|reply| !reply.is_error_event(&mut scanner))
                 });
                 if clean {
                     return None;

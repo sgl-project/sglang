@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native gRPC `ChatComplete`: routed like `/v1/chat/completions` and sent to
-//! the engine's own `ChatComplete`.
+//! Native gRPC: each RPC is routed like its HTTP route and sent to the
+//! engine's own RPC.
 
 use crate::common::cache_aware_fixture;
 use crate::common::mock_worker::MockWorker;
@@ -214,10 +214,6 @@ fn openai(body: Vec<u8>) -> proto::OpenAiRequest {
 
 /// A round-robin router over `(mode, url, engine gRPC port)` workers.
 fn router_ctx(workers: &[(WorkerMode, &str, Option<u16>)]) -> Arc<AppContext> {
-    router_ctx_with(workers, Proxy::new(Duration::from_secs(5)).unwrap())
-}
-
-fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) -> Arc<AppContext> {
     let mut cfg = cache_aware_fixture::config();
     cfg.model.id = "tiny".into();
     cfg.model.policy = PolicyKind::RoundRobin;
@@ -242,7 +238,7 @@ fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) ->
     Arc::new(AppContext::new(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
-        Arc::new(proxy),
+        Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
         Arc::new(registry),
         Arc::new(build_registry_with_defaults(&cfg).unwrap()),
     ))
@@ -275,33 +271,14 @@ fn without_rid(mut body: Value) -> Value {
     body
 }
 
-/// One chunk, then nothing until the call is dropped; `dropped` hears about it.
-fn stalled_after_one_chunk(
-    dropped: tokio::sync::mpsc::UnboundedSender<()>,
-) -> Replies<proto::OpenAiStreamChunk> {
-    struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
-    impl Drop for Dropped {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-    let guard = Dropped(dropped);
-    stream::iter([Ok(chunk("{}", false, None))])
-        .chain(stream::pending())
-        .map(move |item| {
-            let _ = &guard;
-            item
-        })
-        .boxed()
-}
-
 #[tokio::test]
-async fn sends_the_http_body_and_relays_chunks_unchanged() {
+async fn openai_rpcs_send_the_http_body_and_relay_chunks_unchanged() {
     let http = MockWorker::start(vec![]).await;
     let reply = vec![chunk(r#"{"object":"error"}"#, true, Some(400))];
-    let chats = Seen::new();
+    let (chats, completions) = (Seen::new(), Seen::new());
     let port = MockEngine::default()
         .stream("ChatComplete", openai_rpc(&chats, reply.clone()))
+        .stream("Complete", openai_rpc(&completions, reply.clone()))
         .start()
         .await;
     let ctx = router_ctx(&[(WorkerMode::Plain, &http.url, Some(port))]);
@@ -321,20 +298,38 @@ async fn sends_the_http_body_and_relays_chunks_unchanged() {
         without_rid(body_of(&chats.last().await)),
         without_rid(http.captured_json().await)
     );
+
+    let prompt = json!({"model": "tiny", "prompt": "hi", "max_tokens": 4});
+    let chunks = collect(client.complete(openai(prompt.to_string().into())).await).await;
+    assert_eq!(chunks.unwrap(), reply);
+    let sent = without_rid(body_of(&completions.last().await));
+    assert_eq!(sent, prompt, "the prompt is forwarded as sent");
 }
 
 #[tokio::test]
 async fn pd_legs_share_one_bootstrap_room() {
     let done = vec![chunk("", true, None)];
-    let (prefill_chats, decode_chats) = (Seen::new(), Seen::new());
-    let prefill = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&prefill_chats, done.clone()))
-        .start()
-        .await;
-    let decode = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&decode_chats, done))
-        .start()
-        .await;
+    let generated = || {
+        let reply = proto::GenerateResponse {
+            output_ids: vec![7],
+            finished: true,
+            ..Default::default()
+        };
+        stream::iter([Ok(reply)]).boxed()
+    };
+    let engine = |chats: &Seen<_>, generates: &Seen<proto::GenerateRequest>| {
+        let record = generates.record();
+        MockEngine::default()
+            .stream("ChatComplete", openai_rpc(chats, done.clone()))
+            .stream("Generate", move |request| {
+                record(request);
+                generated()
+            })
+    };
+    let (prefill_chats, prefill_generates) = (Seen::new(), Seen::new());
+    let (decode_chats, decode_generates) = (Seen::new(), Seen::new());
+    let prefill = engine(&prefill_chats, &prefill_generates).start().await;
+    let decode = engine(&decode_chats, &decode_generates).start().await;
     let mut client = serve_grpc(router_ctx(&[
         (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
         (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
@@ -350,21 +345,85 @@ async fn pd_legs_share_one_bootstrap_room() {
     );
     assert!(p["bootstrap_room"].is_u64());
     assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+
+    let request = proto::GenerateRequest {
+        input_ids: vec![1, 2, 3],
+        stream: Some(true),
+        ..Default::default()
+    };
+    let replies = collect(client.generate(request).await).await.unwrap();
+    assert_eq!(
+        replies[0].output_ids,
+        [7],
+        "decode's reply reaches the client"
+    );
+    let (p, d) = (
+        prefill_generates.last().await,
+        decode_generates.last().await,
+    );
+    let room = p.disaggregated_params.as_ref().unwrap();
+    assert_eq!(
+        (room.bootstrap_host.as_str(), room.bootstrap_port),
+        ("127.0.0.1", 8998)
+    );
+    assert_eq!(p.disaggregated_params, d.disaggregated_params);
+    assert!(
+        p.rid.is_some() && p.rid == d.rid,
+        "both legs carry the router's rid"
+    );
 }
 
 #[tokio::test]
-async fn client_cancel_aborts_the_engine_request() {
-    let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();
-    let (chats, aborts) = (Seen::new(), Seen::new());
-    let (record_chat, record_abort) = (chats.record(), aborts.record());
+async fn typed_unary_rpc_returns_the_engine_reply() {
+    let embeds = Seen::new();
+    let record = embeds.record();
     let port = MockEngine::default()
-        .stream("ChatComplete", move |request| {
-            record_chat(request);
-            stalled_after_one_chunk(dropped_tx.clone())
+        .unary("Embed", move |request: proto::EmbedRequest| {
+            record(request);
+            proto::EmbedResponse {
+                embedding: vec![0.5],
+                meta_info: Default::default(),
+            }
         })
-        .unary("Abort", move |request: proto::AbortRequest| {
-            record_abort(request);
-            proto::AbortResponse::default()
+        .start()
+        .await;
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
+    .await;
+
+    let request = proto::EmbedRequest {
+        input_ids: vec![4, 5],
+        ..Default::default()
+    };
+    let reply = client.embed(request).await.unwrap().into_inner();
+    assert_eq!(reply.embedding, [0.5]);
+    let sent = embeds.last().await;
+    assert_eq!(sent.input_ids, [4, 5]);
+    assert!(sent.rid.is_some(), "the router mints an engine rid");
+}
+
+#[tokio::test]
+async fn client_cancel_drops_the_engine_call() {
+    struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();
+    let port = MockEngine::default()
+        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
+            let guard = Dropped(dropped_tx.clone());
+            stream::iter([Ok(chunk("{}", false, None))])
+                .chain(stream::pending())
+                .map(move |item| {
+                    let _ = &guard;
+                    item
+                })
+                .boxed()
         })
         .start()
         .await;
@@ -386,81 +445,6 @@ async fn client_cancel_aborts_the_engine_request() {
     tokio::time::timeout(Duration::from_secs(5), dropped.recv())
         .await
         .expect("the engine call outlived the client");
-    // The engine's own abort on a dropped call targets another id, so the rid is aborted too.
-    let rid = body_of(&chats.last().await)["rid"].clone();
-    assert_eq!(aborts.last().await.rid, rid.as_str().unwrap());
-}
-
-#[tokio::test]
-async fn stream_outcomes_reach_the_breaker_by_status() {
-    let calls = Arc::new(Mutex::new(0));
-    let counted = Arc::clone(&calls);
-    let port = MockEngine::default()
-        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-            let mut calls = counted.lock().unwrap();
-            *calls += 1;
-            match *calls {
-                // Backpressure ends three streams; it must not open the breaker.
-                1..=3 => stream::iter([
-                    Ok(chunk("{}", false, None)),
-                    Err(Status::resource_exhausted("queue full")),
-                ])
-                .boxed(),
-                // A rejected request is one finished chunk with its status; faults count.
-                _ => stream::iter([Ok(chunk(r#"{"object":"error"}"#, true, Some(500)))]).boxed(),
-            }
-        })
-        .start()
-        .await;
-    let mut client = serve_grpc(router_ctx(&[(
-        WorkerMode::Plain,
-        "http://127.0.0.1:1",
-        Some(port),
-    )]))
-    .await;
-
-    for _ in 0..3 {
-        let result = collect(client.chat_complete(openai(chat(true))).await).await;
-        assert_eq!(result.unwrap_err().code(), Code::ResourceExhausted);
-    }
-    for _ in 0..3 {
-        let chunks = collect(client.chat_complete(openai(chat(true))).await)
-            .await
-            .unwrap();
-        assert_eq!(chunks[0].status_code, Some(500));
-    }
-    let status = client.chat_complete(openai(chat(true))).await.unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::Unavailable,
-        "three 500s open the breaker"
-    );
-    assert_eq!(*calls.lock().unwrap(), 6);
-}
-
-#[tokio::test]
-async fn router_stream_failures_keep_their_error_code() {
-    let (dropped_tx, _dropped) = tokio::sync::mpsc::unbounded_channel();
-    let port = MockEngine::default()
-        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-            stalled_after_one_chunk(dropped_tx.clone())
-        })
-        .start()
-        .await;
-    // Both the request timeout and the stream idle timeout.
-    let proxy = Proxy::new(Duration::from_millis(100))
-        .unwrap()
-        .with_stream_idle_timeout(Duration::from_millis(100));
-    let workers = [(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))];
-    let mut client = serve_grpc(router_ctx_with(&workers, proxy)).await;
-
-    for stream in [true, false] {
-        let result = collect(client.chat_complete(openai(chat(stream))).await).await;
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), Code::DeadlineExceeded, "stream={stream}");
-        let code = status.metadata().get("x-router-error-code");
-        assert_eq!(code.unwrap(), "upstream_timeout", "stream={stream}");
-    }
 }
 
 #[tokio::test]

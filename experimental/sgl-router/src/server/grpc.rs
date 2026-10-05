@@ -5,11 +5,12 @@
 //! served so a gRPC client can point at the router or at an engine. Each served
 //! RPC is routed like its HTTP route and forwarded to the same RPC on an engine.
 
-use crate::proxy::grpc::ChunkStream;
+use crate::proxy::grpc::{GrpcResponse, OpenAiRpc, OpenAiUnaryRpc, Replies};
 use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
+use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::{chat_completions_grpc, MAX_CHAT_BODY_BYTES};
+use crate::server::routes::chat::{route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES};
 use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
@@ -18,13 +19,12 @@ use sglang_grpc_types::sglang::runtime::v1 as proto;
 use sglang_grpc_types::sglang::runtime::v1::sglang_service_server::{
     SglangService, SglangServiceServer,
 };
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
-
-const CHAT_COMPLETE_ROUTE: &str = "/sglang.runtime.v1.SglangService/ChatComplete";
 
 type RpcResult<T> = Result<Response<T>, Status>;
 type Unserved<T> = futures::stream::Empty<Result<T, Status>>;
@@ -58,14 +58,17 @@ struct RouterGrpc {
     ctx: Arc<AppContext>,
 }
 
+type Routed<T> = (Result<GrpcResponse<T>, ApiError>, Option<RequestLogContext>);
+
 /// Client metadata plus `trace_headers`, which the engine reads as request
 /// headers, so header-driven routing (sticky keys, sessions, SLOs) works as over HTTP.
-fn request_headers(
-    metadata: tonic::metadata::MetadataMap,
-    request: &proto::OpenAiRequest,
-) -> HeaderMap {
+fn request_headers<T>(
+    request: Request<T>,
+    trace_headers: impl Fn(&T) -> &HashMap<String, String>,
+) -> (HeaderMap, T) {
+    let (metadata, _, request) = request.into_parts();
     let mut headers = metadata.into_headers();
-    for (name, value) in &request.trace_headers {
+    for (name, value) in trace_headers(&request) {
         if let (Ok(name), Ok(value)) = (
             HeaderName::try_from(name.as_str()),
             HeaderValue::try_from(value.as_str()),
@@ -73,7 +76,7 @@ fn request_headers(
             headers.insert(name, value);
         }
     }
-    headers
+    (headers, request)
 }
 
 /// The access-log line the HTTP edge middleware writes, for a gRPC call.
@@ -108,38 +111,80 @@ fn log_call(
 }
 
 impl RouterGrpc {
-    async fn chat_complete(
+    /// Run a routed call with the HTTP edge's metrics, in-flight count and access log.
+    async fn finish<T: Send + 'static>(
         &self,
-        request: Request<proto::OpenAiRequest>,
-    ) -> RpcResult<ChunkStream> {
+        rpc: &str,
+        headers: HeaderMap,
+        call: impl Future<Output = Routed<T>>,
+    ) -> Result<Replies<T>, Status> {
         let started = Instant::now();
-        let ctx = &self.ctx;
-        ctx.metrics.record_ingress(CHAT_COMPLETE_ROUTE, "POST");
-        let inflight = ctx.inflight_http.enter();
-        let (metadata, _, request) = request.into_parts();
-        let headers = request_headers(metadata, &request);
-        let (result, log_context) =
-            chat_completions_grpc(ctx, headers.clone(), Bytes::from(request.json_body)).await;
+        let route = format!("/sglang.runtime.v1.SglangService/{rpc}");
+        let metrics = &self.ctx.metrics;
+        metrics.record_ingress(&route, "POST");
+        let inflight = self.ctx.inflight_http.enter();
+        let (result, log_context) = call.await;
         let status = match &result {
             Ok(response) => response.status.as_u16(),
             Err(error) => error.status_code().as_u16(),
         };
-        ctx.metrics
-            .record_response(CHAT_COMPLETE_ROUTE, "POST", status);
-        log_call(
-            CHAT_COMPLETE_ROUTE,
-            &headers,
-            status,
-            log_context.as_ref(),
-            started,
-        );
-        let chunks = result.map_err(|error| error.into_grpc_status())?.chunks;
+        metrics.record_response(&route, "POST", status);
+        log_call(&route, &headers, status, log_context.as_ref(), started);
+        let replies = result.map_err(ApiError::into_grpc_status)?.replies;
         // Counted until the client's stream ends, as an HTTP body is.
-        let chunks = chunks.map(move |chunk| {
-            let _ = &inflight;
-            chunk
-        });
-        Ok(Response::new(Box::pin(chunks)))
+        Ok(replies
+            .map(move |reply| {
+                let _ = &inflight;
+                reply
+            })
+            .boxed())
+    }
+
+    /// [`Self::finish`] for a unary RPC, whose one reply the engine sent.
+    async fn finish_unary<T: Send + 'static>(
+        &self,
+        rpc: &str,
+        headers: HeaderMap,
+        call: impl Future<Output = Routed<T>>,
+    ) -> RpcResult<T> {
+        let mut replies = self.finish(rpc, headers, call).await?;
+        let reply = replies.next().await;
+        reply
+            .unwrap_or_else(|| Err(Status::internal("the engine sent no reply")))
+            .map(Response::new)
+    }
+
+    async fn openai(
+        &self,
+        rpc: OpenAiRpc,
+        endpoint: Endpoint,
+        request: Request<proto::OpenAiRequest>,
+    ) -> RpcResult<Replies<proto::OpenAiStreamChunk>> {
+        let (headers, request) = request_headers(request, |r| &r.trace_headers);
+        let body = Bytes::from(request.json_body);
+        let call = route_grpc(&self.ctx, endpoint, rpc, headers.clone(), body);
+        let name = match rpc {
+            OpenAiRpc::ChatComplete => "ChatComplete",
+            OpenAiRpc::Complete => "Complete",
+        };
+        self.finish(name, headers, call).await.map(Response::new)
+    }
+
+    async fn openai_unary(
+        &self,
+        rpc: OpenAiUnaryRpc,
+        endpoint: Endpoint,
+        request: Request<proto::OpenAiRequest>,
+    ) -> RpcResult<proto::OpenAiResponse> {
+        let (headers, request) = request_headers(request, |r| &r.trace_headers);
+        let body = Bytes::from(request.json_body);
+        let call = route_grpc(&self.ctx, endpoint, rpc, headers.clone(), body);
+        let name = match rpc {
+            OpenAiUnaryRpc::Embed => "OpenAIEmbed",
+            OpenAiUnaryRpc::Classify => "OpenAIClassify",
+            OpenAiUnaryRpc::Rerank => "Rerank",
+        };
+        self.finish_unary(name, headers, call).await
     }
 }
 
@@ -169,17 +214,62 @@ macro_rules! sglang_service {
     };
 }
 
+/// A typed RPC: prepared through the JSON its HTTP sibling reads, then sent as typed.
+macro_rules! typed {
+    ($self:ident, $request:ident, $endpoint:ident, $rpc:literal, $finish:ident) => {{
+        let (headers, request) = request_headers($request, |r| &r.trace_headers);
+        let call = route_typed(&$self.ctx, Endpoint::$endpoint, request, headers.clone());
+        $self.$finish($rpc, headers, call).await
+    }};
+}
+
 sglang_service! {
     served {
-        type ChatCompleteStream = ChunkStream;
-        async fn chat_complete(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<ChunkStream> {
-            RouterGrpc::chat_complete(self, request).await
+        type ChatCompleteStream = Replies<proto::OpenAiStreamChunk>;
+        async fn chat_complete(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<Self::ChatCompleteStream> {
+            self.openai(OpenAiRpc::ChatComplete, Endpoint::Chat, request).await
+        }
+
+        type CompleteStream = Replies<proto::OpenAiStreamChunk>;
+        async fn complete(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<Self::CompleteStream> {
+            self.openai(OpenAiRpc::Complete, Endpoint::Completions, request).await
+        }
+
+        type GenerateStream = Replies<proto::GenerateResponse>;
+        async fn generate(&self, request: Request<proto::GenerateRequest>) -> RpcResult<Self::GenerateStream> {
+            typed!(self, request, Generate, "Generate", finish).map(Response::new)
+        }
+
+        type TextGenerateStream = Replies<proto::TextGenerateResponse>;
+        async fn text_generate(&self, request: Request<proto::TextGenerateRequest>) -> RpcResult<Self::TextGenerateStream> {
+            typed!(self, request, Generate, "TextGenerate", finish).map(Response::new)
+        }
+
+        async fn embed(&self, request: Request<proto::EmbedRequest>) -> RpcResult<proto::EmbedResponse> {
+            typed!(self, request, Embeddings, "Embed", finish_unary)
+        }
+
+        async fn text_embed(&self, request: Request<proto::TextEmbedRequest>) -> RpcResult<proto::TextEmbedResponse> {
+            typed!(self, request, Embeddings, "TextEmbed", finish_unary)
+        }
+
+        async fn classify(&self, request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
+            typed!(self, request, Classify, "Classify", finish_unary)
+        }
+
+        async fn open_ai_embed(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<proto::OpenAiResponse> {
+            self.openai_unary(OpenAiUnaryRpc::Embed, Endpoint::Embeddings, request).await
+        }
+
+        async fn open_ai_classify(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<proto::OpenAiResponse> {
+            self.openai_unary(OpenAiUnaryRpc::Classify, Endpoint::Classify, request).await
+        }
+
+        async fn rerank(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<proto::OpenAiResponse> {
+            self.openai_unary(OpenAiUnaryRpc::Rerank, Endpoint::Rerank, request).await
         }
     }
     unserved {
-        text_embed(TextEmbedRequest) -> TextEmbedResponse;
-        embed(EmbedRequest) -> EmbedResponse;
-        classify(ClassifyRequest) -> ClassifyResponse;
         tokenize(TokenizeRequest) -> TokenizeResponse;
         detokenize(DetokenizeRequest) -> DetokenizeResponse;
         health_check(HealthCheckRequest) -> HealthCheckResponse;
@@ -191,18 +281,12 @@ sglang_service! {
         flush_cache(FlushCacheRequest) -> FlushCacheResponse;
         pause_generation(PauseGenerationRequest) -> PauseGenerationResponse;
         continue_generation(ContinueGenerationRequest) -> ContinueGenerationResponse;
-        open_ai_embed(OpenAiRequest) -> OpenAiResponse;
-        open_ai_classify(OpenAiRequest) -> OpenAiResponse;
         score(OpenAiRequest) -> OpenAiResponse;
-        rerank(OpenAiRequest) -> OpenAiResponse;
         start_profile(StartProfileRequest) -> StartProfileResponse;
         stop_profile(StopProfileRequest) -> StopProfileResponse;
         update_weights_from_disk(UpdateWeightsRequest) -> UpdateWeightsResponse;
     }
     unserved_streams {
-        text_generate(TextGenerateRequest) -> TextGenerateStream<TextGenerateResponse>;
-        generate(GenerateRequest) -> GenerateStream<GenerateResponse>;
-        complete(OpenAiRequest) -> CompleteStream<OpenAiStreamChunk>;
         watch_engine_state(WatchEngineStateRequest) -> WatchEngineStateStream<EngineStateSnapshot>;
     }
 }
