@@ -2305,6 +2305,9 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         "get_self_pp_group",
         "get_default_distributed_backend",
         "get_mooncake_transfer_engine",
+        # Actual duplicate-communicator lifecycle state, not configured topology:
+        # neither get_parallel() nor a config bag says whether it was created.
+        "is_pdmux_enabled",
     }
 
     def _accessors(self):

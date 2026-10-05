@@ -54,6 +54,7 @@ from sglang.srt.models.dspark import (
     run_markov_block,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
     get_platform,
 )
@@ -846,6 +847,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
             and torch.cuda.is_available()
+            # Ordinary helper streams would escape the current lane's green
+            # context during both graph capture and eager draft execution.
+            and not get_disagg().enable_pdmux
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None

@@ -487,7 +487,10 @@ def capture_prefill_graph(
     # Draft models skip here during __init__; the eagle worker calls
     # this method explicitly (force_for_draft_worker=True) after
     # init_lm_head so graphs capture the final embedding weights.
-    if model_runner.is_draft_worker and not force_for_draft_worker:
+    if model_runner.is_draft_worker and (
+        not force_for_draft_worker
+        or (model_runner.spec_algorithm.is_eagle() and get_disagg().enable_pdmux)
+    ):
         return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server

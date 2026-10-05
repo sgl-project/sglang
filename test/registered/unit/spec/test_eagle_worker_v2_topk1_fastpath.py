@@ -229,7 +229,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(
-                    model_runner=SimpleNamespace(attn_backend=attn_backend)
+                    model_runner=SimpleNamespace(
+                        attn_backend=attn_backend,
+                        get_decode_attn_backend=lambda: attn_backend,
+                    )
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),

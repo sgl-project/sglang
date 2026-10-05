@@ -643,6 +643,7 @@ class PrefillAdder:
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
+        enforce_max_prefill_tokens: bool = False,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
@@ -755,6 +756,7 @@ class PrefillAdder:
             else self.page_size
         )
         self.prefill_max_requests = prefill_max_requests
+        self.enforce_max_prefill_tokens = enforce_max_prefill_tokens
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
         # Snapshot of scheduler waiting_queue length at the start of this
@@ -1216,6 +1218,11 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
+    def _prefill_token_budget_exceeded(self, input_tokens: int) -> bool:
+        if self.enforce_max_prefill_tokens:
+            return input_tokens > self.rem_input_tokens
+        return bool(self.can_run_list) and input_tokens >= self.rem_input_tokens
+
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -1223,6 +1230,8 @@ class PrefillAdder:
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
+        if self._prefill_token_budget_exceeded(paged_input):
+            return AddReqResult.OTHER
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
@@ -1550,10 +1559,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Without chunking, allow the first request even above the input cap.
-        if (
-            self.rem_chunk_tokens is None
-            and self.can_run_list
-            and input_tokens >= self.rem_input_tokens
+        if self.rem_chunk_tokens is None and self._prefill_token_budget_exceeded(
+            input_tokens
         ):
             return AddReqResult.OTHER
 
