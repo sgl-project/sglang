@@ -364,9 +364,9 @@ class SchedulerInvariantChecker:
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 
-        def _add_owner(req_or_slot, label, rpi, committed, allocated):
-            assert 0 <= committed <= allocated <= row_width
-            owners.append((label, rpi, allocated))
+        def _add_owner(label, kv):
+            assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
+            owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []
         batch = self.get_last_batch()
@@ -374,22 +374,10 @@ class SchedulerInvariantChecker:
             for req in batch.reqs:
                 if not req.kv.holds_kv or self.tree_cache.session_owns_record(req):
                     continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.kv.req_pool_idx,
-                    req.kv.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
+                _add_owner(f"req {req.rid}", req.kv)
         for sid, kv in self.tree_cache.session_records().items():
             if kv.holds_kv:
-                _add_owner(
-                    kv,
-                    f"slot {sid[:8]}",
-                    kv.req_pool_idx,
-                    kv.kv_committed_len,
-                    kv.kv_allocated_len,
-                )
+                _add_owner(f"slot {sid[:8]}", kv)
 
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
