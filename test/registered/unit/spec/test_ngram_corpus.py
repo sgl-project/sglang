@@ -1,8 +1,10 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -898,6 +900,92 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             any(4 in path or 5 in path for path in leaf_paths),
             f"Expected tokens from corpus 'a' in {leaf_paths}",
         )
+
+    def test_remove_pending_corpus_is_rejected_until_commit(self):
+        """Pending loads must reject removal until the scheduler commits their budget."""
+        from sglang.srt.managers.io_struct import (
+            AddExternalCorpusReqInput,
+            ListExternalCorporaReqInput,
+            RemoveExternalCorpusReqInput,
+        )
+        from sglang.srt.speculative.external_corpus_manager import ExternalCorpusManager
+
+        for load_finished in (False, True):
+            with self.subTest(load_finished=load_finished):
+                corpus = _make_corpus(external_corpus_max_tokens=10)
+                num_tokens = corpus.load_external_corpus_named("other", [[8, 9]])
+                corpus.commit_external_corpus_load("other", num_tokens)
+                started = threading.Event()
+                release = threading.Event()
+                responses = []
+
+                def blocked_load(corpus_id, token_chunks):
+                    started.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("Timed out waiting to release corpus load")
+                    return corpus.load_external_corpus_named(corpus_id, token_chunks)
+
+                # The model worker only delegates these operations to its CPU corpus.
+                worker = SimpleNamespace(
+                    add_external_corpus=blocked_load,
+                    commit_corpus_load=corpus.commit_external_corpus_load,
+                    remove_external_corpus=corpus.remove_external_corpus,
+                    list_external_corpora=corpus.list_external_corpora,
+                )
+                manager = ExternalCorpusManager(
+                    draft_worker=worker,
+                    send_response=lambda result, req: responses.append((result, req)),
+                )
+                add_req = AddExternalCorpusReqInput(
+                    corpus_id="pending", token_chunks=[[1, 2, 3]]
+                )
+                self.assertIsNone(manager.add(add_req))
+                thread = manager._pending_load[1]
+                try:
+                    self.assertTrue(started.wait(timeout=5))
+                    if load_finished:
+                        release.set()
+                        thread.join(timeout=5)
+                        self.assertFalse(thread.is_alive())
+
+                    result = manager.remove(
+                        RemoveExternalCorpusReqInput(corpus_id="pending")
+                    )
+                    self.assertFalse(result.success)
+                    self.assertIn("pending", result.message)
+                    self.assertIn("Wait", result.message)
+                    self.assertEqual(responses, [])
+
+                    result = manager.remove(
+                        RemoveExternalCorpusReqInput(corpus_id="other")
+                    )
+                    self.assertTrue(result.success)
+                    self.assertNotIn("other", corpus.list_external_corpora())
+
+                    release.set()
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+                    manager.check_pending_load()
+                    self.assertEqual(len(responses), 1)
+                    result, req = responses[0]
+                    self.assertIs(req, add_req)
+                    self.assertTrue(result.success, result.message)
+                    self.assertEqual(result.loaded_token_count, 3)
+                    self.assertEqual(
+                        manager.list(ListExternalCorporaReqInput()).corpus_token_counts,
+                        {"pending": 3},
+                    )
+                    self.assertEqual(corpus.remaining_token_budget, 7)
+
+                    result = manager.remove(
+                        RemoveExternalCorpusReqInput(corpus_id="pending")
+                    )
+                    self.assertTrue(result.success)
+                    self.assertEqual(corpus.list_external_corpora(), {})
+                    self.assertEqual(corpus.remaining_token_budget, 10)
+                finally:
+                    release.set()
+                    thread.join(timeout=5)
 
     def test_error_on_load_preserves_existing_corpora(self):
         """A failed load must not wipe previously loaded corpora (staging-only cleanup)."""
