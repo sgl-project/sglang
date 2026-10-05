@@ -10,6 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -71,6 +72,16 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.flydsl import (
+        flydsl_flash_attn_fp8_func,
+        flydsl_flash_attn_fp8_supported,
+    )
+
+    _FLYDSL_FP8_PREFILL_AVAILABLE = True
+except Exception:  # Optional AITER kernel; absence selects the existing path.
+    _FLYDSL_FP8_PREFILL_AVAILABLE = False
+
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
@@ -102,6 +113,29 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
+
+
+# Experimental FlyDSL dual-wave FP8 prefill. This is independent from the
+# existing ASM PS path so disabling it preserves the old dispatch exactly.
+def _flydsl_fp8_prefill_requested() -> bool:
+    return _use_fp8_prefill_attn and get_bool_env_var(
+        "SGLANG_AITER_FLYDSL_FP8_PREFILL_ATTN", "False"
+    )
+
+
+_use_flydsl_fp8_prefill_attn = _flydsl_fp8_prefill_requested()
+
+_FLYDSL_FP8_QUANT_ROWS_TARGET = 256
+
+
+@cache
+def _flydsl_fp8_quant_rows(num_vectors: int) -> int:
+    """Choose at most 256 rows while preserving complete 16-value vectors."""
+    for rows in range(min(num_vectors, _FLYDSL_FP8_QUANT_ROWS_TARGET), 0, -1):
+        if num_vectors % rows == 0:
+            return rows
+    return 1
+
 
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
 # instantiation. This map is copied from MLA_REDUCE_ROUTER in
@@ -138,17 +172,23 @@ class WrapperDispatch(Enum):
 class MlaPrefillPsMetadata:
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
-    kv_indices: torch.Tensor
-    work_metadata: torch.Tensor
-    work_indptr: torch.Tensor
-    work_info_set: torch.Tensor
-    reduce_indptr: torch.Tensor
-    reduce_final_map: torch.Tensor
-    reduce_partial_map: torch.Tensor
     max_q_len: int
+    max_kv_len: int
     is_causal: bool
     need_lse: bool
-    num_partial_tiles: int
+    qo_indptr_cpu: torch.Tensor
+    kv_indptr_cpu: torch.Tensor
+    kv_lens_cpu: torch.Tensor
+    num_kv_tokens: int
+    exact_partial_count: bool
+    kv_indices: Optional[torch.Tensor] = None
+    work_metadata: Optional[torch.Tensor] = None
+    work_indptr: Optional[torch.Tensor] = None
+    work_info_set: Optional[torch.Tensor] = None
+    reduce_indptr: Optional[torch.Tensor] = None
+    reduce_final_map: Optional[torch.Tensor] = None
+    reduce_partial_map: Optional[torch.Tensor] = None
+    num_partial_tiles: int = 0
 
 
 @dataclass
@@ -391,12 +431,32 @@ class AiterAttnBackend(AttentionBackend):
         self.use_fp8_prefill_attn = (
             _use_fp8_prefill_attn and self.fp8_prefill_num_head is not None
         )
+        self.use_asm_fp8_prefill_attn = self.use_fp8_prefill_attn
+        self.use_flydsl_fp8_prefill_attn = (
+            _use_flydsl_fp8_prefill_attn
+            and _FLYDSL_FP8_PREFILL_AVAILABLE
+            and self.use_mla
+            and self.input_dtype == torch.bfloat16
+        )
+        if _use_flydsl_fp8_prefill_attn and not self.use_flydsl_fp8_prefill_attn:
+            logger.warning(
+                "SGLANG_AITER_FLYDSL_FP8_PREFILL_ATTN=1 requested, but the "
+                "FlyDSL FP8 prefill backend is unavailable for this model."
+            )
+        if self.use_flydsl_fp8_prefill_attn:
+            # The FlyDSL path uses the same varlen metadata call sites as the
+            # ASM path, but does not inherit mla_reduce_v1's head-count limit.
+            self.use_fp8_prefill_attn = True
+            logger.info(
+                "Enabled experimental AITER FlyDSL dual-wave FP8 MLA prefill "
+                "dispatch; runtime tensor shapes decide support."
+            )
         # Padding is only offered at GQA ratio 1, so the kv side takes the same
         # delta and the ratio the PS metadata is built for stays put.
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
-        if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
+        if self.use_asm_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
                 f"aiter asm fp8 MLA prefill pads {self.num_head} query heads to "
                 f"{self.fp8_prefill_num_head}; mla_reduce_v1 has no "
@@ -1565,6 +1625,20 @@ class AiterAttnBackend(AttentionBackend):
         ps: MlaPrefillPsMetadata,
     ):
         """Run the asm prefill over one PS metadata, returning (out, lse)."""
+        if self.use_flydsl_fp8_prefill_attn and flydsl_flash_attn_fp8_supported(
+            q.device,
+            q.shape[-2],
+            k.shape[-2],
+            q.shape[-1],
+            v.shape[-1],
+            dtype=fp8_dtype,
+        ):
+            return self._mla_flydsl_fp8_prefill_attn(q, k, v, layer, ps)
+
+        if not self.use_asm_fp8_prefill_attn:
+            return self._mla_varlen_prefill_attn(q, k, v, layer, ps)
+
+        self._materialize_asm_prefill_ps_metadata(ps)
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
@@ -1646,6 +1720,84 @@ class AiterAttnBackend(AttentionBackend):
                 output = output.contiguous()
                 final_lse = final_lse[:, : layer.tp_q_head_num].contiguous()
         return output, final_lse
+
+    def _mla_varlen_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        ps: MlaPrefillPsMetadata,
+    ):
+        """Fall back to BF16 varlen attention for unsupported FP8 shapes."""
+        result = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            ps.qo_indptr,
+            ps.kv_indptr,
+            ps.max_q_len,
+            ps.max_kv_len,
+            softmax_scale=layer.scaling,
+            causal=ps.is_causal,
+            return_lse=ps.need_lse,
+        )
+        if not ps.need_lse:
+            return result, None
+        output, lse = result[:2]
+        return output, lse.transpose(0, 1).contiguous()
+
+    def _mla_flydsl_fp8_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        ps: MlaPrefillPsMetadata,
+    ):
+        """Run dual-wave FP8 varlen attention without MLA head padding."""
+
+        def quant_fp8_per_tensor(x: torch.Tensor):
+            x = x.contiguous()
+            numel = x.numel()
+            if numel % 16:
+                raise ValueError(
+                    "FlyDSL FP8 prefill requires Q/K/V sizes divisible by 16"
+                )
+            rows = _flydsl_fp8_quant_rows(numel // 16)
+            x8, descale = scaled_fp8_quant(x.view(rows, numel // rows))
+            return x8.view(x.shape), descale
+
+        q8, q_descale = quant_fp8_per_tensor(q)
+        k8, k_descale = quant_fp8_per_tensor(k)
+        v8, v_descale = quant_fp8_per_tensor(v)
+        result = flydsl_flash_attn_fp8_func(
+            q8,
+            k8,
+            v8,
+            softmax_scale=layer.scaling,
+            cu_seqlens_q=ps.qo_indptr,
+            cu_seqlens_kv=ps.kv_indptr,
+            max_seqlen_q=ps.max_q_len,
+            max_seqlen_kv=ps.max_kv_len,
+            cross_seqlen=True,
+            causal=ps.is_causal,
+            return_lse=ps.need_lse,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            stream=None,
+        )
+        if ps.need_lse:
+            output, lse = result
+            # FlyDSL returns LSE as [heads, total_q]; merge_state expects
+            # contiguous [total_q, heads].
+            lse = lse.transpose(0, 1).contiguous()
+        else:
+            output, lse = result, None
+        if output.dtype != self.input_dtype:
+            output = output.to(self.input_dtype)
+        return output, lse
 
     def _kv_index_blocks(self, bs: int) -> int:
         if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
@@ -3037,7 +3189,31 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         exact_partial_count: bool = True,
     ) -> MlaPrefillPsMetadata:
-        """Plan one asm-prefill PS metadata over the key set the caller names."""
+        """Build common varlen metadata and materialize ASM-only maps on demand."""
+        qo_indptr_cpu = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
+        kv_indptr_cpu = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
+        ps = MlaPrefillPsMetadata(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            max_q_len=max_q_len,
+            max_kv_len=int(kv_lens_cpu.max().item()),
+            is_causal=is_causal,
+            need_lse=need_lse,
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_indptr_cpu=kv_indptr_cpu,
+            kv_lens_cpu=kv_lens_cpu,
+            num_kv_tokens=num_kv_tokens,
+            exact_partial_count=exact_partial_count,
+        )
+        if not self.use_flydsl_fp8_prefill_attn:
+            self._materialize_asm_prefill_ps_metadata(ps)
+        return ps
+
+    def _materialize_asm_prefill_ps_metadata(self, ps: MlaPrefillPsMetadata) -> None:
+        """Populate metadata and buffer sizing used only by the ASM PS path."""
+        if ps.work_metadata is not None:
+            return
+
         (
             work_metadata,
             work_indptr,
@@ -3046,26 +3222,26 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
         ) = self.make_mla_prefill_ps_meta_data_buffer(
-            len(kv_lens_cpu), max_q_len, self._prefill_qlen_granularity
+            len(ps.kv_lens_cpu), ps.max_q_len, self._prefill_qlen_granularity
         )
         self.make_mla_prefill_ps_meta_data(
-            qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu,
-            kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu,
-            kv_lens_cpu,
+            ps.qo_indptr_cpu,
+            ps.kv_indptr_cpu,
+            ps.kv_lens_cpu,
             work_metadata,
             work_indptr,
             work_info_set,
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            is_causal=is_causal,
-            need_lse=need_lse,
+            is_causal=ps.is_causal,
+            need_lse=ps.need_lse,
         )
-        if exact_partial_count:
+        if ps.exact_partial_count:
             # One D2H sync per PS metadata, once per forward rather than per
             # layer. get_ps_metadata_v1 already pays several.
             num_partial_tiles = int(reduce_indptr[-1].item())
-            if need_lse:
+            if ps.need_lse:
                 assert num_partial_tiles > 0, (
                     "the scheduler emitted no partial tiles, so mla_reduce_v1 "
                     "would write no LSE for this partition"
@@ -3082,23 +3258,17 @@ class AiterAttnBackend(AttentionBackend):
                 )
         else:
             num_partial_tiles = reduce_partial_map.size(0)
-        return MlaPrefillPsMetadata(
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            # The k/v handed to the kernel are contiguous and in key order, so
-            # the page table is the identity.
-            kv_indices=self._get_arange(num_kv_tokens),
-            work_metadata=work_metadata,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            max_q_len=max_q_len,
-            is_causal=is_causal,
-            need_lse=need_lse,
-            num_partial_tiles=num_partial_tiles,
-        )
+
+        # The k/v handed to the kernel are contiguous and in key order, so the
+        # page table is the identity.
+        ps.kv_indices = self._get_arange(ps.num_kv_tokens)
+        ps.work_metadata = work_metadata
+        ps.work_indptr = work_indptr
+        ps.work_info_set = work_info_set
+        ps.reduce_indptr = reduce_indptr
+        ps.reduce_final_map = reduce_final_map
+        ps.reduce_partial_map = reduce_partial_map
+        ps.num_partial_tiles = num_partial_tiles
 
     def _forward_extend_prefix_chunk(
         self,
