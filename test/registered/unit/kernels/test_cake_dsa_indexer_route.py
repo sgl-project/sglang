@@ -67,12 +67,10 @@ def _ragged_env(*on, supports, forward, capturing=False):
     )
 
 
-def _paged_env(*on, supports, metadata, forward, capturing=False):
+def _paged_env(*on, supports, forward, capturing=False):
     return _stack(
         mock.patch.object(routes, "cake_route_enabled", lambda n: n in on),
-        mock.patch.object(
-            routes, "_cake_paged_kernels", lambda: (supports, metadata, forward)
-        ),
+        mock.patch.object(routes, "_cake_paged_kernels", lambda: (supports, forward)),
         mock.patch.object(routes, "_is_capturing", lambda: capturing),
     )
 
@@ -185,7 +183,7 @@ def test_ragged_shape_first_seen_in_capture_falls_back_then_primes():
 
 
 # ---------------------------------------------------------------------------
-# paged decode / verify site (metadata + fp8_paged_mqa_logits)
+# paged decode / verify site (fp8_paged_mqa_logits, one launch, no metadata call)
 # ---------------------------------------------------------------------------
 
 
@@ -212,17 +210,13 @@ def test_paged_route_off_touches_nothing():
     kernels.assert_not_called()
 
 
-def test_paged_route_on_admitted_builds_cake_metadata_and_forwards(caplog):
+def test_paged_route_on_admitted_forwards_one_launch_without_metadata(caplog):
     caplog.set_level(logging.INFO, logger=routes.logger.name)
     q, kv_cache, weights, ctx, block_table = _paged_inputs()
-    meta = torch.zeros(SMS + 1, 2, dtype=torch.int32)
     out = torch.full((B * NEXT_N, MAX_LEN), 3.0)
     supports = mock.Mock(return_value=True)
-    metadata = mock.Mock(return_value=meta)
     forward = mock.Mock(return_value=out)
-    with _paged_env(
-        "dsa_indexer", supports=supports, metadata=metadata, forward=forward
-    ):
+    with _paged_env("dsa_indexer", supports=supports, forward=forward):
         result = routes.cake_fp8_paged_mqa_logits(
             q, kv_cache, weights, ctx, block_table, MAX_LEN, block_kv=64, num_sms=SMS
         )
@@ -230,12 +224,12 @@ def test_paged_route_on_admitted_builds_cake_metadata_and_forwards(caplog):
     s_args, _ = supports.call_args
     assert s_args[0] is q and s_args[1] is kv_cache and s_args[2] is weights
     assert s_args[3] is ctx and s_args[4] is block_table
-    m_args, m_kw = metadata.call_args
-    assert m_args[0] is ctx and m_args[1:] == (64, SMS) and not m_kw
+    # One forwarder call, no schedule-metadata launch: schedule_meta=None, the CTA budget as sm_count.
+    assert forward.call_count == 1
     args, kw = forward.call_args
     assert args[0] is q and args[1] is kv_cache and args[2] is weights
-    assert args[3] is ctx and args[4] is block_table and args[5] is meta
-    assert args[6] == MAX_LEN and kw == {"clean_logits": False}
+    assert args[3] is ctx and args[4] is block_table and args[5] is None
+    assert args[6] == MAX_LEN and kw == {"clean_logits": False, "sm_count": SMS}
     # The engine's strided [::next_n] block-table view is passed through as is.
     assert block_table.stride(0) == NEXT_N * (MAX_LEN // 64)
     assert (
@@ -248,11 +242,8 @@ def test_paged_route_requires_page_64(caplog):
     caplog.set_level(logging.INFO, logger=routes.logger.name)
     q, kv_cache, weights, ctx, block_table = _paged_inputs()
     supports = mock.Mock(return_value=True)
-    metadata = mock.Mock()
     forward = mock.Mock()
-    with _paged_env(
-        "dsa_indexer", supports=supports, metadata=metadata, forward=forward
-    ):
+    with _paged_env("dsa_indexer", supports=supports, forward=forward):
         assert (
             routes.cake_fp8_paged_mqa_logits(
                 q,
@@ -267,22 +258,18 @@ def test_paged_route_requires_page_64(caplog):
             is None
         )
     supports.assert_not_called()
-    metadata.assert_not_called()
     forward.assert_not_called()
     assert "adapter admission rejected: page 32" in caplog.text
 
 
-def test_paged_host_rejection_in_metadata_falls_back(caplog):
+def test_paged_host_rejection_in_forward_falls_back(caplog):
     caplog.set_level(logging.INFO, logger=routes.logger.name)
     q, kv_cache, weights, ctx, block_table = _paged_inputs()
     supports = mock.Mock(return_value=True)
-    metadata = mock.Mock(
+    forward = mock.Mock(
         side_effect=ValueError("context_lens must be int32 [B, next_n]")
     )
-    forward = mock.Mock()
-    with _paged_env(
-        "dsa_indexer", supports=supports, metadata=metadata, forward=forward
-    ):
+    with _paged_env("dsa_indexer", supports=supports, forward=forward):
         for _ in range(2):
             assert (
                 routes.cake_fp8_paged_mqa_logits(
@@ -297,5 +284,5 @@ def test_paged_host_rejection_in_metadata_falls_back(caplog):
                 )
                 is None
             )
-    forward.assert_not_called()
+    assert forward.call_count == 2
     assert caplog.text.count("FlashInfer host rejection") == 1

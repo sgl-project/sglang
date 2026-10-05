@@ -11,10 +11,11 @@ DeepGEMM signatures (``sglang.kernels.ops.attention.cake``):
   inside the engine's ``_chunked_fp8_paged_mqa_logits``):
   ``deep_gemm.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
   block_table, schedule_meta, max_len, clean_logits=False)`` ->
-  ``flashinfer.paged_mqa.get_paged_mqa_logits_metadata`` +
-  ``fp8_paged_mqa_logits`` on the same tensors (the Cake metadata program
-  replaces the engine's DeepGEMM schedule buffer; the atom geometry of the
-  Cake program is a FlashInfer catalog property).
+  ``flashinfer.paged_mqa.fp8_paged_mqa_logits`` on the same tensors with
+  ``schedule_meta=None``: the Cake paged program derives its schedule
+  in-kernel, so the route is ONE launch and the engine's DeepGEMM schedule
+  buffer (and FlashInfer's placeholder ``get_paged_mqa_logits_metadata``) is
+  not needed on the Cake path.
 
 The returned logits keep the engine's contract (f32, ``[Q, K]`` /
 ``[B * next_n, max_len]`` views with unit column stride and a row stride that
@@ -115,21 +116,14 @@ def _cake_ragged_kernels() -> Tuple[Callable, Callable]:
 
 
 @functools.lru_cache(maxsize=None)
-def _cake_paged_kernels() -> Tuple[Callable, Callable, Callable]:
-    """Lazy (admission, metadata forwarder, logits forwarder) of the paged site."""
+def _cake_paged_kernels() -> Tuple[Callable, Callable]:
+    """Lazy (admission, logits forwarder) of the paged site (no metadata launch: one kernel per call)."""
     from sglang.kernels.cake_kernels.attention_sparse import (
         supports_fp8_paged_mqa_logits,
     )
-    from sglang.kernels.ops.attention.cake import (
-        cake_fp8_paged_mqa_logits,
-        cake_get_paged_mqa_logits_metadata,
-    )
+    from sglang.kernels.ops.attention.cake import cake_fp8_paged_mqa_logits
 
-    return (
-        supports_fp8_paged_mqa_logits,
-        cake_get_paged_mqa_logits_metadata,
-        cake_fp8_paged_mqa_logits,
-    )
+    return supports_fp8_paged_mqa_logits, cake_fp8_paged_mqa_logits
 
 
 def _capture_gate(site: str, signature: tuple) -> bool:
@@ -211,16 +205,18 @@ def cake_fp8_paged_mqa_logits(
     block_kv: int,
     num_sms: Optional[int],
 ) -> Optional[torch.Tensor]:
-    """Cake metadata + ``fp8_paged_mqa_logits`` on the engine's paged tensors, or ``None``.
+    """Cake ``fp8_paged_mqa_logits`` on the engine's paged tensors (one launch), or ``None``.
 
     Mirrors one ``deep_gemm.fp8_paged_mqa_logits`` call of the engine's chunk
     loop: ``q [B, next_n, H, 128]``, fused ``kv_cache [pages, 64, 1, 132]``,
     ``weights [B * next_n, H]``, 2-D ``context_lens [B, next_n]``,
-    ``block_table [B, S]`` (any row stride), ``clean_logits=False``.
+    ``block_table [B, S]`` (any row stride), ``clean_logits=False``. No
+    schedule-metadata launch: the Cake program derives its walk in-kernel
+    (``schedule_meta=None``; ``num_sms`` is the CTA budget).
     """
     if not cake_route_enabled(CAKE_ROUTE_DSA_INDEXER):
         return None
-    supports, metadata, forward = _cake_paged_kernels()
+    supports, forward = _cake_paged_kernels()
     summary = _tensor_summary(
         q=q, kv_cache=kv_cache, w=weights, ctx=context_lens, bt=block_table
     )
@@ -237,16 +233,16 @@ def cake_fp8_paged_mqa_logits(
     if not _capture_gate(SITE_PAGED, signature):
         return None
     try:
-        schedule_meta = metadata(context_lens, block_kv, num_sms)
         logits = forward(
             q,
             kv_cache,
             weights,
             context_lens,
             block_table,
-            schedule_meta,
+            None,
             max_context_len,
             clean_logits=False,
+            sm_count=num_sms,
         )
     except ValueError as error:
         kind = (SITE_PAGED, _reason_kind(str(error)))

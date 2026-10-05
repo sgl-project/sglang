@@ -86,13 +86,16 @@ FlashInfer entries (all at FlashInfer ``46340689a5ab``):
 * ``flashinfer.paged_mqa.get_paged_mqa_logits_metadata`` /
   ``fp8_paged_mqa_logits`` / ``prepare_paged_mqa_logits`` (impl
   ``flashinfer.experimental.deepgemm_dense_mqa.paged_mqa``; DeepGEMM paged
-  signatures): int32 ``context_lens [B, next_n]`` (2-D), ``block_kv`` 64,
-  ``num_sms`` -> int32 ``[num_sms + 1, 2]`` metadata; e4m3 ``q [B, next_n, H,
-  128]``, uint8 fused ``kv_cache [pages, 64, 1, 132]``, f32 ``weights [B *
-  next_n, H]``, int32 ``block_table [B, S]`` (unit column stride),
+  signatures): e4m3 ``q [B, next_n, H, 128]``, uint8 fused ``kv_cache [pages,
+  64, 1, 132]``, f32 ``weights [B * next_n, H]``, int32 ``context_lens [B,
+  next_n]`` (2-D), int32 ``block_table [B, S]`` (unit column stride),
+  ``schedule_meta`` (DeepGEMM-signature placeholder, ``None`` allowed, never
+  read: the Cake program derives its schedule in-kernel, ONE launch per call),
   ``max_context_len``, ``clean_logits=False`` only -> f32 ``[B * next_n,
-  max_context_len]`` view (DeepGEMM mask semantics). Any batch size.
-  ``paged_route_available(H, 64, next_n)`` consults the shipped catalog.
+  max_context_len]`` view (DeepGEMM mask semantics). ``get_paged_mqa_logits_metadata``
+  launches nothing (zero ``[num_sms + 1, 2]`` placeholder). Any batch size
+  within the catalog's per-arch admission rules; ``paged_route_available(H,
+  64, next_n, arch=, batch=, max_context_len=)`` consults the shipped catalog.
 * ``flashinfer.sparse_mqa.prepare_sparse_mqa_metadata`` /
   ``prepare_sparse_mqa_logits`` (impl
   ``flashinfer.experimental.deepgemm_sparse_mqa``; same parts): sorted
@@ -1238,8 +1241,10 @@ def get_paged_mqa_logits_metadata(
 ) -> torch.Tensor:
     """Forward to ``flashinfer.paged_mqa.get_paged_mqa_logits_metadata``.
 
-    Returns int32 ``[num_sms + 1, 2]`` walk bounds for ``fp8_paged_mqa_logits``
-    (the Cake metadata program; not interchangeable with DeepGEMM's buffer).
+    DeepGEMM-signature placeholder: validates the call and returns a zero int32
+    ``[num_sms + 1, 2]`` buffer WITHOUT launching a kernel (the Cake paged
+    program derives its schedule in-kernel). Not interchangeable with
+    DeepGEMM's buffer; ``fp8_paged_mqa_logits`` accepts it or ``None``.
     """
     from flashinfer.paged_mqa import get_paged_mqa_logits_metadata
 
@@ -1254,17 +1259,27 @@ def fp8_paged_mqa_logits(
     weights: torch.Tensor,
     context_lens: torch.Tensor,
     block_table: torch.Tensor,
-    schedule_meta: torch.Tensor,
+    schedule_meta: Optional[torch.Tensor],
     max_context_len: int,
     clean_logits: bool = False,
     indices: Optional[torch.Tensor] = None,
+    *,
+    sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """Forward to ``flashinfer.paged_mqa.fp8_paged_mqa_logits`` (DeepGEMM signature).
+    """Forward to ``flashinfer.paged_mqa.fp8_paged_mqa_logits`` (DeepGEMM signature, one launch).
 
-    Returns the f32 ``[B * next_n, max_context_len]`` logits view.
+    ``schedule_meta`` is a signature-parity placeholder (``None`` allowed; a
+    ``[num_sms + 1, 2]`` buffer fixes the CTA budget through its first
+    dimension); ``sm_count`` fixes the budget when ``schedule_meta`` is
+    ``None`` (default: the device's SM count). Returns the f32 ``[B * next_n,
+    max_context_len]`` logits view.
     """
     from flashinfer.paged_mqa import fp8_paged_mqa_logits
 
+    if schedule_meta is None and sm_count is not None:
+        schedule_meta = torch.zeros(
+            (int(sm_count) + 1, 2), dtype=torch.int32, device=q.device
+        )
     return fp8_paged_mqa_logits(
         q,
         kv_cache,
@@ -1292,8 +1307,9 @@ def prepare_paged_mqa_logits(
 ):
     """Forward to ``flashinfer.paged_mqa.prepare_paged_mqa_logits``.
 
-    Returns a ``PagedMqaPlan``; ``plan.run()`` submits the metadata and logits
-    programs without allocation (CUDA-graph replay with changed contents).
+    Returns a ``PagedMqaPlan``; ``plan.run()`` submits the logits program (one
+    launch) without allocation (CUDA-graph replay with changed contents);
+    ``schedule_meta`` is accepted for signature parity and not read.
     """
     from flashinfer.paged_mqa import prepare_paged_mqa_logits
 

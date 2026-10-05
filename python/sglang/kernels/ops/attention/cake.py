@@ -542,9 +542,10 @@ _reg(
     dtypes=("int32",),
     contract=(
         "DeepGEMM signature: int32 context_lens [B,next_n] (2-D), block_kv 64, "
-        "num_sms -> int32 [num_sms+1, 2] walk bounds for fp8_paged_mqa_logits"
+        "num_sms -> zero int32 [num_sms+1, 2] placeholder for fp8_paged_mqa_logits "
+        "(no kernel launch; the Cake program derives its schedule in-kernel)"
     ),
-    description="DeepSeek-V3.2 paged indexer schedule metadata via FlashInfer.",
+    description="DeepSeek-V3.2 paged indexer schedule placeholder (no launch) via FlashInfer.",
 )
 _reg(
     "fp8_paged_mqa_logits",
@@ -570,7 +571,7 @@ _reg(
     dtypes=("float8_e4m3fn", "uint8", "float32", "int32"),
     contract=(
         "as fp8_paged_mqa_logits with caller-owned schedule_meta/output -> "
-        "plan.run() (metadata + logits, no allocation; graph replay)"
+        "plan.run() (one logits launch, no allocation; graph replay)"
     ),
     description="DeepSeek-V3.2 paged indexer logits (prepared) via FlashInfer.",
 )

@@ -82,9 +82,9 @@ Dense/MLA/sparse rows register in `ops/attention/cake.py`; KDA/GDN rows in
 | `prepare_dense_mqa_logits` | `dense_mqa:prepare_dense_mqa_logits` | 10.0-10.3 | prepare once; pins 148/152 SMs |
 | `prepare_dsa_indexer_topk` | `experimental.cake_dsa_indexer.cake_backend:prepare_dsa_indexer_topk` | 10.0-10.7 | prepare once |
 | `fp8_mqa_logits` | `dense_mqa:fp8_mqa_logits` | 10.0-10.3 | post-baseline; one-shot DeepGEMM signature; shipped routes per `dense_route_available` |
-| `get_paged_mqa_logits_metadata` | `paged_mqa:get_paged_mqa_logits_metadata` | 10.0-10.3 | post-baseline; one-warp metadata program (not DeepGEMM's buffer) |
+| `get_paged_mqa_logits_metadata` | `paged_mqa:get_paged_mqa_logits_metadata` | 10.0-10.3 | post-baseline; DeepGEMM-signature placeholder, no kernel launch (the Cake paged program schedules in-kernel) |
 | `fp8_paged_mqa_logits` | `paged_mqa:fp8_paged_mqa_logits` | 10.0-10.3 | post-baseline; one-shot DeepGEMM signature; routes per `paged_route_available` |
-| `prepare_paged_mqa_logits` | `paged_mqa:prepare_paged_mqa_logits` | 10.0-10.3 | post-baseline; prepare once (metadata + logits, graph replay) |
+| `prepare_paged_mqa_logits` | `paged_mqa:prepare_paged_mqa_logits` | 10.0-10.3 | post-baseline; prepare once (one logits launch, graph replay) |
 | `prepare_kimi_k3_attn_res` | `kimi_k3_attn_res:prepare_kimi_k3_attn_res` | 10.0-10.3 | prepare once |
 | `prepare_kimi_k3_mla_fp8_paged_attention` | `mla:KimiK3MlaFp8PagedAttention` | 10.0-10.3 | prepare once (runner class) |
 | `prepare_minimax_h3_varlen_attention` | `experimental.minimax_h3_varlen_attention.cake_backend:prepare_minimax_h3_varlen_attention` | 10.0-10.3 | prepare once |

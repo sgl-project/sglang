@@ -10,9 +10,10 @@ DeepGEMM as the oracle on both engine paths:
   exact, and equality of the top-k index *sets* after the engine's ``+inf``
   init / local-token scatter (exact away from the selection boundary, where
   FP32 accumulation order may swap values within the logits tolerance);
-* paged decode / verify: ``get_paged_mqa_logits_metadata`` +
-  ``fp8_paged_mqa_logits`` with the same gates (skips while the installed
-  FlashInfer catalog has no paged route for the shape);
+* paged decode / verify: ``fp8_paged_mqa_logits`` (one launch; the
+  ``get_paged_mqa_logits_metadata`` placeholder launches nothing) with the
+  same gates (skips while the installed FlashInfer catalog has no paged route
+  for the shape or withholds it for the call's batch / context);
 * the ``Indexer`` helper methods pick the Cake entry when the route admits and
   the stock DeepGEMM call otherwise, on the real tensors;
 * both route helpers captured in a CUDA graph (the engine's decode / verify
@@ -366,8 +367,10 @@ def test_paged_fp8_mqa_logits_matches_deep_gemm(batch, next_n, heads, avg_ctx):
             )
         )
     ref = torch.cat(ref_chunks, dim=0)
+    # Signature-parity placeholder: zeros of the CTA-budget shape, no kernel launch.
     cake_meta = cake_get_paged_mqa_logits_metadata(ctx_2d, 64, num_sms)
     assert cake_meta.dtype == torch.int32 and tuple(cake_meta.shape) == (num_sms + 1, 2)
+    assert not cake_meta.any()
     got = cake_fp8_paged_mqa_logits(
         q,
         kv_cache,
@@ -653,8 +656,9 @@ def test_ragged_route_graph_replay_matches_eager():
 
 
 def test_paged_route_graph_replay_matches_eager():
-    """One paged decode call (metadata + logits) captured in a CUDA graph through
-    the engine route helper replays the eager bits inside every row's length."""
+    """One paged decode call (one logits launch, no metadata kernel) captured in a
+    CUDA graph through the engine route helper replays the eager bits inside every
+    row's length."""
     _skip_unless_device(cake.FI_PAGED_MQA_MODULE, cake.FI_PAGED_MQA_BACKEND_MODULE)
     deep_gemm = _deep_gemm()
     from sglang.srt.layers.attention.dsa import cake_indexer_routes
