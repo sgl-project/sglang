@@ -20,6 +20,8 @@ import torch
 from sglang.srt.mem_cache import memory_pool as mem_pool
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
+    DraftStateGeometry,
+    DraftStateRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.layout.token_major import (
@@ -30,6 +32,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
+    UnifiedDraftMambaPool,
     UnifiedDraftSWAKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -37,6 +40,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     MLASubPoolSpec,
     UnifiedKVPool,
+    UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -66,6 +70,31 @@ def _draft_region():
     # 48 B, V rows of 16 B -- asymmetric draft rows are ordinary parts.
     return DenseDraftRegion(
         lane_num=1, head_num=1, head_dim=24, v_head_dim=8, store_dtype=_DTYPE
+    )
+
+
+def _state_region(lane_num=1):
+    return DraftStateRegion(
+        lane_num=lane_num,
+        state=DraftStateGeometry(
+            conv_state_shapes=((2, 4), (2, 4)),
+            conv_dtype=torch.float32,
+            temporal_state_shape=(2,),
+            temporal_dtype=torch.float32,
+        ),
+    )
+
+
+def _mamba_spec(draft_region=None, layer_num=2):
+    return MambaSubPoolSpec(
+        name="mamba",
+        layer_num=layer_num,
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2,),
+        temporal_dtype=torch.float32,
+        grow_direction="up",
+        draft_region=draft_region,
     )
 
 
@@ -278,6 +307,144 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         torch.testing.assert_close(dp.get_key_buffer(0)[loc].float(), k)
 
 
+class TestFusedStateHost(unittest.TestCase):
+    """A state (mamba) entry carries the draft's state block after the host's
+    streams: the same aligned entry for both, byte-disjoint blocks within a
+    slot, and the host's whole-entry copy/clear carry the draft block, so a
+    radix checkpoint restores the draft's state with the target's. Unfused,
+    the entry stays its raw size; that identity guards every state deploy."""
+
+    SLOTS = 8
+
+    def test_unfused_spec_is_byte_identical_to_before(self):
+        s = _mamba_spec()
+        self.assertEqual(s.host_entry_bytes(), 2 * (3 * 8 * 2 + 2 * 4))
+        self.assertEqual(s.entry_bytes(), s.host_entry_bytes())
+
+    def test_fused_entry_appends_the_state_block(self):
+        f = _mamba_spec(_state_region())
+        host = f.host_entry_bytes()
+        self.assertEqual(f.draft_offset_in_entry(), align_part_offset(host))
+        self.assertEqual(
+            f.entry_bytes(),
+            align_entry_bytes(f.draft_offset_in_entry() + f.draft_region.entry_bytes()),
+        )
+        self.assertEqual(f.draft_region.entry_bytes(), 2 * (2 * 4 * 4) + 2 * 4)
+
+    def _pool(self):
+        region = _state_region()
+        mamba = _mamba_spec(region)
+        full = _host_spec()
+        total = 4 * full.entry_bytes() + self.SLOTS * mamba.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=1,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"mamba": [1]}, regions={"mamba": region}
+            ),
+        )
+        return mamba, pool
+
+    def test_host_and_draft_blocks_stay_byte_disjoint_within_a_slot(self):
+        spec, pool = self._pool()
+        host_conv, host_temporal = pool.mamba_views_for("mamba")
+        draft_conv, draft_temporal = pool.build_draft_state_views("mamba")
+        raw = pool._raw
+        entry = spec.entry_bytes()
+        slot = 3
+        lo = slot * entry
+        split = lo + spec.draft_offset_in_entry()
+        hi = (slot + 1) * entry
+        for view in (*host_conv, host_temporal):
+            for layer in range(view.shape[0]):
+                raw.zero_()
+                view[layer][slot] = 1.0
+                nz = raw.nonzero()
+                self.assertGreater(nz.numel(), 0)
+                self.assertTrue(bool((nz >= lo).all() and (nz < split).all()))
+        for view in (*draft_conv, draft_temporal):
+            for layer in range(view.shape[0]):
+                raw.zero_()
+                view[layer][slot] = 1.0
+                nz = raw.nonzero()
+                self.assertGreater(nz.numel(), 0)
+                self.assertTrue(bool((nz >= split).all() and (nz < hi).all()))
+
+    def test_host_whole_entry_ops_carry_the_draft_block(self):
+        _, pool = self._pool()
+        host = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=2,
+            mamba_layer_ids=[0, 1],
+        )
+        draft_conv, _ = pool.build_draft_state_views("mamba")
+        host.mamba_cache.conv[0][1][3] = 2.0
+        draft_conv[1][0][3] = 7.0
+        host.copy_from(torch.tensor([3]), torch.tensor([5]))
+        self.assertEqual(float(host.mamba_cache.conv[0][1][5].sum()), 2.0 * 3 * 8)
+        self.assertEqual(float(draft_conv[1][0][5].sum()), 7.0 * 2 * 4)
+        host.clear_slots(torch.tensor([5]))
+        self.assertEqual(float(draft_conv[1][0][5].sum()), 0.0)
+        self.assertEqual(float(host.mamba_cache.conv[0][1][5].sum()), 0.0)
+        host.move_kv_cache(torch.tensor([6]), torch.tensor([3]))
+        self.assertEqual(float(host.mamba_cache.conv[0][1][6].sum()), 2.0 * 3 * 8)
+        self.assertEqual(float(draft_conv[1][0][6].sum()), 7.0 * 2 * 4)
+
+    def test_draft_views_alias_the_fused_block(self):
+        _, pool = self._pool()
+        draft = UnifiedDraftMambaPool(
+            unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
+        )
+        draft_conv, _ = pool.build_draft_state_views("mamba")
+        self.assertEqual(
+            draft.mamba_cache.conv[1].shape, (1, pool.max_slots("mamba"), 2, 4)
+        )
+        self.assertEqual(
+            draft.mamba2_layer_cache(0).conv[1].data_ptr(),
+            draft_conv[1][0].data_ptr(),
+        )
+
+    def test_slot_ops_clear_the_draft_block_and_spare_the_host(self):
+        """BUG REGRESSION. These ops were no-ops, on the theory that the host's
+        whole-entry clear covers the draft block. It does, but ModelRunner gates
+        that to a plain EXTEND forward and returns on decode, target-verify and
+        draft-extend -- exactly the modes a draft needs. A slot handed to a new
+        request therefore kept its previous occupant's state, and a slot never
+        written kept whatever the buffer held; a poisoned pool turned that into
+        NaN and the accept length decayed over a long run (an Inkling MTP head).
+        Equally, they must NOT clear the whole entry: the host's own streams
+        share it and stay live while the draft's block is recycled."""
+        spec, pool = self._pool()
+        draft = UnifiedDraftMambaPool(
+            unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
+        )
+        host = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=2,
+            mamba_layer_ids=[0, 1],
+        )
+        draft_conv, draft_temporal = pool.build_draft_state_views("mamba")
+        host.mamba_cache.conv[0][1][2] = 5.0  # host state, same slot
+        draft_conv[0][0][2] = 9.0
+        draft_temporal[0][2] = 7.0
+
+        draft.clear_slots(torch.tensor([2]))
+        self.assertEqual(float(draft_conv[0][0][2].sum()), 0.0)
+        self.assertEqual(float(draft_temporal[0][2].sum()), 0.0)
+        # The host's stream in the SAME slot must survive.
+        self.assertEqual(float(host.mamba_cache.conv[0][1][2].sum()), 5.0 * 3 * 8)
+
+        draft_conv[0][0][2] = 4.0
+        draft.copy_from(torch.tensor([2]), torch.tensor([6]))
+        self.assertEqual(float(draft_conv[0][0][6].sum()), 4.0 * 2 * 4)
+        self.assertEqual(float(host.mamba_cache.conv[0][1][6].sum()), 0.0)
+
+
 def _mla_host_spec(draft_region=None):
     # 32 B latent rows, two layers: a 64 B host entry before the draft parts.
     return MLASubPoolSpec(
@@ -291,7 +458,14 @@ def _mla_host_spec(draft_region=None):
     )
 
 
-def _mamba_spec():
+def _mamba_filler_spec():
+    """A minimal second sub-pool so the MLA host is not alone in the pool.
+
+    Deliberately not `_mamba_spec`: this one is a bystander with its own tiny
+    geometry, while `_mamba_spec` is the subject of the fused-state tests. Two
+    module-level defs of one name silently leave only the last, which is how
+    every `_mamba_spec(region)` call started raising TypeError.
+    """
     return MambaSubPoolSpec(
         name="mamba",
         layer_num=1,
@@ -333,7 +507,7 @@ class TestFusedMLAHost(unittest.TestCase):
 
     def _pool(self):
         full = _mla_host_spec(_draft_region())
-        mamba = _mamba_spec()
+        mamba = _mamba_filler_spec()
         total = self.PAGES * self.PS * full.entry_bytes() + 4 * mamba.entry_bytes()
         return UnifiedKVPool(
             total_bytes=total,

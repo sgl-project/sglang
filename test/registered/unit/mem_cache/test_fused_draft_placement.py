@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftKVProfile,
     DraftLayerSet,
     DraftStateGeometry,
+    DraftStateRegion,
     FusedDraftDecision,
     FusedDraftPlacement,
     PlacementContext,
@@ -74,6 +75,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _HOSTS = ("full", "swa")
+_HOSTS_TRI = ("full", "swa", "mamba")
 _DTYPE = torch.bfloat16
 _WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
@@ -244,6 +246,37 @@ class TestPlaceFusedDraft(CustomTestCase):
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 9).placement)
+
+    def test_state_layers_ride_in_the_mamba_sub_pool(self):
+        # Inkling shape: one block per depth, every depth carrying conv state.
+        decision = _place(
+            _profile(num_layers=8, num_depths=8, state_layer_ids=tuple(range(8))),
+            num_runners=3,
+            host_names=_HOSTS_TRI,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertEqual(placement.hosts(), ("full", "mamba"))
+        self.assertEqual(placement.region("mamba").lane_num, 3)
+        self.assertEqual(placement.region("mamba").state, _STATE)
+        self.assertEqual(
+            placement.region("mamba").entry_bytes(), 3 * _STATE.layer_bytes()
+        )
+        for r in range(3):
+            self.assertEqual(placement.lanes_for(r, "mamba"), range(r, r + 1))
+        # A replicated head carries every state layer per runner.
+        placement = _place(
+            _profile(num_layers=2, state_layer_ids=(0, 1)),
+            num_runners=2,
+            host_names=_HOSTS_TRI,
+        ).placement
+        self.assertEqual(placement.region("mamba").lane_num, 4)
+        self.assertEqual(placement.lanes_for(1, "mamba"), range(2, 4))
+
+    def test_state_layers_decline_without_a_state_host(self):
+        decision = _place(_profile(state_layer_ids=(0,)), host_names=_HOSTS)
+        self.assertIsNone(decision.placement)
+        self.assertIn("'mamba'", decision.declined)
 
     def test_a_layer_kind_with_no_host_kind_declines(self):
         with _dense_only_registry():
@@ -474,17 +507,11 @@ class TestFusedDraftPlacement(CustomTestCase):
 
 class TestBootLogReportsEveryPlacedHost(CustomTestCase):
     """Every placed host reports through its kind's `describe`, so a host kind
-    that forgets one dies at boot instead of hiding a placement."""
+    that forgets one dies at boot instead of hiding a placement, and each kind
+    names its OWN geometry: a shared line would drop to the two fields the
+    kinds have in common and stop saying what was placed."""
 
-    def test_dense_only_placement_reports_its_region(self):
-        placement = FusedDraftPlacement.from_counts(
-            counts={"full": [1]},
-            regions={
-                "full": DenseDraftRegion(
-                    lane_num=1, head_num=2, head_dim=16, store_dtype=_DTYPE
-                )
-            },
-        )
+    def _resolve(self, placement):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         with self.assertLogs(
             "sglang.srt.mem_cache.kv_cache_configurator", level="INFO"
@@ -493,9 +520,68 @@ class TestBootLogReportsEveryPlacedHost(CustomTestCase):
                 FusedDraftDecision(placement=placement)
             )
         self.assertIs(out, placement)
-        joined = "\n".join(captured.output)
+        return "\n".join(captured.output)
+
+    def test_dense_only_placement_reports_its_region(self):
+        joined = self._resolve(
+            FusedDraftPlacement.from_counts(
+                counts={"full": [1]},
+                regions={
+                    "full": DenseDraftRegion(
+                        lane_num=1, head_num=2, head_dim=16, store_dtype=_DTYPE
+                    )
+                },
+            )
+        )
         self.assertIn("fused draft region in 'full'", joined)
         self.assertIn("runner lanes [(0,)]", joined)
+        self.assertNotIn("fused draft state", joined)
+
+    def test_mixed_placement_reports_each_kind_with_its_own_geometry(self):
+        joined = self._resolve(
+            FusedDraftPlacement.from_counts(
+                counts={"full": [1], "mamba": [1]},
+                regions={
+                    "full": DenseDraftRegion(
+                        lane_num=1, head_num=2, head_dim=16, store_dtype=_DTYPE
+                    ),
+                    "mamba": DraftStateRegion(lane_num=1, state=_STATE),
+                },
+            )
+        )
+        self.assertIn("fused draft region in 'full'", joined)
+        self.assertIn(
+            "fused draft state in 'mamba': 1 lane(s) x 2 conv stream(s)", joined
+        )
+
+
+class TestMambaHostPricing(CustomTestCase):
+    """The mamba sub-pool's fused entry is priced from THIS runner's state
+    layers, as the mamba factory slices them; the whole model's list would
+    also count other pipeline ranks'."""
+
+    def test_a_mamba_region_prices_this_runners_state_layers(self):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=4)
+        cfg.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(
+                layers=[0, 1, 2, 3],
+                shape=SimpleNamespace(conv=[(2, 2)], temporal=(2, 2)),
+                dtype=SimpleNamespace(conv=_DTYPE, temporal=_DTYPE),
+            )
+        )
+        state = DraftStateRegion(
+            lane_num=1,
+            state=DraftStateGeometry(
+                conv_state_shapes=((2, 2),),
+                conv_dtype=_DTYPE,
+                temporal_state_shape=(2, 2),
+                temporal_dtype=_DTYPE,
+            ),
+        )
+        spec = cfg._mamba_host_spec(state)
+        self.assertEqual(spec.layer_num, 2)
+        self.assertIs(spec.draft_region, state)
 
 
 class TestUnifiedSWAHeadGeometry(CustomTestCase):
