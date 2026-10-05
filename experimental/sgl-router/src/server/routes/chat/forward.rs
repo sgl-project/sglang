@@ -7,7 +7,7 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
-use crate::discovery::WorkerMode;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
@@ -43,10 +43,11 @@ pub(super) struct SelectedWorkers {
 /// PD sends to both workers and returns the decode response.
 pub(super) async fn forward_request(
     ctx: &AppContext,
-    request: PreparedRequest,
+    request: &mut PreparedRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     request_started_at: Instant,
+    duration: &Arc<RequestDurationGuard>,
 ) -> Result<Response<Body>, ApiError> {
     let SelectedWorkers {
         prefill,
@@ -66,7 +67,7 @@ pub(super) async fn forward_request(
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
     let prefill_rank = (dp_aware && !unpin_prefill)
-        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
         .flatten();
     let decode_rank = decode
         .as_deref()
@@ -88,9 +89,10 @@ pub(super) async fn forward_request(
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
-        &request,
+        request,
         decode.as_deref().unwrap_or(&prefill),
         request_started_at,
+        duration,
     );
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
@@ -106,7 +108,7 @@ pub(super) async fn forward_request(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
-    let body = request.into_outgoing_body(
+    let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
@@ -408,7 +410,7 @@ async fn forward_to_response_worker(
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
         let stream_guards: Box<dyn Send + 'static> =
-            Box::new((load_guards, metrics.stream_duration_guard()));
+            Box::new((load_guards, Arc::clone(&metrics.duration)));
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
@@ -449,6 +451,7 @@ struct DispatchMetrics {
     mode: WorkerModeLabel,
     streaming: bool,
     request_started_at: Instant,
+    duration: Arc<RequestDurationGuard>,
 }
 
 impl DispatchMetrics {
@@ -457,6 +460,7 @@ impl DispatchMetrics {
         request: &PreparedRequest,
         response_worker: &Worker,
         request_started_at: Instant,
+        duration: &Arc<RequestDurationGuard>,
     ) -> Self {
         Self {
             registry: Arc::clone(&ctx.metrics),
@@ -469,6 +473,7 @@ impl DispatchMetrics {
             },
             streaming: request.streaming,
             request_started_at,
+            duration: Arc::clone(duration),
         }
     }
 
@@ -478,14 +483,6 @@ impl DispatchMetrics {
         let model = self.model.clone();
         let request_started_at = self.request_started_at;
         Box::new(move || metrics.observe_ttft(&model, request_started_at.elapsed().as_secs_f64()))
-    }
-
-    fn stream_duration_guard(&self) -> StreamDurationGuard {
-        StreamDurationGuard {
-            metrics: Arc::clone(&self.registry),
-            model: self.model.clone(),
-            request_started_at: self.request_started_at,
-        }
     }
 
     fn stream_end_callback(
@@ -542,12 +539,6 @@ impl DispatchMetrics {
                 &self.worker_url
             }
         };
-        if !self.streaming {
-            self.registry.observe_request_duration(
-                &self.model,
-                self.request_started_at.elapsed().as_secs_f64(),
-            );
-        }
         // The app middleware emits the access log and edge counters exactly once.
         RequestLogContext {
             worker_url: worker_url.clone(),
@@ -572,14 +563,26 @@ fn dispatch_outcome(result: &Result<Response<Body>, ApiError>) -> RequestOutcome
     }
 }
 
-/// Record total request duration when streaming ends or setup fails.
-struct StreamDurationGuard {
+/// Records a dispatched request's total duration once its last holder drops:
+/// the handler for JSON, the SSE pump once a stream ends, so every attempt
+/// of a request shares one observation.
+pub(super) struct RequestDurationGuard {
     metrics: Arc<MetricsRegistry>,
     model: String,
     request_started_at: Instant,
 }
 
-impl Drop for StreamDurationGuard {
+impl RequestDurationGuard {
+    pub(super) fn new(ctx: &AppContext, model: &ModelId, request_started_at: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            metrics: Arc::clone(&ctx.metrics),
+            model: model.0.clone(),
+            request_started_at,
+        })
+    }
+}
+
+impl Drop for RequestDurationGuard {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.request_started_at.elapsed().as_secs_f64());
