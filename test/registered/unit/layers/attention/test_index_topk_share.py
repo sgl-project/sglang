@@ -1,11 +1,14 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -156,6 +159,89 @@ def test_mtp_iteration_clears_missing_draft_extend_seed():
 
     assert not batch.reuse_dsa_topk_indices
     assert batch.spec_info.dsa_topk_indices is None
+
+
+def _capture(indices, *, fused=True, ragged=True, flattened=True, select=None):
+    # Two requests share their first two physical slots. Logical index 5 is
+    # outside the four-slot physical pool, but maps to the valid physical slot 2.
+    table = torch.tensor([[3, 1, 0], [3, 1, 2]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        page_table_1=table,
+        page_table_1_flattened=table.flatten() if flattened else None,
+        indexer_seq_lens_cpu=torch.tensor([3, 3]),
+    )
+    backend = SimpleNamespace(
+        use_fused_topk=fused,
+        get_topk_transform_method=Mock(
+            return_value=(
+                TopkTransformMethod.RAGGED if ragged else TopkTransformMethod.PAGED
+            )
+        ),
+        forward_metadata=metadata,
+    )
+    rows = len(indices) if select is None else len(select)
+    capture = torch.full((rows + 1, indices.shape[1]), -99, dtype=torch.int32)
+    batch = SimpleNamespace(
+        forward_mode=object(),
+        spec_info=SimpleNamespace(
+            dsa_seed_topk_capture=capture,
+            dsa_seed_topk_select=select,
+        ),
+    )
+    indexer = Mock(return_value=indices)
+    with patch.object(forward_mha, "resolve_attn_backend", return_value=backend):
+        forward_mha.forward_dsa_indexer_for_mha(
+            indexer,
+            hidden_states=None,
+            q_lora=None,
+            positions=None,
+            forward_batch=batch,
+            layer_id=0,
+        )
+    assert indexer.call_args.kwargs["return_indices"]
+    assert torch.all(capture[-1] == -99)
+    return capture[:-1]
+
+
+@pytest.mark.parametrize("flattened", [True, False])
+@pytest.mark.parametrize("select", [None, torch.tensor([2, 0])])
+def test_ragged_seed_maps_shared_prefix_and_preserves_padding(flattened, select):
+    indices = torch.tensor([[0, 2, -1], [3, 4, -1], [5, 1, -1]], dtype=torch.int32)
+    original = indices.clone()
+    expected = torch.tensor([[3, 0, -1], [3, 1, -1], [2, 1, -1]], dtype=torch.int32)
+    if select is not None:
+        expected = expected[select]
+    actual = _capture(indices, flattened=flattened, select=select)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(indices, original)
+
+
+@pytest.mark.parametrize("fused,ragged", [(True, False), (False, True), (False, False)])
+def test_paged_and_unfused_seed_contracts_are_preserved(fused, ragged):
+    indices = torch.tensor([[2, 0, -1], [1, 2, -1]], dtype=torch.int32)
+    torch.testing.assert_close(_capture(indices, fused=fused, ragged=ragged), indices)
+
+
+@pytest.mark.parametrize("invalid", [-2, 6])
+def test_invalid_ragged_indices_are_not_clamped(invalid):
+    with pytest.raises((IndexError, RuntimeError)):
+        _capture(torch.tensor([[invalid, -1]], dtype=torch.int32))
+
+
+def test_no_capture_does_not_resolve_backend():
+    indexer = Mock(return_value=None)
+    batch = SimpleNamespace(spec_info=None)
+    with patch.object(forward_mha, "resolve_attn_backend") as resolve:
+        forward_mha.forward_dsa_indexer_for_mha(
+            indexer,
+            hidden_states=None,
+            q_lora=None,
+            positions=None,
+            forward_batch=batch,
+            layer_id=0,
+        )
+    assert not indexer.call_args.kwargs["return_indices"]
+    resolve.assert_not_called()
 
 
 if __name__ == "__main__":
