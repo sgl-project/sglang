@@ -22,7 +22,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeGrammar:
@@ -117,7 +117,9 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.scheduler = SimpleNamespace(batch_result_processor=processor)
+    queue.scheduler = SimpleNamespace(
+        batch_result_processor=processor, kv_checksum_computer=None
+    )
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (

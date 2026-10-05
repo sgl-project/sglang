@@ -104,14 +104,16 @@ if not DISABLE_TORCH:
     PRROVIDERS.append("torch")
 
 
+@marker.parametrize("page_size", [1, 64], [1, 64])
 @marker.parametrize("k", [512, 1024, 2048], [512])
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
-@marker.parametrize("page_size", [1, 64], [1, 64])
 @marker.benchmark("provider", PRROVIDERS)
 def benchmark_paged(
     seq_len: int, batch_size: int, k: int, page_size: int, provider: str
 ):
+    seed = seq_len ^ (batch_size << 16) ^ (k << 32) ^ (page_size << 48)
+    torch.random.manual_seed(seed)
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k == 2048 and provider == "jit_v1":
@@ -127,6 +129,8 @@ def benchmark_paged(
 @marker.parametrize("batch_size", [2**x for x in range(7, 14)], [128, 1024])
 @marker.benchmark("provider", PRROVIDERS)
 def benchmark_ragged(seq_len: int, batch_size: int, k: int, provider: str):
+    seed = seq_len ^ (batch_size << 16) ^ (k << 32)
+    torch.random.manual_seed(seed)
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k != 2048 and provider == "jit_v1":

@@ -1,10 +1,20 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    IncLockRefResult,
+    MatchResult,
+)
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -46,7 +56,20 @@ class _FakeReqToTokenPool:
         req.kv.req_pool_idx = None
 
 
+@pytest.fixture
+def published_config():
+    # release_kv_cache reads the spec / serving bags.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="scheduler")
+    yield
+    reset_context()
+
+
 class _FakeInnerCache:
+    """Stands in for UnifiedRadixCache: owns the session and tries it first."""
+
+    free_kv_row = BasePrefixCache.free_kv_row
+
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
@@ -54,11 +77,25 @@ class _FakeInnerCache:
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
+        self.dec_lock_ref_skip_swa = []
+        self.session = StreamingSession(self)
 
-    def cache_finished_req(self, *args, **kwargs):
-        raise AssertionError("Streaming requests should not delegate to inner cache")
+    def checkpoint(self, req, *, up_to):
+        pass
 
-    def match_prefix(self, *args, **kwargs):
+    def claim_kv_row(self, req):
+        return self.session.try_cache_finished_req(req)
+
+    def unpin(self, req):
+        pass
+
+    def on_release(self, req, *, inserted):
+        pass
+
+    def match_prefix(self, params):
+        result = self.session.try_match_prefix(params)
+        if result is not None:
+            return result
         if not self.match_results:
             raise AssertionError("Unexpected match_prefix call")
         return self.match_results.pop(0)
@@ -66,6 +103,7 @@ class _FakeInnerCache:
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
         self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
+        self.dec_lock_ref_skip_swa.append(kwargs.get("skip_swa", False))
 
     def supports_mamba(self):
         return False
@@ -89,7 +127,6 @@ class _FakeReq:
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
-            swa_evicted_seqlen=0,
             cache_protected_len=0,
         )
         self.origin_input_ids = list(range(committed))
@@ -97,24 +134,38 @@ class _FakeReq:
         self.extra_key = None
         self.cache_salt = None
         self.last_node = None
-        self.swa_uuid_for_lock = None
-        self.skip_lock_node_ids = {}
+        self.swa_branching_seqlen = None
+        self.lock_receipt = DecLockRefParams()
+        self.swa_prefix_lock_released = False
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+
+    skip_radix_cache_insert = False
 
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
 
+    def finished(self):
+        return self.finished_reason is not None
 
-def test_session_slot_round_trip_preserves_mamba_state():
+    def owned_kv_len(self):
+        return self.kv.kv_committed_len
+
+    def refresh_fill_ids(self):
+        pass
+
+
+def test_session_slot_round_trip_preserves_component_state():
     # The mamba state rides in the shared ReqKvInfo record. mamba_branching_seqlen
     # is a per-turn match observation on the Req and is not preserved by the slot.
     req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
     req.kv.mamba_next_track_idx = 1
     req.kv.mamba_last_track_idx = 0
     req.kv.mamba_last_track_seqlen = 3
+    req.kv.set_evicted_seqlen(ComponentType.SWA, 2)
+    req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 3)
 
     slot = SessionSlot()
     slot.save_from_req(req, is_first=True)
@@ -125,6 +176,14 @@ def test_session_slot_round_trip_preserves_mamba_state():
     assert next_req.kv.mamba_next_track_idx == 1
     assert next_req.kv.mamba_last_track_idx == 0
     assert next_req.kv.mamba_last_track_seqlen == 3
+    assert next_req.kv.component_evicted_seqlens == {
+        ComponentType.SWA: 2,
+        ComponentType.AUXILIARY_SWA: 3,
+    }
+    assert req.kv.component_evicted_seqlens == {}
+    next_req.kv.mark_kv_released()
+    assert next_req.kv.is_kv_released
+    assert next_req.kv.component_evicted_seqlens == {}
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -146,13 +205,12 @@ def test_preabort_detaches_session_and_preserves_slot():
             )
         ],
     )
-    tree_cache = StreamingSession(inner)
-    tree_cache.slots["session-a"] = SessionSlot(
+    tree_cache = inner
+    tree_cache.session.slots["session-a"] = SessionSlot(
         kv=ReqKvInfo(
             req_pool_idx=0,
             kv_committed_len=48,
             kv_allocated_len=48,
-            swa_evicted_seqlen=0,
             cache_protected_len=16,
         ),
     )
@@ -170,31 +228,31 @@ def test_preabort_detaches_session_and_preserves_slot():
     # Req detached from session.
     assert req.session is None
     # Slot untouched.
-    slot = tree_cache.slots["session-a"]
+    slot = tree_cache.session.slots["session-a"]
     assert slot.kv.req_pool_idx == 0
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
 
 
-def test_first_mid_abort_nukes_ephemeral_slot():
-    """First-request mid-processing abort: no slot exists yet, ephemeral
-    slot is created from req state and nuked via release_session."""
+def test_first_mid_abort_releases_like_any_request(published_config):
+    """First-turn abort: no slot exists, so the request is released like any
+    aborted request and no slot is created."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = StreamingSession(inner)
+    tree_cache = inner
 
     # No slot exists yet (first request).
-    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
     req.finished_reason = FINISH_ABORT("input too long")
 
-    tree_cache.cache_finished_req(req)
+    release_kv_cache(req, tree_cache)
 
     # Slot must NOT be created.
-    assert "session-a" not in tree_cache.slots
+    assert "session-a" not in tree_cache.session.slots
     # Transient pool slot freed.
     assert req.kv.req_pool_idx is None
     assert req_to_token_pool.free_slots == [0]
@@ -202,28 +260,35 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert allocator.freed[0].tolist() == list(range(20))
 
 
-def test_nth_mid_abort_nukes_session_slot():
-    """Nth-request mid-processing abort: slot exists, restore_to_req ran.
-    ALL KV is wiped (release_session). Slot is deleted. Token IDs stay
-    in req_nodes for next turn's re-prefill."""
+def test_nth_mid_abort_drops_session_slot(published_config):
+    """Later-turn abort: the request ran on the slot's record, so releasing it
+    frees the whole row and drops the slot with its tree lock (skipping an
+    early-released SWA lock); the session re-prefills next turn."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = StreamingSession(inner)
+    tree_cache = inner
 
-    # Mid-processing abort: restore_to_req ran, so the req runs on the slot's
-    # record, which this turn has grown to committed=60 / allocated=65.
-    req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
+    # restore_to_req ran, so the req runs on the slot's record.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
-    tree_cache.slots["session-a"] = SessionSlot(kv=req.kv, last_node=None)
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.session.slots["session-a"] = SessionSlot(
+        kv=req.kv,
+        last_node=lock_node,
+        lock_receipt=DecLockRefParams(
+            node_id=42, component_lock_uuids={ComponentType.SWA: 7}
+        ),
+        swa_prefix_lock_released=True,
+    )
 
-    tree_cache.cache_finished_req(req)
+    release_kv_cache(req, tree_cache)
 
-    # Slot wiped — deleted from slots dict.
-    assert "session-a" not in tree_cache.slots
-    # All KV freed: [0, 65) from release_session.
+    assert "session-a" not in tree_cache.session.slots
+    assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_skip_swa == [True]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(65))
     # Pool slot returned.
@@ -231,38 +296,101 @@ def test_nth_mid_abort_nukes_session_slot():
     assert req.kv.req_pool_idx is None
 
 
-def test_release_session_threads_mamba_skip_ids():
-    """release_session must forward the slot's skip_lock_node_ids to
-    dec_lock_ref. The first req's last_node may be full-only-locked (mamba
-    skipped at inc), so without the skip set the release would drop a mamba
-    lock the session never took -- another request's, on a shared node."""
-    from sglang.srt.mem_cache.unified_cache.components import ComponentType
-
+@pytest.mark.parametrize("uuid", [None, 17])
+def test_release_session_preserves_component_lock_receipt(uuid):
+    """Closing a session releases only the component locks it acquired."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
-    tree_cache = StreamingSession(inner)
+    tree_cache = inner
 
     lock_node = SimpleNamespace(id=42)
-    tree_cache.slots["session-a"] = SessionSlot(
+    acquired = IncLockRefResult(
+        node_id=42,
+        skipped_lock_components=(ComponentType.MAMBA,),
+    )
+    acquired.set_lock_uuid(ComponentType.SWA, uuid)
+    acquired.set_lock_uuid(ComponentType.SWA, 19, lock_host=True)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 23)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, None, lock_host=True)
+    tree_cache.session.slots["session-a"] = SessionSlot(
         kv=ReqKvInfo(
             req_pool_idx=0,
             kv_committed_len=50,
             kv_allocated_len=50,
-            swa_evicted_seqlen=0,
             cache_protected_len=0,
         ),
         last_node=lock_node,
-        skip_lock_node_ids={ComponentType.MAMBA: {42}},
+        lock_receipt=acquired.to_dec_params(),
     )
 
-    tree_cache.release_session("session-a")
+    acquired.set_lock_uuid(ComponentType.SWA, 99)
+    acquired.set_lock_uuid(ComponentType.SWA, 99, lock_host=True)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99, lock_host=True)
+    tree_cache.session.release_session("session-a")
 
     assert inner.dec_lock_ref_calls == [lock_node]
     params = inner.dec_lock_ref_params[0]
     assert params is not None
-    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
+    assert params.skipped_lock_components == (ComponentType.MAMBA,)
+    assert params.get_lock_uuid(ComponentType.SWA) == uuid
+    assert params.get_lock_uuid(ComponentType.SWA, lock_host=True) == 19
+    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA) == 23
+    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA, lock_host=True) is None
+    for lock_host in (False, True):
+        with pytest.raises(KeyError):
+            params.get_lock_uuid(ComponentType.MAMBA, lock_host=lock_host)
+        with pytest.raises(KeyError):
+            DecLockRefParams().get_lock_uuid(ComponentType.SWA, lock_host=lock_host)
+    assert inner.dec_lock_ref_skip_swa == [False]
+
+
+def test_release_session_skips_swa_after_early_release():
+    """A slot saved from a req that early-released its SWA lock
+    (swa_prefix_lock_released) must release with skip_swa, or the session
+    close double-releases the SWA segment."""
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = inner
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.session.slots["session-a"] = SessionSlot(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
+            kv_committed_len=50,
+            kv_allocated_len=50,
+            cache_protected_len=0,
+        ),
+        last_node=lock_node,
+        lock_receipt=DecLockRefParams(
+            node_id=42, component_lock_uuids={ComponentType.SWA: 7}
+        ),
+        swa_prefix_lock_released=True,
+    )
+
+    tree_cache.session.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_params[0].component_lock_uuids[ComponentType.SWA] == 7
+    assert inner.dec_lock_ref_skip_swa == [True]
+
+
+def test_session_slot_does_not_restore_swa_branching_seqlen():
+    req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
+    req.swa_branching_seqlen = 8
+
+    slot = SessionSlot()
+    slot.save_from_req(req, is_first=True)
+
+    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    slot.restore_to_req(next_req)
+
+    assert req.swa_branching_seqlen is None
+    assert next_req.swa_branching_seqlen is None
 
 
 # Shrink tests removed: streaming sessions are append-only after the
@@ -282,9 +410,7 @@ def test_trim_overshoot_postcondition():
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
-    tree_cache = StreamingSession(
-        _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    )
+    tree_cache = _FakeInnerCache(req_to_token_pool, allocator, page_size)
 
     # Overshoot scenario: origin=26, finished_len=12 -> target=38.
     # committed=40 (overshoot 2), allocated=44, swa_evicted=42 (> target),
@@ -292,50 +418,61 @@ def test_trim_overshoot_postcondition():
     req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.kv.swa_evicted_seqlen = 42
+    req.kv.set_evicted_seqlen(ComponentType.SWA, 42)
 
-    tree_cache._trim_overshoot(req, finished_len=12)
+    tree_cache.session._trim_overshoot(req, finished_len=12)
 
     target = 38
     assert req.kv.kv_committed_len == target
     assert req.kv.kv_allocated_len == target
-    assert req.kv.swa_evicted_seqlen == target
+    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == target
     assert len(req.output_ids) == 12
     # Tail [38, 44) freed by _free_kv_aligned, split at the pre-trim eviction
     # floor 42: [38, 42) gave its SWA peers back already, so it goes back full-only.
     assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
 
 
-def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
-    """A mid-page trim target must not become the SWA eviction cursor (the
-    dead/alive split there frees the shared page twice); rewind to the boundary."""
+@pytest.mark.parametrize("operation", ["trim", "match"])
+@pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.AUXILIARY_SWA])
+def test_session_rewind_keeps_component_cursors_page_aligned(operation, component):
+    """Rewinding below any component cursor must free whole pages."""
     page_size = 16
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator(page_size=page_size)
-    tree_cache = StreamingSession(
-        _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    )
+    tree_cache = _FakeInnerCache(req_to_token_pool, allocator, page_size)
 
     # origin=26, finished=12 -> raw target 38 (mid-page); cursor 48 > target.
     req = _FakeReq("session-a", req_pool_idx=0, committed=52, allocated=64)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.kv.swa_evicted_seqlen = 48
+    req.kv.set_evicted_seqlen(ComponentType.SWA, 16)
+    req.kv.set_evicted_seqlen(component, 48)
 
-    tree_cache._trim_overshoot(req, finished_len=12)
+    if operation == "trim":
+        tree_cache.session._trim_overshoot(req, finished_len=12)
+        assert len(req.output_ids) == 12
+    else:
+        slot = SessionSlot()
+        slot.save_from_req(req, is_first=True)
+        tree_cache.session.slots["session-a"] = slot
+        req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
+        result = tree_cache.match_prefix(SimpleNamespace(req=req, key=list(range(38))))
+        assert result.device_indices.tolist() == list(range(32))
 
     # Rewound to floor_align(38) = 32; every cursor lands page-aligned.
     assert req.kv.kv_allocated_len == 32
     assert req.kv.kv_committed_len == 32
-    assert req.kv.swa_evicted_seqlen == 32
-    assert len(req.output_ids) == 12
-    # Freed [32, 64): [32, 48) below the old cursor goes back full-only,
-    # [48, 64) both halves.
-    assert [t.tolist() for t in allocator.freed] == [
-        list(range(32, 48)),
-        list(range(48, 64)),
-    ]
+    assert req.kv.get_evicted_seqlen(component) == 32
+    assert req.kv.max_evicted_seqlen == 32
+    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == (
+        32 if component == ComponentType.SWA else 16
+    )
+    assert [t.tolist() for t in allocator.freed] == (
+        [list(range(32, 48)), list(range(48, 64))]
+        if component == ComponentType.SWA
+        else [list(range(32, 64))]
+    )
 
 
 if __name__ == "__main__":

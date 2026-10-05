@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens: List[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            # PREBUILT does not materialize a local SWA branching window.
+            if req.swa_branching_seqlen is not None:
+                req.swa_branching_seqlen = None
+            checkpoint_kv_cache(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -137,9 +141,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
+        # Non-blocking H2D: with overlap this runs on the schedule stream after
+        # its wait on the in-flight forward, so a blocking copy would stall the
+        # host until that forward ends and leave the GPU idle.
         last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
-        )
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,

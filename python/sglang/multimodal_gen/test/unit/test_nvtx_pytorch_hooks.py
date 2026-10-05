@@ -29,17 +29,6 @@ from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
 
 
 class TestMaybeNvtxRange(unittest.TestCase):
-    def test_disabled_returns_noop_context_manager(self) -> None:
-        ran = False
-        with maybe_nvtx_range("never", enabled=False):
-            ran = True
-        self.assertTrue(ran)
-
-    def test_disabled_propagates_exception(self) -> None:
-        with self.assertRaises(RuntimeError):
-            with maybe_nvtx_range("never", enabled=False):
-                raise RuntimeError("boom")
-
     def test_disabled_does_not_call_nvtx(self) -> None:
         with (
             patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
