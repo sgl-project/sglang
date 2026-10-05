@@ -6,6 +6,7 @@ from array import array
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
+    get_context,
     get_disagg,
     get_exec,
     get_schedule,
@@ -655,9 +656,13 @@ class PrefillAdder:
         # and those two grids meet only where the prefix itself is chunk
         # aligned. A chunk that stops anywhere else therefore costs the request
         # every later donation, not just this one, so keep the cut on the grid.
+        # Unit tests build a PrefillAdder with no published server config.
+        # The real scheduler publishes `exec` before it gets here. A missing
+        # namespace means the extra buffer is off, so the cut stays put.
         self.mamba_chunk_grid = (
             mamba_cache_chunk_size()
-            if get_exec().mamba.enable_mamba_extra_buffer
+            if get_context().is_config_namespace_published("exec")
+            and get_exec().mamba.enable_mamba_extra_buffer
             else 1
         )
         self.prefill_tile_block_m = prefill_tile_block_m
