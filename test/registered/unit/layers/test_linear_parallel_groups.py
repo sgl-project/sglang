@@ -624,7 +624,7 @@ class TestLinearParallelGroups(CustomTestCase):
         with (
             patch.object(step3p5, "get_moe_a2a_backend", return_value=backend),
             patch.object(step3p5, "Step3p5MoEMLP", return_value=torch.nn.Identity()),
-            patch.object(step3p5, "make_stages", return_value=(Mock(), Mock())),
+            patch.object(step3p5, "append_stages", return_value=(Mock(), Mock())),
         ):
             layer = step3p5.Step3p5DecoderLayer(config)
         self.assertEqual(layer.share_expert.gate_up_proj.tp_size, 1)
