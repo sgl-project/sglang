@@ -56,6 +56,8 @@ def _build_batch(seq_specs, dtype, vocab=VOCAB):
         lp_pt += rows
         pruned_lens.append(n_lp)
     metadata = SimpleNamespace(
+        sample_indices_cpu=sample_indices,
+        input_logprob_indices_cpu=input_logprob_indices,
         extend_return_top_logprob=True,
         extend_token_ids_logprob=True,
         top_logprobs_nums=[TOPK_CYCLE[i % 3] for i in range(len(seq_specs))],

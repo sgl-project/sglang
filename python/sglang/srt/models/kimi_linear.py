@@ -12,10 +12,15 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -48,7 +53,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_layers
+from sglang.srt.utils import is_xpu, make_pp_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -60,10 +65,13 @@ def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
     return num_heads // tp_size
 
 
-def _materialize_residual_stream(
-    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-) -> torch.Tensor:
-    return hidden_states if residual is None else hidden_states + residual
+def _is_sparse_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
+    return (
+        config.is_moe
+        and config.num_experts is not None
+        and layer_idx >= config.first_k_dense_replace
+        and layer_idx % config.moe_layer_freq == 0
+    )
 
 
 class KimiMoE(nn.Module):
@@ -120,6 +128,7 @@ class KimiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -175,9 +184,6 @@ class KimiMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -209,7 +215,7 @@ class KimiDeltaAttention(nn.Module):
         safe_gate / lower_bound: clamp the forget gate from below. ``lower_bound``
             is ignored unless ``safe_gate`` is set.
         reduce_results: forwarded to ``o_proj``; set False when the caller does
-            its own all-reduce (e.g. a fused MoE/attention communicator).
+            its own all-reduce (e.g. a fused MoE/attention boundary).
         shard_on_attn_tp: shard on the attention-TP group instead of the global
             TP group. Required under DP attention, where attn_tp_size < tp_size.
         v_head_dim: asymmetric value head dim; defaults to the key head dim.
@@ -567,6 +573,7 @@ class KimiDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                reduce_results=False,
             )
         else:
             self.self_attn = KimiMLAAttention(
@@ -582,14 +589,11 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 skip_rope=True,
+                reduce_results=False,
             )
 
-        if (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+        sparse = _is_sparse_layer(config, layer_idx)
+        if sparse:
             self.block_sparse_moe = KimiMoE(
                 config=config,
                 quant_config=quant_config,
@@ -605,10 +609,21 @@ class KimiDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+        next_sparse = layer_idx + 1 < config.num_hidden_layers and _is_sparse_layer(
+            config, layer_idx + 1
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -616,16 +631,10 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -634,9 +643,10 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class KimiLinearModel(nn.Module):
@@ -666,7 +676,7 @@ class KimiLinearModel(nn.Module):
 
         self.alt_stream = None if is_xpu() else get_stream("alt")
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiDecoderLayer(
                 layer_idx=idx,
@@ -675,8 +685,6 @@ class KimiLinearModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -703,11 +711,12 @@ class KimiLinearModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -717,15 +726,19 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+        ):
+            aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
-                layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=residual,
                     zero_allocator=zero_allocator,
                 )
             if (
@@ -733,22 +746,19 @@ class KimiLinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
             ):
                 aux_hidden_states.append(
-                    _materialize_residual_stream(hidden_states, residual)
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+            proxy = residual_batch.to_pp(hidden_states, forward_batch)
+            if aux_hidden_states:
+                proxy.tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return proxy
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
@@ -787,11 +797,13 @@ class KimiLinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

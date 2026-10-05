@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -71,6 +72,7 @@ def _staged_fixture(full_match=2):
         full_available_size=Mock(return_value=100)
     )
     cc = HybridCacheController.__new__(HybridCacheController)
+    cc.pp_prefetch_command_group = None
     cc.page_size = 2
     cc.get_hash_str = get_hash_str
     cc.prefetch_queue = Queue()
@@ -81,8 +83,12 @@ def _staged_fixture(full_match=2):
     cc.storage_backend.batch_exists.return_value = 0
     cc.mem_pool_host = SimpleNamespace(
         free=Mock(),
+        anchor_entry=SimpleNamespace(host_pool=SimpleNamespace()),
         entry_map={
-            PoolName.SWA: SimpleNamespace(host_pool=SimpleNamespace(free=Mock()))
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(free=Mock()),
+                device_indices_from_anchor_fn=None,
+            )
         },
     )
     cache.cache_controller = cc
@@ -279,6 +285,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
                     operation.pool_transfers = [swa]
                     operation.host_indices = torch.arange(hit_tokens)
+                    operation.buffer_host_occupied_units = hit_tokens
                     cache.ongoing_prefetch[req.cache_request_handle] = info._replace(
                         host_indices=operation.host_indices, comp_xfers={"swa": [swa]}
                     )
@@ -300,6 +307,60 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertFalse(pipeline.has_staged(req.cache_request_handle))
                     cache.tree_core.match_full_device_prefix.assert_not_called()
+
+    def test_storage_credit_starts_at_the_joint_device_match(self):
+        """At admission, storage is credited with everything past the device's
+        joint FULL+aux match, resident FULL the fetched aux tail unlocks
+        included; only hit tokens that match covers are device_covered."""
+        cache, pipeline, req = _staged_fixture()
+        pipeline.staged_prefetches.clear()
+        handle = req.cache_request_handle
+        tokens = array("q", range(10))
+        cache.prefetch_from_storage(
+            handle,
+            0,
+            tokens[2:],
+            matched_prefix_tokens=tokens[:2],
+            storage_hit_end=10,
+        )
+        info = cache.ongoing_prefetch[handle]
+        operation = info.operation
+        operation.hash_value = ["h0", "h1", "h2", "h3"]
+        operation.storage_hit_count = 8
+        collector = cache.storage_metrics_collector = Mock()
+        cache._storage_prefetch_hit_remaining_by_reqid[handle] = 8
+        # FULL [2, 8) is on device: only [8, 10) and the SWA tail are fetched.
+        info, hit_tokens, _ = cache._trim_buffer_prefetch_full_head(
+            handle, info, operation, 8, 8
+        )
+        swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
+        operation.pool_transfers = [swa]
+        operation.host_indices = torch.arange(hit_tokens)
+        cache.ongoing_prefetch[handle] = info._replace(
+            host_indices=operation.host_indices, comp_xfers={"swa": [swa]}
+        )
+        cache.storage_existence_cache = Mock()
+        pipeline.stage_completed_prefetch(handle, hit_tokens, operation.hash_value)
+
+        # A twin made [0, 6) jointly reusable while the fetch was held.
+        cache.tree_core.match_full_device_prefix.return_value = (8, 1, 8)
+        req.prefix_indices = torch.arange(6)
+        self.assertTrue(pipeline.prepare_staged_prefetch(req))
+        self.assertEqual(
+            split_cached_prefix_by_tier(
+                prefix_len=10,
+                host_hit_len=req.host_hit_length,
+                storage_hit_len=req.storage_hit_length,
+                storage_hit_start=req.storage_hit_start,
+                host_hit_is_storage=req.host_hit_is_storage,
+            ),
+            (6, 0, 4),
+        )
+        collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
+        cache._settle_storage_prefetch_hit(handle, credited_tokens=4)
+        collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            4, "device_covered"
+        )
 
     def test_two_rank_completion_capacity_and_anchor_loss(self):
         with tempfile.TemporaryDirectory(prefix="prefetch-rank-test-") as directory:

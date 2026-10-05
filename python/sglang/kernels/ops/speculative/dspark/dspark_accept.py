@@ -11,7 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_dflash_verify_target_probs,
+    build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.utils import is_npu
@@ -104,7 +104,7 @@ def _accept_sampling_core(
             rows_per_request=verify_num_draft_tokens,
         ).view(bs, verify_num_draft_tokens, -1)
     else:
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits,
             sampling_info=sampling_info,
             draft_token_num=verify_num_draft_tokens,
@@ -676,7 +676,10 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
         and logits.dim() == 2
         and logits.dtype == torch.float32
         and logits.stride(1) == 1
-        and logits.shape[0] <= 64
+        and (
+            logits.shape[0] <= 64
+            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+        )
         and logits.shape[1] >= 4096
     ):
         from sglang.kernels.ops.speculative.row_argmax import row_argmax

@@ -267,7 +267,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 )
             if compute_mode == "sage_fp8":
                 capability = current_platform.get_device_capability()
-                if capability is None or capability.to_int() != 90:
+                if capability is None or capability.to_int() not in (90, 120):
                     found = (
                         capability.as_version_str()
                         if capability is not None
@@ -275,14 +275,21 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     )
                     raise ValueError(
                         "MiniMax-H3 SubBlock compute_mode='sage_fp8' currently "
-                        "requires SM90 (compute capability 9.0); "
+                        "requires SM90 or SM120 (compute capability 9.0 or 12.0); "
                         f"found {found}."
                     )
-                from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
-                    _load_sparge_attention_sm90_ops,
-                )
+                if capability.to_int() == 90:
+                    from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+                        _load_sparge_attention_sm90_ops,
+                    )
 
-                _load_sparge_attention_sm90_ops()
+                    _load_sparge_attention_sm90_ops()
+                else:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                        _load_sm120_sage_ops,
+                    )
+
+                    _load_sm120_sage_ops()
         if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
             if server_args.ring_degree > 1:
                 raise ValueError(
@@ -349,3 +356,38 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3SamplingParams,
+        MiniMaxH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

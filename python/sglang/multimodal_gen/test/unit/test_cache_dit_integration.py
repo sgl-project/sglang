@@ -301,14 +301,22 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
     def test_builds_adapter_for_registered_class(self):
         module = _import_module_with_stub()
         blocks = ["block_0", "block_1"]
-        transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
+        for class_name, blocks_attr in (
+            ("ErnieImageTransformer2DModel", "layers"),
+            ("MingImageTransformer2DModel", "layers"),
+            ("AnimaTransformer3DModel", "transformer_blocks"),
+        ):
+            with self.subTest(class_name=class_name):
+                transformer = type(class_name, (), {blocks_attr: blocks})()
+                adapter = module._build_custom_block_adapter(
+                    transformer, has_separate_cfg=True
+                )
 
-        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
-
-        self.assertIsNotNone(adapter)
-        self.assertEqual(adapter.blocks, blocks)
-        self.assertEqual(adapter.forward_pattern, "Pattern_3")
-        self.assertTrue(adapter.has_separate_cfg)
+                self.assertIsNotNone(adapter)
+                self.assertIs(adapter.transformer, transformer)
+                self.assertIs(adapter.blocks, blocks)
+                self.assertEqual(adapter.forward_pattern, "Pattern_3")
+                self.assertTrue(adapter.has_separate_cfg)
 
     def test_returns_none_for_unknown_class(self):
         module = _import_module_with_stub()
@@ -356,6 +364,20 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.blocks, blocks)
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
+
+    def test_native_qwen21_adapter_overrides_generic_family_match(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = True
+        transformer = _make_transformer("QwenImage21Transformer2DModel")
+        transformer.transformer_blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=6)
+
+        module.enable_cache_on_transformer(transformer, config, has_separate_cfg=True)
+
+        adapter = module.cache_dit.enable_calls[0]["target"]
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+        self.assertIs(adapter.blocks, transformer.transformer_blocks)
 
     def test_custom_adapter_is_retained_until_disable(self):
         module = _import_module_with_stub()

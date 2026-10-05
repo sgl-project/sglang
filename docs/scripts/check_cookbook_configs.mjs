@@ -473,9 +473,8 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
     if (!quickStartBody.includes("<Deployment config={config} />")) {
       fail(where, "Quick start must render the command builder before model capabilities");
     }
-    if (!['uv pip install "sglang[diffusion]"', "uv pip install -e 'python[diffusion]'"]
-      .some((command) => quickStartBody.includes(command))) {
-      fail(where, "Quick start must include the diffusion installation command");
+    if (!quickStartBody.includes("(/docs/sglang-diffusion/installation)")) {
+      fail(where, "Quick start must link to the diffusion installation guide");
     }
   }
 
