@@ -34,8 +34,8 @@ except Exception as e:  # pragma: no cover
     fused_mamba_state_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
 
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 from sglang.srt.utils import get_device
@@ -269,7 +269,7 @@ def _make_envelope_views(device="cpu"):
         temporal_dtype=temporal_dtype,
     )
     raw = torch.zeros(slots * entry, dtype=torch.uint8, device=device)
-    conv_views, temporal = build_page_major_mamba_views(
+    conv_views, temporal = build_mamba_entry_views(
         raw,
         layer_num=layers,
         conv_state_shapes=conv_shapes,

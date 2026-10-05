@@ -535,7 +535,7 @@ class TestRegressionGptOss(ScriptedTestCase):
         assert committed > 0
 
         assert len(r.req.prefix_indices) <= committed, (
-            f"cache_unfinished_req over-read past kv_committed_len: "
+            f"checkpoint over-read past kv_committed_len: "
             f"prefix_indices_len={len(r.req.prefix_indices)}, "
             f"kv_committed_len={committed}"
         )
