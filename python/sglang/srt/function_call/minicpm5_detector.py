@@ -29,7 +29,36 @@ _FUNC_NAME_V1_REGEX = re.compile(r"<function\s+name=[\'\"]([^\'\"]+)[\'\"][^>]*>
 _PARAM_WITH_NAME_REGEX = re.compile(
     r"<param\s+name=[\'\"]([^\'\"]+)[\'\"]>([\s\S]*?)</param>", re.DOTALL
 )
-_PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
+_NAME_ATTR_REGEX = re.compile(r"\bname=")
+
+
+def _has_param_missing_name(block: str) -> bool:
+    # Linear equivalent of `<param(?![^>]*\bname=)[^>]*>`.search(); that regex
+    # rescans to the next ">" from every "<param", quadratic without one.
+    pos = 0
+    while (start := block.find("<param", pos)) != -1:
+        tag_end = block.find(">", start)
+        if tag_end == -1:
+            return False
+        # The last "<param" before this ">" has the fewest attrs to check.
+        last = block.rfind("<param", start, tag_end)
+        if _NAME_ATTR_REGEX.search(block, last + len("<param"), tag_end) is None:
+            return True
+        pos = tag_end + 1
+    return False
+
+
+def _iter_delimited(text: str, start_token: str, end_token: str):
+    # Linear scan for `start.*?end` spans; a regex finditer rescans to the end
+    # from every start token when the end token never arrives.
+    start = text.find(start_token)
+    while start != -1:
+        end = text.find(end_token, start + len(start_token))
+        if end == -1:
+            return
+        end += len(end_token)
+        yield start, end
+        start = text.find(start_token, end)
 
 
 def get_argument_type(
@@ -68,7 +97,6 @@ class MiniCPM5Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<function"
         self.eot_token = "</function>"
-        self.func_call_regex = r"<function.*?</function>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a MiniCPM-4 V3 XML-styled tool call."""
@@ -96,11 +124,13 @@ class MiniCPM5Detector(BaseFormatDetector):
 
         try:
             last_end = 0
-            for m in re.finditer(self.func_call_regex, text, re.DOTALL):
-                if m.start() > last_end:
-                    normal_parts.append(text[last_end : m.start()])
+            for block_start, block_end in _iter_delimited(
+                text, self.bot_token, self.eot_token
+            ):
+                if block_start > last_end:
+                    normal_parts.append(text[last_end:block_start])
 
-                block = m.group(0)
+                block = text[block_start:block_end]
                 func_name = None
                 arguments = {}
                 parsed_ok = False
@@ -177,14 +207,18 @@ class MiniCPM5Detector(BaseFormatDetector):
                         m_fn = _FUNC_NAME_V1_REGEX.search(block)
                         if m_fn:
                             func_name = (m_fn.group(1) or "").strip()
-                        has_invalid_param = (
-                            _PARAM_MISSING_NAME_REGEX.search(block) is not None
-                        )
+                        has_invalid_param = _has_param_missing_name(block)
                         seen_keys = set()
                         allowed_props = set()
                         if func_name in tool_names:
                             allowed_props = name_to_allowed_props.get(func_name, set())
-                        for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
+                        # Bounded by the last "</param>": no match ends past it, and
+                        # a start with no "</param>" after it would scan to the end.
+                        params_end = block.rfind("</param>")
+                        params_end = (
+                            params_end + len("</param>") if params_end != -1 else 0
+                        )
+                        for pm in _PARAM_WITH_NAME_REGEX.finditer(block, 0, params_end):
                             key = pm.group(1).strip()
                             if allowed_props and key not in allowed_props:
                                 has_invalid_param = True
@@ -227,7 +261,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 else:
                     normal_parts.append(block)
 
-                last_end = m.end()
+                last_end = block_end
 
             if last_end < len(text):
                 normal_parts.append(text[last_end:])
