@@ -368,6 +368,27 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
 }
 
+/// A `/generate` batch fits by each prompt's own peak, not max(input) + max(output) = 120.
+#[tokio::test]
+async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    for (first_output, status) in [(1, StatusCode::OK), (5, StatusCode::BAD_REQUEST)] {
+        let body = serde_json::json!({
+            "input_ids": [vec![1; 60], vec![1]],
+            "sampling_params": [{"max_new_tokens": first_output}, {"max_new_tokens": 60}]
+        });
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), status);
+    }
+}
+
 #[tokio::test]
 async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
     let worker = MockWorker::start(vec![]).await;
@@ -968,4 +989,79 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
         .collect();
     assert_eq!(dispatched, [false, true, false, true]);
+}
+
+#[tokio::test]
+async fn rerank_instructions_count_toward_bucket_context_limits() {
+    let short_worker = MockWorker::start(vec![]).await;
+    let long_worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut short = Bucket::new("short", BucketGroups::Plain(group("short", policy.clone())));
+    short.max_context_tokens = Some(1024);
+    let long = Bucket::new("long", BucketGroups::Plain(group("long", policy)));
+    let app = build_router(context(
+        &[
+            ("short", Stage::Plain, &short_worker),
+            ("long", Stage::Plain, &long_worker),
+        ],
+        vec![long, short],
+    ));
+
+    // Qwen rerankers include the instruction in every query-document prompt.
+    for (instruct, worker) in [
+        ("Rank relevant documents.".to_owned(), &short_worker),
+        ("instruction ".repeat(8192), &long_worker),
+    ] {
+        let body = serde_json::json!({"query": "hi", "documents": ["yo"], "instruct": instruct});
+        let req = Request::post("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(worker.captured_json().await, body);
+    }
+}
+
+#[tokio::test]
+async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("small", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(128);
+    let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![bucket]))
+        .unwrap_or_else(|_| panic!("context is shared"));
+    // A loadable tokenizer whose engine tokenization cannot be reproduced.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &path).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        r#"{"tokenizer_class":"CodeLlamaTokenizerFast"}"#,
+    )
+    .unwrap();
+    ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
+    ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+    assert!(ctx.tokenizers.encode_prompt("tiny", "hello").is_none());
+    let app = build_router(Arc::new(ctx));
+    for (input, expected) in [
+        (serde_json::json!("hello"), StatusCode::OK),
+        (serde_json::json!(vec!["hello"; 128]), StatusCode::OK),
+        (
+            serde_json::json!(["hello", "x".repeat(600)]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let req = Request::post("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model":"tiny", "input":input}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let body = crate::common::streaming::collect_body(response.into_body()).await;
+        assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    }
 }

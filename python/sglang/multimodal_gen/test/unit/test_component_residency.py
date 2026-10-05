@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -5,6 +6,10 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
 from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as residency_strategies,
@@ -42,11 +47,13 @@ from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     _load_weights_into_module,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 def _server_args(*, supports_auto_residency=True):
     return SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
+        explicit_residency_mode=lambda _: None,
         pipeline_config=SimpleNamespace(
             supports_auto_residency=supports_auto_residency,
         ),
@@ -456,7 +463,7 @@ def test_request_tail_uses_dynamic_component_instance():
     )
     manager = ComponentResidencyManager(
         pipeline,
-        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+        _server_args(),
     )
     strategy = Mock()
     strategy.prefetch_for_use.return_value = False
@@ -551,6 +558,137 @@ class _Stage:
 
     def component_uses(self, server_args, stage_name=None):
         return self.uses
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("hint", ["preferred", "fallback", "keep"])
+@pytest.mark.parametrize(
+    "component_name, cli_args, explicit_mode",
+    [
+        ("text_encoder_2", [], None),
+        ("text_encoder_2", ["--component-residency", "vae=component-offload"], None),
+        ("text_encoder_2", ["--cpu-offload-components", "vae"], None),
+        (
+            "text_encoder_2",
+            ["--component-residency", "text_encoder_2=component-offload"],
+            "component-offload",
+        ),
+        (
+            "text_encoder_2",
+            ["--component-residency", "text_encoder=component-offload"],
+            "component-offload",
+        ),
+        (
+            "text_encoder_2",
+            ["--component-residency", "all=component-offload"],
+            "component-offload",
+        ),
+        pytest.param(
+            "text_encoder_2",
+            ["--component-residency", "text_encoder=snapshot-offload"],
+            "snapshot-offload",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="snapshot-offload requires CUDA"
+            ),
+        ),
+        ("text_encoder_2", ["--text-encoder-cpu-offload", "true"], "component-offload"),
+        ("text_encoder_2", ["--text-encoder-cpu-offload", "false"], "resident"),
+        (
+            "text_encoder_2",
+            ["--cpu-offload-components", "text_encoder"],
+            "component-offload",
+        ),
+        (
+            "text_encoder_2",
+            ["--component-residency", "all=component-offload", "text_encoder=resident"],
+            "resident",
+        ),
+        (
+            "text_encoder_2",
+            [
+                "--component-residency",
+                "text_encoder=component-offload",
+                "text_encoder_2=resident",
+            ],
+            "resident",
+        ),
+        (
+            "aux_encoder",
+            ["--component-residency", "aux_encoder=component-offload"],
+            "component-offload",
+        ),
+        ("vae", ["--vae-cpu-offload", "true"], "component-offload"),
+    ],
+)
+def test_warmup_hints_respect_explicit_residency(
+    monkeypatch, component_name, cli_args, explicit_mode, hint
+):
+    monkeypatch.setattr(
+        PipelineConfig, "from_kwargs", lambda _: QwenImagePipelineConfig()
+    )
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    argv = ["--model-path", "/unused/model", "--performance-mode", "manual", *cli_args]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    parsed, unknown = parser.parse_known_args(argv)
+    args = ServerArgs.from_cli_args(
+        parsed,
+        unknown,
+        default_args={"text_encoder_cpu_offload": True, "vae_cpu_offload": True},
+    )
+    assert args.explicit_residency_mode(component_name) == explicit_mode
+    mode = explicit_mode or "component-offload"
+    assert args.residency_mode(component_name) == mode
+
+    module = torch.nn.Linear(4, 4)
+    expected_weights = {
+        name: tensor.clone() for name, tensor in module.state_dict().items()
+    }
+    inputs = torch.randn(2, 4)
+    expected_output = module(inputs)
+    use = ComponentUse(
+        "encode",
+        component_name,
+        preferred_ready_after_request=hint == "preferred",
+        keep_ready_after_warmup=hint == "keep",
+    )
+    stage = _Stage(use)
+    pipeline = SimpleNamespace(
+        modules={component_name: module},
+        _stage_name_mapping={"encode": stage},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    manager.refresh_pipeline(pipeline)
+    strategy = manager.strategy_for(component_name, module)
+    prepare = Mock(wraps=strategy.prepare_for_use)
+    monkeypatch.setattr(strategy, "prepare_for_use", prepare)
+
+    for is_warmup in (True, False, False):
+        batch = SimpleNamespace(is_warmup=is_warmup)
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        torch.testing.assert_close(module(inputs.cuda()).cpu(), expected_output)
+        manager.end_stage()
+        keep_on_warmup = is_warmup and explicit_mode is None
+        expected_stage_device = (
+            "cuda"
+            if mode == "resident" or (keep_on_warmup and hint == "keep")
+            else "cpu"
+        )
+        assert module.weight.device.type == expected_stage_device
+        prepare.reset_mock()
+        manager.finish_request()
+        if explicit_mode is not None:
+            prepare.assert_not_called()
+        expected_device = "cuda" if mode == "resident" or keep_on_warmup else "cpu"
+        assert module.weight.device.type == expected_device
+        torch.cuda.synchronize()
+        for name, tensor in module.state_dict().items():
+            torch.testing.assert_close(
+                tensor.cpu(), expected_weights[name], rtol=0, atol=0
+            )
 
 
 def test_warmup_records_use_and_transition_peaks(monkeypatch):
