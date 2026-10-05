@@ -84,6 +84,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -1106,11 +1107,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         custom_names = custom_tool_names(request.tools)
-        tool_call_items: list[
-            Union[ResponseFunctionToolCall, ResponseCustomToolCall]
-        ] = []
+        calls: list[ToolCallItem] = []
         parsed_via_native = False
         detector_owns_format = False
+        ordered_parts = None
         if (
             content
             and chat_tools
@@ -1129,16 +1129,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:
-                    content, call_info_list = parser.parse_non_stream(content)
-                    for call_info in call_info_list:
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                call_info.name,
-                                call_info.parameters or "",
-                                custom_names,
-                            )
-                        )
-                    parsed_via_native = bool(call_info_list)
+                    parsed = parser.parse_non_stream_result(content)
+                    content, calls = parsed.normal_text, parsed.calls
+                    ordered_parts = parsed.ordered_parts
+                    parsed_via_native = bool(calls)
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 
@@ -1160,25 +1154,41 @@ class OpenAIServingResponses(OpenAIServingChat):
                         arguments = json.dumps(
                             tool.get("parameters", {}), ensure_ascii=False
                         )
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=len(calls),
+                                name=tool["name"],
+                                parameters=arguments,
                             )
                         )
                     content = ""
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
-        if content:
+        parts = ordered_parts if ordered_parts is not None else [content, *calls]
+        remaining_calls = len(calls)
+        for part in parts:
+            if not isinstance(part, str):
+                output_items.append(
+                    self._make_tool_call_item(part.name, part.parameters, custom_names)
+                )
+                remaining_calls -= 1
+                continue
+            if not part:
+                continue
+            # Region parsers may split adjacent text into several events.
+            if output_items and isinstance(output_items[-1], ResponseOutputMessage):
+                output_items[-1].content[0].text += part
+                continue
             output_text = ResponseOutputText(
-                text=content,
+                text=part,
                 annotations=[],  # TODO
                 type="output_text",
                 # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
-                phase="commentary" if tool_call_items else "final_answer",
+                phase="commentary" if remaining_calls else "final_answer",
                 id=f"msg_{random_uuid()}",
                 content=[output_text],
                 role="assistant",
@@ -1186,7 +1196,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
-        output_items.extend(tool_call_items)
+            # Preserve the existing all-generated-token logprobs payload once.
+            output_logprobs = None
         return output_items
 
     def _make_response_output_items_with_harmony(

@@ -17,6 +17,8 @@ class StreamingParseResult(BaseModel):
 
     normal_text: str = ""
     calls: List[ToolCallItem] = []
+    # None means the detector does not provide text/tool ordering.
+    ordered_parts: Optional[List[str | ToolCallItem]] = None
 
 
 @dataclass

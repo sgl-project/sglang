@@ -15,7 +15,7 @@ from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -192,15 +192,18 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
+        result = self.parse_non_stream_result(full_text)
+        return result.normal_text, result.calls
+
+    def parse_non_stream_result(self, full_text: str) -> StreamingParseResult:
+        """Parse full output without discarding optional text/tool ordering."""
         if not self.tools:
-            return full_text, []
+            return StreamingParseResult(normal_text=full_text)
         has_tool_call = self.detector.has_tool_call(full_text)
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
-        tool_call_list = parsed_result.calls
-        if tool_call_list or has_tool_call:
-            return parsed_result.normal_text, tool_call_list
-        else:
-            return full_text, []
+        result = self.detector.detect_and_parse(full_text, self.tools)
+        if result.calls or has_tool_call:
+            return result
+        return StreamingParseResult(normal_text=full_text)
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
