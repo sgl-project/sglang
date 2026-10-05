@@ -22,6 +22,7 @@ from sglang.srt.layers.layer_boundary.construction import (
     _bind_stage,
     _input_scattered_possible,
     _reject_unsupported_cp_moe,
+    _unpadded_possible,
     _use_ag_after_qlora,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
@@ -64,6 +65,8 @@ def _active_variants():
         yield BatchVariant.INPUT_SCATTERED
     if layernorm_sp.layernorm_sp_enabled():
         yield BatchVariant.SEQUENCE_PARALLEL
+    if _unpadded_possible():
+        yield BatchVariant.UNPADDED
 
 
 def _row_layouts(variant):
@@ -117,6 +120,19 @@ def _resolve_ffn(
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
     if parallel.attn_cp_size > 1 and sparse:
         _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
+    if variant is BatchVariant.UNPADDED and on_rank_rows:
+        # Rows that do not divide over attention TP stay whole: the FFN runs on
+        # the attention's rows (an a2a MoE dispatches them from every
+        # attention-TP rank) and its output is complete, as a2a's combine or
+        # local compute leaves it.
+        return (
+            StageContract(
+                InputContract(attention, read=read),
+                OutputContract(attention, update=update, transform=output_transform),
+            ),
+            attention,
+            attention,
+        )
     on_cp_shards = (
         sparse
         and parallel.attn_cp_size > 1

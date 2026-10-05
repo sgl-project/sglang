@@ -399,6 +399,58 @@ class TestPipelineHandoff(CustomTestCase):
             attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
 
 
+class TestUnpaddedBatches(CustomTestCase):
+    """Without attention DP, --disable-attn-tp-gather lets a batch reach the
+    stages with rows that do not divide over attention TP. Such a batch keeps
+    an FFN that would run on this rank's attention-TP slice on the
+    attention's rows instead."""
+
+    def build(self, parallel, *, sparse):
+        with fixture.planning(parallel, a2a=True, boundary_reduction="ar"):
+            with layer_stack():
+                return [s for _ in range(2) for s in layer(sparse=sparse)]
+
+    def test_an_unpadded_batch_keeps_the_attention_rows(self):
+        for sparse in (True, False):
+            with self.subTest(sparse=sparse):
+                parallel = fixture.parallel_of(
+                    attn_dp=1,
+                    attn_tp=2,
+                    disable_attn_tp_gather=True,
+                    moe_dense_tp_size=None if sparse else 1,
+                )
+                _, ffn, attention, _ = self.build(parallel, sparse=sparse)
+                ordinary = ffn.plan.paths[BatchVariant.ORDINARY]
+                unpadded = ffn.plan.paths[BatchVariant.UNPADDED]
+                # Rows that divide take the slice; the others complete the
+                # attention's sum on every row and hand on a complete output.
+                self.assertIn(TokenAxis.ATTN_TP, ordinary.entry.input_rows.sharded)
+                self.assertEqual(unpadded.entry.input_rows.sharded, frozenset())
+                self.assertIs(
+                    unpadded.entry.prepare.keywords["step"].func,
+                    boundary_prepare._reduce_update_read,
+                )
+                self.assertIsNone(unpadded.output.group)
+                self.assertIs(unpadded.output_move, keep_output)
+                # The next attention reads those rows as they are.
+                self.assertIs(
+                    attention.plan.paths[BatchVariant.ORDINARY].entry.input_move,
+                    attn_tp_gather_input,
+                )
+                self.assertIsNone(
+                    attention.plan.paths[BatchVariant.UNPADDED].entry.input_move
+                )
+
+    def test_padded_batches_have_no_unpadded_path(self):
+        for attn_dp, disabled in ((2, True), (1, False)):
+            with self.subTest(attn_dp=attn_dp, disable_attn_tp_gather=disabled):
+                parallel = fixture.parallel_of(
+                    attn_dp=attn_dp, attn_tp=2, disable_attn_tp_gather=disabled
+                )
+                _, ffn, _, _ = self.build(parallel, sparse=True)
+                self.assertNotIn(BatchVariant.UNPADDED, ffn.plan.paths)
+
+
 class TestDenseFfnOverAttentionTp(CustomTestCase):
     """A dense FFN sharded over attention TP under attention DP computes on
     the attention's rows and sums over attention TP, with no DP move."""

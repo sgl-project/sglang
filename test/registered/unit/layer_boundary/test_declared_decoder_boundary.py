@@ -85,6 +85,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         dwdp_size=1,
         attn_dp_enabled=attn_dp > 1,
         enable_attn_tp_input_scattered=False,
+        disable_attn_tp_gather=False,
         tp_group=SimpleNamespace(
             name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
         ),

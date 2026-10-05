@@ -44,6 +44,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     _batch_shards_over_cp,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
@@ -53,6 +54,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.runtime_context import (
     get_forward,
@@ -89,6 +91,20 @@ def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None
                 "a MoE on the TP group with moe_dp_size == attn_cp_size under "
                 "attention DP and attention CP"
             )
+
+
+def _unpadded_possible() -> bool:
+    """Whether a batch whose rows do not divide over attention TP may reach an
+    FFN that would run on this rank's attention-TP slice, so that FFN needs a
+    variant that stays on the attention's rows."""
+    return batches_are_unpadded() and (
+        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
+    )
+
+
+def _rows_indivisible_over_attn_tp(forward_batch, attn_tp_size: int) -> bool:
+    """Whether this batch arrived with rows that do not divide over attention TP."""
+    return forward_batch.input_ids.shape[0] % attn_tp_size != 0
 
 
 def _input_scattered_possible() -> bool:
@@ -173,6 +189,11 @@ class StagePlan:
     ):
         self.norm = norm
         self.edges = dict(variants)
+        # The attention TP size an unpadded batch's rows are checked against,
+        # when such a batch may arrive (see BatchVariant.UNPADDED).
+        self._unpadded_attn_tp_size = (
+            get_parallel().attn_tp_size if BatchVariant.UNPADDED in self.edges else None
+        )
         self.enters_stack = enters_stack
         self.terminal = terminal
         self.finishes_directly = finishes_directly
@@ -240,6 +261,10 @@ class StagePlan:
             return BatchVariant.INPUT_SCATTERED
         if _batch_shards_over_cp(forward_batch):
             return BatchVariant.CONTEXT_PARALLEL
+        if self._unpadded_attn_tp_size is not None and _rows_indivisible_over_attn_tp(
+            forward_batch, self._unpadded_attn_tp_size
+        ):
+            return BatchVariant.UNPADDED
         return BatchVariant.ORDINARY
 
     def path_for(self, forward_batch):
