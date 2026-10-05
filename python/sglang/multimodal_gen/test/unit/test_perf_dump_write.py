@@ -1,12 +1,16 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils import perf_logger as perf_logger_module
-from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    RequestMetrics,
+)
 
 
 def _metrics(request_id: str) -> SimpleNamespace:
@@ -92,3 +96,37 @@ def test_finalize_preserves_perf_report_ownership(
         report = json.loads(path.read_text())
         assert report["request_id"] == "request"
         assert report["meta"] == {"model": "model"}
+
+
+@pytest.mark.parametrize("is_output_rank", [True, False])
+def test_finalize_preserves_the_output_rank_report_guard(
+    tmp_path, monkeypatch, is_output_rank
+):
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = is_output_rank
+    worker.server_args = SimpleNamespace(model_path="model")
+    worker._materialize_output_transport = Mock()
+    worker._record_output_peak_memory = Mock()
+    worker._record_replica_peak_memory = Mock()
+    path = tmp_path / "perf.json"
+    metrics = RequestMetrics("request")
+
+    worker._finalize_output_batch(
+        output_batch=OutputBatch(metrics=metrics),
+        req=SimpleNamespace(
+            request_id="request",
+            perf_dump_path=str(path),
+            is_warmup=False,
+            suppress_logs=True,
+            return_raw_frames=True,
+        ),
+        save_output_paths=Mock(),
+        output_metrics=[metrics],
+        deferred=False,
+    )
+
+    worker._record_replica_peak_memory.assert_called_once_with([metrics])
+    assert path.exists() == is_output_rank
+    if is_output_rank:
+        assert json.loads(path.read_text())["request_id"] == "request"
