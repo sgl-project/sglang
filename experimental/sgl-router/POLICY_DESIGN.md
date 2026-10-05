@@ -406,8 +406,9 @@ reports change after selection; it neither recaptures nor reserves capacity.
 Fallback policies read their own state and do not share snapshots with callers.
 
 Snapshot capture still scans the full table; an engine-scoped reader can be added
-if profiling justifies it. Power-of-two reuses the legacy prefill/decode pressure
-comparisons, including router-local fallback. Concrete load-aware admission remains
+if profiling justifies it. Power-of-two ranks engines with the shared prefill/decode
+comparisons in `state/load_monitor/engine_ranking.rs`, including router-local
+fallback. Concrete load-aware admission remains
 in #40271. Further shared load interpretation and correction for dispatches since
 the report remain follow-ups; these must preserve source, freshness, and available
 measurements without adding another
