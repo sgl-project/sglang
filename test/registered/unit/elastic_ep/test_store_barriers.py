@@ -191,13 +191,38 @@ class TestExpertMapInbox(StoreBackedTestCase):
         payload = torch.tensor([[3, 1, 2, 0]], dtype=torch.int64)
         self.assertTrue(
             share_expert_map_via_store(
-                payload, is_src=True, cohort_size=2, group_rank=0
+                payload, is_src=True, cohort_ranks=range(2), group_rank=0
             )
         )
         received = torch.zeros_like(payload)
         self.assertTrue(
             share_expert_map_via_store(
-                received, is_src=False, cohort_size=2, group_rank=1
+                received, is_src=False, cohort_ranks=range(2), group_rank=1
+            )
+        )
+        self.assertTrue(torch.equal(received, payload))
+
+    def test_sparse_cohort_is_addressed_by_rank_id(self):
+        """After a fault the live ranks stop being 0..n-1, and the inbox is named for
+        the reader's own id. Width 6 with rank 4 down leaves five live ranks and a top
+        id of 5, so anything driven off the count writes to the rank that just died and
+        never to rank 5, which then waits on an inbox nobody fills."""
+        import torch
+
+        live = (0, 1, 2, 3, 5)
+        payload = torch.tensor([[3, 1, 2, 0]], dtype=torch.int64)
+        self.assertTrue(
+            share_expert_map_via_store(
+                payload, is_src=True, cohort_ranks=live, group_rank=0
+            )
+        )
+        self.assertTrue(self._store.check(["sglang_expert_map_to_r5"]))
+        self.assertFalse(self._store.check(["sglang_expert_map_to_r4"]))
+
+        received = torch.zeros_like(payload)
+        self.assertTrue(
+            share_expert_map_via_store(
+                received, is_src=False, cohort_ranks=live, group_rank=5
             )
         )
         self.assertTrue(torch.equal(received, payload))
@@ -208,7 +233,7 @@ class TestExpertMapInbox(StoreBackedTestCase):
         payload = torch.tensor([[0, 1]], dtype=torch.int64)
         self.assertFalse(
             share_expert_map_via_store(
-                payload, is_src=True, cohort_size=1, group_rank=0
+                payload, is_src=True, cohort_ranks=range(1), group_rank=0
             )
         )
 
