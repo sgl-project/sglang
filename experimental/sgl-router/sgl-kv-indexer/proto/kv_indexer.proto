@@ -71,6 +71,11 @@ message ExternalKvAction {
   // REPORT only. Per-hash token count (block_size), index-aligned with `hashes`,
   // used to accumulate SWA trailing windows. Empty when not supplied (legacy).
   repeated uint32 block_sizes = 5;
+
+  // REPORT only. Parent of hashes[0]; absent means hashes[0] is a root block.
+  // Every later hash is the child of the preceding hash. The Indexer and Bridge
+  // are deployed together, so this new protocol does not support old senders.
+  optional sfixed64 parent_block_hash = 6;
 }
 
 message ApplyExternalKvBatchRequest {

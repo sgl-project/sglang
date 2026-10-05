@@ -64,6 +64,38 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    # Request FP32 SiLU/multiply intermediates until FP8 quantization.
+    # False preserves backend defaults, including their existing FP32 paths.
+    silu_mul_keep_fp32: bool = False
+
+    # The MoE placement a fused func needs is the layer's own, not the
+    # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a
+    # layer's EP view after load. Read it off the layer so there is one
+    # address to keep correct.
+    @property
+    def moe_tp_size(self) -> int:
+        return self._layer_placement("moe_tp_size")
+
+    @property
+    def moe_tp_rank(self) -> int:
+        return self._layer_placement("moe_tp_rank")
+
+    @property
+    def moe_ep_size(self) -> int:
+        return self._layer_placement("moe_ep_size")
+
+    @property
+    def moe_ep_rank(self) -> int:
+        return self._layer_placement("moe_ep_rank")
+
+    def _layer_placement(self, name: str) -> int:
+        if self.layer is None:
+            raise AttributeError(
+                f"{name} is the layer's MoE placement, but this runner config "
+                "has no layer. A layer that runs fused MoE funcs states itself "
+                "on its runner config."
+            )
+        return getattr(self.layer, name)
 
 
 @dataclass

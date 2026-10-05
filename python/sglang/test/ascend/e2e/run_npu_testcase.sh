@@ -6,6 +6,10 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
+# shadow the installed package on sys.path.
+cd "${sglang_source_path}"
+
 echo "NPU info:"
 npu-smi info
 
