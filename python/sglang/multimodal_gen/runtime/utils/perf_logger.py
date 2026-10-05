@@ -449,8 +449,11 @@ class PerformanceLogger:
         try:
             abs_path = os.path.abspath(file_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
+            # readers poll for this file: never let them see a partial write
+            tmp_path = f"{abs_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
+            os.replace(tmp_path, abs_path)
             logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
