@@ -385,8 +385,8 @@ class TestFusedDraftDecision(CustomTestCase):
 class TestMambaHostPrivateDraftRefused(CustomTestCase):
     """A mamba host's unified buffer takes the whole KV budget, so a private
     draft pool on top of it would overcommit; the fused arm is the only
-    EAGLE-family or DFLASH arm such a host builds. DSPARK keeps the private
-    pool it booted with on these hosts before it could fuse."""
+    EAGLE-family or DFLASH arm such a host builds. A DSPARK draft that does
+    not fuse keeps its private pool."""
 
     _DECLINED = "the draft's K/V rows are asymmetric"
 
@@ -412,9 +412,8 @@ class TestMambaHostPrivateDraftRefused(CustomTestCase):
                     )
 
     def test_a_declined_dflash_draft_is_refused_and_dspark_keeps_its_pool(self):
-        """DFLASH is new on the unified pool, so its decliner is refused like
-        EAGLE's. DSPARK already booted here with a private pool, so its
-        decliner still gets one instead of a boot failure."""
+        """A DFLASH decliner is refused like EAGLE's; a DSPARK decliner keeps
+        its private pool instead of failing the boot."""
         declined = FusedDraftDecision(declined=self._DECLINED)
         with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
             self._resolve(decision=declined, algorithm="DFLASH")

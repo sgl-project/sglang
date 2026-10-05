@@ -1149,17 +1149,17 @@ class KVCacheConfigurator:
         allocated on top of it, unbudgeted. Until the mamba solve prices that
         pool, an EAGLE-family or DFLASH draft that does not fuse is refused here
         instead of overcommitting GPU memory. A DSPARK draft that does not fuse
-        keeps its private pool: DSPARK booted that way on these hosts before it
-        could fuse, and refusing it would break those deployments."""
-        placement = self._fused_draft_for_pool_factory()
+        keeps its private pool, unpriced: refusing it would refuse DSPARK on
+        these hosts whenever its draft declines fusion, as the Kimi-Linear
+        default (a trtllm_mha draft) does."""
+        decision = self._fused_draft_decision()
+        placement = self._fused_draft_for_pool_factory(decision)
         if (
             placement is None
             and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
             and not self.is_draft_worker
         ):
-            reason = (
-                self._fused_draft_decision().declined or "fusion does not apply to it"
-            )
+            reason = decision.declined or "fusion does not apply to it"
             raise ValueError(
                 "--enable-unified-memory + EAGLE/EAGLE3/DFLASH on a mamba-hybrid "
                 "target needs the draft's KV fused into the target's pages, but "
@@ -1175,15 +1175,14 @@ class KVCacheConfigurator:
         at the draft's own heads, head_dim and KV dtype, so a draft that does
         not fuse is refused here, as on a mamba host, instead of overcommitting
         GPU memory."""
-        placement = self._fused_draft_for_pool_factory()
+        decision = self._fused_draft_decision()
+        placement = self._fused_draft_for_pool_factory(decision)
         if (
             placement is None
             and self.spec_algorithm.is_eagle()
             and not self.is_draft_worker
         ):
-            reason = (
-                self._fused_draft_decision().declined or "fusion does not apply to it"
-            )
+            reason = decision.declined or "fusion does not apply to it"
             raise ValueError(
                 "--enable-unified-memory + EAGLE/EAGLE3 on a hybrid-SWA target "
                 "needs the draft's KV fused into the target's pages, but this "
@@ -1192,11 +1191,10 @@ class KVCacheConfigurator:
             )
         return placement
 
-    def _fused_draft_for_pool_factory(self):
-        """Resolve ONCE per factory call (not inline) so the boot log reports
-        exactly the placement the factory is handed: a declined fusion and an
-        engaged one otherwise look identical from outside."""
-        decision = self._fused_draft_decision()
+    def _fused_draft_for_pool_factory(self, decision):
+        """The placement a pool factory is handed, from ONE resolved decision,
+        so the boot log reports exactly that placement: a declined fusion and
+        an engaged one otherwise look identical from outside."""
         if decision.placement is None:
             if decision.declined is not None:
                 logger.warning("fused draft KV disabled: %s", decision.declined)
