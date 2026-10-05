@@ -8,12 +8,12 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
     assert_process_healthy,
     configure_nixl_pd_backend,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -151,7 +151,9 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.prefill_tp_size)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -178,7 +180,9 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             "--base-gpu-id",
             str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.decode_base_gpu_id, cls.decode_base_gpu_id + cls.decode_tp_size)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -256,15 +260,13 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
-            num_shots=5,
             num_threads=128,
             temperature=0.0,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
         self.assertGreater(
             metrics["score"],
@@ -303,7 +305,6 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=50,
             num_threads=128,
@@ -312,7 +313,7 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
         # Tolerate eval/request errors; the gate is that workers stay healthy
         # after the injected transfer failures, not the score itself.
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             print(f"Evaluation metrics: {metrics}")
         except Exception as e:
             print(f"Test encountered expected errors: {e}")

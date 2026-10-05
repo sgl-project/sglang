@@ -27,16 +27,14 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
-
-if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 
 logger = logging.getLogger(__name__)
 
@@ -63,17 +61,18 @@ def select_kv_publisher_dp_rank(
     return dp_rank or 0
 
 
-def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -> bool:
+def is_kv_publisher_rank(kv_events_config: Optional[str]) -> bool:
     """Whether this scheduler owns a KV-event publisher slot: one per
     independent KV cache (pp/attn-TP/attn-CP rank 0). Shared by
     `SchedulerKvEventsPublisher` and `SchedulerLoadPublisher`, which must
     gate identically or their /server_info-derived ports disagree.
     """
+    parallel = get_parallel()
     return bool(
         kv_events_config
-        and ps.pp_rank == 0
-        and ps.attn_tp_rank == 0
-        and ps.attn_cp_rank == 0
+        and parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
     )
 
 
