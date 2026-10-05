@@ -299,6 +299,10 @@ class Model(msgspec.Struct):
     weight_loader_prefetch_num_threads: A[
         int, "Number of threads per rank for checkpoint prefetching (default: 4)."
     ] = 4
+    weight_loader_copy_num_threads: A[
+        Optional[int],
+        "Positive per-rank tensor-copy worker limit for DeepSeek V4 and shared V2/V3/R1 loaders. Unset preserves Python default. Separate from checkpoint-prefetch and shard-reader threads.",
+    ] = None
     weight_loader_drop_cache_after_load: A[
         bool, "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it."
     ] = False

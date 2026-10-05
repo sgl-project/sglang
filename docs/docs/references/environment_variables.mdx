@@ -118,11 +118,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
     </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Positive integer limiting concurrent tensor-copy workers per rank in the DeepSeek V4 weight loader. Set this on every rank to tune loading from network storage; it does not change checkpoint-prefetch or shard-reader concurrency. Unset uses Python's ThreadPoolExecutor default.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset</td>
-    </tr>
 </tbody>
 </table>
 
