@@ -3,7 +3,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
@@ -36,6 +36,9 @@ def _optional_positive_finite_float(value: Any, field_name: str) -> float | None
 
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
+    # The video/audio sigma schedules include both interval endpoints.
+    min_num_inference_steps: ClassVar[int] = 2
+
     height: int = 512
     width: int = 896
     num_inference_steps: int = 50

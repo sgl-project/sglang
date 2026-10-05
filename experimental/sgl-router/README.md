@@ -3,11 +3,12 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
-pools come from either a static URL list or Kubernetes EndpointSlice
-discovery. Both edges speak cleartext HTTP/2 where the peer does — see
-[HTTP/2](#http2).
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
+[`/v1/classify`](#classify), [`/v1/rerank`](#rerank), `/v1/chat/completions` and
+SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+`/healthz` / `/readyz` and `/metrics`. Worker pools come from either a static URL
+list or Kubernetes EndpointSlice discovery. Both edges speak cleartext HTTP/2
+where the peer does — see [HTTP/2](#http2).
 
 ## Building
 
@@ -82,6 +83,35 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### KV-event gap replay
+
+ZMQ drops KV events at the publisher's high-water mark, and a lost removal
+leaves the router crediting a worker with blocks it no longer holds. Give each
+engine a replay socket and the router re-fetches the batches a sequence gap
+skipped:
+
+```bash
+python -m sglang.launch_server ... \
+  --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}'
+```
+
+Rank r publishes on 5557 + r and replays on 5558 + r, so with `dp_size > 1`
+place the replay base at least dp_size ports past the PUB base. The engine keeps
+the last `buffer_steps` batches (default 10000); older gaps stay unrepaired.
+`sgl_router_kv_event_replays_total{outcome}` counts the attempts.
+
+### Pending prefixes
+
+Until the engine's KV events arrive, requests that share a cold prefix see no
+cached owner and spread across workers, each prefilling the same prefix. This
+is common with parallel sampling, RL rollouts and agent fan-out.
+`--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
+long after routing it there, so the burst stays together. It is off by default
+and needs `--policy cache_aware` with the Router-local radix tree.
+`sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
+prefix matched deeper than any confirmed one; the policy's candidate and
+admission filters still decide whether that worker is picked.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic
@@ -131,7 +161,7 @@ all of it, and the `sgl_router_kv_bootstrap_*` series in
 ### Reorg routing
 
 Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
-and cache/session flags configure its policies; no separate file is required.
+and cache/session flags configure its policies; a bucket file is optional.
 
 ```bash
 sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
@@ -141,19 +171,71 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
 settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. Unsupported legacy options
-fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
-buckets and are not accepted on this path.
+with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
+an engine whose KV tokens have reached 95% of its capacity.
+Unsupported legacy options fail at startup.
+
+`--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
+bucket is plain or P/D, and each group may set its own engines, policy,
+admission and affinity; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+
+```json
+{"buckets": [{
+  "id": "default",
+  "prefill": {"worker_services": ["inference/prefill"], "admission": {"max_pending_prefill_tokens": 32768}},
+  "decode": {"worker_services": ["inference/decode"], "admission": {"max_kv_usage": 0.9}}
+}]}
+```
+
+`worker_services` matches Kubernetes Services by `namespace/name`, using the
+`kubernetes.io/service-name` label on watched EndpointSlices. Replacement pods
+and new replicas join the same group automatically. The router's discovery
+selectors must include those EndpointSlices; this field does not expand the watch.
+A worker selected by several Services belongs to each of them.
+
+For static URL discovery, use `"worker_ids": ["http://worker:30000"]`: each ID
+is the configured worker URL. Kubernetes worker IDs are `namespace/pod-UID`
+(and change when a pod is replaced), so use `worker_services` for durable pools.
+Set only one membership field, or omit both for every engine of the group's role.
+Empty membership lists and blank worker IDs are rejected at startup.
+
+Admission fields left unset or set to `null` inherit CLI defaults. To apply a
+limit only to selected groups, omit that CLI default and set it on those groups.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
+
+Both reorg affinity policies accept `--affinity-mode prefer` (default) or
+`balanced`. Prefer keeps an admissible session binding or the best admissible
+prefix owner. Balanced samples a power-of-two alternative and switches only
+when the affinity engine's load exceeds both
+`alternative * --affinity-load-factor` (default 2) and
+`alternative + --affinity-load-gap`. `--affinity-balanced-by` picks the load:
+`prefill-tokens` (default; gap default 1024) is the engine's waiting uncached
+tokens plus the prompt tokens it would prefill for this request, so a cache owner
+is credited for its prefix (session-aware assumes the whole prompt on either
+engine); `running-requests` (gap default 4) ignores the request. Missing fresh load preserves admissible
+affinity; ties also preserve it.
+
+A bucket group may override these with `"affinity": {"mode", "balanced_by",
+"load_factor", "load_gap"}`; unset fields take the CLI values, and the balanced
+fields require `"mode": "balanced"`. For example, a session-aware group balanced
+by running requests:
+`"plain": {"affinity": {"mode": "balanced", "balanced_by": "running_requests"}}`.
+
+Both modes fall back within the group when affinity fails admission, excluding
+rejected engines. The fallback winner must pass admission; failure advances to
+the next bucket. Session replacements are bound after admission during selection,
+not after dispatch. Reorg rejects legacy pressure guards, cache switch margins,
+and queue/saturation gates in favor of these shared affinity settings.
 
 ### Optional tokenizer for load-only routing
 
 `--no-tokenizer` skips tokenizer loading for load-only policies such as
 `power_of_two` and `session_aware`, on either routing path. Workers tokenize the
 original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
-Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
-require a tokenizer.
+Cache-aware routing, prefix-cache terms or filters, and buckets with token-length
+or context limits require a tokenizer. Reorg buckets that only select membership
+and load-based policies can use `--no-tokenizer`.
 
 ### DP-rank routing
 
@@ -183,7 +265,8 @@ model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client
-of this router, independently of what the engine's own defaults happen to be:
+of this router, independently of what the engine's own defaults happen to be
+(on native [`/generate`](#native-generate), in each prompt's `sampling_params`):
 
 ```bash
 sgl-router \
@@ -350,6 +433,59 @@ case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
 backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
+
+## Native `/generate`
+
+`/generate` (`POST` or `PUT`) has the engine's interface: the same
+`GenerateReqInput` body and the same response, buffered or SSE. The body names no
+model, so requests go to the one this router serves. Worker selection
+(`--chat-routing`, `--policy`), PD dispatch, and abort-on-disconnect are shared
+with chat completions.
+
+With a tokenizer loaded, the router tokenizes `text` (a string or a list) with
+the special tokens SGLang adds (BOS per `add_bos_token` for Llama-, Gemma- and
+Cohere-class tokenizers, otherwise the `tokenizer.json` post-processor's), and
+forwards it as `input_ids`. The engine skips tokenizing and routing sees its exact
+tokens. Multimodal requests keep `text`, since the engine expands placeholders
+from it, and `--disable-input-ids-forwarding` keeps it for every request. So does
+a model whose `tokenizer.json` normalizer transformers replaces on load (legacy
+SentencePiece Llama files, bge-m3), or whose `tokenizer_config.json` the router
+cannot read, as the router cannot reproduce its tokens. A batch goes to one
+worker: load counts every prompt and each of its `n` samples, while bucket and
+context limits bound the longest prompt plus its own `max_new_tokens`.
+
+Otherwise the body passes through, plus PD bootstrap fields, a minted `rid` for
+a single prompt that has none, and `--override-sampling-params` defaults. Under
+`--dp-aware` each worker's body also carries the chosen `routed_dp_rank`; a PD
+batch or `n > 1` request leaves the prefill rank to the engine, which gives item
+`i` the bootstrap room `room + i`.
+
+## Embeddings
+
+`/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
+body and response. As for chat completions, `model` must name the served model.
+A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+
+Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
+[`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.
+Blank prompts and multimodal items stay as sent, for the engine to reject or
+render. A list is a batch for one worker, routed on load. A single prompt with no
+`rid` gets a minted one. Under `--dp-aware` the engine picks the rank, since its
+embeddings endpoint reads none.
+
+## Classify
+
+`/v1/classify` has the engine's interface: the same `ClassifyRequest` body and
+response. It is served as embeddings are, except that a batch of text stays text,
+since the engine takes token IDs for only one prompt.
+
+## Rerank
+
+`/v1/rerank` has the engine's interface: the same `V1RerankReqInput` body and
+response, sent as `POST` or `PUT` to the model this router serves. The body is
+forwarded as sent, since the engine renders and tokenizes each query-document
+pair. Routing is on load, with each pair's size estimated from its text. As for
+embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
