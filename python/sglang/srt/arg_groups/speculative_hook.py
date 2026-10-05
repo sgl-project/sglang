@@ -1009,17 +1009,28 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-    if cfg.enable_mixed_chunk and not algo.supports_mixed_chunk():
+    pp_spec_mixed_chunk_unsupported = (
+        cfg.pp_size > 1 and envs.SGLANG_ENABLE_PP_SPEC.get()
+    )
+    if cfg.enable_mixed_chunk and (
+        not algo.supports_mixed_chunk() or pp_spec_mixed_chunk_unsupported
+    ):
         declare_resolution(
             server_args,
             "_handle_eagle_family",
             enable_mixed_chunk=False,
         )
-        logger.warning(
-            "Mixed chunked prefill is disabled: %s speculative decoding does "
-            "not support it.",
-            cfg.speculative_algorithm,
-        )
+        if pp_spec_mixed_chunk_unsupported:
+            logger.warning(
+                "Mixed chunked prefill is disabled: pipeline-parallel "
+                "speculative decoding does not support it."
+            )
+        else:
+            logger.warning(
+                "Mixed chunked prefill is disabled: %s speculative decoding does "
+                "not support it.",
+                cfg.speculative_algorithm,
+            )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch in [
