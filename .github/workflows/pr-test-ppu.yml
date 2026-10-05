@@ -1,0 +1,169 @@
+name: PR Test (PPU)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: "Run the preflight even if the last commit touched no PPU path"
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # Newer runs cancel older runs for the same ref; unrelated label events
+  # use isolated groups to avoid interfering with active runs.
+  group: >-
+    pr-test-ppu-${{
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name != 'run-ci' &&
+       github.event.label.name != 'run-ci-ppu') &&
+      format('ignored-label-{0}', github.run_id) ||
+      inputs.ref || github.ref
+    }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    # Give skipped checks from unrelated labels distinct names so they cannot
+    # replace the corresponding checks from an active run.
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          'ignored-label-check-changes' || 'check-changes' }}
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'run-ci' ||
+      github.event.label.name == 'run-ci-ppu'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # Scope only; the shared pr-gate checks both required labels.
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # github.sha (not github.ref) so a runner that dequeues after main
+          # advances still validates the SHA that triggered the run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
+            echo "Run mode: ALL TESTS"
+          else
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          # PPU-specific paths only.
+          filters: |
+            ppu:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "scripts/ci/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/kernels/aot/csrc/ppu/**"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          'ignored-label-pr-gate' || 'pr-gate' }}
+    needs: check-changes
+    if: needs.check-changes.outputs.ppu == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-label: run-ci-ppu
+    secrets: inherit
+
+  # ==================== PPU Runner Preflight ==================== #
+  # Validates the runner contract only; the SRT platform and AOT kernels land
+  # in later PRs and build their first real test on top of this job.
+  ppu-preflight:
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          'ignored-label-ppu-preflight' || 'ppu-preflight' }}
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.ppu == 'true'
+    runs-on: 1-ppu-m890p
+    timeout-minutes: 60
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Validate PPU runner contract
+        timeout-minutes: 10
+        run: python3 scripts/ci/ppu/check_ppu_environment.py
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
+    needs: [pr-gate, check-changes, ppu-preflight]
+    if: always() && needs.check-changes.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          for job in $(echo "$json_needs" | jq -r 'keys_unsorted[]'); do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+
+      - name: Require the preflight when PPU is in scope
+        run: |
+          in_scope='${{ needs.check-changes.outputs.ppu }}'
+          preflight='${{ needs.ppu-preflight.result }}'
+          echo "PPU in scope: '$in_scope' / ppu-preflight: '$preflight'"
+
+          if [[ "$in_scope" == "true" && "$preflight" != "success" ]]; then
+            echo "PPU was in scope but ppu-preflight did not succeed."
+            exit 1
+          fi
+          echo "Preflight status is consistent with the requested scope."

@@ -176,9 +176,9 @@ export const KimiK25Deployment = () => {
     cmd += ` \\\n  --tp ${tpValue}`;
     cmd += ' \\\n  --trust-remote-code';
 
-    // DP Attention: --dp matches --tp
+    // DP Attention: --attn-dp-size matches --tp
     if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
     }
 
     // Reasoning parser

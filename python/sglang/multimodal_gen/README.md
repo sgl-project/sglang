@@ -35,11 +35,7 @@ SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Tr
 
 ## Getting Started
 
-```bash
-uv pip install 'sglang[diffusion]' --prerelease=allow
-```
-
-For more installation methods (e.g. pypi, uv, docker, ROCm/AMD, MUSA/Moore Threads), check the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation).
+Docker is recommended for Linux GPU deployments. Follow the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to start a container with diffusion dependencies included, or choose pip/uv, source installation, or another platform's setup. Run the examples below inside that environment.
 
 ## Inference
 
