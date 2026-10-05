@@ -1,7 +1,7 @@
 """Pool geometry under DCP: the latent KV shards, the indexer does not.
 
 [Test Category] Memory
-[Test Target] NPUMLATokenToKVPool allocation geometry and index_buf_size under
+[Test Target] NPUMLATokenToKVPool allocation geometry and index_size under
               decode context parallelism
 
 This is P2's fourth exit criterion, and it is the only one that fails loudly when
@@ -13,11 +13,13 @@ its last row.
 The comparison is at a fixed **served context** S, which is the thing an operator
 actually holds constant -- not at a fixed per-rank pool size:
 
-    dcp_size 1   size = S      index_buf_size = S
-    dcp_size c   size = S / c  index_buf_size = S
+    dcp_size 1   size = S      index_size = S
+    dcp_size c   size = S / c  index_size = S
 
 so the latent KV falls to 1/c because it is sharded, while the indexer stays flat
 because it is replicated and every rank still has to address all S positions.
+The indexer's only growth is its padding: one widened page, c pages, because the
+allocator hands out widened pages from 1.
 
 Getting the page size right and the capacity wrong is the failure this catches:
 it still allocates correctly-shaped memory, every read and write still lands in
@@ -30,6 +32,7 @@ import unittest
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -47,7 +50,7 @@ DEVICE = "npu:0"
 BYTES_PER_ELEM = 2  # bfloat16
 
 
-def _build(*, size, index_buf_size, **overrides):
+def _build(*, size, index_size, dcp_size=1, **overrides):
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
     kwargs = dict(
@@ -62,10 +65,12 @@ def _build(*, size, index_buf_size, **overrides):
         index_head_dim=INDEX_HEAD_DIM,
         start_layer=0,
         end_layer=LAYER_NUM,
-        index_buf_size=index_buf_size,
+        index_size=index_size,
     )
     kwargs.update(overrides)
-    return NPUMLATokenToKVPool(**kwargs)
+    # The pool reads the DCP width at construction, as a real rank's would.
+    with get_parallel().override(attn_dcp_size=dcp_size, attn_dcp_rank=0):
+        return NPUMLATokenToKVPool(**kwargs)
 
 
 def _latent_bytes(pool) -> int:
@@ -83,7 +88,8 @@ def _measure(dcp_size, **overrides):
     """Bytes for serving SERVED_CONTEXT tokens at this DCP width."""
     pool = _build(
         size=SERVED_CONTEXT // dcp_size,
-        index_buf_size=SERVED_CONTEXT,
+        index_size=SERVED_CONTEXT,
+        dcp_size=dcp_size,
         **overrides,
     )
     latent, index = _latent_bytes(pool), _index_bytes(pool)
@@ -122,23 +128,28 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         """The replicated half. If this shrinks with c, the indexer has been
         given the sharded treatment and will run off the end of its buffer on
         the first position it does not own."""
-        _, base_index = _measure(1)
-
-        for dcp_size in (2, 4, 8):
+        per_page = PAGE_SIZE * INDEX_HEAD_DIM * BYTES_PER_ELEM
+        for dcp_size in (1, 2, 4, 8):
             with self.subTest(dcp_size=dcp_size):
                 _, index = _measure(dcp_size)
-                self.assertEqual(index, base_index)
+                pages = SERVED_CONTEXT // PAGE_SIZE + dcp_size
+                self.assertEqual(index, LAYER_NUM * pages * per_page)
 
     def test_the_widened_indexer_reaches_its_last_global_position(self):
         """Flat bytes are necessary but not sufficient: a replicated indexer is
         addressed at a raw, untranslated loc, so the TOP of the widened range has
         to be writable and readable. This is the only case here that performs a
-        real write, and it is what turns index_buf_size from an allocation size
+        real write, and it is what turns index_size from an allocation size
         into a contract with set_index_k_buffer."""
         dcp_size = 4
-        pool = _build(size=SERVED_CONTEXT // dcp_size, index_buf_size=SERVED_CONTEXT)
+        pool = _build(
+            size=SERVED_CONTEXT // dcp_size,
+            index_size=SERVED_CONTEXT,
+            dcp_size=dcp_size,
+        )
 
-        last = SERVED_CONTEXT - 1
+        # Widened pages start at 1, so the top loc is one widened page past S.
+        last = SERVED_CONTEXT + PAGE_SIZE * dcp_size - 1
         loc = torch.tensor([last], dtype=torch.int32, device=DEVICE)
         value = torch.full(
             (1, INDEX_HEAD_DIM), 3.0, dtype=torch.bfloat16, device=DEVICE
@@ -163,18 +174,19 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         base_latent, base_index = _measure(1, indexer_layer_ids=live_ids)
         latent, index = _measure(4, indexer_layer_ids=live_ids)
 
-        self.assertEqual(index, base_index)
         self.assertAlmostEqual(latent / base_latent, 1 / 4, delta=0.02)
 
         # The elision is still worth what it was: only live layers hold rows,
         # and the compacted buffer has exactly one slot per live layer.
-        pages = SERVED_CONTEXT // PAGE_SIZE + 1
         per_page = PAGE_SIZE * INDEX_HEAD_DIM * BYTES_PER_ELEM
-        self.assertEqual(index, live * pages * per_page)
+        for dcp_size, got in ((1, base_index), (4, index)):
+            pages = SERVED_CONTEXT // PAGE_SIZE + dcp_size
+            self.assertEqual(got, live * pages * per_page)
 
         pool = _build(
             size=SERVED_CONTEXT // 4,
-            index_buf_size=SERVED_CONTEXT,
+            index_size=SERVED_CONTEXT,
+            dcp_size=4,
             indexer_layer_ids=live_ids,
         )
         self.assertEqual(pool.num_indexer_layers, live)

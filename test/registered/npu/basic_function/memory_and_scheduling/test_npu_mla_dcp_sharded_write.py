@@ -51,7 +51,7 @@ class _FakeLayer:
         self.layer_id = layer_id
 
 
-def _build(**overrides):
+def _build(dcp_size=DCP_SIZE, dcp_rank=0, **overrides):
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
     kwargs = dict(
@@ -68,7 +68,9 @@ def _build(**overrides):
         end_layer=LAYER_NUM,
     )
     kwargs.update(overrides)
-    return NPUMLATokenToKVPool(**kwargs)
+    # The pool reads the DCP width and rank at construction, as a real rank's would.
+    with get_parallel().override(attn_dcp_size=dcp_size, attn_dcp_rank=dcp_rank):
+        return NPUMLATokenToKVPool(**kwargs)
 
 
 class TestNpuMlaDcpShardedWrite(CustomTestCase):
@@ -160,7 +162,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         values = (loc % 100).to(torch.bfloat16)
 
         for rank in range(DCP_SIZE):
-            pool = _build()
+            pool = _build(dcp_rank=rank)
             cache_k = values.view(n, 1, 1).expand(n, 1, KV_LORA_RANK).contiguous()
             cache_v = values.view(n, 1, 1).expand(n, 1, QK_ROPE_HEAD_DIM).contiguous()
             with get_parallel().override(attn_dcp_size=DCP_SIZE, attn_dcp_rank=rank):
@@ -181,7 +183,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         """The replicated half: index-K addresses global positions raw. If the
         latent-KV rule ever leaks into this path, the indexer loses c-1 of every
         c positions it is supposed to see."""
-        pool = _build(index_buf_size=SIZE * DCP_SIZE)
+        pool = _build(index_size=SIZE * DCP_SIZE)
         virtual = SIZE * DCP_SIZE - 3
         loc = torch.tensor([virtual], dtype=torch.int32, device=DEVICE)
         value = torch.full(
@@ -197,7 +199,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         self.assertEqual(buffer[virtual, 0, 0].item(), 7.0)
 
     def test_dcp_size_one_touches_nothing(self):
-        pool = _build()
+        pool = _build(dcp_size=1)
         loc = torch.arange(0, 32, dtype=torch.int64, device=DEVICE)
 
         local = self._resolve(pool, loc, rank=0, dcp_size=1)

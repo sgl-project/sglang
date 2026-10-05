@@ -1094,7 +1094,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         maybe_detect_oob(
             loc,
             0,
-            self.index_size + self.index_page_size,
+            # Widened pages start at 1, so the top is one widened page past index_size.
+            self.index_size + self.index_page_size * self.index_page_padding,
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
         assert layer_id in self.indexer_layer_id_to_slot, (
