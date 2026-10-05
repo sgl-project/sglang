@@ -949,11 +949,6 @@ class GptOssForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         mxfp4_block = 32
 
-        moe_tp_rank = get_parallel().moe_tp_rank
-        moe_tp_size = get_parallel().moe_tp_size
-        moe_ep_rank = get_parallel().moe_ep_rank
-        moe_ep_size = get_parallel().moe_ep_size
-
         intermediate_size = self.config.intermediate_size
         original_intermediate_size = getattr(
             self.config, "original_intermediate_size", intermediate_size
@@ -963,29 +958,48 @@ class GptOssForCausalLM(nn.Module):
         )
         intermediate_size_block = intermediate_size // mxfp4_block
 
-        per_rank_intermediate_size_block = math.ceil(
-            intermediate_size_block / moe_tp_size
-        )
-
-        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
-
-        # Calculate common slicing bounds for current rank
-        assert self.config.num_local_experts % moe_ep_size == 0
-        moe_num_global_experts = self.config.num_local_experts
-        moe_num_local_experts = self.config.num_local_experts // moe_ep_size
-
-        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
-        moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
-        )
-
-        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
-        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
-
         weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
             weight = weight.to(weight_device)
+
+            if not any(
+                suffix in name
+                for suffix in (
+                    "gate_up_proj_blocks",
+                    "down_proj_blocks",
+                    "gate_up_proj_scales",
+                    "down_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_bias",
+                )
+            ):
+                continue
+            experts = self.get_submodule(name.rsplit(".", 1)[0])
+            moe_tp_rank = experts.moe_tp_rank
+            moe_tp_size = experts.moe_tp_size
+            moe_ep_rank = experts.moe_ep_rank
+            moe_ep_size = experts.moe_ep_size
+
+            per_rank_intermediate_size_block = math.ceil(
+                intermediate_size_block / moe_tp_size
+            )
+
+            per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+            # Calculate common slicing bounds for current rank
+            assert self.config.num_local_experts % moe_ep_size == 0
+            moe_num_global_experts = self.config.num_local_experts
+            moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
+            moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+            moe_tp_rank_end = min(
+                (moe_tp_rank + 1) * per_rank_intermediate_size,
+                original_intermediate_size,
+            )
+
+            moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+            moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1247,8 +1261,10 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
-                    if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
-                        loaded_weight = loaded_weight.zero_()
+                    if "w2_weight_bias" in name:
+                        experts = self.get_submodule(name.rsplit(".", 1)[0])
+                        if experts.moe_tp_rank != 0:
+                            loaded_weight = loaded_weight.zero_()
 
                     weight_loader(
                         param,
