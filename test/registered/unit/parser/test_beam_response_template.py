@@ -68,6 +68,22 @@ def _full_call(
 
 
 class TestBeamResponseTemplate(CustomTestCase):
+    def test_retaining_incomplete_calls_is_opt_in(self):
+        text = _continuation_call(
+            "get_weather", '<rfl:parameter name="city">\nPar', terminator=""
+        )
+        legacy = FunctionCallParser([_tool()], "beam", prefix=PREFIX)
+        _, calls = legacy.parse_non_stream(text)
+        self.assertEqual(calls, [])
+
+        parser = FunctionCallParser([_tool()], "beam", prefix=PREFIX)
+        result = parser.parse_non_stream_result(text, preserve_incomplete=True)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, "")
+        self.assertEqual(result.ordered_parts, result.calls)
+        self.assertEqual(parser.detector.incomplete_tool_call_indices, {0})
+
     def test_reasoning_and_final_content(self):
         parser = ReasoningParser(model_type="beam", prefix=PREFIX)
         generation = (
