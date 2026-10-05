@@ -227,8 +227,6 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
         full_tokens_per_layer=None,
         swa_tokens_per_layer=None,
         max_total_num_tokens=42,
-        get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
     )
 
     stats = observer._get_mamba_token_info()
