@@ -253,9 +253,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if not inserted:
             self.release_aborted_request(req.cache_request_handle)
 
-    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
-        super().insert_req(req, up_to=up_to, **kwargs)
+        super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
         if req.finished():

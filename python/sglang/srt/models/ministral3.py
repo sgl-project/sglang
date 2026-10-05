@@ -39,6 +39,7 @@ class Ministral3Attention(LlamaAttention):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(
             config=config,
@@ -54,6 +55,7 @@ class Ministral3Attention(LlamaAttention):
             quant_config=quant_config,
             prefix=prefix,
             bias=bias,
+            reduce_results=reduce_results,
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
@@ -128,7 +130,9 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             prefix=add_prefix("self_attn", prefix),
             bias=getattr(config, "attention_bias", False)
             or getattr(config, "bias", False),
+            reduce_results=False,
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
 
 
 class Ministral3Model(LlamaModel):

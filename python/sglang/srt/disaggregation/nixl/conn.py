@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -69,6 +71,9 @@ except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
+
+# Arbitrary; bounds how often an unreachable peer's dlists are rebuilt.
+_PEER_RELOAD_MIN_INTERVAL_S = 1.0
 
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
@@ -352,6 +357,22 @@ def expand_page_indices_for_slice(
     return (pair_offsets[:, None] + within_pair[None, :]).ravel().astype(np.int32)
 
 
+def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
+    """Slots every registered KV entry can address.
+
+    Prepared dlists index entry i's slot p as i * num_slots + p, so every entry
+    must expose the same count. Entries can have different lengths, so use
+    the shortest.
+    """
+    return min(
+        (
+            data_len // item_len
+            for data_len, item_len in zip(kv_data_lens, kv_item_lens)
+        ),
+        default=0,
+    )
+
+
 def repeat_indices_over_layers(
     indices: npt.NDArray[np.int32], num_layers: int, layer_length: int
 ) -> npt.NDArray[np.int32]:
@@ -509,20 +530,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._peer_reload_lock = threading.Lock()
+        self._peer_reload_times: Dict[str, float] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
-                self._num_slots_src = (
-                    self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
+                self._num_slots_src = num_kv_slots(
+                    self.kv_args.kv_data_lens, self.kv_args.kv_item_lens
                 )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
-            # Per-room count of chunks not yet transferred; teardown waits for
-            # zero so a deferred chunk is not dropped by an early conclude.
-            self._staging_outstanding = defaultdict(int)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -631,12 +651,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_staging:
                         self._handle_staging_req(msg)
                     continue
-                if msg[0] == b"ABORT_ACK":
-                    # Drain ack for an aborted room; aggregate per prefill rank.
-                    if len(msg) >= 3:
-                        self.note_abort_ack(
-                            int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
-                        )
+                if self.handle_abort_ack_message(msg):
                     continue
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
@@ -996,6 +1011,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.kv_args.kv_item_lens[seg.start : seg.end],
                     self.kv_args.kv_data_lens[seg.start : seg.end],
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=seg.src_mem_kind,
                 )
                 self.prep_handles_segment_src[src_key] = src_handle
@@ -1159,6 +1175,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     "",
                     self.kv_args.kv_data_ptrs,
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=src_mem_kind,
                 )
             dst_num_slots = (
@@ -1213,6 +1230,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
+            room_transfer_infos = None
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1220,6 +1238,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # clear() keeps the target while a chunk is counted.
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Counted at dequeue, before the status check, so
@@ -1245,6 +1266,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Lazily build a per-worker staging strategy bound to this
@@ -1554,6 +1577,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
+                    # This chunk stays counted in _staging_outstanding, so no
+                    # drain ACK can follow; discard the target and fall back to
+                    # the timeout.
+                    self.poison_deferred_ack_room(room)
+                # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
+                # room_transfer_infos survives the sender's clear() of this room.
+                self._reload_invalidated_peers(room_transfer_infos or {})
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1627,6 +1657,45 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+
+    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        # NIXL drops a peer's metadata after a remote-disconnect error and never
+        # restores it; reload it from the registration we already hold.
+        for agent_name in list(room_transfer_infos):
+            peer_info = self.decode_kv_args_table.get(agent_name)
+            if peer_info is None:
+                continue
+            try:
+                if self.agent.check_remote_metadata(agent_name):
+                    continue
+                with self._peer_reload_lock:
+                    if self.agent.check_remote_metadata(agent_name):
+                        continue
+                    now = time.monotonic()
+                    last = self._peer_reload_times.get(agent_name)
+                    if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                        continue
+                    self._peer_reload_times[agent_name] = now
+                    logger.warning(
+                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        agent_name,
+                    )
+                    # No other thread holds these dlists: every room with this
+                    # peer has the same peer set, so all shard to this worker.
+                    self.prep_handles.pop(agent_name, None)
+                    self.prep_handles_slice_dst.pop(agent_name, None)
+                    peer_info.kv_xfer_segments = None
+                    self.agent.add_remote_agent(peer_info.agent_metadata)
+                    try:
+                        self._prepare_payload_xfer(peer_info)
+                    except Exception:
+                        # Leave the peer invalid so a later failure retries.
+                        self.agent.remove_remote_agent(agent_name)
+                        raise
+            except Exception:
+                logger.exception(
+                    "Failed to reload NIXL metadata for remote agent %s", agent_name
+                )
 
     def _send_kvcache_generic(
         self,
@@ -2986,16 +3055,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
-        if not msg or msg[0] != b"ABORT":
+        if not msg or msg[0] != ABORT_TAG:
             return False
 
-        try:
-            room_to_be_aborted = int(msg[1].decode("ascii"))
-            decode_ip = msg[2].decode("ascii") if len(msg) > 2 else None
-            decode_port = int(msg[3].decode("ascii")) if len(msg) > 3 else None
-        except Exception as e:
-            logger.debug(f"Ignoring malformed abort notification: {e}")
+        notification = AbortNotification.from_zmq(msg)
+        if notification is None:
             return True
+        room_to_be_aborted = notification.room
 
         room_active = (
             room_to_be_aborted in self.request_status
@@ -3017,22 +3083,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"ignoring (already completed or unknown)"
             )
 
-        # Deferred KV release: register only after the status flip above (see
-        # register_deferred_ack_target), then try once -- the room may already be
-        # quiescent and never revisited by the worker. A concluded/unknown room is
-        # acked only when nothing is still counted for it: the ERR path abandons
-        # sibling handles that may still be writing and clear() then drops the
-        # room, so "unknown" alone does not imply quiescent.
-        if self.enable_deferred_decode_kv_release and decode_port is not None:
-            if room_active:
-                self.register_deferred_ack_target(
-                    room_to_be_aborted, decode_ip, decode_port
-                )
-                self._maybe_ack_drained_abort(room_to_be_aborted)
-            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
-
+        self._handle_deferred_abort_ack(notification)
         return True
+
+    def _handle_deferred_abort_ack(self, notification: AbortNotification) -> None:
+        room_to_be_aborted = notification.room
+        if not self.enable_deferred_decode_kv_release:
+            return
+        ack_target = notification.deferred_ack_target()
+        if ack_target is None:
+            return
+
+        # The active-room status flip happens before registration. Success or a
+        # missing status does not imply quiescence: clear() can remove the room
+        # while a counted handle is still writing. The immediate retry closes
+        # both races where the worker drains before or during registration.
+        self.register_deferred_ack_target(room_to_be_aborted, ack_target)
+        self._maybe_ack_drained_abort(room_to_be_aborted)
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
@@ -3114,16 +3181,12 @@ class NixlKVSender(CommonKVSender):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
         self.init_time = time.time()
@@ -3391,7 +3454,9 @@ class NixlKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
             if self.kv_mgr.kv_args.kv_item_lens:
                 dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-                dst_num_slots = self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
+                dst_num_slots = num_kv_slots(
+                    self.kv_mgr.kv_args.kv_data_lens, self.kv_mgr.kv_args.kv_item_lens
+                )
             else:
                 dst_kv_item_len = 0
                 dst_num_slots = 0
