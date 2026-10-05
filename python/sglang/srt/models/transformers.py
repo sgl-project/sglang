@@ -52,7 +52,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -164,6 +164,31 @@ def _encoder_accepts_feature_kwarg(encoder, feature_kwarg: str) -> bool:
         and p.default is inspect.Parameter.empty
     ]
     return len(required_positional_params) == 0
+
+
+def _find_embedding_module(
+    model: nn.Module,
+) -> Tuple[Optional[nn.Module], Optional[str]]:
+    """Locate the conventionally-named input-embedding submodule on a custom
+    (auto_map remote-code) model class, returning (parent_module, attr_name)
+    so callers can getattr/setattr it directly."""
+    for attr_path in (
+        "embeddings.word_embeddings",
+        "embed_tokens",
+        "wte",
+        "word_embeddings",
+    ):
+        parts = attr_path.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part, None)
+            if parent is None:
+                break
+        else:
+            leaf = getattr(parent, parts[-1], None)
+            if isinstance(leaf, nn.Embedding):
+                return parent, parts[-1]
+    return None, None
 
 
 @contextmanager
@@ -630,6 +655,24 @@ class TransformersBase(nn.Module):
                     self.model, "lm_head"
                 ):
                     self.model = inner
+
+            # Some remote-code (auto_map) base-model classes never override
+            # get_input_embeddings()/set_input_embeddings(), inheriting
+            # PreTrainedModel's stubs that raise NotImplementedError (seen
+            # with nomic-ai/nomic-embed-text-v1.5's auto_map NomicBertModel).
+            # The wrapper below calls these in several places, so bind them
+            # directly to whichever conventionally-named embedding submodule
+            # the model actually has.
+            try:
+                self.model.get_input_embeddings()
+            except NotImplementedError:
+                parent, leaf_name = _find_embedding_module(self.model)
+                if parent is None:
+                    raise
+                self.model.get_input_embeddings = lambda: getattr(parent, leaf_name)
+                self.model.set_input_embeddings = lambda value: setattr(
+                    parent, leaf_name, value
+                )
         else:
             raise ValueError(
                 f"Model {model_cls} does not support custom attention backends "
@@ -637,11 +680,15 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        self.vocab_size = getattr(
-            self.text_config,
-            "vocab_size",
-            self.model.get_input_embeddings().num_embeddings,
-        )
+        # NOTE: don't fold this into getattr(..., default) -- Python evaluates
+        # the default argument eagerly, so get_input_embeddings() would run
+        # (and could raise, e.g. remote-code classes that never override the
+        # PreTrainedModel base and hit its NotImplementedError) even when
+        # text_config.vocab_size already exists and the result is discarded.
+        if hasattr(self.text_config, "vocab_size"):
+            self.vocab_size = self.text_config.vocab_size
+        else:
+            self.vocab_size = self.model.get_input_embeddings().num_embeddings
         self.unpadded_vocab_size = self.vocab_size
 
         # Embedding scale (e.g. Whisper)
@@ -936,8 +983,16 @@ class TransformersBase(nn.Module):
         if is_encoder_only:
             logger.info(
                 "Detected encoder-only model (non-causal attention). "
-                "Using RadixAttention with is_cross_attention=True."
+                "Using RadixAttention with attn_type=ENCODER_ONLY."
             )
+        # NOTE: this is a pure self-attention encoder (e.g. BERT/ModernBERT), not
+        # genuine cross-attention to a separately-allocated encoder sequence (e.g.
+        # T5/Whisper). is_cross_attention routes attention backends (xpu_backend,
+        # triton_backend) to forward_batch.encoder_out_cache_loc, which is never
+        # populated for this model shape and crashes with it None. attn_type=
+        # ENCODER_ONLY already gets the same non-causal/bidirectional masking
+        # treatment in those backends without that misrouting.
+        attn_type = AttentionType.ENCODER_ONLY if is_encoder_only else AttentionType.DECODER
 
         instances = {}
         for idx in range(self.start_layer, self.end_layer):
@@ -959,7 +1014,7 @@ class TransformersBase(nn.Module):
                 layer_id=idx,
                 quant_config=self.quant_config,
                 sliding_window_size=per_layer_sliding_window,
-                is_cross_attention=is_encoder_only,
+                attn_type=attn_type,
                 prefix=f"{idx}.attn",
             )
         return instances
