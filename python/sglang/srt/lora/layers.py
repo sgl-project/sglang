@@ -119,7 +119,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         # all-reduce, making the unsharded LoRA approach mathematically
         # incorrect — a sharded LoRA kernel would be needed.
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
-            from sglang.srt.layers.communicator import get_attn_tp_context
+            from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
             assert not get_attn_tp_context().allow_input_scattered, (
                 "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
@@ -295,7 +295,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         # incompatible with input_scattered mode where the all-reduce is
         # skipped.
         if tp_size > 1:
-            from sglang.srt.layers.communicator import get_attn_tp_context
+            from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
             if get_attn_tp_context().allow_input_scattered:
                 raise ValueError(
@@ -1149,9 +1149,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
