@@ -18,6 +18,108 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def test_pdmux_always_gathers_across_attention_dp_ranks(self):
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True),
+            patch.object(dp_attn, "is_pdmux_enabled", return_value=True),
+        ):
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(1))
+            for ranks in (2, 8):
+                self.assertFalse(dp_attn.should_skip_scheduler_all_gather(ranks))
+
+    def test_scheduler_counts_remain_global_and_owned_without_mlp_gather(self):
+        for counts in ([4, 0], [0, 4], [4] * 8, [0] * 8):
+            with self.subTest(counts=counts):
+                batch = SimpleNamespace()
+                info = dp_attn.MLPSyncBatchInfo(
+                    num_dp_ranks=len(counts),
+                    tp_size=1,
+                    cp_size=1,
+                    num_tokens=counts[0],
+                    num_tokens_for_logprob=counts[0],
+                    can_run_decode_cuda_graph=False,
+                    can_run_draft_cuda_graph=False,
+                    can_run_prefill_cuda_graph=False,
+                    is_extend_in_batch=False,
+                    local_can_run_tbo=False,
+                    local_forward_mode=ForwardMode.IDLE.value,
+                    global_num_tokens=list(counts),
+                    global_num_tokens_for_logprob=list(counts),
+                )
+                dp_attn._update_gather_batch(batch, info, require_mlp_tp_gather=False)
+                self.assertEqual(batch.global_num_tokens, [counts[0]])
+                self.assertEqual(batch.scheduler_global_num_tokens, counts)
+                info.global_num_tokens[0] += 1
+                self.assertEqual(batch.scheduler_global_num_tokens, counts)
+
+    def test_pdmux_peer_only_and_all_idle_participation(self):
+        for counts, mode in (
+            ([0, 4], ForwardMode.DECODE),
+            ([0, 7], ForwardMode.EXTEND),
+            ([0] * 7 + [2], ForwardMode.DECODE),
+            ([0] * 8, ForwardMode.IDLE),
+        ):
+            with self.subTest(counts=counts, mode=mode):
+                idle = SimpleNamespace(forward_mode=ForwardMode.IDLE, spec_info=None)
+                get_idle = Mock(return_value=idle)
+                tbo = Mock()
+                tbo.prepare_all_gather.return_value = (False, ForwardMode.IDLE.value)
+                tbo.compute_output.return_value = (None, None)
+
+                def gather(info, **kwargs):
+                    info.global_num_tokens = list(counts)
+                    info.global_num_tokens_for_logprob = list(counts)
+                    info.tp0_info_cpu = torch.zeros((len(counts), 9), dtype=torch.int64)
+                    for rank, tokens in enumerate(counts):
+                        info.tp0_info_cpu[rank, 5] = (
+                            mode if tokens else ForwardMode.IDLE
+                        ).value
+                    info.is_extend_in_batch = mode.is_extend()
+
+                with (
+                    patch.object(dp_attn, "is_pdmux_enabled", return_value=True),
+                    patch.object(
+                        dp_attn,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            num_dp_ranks=len(counts),
+                            attn_tp_size=8 // len(counts),
+                            attn_cp_size=1,
+                            tp_group=SimpleNamespace(
+                                device="cpu", device_group=object()
+                            ),
+                        ),
+                    ),
+                    patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo),
+                    patch.object(
+                        dp_attn, "world_dp_gather_enabled", return_value=False
+                    ),
+                    patch.object(
+                        dp_attn, "check_cuda_graph_backend", return_value=False
+                    ),
+                    patch.object(dp_attn.MLPSyncBatchInfo, "all_gather", gather),
+                ):
+                    result = dp_attn.prepare_mlp_sync_batch_raw(
+                        None,
+                        model_runner=SimpleNamespace(
+                            prefill_cuda_graph_runner=None,
+                            spec_algorithm=SpeculativeAlgorithm.NONE,
+                            model_config=object(),
+                        ),
+                        get_idle_batch=get_idle,
+                        disable_cuda_graph=False,
+                        require_mlp_tp_gather=False,
+                        disable_overlap_schedule=True,
+                        offload_tags=set(),
+                    )
+                if any(counts):
+                    self.assertIs(result, idle)
+                    self.assertEqual(result.scheduler_global_num_tokens, counts)
+                    self.assertEqual(result.global_num_tokens, [0])
+                else:
+                    self.assertIsNone(result)
+                    get_idle.assert_not_called()
+
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))

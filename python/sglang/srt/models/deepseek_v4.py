@@ -180,6 +180,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -3682,7 +3683,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         attn_mhc = None
         if (
-            self.config.model_type == "deepseek_v41"
+            not get_disagg().enable_pdmux
+            and self.config.model_type == "deepseek_v41"
             and x.is_cuda
             and get_platform().is_blackwell
             and (0 < x.shape[0] <= 8 or medium_verify)
@@ -3793,7 +3795,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         mhc = None
         if (
-            self.config.model_type == "deepseek_v41"
+            not get_disagg().enable_pdmux
+            and self.config.model_type == "deepseek_v41"
             and x.is_cuda
             and get_platform().is_blackwell
             and (0 < x.shape[0] <= 8 or (medium_verify and next_combined is not None))
@@ -4331,7 +4334,9 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = (
+        # Helper streams are outside PDMux green-context placement. Keep all
+        # target kernels on the caller's prefill/decode lane.
+        use_stream_pool = not get_disagg().enable_pdmux and (
             _is_cuda
             or (
                 _is_hip
@@ -4354,6 +4359,7 @@ class DeepseekV4Model(nn.Module):
         self.moe_routed_quant_stream = (
             device_module.Stream()
             if _is_cuda
+            and not get_disagg().enable_pdmux
             and config.hc_pre_from_prev_sublayer
             and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             else None
@@ -4363,6 +4369,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_stats_stream = (
             device_module.Stream()
             if _is_cuda
+            and not get_disagg().enable_pdmux
             and (get_platform().is_blackwell or get_platform().is_sm90)
             and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and config.hc_pre_from_prev_sublayer
@@ -4504,50 +4511,73 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        *,
+        split_interval: Optional[Tuple[int, int]] = None,
+        split_state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
-        hash_ids = None
-        cp_extend = (
-            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
-        )
-        if self.engram_hasher is not None:
-            if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
-                parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
-                pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
-                if pad_rows > 0:
-                    hash_ids = torch.cat(
-                        [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
+        if split_state:
+            positions = split_state["positions"]
+            input_ids = split_state["input_ids"]
+            input_ids_global = split_state["input_ids_global"]
+            hash_ids = split_state["hash_ids"]
+            cp_extend = split_state["cp_extend"]
+            tail = split_state["tail"]
+            saved_full = split_state["saved_full"]
+            prev_pre = split_state["prev_pre"]
+            precomputed_attn = split_state["precomputed_attn"]
+            combined_attn = split_state["combined_attn"]
+            normalized_attn = split_state["normalized_attn"]
+            pending_post = split_state["pending_post"]
+        else:
+            hash_ids = None
+            cp_extend = (
+                is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
+            )
+            if self.engram_hasher is not None:
+                if cp_extend:
+                    # n-gram hashing needs each token's predecessors: hash the whole prompt
+                    total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                    hash_ids = self.engram_hasher(
+                        forward_batch.input_ids[:total], forward_batch
                     )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+                    parallel = get_parallel()
+                    hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                    pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
+                    if pad_rows > 0:
+                        hash_ids = torch.cat(
+                            [
+                                hash_ids,
+                                hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:]),
+                            ]
+                        )
+                elif (
+                    forward_batch.forward_mode.is_extend()
+                    and is_in_breakable_cuda_graph()
+                ):
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(input_ids, forward_batch)
+            tail = None
+            if (
+                self.late_layer_start is not None
+                and forward_batch.forward_mode.is_extend_without_speculative()
             ):
-                hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
-                )
-            else:
-                hash_ids = self.engram_hasher(input_ids, forward_batch)
-        tail = None
-        if (
-            self.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._check_late_layer_tail_readers(forward_batch)
-            attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-        saved_full = None
-        prev_pre = None
-        precomputed_attn = None
-        combined_attn = None
-        normalized_attn = None
-        # HIP: the fused boundary hands the next layer its FFN hc_post unapplied
-        pending_post = None
-        for i in range(self.start_layer, self.end_layer):
+                self._check_late_layer_tail_readers(forward_batch)
+                attn_backend = get_attn_backend()
+                tail = attn_backend.tail_forward_metadata.late_layer_tail
+            saved_full = None
+            prev_pre = None
+            precomputed_attn = None
+            combined_attn = None
+            normalized_attn = None
+            # HIP: the fused boundary hands the next layer its FFN hc_post unapplied
+            pending_post = None
+        start, end = split_interval or (self.start_layer, self.end_layer)
+        attn_backend = get_attn_backend()
+        for i in range(start, end):
             if tail is not None and i == self.late_layer_start:
                 combined_attn = None
                 normalized_attn = None
@@ -4690,6 +4720,27 @@ class DeepseekV4Model(nn.Module):
             combined_attn, normalized_attn = (
                 next_combined[0] if next_combined else (None, None)
             )
+        if split_state is not None:
+            # mHC, collapsed inputs, Engram hashes and tail ownership survive a
+            # scheduler yield on this batch, independently of concurrent decode.
+            split_state.update(
+                {
+                    "positions": positions,
+                    "input_ids": input_ids,
+                    "input_ids_global": input_ids_global,
+                    "hash_ids": hash_ids,
+                    "cp_extend": cp_extend,
+                    "tail": tail,
+                    "saved_full": saved_full,
+                    "prev_pre": prev_pre,
+                    "precomputed_attn": precomputed_attn,
+                    "combined_attn": combined_attn,
+                    "normalized_attn": normalized_attn,
+                    "pending_post": pending_post,
+                }
+            )
+        if end != self.end_layer:
+            return hidden_states, prev_pre, tail
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return hidden_states, prev_pre, tail
@@ -4946,6 +4997,24 @@ class DeepseekV4Model(nn.Module):
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
+        return self._finalize_hidden_states(
+            hidden_states,
+            last_pre,
+            tail,
+            input_ids.shape[0],
+            capture_dspark,
+            dspark_aux_hidden_states,
+        )
+
+    def _finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        last_pre: Optional[torch.Tensor],
+        tail: Optional[LateLayerTail],
+        num_tokens: int,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: List[torch.Tensor],
+    ):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
@@ -4962,7 +5031,6 @@ class DeepseekV4Model(nn.Module):
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
                 tail=tail, rows=hidden_states, num_tokens=num_tokens
             )
@@ -4975,9 +5043,117 @@ class DeepseekV4Model(nn.Module):
 
         return hidden_states, pre_hc_head
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        assert self.pp_group.world_size == 1, "PDMux split prefill requires PP=1"
+        start, end = split_interval
+        if start == self.start_layer:
+            hidden_states = (
+                (self.embed_tokens(input_ids) if input_embeds is None else input_embeds)
+                .unsqueeze(1)
+                .repeat(1, self.hc_mult, 1)
+            )
+            if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+                input_ids_global = torch.empty(
+                    (get_global_dp_buffer_len(), 1),
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+                dp_gather_replicate(
+                    input_ids_global, input_ids[:, None].clone(), forward_batch
+                )
+                input_ids_global = input_ids_global.squeeze(-1)
+            else:
+                input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+            for attr in ("freqs_cis_c4", "freqs_cis_c128"):
+                if hasattr(forward_batch, attr):
+                    delattr(forward_batch, attr)
+            forward_batch.hidden_states = hidden_states
+            forward_batch.model_specific_states = {
+                "positions": positions,
+                "input_ids": input_ids,
+                "input_ids_global": input_ids_global,
+                "logits_input_ids": input_ids,
+                "num_tokens": input_ids.shape[0],
+                "hc_pre": {},
+                "prev_residual": None,
+                "prev_post": None,
+                "prev_comb": None,
+                "dspark_aux_hidden_states": [],
+            }
+        states = forward_batch.model_specific_states
+        hidden_states = forward_batch.hidden_states
+        capture_dspark = self.dspark_layers_to_capture is not None
+        aux = states["dspark_aux_hidden_states"]
+        last_pre = tail = None
+        if self.hc_pre_from_prev_sublayer:
+            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+                states["positions"],
+                hidden_states,
+                forward_batch,
+                states["input_ids"],
+                states["input_ids_global"],
+                capture_dspark,
+                aux,
+                split_interval=split_interval,
+                split_state=states["hc_pre"],
+            )
+        else:
+            prev_residual = states["prev_residual"]
+            prev_post = states["prev_post"]
+            prev_comb = states["prev_comb"]
+            for i in range(start, end):
+                layer = self.layers[i]
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                        positions=states["positions"],
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=states["input_ids"],
+                        input_ids_global=states["input_ids_global"],
+                        prev_residual=prev_residual,
+                        prev_post=prev_post,
+                        prev_comb=prev_comb,
+                    )
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    completed = (
+                        layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                        if self.use_fused_mhc_post_pre
+                        else hidden_states
+                    )
+                    aux.append(completed.mean(dim=1))
+            states.update(
+                prev_residual=prev_residual, prev_post=prev_post, prev_comb=prev_comb
+            )
+            if end == self.end_layer and self.use_fused_mhc_post_pre:
+                hidden_states = self.layers[end - 1].hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
+        forward_batch.hidden_states = hidden_states
+        if end != self.end_layer:
+            return None
+        return self._finalize_hidden_states(
+            hidden_states, last_pre, tail, states["num_tokens"], capture_dspark, aux
+        )
+
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    supports_pdmux_dspark_prefill = True
 
     def __init__(
         self,
@@ -5269,6 +5445,73 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
             logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
 
+        output = self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
+        )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.token_indices
+        return output
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        if split_interval[0] == self.model.start_layer:
+            if (
+                self.vision is not None
+                and not forward_batch.forward_mode.is_decode()
+                and not forward_batch.forward_mode.is_target_verify()
+                and forward_batch.mm_inputs is not None
+                and any(x is not None for x in forward_batch.mm_inputs)
+            ):
+                if input_embeds is not None:
+                    raise ValueError("Cannot combine input_embeds and image inputs")
+                input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+            if self.vision is not None and not (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                input_ids = input_ids.masked_fill(
+                    input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+                )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            result = self.model.forward_split_prefill(
+                input_ids, positions, forward_batch, split_interval, input_embeds
+            )
+        if result is None:
+            return None
+        input_ids = forward_batch.model_specific_states["logits_input_ids"]
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            result, aux_hidden_states = result
+        hidden_states, pre_hc_head = result
+        logits_metadata = forward_batch
+        tail = None
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # The backend restored its full metadata at the final layer. Keep
+            # logits and draft-KV injection tied to this batch's captured rows.
+            tail = forward_batch.model_specific_states["hc_pre"]["tail"]
+            input_ids = tail.rows(input_ids)
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
         output = self.logits_processor(
             input_ids,
             hidden_states,
