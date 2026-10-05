@@ -145,6 +145,29 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_prefill_backlog(backlog: &PrefillBacklogConfig) -> ConfigResult<()> {
+        let checks = [
+            ("prefill_backlog.rate", backlog.rate, 0.0, ">= 0"),
+            (
+                "prefill_backlog.hop_factor",
+                backlog.hop_factor,
+                1.0,
+                ">= 1.0",
+            ),
+            ("prefill_backlog.hop_scale", backlog.hop_scale, 0.0, ">= 0"),
+        ];
+        for (field, value, min, bound) in checks {
+            if !value.is_finite() || value < min {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: format!("Must be finite and {}", bound),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random
@@ -157,6 +180,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                prefill_backlog,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -189,6 +213,8 @@ impl ConfigValidator {
                         reason: "Must be > 0".to_string(),
                     });
                 }
+
+                Self::validate_prefill_backlog(prefill_backlog)?;
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
@@ -729,10 +755,53 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_backlog: Default::default(),
             },
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_prefill_backlog() {
+        // Configs written before prefill_backlog existed keep it disabled.
+        let policy: PolicyConfig = serde_json::from_str(
+            r#"{"type":"cache_aware","cache_threshold":0.5,"balance_abs_threshold":32,
+                "balance_rel_threshold":1.1,"eviction_interval_secs":60,"max_tree_size":1000}"#,
+        )
+        .unwrap();
+        let PolicyConfig::CacheAware {
+            prefill_backlog, ..
+        } = policy
+        else {
+            panic!("expected cache_aware");
+        };
+        assert!(!prefill_backlog.is_enabled());
+        assert!(ConfigValidator::validate_prefill_backlog(&prefill_backlog).is_ok());
+
+        for bad in [
+            PrefillBacklogConfig {
+                rate: f64::NAN,
+                ..prefill_backlog
+            },
+            PrefillBacklogConfig {
+                rate: -1.0,
+                ..prefill_backlog
+            },
+            PrefillBacklogConfig {
+                hop_factor: 0.5,
+                ..prefill_backlog
+            },
+            PrefillBacklogConfig {
+                hop_scale: f64::INFINITY,
+                ..prefill_backlog
+            },
+        ] {
+            assert!(
+                ConfigValidator::validate_prefill_backlog(&bad).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -748,6 +817,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_backlog: Default::default(),
             },
         );
 
@@ -802,6 +872,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_backlog: Default::default(),
             },
         );
 
@@ -846,6 +917,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    prefill_backlog: Default::default(),
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
