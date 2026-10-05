@@ -7,6 +7,7 @@ from sglang.benchmark.dspark_sps_profiler import (
     build_request_count_sweep,
     build_table_from_summaries,
     count_aligned_steps,
+    num_dp_ranks_from_internal_state,
     postprocess_round,
     resolve_cuda_graph_max_bs,
     round_summary_dict,
@@ -48,7 +49,7 @@ def make_context(**overrides) -> ServerContext:
         base_url="http://localhost:30000",
         tokenizer_path="dummy",
         tp_size=4,
-        dp_size=1,
+        num_dp_ranks=1,
         verify_num_draft_tokens=8,
         simulate_acc_len=1.0,
         cuda_graph_max_bs=128,
@@ -64,7 +65,7 @@ class TestPostprocessRound(CustomTestCase):
         outcome = postprocess_round(
             rank_rows=[make_rows(step_time=0.01)],
             batch_size_per_rank=4,
-            dp_size=1,
+            num_dp_ranks=1,
             verify_num_draft_tokens=8,
             min_steady_steps=16,
             load_info=make_load_info(),
@@ -79,7 +80,7 @@ class TestPostprocessRound(CustomTestCase):
         outcome = postprocess_round(
             rank_rows=[slow_head + steady_tail],
             batch_size_per_rank=4,
-            dp_size=1,
+            num_dp_ranks=1,
             verify_num_draft_tokens=8,
             min_steady_steps=16,
             load_info=make_load_info(),
@@ -92,7 +93,7 @@ class TestPostprocessRound(CustomTestCase):
         outcome = postprocess_round(
             rank_rows=[ramp + steady],
             batch_size_per_rank=4,
-            dp_size=1,
+            num_dp_ranks=1,
             verify_num_draft_tokens=8,
             min_steady_steps=16,
             load_info=make_load_info(),
@@ -110,7 +111,7 @@ class TestPostprocessRound(CustomTestCase):
             postprocess_round(
                 rank_rows=[head + gap + tail],
                 batch_size_per_rank=4,
-                dp_size=1,
+                num_dp_ranks=1,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -123,7 +124,7 @@ class TestPostprocessRound(CustomTestCase):
             postprocess_round(
                 rank_rows=[rows],
                 batch_size_per_rank=4,
-                dp_size=1,
+                num_dp_ranks=1,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -135,7 +136,7 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
         outcome = postprocess_round(
             rank_rows=[make_rows(step_time=0.01), make_rows(step_time=0.03)],
             batch_size_per_rank=4,
-            dp_size=2,
+            num_dp_ranks=2,
             verify_num_draft_tokens=8,
             min_steady_steps=16,
             load_info=make_load_info(),
@@ -147,12 +148,27 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
         self.assertAlmostEqual(outcome.per_rank_median_step_time[0], 0.01)
         self.assertAlmostEqual(outcome.per_rank_median_step_time[1], 0.03)
 
+    def test_attention_dp_ranks_scale_the_total_batch(self):
+        # One record list per attention-DP rank, all owed by the round: with
+        # `--attn-dp-size 8` the server reports 8 internal states, so the
+        # profiler must expect 8 rank rows and count 8 ranks of requests.
+        outcome = postprocess_round(
+            rank_rows=[make_rows() for _ in range(8)],
+            batch_size_per_rank=4,
+            num_dp_ranks=8,
+            verify_num_draft_tokens=8,
+            min_steady_steps=16,
+            load_info=make_load_info(),
+        )
+        self.assertEqual(outcome.batch_size, 32)
+        self.assertEqual(len(outcome.per_rank_median_step_time), 8)
+
     def test_rank_with_no_new_records_raises(self):
         with self.assertRaisesRegex(RuntimeError, "no new decode-step records"):
             postprocess_round(
                 rank_rows=[make_rows(), []],
                 batch_size_per_rank=4,
-                dp_size=2,
+                num_dp_ranks=2,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -166,7 +182,7 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
                     make_rows(first_forward_ct=1000),
                 ],
                 batch_size_per_rank=4,
-                dp_size=2,
+                num_dp_ranks=2,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -180,7 +196,7 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
             postprocess_round(
                 rank_rows=[make_rows(), make_rows(num_verify_tokens=24)],
                 batch_size_per_rank=4,
-                dp_size=2,
+                num_dp_ranks=2,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -191,7 +207,7 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
             postprocess_round(
                 rank_rows=[make_rows()],
                 batch_size_per_rank=4,
-                dp_size=2,
+                num_dp_ranks=2,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -204,7 +220,7 @@ class TestTableAssembly(CustomTestCase):
             postprocess_round(
                 rank_rows=[make_rows(step_time=step_time)],
                 batch_size_per_rank=4,
-                dp_size=1,
+                num_dp_ranks=1,
                 verify_num_draft_tokens=8,
                 min_steady_steps=16,
                 load_info=make_load_info(),
@@ -239,7 +255,7 @@ class TestSweepHelpers(CustomTestCase):
 
     def test_sweep_within_captured_cuda_graphs_passes(self):
         validate_sweep_against_server(
-            context=make_context(cuda_graph_max_bs=64, dp_size=2),
+            context=make_context(cuda_graph_max_bs=64, num_dp_ranks=2),
             batch_sizes=[8, 64],
         )
 
@@ -251,6 +267,21 @@ class TestSweepHelpers(CustomTestCase):
 
     def test_resolve_cuda_graph_max_bs_handles_missing_config(self):
         self.assertIsNone(resolve_cuda_graph_max_bs(internal_state={}))
+
+
+class TestNumDpRanks(CustomTestCase):
+    def test_attention_dp_groups_multiply_the_rank_count(self):
+        self.assertEqual(
+            num_dp_ranks_from_internal_state({"dp_size": 1, "attn_dp_size": 8}), 8
+        )
+
+    def test_missing_attn_dp_size_counts_replicas_only(self):
+        self.assertEqual(num_dp_ranks_from_internal_state({"dp_size": 4}), 4)
+        self.assertEqual(num_dp_ranks_from_internal_state({}), 1)
+        self.assertEqual(
+            num_dp_ranks_from_internal_state({"dp_size": None, "attn_dp_size": None}),
+            1,
+        )
 
 
 class TestCountAlignedSteps(CustomTestCase):
@@ -267,7 +298,7 @@ class TestMinSteadySteps(CustomTestCase):
             postprocess_round(
                 rank_rows=[make_rows(num_rows=20)],
                 batch_size_per_rank=4,
-                dp_size=1,
+                num_dp_ranks=1,
                 verify_num_draft_tokens=8,
                 min_steady_steps=32,
                 load_info=make_load_info(),
