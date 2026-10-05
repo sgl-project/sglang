@@ -22,7 +22,10 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +514,12 @@ class AudioEncoderAttention(nn.Module):
             window_size=window_size,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
+            # TODO: the audio encoder does not follow --mm-enable-dp-encoder and
+            # reduces over the full TP group, so its output is wrong under
+            # attention DP narrower than TP. Rejecting that would reject the
+            # documented MiMo-V2.5 `--tp 8 --attn-dp-size 2` launch; fix the
+            # reduce group or run the encoder data-parallel instead.
+            allow_tp_reduce_mismatch=True,
         )
 
     def forward(
@@ -1120,7 +1129,6 @@ class MiMoV2AudioConfig:
 
 
 def _remap_audio_tokenizer_state_dict(state_dict: dict) -> dict:
-    from sglang.srt.runtime_context import get_parallel
 
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank

@@ -82,7 +82,7 @@ class StartupWeightLoadOptions:
     attn_cp_size: int
     dcp_size: int
     pp_size: int
-    dp_size: int
+    num_dp_ranks: int
     ep_size: int
     cpu_offload_gb: int
     offload_group_size: int
@@ -119,12 +119,12 @@ class StartupWeightLoadOptions:
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
             speculative_algorithm=get_spec().speculative_algorithm,
-            tp_size=get_parallel().config.tp_size,
-            attn_cp_size=get_parallel().config.attn_cp_size,
-            dcp_size=get_parallel().config.dcp_size,
-            pp_size=get_parallel().config.pp_size,
-            dp_size=get_parallel().config.dp_size,
-            ep_size=get_parallel().config.ep_size,
+            tp_size=get_parallel().tp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
+            dcp_size=get_parallel().dcp_size,
+            pp_size=get_parallel().pp_size,
+            num_dp_ranks=get_parallel().num_dp_ranks,
+            ep_size=get_parallel().ep_size,
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -369,7 +369,7 @@ class StartupWeightLoadManager:
                 "decode context parallelism is not supported",
             ),
             (options.pp_size != 1, "pipeline parallelism is not supported"),
-            (options.dp_size != 1, "data parallelism is not supported"),
+            (options.num_dp_ranks != 1, "data parallelism is not supported"),
             (options.ep_size != 1, "expert parallelism is not supported"),
             (options.cpu_offload_gb > 0, "CPU offload is not supported"),
             (
@@ -520,8 +520,7 @@ class StartupWeightLoadManager:
         if changed_names:
             preview = ", ".join(changed_names[:8])
             raise RuntimeError(
-                "Startup weight commit changed graph-visible tensor storage: "
-                f"{preview}"
+                f"Startup weight commit changed graph-visible tensor storage: {preview}"
             )
         unchanged_names = manifest.unchanged_parameter_names(
             CAPTURE_SAFE_WEIGHT_SENTINEL

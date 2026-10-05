@@ -2,6 +2,11 @@
 //! abort lane ([`AbortSource`]), the producer-side handles ([`Senders`]), and
 //! the shutdown-aware [`recv`].
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::request::Request;
@@ -15,21 +20,65 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
         .wait()
 }
 
-/// Events into the TokenizerManager request loop. API server + tokenizer pool
-/// share this one inbox, keeping the loop a single consumer (no `select`).
+/// Events into the TokenizerManager request loop. API server, tokenizer pool
+/// and MM pool share this one inbox, keeping the loop a single consumer (no
+/// `select`). Both pools take the whole `Request`, advance its FSM, and hand
+/// it back; `drive` re-dispatches on the state.
 pub enum TmEvent {
     /// A freshly received request from the API server.
-    Intake(Request),
+    Intake {
+        request: Request,
+        admission: RequestAdmission,
+    },
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled)
-    /// on success, or `Failed` on a tokenize error. `drive` handles both.
+    /// or `Encoding` (multimodal prompt) on success, `Failed` on a tokenize
+    /// error.
     Tokenized(Request),
-    /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
-    /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
-    /// sidecar (`Server.take_mm`), not this event.
-    MmEncoded { rid: Rid, input_ids: Vec<i32> },
-    /// An MM worker rejected a request parked in `Encoding` (bad media URL,
-    /// unsupported modality, preprocess error, …).
-    MmFailed { rid: Rid, message: String },
+    /// A request back from the MM pool: `PreSendValidating` with the final
+    /// placeholder-expanded `input_ids` and the feature buffers (inline or
+    /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
+    /// preprocess error, ...).
+    Encoded(Request),
+}
+
+const ADMISSION_PENDING: u8 = 0;
+const ADMISSION_ACCEPTED: u8 = 1;
+const ADMISSION_CANCELLED: u8 = 2;
+
+/// Cancellation-safe ownership handoff between a frontend call and Intake.
+///
+/// A bounded `send_async` can enqueue a request and wake its sender without the
+/// sender being polled again. If that task is then cancelled, this token decides
+/// exactly one outcome: either Intake observes the prior cancellation and drops
+/// the request, or the frontend observes prior admission and emits an abort.
+#[derive(Clone)]
+pub struct RequestAdmission {
+    state: Arc<AtomicU8>,
+}
+
+impl RequestAdmission {
+    pub fn pending() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(ADMISSION_PENDING)),
+        }
+    }
+
+    /// Claim the request for Intake. `false` means cancellation won the race.
+    pub fn try_accept(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ADMISSION_PENDING,
+                ADMISSION_ACCEPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Cancel the request. `true` means Intake already owns it and needs an abort.
+    pub fn cancel_requires_abort(&self) -> bool {
+        self.state.swap(ADMISSION_CANCELLED, Ordering::AcqRel) == ADMISSION_ACCEPTED
+    }
 }
 
 /// The source of the abort request. Both variants do the same work in
@@ -42,7 +91,7 @@ pub enum TmEvent {
 /// cannot be tangled up with an abort still in flight for the original.
 #[derive(Clone, Debug)]
 pub enum AbortSource {
-    /// From an `AbortGuard` drop. Owns the release.
+    /// From an in-flight frontend call drop. Owns the release.
     Guard(Rid),
     /// From a detokenizer terminal path. Aborts the scheduler work.
     Detok(Rid),

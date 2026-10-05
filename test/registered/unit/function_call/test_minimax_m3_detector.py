@@ -6,7 +6,7 @@ from sglang.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN, MinimaxM3Detec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NS = MINIMAX_NS_TOKEN
 
@@ -533,6 +533,53 @@ def _parse_segments_text(text, tools):
     return [
         {"name": c.name, "args": json.loads(c.parameters)} for c in result.calls
     ], result.normal_text
+
+
+class TestMinimaxM3TopLevelOneOf(CustomTestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "count": {"type": "integer"},
+                                    "verbose": {"type": "boolean"},
+                                },
+                                "required": ["count", "verbose"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+        self.segments = (
+            "<tool_call>",
+            '<invoke name="acme">',
+            "<count>7",
+            "</count>",
+            "<verbose>true",
+            "</verbose>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        self.expected = {"count": 7, "verbose": True}
+
+    def test_detect_and_parse(self):
+        calls, _ = _parse_segments(self.segments, self.tools)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], self.expected)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 ---
 title: DeepSeek-V4
-description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Pro, and Pro Official (0813)."
-tag: NEW
+description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Flash Vision (Exp), Pro, and Pro Official (0813)."
 ---
 
 ## Deployment
@@ -32,7 +31,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). The one exception is **Flash Vision (Exp)**, whose support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)). **DGX Spark** is the other exception: its three cells (Flash Official FP4, Flash Official NVFP4, Flash Vision FP4) use the DGX Spark–only preview image `lmsysorg/sglang:dev-v4f-2dgx-v2` (the command panel picks it automatically — see the [DGX Spark notes](#spark-note)); do not use that image on any other hardware.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -52,11 +51,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260822`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi30x-20260822`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822
+docker pull lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -66,7 +65,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822 \
+    lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926 \
     sglang serve <use args below>
 ```
 
@@ -85,6 +84,10 @@ Pick your hardware + recipe to generate the launch command. The three serving st
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
+
+<Note>
+  The **Flash Vision (Exp)** variant runs on a dedicated preview Docker image, `lmsysorg/sglang:dev-dsv4-flash-vision` — its support ([sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253)) has not shipped in a release yet. The command panel's Docker mode emits that image automatically for Flash Vision cells; see the [Flash Vision notes](#vision-note).
+</Note>
 
 <Deployment config={config} benchmarks={benchmarks} />
 
@@ -127,7 +130,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refreshes add checkpoints with a bundled DSpark draft head:
+**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refreshes add checkpoints with a bundled DSpark draft head, and the experimental Flash Vision checkpoint builds image understanding on top of the 0731 Flash base:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -158,6 +161,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Official (0731), with a bundled DSpark draft head; verified on 8×B200, 4×GB300, and 4×H200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp">DeepSeek-V4-Flash-Vision-Exp</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>305B</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Vision (Exp) — experimental multimodal (image-text-to-text): the 0731 Flash base + vision encoder & aligner; verified on 4×B200 (TP=4), requires the <a href="#vision-note">preview build</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
@@ -178,7 +187,7 @@ The Instruct checkpoints ship as **FP4 MoE experts + FP8 attention / dense** (on
 
 **Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
+**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Flash Vision (Exp)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
 ## 2. Configuration Tips
 
@@ -205,6 +214,30 @@ For the original Flash and Pro checkpoints:
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
 
+<a id="spark-note" />
+
+**DGX Spark (2x GB10): Flash Official FP4 / NVFP4, Flash Vision FP4**
+
+The **DGX Spark** row has three recipes, all **Balanced · Multi-Nodes**: **Flash Official (0731) · FP4**, **Flash Official (0731) · NVFP4**, and **Flash Vision (Exp) · FP4**. None of these checkpoints fits one 128GB GB10, so every recipe runs TP=2 across two DGX Sparks connected over ConnectX-7 (RoCE). Every other DGX Spark combination is greyed out on purpose.
+
+- **Docker image** — all three cells use `lmsysorg/sglang:dev-v4f-2dgx-v2`, a preview build made **only for DGX Spark** (branch `b12x-vision` @ `452239a74f`): it bakes in the SM12x `b12x` MoE (W4A8) and compressed-MLA attention kernels ([#34878](https://github.com/sgl-project/sglang/pull/34878), [#35899](https://github.com/sgl-project/sglang/pull/35899), [#34018](https://github.com/sgl-project/sglang/pull/34018)), the Flash Vision model support ([#37253](https://github.com/sgl-project/sglang/pull/37253)), the b12x image-prefill fix that lets Flash Vision serve images on SM12x, the NVFP4 MTP-layer dispatch fix, and the CuTeDSL and NCCL pins the GB10 pair needs. Do not use it on other hardware, and use the panel's Docker mode — the bare Python command needs the `b12x` kernel package this image ships.
+- **Run the same command on both Sparks** with `--node-rank 0` / `--node-rank 1` and `--dist-init-addr` pointing at node 0 over the ConnectX-7 link. The `docker run` flags the panel emits (`--network host --ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`) are what let NCCL use RDMA; without them NCCL silently falls back to TCP and decode slows by roughly 40%.
+- **Env knobs** in the cells are part of the recipe: `SGLANG_SM120_FLASHMLA_BACKEND=b12x` selects the b12x attention path, `SGLANG_B12X_MAX_TOKENS` must equal `--chunked-prefill-size`, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids unified-memory fragmentation OOMs on GB10.
+- **NVFP4 (`nvidia/DeepSeek-V4-Flash-0731-NVFP4`)** — only the routed experts are NVFP4; attention, shared experts and the DSpark MTP layer stay in the checkpoint's native formats. On SM12x that means three extra flags: `--moe-runner-backend flashinfer_cutlass` (b12x's MoE is MXFP4-only and trtllm-gen kernels are sm100-only), `--speculative-moe-runner-backend b12x` (the DSpark draft's MTP experts are MXFP4 and run on b12x), and `--disable-shared-experts-fusion` (HashTopK rejects fused shared experts under the cutlass runner). Throughput and DSpark acceptance match the FP4 cell within noise.
+- **Flash Vision** — images are served natively on the b12x recipe with the same flags as Flash Official (send `image_url` content on `/v1/chat/completions`, see [Vision](#3-5-vision-image-inputs)); text-only requests work unchanged. Expect roughly 15–20% lower text throughput than Flash Official on this checkpoint — its bundled DSpark head accepts fewer drafts (~3.2 vs ~3.9) — with text accuracy intact.
+
+<a id="vision-note" />
+
+**DeepSeek-V4-Flash-Vision-Exp (Experimental)**
+
+[`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) is DeepSeek's first experimental multimodal V4 checkpoint: the 0731 Flash base plus a vision encoder and aligner, served through the same `sglang serve` flow with OpenAI-style `image_url` inputs (see [Vision](#3-5-vision-image-inputs) below). Select the **Flash Vision** variant in the Deploy panel for its recipes.
+
+- **Preview build required** — support lands via [sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253) and has not shipped in a release. Docker mode on the Flash Vision cells already emits the preview image `lmsysorg/sglang:dev-dsv4-flash-vision`; for a Python environment, install SGLang from that PR's branch. The DGX Spark Flash Vision cell is the exception: it uses the DGX Spark image `lmsysorg/sglang:dev-v4f-2dgx-v2` (see the [DGX Spark notes](#spark-note)).
+- **Verified matrix** — MMMU-Pro via sgl-eval at `temperature 1.0`, `top-p 0.95`, `--reasoning-effort max`.
+- **Engine auto-configuration** — the engine picks the `flashinfer_mxfp4` MoE runner and auto-disables shared-experts fusion for this checkpoint (its HashTopK routing rejects fused shared experts); don't pass `--enforce-shared-experts-fusion`.
+- **Chunked prefill & radix cache stay enabled** — the scheduler keeps image spans consistent automatically: chunked-prefill truncation points are span-aligned (an image span always prefills within a single extend, overshooting the chunk budget by at most one span), and a radix-cache prefix match ending deep inside an image span is re-issued from the span start.
+- **Speculative decoding** — the checkpoint bundles a DSpark head, and the low-latency recipes enable it with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; the other hardware rows are pending verification). The balanced and high-throughput recipes run target-only: they use DP Attention, which DSpark is incompatible with on current releases. As on the 0731/0813 checkpoints, do not pass the EAGLE flags.
+
 **Shared experts fusion (Blackwell, flashinfer_mxfp4)**
 
 On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shared expert runs as a separate FP8 MLP on an alternate stream by default. Adding:
@@ -215,7 +248,7 @@ On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shar
 
 routes it as one extra MXFP4 expert through the same trtllm-gen MoE kernel, so the whole MoE runs on a single stream (~4 fewer kernel launches and 2 fewer stream syncs per MoE layer). The shared expert is requantized from FP8 to MXFP4 at load time. Measured on GB200 tp4: gsm8k and AIME25 accuracy on par with the unfused baseline; Mean TTFT -13% to -21% and P99 ITL -15% to -53% at QPS 1-8 with neutral throughput.
 
-Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use.
+Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use. Not applicable to [Flash Vision (Exp)](#vision-note) — the engine auto-disables the fusion on that checkpoint.
 
 **Compressed attention state dtype**
 
@@ -273,7 +306,9 @@ fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 
-DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer on SM100 GPUs with DeepGEMM FP4 indexer support. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+
+On **NVIDIA (SM100 / SM120)**, pair the flag with DeepGEMM FP4 indexer support and the FlashInfer MXFP4 MoE runner:
 
 ```bash Command
 # Please use the latest main branch for this feature.
@@ -284,12 +319,27 @@ sglang serve \
   --enable-deepseek-v4-fp4-indexer
 ```
 
+On **AMD MI355X (gfx95)**, the AITER FP4 indexer kernels are available on ROCm. Keep the standard MI355 recipe and add only the indexer flag. Do not need to pass `--moe-runner-backend flashinfer_mxfp4`:
+
+```bash Command
+# Please use the latest ROCm image for this feature.
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --tp 8 \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  <other args from the Deploy panel>
+```
+
 **NVFP4 Hybrid Checkpoints**
 
 The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
 [`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
 quantize MoE experts to **NVFP4** while keeping attention and dense layers in
-**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+**FP8**. The official releases have matching NVFP4 checkpoints at
+[`nvidia/DeepSeek-V4-Flash-0731-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-0731-NVFP4) and
+[`nvidia/DeepSeek-V4-Pro-0813-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-0813-NVFP4).
+All of them require `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
 
 ```bash Command
 sglang serve \
@@ -309,13 +359,18 @@ Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
 MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
 automatically.
 
+The official (0731 / 0813) NVFP4 checkpoints preserve the bundled DSpark draft
+head, so their low-latency recipes use `--speculative-algorithm DSPARK` instead
+of the EAGLE/MTP shape flags — same as the corresponding original-precision
+official checkpoints.
+
 <a id="hopper-note" />
 
 **Hopper (H100 / H200) note**
 
 Two options are available for running DeepSeek-V4 on Hopper:
 
-- **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
+- **Original FP4 checkpoints** — run the MoE experts with W4A16 kernels (Marlin or the FlashInfer SM90 CUTLASS runner) as the command generator picks for Hopper cells. With FlashInfer >= 0.6.18 you can instead select the **W4A8** path — MXFP4 weights with FP8 activations via FlashInfer's Humming kernels — by adding `--flashinfer-mxfp4-moe-precision fp8` to `--moe-runner-backend flashinfer_mxfp4`; the low-latency Hopper cells now generate this form. Both work on H100 and H200; FP4 is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
@@ -335,9 +390,31 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 - **Model checkpoints** — for correct accuracy, the FP4 model uses the stock `deepseek-ai/DeepSeek-V4-{Flash,Pro}`, and the FP8 model uses the repackaged `sgl-project/DeepSeek-V4-{Flash,Pro}-FP8`.
 - **Supported models** — **MI300X** supports DeepSeek-V4-Flash in FP8; **MI355X** supports DeepSeek-V4-Flash / Pro in both FP4 and FP8. All recipes run single-node.
-- **TP / DP setting** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP**, which additionally needs `--dp 8 --enable-dp-attention --enable-prefill-delayer --prefill-delayer-max-delay-ms 5000`.
-- **MTP** — speculative decoding is supported; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
+- **TP / DP setting (MI355X)** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP** (balanced / high-throughput recipes). The verified MI355X DP recipes additionally set `--attn-dp-size 8 --enable-dp-attention-local-control-broadcast --tokenizer-worker-num 8 --stream-interval 20 --prefill-decode-interval 10`.
+- **MTP** — speculative decoding on the original Flash / Pro checkpoints, which bundle an MTP head; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Pro Official (0813) has no MTP head, so these flags do not apply there and the Playground does not offer them.
+- **DSpark (MI355X Pro Official 0813)** — the 0813 checkpoint bundles the DSpark draft head, and DSpark is the only speculative algorithm it supports. Enable `--speculative-algorithm DSPARK` (low-latency) and see the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) for the long-context path. DSpark also runs under **PD disaggregation** — see the Pro Official pairs in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io).
 - **Kernels** — uses the Unified KV attention and the flydsl MoE.
+- **FP4 indexer (MI355X)** — FP4 C4 indexer is supported via `--enable-deepseek-v4-fp4-indexer` on top of the standard ROCm recipe.
+
+**MoRI EP (AMD expert parallelism)**
+
+On AMD, expert parallelism uses the **MoRI** all-to-all backend (`--moe-a2a-backend mori`), not DeepEP. Add the flags below on top of the verified recipe when sharding experts across GPUs; set `--ep-size` to the EP degree (typically the GPU count on one node).
+
+Two optional env vars improve MoRI throughput (both off by default):
+
+```bash Command
+export SGLANG_MORI_DISPATCH_DTYPE=mxfp8
+export SGLANG_MORI_RECV_BOUND=1
+
+sglang serve \
+  --model-path {MODEL_PATH} \
+  --tp 8 --attn-dp-size 8 \
+  --ep-size 8 --moe-a2a-backend mori --deepep-mode normal \
+  <other args from the Deploy panel>
+```
+
+- **FP4**: enable both env vars.
+- **FP8**: use `SGLANG_MORI_RECV_BOUND=1` only; omit `SGLANG_MORI_DISPATCH_DTYPE=mxfp8`.
 
 **MegaMoE**
 
@@ -577,11 +654,13 @@ For AMD devices,
 
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 
-For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache).
+For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache). For the alternative that skips the host tier entirely, see [§3.9 UMBP](#3-9-unified-cache-external-linker-umbp) — it is a sibling of HiCache, not a storage backend for it, and the two cannot be enabled together.
 
 ### 3.4 DSpark (Speculative Decoding)
 
 Flash Official (0731) and Pro Official (0813) bundle a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731` and `deepseek-ai/DeepSeek-V4-Pro-0813`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
+
+The experimental [Flash Vision checkpoint](#vision-note) also bundles a DSpark head, enabled the same way: the Flash Vision low-latency recipes ship with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; other hardware rows pending). The balanced and high-throughput Flash Vision recipes stay target-only because they run DP Attention.
 
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 
@@ -613,4 +692,583 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
-DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+DSpark requires `pp_size == 1`. Selecting a prefill or decode role in the Playground keeps the inherited DSpark flags on both roles; for PD-disaggregated configurations that run DSpark, see the [B200 agentic recipe](#3-6-agentic-long-context-with-hicache-dram-offload-b200-fp4-dspark) and the [MI355X Pro Official PD pairs](#3-8-pd-disaggregation-on-mi355x-mori-io). The MI355X Flash Official recipes run target-only, and so do the DP-Attention recipes in the Deploy panel — for DP-Attention configurations that do run DSpark, see the [B200 agentic recipe](#3-6-agentic-long-context-with-hicache-dram-offload-b200-fp4-dspark) and the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark). If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+
+### 3.5 Vision (Image Inputs)
+
+The experimental [`DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) checkpoint (the **Flash Vision** variant in the Deploy panel — see the [configuration notes](#vision-note)) takes images via the OpenAI-compatible `image_url` content type, as public URLs or base64 `data:` URIs; text and images mix freely in one message. Vision input works with the same server the Deploy panel produces — no extra model-specific flags needed.
+
+<Accordion title="Image Understanding (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url",
+             "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+            {"type": "text", "text": "Describe this image in a few sentences."},
+        ],
+    }],
+)
+
+message = response.choices[0].message
+if getattr(message, "reasoning_content", None):
+    print("=============== Thinking =================")
+    print(message.reasoning_content)
+print("=============== Content =================")
+print(message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.6 Agentic Long-Context with HiCache DRAM Offload (B200 FP4, DSpark)
+
+**TP8, concurrency 1–8:**
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.90 \
+  --swa-full-tokens-ratio 0.1 \
+  --chunked-prefill-size 8192 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2.75 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+DSv4 HiCache sizes the host tier with `--hicache-ratio` (host/device token ratio), not `--hicache-size`.
+
+**DEP8 (DP Attention), concurrency 64–160:**
+```bash Command
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --attn-dp-size 8 \
+  --enable-dp-lm-head \
+  --ep-size 8 \
+  --moe-a2a-backend megamoe \
+  --enable-w4a4-mxfp4-megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-shared-experts-fusion \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.88 \
+  --swa-full-tokens-ratio 0.02 \
+  --chunked-prefill-size 49152 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 8 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so this keeps 6144 tokens per rank.
+
+**Disaggregated 1P1D (DEP8 prefill / DEP8 decode), concurrency 64–128.** Prefill, on one 8-GPU node:
+```bash Command
+SGLANG_DSV4_MHC_PREWARM=1 \
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=9216 \
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --attn-dp-size 8 \
+  --enable-dp-lm-head \
+  --ep-size 8 \
+  --moe-dense-tp-size 1 \
+  --moe-a2a-backend megamoe \
+  --enable-w4a4-mxfp4-megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.85 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.01 \
+  --chunked-prefill-size 65536 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 8 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11
+```
+
+Decode, on a second 8-GPU node:
+```bash Command
+SGLANG_DSV4_MHC_PREWARM=1 \
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --attn-dp-size 8 \
+  --enable-dp-lm-head \
+  --ep-size 8 \
+  --moe-dense-tp-size 1 \
+  --moe-a2a-backend megamoe \
+  --enable-w4a4-mxfp4-megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.90 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.02 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11
+```
+
+Router:
+```bash Command
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 8998 \
+  --decode http://<decode-host>:30000 \
+  --host 0.0.0.0 --port 8000
+```
+
+HiCache runs on the prefill role only, with `write_back` rather than the aggregate recipe's `write_through`. Set `--disaggregation-ib-device` to the node's own external HCAs.
+
+Concurrency 256 uses 2P1D — two prefill workers, one node each, added with a second `--prefill` on the router — with `--swa-full-tokens-ratio 0.02` on prefill and `--mem-fraction-static 0.91 --swa-full-tokens-ratio 0.005` on decode.
+
+### 3.7 Agentic Long-Context with HiCache DRAM Offload (MI355X FP4, DSpark)
+
+Three commands follow, one per concurrency range. They share the model, parser, attention and DSpark flags, and differ in parallelism, MoE path and host offload:
+
+| | TP8 | TP8 + HiCache | DP8 | DP8 EP8 MegaMoE |
+|---|---|---|---|---|
+| Concurrency | 1–16 | 32–48 | 128 | 128–384 |
+| Parallelism | TP8 | TP8 | TP8+DP8 | TP8+DP8+EP8 |
+| MoE | replicated | replicated | replicated | MegaMoEv2 |
+| HiCache | off | on | on | on |
+| `--mem-fraction-static` | 0.86 | 0.86 | 0.92 | 0.85 |
+
+DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every command. The first three use `--enforce-shared-experts-fusion`; the MegaMoE command uses `--disable-shared-experts-fusion` instead.
+
+Three adjustments are not in the commands below. Add them when they apply:
+
+- `--cuda-graph-backend-prefill breakable` at concurrency 1–4.
+- `SGLANG_DSV4_GROUPED_ASM=1` on the TP-only commands at concurrency 16 and above — the kernel needs at least 16 requests per draft token.
+- `--prefill-decode-interval 15` on the MegaMoE command at concurrency 384, replacing the `20` it ships with.
+
+**TP8, concurrency 1–16:**
+```bash Command
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+AITER_BF16_FP8_MOE_BOUND=0 \
+SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --prefill-decode-interval 20 \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --enforce-shared-experts-fusion \
+  --mem-fraction-static 0.86 \
+  --chunked-prefill-size 16384 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --watchdog-timeout 3600
+```
+
+**TP8 + HiCache, concurrency 32–48:** the same command with HiCache DRAM offload added. `--hicache-ratio` is the host/device token ratio; `1.5` is what stays under a ~2.7 TB host DRAM budget at TP8. The same five flags appear in the two DP commands below.
+
+```bash Command
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+**DP8 (DP Attention), concurrency 128:**
+```bash Command
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+AITER_BF16_FP8_MOE_BOUND=0 \
+SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_SHARED_EXPERT_TP1=1 \
+SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
+SGLANG_DP_USE_GATHERV=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=1 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --attn-dp-size 8 \
+  --enable-dp-lm-head \
+  --enable-prefill-delayer \
+  --enable-dp-attention-local-control-broadcast \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --prefill-decode-interval 20 \
+  --prefill-delayer-token-usage-low-watermark 0.7 \
+  --load-balance-method total_requests \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --enforce-shared-experts-fusion \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 65536 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --watchdog-timeout 3600
+```
+
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 65536 keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
+
+**DP8 EP8 MegaMoE, concurrency 128–384:**
+```bash Command
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+AITER_BF16_FP8_MOE_BOUND=0 \
+SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
+SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
+MORI_SHMEM_HEAP_SIZE=17179869184 \
+SGLANG_AITER_MEGA_RANK_SYNC=1 \
+SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1 \
+SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=0 \
+GPU_MAX_HW_QUEUES=5 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --attn-dp-size 8 \
+  --ep 8 \
+  --enable-dp-lm-head \
+  --enable-prefill-delayer \
+  --enable-dp-attention-local-control-broadcast \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --prefill-decode-interval 20 \
+  --prefill-delayer-token-usage-low-watermark 0.7 \
+  --load-balance-method total_requests \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-a2a-backend megamoe \
+  --moe-dense-tp-size 1 \
+  --disable-shared-experts-fusion \
+  --enable-eplb \
+  --eplb-rebalance-num-iterations 200 \
+  --expert-distribution-recorder-mode stat \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 65536 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --watchdog-timeout 3600
+```
+
+This command adds expert parallelism on top of the DP8 one. [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only.
+
+### 3.8 PD Disaggregation on MI355X (MORI-IO)
+
+The prefill and decode roles can use any transport the **PD Disagg** card in the [Playground above](#playground) offers. On MI300X / MI355X that is **MORI-IO**, **Mooncake** and **NiXL**, and all three stay selectable. This section covers MORI-IO only, because it is the transport every AMD recipe in this cookbook was measured with. It is also what the card selects by default on those two platforms, and it is the one transport that is ROCm-only, so the card hides it on the CUDA platforms.
+
+The IB device list works the other way around. ROCm nodes enumerate their NICs as `rdmaN`, so on MI300X / MI355X the card defaults to the node's `rdmaN` list and hides the ConnectX `mlx5_*` names. On the CUDA platforms it hides the `rdmaN` list instead.
+
+Both roles need the RDMA NICs passed into the container, so the **Docker** output adds the fabric flags below on top of the usual ROCm device access from the [Install panel](#install). `/dev/infiniband` covers `rdma_cm` and the per-NIC `uverbs0`…`uverbs7` nodes, and the memlock/`IPC_LOCK` pair is what lets MORI-IO pin the buffers it registers with the NICs:
+
+```bash Command
+docker run \
+    --device=/dev/kfd --device=/dev/dri --device /dev/infiniband \
+    --group-add video --cap-add IPC_LOCK \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    --ulimit nofile=1048576:1048576 \
+    --network host --ipc=host --shm-size 32g \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001 \
+    python3 -m sglang.launch_server <role args below>
+```
+
+The Playground's Docker output uses this `v0.5.21` build for Pro Official. It is the build the PD roles ran on, and the first one carrying the Aiter MegaMoEv2 kernels the high-throughput prefill role needs. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+
+Selecting a role with **MORI** emits the MORI-IO transport env — `MORI_IO_SQ_BACKOFF_TIMEOUT_US` and `MORI_IO_QP_MAX_SEND_WR` — together with that role's sizing.
+
+#### Role-based configuration
+
+Pro Official (0813) has its own pair for each strategy, because it carries a DSpark head:
+
+| | Low-Latency | Balanced | High-Throughput |
+|---|---|---|---|
+| Prefill → Decode | TP8 → TP8 | TP4 → TP8 | TP8+DP8 → TP8+DP8 |
+| `--max-running-requests` | 32 | 96 | 384–1024 |
+| `--speculative-dspark-block-size` | 6 | 3 | 3 |
+| KV offload | linker(UMBP) | linker(UMBP) | linker(UMBP) |
+
+`--cuda-graph-bs-decode` on the decode role covers 1 to `--max-running-requests / attn_dp_size`: the full value on the TP-only rows, an eighth of it on the DP8 rows.
+
+All three Pro Official prefill roles add `--optimistic-prefill-attempts 2` and `--enable-cache-report`, and turn on the [unified cache external linker](#3-9-unified-cache-external-linker-umbp) by default. "Linker" and HiCache are alternatives; SGLang rejects both at once. Every role drops the base cell's `--prefill-decode-interval`, which applies to aggregated serving only.
+
+The high-throughput pair is the one exception to the table above: its prefill role runs **EP8** MoE while decode stays TP8, and it serves a range of concurrencies rather than one. In the Playground, its **Target Concurrency** select moves `--max-running-requests` and `--cuda-graph-bs-decode` together between 192 and 512. The two commands further down are that pair at concurrency 256.
+
+<Note>
+Selecting a TP-only role forces **DP-Attention** off and greys the control. `--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so turning DP on would cut the per-rank batch below the captured `--cuda-graph-bs-decode` values without changing either flag in the command.
+</Note>
+
+<Warning>
+**Speculative decoding changes how you size `--max-running-requests`.** For a target concurrency of N, set it to `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and the high-throughput Pro Official range serves 192 to 512.
+
+The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size`, the per-rank batch. On the Pro Official high-throughput pair the **Target Concurrency** select applies both rules for you.
+</Warning>
+
+Two things then differ between the two roles regardless of strategy:
+
+- **CUDA graphs.** Prefill runs `--disable-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
+- **Speculative decoding** is the same on both. Keep `--speculative-dspark-block-size` equal on the two roles. The original Flash and Pro checkpoints have no DSpark head and use their MTP head instead: `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
+
+**MoE parallelism differs too, on the high-throughput pair.** Each role uses what suits its batch size. Prefill runs **EP8**, with the experts split across the 8 ranks: it processes a 65536-token chunk, so the split pays for the all-to-all it costs. Decode runs **TP8**, with the experts replicated on every rank, because a few tokens per request per step would not pay for it.
+
+The two commands below are that pair at concurrency 256, on one prefill node and one decode node. Run each on its own host, then front them with the router.
+
+**Prefill, EP8:**
+
+```bash Command
+GPU_MAX_HW_QUEUES=5 \
+SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
+SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
+MORI_SHMEM_HEAP_SIZE=8G \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_SHARED_EXPERT_TP1=0 \
+SGLANG_DP_SHARED_EXPERT_LOCAL=0 \
+SGLANG_DP_USE_GATHERV=0 \
+SGLANG_DP_USE_REDUCE_SCATTER=0 \
+UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 6100 \
+  --disaggregation-mode prefill \
+  --disaggregation-bootstrap-port 7200 \
+  --disaggregation-transfer-backend mori \
+  --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
+  --tp-size 8 --dp-size 8 --ep-size 8 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --moe-a2a-backend megamoe \
+  --moe-dense-tp-size 1 \
+  --enforce-shared-experts-fusion \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.15 \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 65536 \
+  --max-running-requests 512 \
+  --context-length 1048576 \
+  --disable-cuda-graph \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-unified-cache-external-linker \
+  --unified-cache-external-linker-backend mori \
+  --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}' \
+  --optimistic-prefill-attempts 2 \
+  --enable-cache-report \
+  --load-balance-method round_robin \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-metrics \
+  --watchdog-timeout 3600
+```
+
+**Decode, TP8:**
+
+```bash Command
+GPU_MAX_HW_QUEUES=5 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_SHARED_EXPERT_TP1=1 \
+SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
+SGLANG_DP_USE_GATHERV=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=1 \
+MORI_MAX_DISPATCH_TOKENS_DECODE=256 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 6100 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mori \
+  --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
+  --tp-size 8 --dp-size 8 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --enforce-shared-experts-fusion \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.15 \
+  --mem-fraction-static 0.92 \
+  --max-running-requests 512 \
+  --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 \
+  --context-length 1048576 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --load-balance-method round_robin \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-metrics \
+  --watchdog-timeout 3600
+```
+
+Decode sets neither `--ep-size` nor `--moe-a2a-backend`. `--moe-a2a-backend` names the dispatch path for expert parallelism, so at `ep_size` 1 there is nothing for it to name, and the MoE runs replicated across TP.
+
+The four `SGLANG_*` variables that flip between the two commands drive the `all_gatherv` / `reduce_scatterv` path. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
+
+The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
+
+On the prefill env:
+
+- `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
+- `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is also the default; the command sets it so the dependency stays visible.
+- `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.7](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
+
+<Note>
+`MORI_SHMEM_MODE=STATIC_HEAP` creates the heap and is already the default. Set it only if your launch script exports `MORI_SHMEM_MODE=ISOLATION`, which creates no heap: every rank then prints `Pointer ... is not in symmetric heap [0x0, 0x0)` and the worker fails.
+</Note>
+
+**Both roles set `SGLANG_DSV4_UNIFIED_KV_FP8=1`**, which splits the unified KV cache pool into an FP8 nope pool and a BF16 rope pool. It requires the `unified_kv_triton` kernels, which the base cell already selects through `SGLANG_HACK_FLASHMLA_BACKEND`. The value must match on both roles — the PD handshake compares KV cache layouts and fails if they differ. The DSpark draft worker stays BF16 either way.
+
+#### Router configuration
+
+Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. Decode holds no reusable prefix, so `--decode-policy round_robin` spreads it evenly. `--dp-aware` takes effect only when the workers run DP attention.
+
+The **Pro Official high-throughput** pair, and only that pair, adds `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
+
+<Warning>
+`--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the low-latency and balanced pairs keep the default. Lower it again if you lower the concurrency.
+</Warning>
+
+### 3.9 Unified Cache External Linker (UMBP)
+
+The **unified cache external linker** is the second way to move KV cache off the GPU. The linker is the SGLang feature, and you enable it with `--enable-unified-cache-external-linker`. UMBP is one store the linker can use; you select it with `--unified-cache-external-linker-backend mori`. The Playground card uses the feature name, not the store name.
+
+The linker is an **alternative to [HiCache](#3-3-hicache-hierarchical-kv-caching), not a tier inside it**. HiCache is a hierarchy — GPU, then pinned host memory, then optionally a storage backend. The linker connects the unified radix tree directly to the external store, with no host cache tier in between, so pages load and offload against that store. SGLang rejects the two together, so enabling the **Unified Cache External Linker** card in the [Playground above](#playground) strips the whole HiCache flag family from the command:
+
+```bash Command
+--enable-unified-cache-external-linker \
+--unified-cache-external-linker-backend mori
+```
+
+The **Backend** knob picks the linker backend. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
+
+**The linker does not need PD disaggregation.** It works in aggregated serving as well, with the **PD Disagg** card set to Off. The §3.8 pairs use it on their prefill role because that is where the KV is produced, but that is a property of those recipes, not a requirement of the linker. Turn the card on next to any command whose selection satisfies the condition below.
+
+**DP Attention is not required.** The linker runs under pure TP as well, and the Pro Official low-latency and balanced prefill roles in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io) are exactly that shape.
+
+DP Attention does change how much the tier holds, so it is worth understanding before you size one. The linker keys its objects by rank, and MLA KV is replicated across TP. Under pure TP, a TP8 worker therefore opens eight separate keyspaces, and all eight hold copies of the same tokens: the tier stores an eighth of the distinct tokens that its byte budget suggests. At TP4 it stores a quarter. DP Attention collapses the keys onto one shared keyspace, so the whole budget counts. Size the pool for the copies you will actually get, and do not read the byte budget as a distinct-token figure.
+
+Every Pro Official prefill role (low-latency, balanced, and the DP8 high-throughput one) uses a **standalone** UMBP tier: a separate `umbp_standalone_server` process on the prefill node owns the DRAM pool, and the prefill server attaches to it over a Unix socket. Start the tier server first; the 1500 GB DRAM budget below is what the verified runs used:
+
+```bash Command
+mkdir -p /tmp/umbp_sa
+UMBP_DRAM_CAPACITY=1500000000000 \
+UMBP_DRAM_USE_HUGEPAGES=1 \
+UMBP_SSD_ENABLED=0 \
+MORI_UMBP_LOG_LEVEL=info \
+<mori>/umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock
+```
+
+Then launch the prefill role with the socket in its environment. The Playground adds both lines: the address has to come from the environment, and the extra-config gives the tier server up to two minutes to bind the socket before prefill gives up.
+
+```bash Command
+UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock \
+sglang serve ... \
+  --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}'
+```
+
+Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.8 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.

@@ -18,7 +18,6 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
@@ -41,9 +40,16 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs as expand_request_outputs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds as normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -159,49 +165,6 @@ def _close_cached_cuda_video_buffer() -> None:
 atexit.register(_close_cached_cuda_video_buffer)
 
 
-@dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0
-    merge_mode: Optional[str] = None
-    lora_alpha: Optional[Union[int, List[Optional[int]]]] = None
-
-
-@dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"
-    strength: float = 1.0
-
-
-@dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"
-
-
-@dataclass
-class ListLorasReq:
-    pass
-
-
-@dataclass
-class ShutdownReq:
-    pass
-
-
-@dataclass
-class ReleaseRealtimeSessionReq:
-    session_id: str
-
-
-@dataclass
-class GetDisaggStatsReq:
-    """Request to get disagg pipeline metrics from the scheduler."""
-
-    pass
-
-
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
@@ -256,127 +219,29 @@ class MaterializedOutput:
     fps: int = 0
 
 
-def normalize_output_seeds(
-    seed: int | list[int],
-    *,
-    num_outputs_per_prompt: int,
-    num_prompts: int = 1,
-    prompt_index: int = 0,
-) -> list[int]:
-    """
-    return a list of seed with size equal to `num_outputs_per_prompt`
-    """
-    if num_outputs_per_prompt <= 0:
-        raise ValueError(
-            f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}"
+@dataclass(frozen=True)
+class RequestOutput:
+    """Map one final sample to its request, metrics and output filename."""
+
+    request: Req
+    request_index: int
+    sample_index: int
+    sample_count: int
+
+    def output_file_path(self):
+        return self.request.output_file_path(self.sample_count, self.sample_index)
+
+
+def map_request_outputs(requests: list[Req]) -> list[RequestOutput]:
+    outputs = []
+    for request_index, req in enumerate(requests):
+        count = req.sampling_params.num_samples_per_request
+        if count < 1:
+            raise ValueError(f"num_samples_per_request must be positive, got {count}")
+        outputs.extend(
+            RequestOutput(req, request_index, index, count) for index in range(count)
         )
-
-    if isinstance(seed, list):
-        seeds = [int(item) for item in seed]
-        total_outputs = num_outputs_per_prompt * num_prompts
-        if len(seeds) == num_outputs_per_prompt:
-            return seeds
-        if len(seeds) == total_outputs:
-            start = prompt_index * num_outputs_per_prompt
-            return seeds[start : start + num_outputs_per_prompt]
-        raise ValueError(
-            "seed list length must match num_outputs_per_prompt "
-            f"({num_outputs_per_prompt}) or total outputs ({total_outputs}), "
-            f"got {len(seeds)}"
-        )
-
-    base_seed = int(seed)
-    return [base_seed + i for i in range(num_outputs_per_prompt)]
-
-
-def _with_output_index_suffix(output_file_name: str, output_index: int) -> str:
-    base, ext = os.path.splitext(output_file_name)
-    return f"{base}_{output_index}{ext}"
-
-
-def _copy_trace_ctx_for_output(req: Req, request_id: str | None, output_index: int):
-    trace_ctx = req.trace_ctx
-    if output_index == 0 or not trace_ctx.tracing_enable:
-        return trace_ctx
-
-    output_trace_ctx = TraceReqContext(
-        rid=request_id,
-        module_name=trace_ctx.module_name,
-        external_trace_header=trace_ctx.external_trace_header,
-    )
-    output_trace_ctx.trace_req_start()
-    return output_trace_ctx
-
-
-def _copy_req_for_output(
-    req: Req,
-    *,
-    request_id: str | None,
-    output_index: int,
-) -> Req:
-    """Create a lightweight per-output ``Req`` without deep-copying tensors."""
-    output_req = copy(req)
-    output_req.sampling_params = copy(req.sampling_params)
-    output_req.extra = dict(req.extra)
-    output_req.condition_inputs = dict(req.condition_inputs)
-    output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
-    return output_req
-
-
-def expand_request_outputs(
-    req: Req,
-    *,
-    num_prompts: int = 1,
-    prompt_index: int = 0,
-) -> list[Req]:
-    """
-    Expand a req to a list with size equal to `num_prompts`
-    """
-    num_outputs = int(req.num_outputs_per_prompt)
-    # each req must has different seed
-    seeds = normalize_output_seeds(
-        req.seed,
-        num_outputs_per_prompt=num_outputs,
-        num_prompts=num_prompts,
-        prompt_index=prompt_index,
-    )
-
-    if num_outputs == 1:
-        req.seed = seeds[0]
-        req.seeds = None
-        req.generator = None
-        req.sampling_params.refresh_request_extra_after_output_expansion(req)
-        return [req]
-
-    expanded: list[Req] = []
-    for output_index, seed in enumerate(seeds):
-        output_request_id = (
-            f"{req.request_id}:{output_index}" if req.request_id is not None else None
-        )
-        output_req = _copy_req_for_output(
-            req, request_id=output_request_id, output_index=output_index
-        )
-        output_req.seed = seed
-        output_req.num_outputs_per_prompt = 1
-        output_req.seeds = None
-        output_req.generator = None
-        output_req.extra["parent_request_id"] = req.request_id
-        output_req.extra["output_index"] = output_index
-
-        if output_request_id is not None:
-            output_req.request_id = output_request_id
-
-        if req.output_file_name:
-            output_req.output_file_name = _with_output_index_suffix(
-                req.output_file_name, output_index
-            )
-        output_req.sampling_params.refresh_request_extra_after_output_expansion(
-            output_req
-        )
-        output_req.validate()
-        expanded.append(output_req)
-
-    return expanded
+    return outputs
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
@@ -455,6 +320,11 @@ def _resolve_ffmpeg_exe() -> str:
     return ffmpeg_exe
 
 
+# ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
+# both quicker and measurably closer to the frames the model produced.
+X264_PRESET = "fast"
+
+
 def _x264_auto_thread_count(height: int) -> int:
     """Match x264's auto frame-thread count for progressive video."""
     try:
@@ -493,6 +363,7 @@ def _try_save_cuda_video_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
@@ -562,6 +433,8 @@ def _try_save_cuda_video_direct(
         command += [
             "-vcodec",
             "libx264",
+            "-preset",
+            x264_preset or X264_PRESET,
             "-pix_fmt",
             "yuv420p",
             "-crf",
@@ -610,21 +483,29 @@ def _try_save_cuda_video_direct(
                     assert buffer.tensor is not None
                     for start in range(0, num_frames, chunk_frames):
                         end = min(start + chunk_frames, num_frames)
-                        frames = (
-                            (video[:, start:end] * 255).clamp_(0, 255).to(torch.uint8)
-                        )
-                        frames = frames.permute(1, 2, 3, 0).contiguous()
-                        buffer.tensor[: end - start].copy_(frames, non_blocking=True)
-                        torch.cuda.current_stream(video.device).synchronize()
-                        del frames
-                        _sendfile_all(
-                            process.stdin.fileno(),
-                            buffer.fd,
-                            (end - start) * height * width * 3,
-                        )
-                process.stdin.close()
-                process.stdin = None
-                returncode = process.wait()
+                        with maybe_record_function(
+                            f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
+                        ):
+                            frames = (
+                                (video[:, start:end] * 255)
+                                .clamp_(0, 255)
+                                .to(torch.uint8)
+                            )
+                            frames = frames.permute(1, 2, 3, 0).contiguous()
+                            buffer.tensor[: end - start].copy_(
+                                frames, non_blocking=True
+                            )
+                            torch.cuda.current_stream(video.device).synchronize()
+                            del frames
+                            _sendfile_all(
+                                process.stdin.fileno(),
+                                buffer.fd,
+                                (end - start) * height * width * 3,
+                            )
+                with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                    process.stdin.close()
+                    process.stdin = None
+                    returncode = process.wait()
             finally:
                 if process.stdin is not None:
                     process.stdin.close()
@@ -661,6 +542,7 @@ def _try_save_cuda_videos_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
     if len(samples) < 2 or len(samples) != len(save_file_paths):
@@ -721,6 +603,7 @@ def _try_save_cuda_videos_direct(
             fps=fps,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
         )
 
     try:
@@ -832,6 +715,7 @@ def _try_save_video_with_audio(
     audio_sample_rate: Optional[int],
     output_format: str,
     quality: float,
+    x264_preset: Optional[str] = None,
 ) -> bool:
     """Encode video and audio in one ffmpeg pass when audio is available."""
     audio_np = _normalize_audio_to_numpy(audio)
@@ -862,6 +746,7 @@ def _try_save_video_with_audio(
             quality=quality,
             audio_path=tmp_wav_path,
             audio_codec="aac",
+            output_params=["-preset", x264_preset or X264_PRESET],
         )
         return True
     except Exception as e:
@@ -887,9 +772,13 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
+    attention_backend_config = server_args.attention_backend_config or {}
+    vsa_sparsity = attention_backend_config.get(
+        "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+    )
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+        VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
     if getattr(sampling_params, "max_sequence_length", None) is not None:
@@ -1063,6 +952,7 @@ def save_materialized_output(
     save_output: bool = True,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
 ) -> None:
     if not save_output:
         return
@@ -1082,6 +972,7 @@ def save_materialized_output(
             audio_sample_rate=audio_sample_rate,
             output_format=output_format,
             quality=quality,
+            x264_preset=x264_preset,
         )
         if not saved_with_audio:
             imageio.mimsave(
@@ -1091,6 +982,7 @@ def save_materialized_output(
                 format=output_format,
                 codec="libx264",
                 quality=quality,
+                output_params=["-preset", x264_preset or X264_PRESET],
             )
 
             _maybe_mux_audio_into_mp4(
@@ -1145,6 +1037,7 @@ def save_outputs(
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
     output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
@@ -1180,6 +1073,7 @@ def save_outputs(
             fps=fps,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
         )
 
     for idx, (sample, save_file_path) in enumerate(zip(samples, save_file_paths)):
@@ -1215,6 +1109,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
+                        x264_preset=x264_preset,
                     )
                 if direct_saved:
                     if samples_out is not None:
@@ -1233,6 +1128,7 @@ def save_outputs(
             save_file_path,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
@@ -1270,6 +1166,7 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    x264_preset: Optional[str] = None,
 ) -> list[Any]:
     """materialize frames and save outputs (optional)"""
     if data_type == DataType.ACTION:
@@ -1294,5 +1191,6 @@ def post_process_sample(
         save_output=save_output,
         audio_sample_rate=audio_sample_rate,
         output_compression=output_compression,
+        x264_preset=x264_preset,
     )
     return materialized.frames

@@ -9,11 +9,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestResolveFn(CustomTestCase):
-
     def test_resolves_top_level_function(self):
         self.assertIs(resolve_fn("json:dumps"), json.dumps)
 
@@ -46,7 +45,6 @@ class TestResolveFn(CustomTestCase):
 
 
 class TestEnsureScriptImportable(CustomTestCase):
-
     _FAKE_ENTRY = "/tmp/__scripted_runtime_ut_fake_sys_path__"
 
     def setUp(self):

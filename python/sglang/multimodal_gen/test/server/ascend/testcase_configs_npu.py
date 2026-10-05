@@ -176,6 +176,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
             },
         ),
         DiffusionSamplingParams(
@@ -227,6 +228,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "96",
+            },
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,
@@ -237,14 +241,26 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
+STANDALONE_FILES = {
+    "2-npu": [
+        "ascend/test_glm_image_distributed.py",
+    ],
+}
+
+STANDALONE_FILE_EST_TIMES = {
+    "2-npu": {
+        "ascend/test_glm_image_distributed.py": 900.0,
+    },
+}
+
 SUITES = {
     "1-npu": [
         "ascend/test_server_1_npu.py",
-        # add new 1-npu test files here
+        *STANDALONE_FILES.get("1-npu", []),
     ],
     "2-npu": [
         "ascend/test_server_2_npu.py",
-        # add new 2-npu test files here
+        *STANDALONE_FILES.get("2-npu", []),
     ],
 }
 
@@ -258,6 +274,5 @@ PARAMETRIZED_CASE_GROUPS = {
 }
 
 FILE_SUITES = {}
-STANDALONE_FILES = {}
 COMPONENT_ACCURACY_SUITES = {}
 _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = None

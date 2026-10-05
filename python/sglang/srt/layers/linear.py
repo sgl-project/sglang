@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -25,6 +24,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -39,7 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -61,7 +61,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
-    "MarlinLinearMethod",
     "QQQLinearMethod",
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
@@ -284,13 +283,13 @@ class ReplicatedLinear(LinearBase):
                     raise ValueError(f"{loaded_weight} are not all equal")
 
             if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
-                assert (
-                    param.dtype == loaded_weight.dtype
-                ), "init para dtype and loaded weight dtype should be the same"
+                assert param.dtype == loaded_weight.dtype, (
+                    "init para dtype and loaded weight dtype should be the same"
+                )
 
-        assert (
-            param.size() == loaded_weight.size()
-        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        assert param.size() == loaded_weight.size(), (
+            f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -457,9 +456,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -491,6 +490,14 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
+
+        # Megatron SP "g": the input is this rank's [M_pad/tp, K] sequence shard;
+        # all-gather to the full sequence and matmul. Participants (qkv/gate_up)
+        # have gather_output=False, so there is no output all-gather to reconcile.
+        if get_forward().sp_active and self.tp_size > 1:
+            output = layernorm_sp.column_parallel_g_matmul(self, input_, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -856,7 +863,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -888,7 +894,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         loaded_weight=loaded_weight,
                         shard_id=shard_id,
                         tp_rank=self.tp_rank,
-                        tp_size=self.tp_size,
                     )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
@@ -898,7 +903,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
                     tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
                 )
                 return
             output_sizes = (
@@ -937,7 +941,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
             tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
 
@@ -1406,9 +1409,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -1566,9 +1569,9 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1621,11 +1624,26 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Megatron SP "g-bar": reduce-scatter along the token dim instead of
+        # all-reduce, leaving the output sharded for the next SP LayerNorm region.
+        # Fires regardless of reduce_results: o_proj / down are built
+        # reduce_results=False, so under SP the linear owns the reduction.
+        if (
+            get_forward().sp_active
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and output_tensor is None
+        ):
+            output = layernorm_sp.row_parallel_gbar_matmul(self, input_parallel, bias_)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
             if output_tensor is None:
@@ -1643,9 +1661,9 @@ class RowParallelLinear(LinearBase):
                     self, input_parallel, output_tensor, bias=bias_
                 )
 
-        # skip_all_reduce: explicit call-site override. Also honor
-        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
-        # the decoder — callers should not thread those flags into modules.
+        # skip_all_reduce: explicit call-site override. Also honor the
+        # mlp_reduce_scatter ForwardFlag published by the decoder — callers
+        # should not thread it into modules.
         if (
             ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce
