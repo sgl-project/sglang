@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -532,14 +533,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `rebind_write_loc` replaced it with physical
-    # ids; a backend re-derives from it into its capture-stable buffer.
+    # This iteration's KV ids, translated once (`KVLocPlan`). Every forward of
+    # the iteration holds the same plan; `out_cache_loc` is its write window in
+    # the space this runner's pool indexes.
+    kv_loc_plan: Optional[KVLocPlan] = None
+    # The same write ids in the virtual space when `out_cache_loc` holds
+    # translated ones (None on a pool that indexes virtual ids), for the
+    # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
+    # split, state capture.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Whether `out_cache_loc` holds physical ids: set by
-    # KVIndexTranslator.rebind_write_loc; capture-time batches declare it.
+    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`;
+    # capture-time batches declare it.
     out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
@@ -937,9 +944,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return_hidden_states_before_norm: bool,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
+        kv_loc_plan: Optional[KVLocPlan] = None,
+        write_cols: Optional[slice] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
+        #
+        # `kv_loc_plan`: the iteration's plan when this forward is one of
+        # several over the same slots (a speculative iteration), `write_cols`
+        # the columns of its window this forward writes. Without one, this
+        # forward is its own iteration and builds the plan itself.
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
@@ -1073,7 +1087,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
         )
 
-        model_runner.kv_index_translator.rebind_write_loc(ret)
+        translator = model_runner.kv_index_translator
+        if kv_loc_plan is None:
+            kv_loc_plan = translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+            )
+        kv_loc_plan.bind(ret, translator, cols=write_cols)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -2143,6 +2165,7 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,

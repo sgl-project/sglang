@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 
@@ -145,9 +146,11 @@ class KVIndexTranslator:
             if isinstance(alloc, UnifiedSWAAllocatorBase) and routes_window_layers:
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
+                self._swa_write_from_virtual = alloc.translate_loc_from_full_to_swa
             else:
                 self._swa_v2p_table = None
                 self._swa_write_loc_from_full = None
+                self._swa_write_from_virtual = None
         else:
             self._capture_page_size = page_size
             self._full_v2p_table = None
@@ -156,6 +159,7 @@ class KVIndexTranslator:
             self._translate_write_full = None
             self.defer_read_translate = False
             self._swa_v2p_table = None
+            self._swa_write_from_virtual = None
             # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
             # which is also what the backends' `_resolve_swa_kv_pool` keys on.
             self._swa_write_loc_from_full = (
@@ -192,6 +196,109 @@ class KVIndexTranslator:
         if not self.is_translating:
             return None
         return self._full_v2p_table
+
+    # -- the iteration's plan ----------------------------------------------------
+
+    def plan(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        write_virtual: Optional[torch.Tensor],
+        read_extent: int = 0,
+    ) -> KVLocPlan:
+        """This iteration's ids, translated once. ``write_virtual`` is the
+        iteration's write window (``[batch, window]`` flattened when its
+        forwards write columns of it); ``read_extent`` is how far past
+        ``seq_lens`` the iteration's reads reach."""
+        return KVLocPlan(
+            source=self,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            write_virtual=write_virtual,
+            read_extent=read_extent,
+        )
+
+    def _swa_write_ids(
+        self, *, virtual: torch.Tensor, physical: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The sliding-window write ids of a plan's window: on the unified pool
+        straight from the virtual ids through the swa side's own table; on a
+        static SWA pool through its full->swa table (virtual == physical)."""
+        if self._swa_write_from_virtual is not None:
+            return self._swa_write_from_virtual(virtual)
+        if not self.is_translating and self._swa_write_loc_from_full is not None:
+            return self._swa_write_loc_from_full(physical)
+        return None
+
+    def _build_iteration_table(
+        self,
+        plan: KVLocPlan,
+        *,
+        rows: Optional[int],
+        previous: Optional[KVIndexTable],
+    ) -> KVIndexTable:
+        """A plan's page table: the passthrough where reads stay virtual, else
+        one build per id space over ``[0, seq_lens + read_extent)``. Rows past
+        the plan's batch (a captured graph's padded lanes) read the sink; a
+        second, wider request copies the built rows instead of building them
+        again."""
+        if not self.reads_are_translated:
+            return KVIndexTable(
+                ids=self.req_to_token,
+                row_ids=plan.req_pool_indices,
+                row_stride=self.req_to_token.stride(0),
+                entry_page_size=1,
+                is_translated=False,
+                sliding_window_ids=None,
+            )
+        bs = int(plan.req_pool_indices.numel())
+        rows = max(bs, rows or 0)
+        if previous is not None:
+            width = previous.ids.shape[1]
+            out_full = torch.zeros((rows, width), dtype=torch.int32, device=self.device)
+            out_full[: previous.ids.shape[0]].copy_(previous.ids)
+            out_swa = None
+            if previous.sliding_window_ids is not None:
+                out_swa = torch.zeros_like(out_full)
+                out_swa[: previous.ids.shape[0]].copy_(previous.sliding_window_ids)
+        else:
+            row_pages = -(-self.req_to_token.shape[1] // self.page_size)
+            slc = plan.seq_lens_cpu
+            if slc is not None and slc.numel() > 0:
+                max_seq = int(slc.max()) + plan.read_extent
+                width = min(max(-(-max_seq // self.page_size), 1), row_pages)
+            else:
+                width = row_pages
+            out_full = torch.zeros((rows, width), dtype=torch.int32, device=self.device)
+            out_swa = (
+                torch.zeros_like(out_full) if self._swa_v2p_table is not None else None
+            )
+            for v2p, out in (
+                (self._full_v2p_table, out_full),
+                (self._swa_v2p_table, out_swa),
+            ):
+                if out is not None:
+                    build_kv_read_table(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=plan.req_pool_indices,
+                        seq_lens=plan.seq_lens,
+                        v2p=v2p,
+                        page_size=self.page_size,
+                        max_pages=width,
+                        out=out,
+                        seq_len_delta=plan.read_extent,
+                    )
+        return KVIndexTable(
+            ids=out_full,
+            row_ids=self._rows[:rows],
+            row_stride=out_full.stride(0),
+            entry_page_size=self.page_size,
+            is_translated=True,
+            sliding_window_ids=out_swa,
+        )
 
     # -- per-batch view --------------------------------------------------------
 
@@ -484,25 +591,21 @@ class KVIndexTranslator:
     # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
 
     def rebind_write_loc(self, forward_batch) -> None:
-        """Phase 1 of the WRITE contract: translate the batch's write loc to
-        FULL-side physical ids exactly once, at ForwardBatch construction, and
-        mark it physical. On non-unified pools the allocation is already
-        physical, so only the mark is set.
+        """Give a forward that is its own iteration its write ids, through a
+        plan of its own (`KVLocPlan.bind`). A forward that
+        shares its iteration's window takes that plan instead.
 
-        REBIND, never mutate: the translate returns a FRESH tensor, so the
-        ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
-        in-flight machinery that reads it. The pre-translate tensor stays on
-        the batch for `fill_capture_write_loc`.
+        The translate makes a FRESH tensor, so the ScheduleBatch's aliased
+        tensor stays VIRTUAL for the radix / accept / in-flight machinery that
+        reads it.
         """
         self._index_table_memo = None
-        if forward_batch.out_cache_loc is None:
-            return
-        if self.is_translating:
-            forward_batch.out_cache_loc_virtual = forward_batch.out_cache_loc
-            forward_batch.out_cache_loc = self._translate_write_full(
-                forward_batch.out_cache_loc
-            )
-        forward_batch.out_cache_loc_is_physical = True
+        self.plan(
+            req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
+            seq_lens=getattr(forward_batch, "seq_lens", None),
+            seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
+            write_virtual=forward_batch.out_cache_loc,
+        ).bind(forward_batch, self)
 
     def fill_capture_write_loc(
         self,

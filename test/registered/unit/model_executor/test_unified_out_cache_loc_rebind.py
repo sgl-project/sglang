@@ -85,7 +85,7 @@ def _armed_source(v2p, swa_map):
 
 def _call_names(func) -> list:
     """Dotted call targets appearing in `func`'s body, e.g.
-    'model_runner.kv_index_translator.rebind_write_loc'."""
+    'kv_loc_plan.bind'."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
     names = []
     for node in ast.walk(tree):
@@ -104,13 +104,15 @@ def _call_names(func) -> list:
 class TestForwardBatchWiring(CustomTestCase):
     """Critical-path bookkeeping: the construction-time call sites."""
 
-    def test_init_new_calls_the_rebind(self):
-        self.assertIn(
-            "model_runner.kv_index_translator.rebind_write_loc",
-            _call_names(ForwardBatch.init_new.__func__),
-            "init_new must rebind the write loc through the source; a batch "
-            "built without it ships virtual ids to the kernels",
-        )
+    def test_init_new_binds_the_plan(self):
+        names = _call_names(ForwardBatch.init_new.__func__)
+        for call in ("translator.plan", "kv_loc_plan.bind"):
+            self.assertIn(
+                call,
+                names,
+                "init_new must take its write ids from a plan; a batch built "
+                "without one ships virtual ids to the kernels",
+            )
 
 
 class TestPadComposesWithDerivation(CustomTestCase):
