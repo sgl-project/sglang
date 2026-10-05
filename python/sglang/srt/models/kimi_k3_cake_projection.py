@@ -42,6 +42,7 @@ fp32 block scale ``[ceil(N/128), K/128]``, even ``N``; ``N`` not a multiple of
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Optional
 
 import torch
@@ -49,6 +50,27 @@ import torch
 from sglang.kernels.cake_kernels._routes import cake_route_enabled
 
 logger = logging.getLogger(__name__)
+
+# Diagnostic knobs (engine side only; no numerics are changed):
+#   SGLANG_CAKE_K3_PROJ_MIN_M=<int>   keep the FP8 linear for row counts below <int>
+#                                     (defaults to 256 when kimi_k3_mla is co-enabled)
+#   SGLANG_CAKE_K3_PROJ_ONLY=a,b,...  wrap only the listed projection names
+#   SGLANG_CAKE_K3_PROJ_CHECK=1       compare every eager Cake launch with the
+#                                     wrapped FP8 linear and log anomalies
+_PROJ_MIN_M = int(os.environ.get("SGLANG_CAKE_K3_PROJ_MIN_M", "0") or 0)
+_PROJ_ONLY = frozenset(
+    s.strip()
+    for s in os.environ.get("SGLANG_CAKE_K3_PROJ_ONLY", "").split(",")
+    if s.strip()
+)
+_PROJ_CHECK = os.environ.get("SGLANG_CAKE_K3_PROJ_CHECK", "0") == "1"
+# Admission guard: with the Cake FP8 MLA decode route (``kimi_k3_mla``)
+# co-enabled, decode-M Cake projection outputs on the q/kv-side GEMMs feed
+# that kernel and it emits non-finite values in the last layers (real-weight
+# GSM8K bisect); the projection route then serves prefill only.  An explicit
+# SGLANG_CAKE_K3_PROJ_MIN_M (including 0) overrides the guard.
+_PROJ_GUARD_MIN_M = 256
+_MLA_ROUTE = "kimi_k3_mla"
 
 ROUTE = "kimi_k3_fp8_projection"
 BLOCK = 128
@@ -285,6 +307,12 @@ class CakeFp8ProjectionLinearMethod:
         ):
             return None
         m = int(x.shape[0])
+        if _PROJ_MIN_M and m < _PROJ_MIN_M:
+            self._log_once(
+                f"minm-{m}",
+                f"M={m} below SGLANG_CAKE_K3_PROJ_MIN_M={_PROJ_MIN_M}; using the FP8 linear",
+            )
+            return None
         if out is not None and not self._out_ok(out, m, x.device):
             return None
         if capturing and m not in self._warm:
@@ -327,7 +355,82 @@ class CakeFp8ProjectionLinearMethod:
             return None
         if not capturing:
             self._warm.add(m)
+            if _PROJ_CHECK:
+                self._check(layer, x, out, m)
         return out
+
+    def _check(
+        self, layer: torch.nn.Module, x: torch.Tensor, out: torch.Tensor, m: int
+    ) -> None:
+        """Diagnostic: compare the Cake output with the wrapped FP8 linear (eager calls only)."""
+        st = self.__dict__.setdefault(
+            "_check_stats",
+            {
+                "calls": 0,
+                "anom": 0,
+                "max_rel": 0.0,
+                "nonfinite": 0,
+                "x_nonfinite_calls": 0,
+                "nf_logged": 0,
+            },
+        )
+        st["calls"] += 1
+        with torch.no_grad():
+            ref = self._inner.apply(layer, x, None)
+            nonfinite = int((~torch.isfinite(out)).sum().item())
+            x_nf = int((~torch.isfinite(x)).sum().item())
+            ref_max = float(ref.abs().max().item())
+            rel = float((out.float() - ref.float()).abs().max().item()) / (
+                ref_max + 1e-6
+            )
+        st["max_rel"] = max(st["max_rel"], rel)
+        if x_nf:
+            st["x_nonfinite_calls"] += 1
+        anomalous = nonfinite > 0 or rel > 0.1
+        if anomalous:
+            st["anom"] += 1
+            st["nonfinite"] += nonfinite
+            if nonfinite > 0 and st["nf_logged"] < 5:
+                st["nf_logged"] += 1
+                bad_rows = (
+                    torch.nonzero(~torch.isfinite(out).all(dim=1))
+                    .flatten()
+                    .tolist()[:8]
+                )
+                logger.warning(
+                    "Cake %s: PROJ_CHECK NON-FINITE M=%d x_nonfinite=%d out_nonfinite=%d ref_nonfinite=%d rows=%s",
+                    self.name,
+                    m,
+                    x_nf,
+                    nonfinite,
+                    int((~torch.isfinite(ref)).sum().item()),
+                    bad_rows,
+                )
+            if st["anom"] <= 10:
+                logger.warning(
+                    "Cake %s: PROJ_CHECK anomaly M=%d N=%d K=%d non_finite=%d max_rel=%.4f |ref|max=%.4g |out|max=%.4g x_finite=%s |x|max=%.4g",
+                    self.name,
+                    m,
+                    self.n_valid,
+                    self.k,
+                    nonfinite,
+                    rel,
+                    ref_max,
+                    float(out.float().abs().max().item()),
+                    bool(torch.isfinite(x).all().item()),
+                    float(x.float().abs().max().item()),
+                )
+        if st["calls"] % 500 == 0 or st["calls"] == 1:
+            logger.info(
+                "Cake %s: PROJ_CHECK summary calls=%d anomalies=%d non_finite_total=%d x_nonfinite_calls=%d max_rel=%.4f (M=%d)",
+                self.name,
+                st["calls"],
+                st["anom"],
+                st["nonfinite"],
+                st["x_nonfinite_calls"],
+                st["max_rel"],
+                m,
+            )
 
 
 def install_cake_kimi_k3_fp8_projections(
@@ -345,10 +448,28 @@ def install_cake_kimi_k3_fp8_projections(
     """
     if not cake_route_enabled(ROUTE):
         return []
+    global _PROJ_MIN_M
+    if (
+        cake_route_enabled(_MLA_ROUTE)
+        and "SGLANG_CAKE_K3_PROJ_MIN_M" not in os.environ
+        and _PROJ_MIN_M < _PROJ_GUARD_MIN_M
+    ):
+        _PROJ_MIN_M = _PROJ_GUARD_MIN_M
+        logger.warning(
+            "Cake %s: %s is co-enabled, so the projection route serves prefill only "
+            "(M >= %d); decode-M Cake projection outputs feeding the Cake FP8 MLA decode "
+            "kernel produce non-finite values. Set SGLANG_CAKE_K3_PROJ_MIN_M to override.",
+            ROUTE,
+            _MLA_ROUTE,
+            _PROJ_GUARD_MIN_M,
+        )
     installed = []
     for name in PROJECTIONS:
         linear = getattr(attn, name, None)
         if linear is None or not isinstance(linear, torch.nn.Module):
+            continue
+        if _PROJ_ONLY and name not in _PROJ_ONLY:
+            logger.info("Cake %s.%s: skipped by SGLANG_CAKE_K3_PROJ_ONLY", prefix, name)
             continue
         quant_method = getattr(linear, "quant_method", None)
         if quant_method is None or isinstance(

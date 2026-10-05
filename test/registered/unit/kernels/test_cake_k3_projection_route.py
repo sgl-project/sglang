@@ -394,5 +394,53 @@ def test_lazy_prepare_on_first_eager_call_but_not_inside_capture(cake_stubs):
     assert len(cake_stubs["prepare_weights"]) == 1 and inner.apply_calls == 1
 
 
+# -------------------------------------------------------- co-enable guard (MLA route)
+
+
+def _routes_env(*names: str) -> None:
+    patcher = mock.patch.dict(os.environ, {}, clear=False)
+    patcher.start()
+    _env_patchers.append(patcher)
+    os.environ[_routes.ENV_VAR] = ",".join(names)
+    os.environ.pop("SGLANG_CAKE_K3_PROJ_MIN_M", None)
+    _routes.reset_cache_for_tests()
+
+
+def test_install_with_mla_route_co_enabled_serves_prefill_only(cake_stubs, monkeypatch):
+    _routes_env(mod.ROUTE, mod._MLA_ROUTE)
+    monkeypatch.setattr(mod, "_PROJ_MIN_M", 0)
+    linear, wrapper, inner = _installed(cake_stubs)
+    assert mod._PROJ_MIN_M == mod._PROJ_GUARD_MIN_M
+    # Decode-M rows stay on the wrapped FP8 linear ...
+    small = torch.zeros(mod._PROJ_GUARD_MIN_M - 1, K, dtype=torch.bfloat16)
+    out = wrapper.apply(linear, small)
+    assert torch.all(out == 7.0) and inner.apply_calls == 1
+    assert cake_stubs["prepare_projection"] == []
+    # ... prefill rows take the Cake route.
+    big = torch.zeros(mod._PROJ_GUARD_MIN_M, K, dtype=torch.bfloat16)
+    out = wrapper.apply(linear, big)
+    assert torch.all(out == 1.0) and inner.apply_calls == 1
+    assert len(cake_stubs["prepare_projection"]) == 1
+
+
+def test_install_without_mla_route_keeps_decode_m(cake_stubs, monkeypatch):
+    _routes_env(mod.ROUTE)
+    monkeypatch.setattr(mod, "_PROJ_MIN_M", 0)
+    linear, wrapper, inner = _installed(cake_stubs)
+    assert mod._PROJ_MIN_M == 0
+    out = wrapper.apply(linear, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert torch.all(out == 1.0) and inner.apply_calls == 0
+
+
+def test_explicit_min_m_env_overrides_the_guard(cake_stubs, monkeypatch):
+    _routes_env(mod.ROUTE, mod._MLA_ROUTE)
+    os.environ["SGLANG_CAKE_K3_PROJ_MIN_M"] = "0"
+    monkeypatch.setattr(mod, "_PROJ_MIN_M", 0)
+    linear, wrapper, inner = _installed(cake_stubs)
+    assert mod._PROJ_MIN_M == 0
+    out = wrapper.apply(linear, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert torch.all(out == 1.0) and inner.apply_calls == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
