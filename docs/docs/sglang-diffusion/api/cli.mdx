@@ -345,15 +345,33 @@ therefore add weight-transfer latency to the first real request after warmup.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
+On NVIDIA CUDA GPUs with separate host and device memory, `component-offload`
+preserves existing checkpoint mappings when host headroom cannot accommodate a
+weight copy, every parameter is file-backed, and the dtype already matches.
+Swap-out restores those CPU views without weight
+D2H or a new pinned copy; mutable buffers still return to CPU. Ordinary, partially
+mapped, and dtype-converted weights keep the low-host-memory transfer path, without
+retaining a CPU weight copy during GPU execution. Shared-memory GPUs are unchanged.
+Mapped pages still consume physical RAM when resident and can count toward a
+container's memory limit; avoiding a new host allocation does not mean zero RAM use.
+When host memory is sufficient, the normal transfer path remains enabled: its
+pinned swap-out storage can make subsequent H2D faster than rereading a mapping.
+Preserving mappings is a memory-pressure fallback, not an unconditional latency win.
+
+Breakable CUDA graphs require a resident DiT. Explicit DiT offload with
+`--enable-breakable-cuda-graph` is rejected; auto-selected DiT offload disables graph
+capture with a warning. Offloading an encoder or VAE does not impose this restriction.
+
 #### Snapshot offload
 
 On NVIDIA CUDA GPUs with separate host and device memory, explicitly select
 `--component-residency vae=snapshot-offload` to avoid repeated weight D2H transfers.
-Existing defaults and `component-offload` behavior are unchanged.
+Use this explicit mode to retain ordinary CPU weights as well as checkpoint mappings.
 
 Snapshot offload retains a full host copy during GPU execution. With
 `--pin-cpu-memory` enabled (the default), it shares a per-worker host pin budget
-with layerwise offload. Layerwise initialization claims its allowance first;
+with layerwise offload. The budget divides host headroom among node-local GPU
+workers. Layerwise initialization claims its allowance first;
 snapshot weights use the remainder. Shared parameter storage is pinned once and
 reused across requests; its allowance is returned when the storage is released.
 Pinning also checks current host headroom, including the cgroup limit.
