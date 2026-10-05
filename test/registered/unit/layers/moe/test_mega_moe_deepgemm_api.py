@@ -402,23 +402,48 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         The draft forward runs outside draft_model_build_scope, so a layer that
         re-read the global flag would pair draft weights with the wrong kernel.
         """
-        for draft_flag, expected_draft in (
-            (False, "fp8xfp4"),
-            (None, "mxf4xmxf4"),
+        for target_flag, draft_flag, expected_target, expected_draft in (
+            (True, False, "mxf4xmxf4", "fp8xfp4"),
+            (True, None, "mxf4xmxf4", "mxf4xmxf4"),
+            (False, True, "fp8xfp4", "mxf4xmxf4"),
+            (False, None, "fp8xfp4", "fp8xfp4"),
         ):
-            with self.subTest(speculative_enable_w4a4_mxfp4_megamoe=draft_flag):
+            with self.subTest(
+                enable_w4a4_mxfp4_megamoe=target_flag,
+                speculative_enable_w4a4_mxfp4_megamoe=draft_flag,
+            ):
                 with get_context().override_server_args(
                     model_path="dummy",
-                    enable_w4a4_mxfp4_megamoe=True,
+                    enable_w4a4_mxfp4_megamoe=target_flag,
                     speculative_enable_w4a4_mxfp4_megamoe=draft_flag,
                 ):
                     target = self._build_fused_moe()
                     with draft_model_build_scope():
                         draft = self._build_fused_moe()
 
-                    self.assertTrue(get_exec().moe.enable_w4a4_mxfp4_megamoe)
-                    self.assertEqual(mega_moe._mega_moe_mma_type(target), "mxf4xmxf4")
+                    self.assertEqual(
+                        get_exec().moe.enable_w4a4_mxfp4_megamoe, target_flag
+                    )
+                    self.assertEqual(
+                        mega_moe._mega_moe_mma_type(target), expected_target
+                    )
                     self.assertEqual(mega_moe._mega_moe_mma_type(draft), expected_draft)
+
+    def test_draft_build_scope_restores_w4a4_on_exception(self):
+        """A failed draft build must not leave the target on the draft's MMA type."""
+        with get_context().override_server_args(
+            model_path="dummy",
+            enable_w4a4_mxfp4_megamoe=False,
+            speculative_enable_w4a4_mxfp4_megamoe=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "draft build failed"):
+                with draft_model_build_scope():
+                    self.assertTrue(get_exec().moe.enable_w4a4_mxfp4_megamoe)
+                    raise RuntimeError("draft build failed")
+
+            self.assertFalse(get_exec().moe.enable_w4a4_mxfp4_megamoe)
+            target = self._build_fused_moe()
+            self.assertEqual(mega_moe._mega_moe_mma_type(target), "fp8xfp4")
 
     def _build_fused_moe(self):
         method = UnquantizedFusedMoEMethod()

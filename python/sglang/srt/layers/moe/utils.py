@@ -546,9 +546,18 @@ def is_shared_experts_fusion_disabled() -> bool:
 
 @contextmanager
 def draft_model_build_scope():
-    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
-    fusion decision on the speculative leaf as well, and the target's ACTIVE
-    value returns on exit.
+    """Brackets a draft model's CONSTRUCTION with the draft's construction-time
+    settings; every value below returns to the target's on exit, including on
+    error.
+
+    - Shared-experts fusion: the gates the draft runs also record their
+      decision on the speculative leaf; the target's ACTIVE
+      ``disable_shared_experts_fusion`` is restored.
+    - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
+      Boundaries built here keep the resolved value after exit.
+    - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
+      when set, else inherited. ``FusedMoE`` layers built here keep the
+      draft's MegaMoE MMA type after exit.
 
     Deliberately does not touch ``runner_backend`` — swapping that is
     ``speculative_moe_backend_context``'s job and has to bracket the draft's
