@@ -39,10 +39,11 @@ workers. Group policy instances are reused across requests.
 | `WorkerRegistry` | Live workers, model membership, health, and role |
 | Request handler | Request preparation, ordered bucket attempts, HTTP errors, and dispatch |
 
-`worker_ids: None` means every healthy engine serving the requested model and
-role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
-a catch-all membership group. `BucketGroups::Pd` requires both groups, making
-partial or mixed plain/PD bucket configurations unrepresentable.
+Omitting both `worker_ids` and `worker_services` includes every healthy engine
+serving the requested model and role. Explicit empty membership lists are rejected
+by the config factory. `EngineGroup::new(policy)` creates a catch-all group.
+`BucketGroups::Pd` requires both groups, making partial or mixed plain/PD bucket
+configurations unrepresentable.
 
 ## 1. Code organization
 
@@ -247,24 +248,25 @@ change buckets, or mutate affinity.
 
 An admission policy is a set of per-engine caps, `AdmissionLimits`. Each cap
 is optional; an unset cap is not checked, and the default admits everything.
-A cap admits while the engine's current metric is below it. Request size is
-not part of admission: buckets already select by input length and context
-capacity, and admission only observes load without reserving it.
+Each cap admits while the engine's load is below it. Usage caps are shares, in
+(0, 1], of the engine's reported capacity, so one limit fits engines of any
+size. The request itself is not counted: an engine just below a cap still takes
+it, and the engine queues or retracts if it overflows. Admission observes load
+without reserving it.
 
-| Limit | Engine metric |
+| Limit | Checks |
 | --- | --- |
-| `max_running_requests` | Reported running requests |
+| `max_running_usage` | Running requests against reported max running requests |
+| `max_kv_usage` | KV tokens against reported KV capacity |
 | `max_waiting_requests` | Reported waiting requests |
-| `max_kv_tokens` | Reported total KV tokens |
 | `max_pending_prefill_tokens` | Reported waiting uncached tokens |
 | `max_inflight_requests` | Router-local in-flight requests |
 
 ```json
-{"max_running_requests": 64, "max_kv_tokens": 1048576, "max_inflight_requests": 64}
+{"max_running_usage": 0.9, "max_kv_usage": 0.95, "max_inflight_requests": 64}
 ```
 
-Limits are absolute caps; they do not default to capacities reported by the
-engine. Unknown fields are rejected during deserialization.
+Unknown fields are rejected during deserialization.
 
 The policy reads the selected engine's `EngineMetrics` from the load snapshot
 it already captured for selection plus the live in-flight counter and calls
@@ -406,8 +408,9 @@ reports change after selection; it neither recaptures nor reserves capacity.
 Fallback policies read their own state and do not share snapshots with callers.
 
 Snapshot capture still scans the full table; an engine-scoped reader can be added
-if profiling justifies it. Power-of-two reuses the legacy prefill/decode pressure
-comparisons, including router-local fallback. Concrete load-aware admission remains
+if profiling justifies it. Power-of-two ranks engines with the shared prefill/decode
+comparisons in `state/load_monitor/engine_ranking.rs`, including router-local
+fallback. Concrete load-aware admission remains
 in #40271. Further shared load interpretation and correction for dispatches since
 the report remain follow-ups; these must preserve source, freshness, and available
 measurements without adding another
@@ -446,61 +449,67 @@ selection or dispatch fails. It must not increment dispatch accounting.
 
 ## 7. Configuration and compatibility
 
-This conceptual example shows the target attachment model. It is not copyable
-current CLI/JSON syntax; existing bucket field names need not change.
+Under `--chat-routing reorg`, `--bucket-config` reads a JSON file of complete
+buckets. Each bucket sets `plain`, or both `prefill` and `decode`; each group may
+set `worker_ids` or `worker_services`, plus `policy` and `admission`.
 
-```yaml
-buckets:
-  - id: short-context
-    rank: 10
-    limits: {min: 0, max: 4096}
-    max_context_tokens: 8192
-    groups:
-      pd:
-        prefill:
-          worker_ids: [P1, P2]
-          policy:
-            type: cache_aware
-            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
-        decode:
-          worker_ids: [D1, D2]
-          policy:
-            type: power_of_two
-            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
-
-  - id: long-context
-    rank: 20
-    limits: {min: 0, max: 131072}
-    max_context_tokens: 131072
-    groups:
-      pd:
-        prefill:
-          worker_ids: [P3, P4]
-          policy:
-            type: cache_aware
-            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
-        decode:
-          worker_ids: [D3, D4]
-          policy:
-            type: power_of_two
-            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
+```json
+{
+  "ttft_slo": "slo_first",
+  "buckets": [
+    {
+      "id": "short-context",
+      "max_input_tokens": 4096,
+      "max_context_tokens": 8192,
+      "ttft_ms": 300,
+      "prefill": {"worker_services": ["inference/prefill-short"], "admission": {"max_pending_prefill_tokens": 32768}},
+      "decode": {"worker_services": ["inference/decode-short"], "admission": {"max_kv_usage": 0.9}}
+    },
+    {
+      "id": "long-context",
+      "rank": 1,
+      "max_context_tokens": 131072,
+      "prefill": {"worker_services": ["inference/prefill-long"]},
+      "decode": {"worker_services": ["inference/decode-long"]}
+    }
+  ]
+}
 ```
 
 A request with 4k input tokens and a 16k expected peak cannot fit the short
 bucket's context capacity. It selects the long bucket and both of its P/D groups.
 With a known peak of 8k or less, the same input selects both groups of the short bucket.
 
-The planned factory validates unique nonempty bucket IDs, token ranges, and
-role-compatible membership. Each bucket is either plain or PD. The selected
-bucket invokes its required groups through `pick_engines`. The existing worker registry
-still rejects mixed plain and PD engines within one model; this PR preserves
-that constraint. The engine group's model and stage filters apply on every pick.
+Membership has two mutually exclusive forms. `worker_ids` pins exact discovery
+identities: URLs for static discovery, `namespace/pod-UID` for Kubernetes pods.
+`worker_services` lists Kubernetes `namespace/service` names and matches any
+listed Service through its EndpointSlices' `kubernetes.io/service-name` label.
+Service membership survives pod replacement and scale-up; worker IDs still
+change per pod incarnation so breaker, load and affinity state cannot carry over.
+Only Services included by the discovery watch are visible. Multiple slices and
+Services selecting one pod contribute the union of its memberships; removing a
+slice removes only memberships no longer advertised by another slice. Membership
+updates preserve the live worker and its in-flight state. Readiness and routing
+use the same group filter, including model, health and role constraints.
 
-Legacy `BucketSpec` represents a single role-specific membership set. Migration
-must explicitly associate prefill and decode specs into complete PD buckets;
-never infer those associations from matching rank or similar names. Translation
-of role-specific ranges/ranks into bucket-level constraints needs explicit
-validation and is deferred with the configuration factory.
+Omitted group fields mean every engine of the group's role and `--policy`
+(power-of-two on decode). Admission limits a group leaves unset take
+`--max-in-flight` / `--max-kv-usage`, field by field. JSON `null` also inherits;
+there is no per-group disable value. To limit only some groups, leave the CLI
+default unset and configure those groups explicitly. A group policy is
+`power_of_two` or the `--policy` kind, whose affinity, cache and tokenizer
+settings are the ones resolved. Startup rejects empty or duplicate IDs, a bucket
+that is not exactly plain or P/D, inverted token ranges, a minimum input above
+the context capacity, empty membership lists, blank worker IDs, malformed
+Service names, both membership fields together, non-positive capacity or SLO
+estimates, usages outside (0, 1], zero count limits, and a policy a stage cannot
+serve. Without the flag, reorg builds one plain and one P/D bucket
+over all engines. The worker registry still rejects mixed plain and PD engines
+within one model.
+
+Legacy `--bucket-config` files describe role-specific buckets and do not
+translate: P/D associations must be written explicitly, never inferred from
+rank or names.
 
 Retained settings keep their meanings, defaults, units, and validation unless a
 change is listed below. Policy-specific tuning applies to role groups using that
@@ -521,7 +530,8 @@ do not accept and ignore them.
 - Preserve session and sticky headers, idle timeouts, eviction cadence, and the
   four sticky fallback choices. Global modes need a bucket-first migration design.
 - Map `--filter overloaded` and `--max-in-flight` to `max_inflight_requests`;
-  the existing router-local counter remains the source.
+  the existing router-local counter remains the source. `--max-kv-usage` sets
+  `max_kv_usage` for groups that leave it unset.
 - Preserve configured capacity, pending-prefill, and in-flight checks, including
   their missing-report behavior. Power-of-two applies admission to its selected
   engine; other policies explicitly place checks in their selection logic.
@@ -588,8 +598,8 @@ Implemented here:
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
-  and `AdmissionLimits` over running, waiting, KV, pending-prefill and in-flight
-  metrics. Power-of-two samples two distinct engines, compares stage pressure,
+  and `AdmissionLimits` with running and KV usage shares plus waiting,
+  pending-prefill and in-flight counts. Power-of-two samples two distinct engines, compares stage pressure,
   and checks its selected engine with no replacement on rejection.
 - Policy-owned load dependency and local observations. Power-of-two passes the
   selected engine's load record directly to admission, without another snapshot.
@@ -618,13 +628,14 @@ Implemented here:
   The caller owns expiry and sweeper lifecycle. A binding may remain after a
   later PD group fails, because it records placement rather than dispatch.
 
-Follow-up work includes remaining selection policies and explicit bucket configuration.
+- `--bucket-config` builds explicit plain and P/D buckets with per-group
+  membership, policy and admission; omitting it builds the default buckets.
+
+Follow-up work includes remaining selection policies.
 
 Not yet implemented in the reorg path:
 
 - Other concrete selection policies.
-- Explicit bucket configuration from the CLI. The YAML above remains illustrative;
-  `--chat-routing reorg` builds default plain/PD buckets from existing policy flags.
 - Global session modes and sticky routing-key affinity.
 - Power-of-k cache-miss fallback configuration and cache decision metrics.
 - Shared load interpretation, dispatch correction, and policy-specific

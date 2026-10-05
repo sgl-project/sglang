@@ -36,9 +36,9 @@ from sglang.kernels.ops.moe.gemma4_routing import (
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -666,7 +666,7 @@ class Gemma4DecoderLayer(nn.Module):
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     output_transform=OutputTransform(self.post_attention_layernorm)
@@ -681,14 +681,6 @@ class Gemma4DecoderLayer(nn.Module):
                 ),
                 self.pre_feedforward_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=self.enable_moe_block,
-                next_layer_sparse=self.enable_moe_block,
-                update=REPLACE_AT_EXIT,
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
