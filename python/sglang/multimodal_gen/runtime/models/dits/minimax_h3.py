@@ -32,7 +32,10 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_mxfp8_,
     silu_mul_mxfp8,
 )
-from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -485,6 +488,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q,
