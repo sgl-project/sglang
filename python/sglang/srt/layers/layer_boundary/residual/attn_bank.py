@@ -14,11 +14,12 @@
 """A residual read that aggregates a bank of snapshots of itself."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attn_residual import AttnResidual
+from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
@@ -87,6 +88,9 @@ class AttnBankState:
     ffn_score_proj: torch.nn.Module
     ffn_score_norm: torch.nn.Module
     writes_block: bool = False
+    # Kernels that complete the attention output's sum with the pending add
+    # ahead of the FFN read.
+    ffn_input_fusions: Tuple[ReadoutFusion, ...] = ()
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -187,6 +191,10 @@ class _AttnReadout(_BankReadout):
 class _FfnReadout(_BankReadout):
     """The FFN input: the attention output's add folded into the bank
     aggregation, and this layer's post-attention norm."""
+
+    @property
+    def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
+        return self.state.ffn_input_fusions
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the

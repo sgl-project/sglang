@@ -51,6 +51,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layer_boundary import (
     ExitRows,
+    ReadoutFusion,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -426,6 +428,14 @@ def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
     optional quant-method capability; only the unquantized method has it."""
     return getattr(o_proj.quant_method, "apply_into", None) is not None
+
+
+def _k3_all_reduce_add(hidden_states, residual, forward_batch):
+    """o_proj's attention-TP sum with the pending residual add in K3's fused
+    all-reduce, for an output o_proj wrote into its multicast buffer."""
+    if k3_ar_fusion.find_mc_ptr(hidden_states) is None:
+        return None
+    return k3_ar_fusion.all_reduce(hidden_states, residual)
 
 
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
@@ -1818,7 +1828,7 @@ class KimiK3DeltaAttention(nn.Module):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = True
+            self.o_proj.reduce_results = reduce_results
             self.o_proj.use_dp_attention_reduce = True
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -2276,7 +2286,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = True
+            self.o_proj.reduce_results = reduce_results
             self.o_proj.use_dp_attention_reduce = True
         if self.all_reduce_fusion:
             # Hand the GEMM a slice of the persistent symmetric buffer
@@ -2447,12 +2457,9 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
 
 def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
     """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. The layer's own communication still runs for: an
-    attention-residual bank whose o_proj all-reduce is fused with the pending
-    add, or whose MoE on its attention-TP token shard (SP-MoE) uses K3's tuned
-    SP collectives, which the sharded carry also needs."""
-    if _fuses_attn_all_reduce(config):
-        return False
+    layer of a stack. An attention-residual bank whose MoE runs on its
+    attention-TP token shard (SP-MoE) with K3's tuned SP collectives, which
+    the sharded carry also needs, still runs the layer's own communication."""
     if not _shards_moe_rows():
         return True
     return config.attn_res_block_size is None or not k3_sp_collective.enabled()
@@ -2623,6 +2630,11 @@ class KimiK3DecoderLayer(nn.Module):
                     self.mlp_res_proj,
                     self.mlp_res_norm,
                     writes_block=self.is_block_write_layer,
+                    ffn_input_fusions=(
+                        (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
+                        if self.all_reduce_fusion
+                        else ()
+                    ),
                 ).residual_ops()
                 attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
                 ffn_ops = dict(

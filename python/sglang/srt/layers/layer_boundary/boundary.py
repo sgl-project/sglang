@@ -572,11 +572,18 @@ def _select_entry_step(
         ):
             raise NotImplementedError(f"{produced=} {need=}")
         fused = tuple(f for f in fusions if f.completes is owes)
+        # The read's own kernels take its residual add, so only a plain one.
+        read_fused = tuple(
+            f.run
+            for f in getattr(read, "completing_fusions", ())
+            if is_plain_add and f.completes is owes
+        )
         return (
             partial(
                 _reduce_update_read,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
+                read_fusions=read_fused,
                 group=owes,
                 read=read,
             ),

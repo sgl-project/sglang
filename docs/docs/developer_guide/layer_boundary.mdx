@@ -339,7 +339,7 @@ A backend fusion provider is passed per stage as the `fusions` option, `(declara
 
 `install_cutedsl_fusion()` and `prepare_cutedsl_fusion()` find providers through the decoder layer's `attn_boundary` and `ffn_boundary` attributes.
 
-Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FfnInputFusion` declares the sum group it completes with residual add and norm. The consumer only tries compatible candidates for the declared update/read capabilities.
+Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FfnInputFusion` declares the sum group it completes with residual add and norm. A residual read may supply its own candidates as `completing_fusions`: each `ReadoutFusion` completes a sum with the residual add, ahead of the read, and is tried before the built-in collective. The consumer only tries compatible candidates for the declared update/read capabilities.
 
 An `OutputTransform` declares contribution processing before residual update. Its explicit `before_reduce_scatter` setting preserves a supported implementation's order; it is not permission to commute arbitrary operations across a reduction.
 

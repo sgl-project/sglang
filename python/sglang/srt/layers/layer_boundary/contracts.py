@@ -168,6 +168,21 @@ class FfnInputFusion(msgspec.Struct, frozen=True):
     preserves_residual: Optional[Callable] = None
 
 
+class ReadoutFusion(msgspec.Struct, frozen=True):
+    """A kernel a stage's read supplies (its ``completing_fusions``) that
+    completes the sum its input owes together with the residual add, for a
+    read that is not the residual's plain norm and so takes no FfnInputFusion.
+
+    ``run(hidden_states, residual, forward_batch)`` returns the written stream,
+    the completed sum plus the residual, which the read then reads; or None
+    when it does not take the batch, before touching its inputs or starting a
+    collective."""
+
+    # The group whose sum it completes.
+    completes: SumGroup
+    run: Callable[..., Optional[torch.Tensor]]
+
+
 class CpMoves(msgspec.Struct, frozen=True):
     """How a CP extend's rows reach an FFN that needs all of them and come back,
     chosen once for the kind of prefill CP: ``gather`` gathers the FFN input
