@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -70,6 +71,7 @@ def _init_cpu_group_once() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
+    get_parallel().override_permanently(world_group=ps._WORLD)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
     torch.cuda.set_stream(torch.cuda.Stream())

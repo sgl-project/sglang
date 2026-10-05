@@ -94,7 +94,7 @@ import { KimiK27CodeDeployment } from '/src/snippets/autoregressive/kimi-k27-cod
 - **Transformers Version**: The model card requires `transformers>=4.57.1,<5.0.0`.
 - **AMD GPU TP Constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.7-Code has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
 - **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
-- **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
+- **DP Attention**: Enable with `--attn-dp-size <N>` for production throughput. A common choice is to set `--attn-dp-size` equal to `--tp`, but this is not required.
 - **Reasoning Parser**: Add `--reasoning-parser kimi_k2` to separate thinking and content in model outputs.
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
 - **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
@@ -597,14 +597,16 @@ The following results are from the official Kimi-K2.7-Code model card. They were
 
 #### 5.2.1 Accuracy Benchmark
 
-GSM8K accuracy of the MXFP4 checkpoint, measured on the deployed server across several client parallelism levels (2,000 questions each):
+Evaluate GSM8K on the deployed MXFP4 checkpoint across client parallelism levels (all 1319 test questions via sgl-eval):
 
 ```shell Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-questions 2000 \
-  --parallel <PARALLEL> \
-  --port 30000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads '<PARALLEL>'
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 <table>
   <thead>
