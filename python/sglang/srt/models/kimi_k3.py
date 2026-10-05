@@ -2618,61 +2618,65 @@ class KimiK3DecoderLayer(nn.Module):
             and not (self._dp_attention and not self.mlp._ep_a2a)
         )
         if self._stage_boundaries:
-            # Under attention DP the FFN input is read on this rank's rows
-            # once the attention's sum is complete, then gathered.
-            attn_ops = {}
-            ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
-            if self.use_attn_residuals:
-                bank_ops = AttnBankState(
-                    attn_bank,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                    self.mlp_res_proj,
-                    self.mlp_res_norm,
-                    writes_block=self.is_block_write_layer,
-                    ffn_input_fusions=(
-                        (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
-                        if self.all_reduce_fusion
-                        else ()
-                    ),
-                ).residual_ops()
-                attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
-                ffn_ops = dict(
-                    read=bank_ops.ffn_readout,
-                    update=(
-                        REPLACE_AT_EXIT
-                        if self._ffn_writes_stream
-                        else bank_ops.ffn_update
-                    ),
-                )
-            self.attn_boundary, self.ffn_boundary = append_stages(
-                (declare_attn(**attn_ops), self.input_layernorm),
-                (
-                    declare_ffn(
-                        **ffn_ops,
-                        sparse=self._is_moe_layer,
-                        next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-                        # The TP width the dense MLP is built with.
-                        dense_tp_size=(
-                            None
-                            if self._is_moe_layer
-                            else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
-                        ),
-                        # SP-MoE runs on this rank's attention-TP shard of the
-                        # rows; on the bank path, whose reads write the bank on
-                        # every row, its output returns to all of them.
-                        exit_rows=(
-                            ExitRows.ATTENTION
-                            if self._sp_moe and self.use_attn_residuals
-                            else None
-                        ),
-                        # A latent MoE completes its output sum together with
-                        # the latent reduction its norm needs.
-                        output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
-                    ),
-                    self.post_attention_layernorm,
+            self._declare_stages(config, layer_idx, attn_bank)
+
+    def _declare_stages(self, config, layer_idx, attn_bank):
+        """Declare this layer's attention and FFN stages: the reads and updates
+        around them, the rows the FFN takes and leaves, and the kernels K3
+        supplies for the bank path."""
+        # Under attention DP the FFN input is read on this rank's rows
+        # once the attention's sum is complete, then gathered.
+        attn_ops = {}
+        ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
+        if self.use_attn_residuals:
+            bank_ops = AttnBankState(
+                attn_bank,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                writes_block=self.is_block_write_layer,
+                ffn_input_fusions=(
+                    (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
+                    if self.all_reduce_fusion
+                    else ()
+                ),
+            ).residual_ops()
+            attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
+            ffn_ops = dict(
+                read=bank_ops.ffn_readout,
+                update=(
+                    REPLACE_AT_EXIT if self._ffn_writes_stream else bank_ops.ffn_update
                 ),
             )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(**attn_ops), self.input_layernorm),
+            (
+                declare_ffn(
+                    **ffn_ops,
+                    sparse=self._is_moe_layer,
+                    next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+                    # The TP width the dense MLP is built with.
+                    dense_tp_size=(
+                        None
+                        if self._is_moe_layer
+                        else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
+                    ),
+                    # SP-MoE runs on this rank's attention-TP shard of the
+                    # rows; on the bank path, whose reads write the bank on
+                    # every row, its output returns to all of them.
+                    exit_rows=(
+                        ExitRows.ATTENTION
+                        if self._sp_moe and self.use_attn_residuals
+                        else None
+                    ),
+                    # A latent MoE completes its output sum together with
+                    # the latent reduction its norm needs.
+                    output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
+                ),
+                self.post_attention_layernorm,
+            ),
+        )
 
     def _finish_attn_reduce(
         self,
