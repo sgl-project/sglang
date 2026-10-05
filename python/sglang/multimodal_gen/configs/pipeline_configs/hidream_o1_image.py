@@ -63,3 +63,17 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
         # only risks truncating against a stale raw_latent_shape.
         del batch
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
+        HiDreamO1ImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HiDreamO1ImageSamplingParams,
+        pipeline_config_cls=HiDreamO1ImagePipelineConfig,
+        hf_model_paths=["HiDream-ai/HiDream-O1-Image"],
+        model_detectors=[lambda hf_id: "hidream-o1-image" in hf_id.lower()],
+    )
