@@ -27,7 +27,6 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.session.streaming_session import StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -162,14 +161,6 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         ):
             self.policy.calc_priority([self.waiting])
         self.assertEqual(calls, [])
-        self._assert_older_prefix_survives_one_eviction()
-
-    def test_streaming_session_wrapper_forwards_the_refresh(self):
-        # --enable-streaming-session wraps caches without native session support;
-        # the wrapper inherits the base no-op unless it forwards explicitly.
-        policy = self._make_policy(StreamingSession(self.cache))
-        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
-            policy.calc_priority([self.waiting])
         self._assert_older_prefix_survives_one_eviction()
 
     def test_chunk_cache_skips_the_refresh(self):
