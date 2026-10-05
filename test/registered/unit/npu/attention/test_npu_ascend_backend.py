@@ -8,6 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    QUANT_MODE_MXFP4,
+    QUANT_MODE_MXFP8,
+    QUANT_MODE_TOKEN_FP8,
+)
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -488,13 +493,19 @@ class TestQuantIndexerMetadataPlanning(unittest.TestCase):
     test_npu_quant_lightning_indexer.py."""
 
     @staticmethod
-    def _make_backend(seq_lens_cpu_int, actual_seq_lengths_q=None, enabled=True):
+    def _make_backend(
+        seq_lens_cpu_int,
+        actual_seq_lengths_q=None,
+        enabled=True,
+        quant_mode=QUANT_MODE_MXFP8,
+    ):
         backend = object.__new__(AscendAttnBackend)
         backend.device = "cpu"
         backend.quant_indexer_enabled = enabled
         backend.quant_indexer_n_heads = 64
         backend.quant_indexer_topk = 2048
         backend.quant_indexer_head_dim = 128
+        backend.quant_indexer_quant_mode = quant_mode
         backend.forward_metadata = ForwardMetadata(
             seq_lens_cpu_int=seq_lens_cpu_int,
             actual_seq_lengths_q=actual_seq_lengths_q,
@@ -537,7 +548,7 @@ class TestQuantIndexerMetadataPlanning(unittest.TestCase):
         op.assert_called_once()
         args, kwargs = op.call_args
         # (num_heads_q, num_heads_k, head_dim, topk, quant_mode=MXFP8)
-        self.assertEqual(args, (64, 1, 128, 2048, 3))
+        self.assertEqual(args, (64, 1, 128, 2048, QUANT_MODE_MXFP8))
         self.assertEqual(kwargs["batch_size"], 2)
         self.assertEqual(kwargs["max_seqlen_q"], -1)
         self.assertEqual(kwargs["max_seqlen_k"], -1)
@@ -547,6 +558,19 @@ class TestQuantIndexerMetadataPlanning(unittest.TestCase):
         self.assertEqual(kwargs["cmp_ratio"], 1)
         self.assertIs(kwargs["cu_seqlens_q"], fm.quant_indexer_cu_seqlens_q)
         self.assertIs(kwargs["seqused_k"], fm.quant_indexer_seqused_k)
+
+    def test_plans_pool_quant_mode(self):
+        # The pool's quant_lightning_indexer quant_mode (captured at
+        # backend construction from --indexer-kv-cache-dtype) is handed to
+        # the metadata op, not hardcoded to MXFP8.
+        for quant_mode in (QUANT_MODE_TOKEN_FP8, QUANT_MODE_MXFP4):
+            backend = self._make_backend(torch.tensor([10]), quant_mode=quant_mode)
+            batch = self._make_forward_batch(
+                is_extend=True, extend_seq_lens=torch.tensor([4])
+            )
+            mock_ns = self._plan(backend, batch)
+            args, _ = mock_ns.quant_lightning_indexer_metadata.call_args
+            self.assertEqual(args, (64, 1, 128, 2048, quant_mode))
 
     def test_decode_uses_actual_seq_lengths_q(self):
         # actual_seq_lengths_q is already the per-request cumsum, so

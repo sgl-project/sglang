@@ -7,6 +7,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    QUANT_MODE_MXFP4,
+    QUANT_MODE_MXFP8,
+    QUANT_MODE_TOKEN_FP8,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -23,6 +28,9 @@ if is_npu():
     # torch.ops namespace is empty and op calls raise AttributeError.
     import cann_ops_transformer  # noqa: F401
 
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        _get_float4_e2m1fn_x2_dtype,
+    )
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -44,14 +52,39 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
-    # Hadamard-rotate x and MX-quantize its 128-dim vectors.
-    # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
-    # and scale holds one E8M0 byte per 32-element block, shaped
-    # x.shape[:-1] + (d/64, 2) == x.shape[:-1] + (2, 2) — the descale layout
-    # quant_lightning_indexer (v2) expects for quant_mode 3 (MXFP8).
+def _quantize_npu_indexer_activation(
+    x, hadamard, dst_type, quant_mode=QUANT_MODE_MXFP8
+):
+    # Hadamard-rotate x and quantize its 128-dim vectors for
+    # quant_lightning_indexer (v2). Returns (quantized, scale):
+    #  - quant_mode 1: quantized has x's shape in dst_type (fp8) and scale is
+    #    one FP32 per token-head, shaped x.shape[:-1] + (1,).
+    #  - quant_mode 3: block-32 MXFP8; quantized has x's shape in fp8 and
+    #    scale holds one E8M0 byte per 32-element block, shaped
+    #    x.shape[:-1] + (d/64, 2) == x.shape[:-1] + (2, 2).
+    #  - quant_mode 5: block-32 MXFP4; quantized packs 2 e2m1 values per
+    #    byte in float4_e2m1fn_x2, shaped x.shape[:-1] + (d//2,), with the
+    #    same (2, 2) E8M0 scale tail as quant_mode 3.
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
+        if quant_mode == QUANT_MODE_TOKEN_FP8:
+            return (
+                torch.empty_like(x, dtype=dst_type),
+                torch.zeros(
+                    x.shape[:-1] + (1,), dtype=torch.float32, device=x.device
+                ),
+            )
+        if quant_mode == QUANT_MODE_MXFP4:
+            return (
+                torch.empty(
+                    x.shape[:-1] + (x.shape[-1] // 2,),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=x.device,
+                ),
+                torch.zeros(
+                    x.shape[:-1] + (2, 2), dtype=torch.uint8, device=x.device
+                ).view(torch.float8_e8m0fnu),
+            )
         return (
             torch.empty_like(x, dtype=dst_type),
             torch.zeros(
@@ -59,15 +92,35 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
             ).view(torch.float8_e8m0fnu),
         )
     rotated = x @ hadamard
+    if quant_mode == QUANT_MODE_TOKEN_FP8:
+        quantized, scale = torch.ops.npu.npu_dynamic_quant(
+            rotated.reshape(-1, 128), dst_type=dst_type
+        )
+        # One FP32 scale per 128-dim token-head vector.
+        scale = scale.to(torch.float32).reshape(x.shape[:-1] + (1,))
+        return quantized.reshape(x.shape), scale
+    if quant_mode == QUANT_MODE_MXFP4:
+        # The packed-FP4 dst dtype must come from torch_npu (see
+        # _get_float4_e2m1fn_x2_dtype); the torch dtype object is rejected
+        # by op-plugin on NPU.
+        dst_type = _get_float4_e2m1fn_x2_dtype()
     quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
         rotated.reshape(-1, 128), dst_type=dst_type, axis=-1
     )
+
     # npu_dynamic_mx_quant may return the block scales as [N, 4] or [N, 2, 2];
     # normalize to the kernel's (d/64, 2) == (2, 2) layout.
     scale = scale.reshape(x.shape[:-1] + (4,)).view(x.shape[:-1] + (2, 2))
     if scale.dtype != torch.float8_e8m0fnu:
         scale = scale.view(torch.float8_e8m0fnu)
 
+    if quant_mode == QUANT_MODE_MXFP4:
+        # Packed storage: 2 e2m1 values per byte.  The op returns the
+        # packed bytes tagged uint8 on this CANN build; view them as the
+        # logical dtype so callers (pool scatter, kernel, empty branch)
+        # can rely on float4_e2m1fn_x2.
+        quantized = quantized.view(torch.float4_e2m1fn_x2)
+        return quantized.reshape(x.shape[:-1] + (x.shape[-1] // 2,)), scale
     return quantized.reshape(x.shape), scale
 
 
@@ -258,8 +311,9 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             _check_quant_lightning_indexer_constraints(pool)
+            quant_mode = getattr(pool, "indexer_quant_mode", QUANT_MODE_MXFP8)
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k, pool.indexer_hadamard_128, pool.dtype, quant_mode
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -356,24 +410,32 @@ class DSANPUIndexerMixin:
             )
 
             if use_quant_indexer:
+                quant_mode = getattr(pool, "indexer_quant_mode", QUANT_MODE_MXFP8)
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
                     pool.dtype,
+                    quant_mode,
                 )
-                # quant_lightning_indexer (v2) contract, quant_mode 3 (MXFP8):
-                #  - layout_q TND: q (q_t, q_n, d) fp8, cu_seqlens_q (b+1,) int32
-                #    required (first value 0, last value q_t)
-                #  - layout_k PA_BBND: k (block_num, block_size, k_n, d) fp8 with
-                #    block_table (b, max_blocks) and seqused_k (b,) both required
-                #  - descales are E8M0: q (q_t, q_n, d/64, 2),
-                #    k (block_num, block_size, k_n, d/64, 2)
+                if quant_mode == QUANT_MODE_TOKEN_FP8:
+                    # q_descale has the same shape as w for quant_mode 1.
+                    query_scale = query_scale.squeeze(-1)
+                # quant_lightning_indexer (v2) contract:
+                #  - layout_q TND: q (q_t, q_n, d) quantized, cu_seqlens_q
+                #    (b+1,) int32 required (first value 0, last value q_t)
+                #  - layout_k PA_BBND: k (block_num, block_size, k_n, d)
+                #    quantized with block_table (b, max_blocks) and
+                #    seqused_k (b,) both required
+                #  - descales: quant_mode 3/5 (MX) are E8M0, q
+                #    (q_t, q_n, d/64, 2), k (block_num, block_size, k_n,
+                #    d/64, 2); quant_mode 1 (token-wise) is FP32, q
+                #    (q_t, q_n), k (block_num, block_size, k_n)
                 #  - w is float32 (q_t, q_n)
                 # The metadata op (task list / load balancing) is pre-planned
-                # once per batch by AscendAttnBackend.init_forward_metadata;
-                # fall back to computing it inline when the backend did not
-                # pre-plan it (cuda-graph capture, other backends, CP, spec
-                # draft model).
+                # once per batch by AscendAttnBackend.init_forward_metadata
+                # (including during cuda-graph capture); fall back to
+                # computing it inline when the backend did not pre-plan it
+                # (other backends, CP, spec draft model).
                 _fm = get_attn_backend().forward_metadata
                 cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
                 seqused_k = getattr(_fm, "quant_indexer_seqused_k", None)
@@ -390,7 +452,7 @@ class DSANPUIndexerMixin:
                             1,
                             self.head_dim,
                             self.index_topk,
-                            3, # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4
+                            quant_mode,
                             cu_seqlens_q=cu_seqlens_q,
                             seqused_k=seqused_k,
                             batch_size=int(cum_q.numel()),
@@ -403,7 +465,6 @@ class DSANPUIndexerMixin:
                         )
                     )
                 block_table = block_table.to(torch.int32)
-                torch.npu.synchronize()
                 topk_indices, _ = torch.ops.cann_ops_transformer.quant_lightning_indexer(
                     query,
                     past_key_states,
@@ -411,7 +472,7 @@ class DSANPUIndexerMixin:
                     query_scale,
                     pool.get_index_k_scale_buffer(layer_id),
                     self.index_topk,
-                    3, # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4,
+                    quant_mode,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=seqused_k,
                     block_table=block_table,

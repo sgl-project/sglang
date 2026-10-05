@@ -35,6 +35,7 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_MXFP8
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -363,9 +364,8 @@ class AscendAttnBackend(AttentionBackend):
                 in model_runner.model_config.hf_config.architectures
             ):
                 self.use_native_sdpa = True
-        # DSA quantized indexer (quant_lightning_indexer v2, quant_mode 3 /
-        # MXFP8) constants, used to pre-plan the per-batch metadata in
-        # init_forward_metadata.
+        # DSA quantized indexer (quant_lightning_indexer v2) constants, used
+        # to pre-plan the per-batch metadata in init_forward_metadata.
         self.quant_indexer_enabled = (
             self.use_mla
             and getattr(model_runner.token_to_kv_pool, "index_k_scale_buffer", None)
@@ -382,10 +382,18 @@ class AscendAttnBackend(AttentionBackend):
             self.quant_indexer_n_heads = get_dsa_index_n_heads(hf_config)
             self.quant_indexer_topk = get_dsa_index_topk(hf_config)
             self.quant_indexer_head_dim = get_dsa_index_head_dim(hf_config)
+            # quant_lightning_indexer (v2) quant_mode of the indexer cache
+            # (1 = token-wise FP8 + FP32 scale, 3 = block-32 MXFP8 + E8M0,
+            # 5 = block-32 MXFP4 + E8M0), picked at pool-build time from
+            # --indexer-kv-cache-dtype.
+            self.quant_indexer_quant_mode = getattr(
+                model_runner.token_to_kv_pool, "indexer_quant_mode", QUANT_MODE_MXFP8
+            )
         else:
             self.quant_indexer_n_heads = None
             self.quant_indexer_topk = None
             self.quant_indexer_head_dim = None
+            self.quant_indexer_quant_mode = QUANT_MODE_MXFP8
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -590,7 +598,7 @@ class AscendAttnBackend(AttentionBackend):
                 1,
                 self.quant_indexer_head_dim,
                 self.quant_indexer_topk,
-                3,  # QUANT_MODE_MXFP8
+                self.quant_indexer_quant_mode,
                 cu_seqlens_q=fm.quant_indexer_cu_seqlens_q,
                 seqused_k=fm.quant_indexer_seqused_k,
                 batch_size=int(fm.quant_indexer_seqused_k.numel()),

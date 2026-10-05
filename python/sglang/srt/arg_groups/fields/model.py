@@ -222,6 +222,25 @@ class Model(msgspec.Struct):
             choices=["auto", "bfloat16", "fp8_e4m3"],
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None inherits from --kv-cache-dtype: an "
+                "FP8 KV cache uses block-32 MXFP8 with E8M0 scales "
+                "(quant_lightning_indexer quant_mode 3, the default behavior), "
+                "any other KV cache dtype leaves the quantized indexer "
+                'disabled. "fp8_e4m3" selects token-wise FP8 E4M3 with FP32 '
+                "scales (quant_mode 1); \"mxfp8\" selects block-32 MXFP8 with "
+                "E8M0 scales (quant_mode 3); \"fp4_e2m1\" selects block-32 "
+                "MXFP4 with E8M0 scales (quant_mode 5). Explicit values "
+                "require --kv-cache-dtype=fp8_e4m3."
+            ),
+            choices=["fp8_e4m3", "mxfp8", "fp4_e2m1"],
+            resolvable=True,
+        ),
+    ] = None
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (
