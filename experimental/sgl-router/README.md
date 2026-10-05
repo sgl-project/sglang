@@ -210,8 +210,10 @@ prefix owner. Balanced samples a power-of-two alternative and switches only
 when the affinity engine's load exceeds both
 `alternative * --affinity-load-factor` (default 2) and
 `alternative + --affinity-load-gap`. `--affinity-balanced-by` picks the load:
-`pending-prefill-tokens` (default; waiting uncached tokens, gap default 1024) or
-`running-requests` (gap default 4). Missing fresh load preserves admissible
+`prefill-tokens` (default; gap default 1024) is the engine's waiting uncached
+tokens plus the prompt tokens it would prefill for this request, so a cache owner
+is credited for its prefix (session-aware assumes the whole prompt on either
+engine); `running-requests` (gap default 4) ignores the request. Missing fresh load preserves admissible
 affinity; ties also preserve it.
 
 A bucket group may override these with `"affinity": {"mode", "balanced_by",

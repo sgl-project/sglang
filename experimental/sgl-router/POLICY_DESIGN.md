@@ -345,9 +345,12 @@ Both affinity policies support `--affinity-mode prefer` (default) and `balanced`
 Prefer retains admissible affinity. Balanced compares it with an admitted
 power-of-two alternative and switches only when the `--affinity-balanced-by` load
 exceeds both the alternative times `--affinity-load-factor` (default 2) and the
-alternative plus `--affinity-load-gap`. The load is `pending-prefill-tokens`
-(default; native waiting uncached tokens, gap default 1024) or `running-requests`
-(native or basic reports, gap default 4). Both reports must be fresh; missing data
+alternative plus `--affinity-load-gap`. The load is `prefill-tokens` (default;
+gap default 1024): native waiting uncached tokens plus the request's uncached
+tokens on that engine, so the alternative also pays for the prefix the cache owner
+holds. Session-aware has no prefix signal and counts the whole input on both
+engines. `running-requests` (native or basic reports, gap default 4) ignores the
+request. Both reports must be fresh; missing data
 or ties preserve affinity. Bindings commit during selection after
 admission, as with initial placement; dispatch failure does not roll them back.
 

@@ -342,7 +342,12 @@ impl Policy for CacheAwarePolicy {
                 Ok(pick)
             }
             .await;
-            affinity::choose(&self.config, affinity, fallback, &load)
+            let uncached_tokens = |engine: &Worker| {
+                (candidates.iter())
+                    .find(|c| c.engine.id == engine.id)
+                    .map_or(request.input_tokens, |c| c.uncached_tokens)
+            };
+            affinity::choose(&self.config, affinity, fallback, &load, uncached_tokens)
         })
     }
 

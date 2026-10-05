@@ -531,9 +531,10 @@ pub enum AffinityMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BalancedBy {
-    /// Engine-reported waiting uncached tokens; needs native load reports.
+    /// Engine-reported waiting uncached tokens plus this request's uncached
+    /// tokens on that engine; needs native load reports.
     #[default]
-    PendingPrefillTokens,
+    PrefillTokens,
     /// Engine-reported running requests.
     RunningRequests,
 }
@@ -542,7 +543,7 @@ impl BalancedBy {
     /// Minimum difference when `--affinity-load-gap` is unset, in this metric's unit.
     pub fn default_gap(self) -> u64 {
         match self {
-            Self::PendingPrefillTokens => 1_024,
+            Self::PrefillTokens => 1_024,
             Self::RunningRequests => 4,
         }
     }
@@ -614,7 +615,7 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
-            balanced_by: BalancedBy::PendingPrefillTokens,
+            balanced_by: BalancedBy::PrefillTokens,
             load_factor: 2.0,
             load_gap: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
