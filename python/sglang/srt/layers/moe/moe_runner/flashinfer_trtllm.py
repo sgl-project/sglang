@@ -1192,7 +1192,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
     from flashinfer import trtllm_fp4_block_scale_moe
 
-    trtllm_gen_output = trtllm_fp4_block_scale_moe(
+    trtllm_fp4_block_scale_moe(
         router_logits.to(torch.bfloat16),
         None,  # routing_bias
         x_quant,
@@ -1222,8 +1222,8 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-    )[0]
-    return StandardCombineInput(hidden_states=trtllm_gen_output)
+    )
+    return StandardCombineInput(hidden_states=symm_output)
 
 
 @dataclass
@@ -1379,8 +1379,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
-        # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
-        # the MoE output is bf16 rather than the input dtype.
+        # Pre-quantized FP4 input makes the MoE output bf16, not the input dtype.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
@@ -1413,7 +1412,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
-        result = trtllm_fp4_block_scale_routed_moe(
+        trtllm_fp4_block_scale_routed_moe(
             topk_ids=routing,
             routing_bias=None,
             hidden_states=hs_fp4,
@@ -1445,7 +1444,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
-        )[0]
+        )
+        # The FFI return may be a tensor rather than a tuple; indexing it drops
+        # the token dimension and can broadcast row zero across prefill tokens.
+        result = symm_output
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1497,7 +1499,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:
-            result = result[0]
+            result = symm_output
 
     return StandardCombineInput(hidden_states=result)
 
