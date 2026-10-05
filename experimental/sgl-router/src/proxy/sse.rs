@@ -141,7 +141,9 @@ pub fn has_error_event(body: &[u8]) -> bool {
 /// An upstream item the pump forwards unchanged.
 pub trait PumpItem: Send + 'static {
     /// Whether this item carries an error event; `scanner` keeps line state across items.
-    fn is_error_event(&self, scanner: &mut ErrorEventScanner) -> bool;
+    fn is_error_event(&self, _scanner: &mut ErrorEventScanner) -> bool {
+        false
+    }
 }
 
 impl PumpItem for Bytes {
