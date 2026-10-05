@@ -35,7 +35,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=96, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=106, stage="extra-b", runner_config="4-gpu-b200")
 register_amd_ci(est_time=180, suite="stage-c-test-4-gpu-amd")
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"

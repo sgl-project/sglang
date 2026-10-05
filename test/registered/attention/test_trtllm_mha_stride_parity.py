@@ -30,7 +30,7 @@ import torch
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="4-gpu-b200")
 
 _PAGES = 4
 _PAGE_SIZE = 16

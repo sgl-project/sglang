@@ -28,7 +28,7 @@ from sglang.test.scripted_runtime.tree_core_inspection import (
     install_tree_core_inspectors,
 )
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=21, suite="base-a-test-cpu")
 
 
 def _cache(backend, enable_session=False):

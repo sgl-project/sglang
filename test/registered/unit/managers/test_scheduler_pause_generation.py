@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 

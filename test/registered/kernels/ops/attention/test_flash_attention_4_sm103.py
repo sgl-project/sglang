@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.flash_attn.cute.testing import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=150, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=158, stage="base-c", runner_config="4-gpu-gb300")
 
 if not (
     torch.cuda.is_available()

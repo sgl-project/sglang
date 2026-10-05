@@ -22,7 +22,7 @@ from sglang.test.kv_canary.fixtures import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, suite="extra-a-test-1-gpu-small-amd")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 

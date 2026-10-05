@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):

@@ -8,7 +8,7 @@ from sglang.srt.utils.common import make_pp_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 NUM_LAYERS = 6
 

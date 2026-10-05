@@ -15,7 +15,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.model_executor.runner_utils import pool
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=21, stage="base-b", runner_config="2-gpu-large")
 
 
 def _run_rank(rank, rendezvous):

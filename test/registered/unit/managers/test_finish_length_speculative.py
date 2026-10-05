@@ -27,7 +27,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 EOS_ID = 2
 STOP_ID = 1
