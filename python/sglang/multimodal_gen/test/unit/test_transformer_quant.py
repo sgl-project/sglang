@@ -1423,6 +1423,49 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsInstance(quant_config, Fp8Config)
         self.assertEqual(quant_config.ignored_layers, ignored_layers)
 
+    def _resolve_online_quant_config(self, method, ignored_layers):
+        return _resolve_quant_config(
+            hf_config={},
+            server_args=self._make_server_args(
+                quantization=method,
+                quantization_ignored_layers=ignored_layers,
+            ),
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+        )
+
+    def test_online_quant_configs_accepting_ignored_layers_receive_them(self):
+        # Every online method whose config constructor takes `ignored_layers`
+        # must be handed the CLI patterns -- the forwarding is driven by the
+        # constructor signature, not by a hardcoded method list.
+        ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
+        for method in ("fp8", "mxfp4", "mxfp8", "convrot_int8"):
+            with self.subTest(method=method):
+                quant_config = self._resolve_online_quant_config(
+                    method, ignored_layers
+                )
+                self.assertEqual(quant_config.ignored_layers, ignored_layers)
+
+    def test_online_quant_config_without_ignored_layers_param_does_not_raise(self):
+        # Configs whose constructor has no `ignored_layers` parameter must be
+        # built without it rather than raising TypeError when the CLI flag is
+        # set.
+        quant_config = self._resolve_online_quant_config(
+            "mxfp4_npu", ["blocks.0.attn.out_proj"]
+        )
+        self.assertIsNotNone(quant_config)
+        self.assertFalse(hasattr(quant_config, "ignored_layers"))
+
+    def test_unset_ignored_layers_leaves_config_default(self):
+        # Omitting the kwarg when the flag is unset must match the previous
+        # behaviour of passing ignored_layers=None explicitly.
+        for ignored_layers in (None, []):
+            with self.subTest(ignored_layers=ignored_layers):
+                quant_config = self._resolve_online_quant_config(
+                    "fp8", ignored_layers
+                )
+                self.assertEqual(quant_config.ignored_layers, [])
+
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
         return_value=None,
