@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -10,10 +10,11 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -59,64 +60,72 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    is_chunk_cache: bool = False,
+    supports_prefix_sharing: bool = True,
     retain_floor: int | None = None,
+    component_type: ComponentType = ComponentType.SWA,
+    free_segment: Callable[..., None] | None = None,
+    eviction_interval: int = 1,
 ) -> None:
     if not req.kv.holds_kv:
         return
 
-    # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+    # For SWA-capable tree caches, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert req.kv.cache_protected_len % page_size == 0, (
         "cache_protected_len must be page aligned"
     )
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
+    # Protected rows limit what can be freed, not where the interval starts.
+    evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
+    if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
+        return
+    dead_lo = (
+        req.kv.swa_dead_lo(page_size)
+        if component_type == ComponentType.SWA
+        else req.kv.cache_protected_len
     )
+    evicted_seqlen = max(evicted_seqlen, dead_lo)
+    req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
-    if is_chunk_cache:
-        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+    if not supports_prefix_sharing:
+        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
         # frontier, and subtracting at least one page keeps it below the insert
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
-    if retain_floor is not None and not is_chunk_cache:
+    if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
-        # this only promises not to free past it. Chunk cache has no tree, so a
-        # retained checkpoint could never be matched and holding it is pure cost.
+        # this only promises not to free past it. Without prefix sharing a retained
+        # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
-    new_swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen,
-        evict_threshold,
-    )
+    new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
 
     if page_size > 1:
-        new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+        new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+    if new_evicted_seqlen > evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
         ]
-        # Local import: multi_ended_allocator imports this module lazily for
-        # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
-        )
+        if free_segment is None:
+            assert component_type == ComponentType.SWA
+            free_segment = token_to_kv_pool_allocator.free_swa_segment
+        free_segment(free_slots, start_pos=evicted_seqlen)
+        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
-        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # Contiguous range with host-int bounds: hand the composite its
-            # start position so the free stays host-sync-free (`free_segment`
-            # derives page reps by stride math instead of `torch.unique`).
-            token_to_kv_pool_allocator.free_swa(
-                free_slots, start_pos=req.kv.swa_evicted_seqlen
-            )
+
+def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
         else:
-            token_to_kv_pool_allocator.free_swa(free_slots)
-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+            merged.append((start, end))
+    return merged
 
 
 def free_kv_row_segments(
@@ -124,85 +133,117 @@ def free_kv_row_segments(
     segments: list[tuple[torch.Tensor, int]],
     *,
     swa_evicted_seqlen: int,
+    swa_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row, split at the SWA eviction floor."""
-    swa_dead: list[torch.Tensor] = []
+    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
+    swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
-        num_indices = kv_indices.numel()
-        if num_indices == 0:
+        end_pos = start_pos + kv_indices.numel()
+        lo = min(max(dead_lo, start_pos), end_pos)
+        hi = min(max(dead_hi, start_pos), end_pos)
+        # start_pos <= lo <= hi <= end_pos
+        # inside [lo, hi) is the swa dead segment
+        if hi <= lo:
+            swa_alive.append((kv_indices, start_pos))
             continue
-        # Below the floor the SWA peers are already gone -- window eviction, or
-        # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
-        num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
-        if num_dead > 0:
-            swa_dead.append(kv_indices[:num_dead])
-        if num_dead < num_indices:
-            swa_alive.append((kv_indices[num_dead:], start_pos + num_dead))
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+
+        if lo > start_pos:
+            swa_alive.append((kv_indices[: lo - start_pos], start_pos))
+        if end_pos > hi:
+            swa_alive.append((kv_indices[hi - start_pos :], hi))
 
     if swa_dead and swa_alive:
-        # A mid-page floor would send a page shared by the dead and alive
-        # sides back twice.
+        # The two sides are separate calls, so neither one's page-disjointness
+        # check sees a boundary that splits a page between them.
         assert swa_evicted_seqlen % allocator.page_size == 0, (
-            f"SWA eviction floor {swa_evicted_seqlen} splits a page "
+            f"SWA eviction cursor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
-    if len(swa_dead) == 1:
-        allocator.free_full(swa_dead[0])
-    elif swa_dead:
-        # Two dead pieces can share a boundary page, and only free_full's own
-        # page dedup covers that -- free_segments trims the alive side alone.
-        allocator.free_full(torch.cat(swa_dead))
+    if swa_dead:
+        allocator.free_full_segments(swa_dead)
     if swa_alive:
         allocator.free_segments(swa_alive)
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
+    # The tree reads req.finished() to tell a checkpoint from the final
+    # insert; a finished request belongs in release_kv_cache.
+    assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if req.skip_radix_cache_insert:
         return
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.checkpoint(req, up_to=req.extend_range.end)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
+    if tree_cache is not None and tree_cache.supports_prefix_sharing():
+        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+            tree_cache, num_tokens
+        )
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> None:
+    """Keep evicting the shortfall until `num_tokens` are allocatable.
+
+    Under classed page sharding available_size() reports the MIN-CLASS
+    capacity floor, so a single evict() sized in tokens can raise that floor by
+    less than the number of tokens it freed: the evicted pages spread across
+    all owner classes. Looping is deterministic, so it stays mirrored across
+    the ranks of a shard group. Stock allocators need no extra pass.
+    """
+    if page_interleave_shard_size(allocator) <= 1:
         return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
+    while True:
         available_size = allocator.available_size()
-        if available_size < num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
-            )
+        if available_size >= num_tokens:
+            return
+        shortfall = num_tokens - available_size
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(shortfall, allocator.page_size))
+        )
+        if result.num_tokens_evicted == 0:
+            return
 
 
-def retraction_backup(
+def dsv41_dspark_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return False
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+
+
+def backup_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Returns False when no backup can be taken ('none' backend, or the host
+    pool cannot hold it); the caller aborts the request."""
+    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
+        # Drain the in-flight verify before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
+    if backend == "none":
+        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -212,11 +253,11 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
     return req.kv.retraction_backup is not None
 
 
-def retraction_restore(
+def restore_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -233,11 +274,13 @@ def retraction_restore(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
-def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+def discard_kv_cache_backup(
+    req: Req, tree_cache: BasePrefixCache, backend: str
+) -> None:
     if backend == "cpu_tensor":
         req.kv.retraction_backup = None
         return
@@ -247,16 +290,18 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.kv.retraction_backup)
+    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+    what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    # MambaRadixCache may alloc mamba state before alloc KV cache
+    # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (
-            "Only MambaRadixCache allow freeing before alloc"
+            "Only a mamba-capable tree cache allows freeing before alloc"
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
@@ -265,31 +310,30 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.kv.mamba_pool_idx = None
         return
-
-    effective_kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
-    )
-
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # internally, then sets req_pool_idx = None.
-    assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    if not req.kv.holds_kv:
+    if tree_cache.claim_kv_row(req):
+        # A streaming session detached the kv record to keep the row.
+        assert not req.kv.holds_kv
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
-
-    # If the prefix cache doesn't manage mamba states, we must free them here.
-    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-        not tree_cache.supports_mamba()
-    ):
-        assert req.kv.holds_mamba, (
-            "mamba state is freed while the tree cache does not manage mamba states"
+    owned_kv_len = req.owned_kv_len()
+    is_insert = is_insert and not req.skip_radix_cache_insert
+    if is_insert:
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
         )
-        tree_cache.req_to_token_pool.free_mamba_cache(req)
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
+    # The protected prefix is not this req's to free.
+    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+    tree_cache.unpin(req)
+    _release_overallocated_kv_indices(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    tree_cache.on_release(req, inserted=is_insert)
+
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
@@ -306,16 +350,25 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
+    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
+    # page: paged free() releases the whole page containing any freed index, so
+    # a boundary aligned only to the kernel page could free a widened page whose
+    # head rows are still live.
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        # start_p is aligned to the allocator's physical page size above, so it
-        # never shares a page with cache_finished_req's tail free in this group.
+        # start_p is aligned to the allocator's page above, so it never shares a
+        # page with the tail free_kv_row in this group.
         tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
 
 

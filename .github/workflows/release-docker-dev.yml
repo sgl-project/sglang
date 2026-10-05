@@ -25,7 +25,7 @@ on:
         required: false
         default: ""
       overlay_cudas:
-        description: "Comma-separated cuda variants to overlay onto (cu12, cu13). Default 'cu13'."
+        description: "Comma-separated cuda variants to overlay onto (cu13). Default 'cu13'."
         required: false
         default: "cu13"
       overlay_tag_suffix:
@@ -86,9 +86,9 @@ jobs:
           # consumers pinned to the pre-flip names.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
@@ -97,7 +97,7 @@ jobs:
           # SUFFIX was computed above from inputs.tag / inputs.pr_number.
           if [ -n "${OVERLAY_DOCKERFILE_INPUT}" ]; then
             # Refuse to overlay without a tag/pr_number: SUFFIX would be empty,
-            # so base would point at the moving 'dev'/'dev-cu12'/'dev-cu13'
+            # so base would point at the moving 'dev'/'dev-cu13'
             # latest tags and overwrite mode would clobber them.
             if [ -z "${SUFFIX}" ]; then
               echo "overlay_dockerfile is set but neither 'tag' nor 'pr_number' was given." >&2
@@ -112,10 +112,8 @@ jobs:
               C="$(echo "${C}" | xargs)"
               if [ "${C}" = "cu13" ]; then
                 BASES='["dev'"${SUFFIX}"'","dev-cu13'"${SUFFIX}"'"]'
-              elif [ "${C}" = "cu12" ]; then
-                BASES='["dev-cu12'"${SUFFIX}"'"]'
               else
-                echo "Unknown overlay cuda variant: ${C} (expected cu12 or cu13)" >&2
+                echo "Unknown overlay cuda variant: ${C} (expected cu13)" >&2
                 exit 1
               fi
               if [ -n "${OVERLAY_SUFFIX_INPUT}" ]; then
@@ -213,7 +211,7 @@ jobs:
     if: ${{ !inputs.build_only && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 

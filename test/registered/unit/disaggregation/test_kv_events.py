@@ -10,21 +10,25 @@ the router can subscribe per replica (the `dp_size` it reads from
 import unittest
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     KVEventBatch,
     StorageMedium,
     ZmqEventPublisher,
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.runtime_context import describe_kv_events_publisher
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -186,42 +190,104 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
-    def _event(self, metadata=None):
-        event_type = BlockStored if metadata is None else BlockStoredWithMetadata
-        kwargs = dict(
+    def _event(self, **extra):
+        return BlockStored(
             block_hashes=[123],
             parent_block_hash=None,
             token_ids=[1, 2],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            **extra,
         )
-        if metadata is not None:
-            kwargs["metadata"] = metadata
-        return event_type(**kwargs)
 
-    def test_unsalted_event_keeps_legacy_array_shape(self):
+    def test_event_is_a_tagged_map(self):
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
-        self.assertEqual(len(decoded), 7)
+        self.assertIsInstance(decoded, dict)
+        self.assertEqual(decoded["type"], "BlockStored")
+        self.assertEqual(
+            set(decoded),
+            {
+                "type",
+                "block_hashes",
+                "parent_block_hash",
+                "token_ids",
+                "block_size",
+                "lora_id",
+                "medium",
+            },
+        )
 
-    def test_salted_event_appends_typed_metadata(self):
-        event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
-        encoded = msgspec.msgpack.encode(event)
-        decoded = msgspec.msgpack.decode(encoded)
-        round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
-        self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
+    def test_salt_and_session_are_named_fields(self):
+        event = self._event(cache_salt="tenant-a", session_id="session-a")
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded["cache_salt"], "tenant-a")
+        self.assertEqual(decoded["session_id"], "session-a")
 
-    def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
+    def test_one_decoder_reads_a_mixed_batch(self):
         batch = KVEventBatch(
             ts=1.0,
-            events=[self._event(BlockStoredMetadata(cache_salt="tenant-a"))],
+            events=[
+                self._event(),
+                self._event(cache_salt="tenant-a"),
+                self._event(session_id="session-a"),
+                BlockRemoved(block_hashes=[123], medium=StorageMedium.GPU),
+                AllBlocksCleared(),
+            ],
         )
         round_tripped = msgspec.msgpack.decode(
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
-        self.assertEqual(round_tripped.events[0].block_hashes, [123])
+        stored = round_tripped.events[:3]
+        self.assertEqual([e.cache_salt for e in stored], [None, "tenant-a", None])
+        self.assertEqual([e.session_id for e in stored], [None, None, "session-a"])
+        self.assertIsInstance(round_tripped.events[3], BlockRemoved)
+        self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
+
+    def test_batch_stays_a_positional_array_of_maps(self):
+        batch = KVEventBatch(ts=1.0, events=[self._event()], attn_dp_rank=0)
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(batch))
+        self.assertEqual(decoded[0], 1.0)
+        self.assertEqual(decoded[2], 0)
+        self.assertIsInstance(decoded[1][0], dict)
+        self.assertEqual(len(decoded), 3)
+
+
+class TestReplay(CustomTestCase):
+    def test_descriptor_advertises_replay_port(self):
+        def descriptor(**cfg):
+            cfg = msgspec.json.encode({"publisher": "zmq", **cfg}).decode()
+            args = ServerArgs(model_path="dummy", page_size=16, kv_events_config=cfg)
+            return describe_kv_events_publisher(args)
+
+        self.assertNotIn("replay_endpoint_port_base", descriptor())
+        self.assertEqual(
+            descriptor(replay_endpoint="tcp://*:6000")["replay_endpoint_port_base"],
+            6000,
+        )
+
+    def test_router_serves_buffered_batches_then_end_seq(self):
+        # The router's DEALER client relies on this exact framing.
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0, endpoint="inproc://kv-replay-test", replay_endpoint=replay
+        )
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(replay)
+        try:
+            for _ in range(3):
+                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+            publisher._event_queue.join()
+            dealer.send_multipart([b"", (1).to_bytes(8, "big")])
+            frames = [dealer.recv_multipart() for _ in range(3)]
+        finally:
+            dealer.close(linger=0)
+            publisher.shutdown()
+        seqs = [int.from_bytes(f[1], "big", signed=True) for f in frames]
+        self.assertEqual(seqs, [1, 2, -1])
+        self.assertEqual([f[0] for f in frames], [b""] * 3)
+        self.assertEqual(frames[2][2], b"")
 
 
 if __name__ == "__main__":

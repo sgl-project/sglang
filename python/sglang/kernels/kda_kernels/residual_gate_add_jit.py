@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
@@ -17,9 +18,6 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
-_FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
-
-logger = logging.getLogger(__name__)
 
 
 @cache_once
@@ -36,10 +34,6 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
                 "residual_gate_add",
                 f"residual_gate_add::ResidualGateAddKernel<{args}>::run",
             ),
-            (
-                "residual_gate_add_transposed",
-                f"residual_gate_add::ResidualGateAddKernel<{args}>::run_transposed",
-            ),
         ],
     )
 
@@ -55,12 +49,7 @@ def _fake_impl(
     )
 
 
-@register_custom_op(
-    op_name="diffusion_residual_gate_add",
-    mutates_args=[],
-    fake_impl=_fake_impl,
-)
-def _residual_gate_add_custom_op(
+def _residual_gate_add_cuda_impl(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     out = torch.empty_strided(
@@ -70,25 +59,156 @@ def _residual_gate_add_custom_op(
         device=residual.device,
     )
     module = _jit_residual_gate_add_module(residual.dtype)
-    if _is_transposed_dense_residual(residual, update, gate):
-        module.residual_gate_add_transposed(out, residual, update, gate)
-        return out
-    broadcast_gate = gate.shape != residual.shape
+    gate_mode = _gate_mode(residual, gate)
     module.residual_gate_add(
         out.view(-1),
         residual.view(-1),
         update.view(-1),
         gate.view(-1),
         residual.shape[-1],
-        broadcast_gate,
+        gate_mode,
     )
     return out
+
+
+@triton.jit
+def _round16_f32(x, IS_BF16: tl.constexpr):
+    if IS_BF16:
+        bits = tl.inline_asm_elementwise(
+            "cvt.rn.bf16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
+        )
+        return bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+    else:
+        bits = tl.inline_asm_elementwise(
+            "cvt.rn.f16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
+        )
+        return bits.to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _rga_transposed(
+    out,
+    res,
+    upd,
+    gate,
+    tokens,
+    hid: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    IS_16: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # residual/out have logical [batch, tokens, hid] with physical strides (T*H, 1, T);
+    # update is contiguous. out[b,t,h] = res + upd * gate[h].
+    # h-major tile indexing ([TILE_h, TILE_t]) makes the residual/output access
+    # coalesced along the physical stride-1 token dim; update (read once) takes
+    # the strided pattern instead. Measured faster than the t-major layout.
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    pid_b = tl.program_id(2).to(tl.int64)
+    t = pid_t * TILE + tl.arange(0, TILE).to(tl.int64)
+    h = pid_h * TILE + tl.arange(0, TILE).to(tl.int64)
+    mt = t < tokens
+    mh = h < hid
+    gv = tl.load(gate + h, mask=mh, other=0.0)
+    base = pid_b * tokens * hid
+    m2 = mh[:, None] & mt[None, :]
+    roffs = h[:, None] * tokens + t[None, :]
+    rv = tl.load(res + base + roffs, mask=m2, other=0.0)
+    uv = tl.load(upd + base + t[None, :] * hid + h[:, None], mask=m2, other=0.0)
+    if IS_16:
+        p32 = uv.to(tl.float32) * gv[:, None].to(tl.float32)
+        pf = _round16_f32(p32, IS_BF16)
+        o32 = rv.to(tl.float32) + pf
+        if IS_BF16:
+            bits = tl.inline_asm_elementwise(
+                "cvt.rn.bf16.f32 $0, $1;",
+                "=h,r",
+                [o32],
+                dtype=tl.int16,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out + base + roffs, bits.to(tl.bfloat16, bitcast=True), mask=m2)
+        else:
+            bits = tl.inline_asm_elementwise(
+                "cvt.rn.f16.f32 $0, $1;",
+                "=h,r",
+                [o32],
+                dtype=tl.int16,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out + base + roffs, bits.to(tl.float16, bitcast=True), mask=m2)
+    else:
+        tl.store(out + base + roffs, rv + uv * gv[:, None], mask=m2)
+
+
+def _residual_gate_add_transposed(residual, update, gate):
+    out = torch.empty_strided(
+        residual.shape, residual.stride(), dtype=residual.dtype, device=residual.device
+    )
+    batch, tokens, hidden = residual.shape
+    if residual.numel() <= 65536:
+        tile, warps = 16, 4
+    elif residual.numel() >= 1 << 20:
+        tile, warps = 64, 8
+    else:
+        tile, warps = 32, 8
+    grid = (triton.cdiv(tokens, tile), triton.cdiv(hidden, tile), batch)
+    _rga_transposed[grid](
+        out,
+        residual,
+        update,
+        gate,
+        tokens,
+        hidden,
+        residual.dtype == torch.bfloat16,
+        residual.dtype in (torch.float16, torch.bfloat16),
+        TILE=tile,
+        num_warps=warps,
+    )
+    return out
+
+
+@register_custom_op(
+    op_name="diffusion_residual_gate_add",
+    mutates_args=[],
+    fake_impl=_fake_impl,
+)
+def _residual_gate_add_custom_op(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    with torch.cuda.device(residual.device):
+        # Take the Triton path only for the transposed-dense layout it was
+        # benchmarked on. For the contiguous layouts every other diffusion model
+        # uses, the existing JIT CUDA kernel is faster at every measured shape.
+        if _is_transposed_dense_residual(residual, update, gate):
+            return _residual_gate_add_transposed(residual, update, gate)
+        return _residual_gate_add_cuda_impl(residual, update, gate)
+
+
+def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
+    """0 = full, 1 = broadcast row (hidden_size), 2 = per-token (rows)."""
+    if gate.shape == residual.shape:
+        return 0
+    if _is_row_broadcast_gate(residual, gate):
+        return 1
+    return 2
 
 
 def _is_row_broadcast_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
     if gate.dim() != residual.dim() or gate.shape[-1] != residual.shape[-1]:
         return False
     return all(size == 1 for size in gate.shape[:-1])
+
+
+def _is_per_token_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Gate holds one scalar per token (row), broadcast along the hidden dim."""
+    return (
+        gate.dim() == residual.dim()
+        and gate.shape[-1] == 1
+        and gate.shape[:-1] == residual.shape[:-1]
+    )
 
 
 def _is_transposed_dense_residual(
@@ -111,7 +231,8 @@ def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
     return (
-        residual.dtype in _SUPPORTED_DTYPES
+        torch.version.hip is None
+        and residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype
         and residual.dtype == gate.dtype
         and residual.is_cuda
@@ -121,7 +242,11 @@ def can_use_residual_gate_add_cuda(
         and residual.dim() >= 2
         and residual.numel() > 0
         and update.shape == residual.shape
-        and (gate.shape == residual.shape or _is_row_broadcast_gate(residual, gate))
+        and (
+            gate.shape == residual.shape
+            or _is_row_broadcast_gate(residual, gate)
+            or _is_per_token_gate(residual, gate)
+        )
         and (
             (residual.is_contiguous() and update.is_contiguous())
             or _is_transposed_dense_residual(residual, update, gate)
@@ -141,29 +266,11 @@ def residual_gate_add_cuda(
 def residual_gate_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """Use the bit-exact CUDA fast path when supported, otherwise eager.
-
-    Runtime build failures are cached per device and dtype so every diffusion
-    model shares one fallback policy instead of maintaining model-local flags.
-    """
-    runtime_key = (residual.device.index, residual.dtype)
-    if (
-        residual.dtype in _BIT_EXACT_DTYPES
-        and runtime_key not in _FAILED_RUNTIME_KEYS
-        and can_use_residual_gate_add_cuda(residual, update, gate)
+    """Use the bit-exact fast path for supported layouts, otherwise eager."""
+    if residual.dtype in _BIT_EXACT_DTYPES and can_use_residual_gate_add_cuda(
+        residual, update, gate
     ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            _FAILED_RUNTIME_KEYS.add(runtime_key)
-            logger.warning(
-                "Disabling diffusion residual-gate CUDA fast path on %s/%s: %s",
-                residual.device,
-                residual.dtype,
-                exc,
-            )
+        return _residual_gate_add_custom_op(residual, update, gate)
     return residual + update * gate
 
 

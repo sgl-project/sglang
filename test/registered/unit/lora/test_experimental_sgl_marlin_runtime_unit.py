@@ -19,7 +19,7 @@ from sglang.srt.lora.marlin_lora_temp import moe_runner
 from sglang.srt.lora.trtllm_lora_temp import environ as trtllm_lora_environ
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _SGLANG_ROOT = Path(sglang.__file__).resolve().parent
 
@@ -273,7 +273,7 @@ def _run_marlin_flow(
     )
     _stub_module(
         monkeypatch,
-        "sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts",
+        "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts",
         merged_experts_fused_moe_lora_add=merged_experts_fused_moe_lora_add,
     )
     _stub_module(

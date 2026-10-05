@@ -118,3 +118,16 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
 
     def post_decoding(self, frames, server_args):
         return self.image_processor.postprocess(frames, output_type="latent")
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.glmimage import (
+        GlmImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=GlmImageSamplingParams,
+        pipeline_config_cls=GlmImagePipelineConfig,
+        model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )

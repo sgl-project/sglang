@@ -18,8 +18,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
@@ -322,16 +322,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            logger.info("Detected nvfp4 checkpoint.")
         self.group_size = group_size
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
         self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
-        self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_int8_config: ConvRotInt8Config | None = None
         self._comfy_fp8_config: ComfyFp8Config | None = None
 
     def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
@@ -349,7 +346,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if marker.get("format") == "int8_tensorwise"
         }
         self._comfy_int8_config = (
-            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+            ConvRotInt8Config(layer_markers=int8_markers) if int8_markers else None
         )
         fp8_markers = {
             prefix: marker

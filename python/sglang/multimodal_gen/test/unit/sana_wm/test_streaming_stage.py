@@ -9,16 +9,12 @@ dim=2 would concat the head axis and silently corrupt every softmax block).
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import (
     SanaWMArchConfig,
     SanaWMConfig,
 )
-from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _CACHE_TYPE_CONCAT,
     _CACHE_TYPE_STATE,
@@ -35,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
     SanaWMStreamingDenoisingStage as Stage,
 )
-from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 B, Hh, D = 1, 2, 4
 
@@ -160,23 +155,6 @@ class _ZeroCross(torch.nn.Module):
         return torch.zeros_like(x)
 
 
-@pytest.fixture
-def _global_args():
-    prev = _sa_mod._global_server_args
-    set_global_server_args(
-        SimpleNamespace(
-            comfyui_mode=False,
-            enable_cfg_parallel=False,
-            enable_torch_compile=False,
-            attention_backend=None,
-        )
-    )
-    try:
-        yield
-    finally:
-        set_global_server_args(prev)
-
-
 def _depth4_model():
     arch = SanaWMArchConfig(
         in_channels=MC,
@@ -201,7 +179,7 @@ def _depth4_model():
     return m
 
 
-def test_streaming_loop_runs_and_accumulates_concat_block(_global_args):
+def test_streaming_loop_runs_and_accumulates_concat_block():
     """Drive forward_long chunk-by-chunk (the stage's core loop) on a depth-4
     model: accumulate -> denoise(save=False) -> clean(save=True). Verify finite
     output, threaded GDN state, and that the softmax block (idx 3) accumulates a

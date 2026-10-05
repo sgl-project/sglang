@@ -1,7 +1,7 @@
 """End-to-end parity at the scheduler-input boundary.
 
 `test_preprocess.py` pins the `preprocess` binding; this drives the whole native
-path — the `process_mm` driver, then `RustMmProcessor.build_output` — and
+path — the `process_mm` driver, then `RustMmProcessor.wrap_encoded` — and
 compares every field the scheduler reads against the Python `mm_processor`.
 Bitwise, for both HF backends: the Rust resize clones PIL's fixed-point bicubic
 and ATen's uint8 antialias kernel, so whichever one a server is configured with
@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
 from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 CORE = load_core()
 DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_mm", None)
@@ -82,18 +83,35 @@ class TestQwenE2eParity(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmEncodeResult, inline transport (test_build_output
-        # pins the shm shape).
-        handoff = SimpleNamespace(
-            features=features,
-            shm_names=None,
-            grids=grids,
-            hashes=hashes,
-            offsets=offsets,
-            mrope=mrope,
-            mrope_delta=delta,
-        )
-        return snapshot(ids, RustMmProcessor.build_output(spec, handoff))
+        # The `mm.*` buffers of one `IngressRequest`, inline transport
+        # (test_wrap_encoded pins the shm shape): the binding concatenates the
+        # per-item features, so slice them back out per grid, and the sidecar
+        # is built as the Rust worker encodes it.
+        meta = {
+            "items": [
+                {
+                    "modality": "image",
+                    "hash": item_hash,
+                    "offsets": [list(offset)],
+                    "model_specific_data": {"image_grid_thw": list(grid)},
+                }
+                for grid, item_hash, offset in zip(grids, hashes, offsets)
+            ],
+            "token_ids": None,
+            "mrope_delta": delta,
+        }
+        buffers = {
+            "mm.mrope": mrope.reshape(3, -1),
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
+        }
+        row = 0
+        for index, (t, h, w) in enumerate(grids):
+            n = t * h * w
+            buffers[f"mm.feature.{index}"] = features[
+                row * spec.feature_dim : (row + n) * spec.feature_dim
+            ].reshape(n, spec.feature_dim)
+            row += n
+        return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""
