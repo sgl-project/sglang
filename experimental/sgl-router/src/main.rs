@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -28,7 +28,7 @@ use sgl_router::{
         },
     },
     tokenizer::TokenizerRegistry,
-    workers::{manager, WorkerRegistry},
+    workers::{introspect::worker_client, manager, WorkerRegistry},
 };
 use std::{
     sync::Arc,
@@ -106,6 +106,13 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Ask the built policies, so any term or filter that reads the prompt is covered.
+    ensure!(
+        config.model.tokenizer_path.is_some()
+            || !chat_routing.needs_request_tokens(&routing_policies),
+        "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
+    );
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -242,10 +249,7 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
 }
 
 fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Arc<KvEventIndex> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("default http client builds");
+    let http = worker_client(Duration::from_secs(2), config.server.worker_auth.clone());
     if use_external_indexer {
         // External indexing still needs worker hash metadata and engine load, but no local KV tree.
         return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
@@ -254,9 +258,10 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
     // pre-settled and `/readyz` never waits on it.
     let bootstrap = Arc::new(
         match (&config.model.cache_aware, config.discovery.peer_selector()) {
-            (Some(cache), Some(_)) => BootstrapTracker::new_with_fetch_cap(
+            (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
                 Duration::from_millis(cache.bootstrap_timeout_ms),
                 Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+                cache.bootstrap_seed_required,
             ),
             _ => BootstrapTracker::disabled(),
         },
@@ -358,6 +363,10 @@ fn build_app_context(
         routing_policies,
         local_inflight_requests,
     );
+    // An external indexer leaves the local tree empty.
+    app_context.dp_rank_prefix_provider = (config.model.dp_aware
+        && external_kv_indexer_client.is_none())
+    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.prefix_index = external_kv_indexer_client;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
         && config
@@ -366,6 +375,10 @@ fn build_app_context(
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
+        engine_state.tree().pending().enable(ttl);
+    }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
@@ -554,6 +567,32 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
+    }
+
+    #[tokio::test]
+    async fn dp_aware_gets_the_local_tree_under_any_policy() {
+        let config = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id=tiny",
+            "--tokenizer-path=tests/fixtures/tiny_tokenizer.json",
+            "--worker-urls=http://127.0.0.1:1",
+            "--policy=power_of_two",
+            "--dp-aware",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        let ctx = build_app_context(
+            &config,
+            Arc::new(TokenizerRegistry::load_from_config(&config).unwrap()),
+            Default::default(),
+            Default::default(),
+            start_local_inflight_tracker(&config).0,
+            &start_engine_state_monitor(&config, false),
+            None,
+        )
+        .unwrap();
+        assert!(ctx.dp_rank_prefix_provider.is_some());
     }
 
     #[tokio::test]
