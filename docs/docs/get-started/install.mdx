@@ -65,7 +65,7 @@ Use Python 3.10 or higher and a compatible CUDA 13 environment.
 
 <Accordion title="CUDA version compatibility">
 
-SGLang requires CUDA 13. CUDA 12 (`cu129`) wheels and images are retired because PyTorch 2.14 publishes no CUDA 12.9 builds. SGLang 0.5.19 is the last release with a CUDA 12 lane.
+SGLang requires CUDA 13. CUDA 12 (`cu129`) wheels and images were retired with the upgrade to PyTorch 2.14, which publishes no CUDA 12.9 builds. SGLang 0.5.19 is the last release with a CUDA 12 lane (PyTorch 2.13).
 
 </Accordion>
 

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.layer_boundary import (
+    PLAIN_ADD,
     Layout,
     MixerExit,
     OutputContract,
@@ -14,6 +15,7 @@ from sglang.srt.layers.layer_boundary import (
     TokenAxis,
     UnreducedOutput,
 )
+from sglang.srt.layers.layer_boundary import exit as exit_module
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
@@ -26,7 +28,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 def layer_stage(pattern, index):
     from sglang.srt.layers.layer_boundary.construction import BatchVariant
-    from sglang.srt.layers.layer_boundary.factories import _connections
+    from sglang.srt.layers.layer_boundary.factories import _connect, _incoming
 
     previous = utils._declaration(pattern, index - 1) if index else None
     declaration = replace(
@@ -39,7 +41,8 @@ def layer_stage(pattern, index):
         if index + 1 < len(pattern)
         else None
     )
-    incoming, outgoing = _connections(declaration, following)
+    incoming = _incoming(declaration)
+    outgoing = _connect(declaration, following, residual_from=incoming)
     return SimpleNamespace(
         kind=declaration.kind,
         edges=(
@@ -166,9 +169,10 @@ class TestStageEdges(CustomTestCase):
 
 
 class TestMixerExit(CustomTestCase):
-    """A mixer skips its output all-reduce when its output always leaves the sum
-    (to an FFN stage), and when it may leave it and the fused kernel takes it;
-    what it hands on says which."""
+    """A mixer never runs its output all-reduce. The exit carries the sum to the
+    next attention stage when its declaration permits deferring and the fused
+    kernel takes it, hands it on as the declared sum when it always leaves it
+    (to an FFN stage), and otherwise completes it itself."""
 
     def test_decision_table(self):
         tp_group = object()
@@ -184,6 +188,7 @@ class TestMixerExit(CustomTestCase):
                     group=SumGroup.ATTN_TP if always or may else None,
                     always_partial=always,
                     may_defer_to_next=may,
+                    update=PLAIN_ADD,
                 )
                 communicator = SimpleNamespace(
                     plan=SimpleNamespace(
@@ -192,22 +197,28 @@ class TestMixerExit(CustomTestCase):
                     _sum_deferral_allowed=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
-                with get_parallel().override(tp_group=tp_group, tp_size=2):
+                summed = MagicMock(side_effect=lambda h, *args, **kwargs: h * 2)
+                with (
+                    get_parallel().override(tp_group=tp_group, tp_size=2),
+                    patch.object(exit_module, "sum_output", summed),
+                ):
                     with MixerExit(
                         communicator, None, stream=ResidualStream()
                     ) as mixer_exit:
                         skipped = should_skip_mlp_all_reduce()
                     output = mixer_exit.finish(hidden)
                     output, _ = mixer_exit._stream.input(output)
-                self.assertFalse(should_skip_mlp_all_reduce())
-                hands_on = may and movable
-                self.assertEqual(mixer_exit.skips_reduction, always or hands_on)
-                self.assertEqual(skipped, always or hands_on)
-                if hands_on:
+                self.assertFalse(skipped)
+                if may and movable:
                     self.assertIsInstance(output, UnreducedOutput)
                     self.assertIs(output.group, tp_group)
+                    summed.assert_not_called()
+                elif may:
+                    self.assertEqual(summed.call_args.args[1], SumGroup.ATTN_TP)
+                    torch.testing.assert_close(output, hidden * 2)
                 else:
                     self.assertIs(output, hidden)
+                    summed.assert_not_called()
 
 
 if __name__ == "__main__":
