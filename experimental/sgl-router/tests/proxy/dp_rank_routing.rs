@@ -242,23 +242,29 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     }
 }
 
-/// The engine's `/v1/embeddings` reads no rank, so the router pins none.
+/// The engine's `/v1/embeddings`, `/v1/classify` and `/v1/rerank` read no rank,
+/// so the router pins none.
 #[tokio::test]
-async fn embeddings_leave_the_rank_to_the_engine() {
+async fn embedding_like_endpoints_leave_the_rank_to_the_engine() {
     let worker = MockWorker::start(vec![]).await;
     let app = router(
         sticky_config(),
         &[(&worker, WorkerMode::Plain, 4)],
         Default::default(),
     );
-    let request = Request::post("/v1/embeddings")
-        .header("content-type", "application/json")
-        .header(KEY, "conv-a")
-        .body(Body::from(
-            json!({"model": MODEL, "input": "hi"}).to_string(),
-        ))
-        .unwrap();
-    assert!(app.oneshot(request).await.unwrap().status().is_success());
-    assert_eq!(worker.captured.lock().unwrap().headers.get(RANK), None);
-    assert!(worker.captured_json().await.get("routed_dp_rank").is_none());
+    for (path, body) in [
+        ("/v1/embeddings", json!({"model": MODEL, "input": "hi"})),
+        ("/v1/classify", json!({"model": MODEL, "input": "hi"})),
+        ("/v1/rerank", json!({"query": "hi", "documents": ["yo"]})),
+    ] {
+        let request = Request::post(path)
+            .header("content-type", "application/json")
+            .header(KEY, "conv-a")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(worker.captured.lock().unwrap().headers.get(RANK), None);
+        assert!(worker.captured_json().await.get("routed_dp_rank").is_none());
+    }
 }
