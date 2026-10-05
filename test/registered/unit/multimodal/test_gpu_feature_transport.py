@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import threading
 import unittest
+from array import array
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -961,6 +962,9 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     def test_embedding_request_aborts_broadcast_processing_error(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.io_struct import TokenizedEmbeddingReqInput
+        from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+        from sglang.srt.sampling.sampling_params import SamplingParams
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.tokenizer = object()
@@ -970,35 +974,35 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler._get_multimodal_inputs = MagicMock(
             side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
         )
-        req = MagicMock()
-        recv_req = SimpleNamespace(
+        recv_req = TokenizedEmbeddingReqInput(
             rid="request-id",
             input_text="prompt",
-            input_ids=[1],
-            sampling_params=object(),
-            positional_embed_overrides=None,
+            input_ids=array("q", [1]),
+            sampling_params=SamplingParams(),
             token_type_ids=None,
-            routed_dp_rank=None,
-            priority=None,
-            dimensions=None,
-            lora_id=None,
-            http_worker_ipc=None,
-            time_stats=None,
-            return_pooled_hidden_states=False,
-            multi_item_delimiter_indices=None,
-            token_indices_to_pool=None,
-            mm_inputs=object(),
+            mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=[]),
         )
+        self.assertIsNone(recv_req.encoding_format)
 
-        with patch.object(scheduler_module, "Req", return_value=req):
-            scheduler.handle_embedding_request(recv_req)
+        for encoding_format in (None, "float", "tensor"):
+            with self.subTest(encoding_format=encoding_format):
+                recv_req.encoding_format = encoding_format
+                req = MagicMock()
+                scheduler._add_request_to_queue.reset_mock()
+                with patch.object(
+                    scheduler_module, "Req", return_value=req
+                ) as create_req:
+                    scheduler.handle_embedding_request(recv_req)
 
-        req.set_finish_with_abort.assert_called_once_with(
-            "bad image",
-            status_code=500,
-            err_type="InternalServerError",
-        )
-        scheduler._add_request_to_queue.assert_called_once_with(req)
+                self.assertEqual(
+                    create_req.call_args.kwargs["encoding_format"], encoding_format
+                )
+                req.set_finish_with_abort.assert_called_once_with(
+                    "bad image",
+                    status_code=500,
+                    err_type="InternalServerError",
+                )
+                scheduler._add_request_to_queue.assert_called_once_with(req)
 
     def test_vmm_materialization_consensus_rejects_any_rank_failure(self):
         cases = (
