@@ -120,7 +120,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         # before multiplying, which moves a rounding without lowering the
         # reference's own operand precision: tier "lossless". The "exact"
         # default keeps the reference FP32-multiply form bit-for-bit.
-        quality = getattr(batch.sampling_params, "quality", "exact")
+        quality = getattr(batch.sampling_params, "quality", "lossless")
         want = quality_allows(quality, "lossless")
         if want == self._quality_fusions_mounted:
             return

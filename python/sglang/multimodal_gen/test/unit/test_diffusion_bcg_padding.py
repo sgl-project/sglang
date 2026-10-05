@@ -74,27 +74,60 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
     def _batch(quality: str):
         return SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
 
-    def test_rejects_fusion_levels_when_they_would_replace_captured_graph(self):
-        for quality in ("lossless", "high"):
-            with self.subTest(quality=quality):
-                unmounted = []
-                handlers = (
-                    (
-                        "lossless",
-                        "test fusion",
-                        lambda _: True,
-                        lambda transformer: unmounted.append(transformer),
-                    ),
-                )
+    def test_each_quality_level_gets_its_own_bcg_runner(self):
+        # A captured graph bakes in the fusions mounted when it was recorded,
+        # and the capture signature only covers the tensors. Warmup captures
+        # at the server's default level, so a request at another level must
+        # not reach those graphs: it gets an empty runner, and the eager
+        # fallback runs the fusion set it actually asked for.
+        self.stage._bcg_runners = {}
+        model = self.stage.transformer
+        built = []
 
-                with patch.object(
-                    denoising_module, "_QUALITY_FUSION_HANDLERS", handlers
-                ):
-                    with self.assertRaisesRegex(ValueError, "exact-tier warmup graphs"):
-                        self.stage._maybe_toggle_quality_fusions(self._batch(quality))
+        class _FakeRunner:
+            def __init__(self, transformer, device):
+                built.append(transformer)
 
-                self.assertEqual(unmounted, [self.stage.transformer])
-                self.assertEqual(self.stage._mounted_quality, "exact")
+        with (
+            patch.object(
+                denoising_module, "get_local_torch_device", return_value="cpu"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.breakable_cuda_graph.runner."
+                "DiffusionBreakableCudaGraphRunner",
+                _FakeRunner,
+            ),
+        ):
+            self.stage._mounted_quality = "lossless"
+            default_runner = self.stage._maybe_get_bcg_runner(model)
+            self.assertIs(self.stage._maybe_get_bcg_runner(model), default_runner)
+
+            self.stage._mounted_quality = "exact"
+            exact_runner = self.stage._maybe_get_bcg_runner(model)
+
+        self.assertIsNot(exact_runner, default_runner)
+        self.assertEqual(len(built), 2)
+
+    def test_mounting_a_fusion_under_bcg_is_allowed(self):
+        # This used to raise: with one runner per module, switching level
+        # would have replayed the warmup level's kernels under another
+        # level's name. The runner key carries the level now, so the request
+        # simply runs.
+        mounted = []
+        handlers = (
+            (
+                "lossless",
+                "test fusion",
+                lambda t: mounted.append(t) or True,
+                lambda _: None,
+            ),
+        )
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("lossless"))
+
+        self.assertEqual(mounted, [self.stage.transformer])
+        self.assertEqual(self.stage._mounted_quality, "lossless")
 
     def test_allows_high_when_model_has_no_dit_quality_fusions(self):
         handlers = (("lossless", "test fusion", lambda _: False, lambda _: None),)

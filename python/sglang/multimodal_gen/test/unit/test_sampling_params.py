@@ -54,8 +54,10 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
-    def test_quality_defaults_to_exact(self):
-        self.assertEqual(SamplingParams().quality, "exact")
+    def test_quality_defaults_to_lossless(self):
+        # The default runs every fast path that keeps the reference math;
+        # "exact" is the opt-in for bit-identical output.
+        self.assertEqual(SamplingParams().quality, "lossless")
 
     def test_quality_levels_are_cumulative(self):
         self.assertEqual(QUALITY_LEVELS, ("exact", "lossless", "high"))

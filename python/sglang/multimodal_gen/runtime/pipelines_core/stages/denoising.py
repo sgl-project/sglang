@@ -387,8 +387,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # The quality level whose request-scoped fusions are mounted.
         self._mounted_quality = "exact"
         self._torch_compile_registry = CompiledModuleRegistry()
-        # Breakable CUDA graph runners, one per transformer module (lazy).
-        self._bcg_runners: dict[int, Any] = {}
+        # Breakable CUDA graph runners, lazily created per (module, quality
+        # level); see _maybe_get_bcg_runner for why the level is in the key.
+        self._bcg_runners: dict[tuple[int, str], Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -790,13 +791,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         Each fusion declares the lowest quality level that may mount it (see
         ``_QUALITY_FUSION_HANDLERS``), so a request mounts the fusions of its
-        own tier and of every stricter one. The ``"exact"`` default mounts
-        none of them and runs the reference path bit-for-bit. ``quality``
-        participates in the dynamic-batch signature, making this transition
-        safe at the batch boundary. Mounting is all-or-nothing per transformer
-        and fusion family; models without marked sites are no-ops.
+        own tier and of every stricter one; ``"exact"`` mounts none of them
+        and runs the reference path bit-for-bit. ``quality`` participates in
+        the dynamic-batch signature, making this transition safe at the batch
+        boundary. Mounting is all-or-nothing per transformer and fusion
+        family; models without marked sites are no-ops.
+
+        Under breakable CUDA graphs the mounted set is baked into whatever was
+        captured, which is why the runner is keyed by level as well as module
+        (see :meth:`_maybe_get_bcg_runner`): changing level here cannot
+        silently replay another level's kernels.
         """
-        quality = getattr(batch.sampling_params, "quality", "exact")
+        quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality == self._mounted_quality:
             return
         mounted_fusions: set[str] = set()
@@ -807,18 +813,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         mounted_fusions.add(description)
                 else:
                     unmount(transformer)
-
-        if mounted_fusions and self.server_args.enable_breakable_cuda_graph:
-            for transformer in filter(None, [self.transformer, self.transformer_2]):
-                for _, _, _, unmount in _QUALITY_FUSION_HANDLERS:
-                    unmount(transformer)
-            descriptions = ", ".join(sorted(mounted_fusions))
-            raise ValueError(
-                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
-                f"this model because its request-scoped DiT fusions "
-                f"({descriptions}) do not match the exact-tier warmup graphs. "
-                "Disable breakable CUDA graphs or use quality='exact'."
-            )
 
         self._mounted_quality = quality
         for description in sorted(mounted_fusions):
@@ -2605,19 +2599,38 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return None
         if not isinstance(current_model, nn.Module):
             return None
-        key = id(current_model)
+        # A captured graph bakes in whichever fusions were mounted when it was
+        # recorded, and the capture signature only covers the tensors -- so a
+        # runner is per (module, quality level). Warmup runs at the default
+        # level and captures its graphs there; a request at another level
+        # finds an empty runner and the eager fallback runs the fusion set it
+        # actually asked for. Sharing one runner would replay the warmup
+        # level's kernels under a different level's name.
+        key = (id(current_model), self._mounted_quality)
         runner = self._bcg_runners.get(key)
         if runner is None:
             from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
                 DiffusionBreakableCudaGraphRunner,
             )
 
+            # Another level already has a runner, so this one arrived after
+            # warmup and will never hold a captured graph.
+            served_another_level = any(
+                model_id == id(current_model) for model_id, _ in self._bcg_runners
+            )
             # DenoisingStage can switch between transformer and transformer_2;
             # each module owns separate graph state and static input buffers.
             runner = DiffusionBreakableCudaGraphRunner(
                 current_model, get_local_torch_device()
             )
             self._bcg_runners[key] = runner
+            if served_another_level:
+                logger.info_once(
+                    "quality=%s has no captured breakable CUDA graphs (warmup "
+                    "captures the server's default level), so its requests run "
+                    "eager.",
+                    self._mounted_quality,
+                )
         return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):

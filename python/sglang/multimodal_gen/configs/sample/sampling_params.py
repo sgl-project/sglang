@@ -264,18 +264,21 @@ class SamplingParams:
     x264_preset: str | None = None
     # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
-    # - "exact" (default): the reference path. Output is bit-identical to it
-    #   in the same environment and passes the CI ground-truth comparisons.
-    # - "lossless": add fast paths that keep the math and the precision of
-    #   every operand, changing only rounding order or position (fusions,
-    #   other kernels); output matches the reference to rounding error, not
-    #   bit for bit.
+    # - "exact": the reference path, plus the fast paths that reproduce its
+    #   rounding exactly. Output is bit-identical to it in the same
+    #   environment; ask for this when a run has to be reproducible or when
+    #   bisecting a numerical bug.
+    # - "lossless" (default): also mount the fast paths that keep the
+    #   reference math and the precision of every operand and accumulator,
+    #   and only move where the rounding happens. Output matches the
+    #   reference to rounding error rather than bit for bit, by less than the
+    #   same path already moves between two legal environments.
     # - "high": also allow model-owned approximate optimizations (lower
     #   precision, sparse computation, feature caching), which need
     #   model-specific quality validation.
     #
     # It intentionally participates in the dynamic-batch signature.
-    quality: str = "exact"
+    quality: str = "lossless"
 
     # Frame interpolation
     enable_frame_interpolation: bool = False
@@ -1262,14 +1265,15 @@ class SamplingParams:
             type=str,
             choices=[*QUALITY_LEVELS, *QUALITY_ALIASES],
             help=(
-                "Request-level quality: 'exact' (default) runs the reference "
-                "path, bit-identical to it in the same environment; "
-                "'lossless' adds fast paths that keep the math and operand "
-                "precision and change only rounding order, so output matches "
-                "to rounding error; 'high' may also enable model-owned "
-                "approximate paths. 'extra-high' is accepted as the former "
-                "name of 'lossless'. Support and validated deployment "
-                "constraints are model-specific."
+                "Request-level quality: 'lossless' (default) runs every fast "
+                "path that keeps the reference math and operand precision and "
+                "only moves the rounding, so output matches the reference to "
+                "rounding error; 'exact' restricts it to the fast paths that "
+                "reproduce the reference's rounding exactly, giving "
+                "bit-identical output in the same environment; 'high' may "
+                "also enable model-owned approximate paths. 'extra-high' is "
+                "accepted as the former name of 'lossless'. Support and "
+                "validated deployment constraints are model-specific."
             ),
         )
         add_argument(
