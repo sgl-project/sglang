@@ -117,7 +117,7 @@ impl Policy for SessionAwarePolicy {
                     fallback,
                     &load,
                     // Without a prefix signal, either engine prefills the whole input.
-                    |_| request.input_tokens,
+                    |_| request.total_input_tokens,
                 )?;
                 if pick.engine.id == bound.id {
                     return Ok(pick);
