@@ -22,6 +22,9 @@ def main():
             torch.ones(8192, 32, device="cuda"), torch.randn(8192, 32, device="cuda")
         )
         positions = torch.arange(rows, device="cuda") % 8192
+        # do_bench_cudagraph warms up on a new stream without waiting for the
+        # current stream. Finish initializing inputs before it reads positions.
+        torch.cuda.synchronize()
 
         def baseline():
             fused_q_norm_rope(q, bf16, None, freqs, positions)
