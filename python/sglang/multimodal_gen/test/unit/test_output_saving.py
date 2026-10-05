@@ -128,6 +128,61 @@ def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_x264_preset_reaches_every_video_save_path(tmp_path, monkeypatch):
+    presets = []
+
+    class FakeWavFile:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            pass
+
+    def parallel_save(samples, _paths, **kwargs):
+        presets.append(("parallel", kwargs["x264_preset"]))
+        return [False] * len(samples)
+
+    def direct_save(**kwargs):
+        presets.append(("direct", kwargs["x264_preset"]))
+        return False
+
+    def mimsave_spy(_path, _frames, **kwargs):
+        encoder = "single-pass" if "audio_path" in kwargs else "imageio"
+        presets.append((encoder, kwargs["output_params"][-1]))
+
+    monkeypatch.setattr(output_utils, "_try_save_cuda_videos_direct", parallel_save)
+    monkeypatch.setattr(output_utils, "_try_save_cuda_video_direct", direct_save)
+    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
+
+    output_utils.save_outputs(
+        [torch.zeros((3, 1, 2, 3)), torch.zeros((3, 1, 2, 3))],
+        DataType.VIDEO,
+        fps=24,
+        save_output=True,
+        build_output_path=lambda idx: str(tmp_path / f"sample_{idx}.mp4"),
+        x264_preset="ultrafast",
+    )
+    save_materialized_output(
+        MaterializedOutput(
+            sample=None,
+            frames=[_rgb_frame()],
+            audio=np.zeros((320, 2), dtype=np.float32),
+            fps=24,
+        ),
+        DataType.VIDEO,
+        str(tmp_path / "with_audio.mp4"),
+        audio_sample_rate=32000,
+        x264_preset="ultrafast",
+    )
+
+    assert {encoder for encoder, _ in presets} == {
+        "parallel",
+        "direct",
+        "imageio",
+        "single-pass",
+    }
+    assert {preset for _, preset in presets} == {"ultrafast"}
+
+
 def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     calls = []
