@@ -97,28 +97,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 
-def _use_glm53_triton_sparse_attention(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    d_v: int,
-) -> bool:
-    """Use Triton only inside the validated GLM-5.3 sparse-attention envelope."""
-    max_tokens_by_heads = {8: 131072, 16: 65536}
-    return (
-        _IS_GFX95
-        and q.dtype == torch.bfloat16
-        and kv.dtype == torch.bfloat16
-        and q.ndim == 3
-        and q.shape[1] in max_tokens_by_heads
-        and 0 < q.shape[0] <= max_tokens_by_heads[q.shape[1]]
-        and q.shape[2] == 512
-        and kv.shape[-1] == 512
-        and indices.shape[-1] == 2051
-        and d_v == 512
-    )
-
-
 if is_cuda():
     import deep_gemm
 
@@ -518,6 +496,43 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._triton_kpool_tail_supported = False
+        if self.dsa_index_kpool > 1 and (
+            self.dsa_prefill_impl == "triton" or self.dsa_decode_impl == "triton"
+        ):
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                can_use_glm53_triton_sparse_attention,
+            )
+
+            topk_width = self.dsa_index_topk + self.dsa_index_kpool - 1
+            self._triton_kpool_tail_supported = can_use_glm53_triton_sparse_attention(
+                q_dtype=model_runner.dtype,
+                kv_dtype=self.kv_cache_dtype,
+                num_tokens=None,
+                num_heads=self.num_q_heads,
+                q_nope_dim=self.kv_lora_rank,
+                q_rope_dim=self.qk_rope_head_dim,
+                kv_dim=self.kv_cache_dim,
+                d_v=self.kv_lora_rank,
+                topk_width=topk_width,
+                dsa_index_topk=self.dsa_index_topk,
+                dsa_index_kpool=self.dsa_index_kpool,
+            )
+            if not self._triton_kpool_tail_supported:
+                raise ValueError(
+                    "Triton with index_kpool > 1 is only validated for GLM-5.3 "
+                    "on gfx950 with BF16 Q/KV, 8 or 16 query heads, zero-width "
+                    "RoPE, 512-wide Q/KV/output, index_topk=2048, "
+                    "and index_kpool=4; got "
+                    f"model_dtype={model_runner.dtype}, "
+                    f"kv_cache_dtype={self.kv_cache_dtype}, "
+                    f"num_q_heads={self.num_q_heads}, "
+                    f"q_nope_dim={self.kv_lora_rank}, "
+                    f"q_rope_dim={self.qk_rope_head_dim}, "
+                    f"kv_dim={self.kv_cache_dim}, "
+                    f"index_topk={self.dsa_index_topk}, "
+                    f"index_kpool={self.dsa_index_kpool}."
+                )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -2119,15 +2134,14 @@ class DeepseekSparseAttnBackend(
             ).to(torch.int32)
 
         if dsa_impl == "tilelang":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
-                q_nope=q_nope,
-                q_rope=q_rope,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                is_prefill=True,
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2431,15 +2445,14 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "tilelang":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
-                q_nope=q_nope,
-                q_rope=q_rope,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                is_prefill=False,
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3080,41 +3093,12 @@ class DeepseekSparseAttnBackend(
 
     def _forward_tilelang(
         self,
-        q_all: Optional[torch.Tensor],
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
+        q_all: torch.Tensor,
         kv_cache: torch.Tensor,
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-        is_prefill: bool,
     ) -> torch.Tensor:
-        if _use_glm53_triton_sparse_attention(
-            q_nope, kv_cache, page_table_1, v_head_dim
-        ):
-            if not is_prefill:
-                return self._forward_triton_decode(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    kv_cache=kv_cache,
-                    page_table_1=page_table_1,
-                    sm_scale=sm_scale,
-                    v_head_dim=v_head_dim,
-                )
-
-            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-                triton_sparse_mla_fwd,
-            )
-
-            return triton_sparse_mla_fwd(
-                q_nope=q_nope,
-                q_rope=q_rope,
-                kv=kv_cache,
-                indices=page_table_1.unsqueeze(1),
-                sm_scale=sm_scale,
-                d_v=v_head_dim,
-            )
-
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
@@ -3129,11 +3113,6 @@ class DeepseekSparseAttnBackend(
                 ),
                 dim=-1,
             )
-
-        # Cat-skip (HIP-only): when q_all is already a zero-copy view of q, reuse
-        # it. Other paths retain the original contiguous concatenation contract.
-        if q_all is None or not _is_hip:
-            q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
         return tilelang_sparse_fwd(
             q=q_all,

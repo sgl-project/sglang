@@ -1,7 +1,10 @@
 """DSA sparse kernels must accept GLM's zero-RoPE geometry."""
 
+import inspect
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -32,6 +35,108 @@ class TestPackedRowInference(CustomTestCase):
             self.assertEqual(_infer_dsa_dims(packed_width), layout)
         with self.assertRaises(ValueError):
             _infer_dsa_dims(265)
+
+    def test_glm53_dispatch_gate_covers_sparse_attention_envelope(self):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            can_use_glm53_triton_sparse_attention,
+        )
+
+        base = dict(
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            q_nope_dim=512,
+            q_rope_dim=0,
+            kv_dim=512,
+            d_v=512,
+            topk_width=2051,
+            dsa_index_topk=2048,
+            dsa_index_kpool=4,
+            is_gfx95=True,
+        )
+        for tokens, heads in ((1, 8), (1, 16), (65536, 16), (131072, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                self.assertTrue(
+                    can_use_glm53_triton_sparse_attention(
+                        **base, num_tokens=tokens, num_heads=heads
+                    )
+                )
+        self.assertTrue(
+            can_use_glm53_triton_sparse_attention(**base, num_tokens=None, num_heads=16)
+        )
+
+        for override in (
+            dict(num_tokens=65537, num_heads=16),
+            dict(num_tokens=131073, num_heads=8),
+            dict(num_tokens=8192, num_heads=16, topk_width=2048),
+            dict(num_tokens=8192, num_heads=16, q_dtype=torch.float32),
+            dict(num_tokens=8192, num_heads=16, q_rope_dim=64),
+            dict(
+                num_tokens=8192,
+                num_heads=16,
+                topk_width=2112,
+                dsa_index_kpool=65,
+            ),
+        ):
+            args = base | override
+            self.assertFalse(can_use_glm53_triton_sparse_attention(**args))
+
+    def test_glm53_2051_prune_selects_the_measured_config(self):
+        from sglang.kernels.ops.attention.dsa import triton_sparse_mla
+
+        named_args = {
+            "topk": 2048 + 4 - 1,
+            "q_nope_ptr": torch.empty(1, 16, 512, device="meta"),
+            "kv_ptr": torch.empty(1, 1, 512, device="meta"),
+        }
+        with patch.object(triton_sparse_mla, "_IS_GFX95", True):
+            configs = triton_sparse_mla._prune_configs(
+                triton_sparse_mla._SPLIT_DIM_CONFIGS,
+                named_args,
+                USE_FP8_DOT=False,
+                H=16,
+                D_V=512,
+                D_TAIL=0,
+            )
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].kwargs["BLOCK_N"], 32)
+        self.assertEqual(configs[0].num_warps, 2)
+        self.assertEqual(configs[0].num_stages, 3)
+
+    def test_query_strides_are_runtime_arguments(self):
+        from sglang.kernels.ops.attention.dsa import (
+            triton_sparse_mla,
+            triton_sparse_mla_decode,
+        )
+
+        for module in (triton_sparse_mla, triton_sparse_mla_decode):
+            source = inspect.getsource(module)
+            for stride in ("STRIDE_QN_T", "STRIDE_QN_H", "STRIDE_QR_T", "STRIDE_QR_H"):
+                self.assertNotIn(f"{stride}: tl.constexpr", source)
+
+    def test_tilelang_remains_an_explicit_tilelang_path(self):
+        from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
+            DeepseekSparseAttnBackendKPoolMixin,
+        )
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        source = inspect.getsource(DeepseekSparseAttnBackend._forward_tilelang)
+        self.assertIn("tilelang_sparse_fwd", source)
+        self.assertNotIn("triton_sparse_mla", source)
+
+        topk_indices = torch.empty(1, 2051, device="meta", dtype=torch.int32)
+        supported = SimpleNamespace(
+            dsa_index_kpool=4, _triton_kpool_tail_supported=True
+        )
+        DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+            supported, topk_indices, "triton", "prefill"
+        )
+        unsupported = SimpleNamespace(
+            dsa_index_kpool=4, _triton_kpool_tail_supported=False
+        )
+        with self.assertRaises(NotImplementedError):
+            DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+                unsupported, topk_indices, "triton", "prefill"
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU required")
@@ -376,51 +481,6 @@ class TestTritonDSAZeroRope(CustomTestCase):
                 self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
                 del q, indices, actual
                 empty_gpu_cache()
-
-    def test_glm53_dispatch_gate_covers_sparse_attention_envelope(self):
-        from sglang.srt.layers.attention.dsa_backend import (
-            _use_glm53_triton_sparse_attention,
-        )
-
-        kv = torch.empty(13_299_712, 1, 512, device="meta", dtype=torch.bfloat16)
-        for tokens, heads in ((1, 8), (1, 16), (65536, 16), (131072, 8)):
-            with self.subTest(tokens=tokens, heads=heads):
-                q = torch.empty(tokens, heads, 512, device="meta", dtype=torch.bfloat16)
-                indices = torch.empty(tokens, 2051, device="meta", dtype=torch.int32)
-                self.assertTrue(_use_glm53_triton_sparse_attention(q, kv, indices, 512))
-
-        q = torch.empty(8192, 16, 512, device="meta", dtype=torch.bfloat16)
-        indices = torch.empty(8192, 2051, device="meta", dtype=torch.int32)
-        self.assertFalse(
-            _use_glm53_triton_sparse_attention(
-                torch.empty(65537, 16, 512, device="meta", dtype=torch.bfloat16),
-                kv,
-                torch.empty(65537, 2051, device="meta", dtype=torch.int32),
-                512,
-            )
-        )
-        self.assertFalse(
-            _use_glm53_triton_sparse_attention(
-                torch.empty(131073, 8, 512, device="meta", dtype=torch.bfloat16),
-                kv,
-                torch.empty(131073, 2051, device="meta", dtype=torch.int32),
-                512,
-            )
-        )
-        self.assertFalse(
-            _use_glm53_triton_sparse_attention(q, kv, indices[:, :2048], 512)
-        )
-        self.assertFalse(
-            _use_glm53_triton_sparse_attention(q.float(), kv, indices, 512)
-        )
-        self.assertFalse(
-            _use_glm53_triton_sparse_attention(
-                q,
-                kv,
-                torch.empty(8192, 2112, device="meta", dtype=torch.int32),
-                512,
-            )
-        )
 
 
 if __name__ == "__main__":

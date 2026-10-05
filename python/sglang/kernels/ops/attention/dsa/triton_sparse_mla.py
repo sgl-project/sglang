@@ -29,12 +29,50 @@ _PREFERRED_BLOCK_K = 64
 _MIN_BLOCK_K = 16
 _INDEX_ELEMENT_SIZE = 4
 _I32_MAX = (1 << 31) - 1
+_IS_GFX95 = is_gfx95_supported()
+_GLM53_DSA_INDEX_TOPK = 2048
+_GLM53_DSA_INDEX_KPOOL = 4
+GLM53_MAX_TOKENS_BY_HEADS = {8: 131072, 16: 65536}
 
 _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
     torch.float8_e4m3fn,
     torch.float8_e4m3fnuz,
 )
+
+
+def can_use_glm53_triton_sparse_attention(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_tokens: int | None,
+    num_heads: int,
+    q_nope_dim: int,
+    q_rope_dim: int,
+    kv_dim: int,
+    d_v: int,
+    topk_width: int,
+    dsa_index_topk: int = _GLM53_DSA_INDEX_TOPK,
+    dsa_index_kpool: int = _GLM53_DSA_INDEX_KPOOL,
+    is_gfx95: bool | None = None,
+) -> bool:
+    """Return whether a shape is inside the validated GLM-5.3 envelope."""
+    max_tokens = GLM53_MAX_TOKENS_BY_HEADS.get(num_heads)
+    natural_topk_width = dsa_index_topk + dsa_index_kpool - 1
+    return (
+        (_IS_GFX95 if is_gfx95 is None else is_gfx95)
+        and q_dtype == torch.bfloat16
+        and kv_dtype == torch.bfloat16
+        and max_tokens is not None
+        and (num_tokens is None or 0 < num_tokens <= max_tokens)
+        and q_nope_dim == 512
+        and q_rope_dim == 0
+        and kv_dim == 512
+        and d_v == 512
+        and dsa_index_topk == _GLM53_DSA_INDEX_TOPK
+        and dsa_index_kpool == _GLM53_DSA_INDEX_KPOOL
+        and topk_width == natural_topk_width
+    )
 
 
 def _validate_input_dtypes(
@@ -271,13 +309,16 @@ def _row_strides(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 def _prune_configs(configs, named_args, **kwargs):
     """Drop wasteful configs and retain the established FP8 search space."""
     topk = named_args["topk"]
-    if (
-        not kwargs["USE_FP8_DOT"]
-        and kwargs["H"] == 16
-        and kwargs["D_V"] == 512
-        and kwargs["D_TAIL"] == 0
-        and topk == 2112
-        and is_gfx95_supported()
+    if can_use_glm53_triton_sparse_attention(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_tokens=named_args["q_nope_ptr"].shape[0],
+        num_heads=kwargs["H"],
+        q_nope_dim=kwargs["D_V"],
+        q_rope_dim=kwargs["D_TAIL"],
+        kv_dim=kwargs["D_V"] + kwargs["D_TAIL"],
+        d_v=kwargs["D_V"],
+        topk_width=topk,
     ):
         return [
             config
@@ -338,10 +379,10 @@ def _sparse_mla_fwd_split_dim_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -616,10 +657,10 @@ def _sparse_mla_fused_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     USE_TOPK_LENGTH: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -812,10 +853,10 @@ def _sparse_mla_split_k_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
