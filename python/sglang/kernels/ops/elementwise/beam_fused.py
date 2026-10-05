@@ -30,6 +30,8 @@ def _fused_attention_gate_kernel(
     gate_ptr,
     bias_ptr,
     hidden_dim: tl.constexpr,
+    gate_row_stride: tl.constexpr,
+    gate_col_stride: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
@@ -42,7 +44,8 @@ def _fused_attention_gate_kernel(
 
     off = row * hidden_dim + offsets
     attn = tl.load(attn_ptr + off, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(gate_ptr + off, mask=mask, other=0.0).to(tl.float32)
+    gate_off = row * gate_row_stride + offsets * gate_col_stride
+    g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
     # As in eager, gate + bias, its sigmoid, and the product round to act_dtype.
     g = (g + b).to(act_dtype).to(tl.float32)
@@ -70,7 +73,6 @@ def fused_attention_gate(
     if attention_output.shape != gate.shape or attention_output.ndim != 2:
         raise ValueError("attention_output and gate must be matching 2-D tensors")
     attention_output = attention_output.contiguous()
-    gate = gate.contiguous()
     hidden_dim = attention_output.shape[1]
     if gate_bias.numel() * head_dim != hidden_dim or not gate_bias.is_contiguous():
         raise ValueError("gate_bias must hold one contiguous entry per local head")
@@ -85,6 +87,8 @@ def fused_attention_gate(
         gate,
         gate_bias,
         hidden_dim=hidden_dim,
+        gate_row_stride=gate.stride(0),
+        gate_col_stride=gate.stride(1),
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
         num_warps=4,
