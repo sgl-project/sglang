@@ -29,11 +29,11 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -723,7 +723,6 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         if self.is_layer_sparse:
@@ -734,6 +733,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                reduce_results=False,
             )
         else:
             if is_dense_ffn_fully_dp():
@@ -749,6 +749,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=config.swiglu_limit,
+                reduce_results=False,
+                allow_fused_down=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -790,7 +792,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(read=residual.attn_readout, update=residual.attn_update),
                 self.input_layernorm,
@@ -809,14 +811,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-                update=residual.ffn_update,
-            )
-            if layer_id != 0
-            else None,
-            terminal=terminal,
         )
 
     def _hc_pre(
@@ -961,13 +955,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        with _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return (hidden_states, topk_indices)
 

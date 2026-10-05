@@ -66,7 +66,7 @@ def _cache():
         sliding_window_size=8,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
-        is_chunk_cache=lambda: False,
+        supports_prefix_sharing=lambda: True,
     )
 
 
@@ -186,7 +186,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
-            is_chunk_cache=lambda: True,
+            supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
         adder = PrefillAdder(
