@@ -80,7 +80,7 @@ class ReqDllmMixin:
             return
 
         if self.dllm_config.requires_separate_context_encoding:
-            self._refresh_fill_ids()
+            self.refresh_fill_ids()
             self.dllm_block_offset = self.seqlen
             if self.dllm_initialized:
                 self.full_untruncated_fill_ids.extend([0] * self.dllm_config.block_size)

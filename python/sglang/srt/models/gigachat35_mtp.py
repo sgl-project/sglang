@@ -18,6 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -64,14 +65,15 @@ class GigaChat35ModelNextN(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        self.decoder = GigaChat35DecoderLayer(
-            config=config,
-            layer_id=0,
-            quant_config=quant_config,
-            prefix=add_prefix("decoder", prefix),
-            alt_stream=self.alt_stream,
-            is_nextn=True,
-        )
+        with layer_stack():
+            self.decoder = GigaChat35DecoderLayer(
+                config=config,
+                layer_id=0,
+                quant_config=quant_config,
+                prefix=add_prefix("decoder", prefix),
+                alt_stream=self.alt_stream,
+                is_nextn=True,
+            )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = build_norm(config, config.hidden_size)

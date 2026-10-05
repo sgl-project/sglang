@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
@@ -14,8 +15,8 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
@@ -66,6 +67,11 @@ pub struct ModelArgs {
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+
+    /// Skip loading a tokenizer; workers tokenize requests. Load-only policies only:
+    /// cache-aware routing, prefix-cache terms or filters, and length buckets require one.
+    #[arg(long, conflicts_with = "tokenizer_path")]
+    pub no_tokenizer: bool,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
     /// Use for worker parser/template overrides or template stop strings.
@@ -128,6 +134,11 @@ pub struct ServerArgs {
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
 
+    /// API key the router sends on its own requests to workers (`/server_info`,
+    /// `/model_info`). Set it to the engines' `--api-key`.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
+
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
@@ -185,6 +196,11 @@ pub struct DiscoveryArgs {
     /// and every replica starts cold.
     #[arg(long)]
     pub kv_peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -205,6 +221,10 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Also pick the DP rank inside each selected multi-rank worker.
+    #[arg(long)]
+    pub dp_aware: bool,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -243,6 +263,12 @@ pub struct CacheArgs {
     /// Prefix-match source: indexer when --kv-indexer-endpoint is set, otherwise radix_tree.
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,
+
+    /// Credit a worker with a prompt's prefix for this many milliseconds after
+    /// routing it there, before the engine's KV events confirm it, so a burst
+    /// sharing a cold prefix lands together. Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_pending_prefix_ttl_ms: Option<u64>,
 
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
@@ -340,9 +366,17 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub stable_pair: bool,
 
-    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
+    /// Affinity mode: reorg prefer (default) or balanced; legacy session strict or soft.
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
+
+    /// Reorg balanced affinity: switch only above this load ratio (>= 1, default 2).
+    #[arg(long)]
+    pub affinity_load_factor: Option<f64>,
+
+    /// Reorg balanced affinity: minimum waiting uncached token difference (default 1024).
+    #[arg(long)]
+    pub affinity_load_gap: Option<u64>,
 
     /// Session lookup mode (--policy session_aware). Defaults to bucket (search the target bucket).
     #[arg(long, value_enum)]
@@ -384,21 +418,55 @@ pub struct AffinityArgs {
 
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
-    pub fn into_config(self) -> Result<Config> {
-        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+    pub fn into_config(mut self) -> Result<Config> {
+        let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
+        if reorg {
             ensure!(
-                self.affinity.affinity_mode != Some(AffinityMode::Soft),
-                "reorg sessions do not support --affinity-mode soft"
+                self.affinity.affinity_mode.is_none_or(|mode| matches!(
+                    mode,
+                    AffinityMode::Prefer | AffinityMode::Balanced
+                )),
+                "reorg --affinity-mode must be prefer or balanced"
             );
             ensure!(
-                self.routing.policy != PolicyKind::SessionAware
-                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                self.affinity.pressure_abs_threshold_tokens.is_none()
                         && self.affinity.pressure_abs_threshold_ms.is_none()
                         && self.affinity.pressure_rel_threshold.is_none()
-                        && !self.affinity.disable_pressure_guard),
-                "reorg pressure guard options only apply to cache_aware"
+                        && !self.affinity.disable_pressure_guard
+                        && self.cache.worker_queue_limit.is_none()
+                        && self.cache.saturation_queue_floor.is_none()
+                        && self.cache.cache_switch_margin_tokens.is_none(),
+                "reorg uses --affinity-mode and --affinity-load-* instead of pressure guards and cache queue gates"
+            );
+            if matches!(
+                self.routing.policy,
+                PolicyKind::SessionAware | PolicyKind::CacheAware
+            ) {
+                self.affinity
+                    .affinity_mode
+                    .get_or_insert(AffinityMode::Prefer);
+            }
+        } else {
+            ensure!(
+                self.affinity
+                    .affinity_mode
+                    .is_none_or(|mode| matches!(mode, AffinityMode::Strict | AffinityMode::Soft))
+                    && self.affinity.affinity_load_factor.is_none()
+                    && self.affinity.affinity_load_gap.is_none(),
+                "prefer, balanced and --affinity-load-* require --chat-routing reorg"
+            );
+            ensure!(
+                self.affinity.affinity_mode.is_none()
+                    || self.routing.policy == PolicyKind::SessionAware,
+                "legacy --affinity-mode requires --policy session_aware"
             );
         }
+        ensure!(
+            (self.affinity.affinity_load_factor.is_none()
+                && self.affinity.affinity_load_gap.is_none())
+                || self.affinity.affinity_mode == Some(AffinityMode::Balanced),
+            "--affinity-load-* require --affinity-mode balanced"
+        );
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -461,22 +529,30 @@ impl Cli {
             .context("--default-chat-template-kwargs must be a JSON object")?
             .unwrap_or_default();
 
+        let worker_auth = self
+            .server
+            .worker_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
+                worker_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
@@ -485,6 +561,7 @@ impl Cli {
                 },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -532,9 +609,10 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
                 );
                 // Peer replicas are found through EndpointSlices too, so with
                 // any other backend the flag would be accepted and then
@@ -554,6 +632,17 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self.pd_version_group_label;
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.trim().is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
                 // An empty selector matches every EndpointSlice in the watched
                 // namespace(s), turning unrelated Services into "siblings".
                 ensure!(
@@ -567,6 +656,7 @@ impl DiscoveryArgs {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector,
+                    version_group_label,
                 })
             }
         };
@@ -687,6 +777,16 @@ impl CacheArgs {
             self.kv_indexer_query_max_inflight.is_none() || self.kv_indexer_endpoint.is_some(),
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms != Some(0),
+            "--cache-pending-prefix-ttl-ms must be greater than zero"
+        );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms.is_none()
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -724,6 +824,7 @@ impl CacheArgs {
                 .kv_bootstrap_fetch_timeout_cap_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
+            pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
         }))
     }
 }
@@ -739,12 +840,15 @@ impl AffinityArgs {
             || self.session_idle_secs.is_some()
             || self.session_eviction_interval_secs.is_some()
             || self.stable_pair
-            || self.affinity_mode.is_some()
             || self.session_affinity_mode.is_some();
         ensure!(
             !tuned_session_affinity || policy == PolicyKind::SessionAware,
-            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+            "--session-id-header, --session-*-secs, --stable-pair, and \
                  --session-affinity-mode require --policy session_aware"
+        );
+        ensure!(
+            self.affinity_mode.is_none() || affinity_policy,
+            "--affinity-mode requires --policy session_aware or cache_aware"
         );
         ensure!(
             !self.disable_pressure_guard || affinity_policy,
@@ -800,6 +904,11 @@ impl AffinityArgs {
             return Ok(None);
         }
         let defaults = AffinityConfig::default();
+        let load_factor = self.affinity_load_factor.unwrap_or(defaults.load_factor);
+        ensure!(
+            load_factor.is_finite() && load_factor >= 1.0,
+            "--affinity-load-factor must be finite and at least 1"
+        );
         let session_id_header = self
             .session_id_header
             .clone()
@@ -867,6 +976,8 @@ impl AffinityArgs {
             session_eviction_interval_secs,
             stable_pair: self.stable_pair,
             mode: self.affinity_mode.unwrap_or(defaults.mode),
+            load_factor,
+            load_gap: self.affinity_load_gap.unwrap_or(defaults.load_gap),
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -951,11 +1062,19 @@ fn join_selector(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(","))
 }
 
+/// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
+fn bearer(key: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+        .context("--worker-api-key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
 
@@ -984,13 +1103,13 @@ mod tests {
         let cache = parse(&[
             "--policy",
             "cache_aware",
-            "--worker-queue-limit",
-            "3",
+            "--affinity-mode",
+            "balanced",
             "--kv-indexer-endpoint",
             "http://localhost:50051",
         ])
         .unwrap();
-        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert_eq!(cache.model.affinity.unwrap().mode, AffinityMode::Balanced);
         assert!(cache
             .model
             .cache_aware
@@ -1024,6 +1143,7 @@ mod tests {
             vec!["--policy", "session_aware", "--affinity-mode", "soft"],
             vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
             vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec!["--policy", "cache_aware", "--worker-queue-limit", "3"],
             vec![
                 "--filter",
                 "prefix_cache",
@@ -1032,6 +1152,28 @@ mod tests {
             ],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn reorg_affinity_modes_share_validated_load_settings() {
+        for policy in ["session_aware", "cache_aware"] {
+            let base = format!("--chat-routing reorg --policy {policy}");
+            assert_eq!(
+                cfg_of(&base).unwrap().model.affinity.unwrap().mode,
+                AffinityMode::Prefer
+            );
+            for factor in ["1", "2", "0.5", "NaN", "inf"] {
+                let result = cfg_of(&format!("{base} --affinity-mode balanced --affinity-load-factor {factor} --affinity-load-gap 10"));
+                assert_eq!(result.is_ok(), matches!(factor, "1" | "2"));
+                if let Ok(config) = result {
+                    let affinity = config.model.affinity.unwrap();
+                    assert_eq!(affinity.load_factor, factor.parse::<f64>().unwrap());
+                    assert_eq!(affinity.load_gap, 10);
+                }
+            }
+            assert!(cfg_of(&format!("{base} --affinity-load-gap 10")).is_err());
+            assert!(cfg_of(&format!("--policy {policy} --affinity-mode balanced")).is_err());
         }
     }
 
@@ -1195,7 +1337,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1209,7 +1351,25 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn no_tokenizer_disables_loading_and_conflicts_with_a_path() {
+        let base = ["--model-id", "qwen3", "--worker-urls", "http://x:30000"];
+        let c = into_config(&[&base[..], &["--no-tokenizer"]].concat()).unwrap();
+        assert_eq!(c.model.tokenizer_path, None);
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--tokenizer-path", "/t.json"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1566,6 +1726,69 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn pd_version_group_label_reaches_k8s_config() {
+        let args: Vec<_> = PD_K8S
+            .iter()
+            .copied()
+            .chain(["--pd-version-group-label", "sglang.ai/version-group"])
+            .collect();
+        let config = into_config_owned(with_model(&args)).unwrap();
+        let DiscoveryBackend::K8s(discovery) = config.discovery else {
+            panic!("expected k8s")
+        };
+        assert_eq!(
+            discovery.version_group_label.as_deref(),
+            Some("sglang.ai/version-group")
+        );
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 
@@ -2573,6 +2796,24 @@ mod tests {
             .expect("native cache-aware needs its default configuration");
         assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
         assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn pending_prefix_ttl_needs_the_local_radix_tree() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(cache.pending_prefix_ttl_ms, 500);
+        for args in [
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 0",
+            "--policy power_of_two --cache-pending-prefix-ttl-ms 500",
+            "--policy cache_aware --kv-indexer-endpoint http://i:1 --cache-pending-prefix-ttl-ms 500",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-ttl-ms"), "{args}: {err}");
+        }
     }
 
     #[test]
