@@ -126,6 +126,31 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
+        Self::openai_inner(ctx, path, model, fields, headers, body, policy_needs_request_tokens, true)
+    }
+
+    pub(super) fn openai_grpc(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        fields: RoutingFields,
+        headers: &HeaderMap,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+    ) -> Result<Self, ApiError> {
+        Self::openai_inner(ctx, path, model, fields, headers, body, policy_needs_request_tokens, false)
+    }
+
+    pub(super) fn openai_inner(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        fields: RoutingFields,
+        headers: &HeaderMap,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+        lower: bool,
+    ) -> Result<Self, ApiError> {
         // The fleet's sampling contract applies to the client's body on both routes.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
@@ -134,7 +159,7 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
-        let lowered = lower_openai(ctx, path, &model, headers, &with_defaults);
+        let lowered = if lower { lower_openai(ctx, path, &model, headers, &with_defaults) } else { Err(InputIdsForwarding::Disabled) };
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
         if let Ok((mut generate, responder)) = lowered {

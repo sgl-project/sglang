@@ -23,7 +23,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
+use crate::proxy::grpc::GrpcResponse;
+use crate::server::metrics::RequestLogContext;
+use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
     COMPLETIONS_PATH, EMBEDDINGS_PATH,
@@ -75,6 +77,22 @@ async fn openai_route(
     let tokens = routing.needs_request_tokens(ctx);
     let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;
     routing.dispatch(ctx, request, headers, start).await
+}
+
+pub async fn chat_completions_grpc(ctx: &AppContext, headers: HeaderMap, body: Bytes) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
+    let start = Instant::now();
+    let prepared = async {
+        let fields = parse_routing_fields(&body)?;
+        let model = ModelId(fields.model.clone().ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
+        let routing = ModelRouting::lookup(ctx, &model)?;
+        let request = PreparedRequest::openai_grpc(ctx, CHAT_PATH, model, fields, &headers, body, routing.needs_request_tokens(ctx))?;
+        let workers = routing.select_workers(ctx, &request, &headers, &[]).await?;
+        Ok::<_, ApiError>((request, workers))
+    }.await;
+    match prepared {
+        Ok((mut request, workers)) => forward_request_grpc(ctx, &mut request, workers, headers, start).await,
+        Err(error) => (Err(error), None),
+    }
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
