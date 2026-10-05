@@ -707,7 +707,8 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
-        mr.attn_backend.init_forward_metadata(forward_batch)
+        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+            mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
             mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
