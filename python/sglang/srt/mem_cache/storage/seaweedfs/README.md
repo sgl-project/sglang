@@ -71,10 +71,16 @@ Objects are named `<prefix>/<model>/<rank scope>/<page hash>`:
 
 Instances share cache entries only when the model name and parallel layout match.
 
+Hybrid models (Mamba, SWA, DeepSeek V4 and other side pools) store each side-pool page next to
+its KV page as `<page hash>.<pool>`. KV pages keep the same names on both interfaces, so one
+cache serves both.
+
 ## Behaviour and limits
 
 - The backend uses the zero-copy HiCache interface: pages move directly between SeaweedFS and the
   host KV pool's own buffers, without a staging page.
+- Hybrid models use the v2 interface (`batch_exists_v2`, `batch_get_v2`, `batch_set_v2`). A side
+  pool with the `trailing_pages` policy only needs the pages in its window to be present.
 - A prefetch stops at the first missing page. Pages after a miss are not loaded.
 - An object whose size does not match the host page is treated as a miss and never copied.
 - `clear()` deletes only the calling rank's objects. Other models and ranks sharing the bucket are

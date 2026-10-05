@@ -23,6 +23,9 @@ from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage import backend_factory
@@ -282,6 +285,116 @@ class TestSeaweedFSStore(CustomTestCase):
         reader = self._store(tp_rank=1, tp_size=2, is_mla=True)
         writer.set("shared", torch.full((64,), 3, dtype=torch.uint8))
         self.assertTrue(reader.exists("shared"))
+
+    # ---- v2 interface (hybrid models): KV plus a side pool -----------------
+    # A second real host pool stands in for the side pool (Mamba/SWA/indexer):
+    # the backend only touches it through the host-pool page API, so what this
+    # proves is the per-pool object naming, routing and hit policies.
+
+    def _v2_store(self, layout="page_first"):
+        store = self._store()
+        kv, side = _host_pool(layout), _host_pool(layout)
+        store.register_mem_host_pool_v2(kv, PoolName.KV)
+        store.register_mem_host_pool_v2(side, PoolName.MAMBA)
+        for pool in (kv, side):
+            pool.kv_buffer.copy_(torch.randn(pool.kv_buffer.shape).to(torch.bfloat16))
+        keys = [f"v2-{uuid.uuid4().hex[:8]}-{i}" for i in range(NUM_PAGES)]
+        indices = torch.arange(NUM_PAGES * PAGE_SIZE, dtype=torch.int64)
+        transfers = [
+            PoolTransfer(name=PoolName.KV, host_indices=indices, keys=keys),
+            PoolTransfer(name=PoolName.MAMBA, host_indices=indices, keys=keys),
+        ]
+        return store, kv, side, keys, transfers
+
+    def test_v2_round_trip_is_bit_exact_per_pool(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                store, kv, side, keys, transfers = self._v2_store(layout)
+                expected = {
+                    p: [_page(pool, i) for i in range(NUM_PAGES)]
+                    for p, pool in ((PoolName.KV, kv), (PoolName.MAMBA, side))
+                }
+                written = store.batch_set_v2(transfers)
+                self.assertEqual(written[PoolName.KV], [True] * NUM_PAGES)
+                self.assertEqual(written[PoolName.MAMBA], [True] * NUM_PAGES)
+                kv.kv_buffer.zero_()
+                side.kv_buffer.zero_()
+                loaded = store.batch_get_v2(transfers)
+                for p, pool in ((PoolName.KV, kv), (PoolName.MAMBA, side)):
+                    self.assertEqual(loaded[p], [True] * NUM_PAGES)
+                    for i in range(NUM_PAGES):
+                        self.assertTrue(torch.equal(_page(pool, i), expected[p][i]))
+
+    def test_v2_kv_pages_are_the_v1_objects(self):
+        # KV pages keep their v1 object names, so v1 and v2 share one cache;
+        # side-pool pages are separate objects and never overwrite them.
+        store, kv, side, keys, transfers = self._v2_store()
+        store.register_mem_pool_host(kv)  # the v1 path reads through this pool
+        store.batch_set_v2(transfers)
+        self.assertEqual(store.batch_exists(keys), NUM_PAGES)
+        self.assertEqual(store.batch_exists([f"{k}.mamba" for k in keys]), NUM_PAGES)
+        self.assertEqual(
+            store.batch_get_v1(keys, transfers[0].host_indices), [True] * NUM_PAGES
+        )
+
+    def test_v2_exists_all_pages_stops_at_a_missing_side_page(self):
+        store, _, _, keys, transfers = self._v2_store()
+        store.batch_set_v2(transfers)
+        store._s3.delete_object(
+            Bucket=self.bucket, Key=store._object_key(f"{keys[2]}.mamba")
+        )
+        side = PoolTransfer(
+            name=PoolName.MAMBA, keys=keys, hit_policy=PoolHitPolicy.ALL_PAGES
+        )
+        result = store.batch_exists_v2(keys, [side])
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(
+            result.extra_pool_hit_pages, {PoolName.KV: NUM_PAGES, PoolName.MAMBA: 2}
+        )
+
+    def test_v2_exists_trailing_pages_needs_only_the_window(self):
+        store, _, _, keys, transfers = self._v2_store()
+        store.batch_set_v2(transfers)
+        # Only the last page's side state matters for a one-page window, so a
+        # gap earlier in the side pool does not shorten the prefix...
+        store._s3.delete_object(
+            Bucket=self.bucket, Key=store._object_key(f"{keys[0]}.mamba")
+        )
+        window = PoolTransfer(
+            name=PoolName.MAMBA, keys=keys[-1:], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        self.assertEqual(store.batch_exists_v2(keys, [window]).kv_hit_pages, NUM_PAGES)
+        # ...but losing the last page's state falls back to the longest prefix
+        # whose own last page still has it.
+        store._s3.delete_object(
+            Bucket=self.bucket, Key=store._object_key(f"{keys[-1]}.mamba")
+        )
+        result = store.batch_exists_v2(keys, [window])
+        self.assertEqual(result.kv_hit_pages, NUM_PAGES - 1)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], NUM_PAGES - 1)
+
+    def test_v2_exists_without_kv_prefix_is_empty(self):
+        store, _, _, keys, _ = self._v2_store()
+        side = PoolTransfer(name=PoolName.MAMBA, keys=keys)
+        result = store.batch_exists_v2(keys, [side])
+        self.assertEqual((result.kv_hit_pages, result.extra_pool_hit_pages), (0, {}))
+
+    def test_v2_rejects_mismatched_indices_and_unknown_pools(self):
+        store, _, _, keys, _ = self._v2_store()
+        short = torch.arange(PAGE_SIZE, dtype=torch.int64)  # one page for four keys
+        bad = [
+            PoolTransfer(name=PoolName.KV, host_indices=short, keys=keys),
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=torch.arange(NUM_PAGES * PAGE_SIZE),
+                keys=keys,
+            ),
+        ]
+        for op in (store.batch_set_v2, store.batch_get_v2):
+            result = op(bad)
+            self.assertEqual(result[PoolName.KV], [False] * NUM_PAGES)
+            self.assertEqual(result[PoolName.SWA], [False] * NUM_PAGES)
+        self.assertEqual(store.batch_exists(keys), 0)
 
     def test_missing_endpoint_is_refused(self):
         with self.assertRaises(ValueError):

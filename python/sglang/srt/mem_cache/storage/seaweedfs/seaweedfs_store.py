@@ -19,7 +19,7 @@ import ctypes
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import msgspec
 import torch
@@ -28,6 +28,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -289,6 +293,113 @@ class SeaweedFSStore(HiCacheStorage):
             for key, buffers in zip(keys, pages)
         ]
         return [f.result() for f in futures]
+
+    # Hybrid models (Mamba, SWA, DeepSeek V4 indexer and other side pools) go
+    # through the v2 interface. Side-pool pages are stored next to their KV page
+    # as "<key>.<pool>"; KV pages keep the same object names as v1, so a cache
+    # written by either path is readable by the other.
+
+    def _component_key(self, key: str, pool_name) -> str:
+        name = getattr(pool_name, "value", pool_name)
+        return key if name == PoolName.KV.value else f"{key}.{name}"
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count: Dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            futures = [
+                self._executor.submit(
+                    self.exists, self._component_key(keys[i], transfer.name)
+                )
+                for i in range(kv_pages)
+            ]
+            present = [f.result() for f in futures]
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = next((i for i, ok in enumerate(present) if not ok), kv_pages)
+            else:  # TRAILING_PAGES: only the window ending at the prefix must exist
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = next(
+                    (
+                        n
+                        for n in range(kv_pages, 0, -1)
+                        if all(present[max(0, n - trailing) : n])
+                    ),
+                    0,
+                )
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _read_page_v2(self, pool_name, key: str, host_pool, offset: int) -> bool:
+        page = host_pool.get_dummy_flat_data_page()
+        if self.get(self._component_key(key, pool_name), page) is None:
+            return False
+        host_pool.set_from_flat_data_page(offset, page)
+        return True
+
+    def _write_page_v2(self, pool_name, key: str, host_pool, offset: int) -> bool:
+        page = host_pool.get_data_page(offset, flat=True)
+        return self.set(self._component_key(key, pool_name), page)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], page_fn):
+        results: Dict[str, List[bool]] = {}
+        pending = []
+        for transfer in transfers:
+            keys = transfer.keys or []
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            if host_pool is None:
+                logger.error("SeaweedFS: host pool %s is not registered", transfer.name)
+                results[transfer.name] = [False] * len(keys)
+                continue
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            indices = transfer.host_indices
+            if indices is None or indices.numel() != len(keys) * page_size:
+                logger.error(
+                    "SeaweedFS: %s has %d keys but %s host indices (page size %d)",
+                    transfer.name,
+                    len(keys),
+                    indices.numel() if indices is not None else 0,
+                    page_size,
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+            futures = [
+                self._executor.submit(
+                    page_fn,
+                    transfer.name,
+                    key,
+                    host_pool,
+                    indices[i * page_size].item(),
+                )
+                for i, key in enumerate(keys)
+            ]
+            pending.append((transfer.name, futures))
+        for name, futures in pending:
+            results[name] = [f.result() for f in futures]
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> Dict[str, List[bool]]:
+        return self._batch_io_v2(transfers, self._read_page_v2)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> Dict[str, List[bool]]:
+        return self._batch_io_v2(transfers, self._write_page_v2)
 
     def exists(self, key: str) -> bool:
         try:
