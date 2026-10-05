@@ -1208,6 +1208,14 @@ class Engine(EngineScoreMixin, EngineBase):
                     get_serving().port,
                     get_observability().enable_metrics,
                 )
+            elif not (
+                get_serving().skip_server_warmup or get_exec().moe.is_ep_scale_joiner
+            ):
+                # Each Rust listener reports healthy only after its own startup
+                # warmup, and node 0 warms only its own listeners.
+                from sglang.srt.entrypoints.http_server import _execute_server_warmup
+
+                _execute_server_warmup(server_args)
 
             scheduler_init_result.block_until_scheduler_exits()
             return (
@@ -1974,19 +1982,29 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
 
 def node_hosts_rust_server() -> bool:
     """Whether this node contains a Rust listener rank, assuming Rust mode."""
+    return bool(rust_listener_ports_on_node())
+
+
+def rust_listener_ports_on_node() -> List[int]:
+    """Ports of this node's Rust listeners, assuming Rust mode.
+
+    Each attention DP group hosts a listener on its first rank (CP=TP=0), at the
+    base port plus the group's index within this node, as `RustServer.launch`
+    binds it.
+    """
     parallel = get_parallel()
-    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    pp_rank_range, tp_rank_range, _, tp_size_per_node = _calculate_rank_ranges(
+        parallel.node_rank
+    )
     if 0 not in pp_rank_range:
-        return False
-
+        return []
     if get_exec().moe.is_ep_scale_joiner:
-        # Scale joiners launch the full local TP group, including its first rank.
-        return True
-
-    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+        # Scale joiners launch the full local TP group.
+        tp_rank_range = range(parallel.tp_size)
+        tp_size_per_node = parallel.tp_size
     ranks_per_dp_group = parallel.attn_tp_size * parallel.attn_cp_size
-    for tp_rank in tp_rank_range:
-        rank_within_dp_group = tp_rank % ranks_per_dp_group
-        if rank_within_dp_group == 0:
-            return True
-    return False
+    return [
+        get_serving().port + (tp_rank % tp_size_per_node) // ranks_per_dp_group
+        for tp_rank in tp_rank_range
+        if tp_rank % ranks_per_dp_group == 0
+    ]
