@@ -19,12 +19,14 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -401,11 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
-        self._tp_sync = SpecTpSync(
-            get_parallel().attn_tp_group
-            if get_parallel().attn_dp_enabled
-            else get_parallel().tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
@@ -1950,9 +1948,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            # The draft pool is static, so its slot ids are physical.
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                ctx_cache_loc,
+                KVWriteLoc(ctx_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -1991,7 +1990,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    ctx_cache_loc,
+                    KVWriteLoc(ctx_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2523,6 +2522,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
