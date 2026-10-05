@@ -36,6 +36,8 @@ class TestLongcatShortcut(CustomTestCase):
             prepare_attn=lambda h, r, batch: (h, r),
             prepare_mlp=lambda h, r, batch: (fork_hidden, fork_residual),
             branch_rows=lambda batch: (local, local, attention),
+            # Each rank's own tokens: the MoE output owes no sum.
+            path_for=lambda batch: SimpleNamespace(output=comm.OutputContract(local)),
         )
         dense_communicator = Communicator(
             branch_rows=lambda batch: (attention, attention, attention)

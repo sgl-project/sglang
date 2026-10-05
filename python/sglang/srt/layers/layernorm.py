@@ -529,6 +529,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 
 
 class RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -579,6 +582,12 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
+        projection that consumes this norm's output, whenever forward_cuda can.
+        The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -586,6 +595,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
