@@ -555,6 +555,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     @staticmethod
     def validate_block_quant_shapes(
+        layer: torch.nn.Module,
         quant_config,
         input_size: int,
         input_size_per_partition: int,
@@ -573,7 +574,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
-            tp_size = get_parallel().tp_size
+            tp_size = getattr(layer, "tp_size", 1)
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -623,6 +624,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
             Fp8LinearMethod.validate_block_quant_shapes(
+                layer,
                 quant_config,
                 input_size,
                 input_size_per_partition,
@@ -1433,7 +1435,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
-        tp_size = get_parallel().tp_size
+        tp_size = layer.moe_tp_size
         w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
