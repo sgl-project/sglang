@@ -79,20 +79,23 @@ class DeprecatedStoreTrueAction(argparse.Action):
         option_strings,
         dest,
         new_flag=None,
+        additional_guidance=None,
         nargs=0,
         const=True,
         default=False,
         **kwargs,
     ):
         self.new_flag = new_flag
+        self.additional_guidance = additional_guidance
         super().__init__(
             option_strings, dest, nargs=nargs, const=const, default=default, **kwargs
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
         replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        guidance = f" {self.additional_guidance}" if self.additional_guidance else ""
         print_deprecated_warning(
-            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}{guidance}"
         )
         setattr(namespace, self.dest, True)
 
