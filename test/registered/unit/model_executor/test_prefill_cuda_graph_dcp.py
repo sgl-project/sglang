@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     set_tc_piecewise_forward_context,
 )
@@ -50,6 +51,7 @@ def _batch(num_tokens, prefix_lens):
         capture_hidden_mode=CaptureHiddenMode.NULL,
         global_num_tokens_cpu=None,
         return_logprob=False,
+        contains_mm_inputs=lambda: False,
         extend_prefix_lens_cpu=prefix_lens,
         extend_prefix_lens=torch.tensor(prefix_lens),
         seq_lens=torch.tensor([num_tokens]),
@@ -67,6 +69,7 @@ def _runner(dcp_active):
     runner.capture_hidden_mode = CaptureHiddenMode.NULL
     runner.max_num_tokens = 32
     runner.capture_num_tokens = [8]
+    runner.max_context_size = None
     runner.backend = SimpleNamespace()
     runner.prefill_backend_name = Backend.BREAKABLE
     runner.has_mha_companion_layers = False
@@ -92,7 +95,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
     def test_replay_reuses_the_captured_gather_buffer(self):
         runner = _runner(dcp_active=True)
         captured = torch.full((8, 1, KV_LORA_RANK + ROPE_DIM), 7.0)
-        runner._dcp_kv_buffers[8] = captured
+        runner._dcp_kv_buffers[ShapeKey(size=8)] = captured
         planned = []
 
         def plan(*args):
@@ -115,7 +118,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
         )
         live = _batch(5, [0])
         static = _batch(8, [0])
-        runner._prepare_forward_metadata_for_replay(live, static, num_tokens=8)
+        runner._prepare_forward_metadata_for_replay(live, static, ShapeKey(size=8))
 
         self.assertEqual(len(planned), 1)
         self.assertIs(static.attn_dcp_metadata, live.attn_dcp_metadata)
