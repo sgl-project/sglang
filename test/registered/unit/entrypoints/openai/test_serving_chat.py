@@ -23,6 +23,8 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -106,6 +108,26 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
         {%- endfor -%}
     {%- endfor -%}
 {%- endfor -%}
+"""
+
+_PRESERVED_REASONING_TEMPLATE = """
+{%- for message in messages -%}
+    {{- message.role + ':' -}}
+    {%- if message.role == 'assistant' -%}
+        {%- if message.reasoning_content is not string -%}
+            {{- raise_exception('Assistant thinking fields must be strings') -}}
+        {%- endif -%}
+        {{- '<ifm|think>\n' + message.reasoning_content + '</ifm|think>' -}}
+    {%- endif -%}
+    {{- message.content -}}
+    {%- for call in message.tool_calls or [] -%}
+        {{- '[' + call.function.name + ']' -}}
+    {%- endfor -%}
+    {{- '\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- 'assistant:<ifm|think>' -}}
+{%- endif -%}
 """
 
 
@@ -4280,6 +4302,226 @@ class ServingChatTestCase(CustomTestCase):
         self.chat.chat_encoding_spec = None
         kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
+
+    def _use_preserved_reasoning_template(self):
+        tokenizer = Tokenizer(
+            models.BPE(
+                vocab={
+                    char: index
+                    for index, char in enumerate(
+                        sorted(pre_tokenizers.ByteLevel.alphabet())
+                    )
+                },
+                merges=[],
+            )
+        )
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+        self.tm.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, chat_template=_PRESERVED_REASONING_TEMPLATE
+        )
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.force_reasoning = True
+        self.chat.reasoning_parser = "k2_horizon"
+        self.chat.tool_call_parser = "k2_horizon"
+
+    def _assert_empty_reasoning_replays(self, message):
+        self.assertIn("reasoning_content", message)
+        self.assertEqual(message["reasoning_content"], "")
+        history = [{"role": "user", "content": "Hi?"}, message]
+        if message.get("tool_calls"):
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message["tool_calls"][0]["id"],
+                    "content": "42",
+                }
+            )
+        else:
+            history.append({"role": "user", "content": "Continue"})
+        request = ChatCompletionRequest(model="x", messages=history)
+        processed = self.chat._apply_jinja_template(request, None, False)
+        prompt = self.tm.tokenizer.decode(processed.prompt_ids)
+        self.assertIn("assistant:<ifm|think>\n</ifm|think>", prompt)
+        expected = self.tm.tokenizer.apply_chat_template(
+            history, tokenize=False, add_generation_prompt=True
+        )
+        self.assertEqual(prompt, expected)
+
+    def test_empty_reasoning_response_replays(self):
+        """An assistant reply with empty thinking must remain replayable as history."""
+        self._use_preserved_reasoning_template()
+        tool = {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+        for effort, terminator in (
+            ("high", "</ifm|think>"),
+            ("medium", "</ifm|think_fast>"),
+            ("low", "</ifm|think_faster>"),
+        ):
+            for tool_only in (False, True):
+                with self.subTest(effort=effort, tool_only=tool_only):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        reasoning_effort=effort,
+                        tools=[tool] if tool_only else None,
+                    )
+                    ret = _spec_result(0)
+                    ret["text"] = terminator + (
+                        '<ifm|tool_call>{"name":"lookup","arguments":{}}</ifm|tool_call>'
+                        if tool_only
+                        else "Hello"
+                    )
+                    response = self.chat._build_chat_response(
+                        request, [ret], created=123
+                    )
+                    message = json.loads(response.model_dump_json())["choices"][0][
+                        "message"
+                    ]
+                    self.assertEqual(message["content"], "" if tool_only else "Hello")
+                    if tool_only:
+                        self.assertEqual(
+                            message["tool_calls"][0]["function"]["name"], "lookup"
+                        )
+                    self._assert_empty_reasoning_replays(message)
+
+    def test_empty_stream_reasoning_response_replays_each_choice(self):
+        """Stream collectors must retain empty thinking for every assistant choice."""
+        self._use_preserved_reasoning_template()
+        request = self.stream_req.model_copy(update={"n": 2})
+
+        async def generate():
+            for text in ("</ifm|thi", "</ifm|think>Hello"):
+                for index in range(request.n):
+                    ret = _spec_result(index)
+                    ret["text"] = text
+                    if text == "</ifm|thi":
+                        ret["meta_info"]["finish_reason"] = None
+                    yield ret
+
+        self.tm.generate_request.return_value = generate()
+        chunks = self._parse_chunks(self._run_chat_stream(None, request))
+        self.assertFalse(any("error" in chunk for chunk in chunks))
+        for index in range(request.n):
+            deltas = [
+                choice["delta"]
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+                if choice["index"] == index
+            ]
+            message = {"role": "assistant", "content": ""}
+            for delta in deltas:
+                for field in ("content", "reasoning_content"):
+                    if delta.get(field) is not None:
+                        message[field] = message.get(field, "") + delta[field]
+            self.assertEqual(message["content"], "Hello")
+            self._assert_empty_reasoning_replays(message)
+
+    def test_empty_stream_reasoning_tool_response_replays(self):
+        """A streamed tool-only assistant turn must preserve its empty thinking field."""
+        self._use_preserved_reasoning_template()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}},
+                }
+            ],
+        )
+
+        async def generate():
+            ret = _spec_result(0)
+            ret["text"] = (
+                '</ifm|think><ifm|tool_call>{"name":"lookup","arguments":{}}'
+                "</ifm|tool_call>"
+            )
+            yield ret
+
+        self.tm.generate_request.return_value = generate()
+        chunks = self._parse_chunks(self._run_chat_stream(None, request))
+        self.assertFalse(any("error" in chunk for chunk in chunks))
+        choices = [choice for chunk in chunks for choice in chunk.get("choices", [])]
+        deltas = [choice["delta"] for choice in choices]
+        message = {"role": "assistant", "content": ""}
+        for delta in deltas:
+            for field in ("content", "reasoning_content"):
+                if delta.get(field) is not None:
+                    message[field] = message.get(field, "") + delta[field]
+        calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+        self.assertEqual(message["content"], "")
+        self.assertEqual(choices[-1]["finish_reason"], "tool_calls")
+        message["tool_calls"] = [
+            {
+                "id": next(call["id"] for call in calls if call.get("id")),
+                "type": "function",
+                "function": {
+                    "name": next(
+                        call["function"]["name"]
+                        for call in calls
+                        if call["function"].get("name")
+                    ),
+                    "arguments": "".join(
+                        call["function"].get("arguments") or "" for call in calls
+                    ),
+                },
+            }
+        ]
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "lookup")
+        self.assertEqual(
+            json.loads(message["tool_calls"][0]["function"]["arguments"]), {}
+        )
+        self._assert_empty_reasoning_replays(message)
+
+    def test_unparsed_reasoning_remains_null(self):
+        """Disabling reasoning separation must not claim that thinking was preserved."""
+        for parser, separate_reasoning in ((None, True), ("k2_horizon", False)):
+            with self.subTest(parser=parser, separate_reasoning=separate_reasoning):
+                self.chat.reasoning_parser = parser
+                request = self.basic_req.model_copy(
+                    update={"separate_reasoning": separate_reasoning}
+                )
+                response = self.chat._build_chat_response(
+                    request, [_spec_result(0)], created=123
+                )
+                self.assertIsNone(response.choices[0].message.reasoning_content)
+                request.stream = True
+
+                async def generate():
+                    yield _spec_result(0)
+
+                self.tm.generate_request.return_value = generate()
+                chunks = self._parse_chunks(self._run_chat_stream(None, request))
+                self.assertFalse(any("error" in chunk for chunk in chunks))
+                self.assertTrue(
+                    all(
+                        choice["delta"].get("reasoning_content") is None
+                        for chunk in chunks
+                        for choice in chunk.get("choices", [])
+                    )
+                )
+
+    def test_missing_reasoning_history_still_rejected(self):
+        """Missing thinking history must not be silently replaced with empty thinking."""
+        self._use_preserved_reasoning_template()
+        for reasoning in ({}, {"reasoning_content": None}):
+            with self.subTest(reasoning=reasoning):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Hi?"},
+                        {"role": "assistant", "content": "Hello", **reasoning},
+                        {"role": "user", "content": "Continue"},
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "thinking fields must be strings"
+                ):
+                    self.chat._apply_jinja_template(request, None, False)
 
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
