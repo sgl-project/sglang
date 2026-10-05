@@ -18,6 +18,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Callable, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -387,7 +388,7 @@ def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bo
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-class ExitDecision:
+class ExitDecision(msgspec.Struct, frozen=True):
     """One decision for an FFN output, made before compute runs.
 
     Fields:
@@ -399,17 +400,9 @@ class ExitDecision:
     Do not independently reselect completion after compute has run.
     """
 
-    __slots__ = ("defer_moe_finalize", "sum_in_reduce_scatter", "complete")
-
-    def __init__(
-        self,
-        defer_moe_finalize: bool,
-        sum_in_reduce_scatter: bool,
-        complete: Callable[[torch.Tensor, torch.Tensor], Tuple],
-    ):
-        self.defer_moe_finalize = defer_moe_finalize
-        self.sum_in_reduce_scatter = sum_in_reduce_scatter
-        self.complete = complete
+    defer_moe_finalize: bool
+    sum_in_reduce_scatter: bool
+    complete: Callable[[torch.Tensor, torch.Tensor], Tuple]
 
 
 def _defer(

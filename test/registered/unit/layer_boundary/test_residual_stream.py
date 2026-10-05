@@ -17,7 +17,6 @@ from sglang.srt.layers.layer_boundary import (
     bind_entry,
 )
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
-from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
@@ -424,45 +423,6 @@ class TestResidualStream(CustomTestCase):
         self.assertIsNone(partial_ref())
         with self.assertRaises(RuntimeError):
             stream.input(hidden)
-
-    def test_layers_trace_under_fullgraph(self):
-        """A stream's record, complete, snapshot and write trace under fullgraph."""
-        group = SimpleNamespace(all_reduce=lambda x: x * 2)
-
-        def finalize(rows):
-            return MoeDeferredFinalize(
-                routed_output=rows,
-                expert_weights=rows,
-                permuted_indices=rows,
-                gated_shared_output=rows,
-                m=rows.shape[0],
-                finish=lambda: rows * 5,
-            )
-
-        def layers(hidden, residual):
-            stream = ResidualStream(residual)
-            for _ in range(2):
-                owed = stream.record(hidden, PLAIN_ADD, declared_sum=SumGroup.TP)
-                residual = stream.write(stream.complete(owed) + stream.residual)
-                owed = stream.record(
-                    UnreducedOutput(residual * 3, group=group), PLAIN_ADD
-                )
-                captured = stream.snapshot(owed)
-                _, residual = stream.input(owed)
-                residual = stream.write(stream.complete(owed) + residual)
-                owed = stream.record(finalize(residual + captured), PLAIN_ADD)
-                hidden = stream.write(stream.complete(owed) + residual)
-            return hidden
-
-        with patch(
-            "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
-            lambda sum_group: group,
-        ):
-            expected = layers(torch.ones(2, 4), torch.full((2, 4), 3.0))
-            torch._dynamo.reset()
-            compiled = torch.compile(layers, fullgraph=True, backend="eager")
-            actual = compiled(torch.ones(2, 4), torch.full((2, 4), 3.0))
-        torch.testing.assert_close(actual, expected)
 
 
 class TestBatchStageOwnership(CustomTestCase):

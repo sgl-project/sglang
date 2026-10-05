@@ -75,35 +75,17 @@ def _resolve_max_m(*, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-class MoeDeferredFinalize(DeferredFinalize):
+class MoeDeferredFinalize(DeferredFinalize, frozen=True):
     """Unfinalized routed output plus the separately gated shared contribution.
     The next layer's fused finalize + AR + add + norm takes it; ``finish`` is
     the MoE's own unfused tail, for any other reader."""
 
-    __slots__ = (
-        "routed_output",
-        "expert_weights",
-        "permuted_indices",
-        "gated_shared_output",
-        "m",
-        "finish",
-    )
-
-    def __init__(
-        self,
-        routed_output: torch.Tensor,
-        expert_weights: torch.Tensor,
-        permuted_indices: torch.Tensor,
-        gated_shared_output: torch.Tensor,
-        m: int,
-        finish: Callable[[], torch.Tensor],
-    ):
-        self.routed_output = routed_output
-        self.expert_weights = expert_weights
-        self.permuted_indices = permuted_indices
-        self.gated_shared_output = gated_shared_output
-        self.m = m
-        self.finish = finish
+    routed_output: torch.Tensor
+    expert_weights: torch.Tensor
+    permuted_indices: torch.Tensor
+    gated_shared_output: torch.Tensor
+    m: int
+    finish: Callable[[], torch.Tensor]
 
     def complete(self) -> torch.Tensor:
         return self.finish()

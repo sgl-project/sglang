@@ -37,7 +37,7 @@ class OutputTransform(msgspec.Struct, frozen=True):
     before_reduce_scatter: bool = False
 
 
-class UnreducedOutput:
+class UnreducedOutput(msgspec.Struct, frozen=True):
     """Internal adapter value describing an unfinished reduction.
 
     Fields:
@@ -52,19 +52,11 @@ class UnreducedOutput:
     required when reduce_to_dp_local is absent.
     """
 
-    __slots__ = ("partial", "group", "reduce_to_dp_local")
-
-    def __init__(
-        self,
-        partial: torch.Tensor,
-        group: Optional[GroupCoordinator] = None,
-        # Under attention DP: the reduction that also brings ``partial`` back to this
-        # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
-        reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    ):
-        self.partial = partial
-        self.group = group
-        self.reduce_to_dp_local = reduce_to_dp_local
+    partial: torch.Tensor
+    group: Optional[GroupCoordinator] = None
+    # Under attention DP: the reduction that also brings ``partial`` back to this
+    # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
+    reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
     def complete(self) -> torch.Tensor:
         """Complete the sum, on the destination rows when it moves them."""
@@ -73,14 +65,12 @@ class UnreducedOutput:
         return self.group.all_reduce(self.partial)
 
 
-class DeferredFinalize:
+class DeferredFinalize(msgspec.Struct, frozen=True):
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
     norm that accepts it (residual_batch.final_norm(finalize_norm=...)). A fused kernel
     there may do that work together with its own; anything else passes it
     through complete_owed(), which calls ``complete()``."""
-
-    __slots__ = ()
 
     def complete(self) -> torch.Tensor:
         """Do the owed work, unfused, and return the complete output."""
