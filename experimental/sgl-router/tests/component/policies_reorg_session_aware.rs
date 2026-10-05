@@ -5,11 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sgl_router::config::AffinityMode;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
+use sgl_router::policies_reorg::admission::AdmissionLimits;
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
+use sgl_router::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
+};
 use sgl_router::state::load_monitor::router_inflight_load::MockClock;
 use sgl_router::state::AffinityStore;
 use sgl_router::workers::Worker;
@@ -20,7 +24,7 @@ fn engine(id: &str, active: usize) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     engine.active_requests.store(active, Ordering::Relaxed);
     engine
@@ -111,7 +115,7 @@ async fn missing_and_empty_keys_use_admitted_power_of_two_without_binding() {
 }
 
 #[tokio::test]
-async fn rejected_new_and_existing_sessions_never_rebind_or_try_another_engine() {
+async fn failed_fallback_preserves_existing_binding() {
     let (mut policy, store) = policy();
     let admission = Arc::new(Admission::default());
     policy.admission = admission.clone();
@@ -138,7 +142,63 @@ async fn rejected_new_and_existing_sessions_never_rebind_or_try_another_engine()
         "a"
     );
     assert_eq!(store.len(), 1);
-    assert_eq!(admission.calls.lock().unwrap().len(), 4);
+    assert_eq!(admission.calls.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn rejection_and_load_switches_rebind_the_session() {
+    for mode in [AffinityMode::Prefer, AffinityMode::Balanced] {
+        let table = EngineReportedLoadTable::new();
+        let store = AffinityStore::new(Duration::from_secs(60));
+        let mut policy = SessionAwarePolicy::new(store, table.clone());
+        policy.config.mode = mode;
+        policy.config.load_gap = 10;
+        policy.admission = Arc::new(AdmissionLimits {
+            max_inflight_requests: Some(10),
+            ..Default::default()
+        });
+        let engines = [engine("a", 0), engine("b", 1)];
+        let model = ModelId("m".into());
+        let request = request(&model);
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "a"
+        );
+        if mode == AffinityMode::Prefer {
+            engines[0].active_requests.store(10, Ordering::Relaxed);
+        } else {
+            for (engine, pending) in [(&engines[0], 100), (&engines[1], 0)] {
+                table.set(
+                    &engine.url,
+                    0,
+                    LoadStat {
+                        native_cache: Some(NativeCacheRankLoad {
+                            num_waiting_uncached_tokens: pending,
+                            num_total_tokens: 10,
+                            max_running_requests: 100,
+                            total_prefill_uncached_tokens: 0,
+                            total_prefill_busy_us: 0,
+                        }),
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 1,
+                        num_tokens: 10,
+                        max_total_num_tokens: 100,
+                    },
+                    Instant::now(),
+                );
+            }
+        }
+        let pick = policy.pick(&engines, &request).await.unwrap();
+        assert_eq!(
+            (pick.engine.id.0.as_str(), pick.reason),
+            ("b", "session_rebound")
+        );
+        engines[0].active_requests.store(0, Ordering::Relaxed);
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "b"
+        );
+    }
 }
 
 #[tokio::test]
