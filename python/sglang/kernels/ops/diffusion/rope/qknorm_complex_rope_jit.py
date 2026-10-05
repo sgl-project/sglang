@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _HEAD_DIM = 128
-_ROW_ALIGN = 8
 
 
 @cache_once
@@ -50,117 +49,19 @@ def _jit_module(fuse_real_sin: bool, copy_v: bool) -> Module:
     )
 
 
-def _is_rows(t: torch.Tensor, device: torch.device, tokens: int | None = None) -> bool:
-    """``[B, T, H, 128]`` bf16 CUDA tensor whose heads are contiguous; batch/token strides may be padded."""
-    return (
-        isinstance(t, torch.Tensor)
-        and t.dtype is torch.bfloat16
-        and t.is_cuda
-        and t.device == device
-        and t.dim() == 4
-        and t.numel() > 0
-        and t.shape[-1] == _HEAD_DIM
-        and (tokens is None or t.shape[1] == tokens)
-        and t.stride(-1) == 1
-        and t.stride(-2) == _HEAD_DIM
-        and t.stride(1) % (_ROW_ALIGN // 2) == 0
-        and t.stride(0) % (_ROW_ALIGN // 2) == 0
-        and t.data_ptr() % _ROW_ALIGN == 0
-    )
-
-
-def _is_weight(w: torch.Tensor, device: torch.device) -> bool:
-    return (
-        isinstance(w, torch.Tensor)
-        and w.dtype is torch.bfloat16
-        and w.is_cuda
-        and w.device == device
-        and w.shape == (_HEAD_DIM,)
-        and w.is_contiguous()
-    )
-
-
-def _is_rope(rope: torch.Tensor, seq: int, device: torch.device) -> bool:
-    return (
-        isinstance(rope, torch.Tensor)
-        and rope.dtype is torch.complex64
-        and rope.device == device
-        and rope.shape == (seq, _HEAD_DIM // 2)
-        and rope.is_contiguous()
-    )
-
-
-def _cuda_platform(t: torch.Tensor) -> bool:
-    return t.is_cuda and torch.version.hip is None and not torch.compiler.is_compiling()
+@torch.compiler.assume_constant_result
+@cache_once
+def can_use_qknorm_complex_rope_cuda(dtype: torch.dtype, head_dim: int) -> bool:
+    """The CUDA reduction is specialized to BF16, 128-wide heads."""
+    return dtype is torch.bfloat16 and head_dim == _HEAD_DIM
 
 
 def _rope_real(rope: torch.Tensor) -> torch.Tensor:
-    return torch.view_as_real(rope).view(rope.shape[0], _HEAD_DIM)
-
-
-def can_use_qknorm_complex_rope_cuda(
-    x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor
-) -> bool:
-    """Contiguous ``[B, S, H, 128]`` bf16 Q or K with its ``(S, 64)`` complex64 table."""
-    return (
-        _cuda_platform(x)
-        and _is_rows(x, x.device)
-        and x.is_contiguous()
-        and _is_weight(weight, x.device)
-        and _is_rope(rope, x.shape[1], x.device)
-    )
-
-
-def can_use_qknorm_complex_rope_pack(
-    q: torch.Tensor,
-    k_out: torch.Tensor,
-    v_out: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    rope: torch.Tensor,
-    k_prefix: torch.Tensor,
-    v_prefix: torch.Tensor,
-    k_src: Optional[torch.Tensor],
-    v_src: Optional[torch.Tensor],
-) -> bool:
-    """Shapes for :func:`qknorm_complex_rope_pack_`; ``None`` sources mean "already in the buffer"."""
-    if not (_cuda_platform(q) and _is_rows(q, q.device)):
-        return False
-    device = q.device
-    batch, seq, heads, _ = q.shape
-    if not (
-        k_prefix.dim() == 4
-        and k_prefix.shape[0] == batch
-        and k_prefix.shape[1] > 0
-        and k_prefix.shape[2] == heads
-        and k_prefix.shape[3] == _HEAD_DIM
-        and k_prefix.is_contiguous()
-        and v_prefix.shape == k_prefix.shape
-        and v_prefix.is_contiguous()
-        and all(
-            t.dtype is torch.bfloat16 and t.device == device
-            for t in (k_prefix, v_prefix)
-        )
-    ):
-        return False
-    prefix = k_prefix.shape[1]
-    return (
-        _is_rows(k_out, device, prefix + seq)
-        and _is_rows(v_out, device, prefix + seq)
-        and k_out.shape[0] == batch
-        and v_out.shape[0] == batch
-        and k_out.shape[2] == heads
-        and v_out.shape[2] == heads
-        and (k_src is None or (_is_rows(k_src, device, seq) and k_src.shape == q.shape))
-        and (v_src is None or (_is_rows(v_src, device, seq) and v_src.shape == q.shape))
-        and _is_weight(q_weight, device)
-        and _is_weight(k_weight, device)
-        and _is_rope(rope, seq, device)
-    )
+    return torch.view_as_real(rope)
 
 
 def _fake_norm_rope(x, weight, rope, eps):
-    return torch.empty_like(x)
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 @register_custom_op(
@@ -171,8 +72,8 @@ def _fake_norm_rope(x, weight, rope, eps):
 def qknorm_complex_rope_cuda(
     x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """``rope(rmsnorm(x))`` for one contiguous ``[B, S, H, 128]`` tensor, out of place."""
-    out = torch.empty_like(x)
+    """``rope(rmsnorm(x))`` for one ``[B, S, H, 128]`` tensor with packed head rows, out of place."""
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     module = _jit_module(_fuse_real_sin(x.device), False)
     with torch.cuda.device(x.device):
         module.norm_rope(x, out, weight, _rope_real(rope), float(eps))
@@ -224,7 +125,6 @@ def qknorm_complex_rope_pack_(
 
 __all__ = [
     "can_use_qknorm_complex_rope_cuda",
-    "can_use_qknorm_complex_rope_pack",
     "qknorm_complex_rope_cuda",
     "qknorm_complex_rope_pack_",
 ]
