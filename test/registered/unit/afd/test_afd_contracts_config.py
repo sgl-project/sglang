@@ -392,37 +392,28 @@ def test_lane_count_outside_admitted_range_fails_config_validation():
         profiles.QWEN3_PAIRED_C1.validate_shape(config=config.AFDConfig(lanes=3))
 
 
-def test_attention_lane_count_outside_admitted_range_fails_config_validation():
-    """Counts are bounded here; model profiles own the admitted combinations."""
-
-    for attention_lanes in (0, -1, 36):
-        with pytest.raises(
-            contracts.AFDError,
-            match="AFD_GRAPH_ATTENTION_LANE_COUNT_INVALID",
-        ):
-            config.AFDConfig(
-                lanes=4,
-                attention_lanes=attention_lanes,
-            ).validate()
-    config.AFDConfig(lanes=4, attention_lanes=2).validate()
-    config.AFDConfig(lanes=4, attention_lanes=3).validate()
-    config.AFDConfig(lanes=4, attention_lanes=6).validate()
+@pytest.mark.parametrize("value", [0, -1, True, 5.0, "7"])
+def test_attention_lane_count_requires_a_positive_integer(value):
     with pytest.raises(
-        contracts.AFDError, match="AFD_TOPOLOGY_ATTENTION_LANE_COUNT_UNSUPPORTED"
+        contracts.AFDError, match="AFD_GRAPH_ATTENTION_LANE_COUNT_INVALID"
     ):
-        profiles.GLM5_PAIRED_C1.validate_shape(
-            config=config.AFDConfig(lanes=4, attention_lanes=6, attention_backend="nsa")
-        )
-    # Sixteen clears the cheap bound and the ratio, and GLM-5 admits it.
-    config.AFDConfig(
-        lanes=4,
-        attention_lanes=16,
-    ).validate()
-    # GLM builds its A-side router/proxy before experts, so 12A no longer
-    # constructs a meaningless TP12 expert partition.
-    profiles.GLM5_PAIRED_C1.validate_shape(
-        config=config.AFDConfig(lanes=4, attention_lanes=12, attention_backend="nsa")
-    )
+        config.AFDConfig(lanes=4, attention_lanes=value).validate()
+
+
+@pytest.mark.parametrize("a,f", [(1, 1), (1, 4), (4, 1), (5, 4), (7, 4), (36, 4)])
+@pytest.mark.parametrize("backend", ["fa4", "nsa"])
+def test_model_profiles_admit_independent_a_counts_without_an_enum(a, f, backend):
+    cfg = config.AFDConfig(lanes=f, attention_lanes=a, attention_backend=backend)
+    profile = profiles.QWEN3_PAIRED_C1 if backend == "fa4" else profiles.GLM5_PAIRED_C1
+    profile.validate_shape(config=cfg)
+    assert profile.contract()["attention_lane_policy"] == "positive-integer"
+    for role in ("attention", "ffn"):
+        args = _role_args(role, lanes=f, attention_lanes=a)
+        args.afd_config, args.attention_backend = cfg, backend
+        args.enable_dp_lm_head = role == "attention" and a > 1
+        config.validate_afd_server_args(args)
+        # The single A path retains native non-DP attention semantics.
+        assert args.enable_dp_attention == (role == "attention" and a > 1)
 
 
 @pytest.mark.parametrize(
