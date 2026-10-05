@@ -26,6 +26,8 @@ prices. Pinned:
     slots;
   - a draft whose attention backend is off the translated MHA rails
     declines: it would read the fused rows without the KV-index translator;
+  - so does a draft under --dcp-size > 1, where each rank's host rows hold
+    only its share of the tokens the replicated draft reads;
   - the profile divides the draft's heads by attn_tp, as the target does;
   - a placement whose runner lane counts do not fill its region is refused;
   - the priced entry counts the layers THIS runner owns, not the whole model's.
@@ -248,6 +250,7 @@ class TestFusedDraftDecision(CustomTestCase):
         attention_arch=None,
         draft_backend=None,
         target_backends=("triton", "triton"),
+        dcp_size=1,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
@@ -289,7 +292,7 @@ class TestFusedDraftDecision(CustomTestCase):
             patch.object(kvc, "get_spec", return_value=spec),
             patch.object(kvc, "attention_backends", return_value=target_backends),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
-            get_parallel().override(attn_tp_size=1),
+            get_parallel().override(attn_tp_size=1, attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
         ):
             return cfg._fused_draft_decision()
@@ -334,6 +337,15 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertEqual(decision.placement is not None, fuses, target_backends)
         # An EAGLE draft with no backend of its own runs the target's pair.
         self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+
+    def test_dcp_keeps_the_private_pool(self):
+        """Under --dcp-size > 1 each rank's host rows hold only its share of
+        the widened id space, while the draft, outside the DCP group, reads
+        every token."""
+        for algorithm in ("DSPARK", "EAGLE"):
+            declined = self._decide(algorithm=algorithm, dcp_size=2)
+            self.assertIsNone(declined.placement, algorithm)
+            self.assertIn("--dcp-size 2", declined.declined)
 
 
 class TestMambaHostPrivateDraftRefused(CustomTestCase):
