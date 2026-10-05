@@ -270,12 +270,21 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
-        )
+    if cfg.attn_dp_size > 1:
+        if not cfg.device.startswith(("cuda", "npu")):
+            raise ValueError(
+                "DFLASH with dp attention is only supported on CUDA or NPU."
+            )
+        # Like DSpark, the per-DP drafter borrows the target LM head. Its
+        # vocabulary shards must use the same attention-TP group as the draft.
+        # This also applies to DFlash2's candidate selector.
+        if not cfg.enable_dp_lm_head:
+            raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
+        if cfg.attn_cp_size > 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel "
+                f"(attn_cp_size={cfg.attn_cp_size})."
+            )
 
     if cfg.pp_size != 1:
         raise ValueError(
