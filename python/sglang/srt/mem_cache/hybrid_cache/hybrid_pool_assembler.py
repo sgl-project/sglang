@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
     HostPoolGroupConfig,
     check_packed_kv_rows,
     is_mla_pool,
+    layout_root,
     prepare_host_pool_config,
     with_packed_draft_layer_mapping,
 )
@@ -26,7 +27,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
+from sglang.srt.mem_cache.pool_host.host_pool_decl import (
+    HostPoolDecl,
+    make_draft_sidecar_decls,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -1390,13 +1394,20 @@ def build_host_pool_group(
 ) -> HostPoolGroup:
     """Allocate host pools and transfer entries from prepared configs."""
     root = config.pools[0]
-    host_pools = {
-        root.decl.pool_name: build_kv_host_pool(
-            kv_pool=root.decl.device_pool,
-            page_size=config.transfer_page_size,
-            mtp_draft_device_pools=root.packed_draft_device_pools,
-        )
-    }
+    root_host_pool = build_kv_host_pool(
+        kv_pool=root.decl.device_pool,
+        page_size=config.transfer_page_size,
+        mtp_draft_device_pools=root.packed_draft_device_pools,
+    )
+    return HostPoolGroup(
+        _build_pool_entries(config=config, root_host_pool=root_host_pool)
+    )
+
+
+def _build_pool_entries(
+    *, config: HostPoolGroupConfig, root_host_pool: Any
+) -> list[PoolEntry]:
+    host_pools = {config.pools[0].decl.pool_name: root_host_pool}
     entries = []
     for pool_config in config.pools:
         decl = pool_config.decl
@@ -1418,7 +1429,7 @@ def build_host_pool_group(
                 packed_draft_device_pools=pool_config.packed_draft_device_pools,
             )
         )
-    return HostPoolGroup(entries)
+    return entries
 
 
 def _build_mha_mla_host_pool(
@@ -1460,20 +1471,26 @@ def build_full_draft_pools(
     draft_kv_pool: Any,
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
-    """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    """Build the separate draft sidecars declared by a full-attention draft pool.
+    Transfer indices follow target KV and layout follows the draft KV host pool."""
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = pool.full_kv_pool
+    decls = draft_kv_pool.host_pool_decls()
+    # A hybrid draft declares its KV on the full-attention sub-pool.
+    pool = layout_root(decls).device_pool
     if pool.layer_num == 0:
         return [], []
 
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
 
+    config = prepare_host_pool_config(
+        decls=make_draft_sidecar_decls(decls),
+        full_layer_mapping={i: i for i in range(pool.layer_num)},
+        transfer_layer_id_max=pool.layer_num,
+        transfer_page_size=controller.page_size,
+        index_primary=PoolName.KV,
+    )
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(
@@ -1484,50 +1501,12 @@ def build_full_draft_pools(
         allocator_type=_get_allocator_type(),
         pool_label="draft",
     )
-    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
+    entries = _build_pool_entries(config=config, root_host_pool=draft_host_pool)
+    specs = [c.decl.sidecar_spec() for c in config.pools]
 
-    specs = [
-        SidecarPoolSpec(
-            pool_name=PoolName.DRAFT,
-            indices_from_pool=PoolName.KV,
-        )
-    ]
-    entries = [
-        build_pool_entry(
-            name=PoolName.DRAFT,
-            host_pool=draft_host_pool,
-            device_pool=pool,
-            layer_mapping=draft_layer_mapping,
-            transfer_layer_id_max=draft_host_pool.layer_num,
-        )
-    ]
-
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        from sglang.srt.mem_cache.pool_host.dsa import (
-            DSAIndexerPoolHost,
-            make_dsa_indexer_pool_decl,
-        )
-
-        # Separate draft indexer: its own host pool laid out on the draft KV
-        # host pool, but transfer indices still follow the target KV anchor.
-        indexer_decl = make_dsa_indexer_pool_decl(pool, name=PoolName.DRAFT_INDEXER)
-        indexer_host_pool = DSAIndexerPoolHost(
-            decl=indexer_decl,
-            anchor_host=draft_host_pool,
-            allocator_type=_get_allocator_type(),
-        )
-        specs.append(indexer_decl.sidecar_spec())
-        entries.append(
-            build_pool_entry(
-                name=PoolName.DRAFT_INDEXER,
-                host_pool=indexer_host_pool,
-                device_pool=pool,
-                layer_mapping=draft_layer_mapping,
-                transfer_layer_id_max=indexer_host_pool.layer_num,
-            )
-        )
-
+    # QSA indexer state is not yet included in its pool declarations.
     if isinstance(draft_kv_pool, QSATokenToKVPool):
+        draft_layer_mapping = {i: i for i in range(pool.layer_num)}
         specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
         entries.append(
             build_pool_entry(
