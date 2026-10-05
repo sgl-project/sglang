@@ -175,7 +175,7 @@ export const KimiK26Deployment = () => {
     cmd += ' \\\n  --trust-remote-code';
 
     if (dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
     }
 
     if (reasoning === 'enabled') {

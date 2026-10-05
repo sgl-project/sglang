@@ -61,7 +61,6 @@ class DeepEPv2DispatchOutput(NamedTuple):
     topk_weights: torch.Tensor
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
-    hidden_states_scale_tma_aligned: bool = False
     use_masked_gemm: bool = False
     expected_m: int = 0
     masked_max_m: int = 0
@@ -120,7 +119,8 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-
+    # Multi-node is rejected with direct in server-args validation, so a hybrid
+    # mode here already covers every multi-node run.
     return get_exec().moe.deepep_v2_mode == "hybrid"
 
 
@@ -246,6 +246,12 @@ class _DeepEPv2Impl:
         self.use_fp8_dispatch = use_fp8_dispatch
         self._handle = None
         self._pad_empty_combine = False
+        prefill_expand = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
+        if prefill_expand is None:
+            # Unset: expanded prefill is validated end to end only without
+            # UE8M0 scales (Hopper), so Blackwell keeps the non-expanded path.
+            prefill_expand = not scale_format.ue8m0
+        self._prefill_expand_enabled = prefill_expand
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -258,6 +264,15 @@ class _DeepEPv2Impl:
             self.num_max_dispatch_tokens_per_rank,
             self.use_fp8_dispatch,
         )
+
+    def prebuild_buffer(self) -> None:
+        """Build the ElasticBuffer now instead of lazily on the first dispatch.
+
+        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
+        when decode CUDA-graph capture did not already build it. Needs only
+        host-known config already on this impl; key-cached so dispatch reuses it.
+        """
+        self._get_buffer()
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -297,9 +312,9 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
-        use_masked = use_expand_layout
+        is_decode = not get_is_extend_in_batch()
+        use_masked = is_decode
+        use_expand_layout = is_decode or self._prefill_expand_enabled
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
@@ -314,7 +329,7 @@ class _DeepEPv2Impl:
         if not self.use_fp8_dispatch:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
-        elif use_masked:
+        elif use_expand_layout:
             _ensure_fp8_quant_available()
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
@@ -364,6 +379,11 @@ class _DeepEPv2Impl:
         if use_expand_layout:
             # Expanded combine uses handle metadata instead of recv_topk_idx.
             local_topk_ids = None
+            if recv_topk_weights.shape != (recv_hidden_states.shape[0],):
+                raise ValueError(
+                    "DeepEP v2 expanded activations and router weights must "
+                    "have the same receive capacity"
+                )
         else:
             num_recv_tokens = int(
                 handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
@@ -383,11 +403,6 @@ class _DeepEPv2Impl:
         total_expanded = 0
         if use_masked:
             recv_capacity = recv_hidden_states.shape[0]
-            if recv_topk_weights.shape != (recv_capacity,):
-                raise ValueError(
-                    "DeepEP v2 expanded activations and router weights must "
-                    "have the same receive capacity"
-                )
             # expected_m is only a schedule hint; masked_m is the actual bound.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(
@@ -408,7 +423,6 @@ class _DeepEPv2Impl:
             recv_topk_weights,
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
-            use_tma_aligned_col_major_sf,
             use_masked,
             expected_m,
             masked_max_m,
@@ -490,3 +504,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
         return self._impl.combine(combine_input)
+
+    def prebuild(self) -> None:
+        """Build the ElasticBuffer eagerly at deployment time (no forward needed)."""
+        self._impl.prebuild_buffer()
