@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,7 +82,9 @@ class TestMamba2ReplaySizing(CustomTestCase):
         configurator.mambaish_config = SimpleNamespace(mamba2_cache_params=params)
         configurator.pp_size = 1
         configurator.model_config = SimpleNamespace(
-            dtype=torch.bfloat16, num_hidden_layers=88
+            dtype=torch.bfloat16,
+            num_hidden_layers=88,
+            hf_text_config=SimpleNamespace(model_type="nemotron_h"),
         )
         configurator.spec_algorithm = SpeculativeAlgorithm.EAGLE
         configurator.is_draft_worker = False
@@ -97,7 +100,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
             with (
                 self.subTest(fixed=fixed, no_radix=no_radix, dp=dp),
                 rc.get_context().override_server_args(
-                    enable_mamba2_spec_replay=True,
+                    enable_linear_replayssm_spec=True,
                     max_mamba_cache_size=fixed,
                     disable_radix_cache=no_radix,
                     max_running_requests=cap,
@@ -139,8 +142,10 @@ class TestMamba2ReplaySizing(CustomTestCase):
                     self.assertGreater(costs.bytes_for(slots + 1, cap, ratio), budget)
 
     def test_gates(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.server_args import ServerArgs
+
         valid = dict(
-            enable_mamba2_spec_replay=True,
             mamba_backend="flashinfer",
             mamba_ssm_dtype="float16",
             speculative_algorithm="EAGLE",
@@ -149,10 +154,13 @@ class TestMamba2ReplaySizing(CustomTestCase):
             disaggregation_mode="null",
             enable_unified_memory=False,
             enable_linear_replayssm=False,
-            enable_linear_replayssm_spec=False,
+            enable_linear_replayssm_spec=True,
         )
         validate_mamba2_spec_replay(
-            SimpleNamespace(**valid), "nemotron_h", is_cuda=True, resolved=True
+            resolving_view(ServerArgs(model_path="dummy", **valid)),
+            "nemotron_h",
+            is_cuda=True,
+            resolved=True,
         )
         for change in (
             dict(speculative_eagle_topk=2),
@@ -161,7 +169,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
             dict(speculative_num_draft_tokens=None),
             dict(disaggregation_mode="decode"),
             dict(enable_unified_memory=True),
-            dict(enable_linear_replayssm_spec=True),
+            dict(enable_linear_replayssm=True),
             dict(mamba_backend="triton"),
             dict(mamba_ssm_dtype="bfloat16"),
             dict(enable_int8_mamba_checkpoint=True),
@@ -169,7 +177,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_mamba2_spec_replay(
-                    SimpleNamespace(**(valid | change)),
+                    resolving_view(ServerArgs(model_path="dummy", **(valid | change))),
                     "nemotron_h",
                     is_cuda=True,
                     resolved=True,
@@ -177,8 +185,86 @@ class TestMamba2ReplaySizing(CustomTestCase):
         for model, cuda in (("qwen3_next", True), ("nemotron_h", False)):
             with self.assertRaises(ValueError):
                 validate_mamba2_spec_replay(
-                    SimpleNamespace(**valid), model, is_cuda=cuda, resolved=True
+                    resolving_view(ServerArgs(model_path="dummy", **valid)),
+                    model,
+                    is_cuda=cuda,
+                    resolved=True,
                 )
+
+    def test_global_flag_dispatch_excludes_drafts_and_other_families(self):
+        """A shared switch must not allocate Mamba2 scratch for GDN/KDA or drafts."""
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        for enabled in (False, True):
+            with rc.get_context().override_server_args(
+                enable_linear_replayssm_spec=enabled
+            ):
+                for model_type in ("nemotron_h", "qwen3_next", "kimi_linear", "other"):
+                    configurator.model_config = SimpleNamespace(
+                        hf_text_config=SimpleNamespace(model_type=model_type)
+                    )
+                    for draft in (False, True):
+                        configurator.is_draft_worker = draft
+                        with self.subTest(
+                            enabled=enabled, model=model_type, draft=draft
+                        ):
+                            self.assertEqual(
+                                configurator._mamba2_spec_replay_enabled,
+                                enabled and model_type == "nemotron_h" and not draft,
+                            )
+
+    def test_global_flag_preserves_model_specific_resolution(self):
+        """Mamba2 must not inherit GDN/KDA's FP32 default or replay backend gate."""
+        from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+        from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.runtime_context import override_platform
+        from sglang.srt.server_args import ServerArgs
+
+        for model_type in ("nemotron_h", "qwen3_next", "kimi_linear"):
+            dtype = "float16" if model_type == "nemotron_h" else None
+            args = ServerArgs(
+                model_path="dummy",
+                enable_linear_replayssm_spec=True,
+                mamba_ssm_dtype=dtype,
+                mamba_backend="flashinfer" if model_type == "nemotron_h" else "triton",
+                speculative_algorithm="EAGLE",
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+            )
+            # Model metadata is an external loading boundary; no weights/download.
+            model = SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type=model_type)
+            )
+            with (
+                patch.object(args, "_model_config", model, create=True),
+                override_platform(is_cuda=True, is_sm100=True, has_flashinfer=True),
+            ):
+                handle_mamba_backend(args)
+                handle_linear_attn_backend(args)
+            self.assertEqual(
+                resolution_result(args, "mamba_ssm_dtype"),
+                "float16" if model_type == "nemotron_h" else "float32",
+            )
+
+    def test_cli_exposes_only_shared_replay_switch(self):
+        import argparse
+        import contextlib
+        import io
+
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            ["--model", "dummy", "--enable-linear-replayssm-spec"]
+        )
+        self.assertTrue(parsed.enable_linear_replayssm_spec)
+        self.assertFalse(hasattr(parsed, "enable_mamba2_spec_replay"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--model", "dummy", "--enable-mamba2-spec-replay"])
 
 
 if __name__ == "__main__":

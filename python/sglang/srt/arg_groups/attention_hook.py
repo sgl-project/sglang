@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.mamba2_spec_replay import mamba2_spec_replay_enabled
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -41,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 
 def handle_attention_backend_compatibility(server_args: Any):
-
     cfg = resolving_view(server_args)
     model_config = model_config_of(server_args)
 
@@ -377,7 +377,11 @@ def handle_linear_attn_backend(server_args: Any):
     # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
     # --linear-replayssm-cache-len window and folds via its own fused
     # verify ring-write + commit_kda_replayssm_after_verify.
-    if cfg.enable_linear_replayssm_spec:
+    # Mamba2 uses FlashInfer checkpointing_ssu and has its own capability/dtype
+    # checks in handle_mamba_backend, not the GDN/KDA replay defaults below.
+    if cfg.enable_linear_replayssm_spec and not mamba2_spec_replay_enabled(
+        cfg, getattr(model_config_of(server_args).hf_text_config, "model_type", None)
+    ):
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires a linear draft chain "

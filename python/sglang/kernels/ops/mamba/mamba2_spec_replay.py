@@ -16,7 +16,7 @@ def checkpointing_kernel():
     installed = version("flashinfer-python")
     if installed.split("+")[0] != "0.7.0.post1":
         raise ValueError(
-            "--enable-mamba2-spec-replay requires FlashInfer 0.7.0.post1; "
+            "--enable-linear-replayssm-spec for Mamba2 requires FlashInfer 0.7.0.post1; "
             f"found {installed}"
         )
     from flashinfer.mamba import checkpointing_ssu

@@ -3,10 +3,15 @@
 from dataclasses import dataclass
 
 
+def mamba2_spec_replay_enabled(cfg, model_type):
+    """Dispatch the shared spec-replay flag to the supported Mamba2 family."""
+    return cfg.enable_linear_replayssm_spec and model_type == "nemotron_h"
+
+
 def validate_mamba2_spec_replay(cfg, model_type, *, is_cuda, resolved=False):
-    if not cfg.enable_mamba2_spec_replay:
+    if not cfg.enable_linear_replayssm_spec:
         return
-    prefix = "--enable-mamba2-spec-replay "
+    prefix = "--enable-linear-replayssm-spec for Mamba2 "
     if not is_cuda or model_type != "nemotron_h":
         raise ValueError(prefix + "requires a CUDA NemotronH Mamba2 target model.")
     if cfg.mamba_backend not in (("flashinfer",) if resolved else (None, "flashinfer")):
@@ -32,8 +37,8 @@ def validate_mamba2_spec_replay(cfg, model_type, *, is_cuda, resolved=False):
         raise ValueError(prefix + "does not yet support unified memory pools.")
     if getattr(cfg, "enable_page_major_kv_layout", False):
         raise ValueError(prefix + "requires contiguous layer-major Mamba pools.")
-    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
-        raise ValueError(prefix + "cannot share the GDN/KDA ReplaySSM feature flags.")
+    if cfg.enable_linear_replayssm:
+        raise ValueError(prefix + "cannot be combined with --enable-linear-replayssm.")
     if getattr(cfg, "speculative_adaptive", False):
         raise ValueError(prefix + "does not yet support adaptive verify widths.")
     if getattr(cfg, "enable_int8_mamba_checkpoint", False):
