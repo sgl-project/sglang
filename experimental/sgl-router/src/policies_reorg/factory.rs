@@ -79,6 +79,22 @@ pub struct AffinitySpec {
 }
 
 impl AffinitySpec {
+    /// Balanced-only fields need balanced `mode`; a set load factor must be at least 1.
+    pub(crate) fn validate(&self, mode: AffinityMode) -> Result<()> {
+        ensure!(
+            mode == AffinityMode::Balanced
+                || (self.balanced_by.is_none()
+                    && self.load_factor.is_none()
+                    && self.load_gap.is_none()),
+            "--affinity-balanced-by and --affinity-load-* (group balanced_by and load_*) require balanced mode"
+        );
+        ensure!(
+            (self.load_factor).is_none_or(|factor| factor.is_finite() && factor >= 1.0),
+            "--affinity-load-factor (group load_factor) must be finite and at least 1"
+        );
+        Ok(())
+    }
+
     /// `defaults` with each set field replaced, validated like the CLI flags.
     fn or(&self, defaults: &AffinityConfig) -> Result<AffinityConfig> {
         let balanced_by = self.balanced_by.unwrap_or(defaults.balanced_by);
@@ -96,17 +112,7 @@ impl AffinitySpec {
             matches!(config.mode, AffinityMode::Prefer | AffinityMode::Balanced),
             "group affinity mode must be prefer or balanced"
         );
-        ensure!(
-            config.mode == AffinityMode::Balanced
-                || (self.balanced_by.is_none()
-                    && self.load_factor.is_none()
-                    && self.load_gap.is_none()),
-            "group affinity balanced_by and load_* require mode balanced"
-        );
-        ensure!(
-            config.load_factor.is_finite() && config.load_factor >= 1.0,
-            "group affinity load_factor must be finite and at least 1"
-        );
+        self.validate(config.mode)?;
         Ok(config)
     }
 }
@@ -374,11 +380,13 @@ mod tests {
             load_gap: Some(2_048),
             ..Default::default()
         };
-        let by_requests = AffinitySpec {
-            balanced_by: Some(BalancedBy::RunningRequests),
-            ..Default::default()
-        };
-        assert_eq!(by_requests.or(&cli).unwrap().load_gap(), 4);
+        let by_requests: AffinitySpec =
+            serde_json::from_str(r#"{"balanced_by": "running_requests"}"#).unwrap();
+        let group = by_requests.or(&cli).unwrap();
+        assert_eq!(
+            (group.mode, group.balanced_by, group.load_gap()),
+            (AffinityMode::Balanced, BalancedBy::RunningRequests, 4)
+        );
         assert_eq!(AffinitySpec::default().or(&cli).unwrap().load_gap(), 2_048);
     }
 }

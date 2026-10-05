@@ -22,6 +22,7 @@ use crate::config::{
     DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
+use crate::policies_reorg::factory::AffinitySpec;
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
@@ -479,13 +480,13 @@ impl Cli {
                 "legacy --affinity-mode requires --policy session_aware"
             );
         }
-        ensure!(
-            (self.affinity.affinity_balanced_by.is_none()
-                && self.affinity.affinity_load_factor.is_none()
-                && self.affinity.affinity_load_gap.is_none())
-                || self.affinity.affinity_mode == Some(AffinityMode::Balanced),
-            "--affinity-balanced-by and --affinity-load-* require --affinity-mode balanced"
-        );
+        let balanced = AffinitySpec {
+            mode: None,
+            balanced_by: self.affinity.affinity_balanced_by,
+            load_factor: self.affinity.affinity_load_factor,
+            load_gap: self.affinity.affinity_load_gap,
+        };
+        balanced.validate(self.affinity.affinity_mode.unwrap_or_default())?;
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -940,10 +941,6 @@ impl AffinityArgs {
         }
         let defaults = AffinityConfig::default();
         let load_factor = self.affinity_load_factor.unwrap_or(defaults.load_factor);
-        ensure!(
-            load_factor.is_finite() && load_factor >= 1.0,
-            "--affinity-load-factor must be finite and at least 1"
-        );
         let session_id_header = self
             .session_id_header
             .clone()
@@ -2974,11 +2971,6 @@ mod tests {
             .map(|b| (b.id.as_str(), b.rank, b.limits.max))
             .collect();
         assert_eq!(shape, [("short", 0, Some(4096)), ("long", 1, None)]);
-        let crate::buckets_reorg::BucketGroups::Plain(short) = &resolver.buckets[0].groups else {
-            panic!("expected plain bucket");
-        };
-        let short = format!("{:?}", short.policy);
-        assert!(short.contains("mode: Balanced, balanced_by: RunningRequests"));
         let crate::buckets_reorg::BucketGroups::Pd { decode, .. } = &resolver.buckets[1].groups
         else {
             panic!("expected PD bucket");
