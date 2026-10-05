@@ -50,7 +50,7 @@ const TARGETS: &[Target] = &[
         root: "sglang/api/v1/service.proto",
         package: "sglang.api.v1",
         rust_out: "rust/sglang-api-types/src/generated",
-        python_out: Some("python/sglang/api/v1/types.py"),
+        python_out: Some("python/sglang/api/v1/api_types.py"),
         // Boxed abort payload won't set the size of every ChunkEvent.
         boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
     },
