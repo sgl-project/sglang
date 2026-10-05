@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -16,6 +18,7 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,21 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def get_mamba_pool_schema_fingerprint(pool: MambaPoolHost) -> str:
+    # Pool layout and tensor schemas are fixed at allocation. Exclude capacity
+    # so a new engine can restore checkpoints into a differently sized cache.
+    schema = [
+        pool.layout,
+        [
+            (str(buf.dtype), list(buf.shape[1:]))
+            for buf in pool.get_hybrid_pool_buffer()
+        ],
+    ]
+    return hashlib.sha256(
+        json.dumps(schema, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class HiCacheStorage(ABC):
@@ -383,6 +401,11 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self._state_tp_rank = (
+            storage_config.tp_rank if storage_config.is_mla_model else None
+        )
+        self._state_tp_size = storage_config.tp_size
+        self._mamba_schema_fingerprint = None
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -405,6 +428,25 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # Reserve 67 bytes for h1_<SHA256> and 4 for .bin within NAME_MAX=255.
+        # Metadata scans and LRU ownership require an intact namespace suffix.
+        if len(os.fsencode(self.config_suffix)) > 184:
+            self.config_suffix = (
+                "_ns1_" + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
+            )
+
+        # Keep state ownership outside the compacted key. A replica of MLA KV
+        # still owns its recurrent state, including during a fresh LRU scan.
+        self._state_config_suffix = self.config_suffix
+        if self._state_tp_rank is not None:
+            owner = f"_mamba_tp{self._state_tp_rank}_{self._state_tp_size}"
+            self._state_config_suffix += owner
+            if len(os.fsencode(self._state_config_suffix)) > 184:
+                self._state_config_suffix = (
+                    "_ns1_"
+                    + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
+                    + owner
+                )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -451,13 +493,29 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            self._mamba_schema_fingerprint = get_mamba_pool_schema_fingerprint(
+                host_pool
+            )
+            self._evictor.add_owned_suffix(self._state_config_suffix)
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
     def _get_suffixed_key(self, key: str) -> str:
-        return key + self.config_suffix
+        suffix = self.config_suffix
+        if (
+            self._state_tp_rank is not None
+            and f".mamba_tp{self._state_tp_rank}_" in key
+        ):
+            suffix = self._state_config_suffix
+        if len(os.fsencode(key + suffix + ".bin")) > 255:
+            key = "h1_" + hashlib.sha256(os.fsencode(key)).hexdigest()
+        return key + suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -469,7 +527,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self._state_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(
@@ -659,7 +717,17 @@ class HiCacheFile(HiCacheStorage):
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        if pool_name == PoolName.KV:
+            return key
+        component = f"{key}.{pool_name}"
+        if pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            if self._mamba_schema_fingerprint is None:
+                raise ValueError(f"Unregistered file hybrid pool: {pool_name}")
+            owner = f"{self._state_tp_rank}_{self._state_tp_size}"
+            # DCP1 MLA keys omit TP topology, but recurrent state is TP-sharded.
+            # Legacy `.mamba` files alias ranks and cannot be reused safely.
+            component = f"{key}.mamba_tp{owner}_v1_{self._mamba_schema_fingerprint}"
+        return component
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
