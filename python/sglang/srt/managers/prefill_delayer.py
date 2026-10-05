@@ -199,7 +199,6 @@ class PrefillDelayer:
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
-        global_queue_timeout_expired = tp0_info[:, 5].max().item() > 0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -269,7 +268,7 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and global_queue_timeout_expired:
+                if queue_condition and tp0_info[:, 5].max().item() > 0:
                     queue_condition = False
 
             slot_condition = (
