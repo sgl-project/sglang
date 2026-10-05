@@ -3,9 +3,11 @@
 import argparse
 import json
 import pathlib
+import re
 import shutil
 from typing import Any, Dict, List
 
+import torch
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -37,6 +39,8 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     # for the FLF2V model
     "img_emb.emb_pos": "condition_embedder.image_embedder.pos_embed",
     # Add attention component mappings
+    "self_attn.q_rot": "attn1.q_rot",
+    "self_attn.k_rot": "attn1.k_rot",
     "self_attn.q": "attn1.to_q",
     "self_attn.k": "attn1.to_k",
     "self_attn.v": "attn1.to_v",
@@ -52,6 +56,7 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "attn2.to_k_img": "attn2.add_k_proj",
     "attn2.to_v_img": "attn2.add_v_proj",
     "attn2.norm_k_img": "attn2.norm_added_k",
+    "self_attn": "attn1",
     # MXFP4 msmodelslim wraps Linear layers with a `.linear.` subpath;
     # strip it so keys match the SGLang model parameters.
     ".linear.": ".",
@@ -111,6 +116,25 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     return state_dict
 
 
+def pack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+    if weight.dtype == torch.uint8:
+        return weight
+    if weight.dtype != torch.float8_e4m3fn or weight.shape[-1] % 2:
+        raise ValueError(
+            "MXFP4 weights must be packed uint8 or even-width FP8 containers"
+        )
+    # Convert numeric E2M1 values before the loader casts to the target dtype.
+    values = weight.float()
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device)
+    codes = torch.searchsorted(magnitudes, values.abs()).clamp(max=7)
+    if not torch.equal(magnitudes[codes], values.abs()):
+        raise ValueError(
+            "FP8 container contains values that are not representable as FP4 E2M1"
+        )
+    codes = (codes | (torch.signbit(values).long() << 3)).to(torch.uint8)
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+
+
 def convert_transformer(
     model_type: str, model_dir: pathlib.Path, output_dir: pathlib.Path
 ) -> None:
@@ -130,15 +154,34 @@ def convert_transformer(
     with open(json_candidates[0]) as f:
         quant_config = json.load(f)
 
-    for key in list(state_dict.keys()):
-        new_key = key[:]
-        for replace_key, rename_key in RENAME_DICT.items():
-            new_key = new_key.replace(replace_key, rename_key)
-        if new_key != key:
-            update_dict_(state_dict, key, new_key)
-            # The quant JSON only covers quantized layers, not all model keys
-            if key in quant_config:
-                update_dict_(quant_config, key, new_key)
+    # Attention descriptors need not have a corresponding checkpoint tensor.
+    for mapping in (state_dict, quant_config):
+        renamed = {}
+        for key, value in mapping.items():
+            new_key = key
+            for replace_key, rename_key in RENAME_DICT.items():
+                if replace_key.startswith("."):
+                    new_key = new_key.replace(replace_key, rename_key)
+                else:
+                    # Projection names must not match quant_type or q_rot.
+                    new_key = re.sub(
+                        r"(?<!\w)" + re.escape(replace_key) + r"(?!\w)",
+                        rename_key,
+                        new_key,
+                    )
+            if new_key in renamed:
+                raise ValueError(f"Checkpoint keys collide after renaming: {new_key}")
+            renamed[new_key] = value
+        mapping.clear()
+        mapping.update(renamed)
+
+    for key, weight in state_dict.items():
+        if key.endswith(".weight") and quant_config.get(key) in (
+            "W4A4_MXFP4",
+            "W4A4_MXFP4_DYNAMIC",
+            "W4A4_MXFP4_DUALSCALE",
+        ):
+            state_dict[key] = pack_fp4_weight(weight)
 
     save_file(state_dict, out_path / "diffusion_pytorch_model.safetensors")
 

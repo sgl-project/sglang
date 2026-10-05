@@ -800,7 +800,10 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
         # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
         qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=fp4_dtype, round_mode="round"
+            x_2d,
+            dst_type=fp4_dtype,
+            round_mode="round",
+            **getattr(layer, "mxfp4_quant_kwargs", {}),
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
