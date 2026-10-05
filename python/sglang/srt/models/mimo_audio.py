@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
+from sglang.srt.utils import is_sm90_supported
 
 logger = logging.getLogger(__name__)
 
@@ -45,29 +46,17 @@ def _mimo_local_attention_forward(
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
     if (
-        query.is_cuda
-        and query.device == key.device == value.device
-        and query.dtype == key.dtype == value.dtype
-        and query.dtype in (torch.float16, torch.bfloat16)
-        and query.ndim == 4
-        and query.shape == key.shape == value.shape
-        and query.shape[0] > 0
-        and 0 < query.shape[2] <= 4
-        and query.shape[3] == 16
-        and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+        query.dtype in (torch.float16, torch.bfloat16)
         and attention_mask is None
         and position_bias is None
         and dropout == 0.0
         and not kwargs.get("output_attentions", False)
-        and torch.cuda.get_device_capability(query.device)[0] == 9
     ):
         from sglang.kernels.ops.attention.mimo_local_attention import (
             mimo_local_attention,
         )
 
-        causal = (
-            is_causal if is_causal is not None else getattr(module, "is_causal", True)
-        )
+        causal = is_causal if is_causal is not None else module.is_causal
         return mimo_local_attention(
             query,
             key,
@@ -89,7 +78,10 @@ def _mimo_local_attention_forward(
     )
 
 
-def _register_mimo_local_attention():
+def _register_mimo_local_attention(config, group_size):
+    if not (is_sm90_supported() and config.head_dim == 16 and 0 < group_size <= 4):
+        return "sdpa"
+
     from transformers import AttentionInterface
     from transformers.masking_utils import (
         ALL_MASK_ATTENTION_FUNCTIONS,
@@ -1300,7 +1292,9 @@ class AudioEncoderMixin:
             partial_rotary_factor=config.partial_rotary_factor,
         )
         input_local_config.head_dim = config.input_local_head_dim
-        input_local_config._attn_implementation = _register_mimo_local_attention()
+        input_local_config._attn_implementation = _register_mimo_local_attention(
+            input_local_config, self.audio_group_size
+        )
         self.input_local_transformer = Qwen2Model(input_local_config)
         if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()
