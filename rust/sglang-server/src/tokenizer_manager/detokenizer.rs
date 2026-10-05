@@ -12,10 +12,11 @@
 //!
 //! Real detokenization uses dynamo-tokenizers' `DecodeStream`, a stateful
 //! incremental decoder (TGI/vLLM-style: it buffers partial UTF-8 / byte-fallback
-//! tokens and only emits text once a valid boundary is reached). Each request
-//! gets its own `DecodeStream`. When no tokenizer is configured (or
-//! `skip_tokenizer_init` is set) the backend is `Skip`: no decoding, the raw
-//! `output_ids` are emitted instead of text.
+//! tokens and only emits text once a valid boundary is reached). Requests that
+//! need generated text get their own `DecodeStream`. Token-only requests skip
+//! the stream decoder but can still decode logprob text with the shared tokenizer.
+//! When no tokenizer is configured (or `skip_tokenizer_init` is set) the backend
+//! is `Skip`: no decoding, the raw `output_ids` are emitted instead of text.
 //!
 //! Per-chunk response flow (no FSM state change inside Streaming):
 //!   ChunkEvent{finish:None}  -> step ids -> delta -> Server frame
@@ -69,8 +70,8 @@ impl StreamDecoder for DynamoDecoder {
     }
 }
 
-/// Shard-wide detok backend. Cloned per shard; mints a fresh per-request decoder
-/// on each `Register`.
+/// Shard-wide detok backend. Cloned per shard; creates a per-request stream
+/// decoder on `Register` only when generated text is required.
 #[derive(Clone)]
 pub enum DetokenizerBackend {
     Dynamo(dynamo_tokenizers::Tokenizer),
@@ -141,7 +142,9 @@ struct DetokState {
     /// `SamplingParams.no_stop_trim`: keep the matched stop in the output. Default
     /// (`false`) trims it off the final chunk (see [`trim_stop_str`]).
     no_stop_trim: bool,
-    /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
+    /// Per-request incremental decoder; `None` for token-only output or when
+    /// no tokenizer is configured. Logprob-text decoding uses the shared backend
+    /// independently of this stream decoder.
     /// This is the *only* per-request accumulation the shard keeps: the decoder's
     /// internal byte/UTF-8 buffer. Decoded **text deltas** are emitted per chunk
     /// (no cumulative buffer here) — the api-server's drain loop reassembles the
@@ -517,41 +520,44 @@ mod tests {
     /// entry.
     #[test]
     fn decode_answers_via_registered_sink_and_consumes_the_entry() {
-        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
-        let mut table = HashMap::new();
-        table.insert(
-            Rid::from("d1"),
-            DetokState {
-                sink: ResponseSink::Local(tx),
-                decode_logprob_text: false,
-                no_stop_trim: false,
-                decoder: None,
-                fsm: RequestState::Queued,
-            },
-        );
+        let tokenizer = dynamo_tokenizers::Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tokenizer_manager/testdata/wordlevel.json"
+        ))
+        .unwrap();
+        for backend in [
+            DetokenizerBackend::Skip,
+            DetokenizerBackend::Dynamo(tokenizer),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
+            let mut table = HashMap::new();
+            table.insert(
+                Rid::from("d1"),
+                DetokState {
+                    sink: ResponseSink::Local(tx),
+                    decode_logprob_text: false,
+                    no_stop_trim: false,
+                    decoder: None,
+                    fsm: RequestState::Queued,
+                },
+            );
 
-        handle_decode(
-            &mut table,
-            &Rid::from("d1"),
-            &[1],
-            &DetokenizerBackend::Skip,
-        );
+            handle_decode(&mut table, &Rid::from("d1"), &[1], &backend);
 
-        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
-            panic!("the decode error must reach the sink, not vanish");
-        };
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(!table.contains_key(&Rid::from("d1")), "entry consumed");
+            match (&backend, rx.try_recv().unwrap()) {
+                (DetokenizerBackend::Skip, ResponseItem::Error(Error::Validation(_))) => {}
+                (DetokenizerBackend::Dynamo(_), ResponseItem::Data(text)) => {
+                    assert_eq!(text.as_ref(), b"hello");
+                }
+                _ => panic!("the decode result must reach the sink"),
+            }
+            assert!(!table.contains_key(&Rid::from("d1")), "entry consumed");
 
-        // Unregistered rid (raced with an abort's Deregister): nothing to
-        // answer to — must be a no-op, not a panic.
-        handle_decode(
-            &mut table,
-            &Rid::from("d2"),
-            &[1],
-            &DetokenizerBackend::Skip,
-        );
-        assert!(rx.try_recv().is_err());
+            // Unregistered rid (raced with an abort's Deregister): nothing to
+            // answer to — must be a no-op, not a panic.
+            handle_decode(&mut table, &Rid::from("d2"), &[1], &backend);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// Two requests on the SAME shard keep separate entries. This is what a
@@ -695,55 +701,94 @@ mod tests {
         .unwrap();
         let backend = DetokenizerBackend::Dynamo(tokenizer);
         for mode in [OutputMode::TextAndTokenIds, OutputMode::TokenIds] {
-            let decoder = backend.new_decoder(mode);
-            assert_eq!(decoder.is_some(), mode == OutputMode::TextAndTokenIds);
-            let (tx, mut rx) = mpsc::channel(4);
-            let mut table = HashMap::from([(
-                Rid::from("mode"),
-                DetokState {
-                    sink: ResponseSink::Local(tx),
-                    decode_logprob_text: true,
-                    no_stop_trim: false,
-                    decoder,
-                    fsm: RequestState::Queued,
-                },
-            )]);
-            let (abort, abort_rx) = flume::unbounded();
-            handle_chunk(
-                &mut table,
-                ChunkEvent {
-                    rid: Rid::from("mode"),
-                    token_ids: vec![1, 2],
-                    finish_reason: Some(
-                        serde_json::from_value(serde_json::json!({"type":"stop","matched":2}))
-                            .unwrap(),
-                    ),
-                    extras: Some(Box::new(crate::message::response::ChunkExtras {
-                        out_lp_val: vec![-0.5],
-                        out_lp_idx: vec![1],
+            for matched in [serde_json::json!(2), serde_json::json!("STOP")] {
+                let decoder = backend.new_decoder(mode);
+                assert_eq!(decoder.is_some(), mode == OutputMode::TextAndTokenIds);
+                let (tx, mut rx) = mpsc::channel(4);
+                let mut table = HashMap::from([(
+                    Rid::from("mode"),
+                    DetokState {
+                        sink: ResponseSink::Local(tx),
+                        decode_logprob_text: true,
+                        no_stop_trim: false,
+                        decoder,
+                        fsm: RequestState::Queued,
+                    },
+                )]);
+                let (abort, abort_rx) = flume::unbounded();
+                handle_chunk(
+                    &mut table,
+                    ChunkEvent {
+                        rid: Rid::from("mode"),
+                        token_ids: vec![1],
                         ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                &backend,
-                &abort,
-            );
-            let ResponseItem::Done(output) = rx.try_recv().unwrap() else {
-                panic!("missing terminal output")
-            };
-            assert_eq!(output.token_ids, vec![1]);
-            assert_eq!(output.completion_tokens, 2);
-            assert_eq!(
-                output.text,
-                if mode == OutputMode::TokenIds {
-                    ""
-                } else {
-                    "hello"
-                }
-            );
-            assert_eq!(output.extras.unwrap().out_lp_txt, vec!["hello"]);
-            assert!(table.is_empty());
-            assert!(abort_rx.try_recv().is_err());
+                    },
+                    &backend,
+                    &abort,
+                );
+                let ResponseItem::Frame(output) = rx.try_recv().unwrap() else {
+                    panic!("missing intermediate output")
+                };
+                assert_eq!(output.token_ids, vec![1]);
+                assert_eq!(output.completion_tokens, 1);
+                assert_eq!(
+                    output.text,
+                    if mode == OutputMode::TokenIds {
+                        ""
+                    } else {
+                        "hello"
+                    }
+                );
+                assert!(output.finish_reason.is_none());
+                assert!(table.contains_key(&Rid::from("mode")));
+                assert!(abort_rx.try_recv().is_err());
+                handle_chunk(
+                    &mut table,
+                    ChunkEvent {
+                        rid: Rid::from("mode"),
+                        token_ids: vec![1, 2],
+                        finish_reason: Some(
+                            serde_json::from_value(
+                                serde_json::json!({"type":"stop","matched":matched}),
+                            )
+                            .unwrap(),
+                        ),
+                        extras: Some(Box::new(crate::message::response::ChunkExtras {
+                            out_lp_val: vec![-0.5],
+                            out_lp_idx: vec![1],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    &backend,
+                    &abort,
+                );
+                let ResponseItem::Done(output) = rx.try_recv().unwrap() else {
+                    panic!("missing terminal output")
+                };
+                assert_eq!(
+                    output.token_ids,
+                    if matched.is_number() {
+                        vec![1]
+                    } else {
+                        vec![1, 2]
+                    }
+                );
+                assert_eq!(output.completion_tokens, 2);
+                assert_eq!(
+                    output.text,
+                    if mode == OutputMode::TokenIds {
+                        ""
+                    } else if matched.is_number() {
+                        " hello"
+                    } else {
+                        " hello "
+                    }
+                );
+                assert_eq!(output.extras.unwrap().out_lp_txt, vec!["hello"]);
+                assert!(table.is_empty());
+                assert!(abort_rx.try_recv().is_err());
+            }
         }
     }
 }

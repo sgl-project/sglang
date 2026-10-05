@@ -1,6 +1,7 @@
 //! Messages to a Detokenizer shard.
 
 use super::ids::Rid;
+use super::request::OutputMode;
 use super::response::{ChunkEvent, ResponseSink};
 
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
@@ -18,7 +19,9 @@ pub enum DetokMsg {
         sink: ResponseSink,
         /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
-        output_mode: super::request::OutputMode,
+        /// TokenIds skips the per-request stream decoder. Stop-token trimming
+        /// and logprob-text decoding remain independent of this mode.
+        output_mode: OutputMode,
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
     },

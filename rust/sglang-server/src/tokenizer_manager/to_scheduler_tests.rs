@@ -382,29 +382,58 @@ fn hidden_states_gated_on_server_support() {
 /// to the channel, after registration -- so it must be deregistered, not leaked.
 #[test]
 fn over_context_request_deregisters_and_never_reaches_the_channel() {
-    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
-        context_len: 4,
-        ..test_limits()
+    for mode in [OutputMode::TextAndTokenIds, OutputMode::TokenIds] {
+        let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
+            context_len: 4,
+            ..test_limits()
+        });
+        let mut req = generate_req(
+            33,
+            SamplingParams {
+                max_new_tokens: Some(64),
+                ..Default::default()
+            },
+        );
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!();
+        };
+        g.output_mode = mode;
+        intake.drive(req);
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, output_mode, .. }) if rid.as_str() == "33" && output_mode == mode),
+            "registered before the check",
+        );
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "33"),
+            "must deregister on reject",
+        );
+        assert!(
+            consumer.drain(16).is_empty(),
+            "must not reach the scheduler"
+        );
+    }
+}
+
+#[test]
+fn control_registers_without_a_stream_decoder() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (tx, _rx) = mpsc::channel(8);
+    intake.drive(Request {
+        rid: "control".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tx),
+        kind: RequestKind::Control(Box::new(ControlRequest::GetInternalStateReq(
+            crate::message::io_struct::GetInternalStateReq::new("control".into()),
+        ))),
     });
-    intake.drive(generate_req(
-        33,
-        SamplingParams {
-            max_new_tokens: Some(64),
-            ..Default::default()
-        },
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Register {
+            output_mode: OutputMode::TokenIds,
+            ..
+        })
     ));
-    assert!(
-        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
-        "registered before the check",
-    );
-    assert!(
-        matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "33"),
-        "must deregister on reject",
-    );
-    assert!(
-        consumer.drain(16).is_empty(),
-        "must not reach the scheduler"
-    );
+    assert_eq!(consumer.drain(16).len(), 1);
 }
 
 /// A `Detokenize` request terminates at the detok stage, and the shard must
@@ -426,7 +455,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
         },
     });
     assert!(
-        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "41"),
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, output_mode: OutputMode::TokenIds, .. }) if rid.as_str() == "41"),
         "the sink must be registered before the decode job",
     );
     assert!(
