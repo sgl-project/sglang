@@ -14,17 +14,24 @@ import torch
 
 from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
+    DraftStateRegion,
     FusedDraftPlacement,
+    draft_state_layer_ids,
     draft_swa_layer_ids,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
+    MambaPool,
     MHATokenToKVPool,
     unwrap_write_loc,
     write_loc_is_physical,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedHybridReqToTokenPool,
+    UnifiedKVPool,
+)
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 class UnifiedDraftKVPool(MHATokenToKVPool):
@@ -310,6 +317,118 @@ class UnifiedDraftSWAKVPool(SWAKVPool):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
 
 
+class UnifiedDraftMambaPool(MambaPool):
+    """A draft runner's recurrent state as views of the draft block fused into
+    the host's state entries: `mamba_cache.conv[stream][layer]` is laid out
+    exactly as a private `MambaPool`'s. Slot ids are the target's, translated
+    by the shared allocator. Pure view: the host's whole-entry clear and copy
+    already cover the draft block, so the block ops here act on the draft block alone, and it
+    never calls `MambaPool.__init__` (no buffers of its own)."""
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        sub_pool_name: str,
+        layer_lanes: Mapping[int, int],
+    ):
+        spec = unified_buffer.mamba_spec(sub_pool_name)
+        region = spec.draft_region
+        assert isinstance(region, DraftStateRegion), (
+            f"UnifiedDraftMambaPool: sub-pool {sub_pool_name!r} carries no fused "
+            "draft state region"
+        )
+        layer_ids = sorted(layer_lanes)
+        assert layer_ids, "UnifiedDraftMambaPool binds at least one layer"
+        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
+        # A runner's lanes are one contiguous range, so its layers are one
+        # strided slice of the region's views (a gather would copy).
+        start = lanes[0]
+        assert lanes == list(range(start, start + len(lanes))) and (
+            0 <= start and start + len(lanes) <= region.lane_num
+        ), (
+            f"draft state lanes {lanes} must be a contiguous range within "
+            f"{region.lane_num}"
+        )
+        conv_views, temporal_view = unified_buffer.build_draft_state_views(
+            sub_pool_name
+        )
+        stop = start + len(lanes)
+
+        self._unified_buffer = unified_buffer
+        self._sub_pool_name = sub_pool_name
+        self.layer_lanes: Dict[int, int] = dict(layer_lanes)
+        self.mamba_layer_ids = layer_ids
+        self.num_mamba_layers = len(layer_ids)
+        self._max_size = unified_buffer.max_slots(sub_pool_name) - 1
+        self.size = self._max_size
+        self.device = unified_buffer.device
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        self.enable_custom_mem_pool = False
+        self.custom_mem_pool = None
+        # Same disabled-state attributes `UnifiedMambaPool` replicates for the
+        # base class's unconditional reads.
+        self.enable_linear_replayssm = False
+        self.linear_replayssm_cache_len = 16
+        self.replayssm_write_pos = None
+        self.replayssm_is_kda = False
+        self.enable_linear_replayssm_spec = False
+        self.replayssm_spec_fold = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
+        self.debug_memory_pool = False
+        self.conv_shard_groups = None
+        self.conv_slice_axis = spec.conv_slice_axis
+        self.mamba_cache = self.State(
+            conv=[view[start:stop] for view in conv_views],
+            temporal=temporal_view[start:stop],
+        )
+        self.mem_usage = 0.0  # fused into the host entries
+
+    def clear_slots(self, indices: torch.Tensor):
+        """Zero THIS runner's state block in the given slots.
+
+        The block only, never the whole entry: the host's own streams share
+        the entry and must survive, since a new request takes over the
+        draft's block while the target's state for that slot is still live.
+        The host's whole-entry clear covers the block too, but only on a
+        plain EXTEND forward: ModelRunner skips it on decode, target-verify
+        and draft-extend, the modes the draft needs it in.
+        """
+        for view in self.mamba_cache.conv:
+            view[:, indices] = 0
+        self.mamba_cache.temporal[:, indices] = 0
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        """Copy-on-write THIS runner's state block, block only (see above)."""
+        for view in self.mamba_cache.conv:
+            view[:, dst_indices] = view[:, src_indices]
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
+        ]
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "fused draft state relocates with the HOST pool's whole-entry move"
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft state has no contiguous region of its own; state "
+            "transfer / disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError(
+            "CPU offloading is unsupported for fused draft state."
+        )
+
+    def load_cpu_copy(self, mamba_cache_cpu, indices):
+        raise NotImplementedError(
+            "CPU offloading is unsupported for fused draft state."
+        )
+
+
 def fused_draft_host_allocator(token_to_kv_pool: Any) -> Optional[Any]:
     """The host allocator a fused draft pool translates through, or None for
     any other pool."""
@@ -331,8 +450,8 @@ def draft_kv_layer_ids(model) -> List[int]:
 
 def draft_state_layer_classes(model) -> List[str]:
     """Class names of the BUILT draft model's recurrent / linear-attention
-    modules. A fused draft has KV lanes only, so any of these would run with
-    no state pool of its own."""
+    modules. A runner the placement gives no state lanes would run any of
+    these with no state pool of its own."""
     from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 
@@ -474,3 +593,41 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
 
 
 register_draft_binder("dense", _bind_dense)
+
+
+def _runner_state_layer_ids(ctx: BindContext) -> Tuple[int, ...]:
+    """The recurrent-state layer ids this runner serves: its own depth for a
+    per-depth head, every state layer otherwise."""
+    mc = ctx.model_config
+    num_depths = mc.num_nextn_predict_layers
+    num_depths = 1 if num_depths is None else int(num_depths)
+    layer_ids = draft_state_layer_ids(mc, num_depths=num_depths)
+    if num_depths > 1:
+        return (ctx.runner,) if ctx.runner in layer_ids else ()
+    return layer_ids
+
+
+def _bind_state(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBinding:
+    """This runner's recurrent-state block: its request table is the target's
+    (same request->slot mappings, same slot allocator) with a `mamba_pool`
+    view keyed by the runner's own state layer ids."""
+    hosts = ctx.hosts_of("state")
+    assert hosts == ("mamba",), (
+        f"the state binder serves the 'mamba' host alone; got {hosts}"
+    )
+    assert isinstance(binding.req_to_token_pool, UnifiedHybridReqToTokenPool), (
+        "a fused draft state block needs the target's unified state pool"
+    )
+    layer_ids = _runner_state_layer_ids(ctx)
+    lanes = ctx.placement.lanes_for(ctx.runner, "mamba")
+    assert len(layer_ids) == len(lanes), (
+        f"draft runner {ctx.runner}: state layers {list(layer_ids)} vs placed "
+        f"lanes {list(lanes)}"
+    )
+    req_to_token_pool = binding.req_to_token_pool.clone_for_fused_draft(
+        layer_lanes=dict(zip(layer_ids, lanes))
+    )
+    return msgspec.structs.replace(binding, req_to_token_pool=req_to_token_pool)
+
+
+register_draft_binder("state", _bind_state)

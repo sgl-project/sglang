@@ -588,14 +588,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         seen = set()
         for runner in self.draft_runner_list:
-            pool = runner.req_to_token_pool.mamba_pool
+            req_pool = runner.req_to_token_pool
+            pool = req_pool.mamba_pool
             if id(pool) in seen:
                 continue
             seen.add(id(pool))
+            # The pool is a PHYSICAL store; a unified req pool hands out
+            # virtual slot ids (identity on a static pool).
             if clear is not None and len(clear) > 0:
-                pool.clear_slots(clear)
+                pool.clear_slots(req_pool.translate_mamba_indices(clear))
             if cow_src is not None and len(cow_src) > 0:
-                pool.copy_from(cow_src, cow_dst)
+                pool.copy_from(
+                    req_pool.translate_mamba_indices(cow_src),
+                    req_pool.translate_mamba_indices(cow_dst),
+                )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

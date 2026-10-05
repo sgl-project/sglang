@@ -32,7 +32,7 @@ rule allows.
 """
 
 import math
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -112,10 +112,6 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-# Widened to a Union once a host kind places a region of another shape.
-DraftRegion = DenseDraftRegion
-
-
 class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
     """Per-GPU K/V row geometry of one kind of draft attention layer."""
 
@@ -144,6 +140,29 @@ class DraftStateGeometry(msgspec.Struct, frozen=True, kw_only=True):
     def layer_bytes(self) -> int:
         conv = sum(self.conv_row_bytes(i) for i in range(len(self.conv_state_shapes)))
         return conv + self.temporal_row_bytes()
+
+
+class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """The draft's recurrent state fused into every slot of a host state
+    sub-pool: one block per fused (runner, layer), laid out stream-major like
+    the host's own block, after it. The host's whole-entry clear and copy then
+    carry the draft's state with the target's."""
+
+    lane_num: int
+    state: DraftStateGeometry
+
+    def validate(self) -> None:
+        assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
+        assert len(self.state.conv_state_shapes) > 0, (
+            "conv_state_shapes must be non-empty"
+        )
+
+    def entry_bytes(self) -> int:
+        """Draft state bytes per slot, before the host entry's alignment."""
+        return self.lane_num * self.state.layer_bytes()
+
+
+DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
 
 
 class DraftLayerSet(msgspec.Struct, frozen=True, kw_only=True):
@@ -331,6 +350,37 @@ SWA_HOST = register_host_kind(
     WindowHostKind(
         name="swa", serves=LAYER_WINDOW, family="dense", fallback_host="full"
     )
+)
+
+
+class StateHostKind(HostKind):
+    """The mamba sub-pool: its entries take the draft's recurrent-state block
+    after the host's streams, so the slot that is the request's carries both."""
+
+    def region_for(
+        self,
+        *,
+        layers: DraftLayerSet,
+        lane_num: int,
+        store_dtype: torch.dtype,
+        kv_dtype: Optional[torch.dtype],
+    ) -> DraftStateRegion:
+        geometry = layers.geometry
+        assert isinstance(geometry, DraftStateGeometry), geometry
+        return DraftStateRegion(lane_num=lane_num, state=geometry)
+
+    def describe(self, *, region: DraftRegion, lanes: Sequence[Tuple[int, ...]]) -> str:
+        state = region.state
+        return (
+            f"fused draft state in {self.name!r}: {region.lane_num} lane(s) x "
+            f"{len(state.conv_state_shapes)} conv stream(s) @ {state.conv_dtype} + "
+            f"temporal {tuple(state.temporal_state_shape)} @ {state.temporal_dtype} "
+            f"= {region.entry_bytes()} B/slot; runner lanes {list(lanes)}"
+        )
+
+
+MAMBA_HOST = register_host_kind(
+    StateHostKind(name="mamba", serves=LAYER_STATE, family="state")
 )
 
 
