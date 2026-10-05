@@ -388,4 +388,4 @@ Each speculative row still requires keyed selection, but tree-context reconstruc
 
 The fused Triton selector is adapted from Meta's Apache-2.0 [TextSeal](https://github.com/facebookresearch/textseal) implementation and re-implemented on the hash contract above, so detection follows this page rather than TextSeal's own tooling.
 
-The runtime and reference detector live in `python/sglang/srt/sampling/watermarking/`. Registered coverage lives in `test/registered/unit/sampling/test_watermark*.py`, `test/registered/kernels/ops/sampling/test_watermark_*.py`, and `test/registered/e2e/openai_server/test_watermark.py`.
+The runtime and reference detector live in `python/sglang/srt/sampling/watermarking/`. Registered coverage lives in `test/registered/kernels/ops/sampling/test_watermark_*.py` and `test/registered/e2e/openai_server/test_watermark.py`.
