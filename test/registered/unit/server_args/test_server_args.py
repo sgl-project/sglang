@@ -2058,6 +2058,40 @@ class TestHiCacheArgs(CustomTestCase):
         handle_hicache_ratio_default(args)
         return args
 
+    def test_hicache_swa_ratio_requires_explicit_sizing_and_valid_value(self):
+        for ratio in (0, -1, float("inf"), float("nan")):
+            with (
+                self.subTest(ratio=ratio),
+                self.assertRaisesRegex(ValueError, "positive finite"),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=2,
+                    hicache_swa_ratio=ratio,
+                ).resolve_once()
+
+        with self.assertRaisesRegex(ValueError, "explicit --hicache-ratio"):
+            ServerArgs(
+                model_path="dummy",
+                enable_hierarchical_cache=True,
+                hicache_swa_ratio=4,
+            ).resolve_once()
+
+        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+            ServerArgs(
+                model_path="dummy", hicache_ratio=2, hicache_swa_ratio=4
+            ).resolve_once()
+
+        args = ServerArgs(
+            model_path="dummy",
+            enable_hierarchical_cache=True,
+            hicache_ratio=2,
+            hicache_swa_ratio=4,
+        )
+        args.resolve_once()
+        self.assertEqual(args.hicache_swa_ratio, 4)
+
     def _assert_hicache_fields(
         self,
         args: ServerArgs,

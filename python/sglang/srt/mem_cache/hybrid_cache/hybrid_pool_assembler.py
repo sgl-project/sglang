@@ -547,14 +547,20 @@ def _deepseek_v4_num_host_pages(
 
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
-    if get_memory().hicache_size > 0:
+    memory = get_memory()
+    if memory.hicache_size > 0:
         raise ValueError(
             "DeepSeek V4 HiCache currently does not support --hicache-size; "
             "use --hicache-ratio instead."
         )
-    ratio = get_memory().hicache_ratio
+    ratio = memory.hicache_ratio
+    swa_ratio = memory.hicache_swa_ratio
     full_host_pages = int(device_full_pages * ratio)
-    swa_host_pages = int(device_swa_pages * ratio)
+    swa_host_pages = int(device_swa_pages * (ratio if swa_ratio is None else swa_ratio))
+    if swa_ratio is not None and swa_host_pages == 0:
+        raise ValueError(
+            "--hicache-swa-ratio is too small to allocate even one SWA host page."
+        )
 
     # NPU sizes the independent C128 host pool from its device page count.
     # For example, host pages = device pages * hicache_ratio.
@@ -845,6 +851,14 @@ def build_deepseek_v4_hicache_stack(
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
+    if (
+        getattr(get_memory(), "hicache_swa_ratio", None) is not None
+        and not has_paged_swa
+    ):
+        raise ValueError(
+            "--hicache-swa-ratio requires a paged DeepSeek V4 SWA host pool; "
+            "this KV layout rebuilds SWA state instead."
+        )
     mtp_swa_device_buffers = []
     if not has_paged_swa:
         # Unified KV and encoder replay rebuild SWA state; keep it out of host cache.
