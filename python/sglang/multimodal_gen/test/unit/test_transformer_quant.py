@@ -1441,9 +1441,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
         for method in ("fp8", "mxfp4", "mxfp8", "convrot_int8"):
             with self.subTest(method=method):
-                quant_config = self._resolve_online_quant_config(
-                    method, ignored_layers
-                )
+                quant_config = self._resolve_online_quant_config(method, ignored_layers)
                 self.assertEqual(quant_config.ignored_layers, ignored_layers)
 
     def test_online_quant_config_without_ignored_layers_param_does_not_raise(self):
@@ -1461,9 +1459,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         # behaviour of passing ignored_layers=None explicitly.
         for ignored_layers in (None, []):
             with self.subTest(ignored_layers=ignored_layers):
-                quant_config = self._resolve_online_quant_config(
-                    "fp8", ignored_layers
-                )
+                quant_config = self._resolve_online_quant_config("fp8", ignored_layers)
                 self.assertEqual(quant_config.ignored_layers, [])
 
     @patch(
