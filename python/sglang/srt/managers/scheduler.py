@@ -6432,11 +6432,7 @@ class Scheduler(
             self.uocr_runtime.release_doc(recv_req.doc_id)
 
     def handle_subagent_keepalive(self, recv_req: SubagentKeepaliveReqInput):
-        """Refresh a parent session's prefix-cache LRU while its subagent runs.
-
-        Broadcast to every rank, so a rank that never served this session just
-        misses the lookup and returns.
-        """
+        """Refresh a parent session's prefix-cache LRU while its subagent runs."""
         self.tree_cache.bump_session_keepalive(recv_req.session_id)
         return None
 
