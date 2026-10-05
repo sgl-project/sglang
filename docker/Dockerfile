@@ -4,7 +4,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.7
+ARG SGL_KERNEL_VERSION=0.4.9
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -13,7 +13,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.18
+ARG FLASHINFER_VERSION=0.7.0.post1
 ARG MOONCAKE_VERSION=0.3.13.post1
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -286,7 +286,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
-        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache*.dist-info /flashinfer_jit_output/ ; \
     fi
 
 ########################################################
@@ -498,9 +498,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# PyTorch 2.13 requires nvidia-nccl-cu13==2.29.7, so keep that version while
-# resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7
-# at runtime; apply the override only after the constrained dependency solve.
+# DeepEP needs SGL_NCCL_VERSION at runtime even if torch pins another version;
+# install it after the constrained dependency solve so the solve cannot revert it.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall --no-deps \
         "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
