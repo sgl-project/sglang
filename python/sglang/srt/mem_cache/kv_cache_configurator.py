@@ -976,17 +976,14 @@ class KVCacheConfigurator:
         host_has_fusable_full_pool = (
             self.is_hybrid_swa or self.mambaish_config is not None
         )
-        if self.spec_algorithm.is_eagle():
-            draft_num_layers = aux.draft_kv_num_layers
-        elif self.spec_algorithm.is_dflash_family():
-            draft_num_layers = aux.dflash_draft_num_layers
-        else:
-            draft_num_layers = None
         if not (
             get_memory().enable_unified_memory
             and host_has_fusable_full_pool
             and not self.is_draft_worker
-            and draft_num_layers
+            and (
+                self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
+            )
+            and aux.draft_kv_num_layers
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
@@ -1048,7 +1045,7 @@ class KVCacheConfigurator:
             )
         profile = draft_kv_profile(
             aux.draft_model_config,
-            num_layers=int(draft_num_layers),
+            num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=get_parallel().attn_tp_size,
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
