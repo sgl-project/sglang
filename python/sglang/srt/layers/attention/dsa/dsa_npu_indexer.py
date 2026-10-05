@@ -12,6 +12,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -60,7 +61,7 @@ class DSANPUIndexerMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        input_on_attention_tp_slices: bool = False,
+        input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
@@ -140,7 +141,7 @@ class DSANPUIndexerMixin:
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
-            if _use_ag_after_qlora and input_on_attention_tp_slices:
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
                 k = scattered_to_tp_attn_full(k, forward_batch)
             k_pe, k_nope = torch.split(
                 k,
@@ -207,16 +208,31 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
+        indexer_cache_loc = forward_batch.out_cache_loc
+        parallel = get_parallel()
+        if (
+            parallel.dcp_enabled
+            and parallel.attn_dcp_size > 1
+            and not get_attn_backend().is_draft_worker
+        ):
+            indexer_cache_loc = (
+                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
+            )
+            assert indexer_cache_loc is not None, (
+                "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
+            )
+            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
+                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+            )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
-            pool.set_index_k_scale_buffer(
-                layer_id, forward_batch.out_cache_loc, k_scale
-            )
-        pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
+            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
+        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -284,7 +300,7 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-        if _use_ag_after_qlora and input_on_attention_tp_slices:
+        if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if (
