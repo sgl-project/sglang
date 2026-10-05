@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -651,19 +651,28 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+    def session_owns_record(self, req: Req) -> bool:
+        """Whether the request runs on a record a session owns. Pool accounting
+        counts such a record as session-held, not as the request's."""
+        return False
+
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The KV records sessions own, by session id."""
+        return {}
+
+    def session_held_tokens(self) -> int:
         return 0
 
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+    def session_held_full_tokens(self) -> int:
         return 0
 
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+    def session_held_swa_tokens(self) -> int:
         return 0
 
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+    def session_held_req_count(self) -> int:
         return 0
 
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+    def session_held_mamba_slots(self) -> int:
         return 0
 
     def supports_prefix_sharing(self) -> bool:

@@ -1022,7 +1022,6 @@ class TestTriFactorySizing(unittest.TestCase):
                     session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
                     session.slots = {"test": slot}
                     self.assertEqual(session.session_held_mamba_slots(), count + 1)
-                    self.assertEqual(session.session_held_mamba_slots({1}), 0)
                     session._free_slot_mamba(slot)
                     self.assertEqual(session.session_held_mamba_slots(), 0)
                     self.assertEqual(allocator.available_size(), available)

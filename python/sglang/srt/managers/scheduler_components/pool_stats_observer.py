@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     List,
     Optional,
     Tuple,
@@ -155,8 +154,6 @@ class SchedulerPoolStatsObserver:
     full_tokens_per_layer: Any
     swa_tokens_per_layer: Any
     max_total_num_tokens: int
-    get_last_batch: Callable
-    get_running_batch: Callable
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -165,35 +162,20 @@ class SchedulerPoolStatsObserver:
             if session.streaming
         )
 
-    def active_pool_idxs(self) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
-
-        Used to decide which session slots' KV is owned by batch reqs
-        (and thus counted via uncached_size, not session_held).
-        """
-        idxs = set()
-        for batch in [self.get_last_batch(), self.get_running_batch()]:
-            if batch is None or batch.is_empty():
-                continue
-            for req in batch.reqs:
-                if req.kv.holds_kv:
-                    idxs.add(req.kv.req_pool_idx)
-        return idxs
-
     def session_held_tokens(self) -> int:
-        return self.tree_cache.session_held_tokens(self.active_pool_idxs())
+        return self.tree_cache.session_held_tokens()
 
     def session_held_full_tokens(self) -> int:
-        return self.tree_cache.session_held_full_tokens(self.active_pool_idxs())
+        return self.tree_cache.session_held_full_tokens()
 
     def session_held_swa_tokens(self) -> int:
-        return self.tree_cache.session_held_swa_tokens(self.active_pool_idxs())
+        return self.tree_cache.session_held_swa_tokens()
 
     def session_held_req_count(self) -> int:
         return self.tree_cache.session_held_req_count()
 
     def session_held_mamba_slots(self) -> int:
-        return self.tree_cache.session_held_mamba_slots(self.active_pool_idxs())
+        return self.tree_cache.session_held_mamba_slots()
 
     def get_pool_stats(self) -> PoolStats:
         if self.is_hybrid_swa:

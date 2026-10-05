@@ -355,8 +355,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
             full_tokens_per_layer=self.pool_size,
             swa_tokens_per_layer=None,
             max_total_num_tokens=self.pool_size,
-            get_last_batch=lambda: queue.scheduler.last_batch,
-            get_running_batch=lambda: queue.scheduler.running_batch,
         )
         return queue, queue.kv_manager.kv_args
 

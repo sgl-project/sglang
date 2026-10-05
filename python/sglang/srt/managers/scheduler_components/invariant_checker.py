@@ -304,7 +304,7 @@ class SchedulerInvariantChecker:
             if id(req) in counted:
                 continue
             counted.add(id(req))
-            if not req.kv.holds_kv:
+            if not req.kv.holds_kv or self.tree_cache.session_owns_record(req):
                 continue
 
             allocated_len = req.kv.kv_allocated_len
@@ -378,7 +378,7 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if not req.kv.holds_kv:
+                if not req.kv.holds_kv or self.tree_cache.session_owns_record(req):
                     continue
                 _add_owner(
                     req,
@@ -387,17 +387,15 @@ class SchedulerInvariantChecker:
                     req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
-        sess = getattr(self.tree_cache, "slots", None)
-        if sess:
-            for sid, slot in sess.items():
-                if slot.kv.holds_kv:
-                    _add_owner(
-                        slot,
-                        f"slot {sid[:8]}",
-                        slot.kv.req_pool_idx,
-                        slot.kv.kv_committed_len,
-                        slot.kv.kv_allocated_len,
-                    )
+        for sid, kv in self.tree_cache.session_records().items():
+            if kv.holds_kv:
+                _add_owner(
+                    kv,
+                    f"slot {sid[:8]}",
+                    kv.req_pool_idx,
+                    kv.kv_committed_len,
+                    kv.kv_allocated_len,
+                )
 
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0

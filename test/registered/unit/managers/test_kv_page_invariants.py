@@ -25,7 +25,11 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         free_pages=free_pages,
         get_all_free_pages=lambda: free_pages,
     )
-    tc = SimpleNamespace(slots={})
+    records = {}
+    tc = SimpleNamespace(
+        session_records=lambda: records,
+        session_owns_record=lambda req: False,
+    )
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc
 
     class _FakeChecker:
@@ -80,7 +84,7 @@ class TestKVPageInvariants(CustomTestCase):
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
         chk.get_last_batch = lambda: None
-        tc.slots = {"s1": _FakeOwner(0, 145, 144)}
+        tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 

@@ -181,6 +181,13 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
+    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
+        """The slot whose record the request runs on, if any."""
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        return slot if slot is not None and slot.kv is req.kv else None
+
     def try_cache_finished_req(self, req: Req) -> bool:
         """Hands a turn's row to the session slot when it finishes or is
         retracted. Returns False for non-streaming requests and aborts, which
@@ -265,32 +272,24 @@ class StreamingSession:
 
         self._free_slot_mamba(slot)
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """KV tokens held by idle session slots; a slot whose pool idx is in
-        ``active_pool_idxs`` is counted via uncached_size instead."""
+    def session_held_tokens(self) -> int:
+        """KV tokens the session slots own past their tree-owned prefix, whether
+        or not a turn is running on them."""
         total = 0
         for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None
-                and slot.kv.req_pool_idx in active_pool_idxs
-            )
-            if slot.kv.holds_kv and not in_batch:
+            if slot.kv.holds_kv:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
                 total += allocated - slot.kv.cache_protected_len
         return total
 
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session_held_tokens(active_pool_idxs)
+    def session_held_full_tokens(self) -> int:
+        return self.session_held_tokens()
 
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total SWA tokens held by session slots, not tracked by the tree."""
+    def session_held_swa_tokens(self) -> int:
+        """SWA tokens the session slots own, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None
-                and slot.kv.req_pool_idx in active_pool_idxs
-            )
-            if slot.kv.holds_kv and not in_batch:
+            if slot.kv.holds_kv:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.cache.page_size)
                 total += allocated - max(
                     slot.kv.cache_protected_len,
@@ -298,28 +297,14 @@ class StreamingSession:
                 )
         return total
 
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Number of req pool slots held by session slots."""
+    def session_held_req_count(self) -> int:
+        """Number of req pool slots the session slots own."""
+        return sum(slot.kv.holds_kv for slot in self.slots.values())
 
-        def _owned(s):
-            in_batch = (
-                active_pool_idxs is not None and s.kv.req_pool_idx in active_pool_idxs
-            )
-            return s.kv.holds_kv and not in_batch
-
-        return sum(_owned(s) for s in self.slots.values())
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        """mamba_pool entries held by idle session slots (same exclusion as
-        ``session_held_tokens``)."""
+    def session_held_mamba_slots(self) -> int:
+        """mamba_pool entries the session slots own."""
         total = 0
         for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None
-                and slot.kv.req_pool_idx in active_pool_idxs
-            )
-            if in_batch:
-                continue
             if slot.kv.holds_mamba:
                 total += slot.kv.mamba_pool_idx.numel()
             if slot.kv.mamba_ping_pong_track_buffer is not None:
