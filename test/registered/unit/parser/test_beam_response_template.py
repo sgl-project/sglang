@@ -453,15 +453,22 @@ class TestBeamResponseTemplate(CustomTestCase):
         bare = _continuation_call("set_mode", _parameter("mode", "\nab"))
         bare = bare.replace("\n\nab\n", "\nab")
         self.assertFalse(_is_grammar_accept_string(grammar, bare))
+        # No framing holds these choices, so the tool takes any arguments.
         for choice in ("a\n</rfl:parameter>b", "a<|end|><|start|>assistantb"):
             with self.subTest(choice=choice):
                 tool = _tool("set_mode", {"mode": {"type": "string", "enum": [choice]}})
                 tool.function.strict = True
                 parser = FunctionCallParser(tools=[tool], tool_call_parser="beam")
 
-                kind, _ = parser.get_structure_constraint("required")
+                kind, tag = parser.get_structure_constraint("required")
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
 
-                self.assertEqual(kind, "json_schema")
+                self.assertEqual(kind, "structural_tag")
+                self.assertTrue(
+                    _is_grammar_accept_string(
+                        grammar, _continuation_call("set_mode", _parameter("mode", "x"))
+                    )
+                )
         named = _tool("set_mode", {"a<|end|><|start|>assistantb": {"type": "string"}})
         named.function.strict = True
         with self.assertRaisesRegex(ValueError, "parameter name"):

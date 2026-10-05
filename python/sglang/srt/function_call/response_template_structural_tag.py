@@ -629,17 +629,28 @@ def answer_rest_structural_tag(answer: ResponseTemplateField) -> dict[str, Any] 
     return {"type": "structural_tag", "format": _sequence(*_answer_text(closers))}
 
 
-def supports_tool_call_structural_tag(
-    field: ResponseTemplateField, tools: list[dict[str, Any]] | None = None
-) -> bool:
-    """Whether these tools can use the template format for forced calls."""
+def supports_tool_call_structural_tag(field: ResponseTemplateField) -> bool:
+    """Whether the template format can carry forced calls. Tools cannot change
+    it: only strict ones fail to derive, and `holds_strict_arguments` tells which."""
     probe = [{"function": {"name": "f", "parameters": {"properties": {}}}}]
     try:
-        tag = tool_call_structural_tag(field, tools or probe, parallel_tool_calls=True)
+        tag = tool_call_structural_tag(field, probe, parallel_tool_calls=True)
     except ValueError:
         # Derivable, only a name does not fit the template.
         return True
     return tag is not None
+
+
+def holds_strict_arguments(
+    field: ResponseTemplateField, parameters: dict[str, Any]
+) -> bool:
+    """Whether native calls can hold a strict tool's arguments to `parameters`."""
+    try:
+        format = _arguments_format(field, typed_parameters(parameters), strict=True)
+    except ValueError:
+        # The tags reject the names the template cannot encode.
+        return True
+    return format is not None
 
 
 def tool_call_structural_tag(

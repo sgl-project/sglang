@@ -33,6 +33,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.response_template_structural_tag import (
     answer_rest_structural_tag,
+    holds_strict_arguments,
     json_answer_structural_tag,
     message_start_anchors,
     message_start_openers,
@@ -44,8 +45,10 @@ from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
+    ResponseTemplateField,
     load_response_template,
 )
+from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -219,11 +222,14 @@ class ResponseTemplateStreamAdapter:
         """Create the parser and replay a tool region left open by the prefix."""
         if self._parser is not None:
             return []
+        field = self._template.fields.get(_TOOL_FIELD)
         self._parser = ResponseParser(
             self._template,
             prefix=self._prefix,
             tools=[
-                _typed_tool(tool if isinstance(tool, dict) else tool.model_dump())
+                _typed_tool(
+                    tool if isinstance(tool, dict) else tool.model_dump(), field
+                )
                 for tool in tools or []
             ],
             constrained=self._constrained,
@@ -777,8 +783,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         # Forced calls then keep the native format, which this detector parses
         # instead of the JSON array used without a template-derived tag.
-        tools = [tool.model_dump() for tool in self._tools or ()]
-        return supports_tool_call_structural_tag(self._tool_field, tools)
+        return supports_tool_call_structural_tag(self._tool_field)
 
     def open_call_closer(self, text: str) -> str | None:
         """The closer for a call that `text` leaves open at its end."""
@@ -801,15 +806,13 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         parallel_tool_calls: bool = True,
         message_start: bool = False,
     ):
-        tool_dicts = [tool.model_dump() for tool in tools or ()]
+        # As the parser reads them, so both agree on which tools are strict.
+        tool_dicts = [
+            _typed_tool(tool.model_dump(), self._tool_field) for tool in tools or ()
+        ]
         if tool_choice == "none":
             tool_dicts, tool_choice = [], "auto"
         named = isinstance(tool_choice, ToolChoice)
-        # Named calls still fall back if another tool cannot use this format.
-        if named and not supports_tool_call_structural_tag(
-            self._tool_field, tool_dicts
-        ):
-            return None
         if named:
             tool_dicts = [
                 tool
@@ -863,16 +866,30 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         )
 
 
-def _typed_tool(tool: dict) -> dict:
-    """`tool`, in either API's shape, as template grammars constrain it."""
+def _typed_tool(tool: dict, field: ResponseTemplateField | None) -> dict:
+    """`tool`, in either API's shape, as template grammars constrain it. Like
+    XGrammar with the schema keywords it does not support, a strict tool whose
+    schema the `field` grammar cannot hold takes any arguments instead."""
     function = tool.get("function", tool)
     if not isinstance(function, dict):
         return tool
     function = dict(function)
-    if isinstance(function.get("parameters"), dict):
-        function["parameters"] = typed_parameters(function["parameters"])
+    parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        function["parameters"] = parameters = typed_parameters(parameters)
     if envs.SGLANG_TOOL_STRICT_LEVEL.get() >= ToolStrictLevel.PARAMETER:
         function["strict"] = True
+    if (
+        function.get("strict")
+        and field is not None
+        and isinstance(parameters, dict)
+        and not holds_strict_arguments(field, parameters)
+    ):
+        print_warning_once(
+            f"response_template: tool {function.get('name')!r} takes any "
+            "arguments, as the template cannot hold them to its strict schema"
+        )
+        function["strict"] = False
     return {**tool, "function": function} if "function" in tool else function
 
 
