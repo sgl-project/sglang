@@ -1147,7 +1147,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             q_seq_lens_cpu=q_seq_lens_cpu,
             kv_seq_lens_cpu=kv_seq_lens_cpu,
             query=q,
@@ -1170,6 +1170,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+        if return_lse:
+            output, lse = result
+            # TRT-LLM returns log2 LSE; merge_state consumes natural-log LSE.
+            return output, lse.mul_(math.log(2))
+        return result
 
     def _set_kv_and_concat_q_fused(
         self,

@@ -82,6 +82,7 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
     )
     config.qk_nope_head_dim = config.hf_config.qk_nope_head_dim = 128
     config.v_head_dim = config.hf_config.v_head_dim = 128
+    config.scaling = 192**-0.5
     runner = MockMLAModelRunner(
         case=case,
         model_config=config,

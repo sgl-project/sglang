@@ -48,6 +48,84 @@ def _extend_batch():
 
 @skipUnless(torch.cuda.is_available(), "CUDA required")
 class PrefillCpuLensTest(CustomTestCase):
+    def test_native_prefix_merge_matches_dense_reference(self):
+        from sglang.srt.layers.attention.merge_state import merge_state
+
+        torch.manual_seed(19)
+        tokens, prefix, heads = 32, 128, 12
+        q = torch.randn(tokens, heads, 192, device="cuda", dtype=torch.bfloat16) * 0.5
+        k = (
+            torch.randn(
+                prefix + tokens, heads, 192, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.5
+        )
+        v = (
+            torch.randn(
+                prefix + tokens, heads, 128, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.5
+        )
+        layer = NS(scaling=192**-0.5)
+        cpu_q_lens = torch.tensor([tokens], dtype=torch.int32)
+        cum_q = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                backend = _backend()
+                backend.data_type = dtype
+                q_ref, k_ref, v_ref = (x.to(dtype).float() for x in (q, k, v))
+                scores = torch.einsum("qhd,khd->hqk", q_ref, k_ref) * layer.scaling
+                mask = (
+                    torch.arange(prefix + tokens, device="cuda")[None, :]
+                    > (prefix + torch.arange(tokens, device="cuda"))[:, None]
+                )
+                scores.masked_fill_(mask, float("-inf"))
+                expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v_ref)
+                states = []
+                for start, end, causal in (
+                    (0, prefix, False),
+                    (prefix, prefix + tokens, True),
+                ):
+                    length = end - start
+                    out = torch.empty(
+                        tokens, heads, 128, device="cuda", dtype=torch.bfloat16
+                    )
+                    output, lse = backend._run_prefill_kernel(
+                        q,
+                        k[start:end],
+                        v[start:end],
+                        layer,
+                        batch_size=1,
+                        cum_seq_lens_q=cum_q,
+                        max_q_len=tokens,
+                        seq_lens_kv=torch.tensor(
+                            [length], dtype=torch.int32, device="cuda"
+                        ),
+                        cum_seq_lens_kv=torch.tensor(
+                            [0, length], dtype=torch.int32, device="cuda"
+                        ),
+                        max_kv_len=length,
+                        is_causal=causal,
+                        return_lse=True,
+                        out_buffer=out,
+                        o_sf_scale=1.0,
+                        q_seq_lens_cpu=cpu_q_lens,
+                        kv_seq_lens_cpu=torch.tensor([length], dtype=torch.int32),
+                    )
+                    expected_lse = scores[:, :, start:end].logsumexp(-1).T
+                    torch.testing.assert_close(
+                        lse, expected_lse, rtol=0.001, atol=0.002
+                    )
+                    states.append((output, lse))
+                merged, _ = merge_state(*states[0], *states[1])
+                relative_rms = (
+                    (merged.float() - expected).square().mean()
+                    / expected.square().mean()
+                ).sqrt()
+                self.assertLess(
+                    relative_rms.item(), 0.04 if dtype == torch.float8_e4m3fn else 0.005
+                )
+
     def test_metadata_builds_typed_cpu_lens_once(self):
         backend = _backend()
         backend._kv_shard_pool = None
