@@ -1,4 +1,4 @@
-"""Compare cuBLAS, the PR84 router, and mixed-weight tiny_gemm.
+"""Compare cuBLAS and mixed-weight tiny_gemm.
 
 Run with the candidate Python package on CUDA SM90+:
     python test/manual/kernels/bench_fp32_router.py
@@ -13,7 +13,6 @@ import statistics
 
 import torch
 
-from sglang.kernels.ops.gemm.fp32_router import fp32_router_gemm
 from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 
 torch.manual_seed(42)
@@ -59,7 +58,6 @@ for m in range(1, 17):
     base = bench(lambda w: torch.nn.functional.linear(x.float(), w))
     ref = x.double() @ weights[0].double().T
     for name, fn in (
-        ("pr84", lambda w: fp32_router_gemm(x, w)),
         ("tiny", lambda w: tiny_gemm_bf16(x, w, out_dtype=torch.float32)),
     ):
         out = fn(weights[0])
