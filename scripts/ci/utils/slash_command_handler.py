@@ -946,6 +946,7 @@ _OTHER_BACKEND_REGISTERS = {
     "register_xpu_ci": "XPU",
     "register_musa_ci": "MUSA",
     "register_mlx_ci": "MLX",
+    "register_mps_ci": "MPS",
     "register_ppu_ci": "PPU",
 }
 

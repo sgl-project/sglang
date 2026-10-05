@@ -24,9 +24,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -425,7 +425,6 @@ class LagunaDecoderLayer(nn.Module):
 
         mlp_types = config.mlp_layer_types
         self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_previous_layer_sparse = layer_id > 0 and mlp_types[layer_id - 1] == "sparse"
         is_next_layer_sparse = (
             layer_id + 1 < config.num_hidden_layers
             and mlp_types[layer_id + 1] == "sparse"
@@ -453,7 +452,7 @@ class LagunaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -462,12 +461,6 @@ class LagunaDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
