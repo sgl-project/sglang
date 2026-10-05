@@ -36,6 +36,7 @@ nothing in this module executes.
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 import re
 from collections import Counter
@@ -314,7 +315,9 @@ def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
     global _cake_sp_symm_backend
     if _cake_sp_symm_backend is None:
         try:
-            import torch.distributed._symmetric_memory as symm_mem
+            # resolved through sys.modules (not the package attribute) so the
+            # unit tests can substitute the module
+            symm_mem = importlib.import_module("torch.distributed._symmetric_memory")
 
             if str(symm_mem.get_backend(device) or "").upper() != "NVSHMEM":
                 symm_mem.set_backend("NVSHMEM")

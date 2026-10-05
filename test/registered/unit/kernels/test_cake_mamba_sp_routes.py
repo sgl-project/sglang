@@ -949,7 +949,9 @@ def test_sp_route_value_error_refusal_falls_back_and_is_cached(sp_env):
     ag.assert_not_called()
     assert linear.quant_method.apply.call_count == 2
     assert torch.all(out == 1.0)
-    assert sp_mod.cake_sp_call_counts()[("fallback", N)] == 1
+    # every call is counted: the refused prepare, then the cached rejection
+    assert sp_mod.cake_sp_call_counts()[("fallback", N)] == 2
+    assert ("prepare", N) not in sp_mod.cake_sp_call_counts()
 
 
 def test_sp_route_selects_nvshmem_backend_once_and_falls_back_without_it(
