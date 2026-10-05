@@ -64,7 +64,6 @@ def _fake_api(
     api.replay_saved_memory_pool_config = record(
         "replay_saved_memory_pool_config", "cfg"
     )
-    api.shared_read_ends_override = record("shared_read_ends_override", "POST")
 
     @contextmanager
     def scope(name, *args):
@@ -109,7 +108,6 @@ class TestFoundryAdapter(CustomTestCase):
             self.assertIs(adapter, get_foundry_adapter())
             self.assertFalse(adapter.enabled)
             self.assertIsNone(adapter.replay_saved_memory_pool_config())
-            self.assertIsNone(adapter.shared_read_ends_override(None, None, None))
             with adapter.capture_scope(object()), adapter.configure_subprocess():
                 pass
 
@@ -204,9 +202,6 @@ class TestFoundryAdapter(CustomTestCase):
             self.assertEqual((name, args), ("capture_one", ("key", None)))
             self.assertEqual(
                 kwargs, {"pool": "pool", "stream": "stream", "prefill_req_slots": 4}
-            )
-            self.assertEqual(
-                adapter.shared_read_ends_override(runner, None, None), "POST"
             )
         called = [name for name, _, _ in api.calls]
         methods = [

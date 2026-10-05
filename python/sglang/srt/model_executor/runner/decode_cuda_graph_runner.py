@@ -522,12 +522,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
-        # Foundry LOAD: restored graphs have no in-graph marker; fence after replay.
-        override = get_foundry_adapter().shared_read_ends_override(
-            self, attn_backend, forward_mode
-        )
-        if override is not None:
-            return override
         declared = attn_backend.shared_read_ends(forward_mode)
         if (
             declared is SharedReadEnds.IN_REPLAY

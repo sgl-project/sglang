@@ -13,8 +13,9 @@ Call sites: the resolution steps in ``arg_groups/cuda_graph_hook.py``,
 ``managers/data_parallel_controller.py``), ``run_scheduler_process``,
 ``bootstrap.init_parallel_runtime``, ``ModelRunner.init_torch_distributed`` and
 ``alloc_memory_pool``, ``KVCacheConfigurator._resolve_memory_pool_config``, the
-decode / prefill runners' ``capture``, ``FullCudaGraphBackend.capture_one`` and
-``DecodeCudaGraphRunner._resolve_shared_read_ends``.
+decode / prefill runners' ``capture`` and ``FullCudaGraphBackend.capture_one``.
+Restored decode graphs carry no in-graph shared-read marker; the decode
+runner's own fallback for that case (POST_REPLAY) is the fence they need.
 
 Foundry is imported only when the flag is set: importing it loads its CUDA
 extension, which a server without the flag must not pay for.
@@ -119,9 +120,6 @@ class FoundryAdapter:
         """Returns ``(graph, output)`` for the backend to store."""
         raise RuntimeError("capture_one is only called when Foundry is enabled")
 
-    def shared_read_ends_override(self, runner, attn_backend, forward_mode):
-        return None
-
 
 class _FoundryAdapterReal(FoundryAdapter):
     enabled = True
@@ -180,9 +178,6 @@ class _FoundryAdapterReal(FoundryAdapter):
             stream=stream,
             prefill_req_slots=prefill_req_slots,
         )
-
-    def shared_read_ends_override(self, runner, attn_backend, forward_mode):
-        return self._api.shared_read_ends_override(runner, attn_backend, forward_mode)
 
 
 def _import_foundry_api():
