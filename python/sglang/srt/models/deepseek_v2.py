@@ -1118,11 +1118,15 @@ class DeepseekV2MoE(nn.Module):
                 self.experts, hidden_states.shape[0], hidden_states.shape[-1]
             )
         )
+        supports_deferred_finalize = (
+            self.experts.supports_deferred_finalize
+            if topk_output.format == TopKOutputFormat.BYPASSED
+            else self.experts.supports_routed_deferred_finalize
+        )
         deferred_finalize = use_fused_finalize_all_reduce or (
             has_shared_output
             and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
+            and supports_deferred_finalize
             and (
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
