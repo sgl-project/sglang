@@ -64,5 +64,37 @@ def cake_route_enabled(name: str) -> bool:
     return name in _selected()
 
 
+# Process-wide environment a selected route needs before torch.distributed or
+# any symmetric-memory allocation runs in the engine's worker processes.
+# ``sp_all_gather_matmul``: FlashInfer's Cake all-gather matmul allocates its
+# symmetric scratch through torch's NVSHMEM symmetric-memory backend, and torch
+# fixes the backend process-wide at the first symmetric allocation (the engine's
+# custom all-reduce), so the backend must be chosen before the workers start.
+ROUTE_PROCESS_ENV: dict[str, dict[str, str]] = {
+    "sp_all_gather_matmul": {"TORCH_SYMMMEM": "NVSHMEM"},
+}
+
+
+def apply_route_process_env(environ=None) -> dict[str, str]:
+    """Export the process environment the selected routes need.
+
+    Called by the engine launcher before the scheduler processes are spawned so
+    they inherit the values. Variables the user already set are left alone (the
+    route then falls back with a logged reason if the value is incompatible).
+    Returns the variables this call set.
+    """
+    environ = os.environ if environ is None else environ
+    applied: dict[str, str] = {}
+    for route, variables in ROUTE_PROCESS_ENV.items():
+        if route not in _selected():
+            continue
+        for key, value in variables.items():
+            if key in environ:
+                continue
+            environ[key] = value
+            applied[key] = value
+    return applied
+
+
 def reset_cache_for_tests() -> None:
     _selected.cache_clear()

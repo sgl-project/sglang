@@ -327,10 +327,14 @@ def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
                     "NVSHMEM symmetric-memory backend not selected: "
                     f"get_backend returned {symm_mem.get_backend(device)!r}",
                 )
-        except Exception as exc:  # backend missing in this torch / no NVSHMEM
+        except Exception as exc:  # backend missing in this torch / no NVSHMEM /
+            # already fixed by an earlier symmetric allocation of this process
             _cake_sp_symm_backend = False
             _log_cake_sp_once(
-                "fallback", f"NVSHMEM symmetric-memory backend unavailable ({exc!r})"
+                "fallback",
+                f"NVSHMEM symmetric-memory backend unavailable ({exc!r}); the "
+                "engine launcher exports TORCH_SYMMMEM=NVSHMEM for this route, "
+                "set it explicitly when launching the workers another way",
             )
     return _cake_sp_symm_backend
 

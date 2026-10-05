@@ -56,3 +56,28 @@ def test_import_loads_no_flashinfer_or_torch():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_route_process_env_exported_only_for_selected_routes():
+    with mock.patch.dict(os.environ, {_routes.ENV_VAR: "gdn_prefill"}):
+        env: dict = {}
+        assert _routes.apply_route_process_env(env) == {}
+        assert env == {}
+    _routes.reset_cache_for_tests()
+    with mock.patch.dict(os.environ, {_routes.ENV_VAR: "sp_all_gather_matmul"}):
+        env = {}
+        assert _routes.apply_route_process_env(env) == {"TORCH_SYMMMEM": "NVSHMEM"}
+        assert env == {"TORCH_SYMMMEM": "NVSHMEM"}
+        # a value the user set explicitly is left alone and not reported
+        env = {"TORCH_SYMMMEM": "CUDA"}
+        assert _routes.apply_route_process_env(env) == {}
+        assert env == {"TORCH_SYMMMEM": "CUDA"}
+        # idempotent on the process environment
+        assert _routes.apply_route_process_env(env) == {}
+
+
+def test_route_process_env_defaults_to_os_environ():
+    with mock.patch.dict(os.environ, {_routes.ENV_VAR: "sp_all_gather_matmul"}):
+        os.environ.pop("TORCH_SYMMMEM", None)
+        assert _routes.apply_route_process_env() == {"TORCH_SYMMMEM": "NVSHMEM"}
+        assert os.environ["TORCH_SYMMMEM"] == "NVSHMEM"
