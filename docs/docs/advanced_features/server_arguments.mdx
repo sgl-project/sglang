@@ -2868,7 +2868,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
 
 ### FFN boundary reduction
 
-Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to the dense and MoE FFN stages of decoders built with independently constructed stage boundaries (`declare_ffn` / `make_stages`; see [Layer boundaries](/docs/developer_guide/layer_boundary)). Other models keep their built-in FFN output communication and ignore this option.
+Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to the dense and MoE FFN stages of decoders built with independently constructed stage boundaries (`declare_ffn` / `append_stages`; see [Layer boundaries](/docs/developer_guide/layer_boundary)). Other models keep their built-in FFN output communication and ignore this option.
 
 | Value | Behavior |
 | --- | --- |

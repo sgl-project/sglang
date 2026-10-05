@@ -31,9 +31,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -491,7 +491,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         )
         is_moe_layer = config.is_moe_layer
         num_layers = config.num_hidden_layers
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -501,13 +501,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_moe_layer[layer_id - 1],
-                next_layer_sparse=is_moe_layer[layer_id],
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == num_layers - 1,
         )
 
     def forward(
