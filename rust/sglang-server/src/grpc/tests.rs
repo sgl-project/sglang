@@ -148,6 +148,7 @@ async fn generate_streams_incremental_token_ids_with_cumulative_count() {
             input_ids: vec![4, 5],
             stream: Some(true),
             rid: Some("tokens".into()),
+            return_text: Some(true),
             ..Default::default()
         }))
         .await
@@ -171,6 +172,10 @@ async fn generate_streams_incremental_token_ids_with_cumulative_count() {
     let finished = stream.next().await.unwrap().unwrap();
     assert_eq!(first.output_ids, vec![10]);
     assert_eq!(finished.output_ids, vec![11]);
+    assert_eq!(
+        (first.text.as_deref(), finished.text.as_deref()),
+        (Some("A"), Some("B"))
+    );
     assert_eq!(finished.meta_info["completion_tokens"], "2");
     assert!(finished.finished);
 }
