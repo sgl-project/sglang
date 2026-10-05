@@ -1,5 +1,6 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
+import itertools
 import math
 import os
 import tempfile
@@ -577,11 +578,18 @@ class TestBeamLoading(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_attention_tp_shards_and_packed_projections(self):
+        """LoRA must retain its QKV/gate targets and load the same TP shards."""
         config = tiny_config()
-        for tp_size in (1, 2, 4, 8, 16):
+        for tp_size, lora_mode in itertools.product(
+            (1, 2, 4, 8, 16), ("off", "dynamic", "preloaded")
+        ):
             rank = tp_size - 1
             with (
-                self.subTest(tp_size=tp_size),
+                self.subTest(tp_size=tp_size, lora_mode=lora_mode),
+                get_context().override_server_args(
+                    enable_lora=lora_mode == "dynamic",
+                    lora_paths=["test-adapter"] if lora_mode == "preloaded" else None,
+                ),
                 get_parallel().override(
                     tp_size=tp_size,
                     attn_tp_rank=rank,
@@ -645,7 +653,7 @@ class TestBeamLoading(CustomTestCase):
                 expected_gate = weights["model.layers.0.self_attn.gate_proj.weight"][
                     q_start : q_start + attention.q_size
                 ]
-                if tp_size <= config.num_key_value_heads:
+                if lora_mode == "off" and tp_size <= config.num_key_value_heads:
                     torch.testing.assert_close(
                         attention.qkv_gate_proj.weight,
                         torch.cat([expected_qkv, expected_gate]),

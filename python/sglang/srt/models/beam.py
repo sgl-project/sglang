@@ -64,7 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
 
 _is_cuda = is_cuda()
@@ -307,8 +307,12 @@ class BeamAttention(nn.Module):
         # MergedColumnParallelLinear shards each projection independently, but
         # does not replicate KV heads. Keep the existing quantized/replicated
         # paths until their loading and backend contracts are validated.
+        # LoRA wraps qkv_proj and gate_proj separately; keep those modules
+        # whenever adapters can be loaded, including dynamic LoRA loading.
         self.use_packed_projection = (
-            quant_config is None and config.num_key_value_heads >= self.tp_size
+            quant_config is None
+            and config.num_key_value_heads >= self.tp_size
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
