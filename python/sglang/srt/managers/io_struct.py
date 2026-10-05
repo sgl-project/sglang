@@ -1290,18 +1290,27 @@ class EmbeddingReqInput:
                 self.is_single = False
             else:
                 self.batch_size = 1
-        elif self.image_data is not None and isinstance(self.image_data, list):
-            self.batch_size = len(self.image_data)
-            self.is_single = False
-        elif self.video_data is not None and isinstance(self.video_data, list):
-            self.batch_size = len(self.video_data)
-            self.is_single = False
-        elif self.audio_data is not None and isinstance(self.audio_data, list):
-            self.batch_size = len(self.audio_data)
-            self.is_single = False
         else:
-            self.batch_size = 1
-            self.is_single = True
+            # Without text, a flat media list is one request carrying all items
+            # (the HF processor reading); only a list of per-request lists is a batch.
+            media = next(
+                data
+                for data in (self.image_data, self.video_data, self.audio_data)
+                if data is not None
+            )
+            if (
+                isinstance(media, list)
+                and len(media) > 0
+                and all(isinstance(item, list) for item in media)
+            ):
+                self.batch_size = len(media)
+                self.is_single = False
+            else:
+                self.batch_size = 1
+                self.is_single = True
+
+        if not self.is_single:
+            self._validate_mm_batch_lengths()
 
         # Fill in default arguments
         if self.is_single:
@@ -1326,6 +1335,19 @@ class EmbeddingReqInput:
             self._normalize_lora_paths(self.batch_size)
 
         self._validate_rid_uniqueness()
+
+    def _validate_mm_batch_lengths(self):
+        # A scalar media item is broadcast to every request; a list is per-request.
+        for field_name, data in (
+            ("image_data", self.image_data),
+            ("video_data", self.video_data),
+            ("audio_data", self.audio_data),
+        ):
+            if isinstance(data, list) and len(data) != self.batch_size:
+                raise ValueError(
+                    f"{field_name} has {len(data)} entries but the batch has "
+                    f"{self.batch_size} requests; pass one entry (or None) per request."
+                )
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1363,20 +1385,15 @@ class EmbeddingReqInput:
         if i in cache:
             return cache[i]
 
+        # Lengths were checked in _validate_mm_batch_lengths; scalars broadcast.
         image_item = (
-            self.image_data[i]
-            if isinstance(self.image_data, list) and i < len(self.image_data)
-            else self.image_data
+            self.image_data[i] if isinstance(self.image_data, list) else self.image_data
         )
         video_item = (
-            self.video_data[i]
-            if isinstance(self.video_data, list) and i < len(self.video_data)
-            else self.video_data
+            self.video_data[i] if isinstance(self.video_data, list) else self.video_data
         )
         audio_item = (
-            self.audio_data[i]
-            if isinstance(self.audio_data, list) and i < len(self.audio_data)
-            else self.audio_data
+            self.audio_data[i] if isinstance(self.audio_data, list) else self.audio_data
         )
 
         if self.is_cross_encoder_request:
