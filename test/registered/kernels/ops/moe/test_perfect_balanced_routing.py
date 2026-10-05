@@ -1,5 +1,6 @@
 """GPU coverage for perfect-balanced benchmark routing."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -240,3 +241,7 @@ def test_select_experts_preserves_fused_shared_expert_column():
     assert torch.equal(
         output.topk_weights[:, -1], torch.full((2,), 0.75, device="cuda")
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
