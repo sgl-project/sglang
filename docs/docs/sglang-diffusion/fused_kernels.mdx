@@ -14,7 +14,7 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 
 **Bit-exact — mounted unconditionally.** The kernel reproduces every rounding boundary of the eager chain, so `torch.equal` holds against the reference. Some go quite far to get there: the fused LayerNorm+modulate kernel replicates PyTorch's `vectorized_layer_norm_kernel` down to its Welford update order, guarded reciprocal, and warp-fold tree; the fused RMSNorm+scale/shift kernel replicates FlashInfer's CuTe-DSL `RMSNormKernel` fragment order and `shfl.bfly` fold. Because the dispatch they replicate can change underneath them, each one still verifies itself against the live eager chain on first sight and falls back permanently on any mismatch.
 
-**Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. The default `quality="exact"` runs the unmodified reference chain.
+**Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` (the default) and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. `quality="exact"` runs the unmodified reference chain instead.
 
 **Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), and SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32).
 
@@ -53,7 +53,7 @@ If a model has no eligible request-gated fusion, `lossless` can execute the same
 sglang generate --model-path MODEL_PATH --prompt "..." --quality lossless
 ```
 
-The server default stays `exact`; the OpenAI-compatible endpoints carry it per request. Images:
+The server default is `lossless`, so this is the set a request gets unless it asks otherwise; the OpenAI-compatible endpoints carry the level per request. Images:
 
 ```bash
 curl -X POST http://${HOST}:${PORT}/v1/images/generations \

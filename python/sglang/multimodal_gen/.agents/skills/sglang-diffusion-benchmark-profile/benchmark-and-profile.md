@@ -139,7 +139,7 @@ The helper defaults to eager. Add `--torch-compile` only for a labeled compile
 control. `--no-torch-compile` remains accepted for compatibility but is no
 longer required.
 
-Run one explicit quality or BCG comparator with `--quality {lossless,lossless,high}` and
+Run one explicit quality or BCG comparator with `--quality {exact,lossless,high}` and
 `--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
 exclusive in this helper. An lossless/high+BCG command is only a compatibility probe:
 it is invalid if request-scoped DiT fusions mount after the lossless warmup
@@ -327,7 +327,7 @@ Use the preset categories this way:
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
 | `lingbot-world` | `robbyant/lingbot-world-fast-diffusers` | No | One-H200 offline single-chunk profile for the registered causal DMD path: 832x480x9, four steps, guidance 1.0, the shared image fixture, and forward-camera actions for all nine frames. Keep stateful websocket latency as a separate metric. |
 | `lingbot-world-v2` | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | No | Matching controlled single-chunk profile for the separately registered v2 checkpoint. The fixed shape, action program, and schedule make v1/v2 hotspot comparisons reproducible without presenting one-chunk e2e as stateful realtime latency. |
-| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/lossless/high comparisons do not measure an offload-policy change. |
+| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so exact/lossless/high comparisons do not measure an offload-policy change. |
 | `wan21-t2v-1.3b` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU 832x480, 81-frame Wan2.1 baseline at 50 steps and guidance 3.0. Keep it separate from FastWan and TurboWan because the longer schedule changes the end-to-end weight of VAE optimizations. |
 | `wan21-t2v-14b` | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | No | Cookbook-aligned four-GPU CFG/Ulysses baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Text encoding stays CPU-offloaded as in the documented deployment command. |
 | `wan21-i2v-14b-480p` | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Uses the shared cat fixture and its motion prompt. |

@@ -2315,7 +2315,7 @@ def main():
         "--quality-bcg-matrix",
         action="store_true",
         help=(
-            "Run lossless/lossless/high Eager-vs-BCG as three ABBA pairs "
+            "Run exact/lossless/high Eager-vs-BCG as three ABBA pairs "
             "on one GPU set "
             "and one task-owned model cache."
         ),

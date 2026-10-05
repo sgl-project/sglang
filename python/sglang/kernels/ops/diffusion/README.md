@@ -247,8 +247,9 @@ inspecting model modules is its whole job.
    shapes it was verified on.
 5. If it is not bit-exact, gate it through `sites/` and declare its tier in
    `_QUALITY_FUSION_HANDLERS`: `lossless` when it keeps the reference math and
-   every operand's precision, `high` when it does not. Never the default
-   `exact` path. A `lossless` claim has to pass
+   every operand's precision, `high` when it does not. Never `exact`, which
+   is reserved for paths that reproduce the reference's rounding. A
+   `lossless` claim has to pass
    `multimodal_gen/test/quality_tier_admission.py`.
 6. Test it in the domain suite (`test/registered/kernels/ops/diffusion/`), and
    the model wiring in `test_model_fast_paths.py`.

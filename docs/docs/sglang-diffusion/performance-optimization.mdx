@@ -25,19 +25,23 @@ stricter tier.
 
 | Tier | Optimization boundary |
 | --- | --- |
-| `exact` (default) | The selected deployment's reference execution plus all unconditional bit-exact replacements. Output is bit-identical to the reference path in the same environment |
-| `lossless` | Everything in `exact`, plus request-gated DiT/VAE fusions that keep the reference math and the precision of every operand and accumulator, changing only where or in which order the rounding happens. Output matches the reference to rounding error, not bit for bit |
+| `exact` | The selected deployment's reference execution plus all unconditional bit-exact replacements. Output is bit-identical to the reference path in the same environment |
+| `lossless` (default) | Everything in `exact`, plus request-gated DiT/VAE fusions that keep the reference math and the precision of every operand and accumulator, changing only where or in which order the rounding happens. Output matches the reference to rounding error, not bit for bit |
 | `high` | Everything in `lossless`, plus model-owned paths that change what is computed -- lower precision, sparsity, or reuse across steps, such as an audited Cache-DiT policy or lower-precision VAE decode |
 
 Bit-identical describes reproducibility, not quality: a `lossless` fast path is
 the same mathematical function, and its rounding is no further from the exact
-value than the reference's own. Pick `exact` when you need a byte-for-byte
-reproducible output or are tracking down a numerical bug, `lossless` for the
-fastest path that still computes the reference function.
+value than the reference's own. On FLUX.1-dev the two tiers differ by 34.5 dB
+PSNR, while the same tier differs by 32.5 dB between one GPU and two -- the
+tier moves the image less than the parallel layout does, which is why it is
+the default. Ask for `exact` when a run has to be byte-for-byte reproducible,
+or when bisecting a numerical bug.
 
-`extra-high` is accepted as the former name of `lossless`. Note that `lossless`
-itself was the former name of `exact`: a request that passes `quality="lossless"`
-for bit-identical output has to pass `quality="exact"` instead.
+`extra-high` is accepted as the former name of `lossless`. Note that
+`lossless` itself was the former name of `exact`, and that it is now the
+default: a request that passed `quality="lossless"` for bit-identical output
+has to pass `quality="exact"`, and a deployment that never set `quality` moves
+from the bit-exact path to this one.
 
 A tier may be a no-op when the active model has no eligible path.
 Separately configured quantization, attention, or caching options still apply.

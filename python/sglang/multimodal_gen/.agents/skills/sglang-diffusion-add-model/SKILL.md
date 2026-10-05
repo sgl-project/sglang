@@ -666,7 +666,7 @@ guard/parity tests and a model wiring test instead of embedding request-policy
 branches throughout the DiT.
 
 Finally, use the benchmark/profile skill's `--quality-bcg-matrix` to run
-same-GPU ABBA pairs for Eager/BCG at lossless/lossless/high. Report denoise and saved
+same-GPU ABBA pairs for Eager/BCG at exact/lossless/high. Report denoise and saved
 request e2e separately, require at least 1.5% repeated mean e2e improvement for
 an optimization PR, attach profile and generated-media A/B evidence, then
 delete the task-owned checkpoint cache and verify zero residual weight files
