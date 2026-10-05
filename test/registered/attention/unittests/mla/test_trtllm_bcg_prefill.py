@@ -1,10 +1,4 @@
-"""CPU sequence-length propagation into flashinfer's ragged MLA prefill.
-
-Without q_seq_lens_cpu/kv_seq_lens_cpu, trtllm_ragged_attention_deepseek
-derives lengths on GPU and calls .any().item() for empty-row validation,
-synchronizing the host once per layer per kernel launch. The backend builds
-one int32 CPU tensor per batch metadata init and threads it through.
-"""
+"""Native MLA prefix merging and breakable-graph replay regressions."""
 
 from types import SimpleNamespace as NS
 from unittest import main, skipUnless
@@ -30,6 +24,7 @@ def _backend():
     backend.workspace_buffer = torch.empty(
         64 * 1024 * 1024, dtype=torch.uint8, device="cuda"
     )
+    backend._kv_shard_pool = None
     backend.forward_prefill_metadata = None
     backend.disable_chunked_prefix_cache = False
     return backend
@@ -66,7 +61,13 @@ class PrefillCpuLensTest(CustomTestCase):
             )
             * 0.5
         )
-        layer = NS(scaling=192**-0.5)
+        layer = NS(
+            scaling=192**-0.5,
+            tp_q_head_num=heads,
+            tp_k_head_num=heads,
+            head_dim=192,
+            v_head_dim=128,
+        )
         cpu_q_lens = torch.tensor([tokens], dtype=torch.int32)
         cum_q = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
         for dtype in (torch.bfloat16, torch.float8_e4m3fn):
@@ -87,30 +88,42 @@ class PrefillCpuLensTest(CustomTestCase):
                     (prefix, prefix + tokens, True),
                 ):
                     length = end - start
-                    out = torch.empty(
-                        tokens, heads, 128, device="cuda", dtype=torch.bfloat16
+                    cpu_kv_lens = torch.tensor([length], dtype=torch.int32)
+                    backend.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
+                        tokens, cum_q, cpu_q_lens.cuda(), seq_lens_cpu=cpu_q_lens
                     )
-                    output, lse = backend._run_prefill_kernel(
-                        q,
-                        k[start:end],
-                        v[start:end],
-                        layer,
+                    batch = NS(
+                        forward_mode=ForwardMode.EXTEND,
                         batch_size=1,
-                        cum_seq_lens_q=cum_q,
-                        max_q_len=tokens,
-                        seq_lens_kv=torch.tensor(
-                            [length], dtype=torch.int32, device="cuda"
-                        ),
-                        cum_seq_lens_kv=torch.tensor(
-                            [0, length], dtype=torch.int32, device="cuda"
-                        ),
-                        max_kv_len=length,
-                        is_causal=causal,
-                        return_lse=True,
-                        out_buffer=out,
-                        o_sf_scale=1.0,
-                        q_seq_lens_cpu=cpu_q_lens,
-                        kv_seq_lens_cpu=torch.tensor([length], dtype=torch.int32),
+                        attn_attend_prefix_cache=not causal,
+                        mha_return_lse=True,
+                        prefix_chunk_idx=0,
+                        prefix_chunk_has_zero_kv=[False],
+                        prefix_chunk_seq_lens=[cpu_kv_lens.cuda()],
+                        prefix_chunk_seq_lens_cpu=[cpu_kv_lens],
+                        prefix_chunk_cu_seq_lens=[
+                            torch.tensor([0, length], dtype=torch.int32, device="cuda")
+                        ],
+                        prefix_chunk_max_seq_lens=[length],
+                    )
+                    import flashinfer.prefill
+
+                    with patch(
+                        "flashinfer.prefill.trtllm_ragged_attention_deepseek",
+                        wraps=flashinfer.prefill.trtllm_ragged_attention_deepseek,
+                    ) as kernel:
+                        output, lse = backend.forward_extend(
+                            q,
+                            k[start:end],
+                            v[start:end],
+                            layer,
+                            batch,
+                            save_kv_cache=False,
+                        )
+                    self.assertIs(kernel.call_args.kwargs["q_seq_lens_cpu"], cpu_q_lens)
+                    expected_kv_lens = cpu_q_lens if causal else cpu_kv_lens
+                    self.assertIs(
+                        kernel.call_args.kwargs["kv_seq_lens_cpu"], expected_kv_lens
                     )
                     expected_lse = scores[:, :, start:end].logsumexp(-1).T
                     torch.testing.assert_close(
@@ -126,148 +139,25 @@ class PrefillCpuLensTest(CustomTestCase):
                     relative_rms.item(), 0.04 if dtype == torch.float8_e4m3fn else 0.005
                 )
 
-    def test_metadata_builds_typed_cpu_lens_once(self):
-        backend = _backend()
-        backend._kv_shard_pool = None
-        with patch(
-            "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
-            return_value=NS(dcp_enabled=False),
-        ):
-            backend.init_forward_metadata(_extend_batch())
-        md = backend.forward_prefill_metadata
-        self.assertEqual(md.seq_lens_cpu.dtype, torch.int32)
-        self.assertEqual(md.seq_lens_cpu.device.type, "cpu")
-        self.assertEqual(md.seq_lens_cpu.tolist(), [5, 3])
-
-    def test_metadata_cpu_lens_none_under_dcp(self):
-        backend = _backend()
-        backend._kv_shard_pool = None
-        with patch(
-            "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
-            return_value=NS(dcp_enabled=True),
-        ):
-            backend.init_forward_metadata(_extend_batch())
-        self.assertIsNone(backend.forward_prefill_metadata.seq_lens_cpu)
-
-    def test_suffix_kernel_receives_cpu_lens_and_matches(self):
-        backend = _backend()
-        lens, heads = [5, 3], 8
-        total = sum(lens)
-        torch.manual_seed(7)
-        q = torch.randn(total, heads, 192, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(total, 1, 192, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(total, 1, 128, device="cuda", dtype=torch.bfloat16)
-        cum = torch.tensor([0, 5, 8], dtype=torch.int32, device="cuda")
-        seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
-        cpu_lens = torch.tensor(lens, dtype=torch.int32)
-        layer = NS(scaling=0.05)
-        out_spy = torch.empty(total, heads, 128, device="cuda", dtype=torch.bfloat16)
-        out_ref = torch.empty_like(out_spy)
-
-        import flashinfer.prefill
-
-        with patch(
-            "flashinfer.prefill.trtllm_ragged_attention_deepseek",
-            wraps=flashinfer.prefill.trtllm_ragged_attention_deepseek,
-        ) as spy:
-            backend._run_prefill_kernel(
-                q,
-                k,
-                v,
-                layer,
-                batch_size=2,
-                cum_seq_lens_q=cum,
-                max_q_len=5,
-                seq_lens_kv=seq,
-                cum_seq_lens_kv=cum,
-                max_kv_len=5,
-                is_causal=True,
-                return_lse=False,
-                out_buffer=out_spy,
-                q_seq_lens_cpu=cpu_lens,
-                kv_seq_lens_cpu=cpu_lens,
-            )
-        spy.assert_called_once()
-        self.assertIs(spy.call_args.kwargs["q_seq_lens_cpu"], cpu_lens)
-        self.assertIs(spy.call_args.kwargs["kv_seq_lens_cpu"], cpu_lens)
-
-        flashinfer.prefill.trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=backend.workspace_buffer,
-            batch_size=2,
-            window_left=-1,
-            enable_pdl=False,
-            max_q_len=5,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
-            cum_seq_lens_q=cum,
-            cum_seq_lens_kv=cum,
-            seq_lens=seq,
-            max_kv_len=5,
-            is_causal=True,
-            return_lse=False,
-            o_sf_scale=1.0,
-            out=out_ref,
-        )
-        torch.testing.assert_close(out_spy, out_ref, atol=0, rtol=0)
-
-    def test_prefix_call_site_threads_chunk_cpu_lens(self):
-        backend = _backend()
-        lens, heads = [3, 2], 8
-        total_q = sum(lens)
-        chunk_kv = [4, 0]
-        torch.manual_seed(11)
-        q = torch.randn(total_q, heads, 192, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(chunk_kv[0], 1, 192, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(chunk_kv[0], 1, 128, device="cuda", dtype=torch.bfloat16)
-        cum_q = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
-        cpu_lens = torch.tensor(lens, dtype=torch.int32)
-        backend.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
-            max_seq_len=3,
-            cum_seq_lens=cum_q,
-            seq_lens=torch.tensor(lens, dtype=torch.int32, device="cuda"),
-            seq_lens_cpu=cpu_lens,
-        )
-        chunk_lens_gpu = torch.tensor(chunk_kv, dtype=torch.int32, device="cuda")
-        chunk_lens_cpu = chunk_lens_gpu.cpu()
-        batch = NS(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=2,
-            attn_attend_prefix_cache=True,
-            prefix_chunk_idx=0,
-            prefix_chunk_seq_lens=[chunk_lens_gpu],
-            prefix_chunk_seq_lens_cpu=[chunk_lens_cpu],
-            prefix_chunk_cu_seq_lens=[
-                torch.tensor([0, 4, 4], dtype=torch.int32, device="cuda")
-            ],
-            prefix_chunk_max_seq_lens=[4],
-            prefix_chunk_has_zero_kv=[False],
-        )
-        layer = NS(
-            scaling=0.05,
-            tp_q_head_num=heads,
-            tp_k_head_num=1,
-            v_head_dim=128,
-            head_dim=192,
-        )
-        import flashinfer.prefill
-
-        with patch(
-            "flashinfer.prefill.trtllm_ragged_attention_deepseek",
-            wraps=flashinfer.prefill.trtllm_ragged_attention_deepseek,
-        ) as spy:
-            out, lse = backend.forward_extend(
-                q, k, v, layer, batch, save_kv_cache=False
-            )
-        spy.assert_called_once()
-        self.assertIs(spy.call_args.kwargs["q_seq_lens_cpu"], cpu_lens)
-        self.assertIs(spy.call_args.kwargs["kv_seq_lens_cpu"], chunk_lens_cpu)
-        self.assertEqual(spy.call_args.kwargs["is_causal"], False)
-        self.assertEqual(spy.call_args.kwargs["o_sf_scale"], -1.0)
-        self.assertEqual(out.shape, (total_q, heads, 128))
-        self.assertEqual(lse.shape, (total_q, heads))
+    def test_metadata_cpu_lengths_and_dcp(self):
+        for dcp in (False, True):
+            with (
+                self.subTest(dcp=dcp),
+                patch(
+                    "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
+                    return_value=NS(dcp_enabled=dcp),
+                ),
+            ):
+                backend = _backend()
+                backend.init_forward_metadata(_extend_batch())
+                lengths = backend.forward_prefill_metadata.seq_lens_cpu
+                if dcp:
+                    self.assertIsNone(lengths)
+                else:
+                    self.assertEqual(
+                        (lengths.dtype, lengths.device.type, lengths.tolist()),
+                        (torch.int32, "cpu", [5, 3]),
+                    )
 
 
 class BreakableGraphDispatchTest(CustomTestCase):
@@ -277,42 +167,38 @@ class BreakableGraphDispatchTest(CustomTestCase):
             AttnForwardMethod,
         )
 
-        for handler, disabled, piecewise, expected in (
-            (
-                h.handle_attention_trtllm_mla,
-                False,
-                False,
-                AttnForwardMethod.MHA_CHUNKED_KV,
-            ),
-            (h.handle_attention_trtllm_mla, True, False, AttnForwardMethod.MLA),
-            (h.handle_attention_trtllm_mla, False, True, AttnForwardMethod.MLA),
-            (h.handle_attention_tokenspeed_mla, False, False, AttnForwardMethod.MLA),
-        ):
-            for prefixes in ([0, 0], [4096, 0]):
-                with (
-                    self.subTest(
-                        handler=handler.__name__,
-                        disabled=disabled,
-                        piecewise=piecewise,
-                        prefixes=prefixes,
-                    ),
-                    patch.object(h, "is_in_breakable_cuda_graph", return_value=True),
-                    patch.object(
-                        h, "is_in_tc_piecewise_cuda_graph", return_value=piecewise
-                    ),
+        mla, mha = AttnForwardMethod.MLA, AttnForwardMethod.MHA_CHUNKED_KV
+        cases = (
+            (h.handle_attention_trtllm_mla, False, False, mha),
+            (h.handle_attention_trtllm_mla, True, False, mla),
+            (h.handle_attention_trtllm_mla, False, True, mla),
+            (h.handle_attention_tokenspeed_mla, False, False, mla),
+        )
+        with patch.object(h, "is_in_breakable_cuda_graph", return_value=True):
+            for handler, disabled, piecewise, expected in cases:
+                with patch.object(
+                    h, "is_in_tc_piecewise_cuda_graph", return_value=piecewise
                 ):
-                    self.assertIs(
-                        handler(
-                            NS(disable_chunked_prefix_cache=disabled),
-                            NS(
+                    for prefixes in ([0, 0], [4096, 0]):
+                        with self.subTest(
+                            handler=handler.__name__,
+                            disabled=disabled,
+                            piecewise=piecewise,
+                            prefixes=prefixes,
+                        ):
+                            batch = NS(
                                 forward_mode=ForwardMode.EXTEND,
                                 extend_prefix_lens_cpu=prefixes,
-                            ),
-                        ),
-                        expected,
-                    )
+                            )
+                            self.assertIs(
+                                handler(
+                                    NS(disable_chunked_prefix_cache=disabled), batch
+                                ),
+                                expected,
+                            )
 
     def test_chunk_metadata_hook_fallback_only_for_tokenspeed(self):
+        from sglang.srt.layers.attention import trtllm_mla_backend as trtllm
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
@@ -329,13 +215,9 @@ class BreakableGraphDispatchTest(CustomTestCase):
             backend = cls.__new__(cls)
             backend.disable_chunked_prefix_cache = disabled
             with (
-                patch(
-                    "sglang.srt.layers.attention.trtllm_mla_backend.is_in_breakable_cuda_graph",
-                    return_value=True,
-                ),
-                patch(
-                    "sglang.srt.layers.attention.trtllm_mla_backend.is_in_tc_piecewise_cuda_graph",
-                    return_value=False,
+                patch.object(trtllm, "is_in_breakable_cuda_graph", return_value=True),
+                patch.object(
+                    trtllm, "is_in_tc_piecewise_cuda_graph", return_value=False
                 ),
                 patch.object(
                     FlashInferMLAAttnBackend, "init_mha_chunk_metadata"

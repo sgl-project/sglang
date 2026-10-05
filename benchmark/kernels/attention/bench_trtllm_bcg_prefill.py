@@ -6,7 +6,6 @@ import json
 import random
 import statistics
 import time
-from contextlib import ExitStack
 
 import flashinfer
 import torch
@@ -155,29 +154,29 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
                 k = torch.cat((kv[:, :, :128], k_rope.expand(-1, 12, -1)), dim=-1)
                 return attn.forward_normal_chunked_kv_core(q, k, kv[:, :, 128:], batch)
 
+            def prepare(mode):
+                backend.fallback_mla_under_breakable_graph = mode == "without"
+                batch.num_prefix_chunks = batch.prefix_chunk_len = None
+                batch.attn_attend_prefix_cache = None
+                backend.init_forward_metadata(batch)
+
             graphs, outputs = {}, {}
-            with ExitStack() as stack:
-                stack.enter_context(
-                    forward_context(ForwardContext(attn_backend=backend))
-                )
-                stack.enter_context(
-                    set_tc_piecewise_forward_context(
-                        batch,
-                        [attn.attn_mqa],
-                        None,
-                        [],
-                        [],
-                        mha_companion_layers=[attn.attn_mha],
-                    )
-                )
-                stack.enter_context(enable_breakable_cuda_graph())
+            with (
+                forward_context(ForwardContext(attn_backend=backend)),
+                set_tc_piecewise_forward_context(
+                    batch,
+                    [attn.attn_mqa],
+                    None,
+                    [],
+                    [],
+                    mha_companion_layers=[attn.attn_mha],
+                ),
+                enable_breakable_cuda_graph(),
+            ):
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 for mode, fn in (("without", old_forward), ("with", new_forward)):
-                    backend.fallback_mla_under_breakable_graph = mode == "without"
-                    batch.num_prefix_chunks = batch.prefix_chunk_len = None
-                    batch.attn_attend_prefix_cache = None
-                    backend.init_forward_metadata(batch)
+                    prepare(mode)
                     for _ in range(3):
                         fn()
                     torch.cuda.synchronize()
@@ -188,10 +187,7 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
                 # A changed input catches stale captured outputs before timing.
                 q.mul_(0.9375)
                 for mode, fn in (("without", old_forward), ("with", new_forward)):
-                    backend.fallback_mla_under_breakable_graph = mode == "without"
-                    batch.num_prefix_chunks = batch.prefix_chunk_len = None
-                    batch.attn_attend_prefix_cache = None
-                    backend.init_forward_metadata(batch)
+                    prepare(mode)
                     graphs[mode].replay()
                     torch.cuda.synchronize()
                     reference = fn()
@@ -204,10 +200,7 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
                     order = list(graphs)
                     rng.shuffle(order)
                     for mode in order:
-                        backend.fallback_mla_under_breakable_graph = mode == "without"
-                        batch.num_prefix_chunks = batch.prefix_chunk_len = None
-                        batch.attn_attend_prefix_cache = None
-                        backend.init_forward_metadata(batch)
+                        prepare(mode)
                         graph = graphs[mode]
                         for _ in range(3):
                             graph.replay()

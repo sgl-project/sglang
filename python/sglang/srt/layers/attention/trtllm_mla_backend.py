@@ -164,9 +164,7 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
-    # Extend lengths as one int32 CPU tensor, built once per batch. Fed to
-    # flashinfer's empty-row validation so it stays on the host instead of
-    # deriving lengths on GPU and syncing (.any().item()) every layer.
+    # CPU lengths keep FlashInfer empty-row validation asynchronous.
     seq_lens_cpu: Optional[torch.Tensor] = None
 
 
@@ -202,10 +200,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Under BCG the extend path stays on the native ragged kernels through
-    # the chunked-prefix eager boundary, so the absorbed-MLA flashinfer
-    # fallback is not needed. Subclasses whose dispatch keeps the absorbed
-    # pin under BCG (tokenspeed) set this to keep the fallback.
+    # Subclasses using absorbed MLA under BCG require FlashInfer metadata.
     fallback_mla_under_breakable_graph: bool = False
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
@@ -1814,8 +1809,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out_buffer=out,
                 o_sf_scale=-1.0,
                 q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
-                # Same DCP gate as seq_lens_cpu: flashinfer requires both or
-                # neither, and the gathered prefix KV is DCP-sharded there.
+                # FlashInfer requires both CPU length tensors or neither.
                 kv_seq_lens_cpu=(
                     forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx]
                     if self.forward_prefill_metadata.seq_lens_cpu is not None
