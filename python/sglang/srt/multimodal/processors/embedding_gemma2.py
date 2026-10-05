@@ -15,6 +15,7 @@
 """Multimodal processor for EmbeddingGemma2Model (EmbeddingGemma v2)."""
 
 import logging
+import re
 from typing import Any
 
 import numpy as np
@@ -81,6 +82,8 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
     Preprocesses image, video, and audio inputs for EmbeddingGemma v2:
       - Prompt retention: retains prompt task/title prefixes verbatim, disabling the
         anchored prompt suppression used in generative Gemma4.
+      - Media-only requests: synthesizes the placeholder prompt the HF processor builds
+        when no text is given, and rejects placeholder/media count mismatches.
       - Video processing: samples frame indices with the HF video processor's
         fps/max_frames rule before decoding, so only sampled frames are materialized.
       - Audio processing: provides unpadded raw waveforms (16kHz mono float32).
@@ -125,6 +128,68 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             audio_sample_rate=audio_sample_rate,
             discard_alpha_channel=discard_alpha_channel,
         )
+
+    async def process_mm_data_async(  # type: ignore[override]
+        self,
+        image_data: list[Any] | None = None,
+        audio_data: list[Any] | None = None,
+        input_text: Any = "",
+        request_obj: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        video_data = request_obj.video_data if request_obj is not None else None
+        input_text = self._resolve_prompt(
+            input_text,
+            n_image=len(image_data) if image_data else 0,
+            n_video=len(video_data) if video_data else 0,
+            n_audio=len(audio_data) if audio_data else 0,
+        )
+        return await super().process_mm_data_async(
+            image_data, audio_data, input_text, request_obj, *args, **kwargs
+        )
+
+    def _resolve_prompt(
+        self, input_text: Any, *, n_image: int, n_video: int, n_audio: int
+    ) -> Any:
+        if not input_text:
+            # Same layout HF builds for text=None: images, then videos, then audio.
+            tokens = self.mm_tokens
+            return " ".join(
+                [tokens.image_token] * n_image
+                + [tokens.video_token] * n_video
+                + [tokens.audio_token] * n_audio
+            )
+        prompt = (
+            self._tokenizer.decode(input_text)
+            if isinstance(input_text, list)
+            else input_text
+        )
+        found = {Modality.IMAGE: 0, Modality.VIDEO: 0, Modality.AUDIO: 0}
+        for part in re.split(self.mm_tokens.get_combined_regex(), prompt):
+            modality = self.mm_tokens.get_modality_of_token(part)
+            if modality is not None:
+                found[modality] += 1
+        expected = {
+            Modality.IMAGE: n_image,
+            Modality.VIDEO: n_video,
+            Modality.AUDIO: n_audio,
+        }
+        # The generic loader silently drops unmatched media, which yields a wrong
+        # embedding instead of an error; HF raises here too.
+        mismatched = [
+            f"{m.name.lower()}: {found[m]} placeholder(s) vs {expected[m]} item(s)"
+            for m in expected
+            if found[m] != expected[m]
+        ]
+        if mismatched:
+            raise ValueError(
+                "EmbeddingGemma2 needs exactly one <|image|>/<|video|>/<|audio|> "
+                "placeholder per media item, or no text at all; got "
+                + ", ".join(mismatched)
+                + "."
+            )
+        return input_text
 
     def _sample_video(self, video: Any) -> tuple[torch.Tensor, VideoMetadata]:
         """Decode only the frames the HF video processor would keep."""
