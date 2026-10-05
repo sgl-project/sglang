@@ -158,8 +158,6 @@ class BaseKVSender(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
@@ -181,6 +179,10 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
+
+    def mark_prefill_complete(self) -> None:
+        """Publish retained final-prefill KV for an enabled allocation policy."""
+        raise NotImplementedError
 
     def pop_decode_prefix_len(self) -> int:
         return 0

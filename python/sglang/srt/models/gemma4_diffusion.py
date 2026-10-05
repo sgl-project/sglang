@@ -57,7 +57,7 @@ from sglang.srt.models.gemma4_mm import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +362,7 @@ class DiffusionGemmaModel(nn.Module):
             prefix=add_prefix("self_conditioning", prefix),
         )
         self.pp_group = get_parallel().pp_group
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             text_config.num_hidden_layers,
             lambda idx, prefix: DiffusionGemmaDecoderLayer(
                 layer_id=idx,
@@ -370,8 +370,6 @@ class DiffusionGemmaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
