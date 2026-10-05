@@ -142,6 +142,8 @@ class StagePlan:
         is_branch: Branch reusing an already-read input; requires branch_input
             instead of a normal prepare to avoid repeating the read/update.
         terminal: Whether the stage ends the model's layer stack.
+        writes_at_handoff: Whether the stage, an FFN handing off to another
+            pipeline rank, writes its output into the residual at its exit.
         finishes_directly: Attention can publish its output with finish instead of
             an exit scope and output transport.
         qkv_latent_func: Optional hook for prepared attention input.
@@ -164,6 +166,7 @@ class StagePlan:
         enters_stack=False,
         is_branch=False,
         terminal=False,
+        writes_at_handoff=False,
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
@@ -217,6 +220,7 @@ class StagePlan:
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
+                writes_at_handoff=writes_at_handoff,
             )
 
     @property
@@ -304,6 +308,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         enters_stack=incoming.producer is None,
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
+        writes_at_handoff=declaration.writes_at_handoff,
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
         **options,

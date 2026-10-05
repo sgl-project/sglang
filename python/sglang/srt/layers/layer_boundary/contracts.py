@@ -233,6 +233,8 @@ class StagePath(msgspec.Struct, frozen=True):
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
+        writes_at_handoff: Whether the exit completes the output and writes it
+            into the residual, for an FFN that hands off to another pipeline rank.
     """
 
     entry: EntryPath
@@ -242,6 +244,7 @@ class StagePath(msgspec.Struct, frozen=True):
     output_move_completes_sum: bool = False
 
     returns_over_dp: bool = False
+    writes_at_handoff: bool = False
 
 
 class StageKind(Enum):
