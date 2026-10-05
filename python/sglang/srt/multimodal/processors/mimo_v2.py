@@ -218,8 +218,12 @@ class Content:
 # image_mean/image_std with do_rescale 1/255). Kept in 0-255 space because
 # standardize_batch sees un-rescaled PIL tensors. ImageNet values were wrong
 # for MiMo-VL and scrambled colors.
-_QWEN2VL_PIXEL_MEAN = torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
-_QWEN2VL_PIXEL_STD = torch.Tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1) * 255.0
+_QWEN2VL_PIXEL_MEAN = (
+    torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
+)
+_QWEN2VL_PIXEL_STD = (
+    torch.Tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1) * 255.0
+)
 _mean_std_cache = {}
 
 
