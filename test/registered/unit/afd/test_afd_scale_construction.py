@@ -8,9 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.afd import config, contracts, profiles
+from sglang.srt import runtime_context
+from sglang.srt.afd import config, contracts, model_hooks, profiles
 from sglang.test.afd.config_fixtures import _lane_server_args
 from sglang.test.afd.moe_fixtures import (
+    bare_module,
     torch,
 )
 
@@ -73,14 +75,54 @@ def _config():
 
 
 @pytest.mark.parametrize("layer_id", [0, 3])
+@pytest.mark.parametrize("tp", [3, 8, 20])
 def test_attention_constructor_never_allocates_router_or_experts(
-    routing, monkeypatch, layer_id
+    routing, monkeypatch, layer_id, tp
 ):
     calls = _install_constructor(routing, monkeypatch)
-    layer = routing["DeepseekV2DecoderLayer"](_config(), layer_id)
+    context = runtime_context.RuntimeContext(parallel=runtime_context.ParallelContext())
+    context.set_server_args(SimpleNamespace(afd_execution_mode="attention"))
+    context.parallel.override_permanently(
+        tp_size=tp,
+        tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_dp_size=tp,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+    )
+    monkeypatch.setattr(runtime_context, "_CONTEXT", context)
+    monkeypatch.setattr(runtime_context, "_PARALLEL", context.parallel)
+    routing["afd_execution_mode"] = model_hooks.afd_execution_mode
+    routing["get_parallel"] = runtime_context.get_parallel
+    model_config = _config()
+    model_config.quantization_config = {"weight_block_size": [128, 128]}
+    layer = routing["DeepseekV2DecoderLayer"](
+        model_config, layer_id, quant_config=SimpleNamespace(get_name=lambda: "fp8")
+    )
     routing["GlmMoeDsaAFDDecoderLayer"].install(layer)
     assert isinstance(layer.mlp, routing["AFDProxyMLP"])
     assert list(layer.mlp.parameters()) == [] and calls == []
+    assert not hasattr(layer.mlp, "quant_method")
+    loaded = []
+
+    def load_weights(self, weights, is_nextn=False):
+        assert not is_nextn
+        loaded.extend(name for name, _ in weights)
+
+    monkeypatch.setattr(routing["DeepseekV2ForCausalLM"], "load_weights", load_weights)
+    names = (
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.3.mlp.gate.weight",
+        "model.layers.3.mlp.shared_experts.gate_proj.weight",
+        "model.layers.3.mlp.experts.0.gate_proj.weight",
+        "model.layers.3.self_attn.q_a_proj.weight",
+        "lm_head.weight",
+    )
+    bare_module(routing["GlmMoeDsaForCausalLM"]).load_weights(
+        iter((name, torch.zeros(1)) for name in names)
+    )
+    assert loaded == list(names[-2:])
 
 
 @pytest.mark.parametrize("kind", ["hash", "activation", "quantization", "role"])

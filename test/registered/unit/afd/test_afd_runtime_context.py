@@ -135,6 +135,63 @@ def test_attention_runner_uses_captured_tp_rank(monkeypatch, role, draft):
 
 
 @pytest.mark.parametrize(
+    "role,draft,tp,ep,error",
+    [
+        ("attention", False, 3, 1, None),
+        ("attention", False, 20, 1, None),
+        ("attention", False, 4, 1, None),
+        ("attention", False, 8, 1, None),
+        ("off", False, 3, 1, "moe_intermediate_size"),
+        ("off", False, 20, 1, "moe_intermediate_size"),
+        ("ffn", False, 3, 1, "moe_intermediate_size"),
+        ("ffn", False, 20, 1, "moe_intermediate_size"),
+        ("attention", True, 3, 1, "moe_intermediate_size"),
+        ("attention", True, 20, 1, "moe_intermediate_size"),
+        ("off", False, 4, 1, None),
+        ("ffn", False, 4, 4, None),
+        ("ffn", False, 32, 32, None),
+        ("off", False, 3, 2, "must be divisible by ep_size"),
+        ("ffn", False, 32, 1, "For quantized MoE models"),
+    ],
+)
+def test_runner_quantized_moe_check_applies_to_local_expert_owners(
+    monkeypatch, role, draft, tp, ep, error
+):
+    from sglang.srt.model_executor import model_runner
+    from sglang.srt.model_executor.model_runner_components import moe_ep_setup
+
+    monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "0")
+    monkeypatch.setattr(moe_ep_setup, "_use_aiter", False)
+    monkeypatch.setattr(
+        model_runner,
+        "get_parallel",
+        lambda: SimpleNamespace(moe_ep_size=ep, moe_dp_size=1),
+    )
+    runner = object.__new__(model_runner.ModelRunner)
+    runner.is_draft_worker = draft
+    runner.server_args = SimpleNamespace(afd_execution_mode=role)
+    runner.tp_size = tp
+    hf = SimpleNamespace(
+        moe_intermediate_size=2048,
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    runner.model_config = SimpleNamespace(hf_config=hf, hf_text_config=hf)
+    calls = []
+
+    def check(**kwargs):
+        calls.append(kwargs)
+        return moe_ep_setup.check_quantized_moe_compatibility(**kwargs)
+
+    monkeypatch.setattr(model_runner, "check_quantized_moe_compatibility", check)
+    if error is None:
+        runner.check_quantized_moe_compatibility()
+    else:
+        with pytest.raises(ValueError, match=error):
+            runner.check_quantized_moe_compatibility()
+    assert len(calls) == int(role != "attention" or draft)
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("old_internal_flag", 1),

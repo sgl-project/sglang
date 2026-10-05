@@ -1279,6 +1279,13 @@ class ModelRunner:
         )
 
     def check_quantized_moe_compatibility(self):
+        if (
+            not self.is_draft_worker
+            and self.server_args.afd_execution_mode == "attention"
+        ):
+            # A owns no local experts; its TP describes attention/request lanes,
+            # not the remote F group's quantized FFN weight partition.
+            return
         check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=get_parallel().tp_size,
