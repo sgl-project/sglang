@@ -427,6 +427,38 @@ async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
 }
 
 #[tokio::test]
+async fn balanced_charges_capped_out_prefix_holders_only_their_uncached_tokens() {
+    // The candidate cap keeps only the owner, but the alternative holds 7 of 8
+    // tokens: 20 vs 5 + 1 switches, where charging the whole prompt would not.
+    let engines = [engine("owner", 0), engine("warm", 9)];
+    let model = ModelId("m".into());
+    let table = EngineReportedLoadTable::new();
+    report(&table, &engines[0], 0, 20, Instant::now());
+    report(&table, &engines[1], 0, 5, Instant::now());
+    let policy = CacheAwarePolicy::new(
+        local(&[(&engines[0], 8), (&engines[1], 7)]),
+        table,
+        AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(10),
+            cache_candidate_min_workers: 1,
+            ..config()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        policy
+            .pick(&engines, &request(&model))
+            .await
+            .unwrap()
+            .engine
+            .id
+            .0,
+        "warm"
+    );
+}
+
+#[tokio::test]
 async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
     let engines = [engine("owner", 0), engine("cold", 9)];
     let model = ModelId("m".into());

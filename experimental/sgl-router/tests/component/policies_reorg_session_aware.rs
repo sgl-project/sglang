@@ -202,6 +202,55 @@ async fn rejection_and_load_switches_rebind_the_session() {
 }
 
 #[tokio::test]
+async fn balanced_sessions_count_every_prompt_in_a_batch() {
+    // Ten 1,000-token prompts against queues of 10,000 and 0: the batch makes
+    // it 20,000 vs 10,000, inside factor 2; the longest prompt alone would switch.
+    for (total, expected) in [(10_000, "a"), (1_000, "b")] {
+        let table = EngineReportedLoadTable::new();
+        let store = AffinityStore::new(Duration::from_secs(60));
+        let mut policy = SessionAwarePolicy::new(store, table.clone());
+        policy.config.mode = AffinityMode::Balanced;
+        let engines = [engine("a", 0), engine("b", 1)];
+        let model = ModelId("m".into());
+        let request = PickRequest {
+            total_input_tokens: total,
+            ..PickRequest {
+                input_tokens: 1_000,
+                ..request(&model)
+            }
+        };
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "a"
+        );
+        for (engine, pending) in [(&engines[0], 10_000), (&engines[1], 0)] {
+            table.set(
+                &engine.url,
+                0,
+                LoadStat {
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: pending,
+                        num_total_tokens: 10,
+                        max_running_requests: 100,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                    num_running_reqs: 1,
+                    num_waiting_reqs: 1,
+                    num_tokens: 10,
+                    max_total_num_tokens: 100,
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn removed_binding_is_replaced_only_after_admission() {
     let (mut policy, store) = policy();
     let admission = Arc::new(Admission::default());
