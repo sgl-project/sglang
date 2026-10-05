@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
     require_kvcacheio_ops,
 )
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_MXFP4
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -123,7 +124,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+
+        if not self.is_dummy and getattr(
+            device_pool, "indexer_quant_mode", None
+        ) == QUANT_MODE_MXFP4:
+            # Packed-MXFP4 index-k storage (quant_lightning_indexer
+            # quant_mode 5) holds raw float4_e2m1fn_x2 bytes on the device;
+            # the host mirror and the transfer path assume the pool's
+            # storage dtype and full index_head_dim width, so they cannot
+            # round-trip it yet.  Fail at construction instead of corrupting
+            # pages silently.
+            raise ValueError(
+                "Hierarchical cache cannot mirror a quant_lightning_indexer "
+                "MXFP4 (quant_mode 5) DSA index-k cache yet; run with "
+                "--indexer-kv-cache-dtype=mxfp8 (or unset) to use "
+                "hierarchical cache with the quantized DSA indexer."
             )
+
         self.dtype = buffer_info.dtype
         self.layout = layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
@@ -380,7 +397,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         * self.dtype.itemsize
                     )
                 if native.index_scales is not None:
-                    # MX scale mirror (4 E8M0 bytes per token per layer)
+                    # Indexer scale mirror (4 bytes per token per layer in
+                    # every quant mode: 4 E8M0 or one FP32).
                     total_bytes += (
                         self.page_num * self.page_size * num_indexer_layers * 4
                     )
@@ -412,14 +430,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # Host-side mirror of the NPU quantized-Indexer scale cache
             # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
             # the device pool carries one (FP8 DSA + quant_lightning_indexer).
-            # The trailing (k_n, d/64, 2) MX-scale tail and the uint8 storage
-            # dtype are taken from the device pool so the mirror matches it
+            # The device buffer is
+            # (num_indexer_layers, page_num, page_size, k_n, *tail):
+            # (k_n, d/64, 2) uint8 E8M0 for quant_mode 3/5, or () (one FP32
+            # per token-head) for quant_mode 1.  Append the tail via
+            # shape[4:] (never shape[-2:]) so the FP32 layout works too, and
+            # take the dtype from the device pool so the mirror matches it
             # byte-for-byte.
             self.index_k_scale_buffer = None
             if native.index_scales is not None:
                 self.index_k_scale_buffer = alloc_func(
+<<<<<<< HEAD
                     (*indexer_dims, *native.index_scales.shape[-2:]),
                     dtype=native.index_scales.dtype,
+=======
+                    (*indexer_dims, *device_index_k_scale.shape[4:]),
+                    dtype=device_index_k_scale.dtype,
+>>>>>>> 50ba99cf8e (Implemented indexer MXFP4 quantization for DSA)
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -1277,8 +1304,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 2, 2) uint8: 4 E8M0 MX-scale bytes per
-                    # token per indexer layer.
+                    # page_size, 1, 2, 2) uint8 for quant_mode 3/5, or
+                    # (page_num, num_indexer_layers, page_size, 1) FP32 for
+                    # quant_mode 1: 4 bytes per token per indexer layer
+                    # either way.
                     ptr_list.append(
                         scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
                     )
