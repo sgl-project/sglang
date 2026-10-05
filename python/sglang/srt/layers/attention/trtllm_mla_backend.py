@@ -66,12 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import (
-    get_buffer,
-    get_parallel,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_schedule, get_spec
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -169,6 +164,10 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    # Extend lengths as one int32 CPU tensor, built once per batch. Fed to
+    # flashinfer's empty-row validation so it stays on the host instead of
+    # deriving lengths on GPU and syncing (.any().item()) every layer.
+    seq_lens_cpu: Optional[torch.Tensor] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -202,6 +201,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # Ragged verify: the packed query is front-aligned into the dense
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
+
+    # Under BCG the extend path stays on the native ragged kernels through
+    # the chunked-prefix eager boundary, so the absorbed-MLA flashinfer
+    # fallback is not needed. Subclasses whose dispatch keeps the absorbed
+    # pin under BCG (tokenspeed) set this to keep the fallback.
+    fallback_mla_under_breakable_graph: bool = False
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
@@ -721,7 +726,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         fallback_to_flashinfer_impl = (
             (self.disable_chunked_prefix_cache and has_prefix)
             or is_in_tc_piecewise_cuda_graph()
-            or is_in_breakable_cuda_graph()
+            or (
+                (
+                    self.fallback_mla_under_breakable_graph
+                    or self.disable_chunked_prefix_cache
+                )
+                and is_in_breakable_cuda_graph()
+            )
         )
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
@@ -835,7 +846,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             fallback_to_flashinfer_impl = (
                 (self.disable_chunked_prefix_cache and has_prefix)
                 or is_in_tc_piecewise_cuda_graph()
-                or is_in_breakable_cuda_graph()
+                or (
+                    (
+                        self.fallback_mla_under_breakable_graph
+                        or self.disable_chunked_prefix_cache
+                    )
+                    and is_in_breakable_cuda_graph()
+                )
             )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
@@ -850,11 +867,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            # DCP shards the gathered KV, so the kernel's cpu-length sum
+            # checks no longer match; let it fall back to the GPU check there.
+            seq_lens_cpu = (
+                torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32)
+                if not get_parallel().dcp_enabled
+                else None
+            )
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
+                seq_lens_cpu,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1113,6 +1138,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
@@ -1121,6 +1148,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            q_seq_lens_cpu=q_seq_lens_cpu,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
             query=q,
             key=k,
             value=v,
@@ -1779,6 +1808,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out_buffer=out,
                 o_sf_scale=-1.0,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                # Same DCP gate as seq_lens_cpu: flashinfer requires both or
+                # neither, and the gathered prefix KV is DCP-sharded there.
+                kv_seq_lens_cpu=(
+                    forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx]
+                    if self.forward_prefill_metadata.seq_lens_cpu is not None
+                    else None
+                ),
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -1822,6 +1859,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
             )
 
 

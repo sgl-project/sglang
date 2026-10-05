@@ -112,6 +112,10 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
+    # tokenspeed keeps the absorbed-MLA dispatch under BCG, so it also keeps
+    # the matching flashinfer fallback in the metadata hooks.
+    fallback_mla_under_breakable_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -471,7 +475,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
+        # tokenspeed_mla_prefill takes no cpu-length arguments; the kernel's
+        # own empty-row handling is unchanged.
+        del q_seq_lens_cpu, kv_seq_lens_cpu
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
         # Hybrid MLA models resolve the model-side hook through the outer
         # HybridLinearAttnBackend, so their fallback MHA path can pass V as a

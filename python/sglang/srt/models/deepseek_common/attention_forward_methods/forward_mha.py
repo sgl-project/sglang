@@ -14,11 +14,19 @@ from sglang.srt.layers.dcp import (
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -166,6 +174,36 @@ def forward_dsa_indexer_for_mha(
 #       v_i: [chunk_size, num_local_heads, v_head_dim],
 #       acc_o_i, acc_lse_i = merge_state(acc_o_{i-1}, acc_lse_{i-1}, o_i, lse_i)
 #       The final output is the accumulated output acc_o_n
+
+
+@eager_on_graph(True)
+def _breakable_chunked_kv_core(attn, q, k, v):
+    # Prefix topology is Python control flow: replay the entire core, not just
+    # its suffix attention call. Never retain the capture-time ForwardBatch.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    n = forward_batch.global_num_token_non_padded_cpu
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_positions = forward_batch.positions
+    forward_batch.out_cache_loc = original_out_cache_loc[:n]
+    if original_positions is not None:
+        forward_batch.positions = original_positions[:n]
+    try:
+        # RadixAttention must not start another eager break inside this one.
+        with force_eager_attention():
+            output = attn._forward_normal_chunked_kv_core(
+                q[:n],
+                k[:n],
+                v[:n],
+                forward_batch,
+            )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.positions = original_positions
+    # eager_on_graph keeps this bridge's address stable. Clear padding on every
+    # replay so a shorter batch cannot leak old rows into residual/MoE kernels.
+    padded = output.new_zeros((q.shape[0], *output.shape[1:]))
+    padded[:n].copy_(output)
+    return padded
 
 
 class DeepseekMHAForwardMixin:
@@ -340,6 +378,25 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cuda and is_in_breakable_cuda_graph():
+            attn_output = _breakable_chunked_kv_core(self, q, k, v)
+        else:
+            attn_output = self._forward_normal_chunked_kv_core(q, k, v, forward_batch)
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
+        # K3's o_proj wrapper consumes Python gate state set during capture.
+        # Keep it (and the gate GEMM/multiply) captured, outside the eager break.
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_normal_chunked_kv_core(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
@@ -364,12 +421,7 @@ class DeepseekMHAForwardMixin:
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         if fused_prefix:
-            attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
-            attn_output = attn_output.reshape(
-                -1, self.num_local_heads * self.v_head_dim
-            )
-            output, _ = self.o_proj(attn_output)
-            return output
+            return self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -387,11 +439,7 @@ class DeepseekMHAForwardMixin:
                 forward_batch=forward_batch,
             )
 
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        if gate is not None:
-            attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,
