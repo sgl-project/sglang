@@ -78,6 +78,9 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+# flashinfer's XQA decode keeps its multi-block semaphores in the first 8 MiB
+# of the workspace and needs them zero at every launch.
+_XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -295,15 +298,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
+        semaphore_bytes = _XQA_SEMAPHORE_BYTES if self.is_xqa_impl else 0
         # Allocate buffers
         self.workspace_buffer = get_buffer(
             "trtllm_mha_zero_workspace",
             lambda: torch.zeros(
-                self.workspace_size,
+                semaphore_bytes + self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
             ),
         )
+        self.fmha_v2_workspace_buffer = self.workspace_buffer[semaphore_bytes:]
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -1773,7 +1778,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
