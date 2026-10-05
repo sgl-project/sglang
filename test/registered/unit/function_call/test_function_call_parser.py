@@ -2969,6 +2969,24 @@ class TestGlm4MoeDetector(unittest.TestCase):
             result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
         )
 
+    def test_unpaired_arg_keys_parse_in_linear_time(self):
+        """Many `<arg_key>` tags that never get a value must not stall the
+        parser; the complete pair before them still parses."""
+        text = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
+            + "<arg_key>a</arg_key>" * 20000
+            + "</tool_call>"
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Beijing"})
+
     def test_streaming_tool_call(self):
         chunks = [
             "<tool_call>get_weather\n",
