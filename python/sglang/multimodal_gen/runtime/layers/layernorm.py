@@ -90,6 +90,11 @@ if USE_AITER:
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_scale_residual_norm_scale_shift_sycl,
+        fused_scale_residual_norm_scale_shift_sycl,
+    )
+
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
 
@@ -727,6 +732,25 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if self.norm_type == "layer":
             weight = self.norm.weight
             bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_sycl(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_sycl(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
             if can_use_fused_scale_residual_norm_scale_shift_triton(
                 residual=residual,
                 x=x,
