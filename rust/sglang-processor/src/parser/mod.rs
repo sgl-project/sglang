@@ -9,9 +9,7 @@
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
-use dynamo_parsers::reasoning::{
-    ReasoningParser as _, ReasoningParserType, ReasoningParserWrapper,
-};
+use dynamo_parsers::reasoning::{ReasoningParser as _, ReasoningParserWrapper};
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -23,7 +21,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
-use crate::tool_parser::dynamo_tool_parser_name;
+
+mod aliases;
+
+use self::aliases::build_reasoning_parser;
+pub use self::aliases::dynamo_tool_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,19 +447,6 @@ fn from_dynamo_finish_reason(reason: FinishReason) -> ChatFinishReason {
         FinishReason::ContentFilter => ChatFinishReason::ContentFilter,
         FinishReason::ToolCalls | FinishReason::FunctionCall => ChatFinishReason::ToolCalls,
     }
-}
-
-pub(super) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
-    let name = match server_name {
-        "deepseek-r1" | "step3p5" => "deepseek_r1",
-        "kimi_k2" => "kimi_k25",
-        "gpt-oss" => "gpt_oss",
-        "nemotron_3" => "nemotron3",
-        "interns1" => "qwen3",
-        "qwen3-thinking" | "minimax" => "deepseek_r1",
-        _ => server_name,
-    };
-    ReasoningParserType::get_reasoning_parser_from_name(name)
 }
 
 struct ReasoningStreamSplitter {
