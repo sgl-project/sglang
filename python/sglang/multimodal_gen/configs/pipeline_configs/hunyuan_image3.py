@@ -71,3 +71,20 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
 
     def supports_sequential_multi_output_inference(self):
         return current_platform.is_npu()
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
+        HunyuanImage3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HunyuanImage3SamplingParams,
+        pipeline_config_cls=HunyuanImage3PipelineConfig,
+        hf_model_paths=[
+            "tencent/HunyuanImage-3.0",
+            "tencent/HunyuanImage-3.0-Instruct",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanimage-3" in hf_id.lower()],
+    )
