@@ -205,8 +205,7 @@ class SchedulerPoolStatsObserver:
         return len(self._session_kv_rows())
 
     def session_held_mamba_slots(self) -> int:
-        records = self.tree_cache.session_records().values()
-        return sum(kv_mamba_slots(kv) for kv in records)
+        return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
 
     def get_pool_stats(self) -> PoolStats:
         if self.is_hybrid_swa:

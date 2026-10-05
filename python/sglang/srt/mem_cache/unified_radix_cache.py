@@ -3559,9 +3559,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
-    def session_owns_record(self, req: Req) -> bool:
-        return self.session.borrowed_slot(req) is not None
-
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 

@@ -219,7 +219,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 cache_protected_len=self.PAGE_SIZE,
             ),
             beam_group=None,
-            session=None,
         )
         self.last_batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
         self.running_batch = self.last_batch
@@ -293,7 +292,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         req = self._active_partial_page(checker)
         # The session owns the row: session-held whether the turn is in a batch
         # or parked between prefill chunks, never also uncached.
-        req.session = SimpleNamespace(session_id="s", streaming=True)
         self.cache.session.slots["s"] = SessionSlot(kv=req.kv)
         for parked in (False, True):
             with self.subTest(parked=parked):

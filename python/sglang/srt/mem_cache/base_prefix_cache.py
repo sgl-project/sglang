@@ -651,13 +651,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_owns_record(self, req: Req) -> bool:
-        """Whether the request runs on a record a session owns. Pool accounting
-        counts such a record as session-held, not as the request's."""
-        return False
-
     def session_records(self) -> dict[str, ReqKvInfo]:
-        """The KV records sessions own, by session id."""
+        """The KV records sessions own, by session id. Pool accounting counts them
+        as session-held, including while a request runs on one."""
         return {}
 
     def supports_prefix_sharing(self) -> bool:

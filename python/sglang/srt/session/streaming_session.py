@@ -180,12 +180,6 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
-        if not _is_streaming(req):
-            return None
-        slot = self.slots.get(req.session.session_id)
-        return slot if slot is not None and slot.kv is req.kv else None
-
     def try_cache_finished_req(self, req: Req) -> bool:
         """Hands a turn's row to the session slot when it finishes or is
         retracted. Returns False for non-streaming requests and aborts, which
