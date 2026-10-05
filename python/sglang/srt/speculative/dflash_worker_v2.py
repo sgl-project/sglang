@@ -617,9 +617,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_owns_attention),
         ):
             self._draft_worker.init_attention_backends()
-        translator = self.draft_model_runner.kv_index_translator
-        if translator.is_translating:
-            translator.bind_and_verify_backends([self.draft_model_runner.attn_backend])
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
