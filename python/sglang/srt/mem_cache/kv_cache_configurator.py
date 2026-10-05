@@ -329,6 +329,30 @@ class KVCacheConfigurator:
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
 
+    def _warn_if_pool_cannot_hold_context(self, *, max_total_num_tokens: int) -> None:
+        """Warn when the KV pool cannot hold one full-length request, which would
+        otherwise surface only as refusals at serving time. Not an error: a
+        deployment that never sends max-length requests may want a small pool."""
+        # The draft shares the target's capacity; one warning is enough.
+        if self.is_draft_worker:
+            return
+        # Request tokens, not per-rank rows: under DCP they differ by attn_dcp_size.
+        capacity = self.logical_token_capacity(
+            max_total_num_tokens=max_total_num_tokens
+        )
+        context_len = self.model_config.context_len
+        if capacity >= context_len:
+            return
+        logger.warning(
+            "KV pool holds %d tokens, fewer than --context-length %d. One "
+            "full-length request cannot fit, so long requests will be refused "
+            "or truncated at serving time rather than here. Lower "
+            "--context-length, raise --mem-fraction-static, or free memory taken "
+            "before the pool is sized.",
+            capacity,
+            context_len,
+        )
+
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
@@ -390,6 +414,10 @@ class KVCacheConfigurator:
                 f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
                 "(fixed per-request SWA ring capacity)."
             )
+
+        self._warn_if_pool_cannot_hold_context(
+            max_total_num_tokens=sizes.max_total_num_tokens
+        )
 
         logger.info(
             f"Memory pool end. "
@@ -1566,10 +1594,11 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        # Not gated on is_arch35: which layers own an Indexer is a property of
+        # the model config, not the die, and a layer without one never writes
+        # index-K on any hardware.
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:
@@ -2069,6 +2098,8 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         # DCP allocation is in the global virtual loc space.
                         # The target attention path localizes these locs when

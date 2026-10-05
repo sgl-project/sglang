@@ -331,12 +331,10 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in an allocator whose page_size is the configured page_size *
-    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
-    # the real allocator's page_size there. Elsewhere the two are equal --
-    # including under KV sharding, which widens the index space but keeps the
-    # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    # Under DCP the allocator pages at page_size * dcp_size, so it can differ
+    # from tree_cache.page_size; ask the allocator there. NPU belongs with
+    # hip/cuda since its allocator started scaling.
+    if (_is_hip or _is_cuda or _is_npu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
