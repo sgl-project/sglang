@@ -39,6 +39,7 @@ def _temporal_vae() -> AutoencoderKLLegacy:
     vae.use_3d_conv = True
     vae.transform = None
     vae.transform_rev = None
+    vae.transform_rev_inplace = None
     vae.setup_forward(clip_length=17, token_drop=3)
     vae._adaptive_decode = lambda clip_z: clip_z.repeat_interleave(4, dim=2)
     return vae.eval()
