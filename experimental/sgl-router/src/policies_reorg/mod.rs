@@ -5,6 +5,7 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod affinity;
 pub mod cache_aware;
 pub mod factory;
 pub mod power_of_two;
@@ -102,7 +103,7 @@ pub trait Policy: Send + Sync + Debug {
         false
     }
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
     }

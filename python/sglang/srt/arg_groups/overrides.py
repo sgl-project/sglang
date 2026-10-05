@@ -1713,9 +1713,6 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
-    # Unified arenas are fully backed before capture and cannot resize afterward.
-    if cfg.enable_unified_memory:
-        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:
@@ -1735,6 +1732,19 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         and envs.MOONCAKE_PROTOCOL.get().lower() == "efa"
     ):
         return False
+
+    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
+    model_config = model_config_of(server_args)
+    if cfg.enable_unified_memory:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+            return False
+        # The solver budgets these independent draft pools again after capture.
+        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
+            return False
 
     if (
         cfg.disaggregation_mode != "prefill"
@@ -1756,33 +1766,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-    hf_config = model_config_of(server_args).hf_config
+    hf_config = model_config.hf_config
     if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True
-
-
-def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
-    """Largest number of tokens a single forward routes through a CuteDSL
-    MoE layer on one (DP) rank. Single source of truth for both the
-    standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
-    budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-    capture, and decode/verify bounds; num_tokens_per_req is
-    speculative_num_draft_tokens under speculative decoding, else 1.
-    """
-    cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm:
-        num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
-    else:
-        num_tokens_per_req = 1
-    prefill_tokens = cfg.max_prefill_tokens
-    cg_config = cfg.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-    decode_tokens = decode_max_bs * num_tokens_per_req
-    return max(prefill_tokens, decode_tokens)
 
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
@@ -1804,6 +1792,17 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         record = record_of(server_args)
     return prefill_buffer_ceiling_of(record, tokens)
+
+
+def flashinfer_a2a_max_dispatch_tokens_per_rank(prefill_buffer_tokens: int) -> int:
+    """Per-rank token capacity of the FlashInfer A2A workspace; the allocation
+    and the startup budget check must both read it from here."""
+    configured = envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if configured is not None:
+        return configured
+    # max_running_requests is unresolved at model construction; 4096 covers the
+    # per-DP-worker cap resolve_max_num_reqs applies, and _dummy_run.
+    return max(prefill_buffer_tokens, 4096)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:
