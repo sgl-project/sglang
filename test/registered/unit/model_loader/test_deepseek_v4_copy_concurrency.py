@@ -1,5 +1,6 @@
-"""Exercise the real V4 weight-loading loop with small CPU parameters."""
+"""Exercise the real DeepSeek weight-loading loops with small CPU parameters."""
 
+import argparse
 import concurrent.futures
 import threading
 from types import SimpleNamespace
@@ -8,6 +9,9 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    DeepseekV2WeightLoaderMixin,
+)
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -41,8 +45,30 @@ class LoaderProbe(nn.Module):
         pass
 
 
-def test_copy_worker_limit_bounds_loading_and_preserves_weights(monkeypatch):
-    monkeypatch.setenv("SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS", "2")
+class SharedDeepseekLoaderProbe(LoaderProbe, DeepseekV2WeightLoaderMixin):
+    load_weights = DeepseekV2WeightLoaderMixin.do_load_weights
+
+
+@pytest.fixture(
+    params=[LoaderProbe, SharedDeepseekLoaderProbe], ids=["v4", "shared-v2-v3-r1"]
+)
+def loader_probe(request):
+    config = SimpleNamespace(weight_loader_copy_num_threads=None)
+    request.getfixturevalue("monkeypatch").setattr(
+        "sglang.srt.models.deepseek_v4.get_model", lambda: config
+    )
+    request.getfixturevalue("monkeypatch").setattr(
+        "sglang.srt.models.deepseek_common.deepseek_weight_loader.get_model",
+        lambda: config,
+    )
+    return request.param, config
+
+
+def test_copy_worker_limit_bounds_loading_and_preserves_weights(
+    monkeypatch, loader_probe
+):
+    loader_probe, config = loader_probe
+    config.weight_loader_copy_num_threads = 2
     release = threading.Event()
     started = threading.Event()
     exceeded = threading.Event()
@@ -62,7 +88,7 @@ def test_copy_worker_limit_bounds_loading_and_preserves_weights(monkeypatch):
         with lock:
             active -= 1
 
-    model = LoaderProbe(loader)
+    model = loader_probe(loader)
     weights = [(f"probe_{i}", torch.full((2,), float(i))) for i in range(8)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as driver:
         future = driver.submit(model.load_weights, weights)
@@ -77,37 +103,56 @@ def test_copy_worker_limit_bounds_loading_and_preserves_weights(monkeypatch):
 
 
 @pytest.mark.parametrize("workers", ["0", "-1"])
-def test_invalid_copy_limit_fails_before_reading_weights(monkeypatch, workers):
-    monkeypatch.setenv("SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS", workers)
+def test_invalid_copy_limit_fails_before_reading_weights(
+    monkeypatch, workers, loader_probe
+):
+    loader_probe, config = loader_probe
+    config.weight_loader_copy_num_threads = int(workers)
 
     def weights():
         pytest.fail("invalid worker count consumed checkpoint tensors")
         yield
 
     with pytest.raises(ValueError, match="max_workers"):
-        LoaderProbe(lambda param, weight: param.data.copy_(weight)).load_weights(
+        loader_probe(lambda param, weight: param.data.copy_(weight)).load_weights(
             weights()
         )
 
 
-def test_unset_limit_preserves_loading(monkeypatch):
-    monkeypatch.delenv("SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS", raising=False)
-    model = LoaderProbe(lambda param, weight: param.data.copy_(weight))
+def test_unset_limit_preserves_loading(monkeypatch, loader_probe):
+    loader_probe, config = loader_probe
+    model = loader_probe(lambda param, weight: param.data.copy_(weight))
     weights = [(f"probe_{i}", torch.full((2,), float(i))) for i in range(8)]
     model.load_weights(weights)
     for name, weight in weights:
         torch.testing.assert_close(getattr(model, name), weight)
 
 
-def test_limited_copy_workers_propagate_loader_errors(monkeypatch):
-    monkeypatch.setenv("SGLANG_DSV4_WEIGHT_LOADER_MAX_WORKERS", "1")
+def test_limited_copy_workers_propagate_loader_errors(monkeypatch, loader_probe):
+    loader_probe, config = loader_probe
+    config.weight_loader_copy_num_threads = 1
 
     def fail_copy(param, weight):
         raise RuntimeError("checkpoint copy failed")
 
     with pytest.raises(RuntimeError, match="checkpoint copy failed"):
-        LoaderProbe(fail_copy).load_weights([("probe_0", torch.ones(2))])
+        loader_probe(fail_copy).load_weights([("probe_0", torch.ones(2))])
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_copy_threads_cli_round_trip():
+    from sglang.srt.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        ["--model-path", "dummy", "--weight-loader-copy-num-threads", "2"]
+    )
+    assert args.weight_loader_copy_num_threads == 2
+    assert (
+        parser.parse_args(["--model-path", "dummy"]).weight_loader_copy_num_threads
+        is None
+    )
