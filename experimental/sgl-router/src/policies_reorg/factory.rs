@@ -81,11 +81,15 @@ pub struct AffinitySpec {
 impl AffinitySpec {
     /// `defaults` with each set field replaced, validated like the CLI flags.
     fn or(&self, defaults: &AffinityConfig) -> Result<AffinityConfig> {
+        let balanced_by = self.balanced_by.unwrap_or(defaults.balanced_by);
         let config = AffinityConfig {
             mode: self.mode.unwrap_or(defaults.mode),
-            balanced_by: self.balanced_by.unwrap_or(defaults.balanced_by),
+            balanced_by,
             load_factor: self.load_factor.unwrap_or(defaults.load_factor),
-            load_gap: self.load_gap.or(defaults.load_gap),
+            // A CLI gap is in the CLI metric's unit; another metric uses its own default.
+            load_gap: (self.load_gap).or(defaults
+                .load_gap
+                .filter(|_| balanced_by == defaults.balanced_by)),
             ..defaults.clone()
         };
         ensure!(
@@ -356,5 +360,25 @@ impl Groups<'_> {
                 )),
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_metric_change_drops_the_cli_gap() {
+        let cli = AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(2_048),
+            ..Default::default()
+        };
+        let by_requests = AffinitySpec {
+            balanced_by: Some(BalancedBy::RunningRequests),
+            ..Default::default()
+        };
+        assert_eq!(by_requests.or(&cli).unwrap().load_gap(), 4);
+        assert_eq!(AffinitySpec::default().or(&cli).unwrap().load_gap(), 2_048);
     }
 }

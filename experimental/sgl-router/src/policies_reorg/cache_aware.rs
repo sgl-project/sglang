@@ -355,9 +355,11 @@ impl Policy for CacheAwarePolicy {
                 Ok(pick)
             }
             .await;
+            // The prefix hit covers the longest prompt; the rest of the batch is uncached.
             let uncached_tokens = |engine: &Worker| {
-                (uncached.get(engine.url.as_str()))
-                    .map_or(request.total_input_tokens, |&tokens| tokens)
+                let cached = (uncached.get(engine.url.as_str()))
+                    .map_or(0, |&tokens| request.input_tokens - tokens);
+                request.total_input_tokens.saturating_sub(cached)
             };
             affinity::choose(&self.config, affinity, fallback, &load, uncached_tokens)
         })

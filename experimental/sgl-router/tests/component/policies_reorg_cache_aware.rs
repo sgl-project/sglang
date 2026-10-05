@@ -459,6 +459,35 @@ async fn balanced_charges_capped_out_prefix_holders_only_their_uncached_tokens()
 }
 
 #[tokio::test]
+async fn balanced_credits_the_prefix_once_per_batch() {
+    // A 16-token batch whose longest prompt the owner fully caches: 30 + 8 vs
+    // 0 + 16 switches, where crediting the whole batch (30 vs 16) would not.
+    let engines = [engine("owner", 0), engine("cold", 9)];
+    let model = ModelId("m".into());
+    let table = EngineReportedLoadTable::new();
+    report(&table, &engines[0], 0, 30, Instant::now());
+    report(&table, &engines[1], 0, 0, Instant::now());
+    let policy = CacheAwarePolicy::new(
+        local(&[(&engines[0], 8)]),
+        table,
+        AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(10),
+            ..config()
+        },
+    )
+    .unwrap();
+    let request = PickRequest {
+        total_input_tokens: 16,
+        ..request(&model)
+    };
+    assert_eq!(
+        policy.pick(&engines, &request).await.unwrap().engine.id.0,
+        "cold"
+    );
+}
+
+#[tokio::test]
 async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
     let engines = [engine("owner", 0), engine("cold", 9)];
     let model = ModelId("m".into());
