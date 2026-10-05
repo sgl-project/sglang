@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import bisect
 import contextlib
+import itertools
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -21,7 +23,10 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -75,6 +80,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    print_info_once,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -245,6 +251,17 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         "Hidden size must be a power of 2 for Hadamard transform."
     )
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def _chunk_request_rows(
+    req_cu_cpu: List[int], req_cu: torch.Tensor, start: int, end: int
+) -> Tuple[torch.Tensor, slice]:
+    """Per-request query-row counts of indexer rows [start, end), and the slice
+    of page_table_1 rows (one per request) those counts index."""
+    first = bisect.bisect_right(req_cu_cpu, start) - 1
+    last = bisect.bisect_right(req_cu_cpu, end - 1) - 1
+    chunk_cu = (req_cu[first : last + 2] - start).clamp_(min=0, max=end - start)
+    return chunk_cu[1:] - chunk_cu[:-1], slice(first, last + 1)
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
@@ -1446,6 +1463,42 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes
 
+    def _dedupe_chunk_gather_req_cu(
+        self, metadata: BaseIndexerMetadata, q_offset: int
+    ) -> Optional[List[int]]:
+        # Host cumsum of per-request query rows, or None to keep the per-token
+        # page-table gather in the chunked PAGED top-k.
+        if not envs.SGLANG_DSA_DEDUPE_CHUNK_GATHER.get() or self.dsa_enable_prefill_cp:
+            return None
+        # Fused sgl-kernel PAGED transform on CUDA; on ROCm, the packed v2 top-k
+        # maps rows through the per-token batch_idx_list tensor and copies nothing.
+        if not (
+            _is_cuda
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_backend.is_sgl_kernel()
+            and not metadata.force_unfused_topk
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+        ):
+            return None
+        attn_metadata = metadata.attn_metadata
+        extend_lens = metadata.get_dsa_extend_len_cpu()
+        # Rows must be request-major with one page_table_1 row per request, which is
+        # the layout the unchunked call already hands the kernel via cu_seqlens_q.
+        if (
+            not extend_lens
+            or attn_metadata.page_table_1 is None
+            or attn_metadata.page_table_1.shape[0] != len(extend_lens)
+            or attn_metadata.cu_seqlens_q.shape[0] != len(extend_lens) + 1
+            or min(extend_lens) <= 0
+            or sum(extend_lens) != q_offset
+        ):
+            return None
+        print_info_once(
+            "DSA indexer: chunked-prefill top-k uses per-request page-table rows "
+            "(SGLANG_DSA_DEDUPE_CHUNK_GATHER=1)"
+        )
+        return list(itertools.accumulate(extend_lens, initial=0))
+
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1596,8 +1649,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
+        req_cu_cpu = None
         cu_seqlens_q_full = None
         if global_topk_offset is None:
+            req_cu_cpu = self._dedupe_chunk_gather_req_cu(
+                metadata=metadata, q_offset=q_offset
+            )
+        if global_topk_offset is None and req_cu_cpu is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
         assert seq_lens_expanded.shape[0] == q_offset, (
@@ -1658,6 +1716,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_offset_chunk = global_topk_offset[start:end]
                 cu_seqlens_q_chunk = None
                 batch_idx_chunk = None
+            elif req_cu_cpu is not None:
+                # PAGED path, one sequence per request: the kernel maps rows to
+                # requests via cu_seqlens_q; a slice makes page_table_1 a view.
+                topk_offset_chunk = None
+                cu_seqlens_q_chunk, batch_idx_chunk = _chunk_request_rows(
+                    req_cu_cpu=req_cu_cpu,
+                    req_cu=metadata.attn_metadata.cu_seqlens_q,
+                    start=start,
+                    end=end,
+                )
             else:
                 # PAGED path: treat each token as a length-1 sequence
                 topk_offset_chunk = None
