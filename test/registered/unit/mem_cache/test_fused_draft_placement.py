@@ -29,8 +29,7 @@ prices. Pinned:
   - so does a draft under --dcp-size > 1, where each rank's host rows hold
     only its share of the tokens the replicated draft reads, and a draft
     under a host-pool-backed cache, which needs a device pool of its own;
-  - the plan-time KV dtype check resolves the draft's dtype the way the
-    draft runner does, including its fa4 override for a DFLASH-family draft;
+  - an explicit draft KV dtype unlike the host's declines;
   - the profile divides the draft's heads by attn_tp, as the target does;
   - a placement whose runner lane counts do not fill its region is refused;
   - the priced entry counts the layers THIS runner owns, not the whole model's.
@@ -337,34 +336,20 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
         """A fused draft stores its rows in the host's KV dtype; an explicit
-        draft dtype that differs declines instead of mis-typing those rows."""
+        draft dtype that differs declines instead of mis-typing those rows,
+        and one that matches the host's fuses."""
         self.assertIsNotNone(self._decide(draft_kv_dtype="auto").placement)
         declined = self._decide(draft_kv_dtype="fp8_e4m3")
         self.assertIsNone(declined.placement)
         self.assertIn("KV cache dtype", declined.declined)
-
-    def test_the_kv_dtype_check_resolves_the_dtype_as_the_draft_runner(self):
-        """The draft runner forces a DFLASH-family fa4 draft to the model
-        dtype. The plan-time check predicts the same: such a draft over an fp8
-        host declines even with no draft dtype set, and an explicit fp8 draft
-        dtype it will never use does not decline it over a bf16 host. fa4 is
-        off the translated rails, so they are widened to see the check alone."""
-        from sglang.srt.mem_cache import kv_cache_configurator as kvc
-
-        rails = kvc.TRANSLATED_MHA_RAILS | {"fa4"}
-        with patch.object(kvc, "TRANSLATED_MHA_RAILS", rails):
-            declined = self._decide(
-                algorithm="DFLASH",
-                draft_backend="fa4",
+        for algorithm in ("EAGLE", "DFLASH"):
+            placed = self._decide(
+                algorithm=algorithm,
+                draft_kv_dtype="fp8_e4m3",
                 host_kv_dtype=torch.float8_e4m3fn,
                 kv_cache_dtype_flag="fp8_e4m3",
             )
-            self.assertIsNone(declined.placement)
-            self.assertIn("KV cache dtype", declined.declined)
-            placed = self._decide(
-                algorithm="DFLASH", draft_backend="fa4", draft_kv_dtype="fp8_e4m3"
-            )
-            self.assertIsNotNone(placed.placement)
+            self.assertIsNotNone(placed.placement, algorithm)
 
     def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
         """A fused draft reads its rows through the KV-index translator, which
