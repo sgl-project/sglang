@@ -3,7 +3,7 @@
 //! `recv_requests` and `push_decode_result_batch`.
 //!
 //! Thread layout:
-//!   * API server     — tokio multi-thread runtime (I/O bound), pinned core set A
+//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned core set A
 //!   * Tokenizer      — N pinned OS threads (CPU bound), core set B
 //!   * Detokenizer    — M pinned OS threads (CPU bound), core set C
 //!   * To_scheduler   — 1 thread driving the FSM
@@ -12,7 +12,7 @@
 //!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
-//! axum's worker threads.
+//! the HTTP/gRPC worker threads.
 
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -180,6 +180,22 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
+    // The potentially slow/fallible tokenizer load above happens before the
+    // ports become visible. Own both sockets before starting any worker or
+    // transport thread, though, so startup remains all-or-nothing: if either
+    // configured port is unavailable, both local listeners are dropped and no
+    // partial runtime needs cleanup.
+    let http_addr = cfg.rust_server_args.http_addr;
+    let http_listener = bind_tcp_listener(http_addr)
+        .map_err(|e| format!("binding HTTP listener on {http_addr} failed: {e}"))?;
+    let grpc_listener = match cfg.rust_server_args.grpc_addr {
+        Some(addr) => Some(
+            bind_tcp_listener(addr)
+                .map_err(|e| format!("binding gRPC listener on {addr} failed: {e}"))?,
+        ),
+        None => None,
+    };
+
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
         // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
@@ -294,21 +310,19 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            metadata: crate::frontend::FrontendMetadata::from(cfg.server_args.as_ref()),
         },
     );
 
-    // --- HTTP adapter (tokio, I/O bound) ---
+    // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
-        let frontend = frontend.clone();
         let shutdown_rx = shutdown_rx.clone();
-        // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
-        // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
-        // launcher process.
-        let http_addr = cfg.rust_server_args.http_addr;
-        let listener = bind_tcp_listener(http_addr)
-            .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
+        let grpc_server = grpc_listener.map(|listener| {
+            let service = crate::grpc::GrpcService::new(frontend.clone(), &cfg.server_args);
+            (listener, service)
+        });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -326,12 +340,19 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::app::serve(
-                    listener,
-                    frontend,
-                    cfg.server_args.clone(),
-                    shutdown_rx,
-                ))
+                rt.block_on(async move {
+                    let http = api_server::app::serve(
+                        http_listener,
+                        frontend,
+                        cfg.server_args.clone(),
+                        shutdown_rx.clone(),
+                    );
+                    if let Some((listener, service)) = grpc_server {
+                        tokio::join!(http, crate::grpc::serve(listener, service, shutdown_rx));
+                    } else {
+                        http.await;
+                    }
+                })
             })
             .expect("spawn api runtime");
         threads.push(handle);
@@ -353,6 +374,71 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 mod tests {
     use super::*;
     use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::message::response::{BatchHeader, frame_decode_batch_cols};
+    use sglang_grpc_types::sglang::runtime::v1 as proto;
+    use sglang_grpc_types::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
+
+    fn free_loopback_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
+        // Hold both probes at once so the OS cannot return the same ephemeral
+        // port twice. Release them together immediately before runtime startup.
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addrs = (first.local_addr().unwrap(), second.local_addr().unwrap());
+        drop((first, second));
+        addrs
+    }
+
+    fn test_config(
+        http_addr: std::net::SocketAddr,
+        grpc_addr: Option<std::net::SocketAddr>,
+    ) -> RuntimeConfig {
+        RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr,
+                grpc_addr,
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(test_server_args()),
+        }
+    }
+
+    async fn connect_grpc(
+        addr: std::net::SocketAddr,
+    ) -> SglangServiceClient<tonic::transport::Channel> {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect_timeout(std::time::Duration::from_secs(2));
+        SglangServiceClient::new(endpoint.connect().await.expect("connect gRPC client"))
+    }
+
+    fn scheduler_rid(header: &[u8]) -> String {
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(header)).unwrap();
+        value
+            .as_array()
+            .and_then(|fields| fields.get(1))
+            .and_then(rmpv::Value::as_str)
+            .expect("TokenizedGenerateReqInput rid")
+            .to_owned()
+    }
+
+    fn terminal_token_frame(rid: String, output_ids: &[i64]) -> bytes::Bytes {
+        let header = BatchHeader {
+            rids: vec![rid],
+            finish_reasons: vec![Some(
+                serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap(),
+            )],
+            prompt_tokens: vec![3],
+            tok_lens: vec![output_ids.len() as u32],
+            ..Default::default()
+        };
+        let header = rmp_serde::to_vec(&header).unwrap();
+        let data = output_ids
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        frame_decode_batch_cols(&header, &[&data])
+    }
 
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
     /// `Default`), unified role.
@@ -530,5 +616,178 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("bind"), "error should mention bind: {err}");
+    }
+
+    /// A configured gRPC bind is part of startup, not a best-effort side task:
+    /// failure returns synchronously and releases the HTTP listener acquired
+    /// immediately before it.
+    #[test]
+    fn grpc_port_conflict_fails_startup_without_leaking_http_listener() {
+        let grpc_hog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let grpc_addr = grpc_hog.local_addr().unwrap();
+        // Choose HTTP while the gRPC port remains occupied, guaranteeing that
+        // the two addresses differ.
+        let http_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_probe.local_addr().unwrap();
+        drop(http_probe);
+
+        let error = match start(test_config(http_addr, Some(grpc_addr))) {
+            Ok(_) => panic!("gRPC bind conflict must fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.contains("gRPC listener"), "unexpected error: {error}");
+        assert!(error.contains(&grpc_addr.to_string()));
+
+        let rebound = std::net::TcpListener::bind(http_addr)
+            .expect("failed startup must release its pre-bound HTTP listener");
+        drop(rebound);
+    }
+
+    /// End to end over the configured socket: the generated runtime.v1 client
+    /// reaches the existing scheduler ring, and an existing scheduler frame is
+    /// translated back into a protobuf response. Shutdown then closes both
+    /// transport listeners.
+    #[test]
+    fn configured_grpc_serves_generation_and_closes_with_http() {
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        assert!(std::net::TcpStream::connect(http_addr).is_ok());
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.generate(proto::GenerateRequest {
+                    input_ids: vec![1, 2, 3],
+                    stream: Some(true),
+                    rid: Some("network-generation".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("timed out starting Generate RPC")
+            .expect("Generate RPC")
+            .into_inner()
+        });
+
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "gRPC request did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        let input = requests[0]
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "input_ids")
+            .expect("input token buffer");
+        assert_eq!(input.shape, vec![3]);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+
+        let response = client_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), stream.message()).await
+            })
+            .expect("timed out waiting for gRPC response")
+            .expect("gRPC stream error")
+            .expect("gRPC stream ended without a response");
+        assert_eq!(response.output_ids, vec![9, 10]);
+        assert!(response.finished);
+        assert_eq!(response.meta_info["id"], r#""network-generation""#);
+
+        rt.request_shutdown();
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// The existing runtime.v1 listener accepts bodies above Tonic's 4 MiB
+    /// default. Keep that transport policy when mounting the same protocol on
+    /// the Rust frontend; reaching adapter validation proves the body decoded.
+    #[test]
+    fn grpc_listener_preserves_existing_large_message_limit() {
+        use tonic::Code;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = client_runtime.block_on(async {
+            let client = connect_grpc(grpc_addr).await;
+            let mut client = client.max_encoding_message_size(64 * 1024 * 1024);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.generate(proto::GenerateRequest {
+                    input_ids: vec![1],
+                    // This field is intentionally unsupported. An
+                    // UNIMPLEMENTED status proves the >4 MiB protobuf reached
+                    // the adapter instead of Tonic rejecting it on size.
+                    routing_key: Some("x".repeat(5 * 1024 * 1024)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("timed out sending large Generate RPC")
+            .expect_err("unsupported routing_key must fail")
+        });
+        assert_eq!(error.code(), Code::Unimplemented);
+
+        rt.request_shutdown();
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// Tonic's unbounded graceful-drain API waits for open HTTP/2 connections.
+    /// Keep a generated response stream live to ensure the frontend's shared
+    /// shutdown remains bounded and cancels it instead.
+    #[test]
+    fn grpc_shutdown_returns_promptly_with_in_flight_generation() {
+        use std::time::{Duration, Instant};
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        let client_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_client, _stream) = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.generate(proto::GenerateRequest {
+                    input_ids: vec![1, 2, 3],
+                    stream: Some(true),
+                    rid: Some("in-flight".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("timed out starting Generate RPC")
+            .expect("Generate RPC")
+            .into_inner();
+            (client, stream)
+        });
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(2)));
+
+        let started = Instant::now();
+        rt.request_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown waited for an open gRPC stream: {:?}",
+            started.elapsed()
+        );
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
     }
 }

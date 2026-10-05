@@ -86,6 +86,7 @@ pub fn build_resolver(
                 store.spawn_sweeper(Duration::from_secs(affinity.session_eviction_interval_secs));
             let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load());
             policy.admission = admission;
+            policy.config = affinity;
             Arc::new(policy)
         }
         PolicyKind::CacheAware => {
