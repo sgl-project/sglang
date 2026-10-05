@@ -8,8 +8,11 @@ reference built from plain tensor indexing. The sink row, which several masked
 tokens may write in any order, is excluded.
 """
 
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -207,6 +210,105 @@ class TestRequestWindowCopy(CustomTestCase):
                 graph.replay()
                 torch.cuda.synchronize()
                 self._check(window, 0, expected)
+
+
+def window_with_history():
+    window = RequestWindow(
+        _pool_factory(KVLayout.V4, 16),
+        num_slots=NUM_SLOTS,
+        layers=LAYERS,
+        page_size=16,
+        capacity=CAPACITY,
+        workspace_rows=1024,
+    )
+    layout = window_layout(
+        torch.tensor([0, 1, 1], device="cuda"),
+        torch.tensor([20, 7, 8], device="cuda"),
+        window=WINDOW,
+        capacity=window.capacity,
+        num_groups=2,
+    )
+    window.activate(layout)
+    window.initialize_dummy_history()
+    return window, layout
+
+
+def drop_history_row(window, layout, layer):
+    """Untag one history row the layout gathers for ``layer``."""
+    valid = layout.history_valid.nonzero().flatten()
+    row = (layout.history_req * window.capacity + layout.history_pos % window.capacity)[
+        valid[0]
+    ]
+    window.tags[layer, row] = -1
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestRequestWindowHistoryCheck(CustomTestCase):
+    """The eager history check runs once per forward and covers every layer."""
+
+    def _commit_checks(self, window, layers):
+        """Commit ``layers`` and return the condition of each history assert."""
+        with mock.patch.object(torch, "_assert_async") as assert_async:
+            for layer in layers:
+                window.commit(layer)
+        calls = assert_async.call_args_list
+        for call in calls:
+            self.assertIn("SWA history is missing", call.args[1])
+        return [bool(call.args[0]) for call in calls]
+
+    def test_valid_history_is_checked_once_for_all_layers(self):
+        window, _ = window_with_history()
+        self.assertEqual(self._commit_checks(window, range(LAYERS)), [True])
+
+    def test_check_does_not_wait_for_the_gpu(self):
+        window, _ = window_with_history()
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for layer in range(LAYERS):
+                window.commit(layer)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        torch.cuda.synchronize()
+
+    def test_first_commit_checks_every_layer(self):
+        window, layout = window_with_history()
+        drop_history_row(window, layout, LAYERS - 1)
+        self.assertEqual(self._commit_checks(window, [0]), [False])
+
+    def test_checks_again_after_a_new_layout(self):
+        window, layout = window_with_history()
+        self.assertEqual(self._commit_checks(window, [0]), [True])
+        window.activate(
+            window_layout(
+                layout.req.clone(),
+                layout.pos + 1,
+                window=WINDOW,
+                capacity=window.capacity,
+                num_groups=2,
+            )
+        )
+        window.tags[1].fill_(-1)
+        self.assertEqual(self._commit_checks(window, [0]), [False])
+
+    def test_missing_history_fails_on_the_device(self):
+        # A failed device assert leaves the CUDA context unusable, so it runs in
+        # a child process.
+        child = (
+            "import importlib.util, torch\n"
+            f"spec = importlib.util.spec_from_file_location('t', {__file__!r})\n"
+            "t = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(t)\n"
+            "window, layout = t.window_with_history()\n"
+            "t.drop_history_row(window, layout, t.LAYERS - 1)\n"
+            "window.commit(0)\n"
+            "torch.cuda.synchronize()\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", child], capture_output=True, text=True, timeout=300
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("device-side assert", result.stderr)
 
 
 if __name__ == "__main__":

@@ -161,6 +161,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self.history_checked = False
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -175,12 +176,14 @@ class RequestWindow:
         )
         self.tags[:, loc.flatten()] = -1
         self.prepared = None
+        self.history_checked = False
 
     def activate(self, layout):
         if self.layout is layout:
             return
         self.layout = layout
         self.prepared = None
+        self.history_checked = False
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -198,6 +201,7 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
+        self.history_checked = False
 
     def _history_src(self, layout):
         return torch.where(
@@ -215,15 +219,21 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            if not in_capture:
-                src = self._history_src(layout)
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
-                ):
-                    raise RuntimeError(
-                        "SWA history is missing: replay or window ownership is invalid"
-                    )
+            if in_capture:
+                self.history_checked = False
+            elif not self.history_checked:
+                # A layer's tags change only in its own commit, so checking every
+                # layer at the layout's first gather equals checking each layer
+                # before its own. The assert runs on the GPU without a host sync; a
+                # failure surfaces at the next synchronizing call and leaves the
+                # CUDA context unusable.
+                tags = self.tags[:, self._history_src(layout)]
+                ok = (tags == layout.history_pos) | ~layout.history_valid
+                torch._assert_async(
+                    ok.all(),
+                    "SWA history is missing: replay or window ownership is invalid",
+                )
+                self.history_checked = True
             gather_window_history(
                 self.state.kv_buffer[layer],
                 self.workspace.kv_buffer[0],
