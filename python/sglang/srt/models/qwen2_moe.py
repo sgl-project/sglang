@@ -49,9 +49,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -62,10 +62,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    reduce_moe_output,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
@@ -73,6 +70,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    sum_post_experts_output,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -107,7 +105,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
-    make_layers,
+    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -266,8 +264,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
         enable_cuda_shared_expert_fusion: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
+        # False when a stage boundary completes this output's sum.
+        self.reduce_results = reduce_results
         self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -394,8 +395,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
         ):
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -873,7 +872,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=num_tokens,
-                reduce=reduce_moe_output,
+                reduce=sum_post_experts_output,
             )
 
         if shared_output is not None:
@@ -886,7 +885,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
+        if self.reduce_results:
+            final_hidden_states = reduce_moe_output(final_hidden_states)
 
         # Debug removed - was causing issues during CUDA graph capture
 
@@ -1025,12 +1025,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         # Qwen2MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
         if self.is_layer_sparse:
@@ -1040,6 +1036,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -1048,12 +1045,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -1062,12 +1060,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1096,9 +1088,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -1116,8 +1107,6 @@ class Qwen2MoeModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
-
-        self.moe_dp_size = get_parallel().moe_dp_size
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1137,7 +1126,7 @@ class Qwen2MoeModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -1147,8 +1136,6 @@ class Qwen2MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

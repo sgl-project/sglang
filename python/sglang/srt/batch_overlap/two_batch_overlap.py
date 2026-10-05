@@ -19,7 +19,6 @@ from sglang.srt.layers.layer_boundary import (
     tbo_split_moves,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -698,6 +697,7 @@ class TboForwardBatchPreparer:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
                 start_token_index:end_token_index
             ]
+        output_dict["out_cache_loc_is_physical"] = batch.out_cache_loc_is_physical
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
@@ -1100,18 +1100,15 @@ def _model_forward_filter_inputs(
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
     stream_a, stream_b = output_a["residual"], output_b["residual"]
-    has_stream = isinstance(stream_a, ResidualStream)
-    assert has_stream == isinstance(stream_b, ResidualStream)
+    pending_a, pending_b = stream_a.pending, stream_b.pending
+    assert (pending_a is None) == (pending_b is None)
     update = None
-    if has_stream:
-        pending_a, pending_b = stream_a.pending, stream_b.pending
-        assert (pending_a is None) == (pending_b is None)
-        if pending_a is not None:
-            assert pending_a.update is pending_b.update
-            update = pending_a.update
+    if pending_a is not None:
+        assert pending_a.update is pending_b.update
+        update = pending_a.update
     for output in (output_a, output_b):
-        output["hidden_states"], output["residual"] = export_output(
-            output["hidden_states"], output["residual"], output["forward_batch"]
+        output["hidden_states"], output["residual"] = output["residual"].export(
+            output["hidden_states"]
         )
 
     def _handle_key(name):
@@ -1132,11 +1129,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
         return res
 
     hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
-    return (
-        ResidualStream.from_handoff(hidden, residual, update)
-        if has_stream
-        else (hidden, residual)
-    )
+    return ResidualStream.from_handoff(hidden, residual, update)
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------
