@@ -1,4 +1,8 @@
-"""Rotate Q while writing the padded buffer consumed by sparse attention."""
+"""Rotate BF16 Q and write FP8 directly for TRT-LLM sparse attention.
+
+The BF16-output path lives in fused_q_norm_rope. This specialization preserves
+its BF16 RoPE rounding before conversion while avoiding a separate FP8 copy.
+"""
 
 import torch
 import triton
@@ -9,7 +13,7 @@ from sglang.srt.utils import is_hip
 
 
 @triton.jit
-def _q_rope_store(
+def _q_rope_fp8_store(
     X,
     Y,
     F,
@@ -19,13 +23,14 @@ def _q_rope_store(
     IS_HIP: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
-    row, head = tl.program_id(0), tl.program_id(1)
+    row, head = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    # 128 heads reach 2**31 elements at row 32768, before the 64K ceiling.
     r = tl.arange(0, 512)
     if USE_GDC:
         tl.extra.cuda.gdc_wait()  # X is the wq_b GEMM output; POS may be in-graph
     value = tl.load(X + row * SX + head * 512 + r).to(tl.float32)
     partner = tl.gather(value, r ^ 1, 0)
-    position = tl.load(POS + row)
+    position = tl.load(POS + row).to(tl.int64)
     cos = tl.load(F + position * 64 + (r - 448) // 2 * 2, r >= 448, 0)
     sin = tl.load(F + position * 64 + (r - 448) // 2 * 2 + 1, r >= 448, 0)
     # Match the operation order of deepseek_rope_kernel before BF16 rounding.
@@ -38,15 +43,14 @@ def _q_rope_store(
     rotated = tl.where((r & 1) == 0, even, odd)
     result = tl.where(r >= 448, rotated, value)
     # Preserve the unfused RoPE -> BF16 -> FP8 rounding, including ties.
-    if Y.dtype.element_ty == tl.float8e4nv:
-        result = result.to(tl.bfloat16).to(tl.float32)
+    result = result.to(tl.bfloat16).to(tl.float32)
     tl.store(Y + row * SY + head * 512 + r, result)
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
-def _q_rope_store_prefill(
+def _q_rope_fp8_store_prefill(
     X,
     Y,
     F,
@@ -81,8 +85,7 @@ def _q_rope_store_prefill(
     rotated = tl.where((r[None, :] & 1) == 0, even, odd)
     y_offset = row[:, None].to(tl.int64) * SY + head[:, None] * 512 + r[None, :]
     result = tl.where(r[None, :] >= 448, rotated, value)
-    if Y.dtype.element_ty == tl.float8e4nv:
-        result = result.to(tl.bfloat16).to(tl.float32)
+    result = result.to(tl.bfloat16).to(tl.float32)
     tl.store(
         Y + y_offset,
         result,
@@ -90,7 +93,7 @@ def _q_rope_store_prefill(
     )
 
 
-def q_rope_store(
+def q_rope_fp8_store(
     q: torch.Tensor,
     output: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -99,14 +102,14 @@ def q_rope_store(
     """Apply 64-wide forward RoPE to 512-wide heads without changing Q padding."""
     assert q.shape == output.shape and q.ndim == 3 and q.shape[2] == 512
     assert q.dtype == torch.bfloat16
-    assert output.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    assert output.dtype == torch.float8_e4m3fn
     assert q.stride(2) == output.stride(2) == 1
     assert q.stride(1) == output.stride(1) == 512
     assert freqs_cis.dtype == torch.complex64 and freqs_cis.is_contiguous()
     assert freqs_cis.shape[1] == 32 and positions.shape == (q.shape[0],)
     assert positions.dtype in (torch.int32, torch.int64) and positions.is_contiguous()
     if q.shape[0] >= 4096 and q.shape[1] == 16:
-        _q_rope_store_prefill[(triton.cdiv(q.shape[0] * q.shape[1], 4),)](
+        _q_rope_fp8_store_prefill[(triton.cdiv(q.shape[0] * q.shape[1], 4),)](
             q,
             output,
             torch.view_as_real(freqs_cis),
@@ -121,7 +124,7 @@ def q_rope_store(
         )
         return
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    _q_rope_store[(q.shape[0], q.shape[1])](
+    _q_rope_fp8_store[(q.shape[0], q.shape[1])](
         q,
         output,
         torch.view_as_real(freqs_cis),

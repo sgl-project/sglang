@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
+from sglang.kernels.ops.attention.dsv4.q_rope_fp8_store import q_rope_fp8_store
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -193,7 +193,7 @@ class DSparkAttention(MqaAttentionBase):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
-                q_rope_store(q, q_out, self.freqs_cis, positions)
+                q_rope_fp8_store(q, q_out, self.freqs_cis, positions)
                 return q_out
             if self._use_fast_kernel and not _is_npu:
                 fused_rope_inplace(

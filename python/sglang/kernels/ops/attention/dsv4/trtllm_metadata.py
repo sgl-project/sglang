@@ -38,12 +38,19 @@ def pack_sparse_tail(
 
     The caller owns the tile-padded buffers and their invariant SWA columns.
     Only active rows are modified, preserving inert graph/tile padding.
+
+    Compressed entries start at column swa_width even for short sequences.
+    total_lengths describes the table span to scan, not the valid-token count:
+    adding only the actual SWA length would truncate the compressed tail.
+    Unused SWA slots retain their -1 sentinel and are ignored by attention.
     """
     rows, width = indices.shape
     assert table.shape == (rows, swa_width + width)
     assert lengths.shape == total_lengths.shape == (rows,)
     assert indices.stride(1) == table.stride(1) == 1
     assert indices.dtype == table.dtype == total_lengths.dtype == torch.int32
+    assert lengths.dtype in (torch.int32, torch.int64)
+    assert indices.device == lengths.device == table.device == total_lengths.device
     if rows == 0:
         return
     _pack_sparse_tail[(rows,)](
