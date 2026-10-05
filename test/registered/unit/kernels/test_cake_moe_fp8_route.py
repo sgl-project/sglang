@@ -617,13 +617,15 @@ def policy_env(api, monkeypatch):
         yield api
 
 
-def _policy(default, weights=None, *, activation="silu"):
+def _policy(default, weights=None, *, activation="silu", assignments=2048, experts=256):
     return dg._cake_contiguous_layout_alignment(
         default,
         quant_info=_quant_info(weights or _weights()),
         runner_config=SimpleNamespace(activation=activation),
         hidden_size=K,
         device=torch.device("cuda", 0),
+        num_assignments=assignments,
+        num_experts=experts,
     )
 
 
@@ -633,6 +635,28 @@ def test_alignment_policy_picks_128_for_admitted_layers(policy_env, caplog):
         assert _policy(224) == 128
     assert any("alignment 128" in rec.getMessage() for rec in caplog.records)
     assert _policy(128) == 128
+
+
+def test_alignment_policy_bands_by_assignments(policy_env):
+    """Qwen3.5-35B top-8 over 256 experts: bs 1 (8 assignments, 1024 padded
+    rows) and bs 32 (256 assignments, every expert populated on average) take
+    the 128-row layout; bs 8 (64 assignments, 8192 padded rows) keeps DeepGEMM's
+    alignment, where the padding rows cost more than the fast schedule gains."""
+    assert _policy(32, assignments=8, experts=256) == 128
+    assert _policy(32, assignments=16, experts=256) == 128  # 2048 rows: the band edge
+    assert _policy(32, assignments=17, experts=256) == 32
+    assert _policy(32, assignments=64, experts=256) == 32
+    assert _policy(64, assignments=255, experts=256) == 64
+    assert _policy(32, assignments=256, experts=256) == 128
+    assert _policy(64, assignments=8192, experts=256) == 128
+    # Prefill-sized assignments over a few local experts (EP) are always dense.
+    assert _policy(32, assignments=4096, experts=4) == 128
+    assert _policy(32, assignments=0, experts=256) == 128
+    # The override wins over the band.
+    with mock.patch.dict(os.environ, {dg._CAKE_LAYOUT_ALIGNMENT_ENV: "128"}):
+        assert _policy(32, assignments=64, experts=256) == 128
+    with mock.patch.dict(os.environ, {dg._CAKE_LAYOUT_ALIGNMENT_ENV: "deepgemm"}):
+        assert _policy(32, assignments=256, experts=256) == 32
 
 
 def test_alignment_policy_keeps_deepgemm_choice_when_route_cannot_run(policy_env):
@@ -672,6 +696,8 @@ def test_alignment_policy_ignores_non_cuda_devices(policy_env):
             runner_config=SimpleNamespace(activation="silu"),
             hidden_size=K,
             device=torch.device("cpu"),
+            num_assignments=4096,
+            num_experts=4,
         )
         == 32
     )

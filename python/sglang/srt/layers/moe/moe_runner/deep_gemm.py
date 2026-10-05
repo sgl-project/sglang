@@ -234,6 +234,29 @@ def _cake_layout_alignment_override() -> Optional[Any]:
     return value
 
 
+# Widening the compact layout to 128-row expert runs multiplies the ``-1`` rows
+# every per-row kernel of the MoE layer sweeps (scatter, SiLU, quant,
+# post-permute) by 128 / DeepGEMM's alignment.  Measured on GB200 TP1
+# Qwen3.5-35B-A3B-FP8 (bench_one_batch, 256 experts, top-8): bs 1 (8
+# assignments, 1024 rows at 128) and bs 32 (256 assignments) are faster at 128
+# than on DeepGEMM's layout, bs 8 (64 assignments, 8192 rows at 128 vs 2048)
+# is 7 % slower at 128 and 2.5 % slower on DeepGEMM's own alignment.  The
+# policy therefore keeps 128 when the padded layout stays small in absolute
+# terms or when the assignments populate every expert on average, and leaves
+# the sparse middle band on DeepGEMM's alignment.
+_CAKE_FAST_ALIGNMENT_MAX_ROWS = 2048
+
+
+def _cake_fast_alignment_pays(num_assignments: int, num_experts: int) -> bool:
+    """Whether the 128-row layout is expected to beat DeepGEMM's alignment for
+    ``num_assignments`` token-expert assignments over ``num_experts`` local
+    experts (see :data:`_CAKE_FAST_ALIGNMENT_MAX_ROWS`)."""
+    if num_assignments <= 0:
+        return True
+    rows = _get_compact_all_tokens(num_assignments, num_experts, _CAKE_LAYOUT_ALIGNMENT)
+    return rows <= _CAKE_FAST_ALIGNMENT_MAX_ROWS or num_assignments >= num_experts
+
+
 def _cake_contiguous_layout_alignment(
     default: int,
     *,
@@ -241,21 +264,32 @@ def _cake_contiguous_layout_alignment(
     runner_config: MoeRunnerConfig,
     hidden_size: int,
     device: torch.device,
+    num_assignments: int,
+    num_experts: int,
 ) -> int:
     """Row alignment for the compact contiguous layout.
 
     ``default`` is DeepGEMM's own choice (``get_contiguous_layout_alignment``).
     When the ``moe_fp8_grouped`` Cake route is enabled and will admit this
     layer on this device, the layout is built with :data:`_CAKE_LAYOUT_ALIGNMENT`
-    instead so the Cake GEMMs run their fast schedule.  The decision uses the
-    same static admission as the route (``_cake_weights_reject_reason`` plus the
-    adapter's device-level probe); the dynamic per-call admission can still
-    fall back to DeepGEMM, which then runs on the 128-aligned layout.
+    instead so the Cake GEMMs run their fast schedule, unless the batch falls in
+    the band where the extra padding rows cost more than the schedule gains
+    (:func:`_cake_fast_alignment_pays`).  The decision uses the same static
+    admission as the route (``_cake_weights_reject_reason`` plus the adapter's
+    device-level probe); the dynamic per-call admission can still fall back to
+    DeepGEMM, which then runs on the chosen layout.
     :data:`_CAKE_LAYOUT_ALIGNMENT_ENV` overrides the choice for admitted layers
     (``deepgemm`` or a multiple of 32).
     """
     override = _cake_layout_alignment_override()
-    target = _CAKE_LAYOUT_ALIGNMENT if override is None else override
+    if override is None:
+        target = (
+            _CAKE_LAYOUT_ALIGNMENT
+            if _cake_fast_alignment_pays(num_assignments, num_experts)
+            else default
+        )
+    else:
+        target = override
     if target == "deepgemm":
         target = default
     if default == target or not cake_route_enabled(_CAKE_ROUTE):
@@ -290,9 +324,10 @@ def _cake_contiguous_layout_alignment(
         )
         return default
     _cake_log_once(
-        "alignment",
+        f"alignment_{target}",
         f"Cake {_CAKE_ROUTE}: compact layout alignment {target} "
-        f"(DeepGEMM would pick {default}"
+        f"(DeepGEMM would pick {default}, {num_assignments} assignments over "
+        f"{num_experts} experts"
         f"{'' if override is None else f', {_CAKE_LAYOUT_ALIGNMENT_ENV}={override}'})",
     )
     return target
@@ -1788,6 +1823,8 @@ def pre_permute_standard_to_deep_gemm(
         runner_config=runner_config,
         hidden_size=hidden_states.size(1),
         device=hidden_states_device,
+        num_assignments=num_assignments,
+        num_experts=num_experts,
     )
     all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
