@@ -181,7 +181,8 @@ class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
 
 
 class TestUnifiedMemoryHiCacheSWASerialized(TestUnifiedMemoryHiCacheSWA):
-    """Per-node load-back binds each SWA row to the Full rows its own node loaded."""
+    """The prompt outruns the SWA window, so it is cached as several radix nodes;
+    a serialized reload must bind the last node's SWA rows to that node's Full rows."""
 
     extra_hicache_args = ["--hicache-serialize-load-back"]
 

@@ -5746,11 +5746,7 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def handle_subagent_keepalive(self, recv_req: SubagentKeepaliveReqInput):
-        """Refresh a parent session's prefix-cache LRU while its subagent runs.
-
-        Broadcast to every rank, so a rank that never served this session just
-        misses the lookup and returns.
-        """
+        """Refresh a parent session's prefix-cache LRU while its subagent runs."""
         self.tree_cache.bump_session_keepalive(recv_req.session_id)
         return None
 

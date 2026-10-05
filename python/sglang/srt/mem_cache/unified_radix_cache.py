@@ -3751,17 +3751,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._session_tail_node.popitem(last=False)
 
     def bump_session_keepalive(self, session_id: str) -> bool:
-        """Re-age a parent session's cached path while its subagent runs.
-
-        An agent that spawns a subagent resumes as soon as the subagent returns,
-        so its KV is idle-but-live for the whole subagent run and would
-        otherwise age out and be re-prefilled. Refreshing on every subagent
-        request keeps the parent as recently-used as its own child's traffic.
-
-        This is broadcast to every attention-DP rank, so a miss (unknown
-        session, or one whose path has since been reclaimed) is the normal case
-        and returns False without touching the tree.
-        """
+        """Re-age the session's last cached path; False on a miss."""
         if not self.allow_subagent_keepalive or not session_id:
             return False
         node_id = self._session_tail_node.get(session_id)
@@ -3780,14 +3770,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return False
 
     def _maybe_log_keepalive_rate(self) -> None:
-        """Periodically report how often keepalives find their parent.
-
-        A keepalive is broadcast to every attention-DP rank but only the rank
-        holding that session can act on it, so a low hit rate here is the
-        expected shape rather than a fault -- what it does tell you is whether
-        the feature is reaching any cached parent at all, which is otherwise
-        invisible.
-        """
+        """Log the cumulative keepalive hit rate every ``_KEEPALIVE_LOG_INTERVAL``."""
         total = self._keepalive_hits + self._keepalive_misses
         # Always log the first one: on a short run the interval alone can leave the
         # feature with no evidence that it ran at all.

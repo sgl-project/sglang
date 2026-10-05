@@ -2326,14 +2326,8 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
 
 
 class SubagentKeepaliveReqInput(BaseReq, kw_only=True):
-    """Refresh the prefix-cache LRU of a session that is blocked on a subagent.
-
-    Emitted by the tokenizer manager (``--allow-subagent-keepalive``) when a
-    request declares a ``parent_session_id``. It is a control request, so the
-    scheduler broadcasts it to every attention-DP rank: the parent's KV lives on
-    whichever rank served its last turn, which is not in general the rank the
-    subagent's own request was routed to.
-    """
+    """Keep a parent session's KV hot while its subagent runs;
+    sent to every attention-DP rank, since any of them may hold the parent's KV."""
 
     session_id: str
 

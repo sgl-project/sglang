@@ -1,37 +1,20 @@
 """End-to-end KV *content* checks for UnifiedRadixCache + HiCache, on CPU.
 
-Every other unit test in this directory asserts bookkeeping: which node is in
-which leaf set, what a lock_ref is, how many transfers were issued. None asserts
-what a served request actually depends on -- that the KV slots a match hands
-back hold the bytes that were cached under those token ids. A cache can keep
-every counter consistent, pass ``sanity_check``, and still serve one request
-another request's KV; that reaches the client as a plausible completion or an
-immediate stop token, never as an error, so there is nothing in a log to find.
+Runs the real stack -- ``UnifiedRadixCache``, ``HiCacheController``, the host
+pool, real D->H and H->D copies -- over fixed workloads and checks every matched
+prefix byte for byte. Each KV slot is stamped with its token id, so a mismatch
+names the position, the layer, and the token that should be there.
 
-This file runs the real stack -- ``UnifiedRadixCache``, ``HiCacheController``,
-the host pool, real D->H and H->D copies -- over fixed workloads, and checks
-every matched prefix byte for byte. Each KV slot is stamped with its token id,
-so a mismatch names the position, the layer, and the token that should be there.
+``deferred_dma`` holds each copy until the fixture releases it, which is what
+exposes an ack-before-copy bug. A conversation that only grows is one radix node
+with a single-step load-back; ``branching_corpus`` puts several evicted nodes on
+one root path, so a load-back spans more than one node.
 
-The two fixture knobs that decide what gets covered:
-
-* ``deferred_dma`` holds each copy until the fixture releases it, instead of
-  letting it land at submit time. It is what makes an ack-before-copy bug
-  visible: acking a write-back whose D->H has not run corrupts 150 prefixes in
-  this file's workload with it on, and none with it off.
-* the workload shape decides chain length. A conversation that only grows is one
-  radix node, and its load-back is a single step, so ``branching_corpus`` is
-  what puts several evicted nodes on one root path and makes
-  ``split_full_load_back_spec`` do anything.
-
-What is faked: accelerator streams and events, ``transfer_kv_direct`` (a CUDA op
-restated in torch as the indexed copy it is), the host-memory budget check, and
-``cudaHostRegister``. Admission, load-back, eviction, write-back, and the
-controller's queues, acks and layer counter are all the shipped code.
-
-Two things stay out of reach here: the unaligned page tail (the CPU fixture has
-no ``alloc_extend``, so sequences are page-aligned) and anything that needs two
-TP ranks.
+Faked: accelerator streams and events, ``transfer_kv_direct`` (restated in torch
+as the indexed copy it is), the host-memory budget check, and
+``cudaHostRegister``. Out of reach: the unaligned page tail (the fixture has no
+``alloc_extend``, so sequences are page-aligned) and anything needing two TP
+ranks.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
