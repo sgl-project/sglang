@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -171,7 +172,10 @@ class TestGatedResidualOps(CustomTestCase):
                 residual = _expand(self.hidden)
                 state.normed = _normalize(residual, 2)
                 expected = _combine(self.output * 4, (residual, state.normed))
-                batch = SimpleNamespace(residual_stream=ResidualStream(residual))
+                batch = SimpleNamespace(
+                    residual_stream=ResidualStream(residual),
+                    forward_mode=ForwardMode.DECODE,
+                )
                 with (
                     fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=4)),
                     layer_stack(),
