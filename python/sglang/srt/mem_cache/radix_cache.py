@@ -494,7 +494,7 @@ class RadixCache(BasePrefixCache):
         )
         return radix_key, kv_indices, result.prefix_len
 
-    def insert_req(self, req: Req, *, up_to: int):
+    def checkpoint(self, req: Req, *, up_to: int):
         if self.disable:
             return
         token_ids = req.full_untruncated_fill_ids[:up_to]
@@ -524,7 +524,7 @@ class RadixCache(BasePrefixCache):
 
         # With page_size > 1 the partial page sits in req.prefix_indices but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
-        # insert_req or release_kv_cache frees the rest.
+        # checkpoint or release_kv_cache frees the rest.
         req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)

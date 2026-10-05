@@ -19,7 +19,6 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_ltx25_decoder_rope,
     fused_ltx25_decoder_rope,
     tensors_equal,
 )
@@ -32,7 +31,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -326,7 +328,9 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
         verified = _LTX25_DECODER_ROPE.verified
         if (
             not _LTX25_DECODER_ROPE.disabled
-            and can_use_ltx25_decoder_rope(query, key, tables, self.rope_dim_split)
+            and _is_cuda
+            and query.is_cuda
+            and query.dtype is torch.bfloat16
             and (verified or _LTX25_DECODER_ROPE.can_attempt_once())
         ):
             dim_t, dim_h, _ = self.rope_dim_split
