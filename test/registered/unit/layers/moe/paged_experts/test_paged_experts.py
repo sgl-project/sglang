@@ -2,19 +2,23 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod
 from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, UnquantizedFormat
+from sglang.srt.layers.moe.paged_experts.method import (
+    _cap_decode_capture_batch_sizes,
+    check_paged_experts_compat,
+)
 from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
     plan_waves,
 )
-from sglang.srt.layers.moe.paged_experts.runners import RunnerContract
+from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, TritonContract
 from sglang.srt.layers.moe.paged_experts.sizing import (
     _checkpoint_bytes,
     num_resident_for_budget,
@@ -31,25 +35,37 @@ E, K, H, TOP_K = 16, 4, 8, 2
 class _TopK(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+    router_logits: Optional[torch.Tensor] = None
 
 
 class _Dispatch(NamedTuple):
     hidden_states: torch.Tensor
     topk_output: _TopK
+    hidden_states_scale: Optional[torch.Tensor] = None
+    hidden_states_pre_quant: Optional[tuple] = None
 
 
 class _LinearMoE:
     """Stand-in for the fused-MoE method in no-combine mode: the [tokens, top_k, hidden]
-    entries w[t,j] * x[t] @ w13[id] @ w2[id], left for the caller to sum."""
+    entries w[t,j] * x[t] @ w13[id] @ w2[id], left for the caller to sum; expert id -1 gives
+    zero entries."""
+
+    runner = SimpleNamespace(config=SimpleNamespace(num_experts=E, num_local_experts=K))
+
+    def __init__(self):
+        self.rows = 0
 
     def apply(self, layer, dispatch_output):
         topk = dispatch_output.topk_output
         ids, w = topk.topk_ids.long(), topk.topk_weights
+        valid = ids >= 0
+        self.rows += int(valid.sum())
+        ids = ids.clamp(min=0)
         y = torch.einsum(
             "th,tjhi->tji", dispatch_output.hidden_states, layer.w13_weight[ids]
         )
         y = torch.einsum("tji,tjio->tjo", y, layer.w2_weight[ids])
-        return SimpleNamespace(hidden_states=w.unsqueeze(-1) * y)
+        return SimpleNamespace(hidden_states=(w * valid).unsqueeze(-1) * y)
 
     def process_weights_after_loading(self, layer):
         pass
@@ -60,13 +76,19 @@ class _CpuStore(HostExpertStore):
         return torch.empty(shape, dtype=dtype)
 
 
-class _CpuContract(RunnerContract):
-    def _sum_top_k(self, entries, out, routed_scaling_factor):
-        out.copy_(entries.sum(1) * routed_scaling_factor)
+def _sum_top_k(self, entries, out, routed_scaling_factor):
+    out.copy_(entries.sum(1) * routed_scaling_factor)
 
 
-class _CpuUnquantizedFormat(UnquantizedFormat):
-    contract = _CpuContract()
+class _CompactingContract(RunnerContract):
+    _sum_top_k = _sum_top_k
+
+
+class _SkippingContract(TritonContract):
+    _sum_top_k = _sum_top_k
+
+
+CONTRACTS = (_CompactingContract(), _SkippingContract())
 
 
 def _reference(full, dispatch_output):
@@ -80,7 +102,7 @@ def _step(num_tokens):
     return _Dispatch(x, _TopK(ids, weights))
 
 
-def _paged_layer():
+def _paged_layer(contract=CONTRACTS[0]):
     """A paged method over random experts, loaded into a CPU store."""
     full = {
         "w13_weight": torch.randn(E, H, H, dtype=torch.float32),
@@ -92,9 +114,11 @@ def _paged_layer():
             for name, t in full.items()
         }
     )
+    expert_format = UnquantizedFormat()
+    expert_format.contract = contract
     method = PagedExpertsMoEMethod(
         base_method=_LinearMoE(),
-        expert_format=_CpuUnquantizedFormat(),
+        expert_format=expert_format,
         num_experts=E,
         num_resident=K,
     )
@@ -109,27 +133,41 @@ def _paged_layer():
 
 class TestPagedForward(CustomTestCase):
     def test_matches_unpaged(self):
-        for num_tokens in (1, 2, 64):  # one wave, one wave, several waves
-            with self.subTest(num_tokens=num_tokens):
-                torch.manual_seed(0)
-                method, layer, full = _paged_layer()
-                for _ in range(8):  # consecutive steps reuse and evict residents
-                    d = _step(num_tokens)
-                    out = method.apply(layer=layer, dispatch_output=d).hidden_states
-                    torch.testing.assert_close(out, _reference(full, d))
+        for contract in CONTRACTS:
+            for num_tokens in (1, 2, 64):  # one wave, one wave, several waves
+                with self.subTest(
+                    contract=type(contract).__name__, num_tokens=num_tokens
+                ):
+                    torch.manual_seed(0)
+                    method, layer, full = _paged_layer(contract)
+                    for _ in range(8):  # consecutive steps reuse and evict residents
+                        d = _step(num_tokens)
+                        out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                        torch.testing.assert_close(out, _reference(full, d))
+
+    def test_waves_compute_only_their_entries(self):
+        torch.manual_seed(0)
+        method, layer, _ = _paged_layer(CONTRACTS[0])
+        d = _step(64)
+        method.apply(layer=layer, dispatch_output=d)
+        # Each entry once, plus the padding to a bucketed size; without compaction every wave
+        # would compute all of them (here 4 waves).
+        self.assertLess(method.base_method.rows, 2 * d.topk_output.topk_ids.numel())
 
     def test_padded_ids_are_masked(self):
-        torch.manual_seed(0)
-        method, layer, full = _paged_layer()
-        d = _step(3)
-        ids = d.topk_output.topk_ids.clone()
-        ids[1] = -1
-        d = d._replace(topk_output=d.topk_output._replace(topk_ids=ids))
-        out = method.apply(layer=layer, dispatch_output=d).hidden_states
-        weights = d.topk_output.topk_weights.clone()
-        weights[1] = 0
-        masked = d._replace(topk_output=_TopK(ids.clamp(min=0), weights))
-        torch.testing.assert_close(out, _reference(full, masked))
+        for contract in CONTRACTS:
+            with self.subTest(contract=type(contract).__name__):
+                torch.manual_seed(0)
+                method, layer, full = _paged_layer(contract)
+                d = _step(3)
+                ids = d.topk_output.topk_ids.clone()
+                ids[1] = -1
+                d = d._replace(topk_output=d.topk_output._replace(topk_ids=ids))
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                weights = d.topk_output.topk_weights.clone()
+                weights[1] = 0
+                masked = d._replace(topk_output=_TopK(ids.clamp(min=0), weights))
+                torch.testing.assert_close(out, _reference(full, masked))
 
     def test_slots_hold_the_resident_experts(self):
         torch.manual_seed(0)
@@ -227,6 +265,7 @@ class TestLoading(CustomTestCase):
         class _RepackFormat(ExpertFormat):
             checkpoint_params = ("raw_weight",)
             paged_params = ("packed_weight",)
+            repacks_after_loading = True
 
             @classmethod
             def supports(cls, base_method):
@@ -273,6 +312,13 @@ class TestResidency(CustomTestCase):
     def test_resident_wave_loads_nothing(self):
         self.assertEqual(LRUPolicy(4).place([3, 1]).loads, [])
 
+    def test_waves_serve_residents_before_evicting_them(self):
+        policy = LRUPolicy(2)
+        policy.place([2, 3])  # residents {2, 3}
+        waves = plan_waves(policy=policy, distinct=[0, 1, 2, 3])
+        self.assertEqual([w.experts for w in waves], [[2, 3], [0, 1]])
+        self.assertEqual(sum(len(w.loads) for w in waves), 2)
+
     def test_waves_cover_every_expert_once(self):
         for distinct, sizes in (([], [0]), ([2, 9], [2]), (list(range(10)), [4, 4, 2])):
             with self.subTest(distinct=distinct):
@@ -302,6 +348,53 @@ class TestResidency(CustomTestCase):
         self.assertEqual(state.slot_lastuse.tolist(), [10, 12, 11, 9])
         self.assertEqual(int(state.step), 12)
         self.assertEqual(state.expert_slot[[9, 11, 7, 5, 2]].tolist(), [0, 1, 2, 3, -1])
+
+
+class TestDecodeCaptureCap(CustomTestCase):
+    def _capped(self, bs, max_bs):
+        decode = SimpleNamespace(bs=list(bs), max_bs=max(bs))
+        exec_ctx = SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=decode))
+        )
+        with patch(
+            "sglang.srt.layers.moe.paged_experts.method.get_exec", return_value=exec_ctx
+        ):
+            _cap_decode_capture_batch_sizes(max_bs)
+        return decode.bs, decode.max_bs
+
+    def test_only_shrinks_the_configured_sizes(self):
+        self.assertEqual(self._capped([1, 2, 4], 16), ([1, 2, 4], 4))
+        self.assertEqual(self._capped([1, 2, 4, 8], 3), ([1, 2, 3], 3))
+
+
+class TestCompat(CustomTestCase):
+    def test_rejects_speculative_decoding(self):
+        method = "sglang.srt.layers.moe.paged_experts.method."
+        moe = SimpleNamespace(
+            enable_eplb=False,
+            paged_experts_num_resident=None,
+            enable_fused_moe_sum_all_reduce=False,
+        )
+        layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
+        with (
+            patch(
+                method + "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_size=1, ep_size=1, pp_size=1, dp_size=1
+                ),
+            ),
+            patch(method + "get_exec", return_value=SimpleNamespace(moe=moe)),
+            patch(
+                method + "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="EAGLE"),
+            ),
+            patch(
+                method + "get_model", return_value=SimpleNamespace(load_format="auto")
+            ),
+            patch(method + "check_cuda_graph_backend", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
+                check_paged_experts_compat(layer=layer, expert_format=object())
 
 
 class TestSizing(CustomTestCase):
@@ -337,9 +430,50 @@ class TestSizing(CustomTestCase):
                 os.path.join(folder, "model.safetensors"),
             )
             self.assertEqual(
-                _checkpoint_bytes(model_path=folder, revision=None, num_layers=1),
+                _checkpoint_bytes(
+                    files=[os.path.join(folder, "model.safetensors")], num_layers=1
+                ),
                 (128, 14),
             )
+
+    def test_loader_resolves_the_checkpoint_before_building_the_model(self):
+        from sglang.srt.layers.moe.paged_experts import sizing
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        loader = DefaultModelLoader.__new__(DefaultModelLoader)
+        model_config = SimpleNamespace(
+            model_path="org/model", revision=None, hf_config=None
+        )
+        model_class = type("Model", (), {"fall_back_to_pt_during_load": False})
+        prepared = ("/cache/org/model", ["/cache/org/model/a.safetensors"], True)
+        loader_module = "sglang.srt.model_loader.loader."
+        with (
+            patch.object(sizing, "needs_checkpoint", return_value=True),
+            patch.object(sizing, "_checkpoint_files", ()),
+            patch(
+                loader_module + "get_model_architecture",
+                return_value=(model_class, "Model"),
+            ),
+            patch(
+                loader_module + "maybe_add_mtp_safetensors", side_effect=lambda f, *_: f
+            ),
+            patch.object(
+                DefaultModelLoader,
+                "_prepare_weights",
+                return_value=prepared,
+                create=True,
+            ) as prepare,
+        ):
+            resolved = loader._resolve_before_init(model_config)
+            self.assertEqual(
+                sizing._checkpoint_files, ("/cache/org/model/a.safetensors",)
+            )
+        prepare.assert_called_once_with("org/model", None, False, None)
+        # The load after the model is built reuses it instead of preparing again.
+        self.assertEqual(
+            resolved.source,
+            DefaultModelLoader.Source.init_new(model_config, model_class),
+        )
 
 
 if __name__ == "__main__":

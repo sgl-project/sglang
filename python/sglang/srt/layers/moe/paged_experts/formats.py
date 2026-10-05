@@ -31,20 +31,17 @@ _EXPERT_PARAM_PREFIXES = ("w13_", "w2_")
 class ExpertFormat(ABC):
     #: Per-expert tensors the base method creates for loading.
     checkpoint_params: Tuple[str, ...] = ()
-    #: Per-expert tensors paged at run time. They differ from ``checkpoint_params`` only when the
-    #: base post-load step repacks the experts; the step then runs over the host copy K experts
-    #: at a time.
+    #: Per-expert tensors paged at run time.
     paged_params: Tuple[str, ...] = ()
+    #: Whether the base post-load step repacks the experts; it then runs over the host copy K
+    #: experts at a time.
+    repacks_after_loading: bool = False
     contract: RunnerContract = TRITON
 
     @classmethod
     @abstractmethod
     def supports(cls, base_method) -> bool:
         """Whether this format handles ``base_method``."""
-
-    @property
-    def repacks_after_loading(self) -> bool:
-        return self.paged_params != self.checkpoint_params
 
     def check_params(self, layer, num_slots: int) -> None:
         """Raise unless the layer's per-expert tensors are exactly the declared ones."""
@@ -168,6 +165,7 @@ class GptqMarlinFormat(ExpertFormat):
     )
     # GPTQ-Marlin's MoE apply never passes the zero points to the kernel.
     paged_params = tuple(n for n in checkpoint_params if not n.endswith("_qzeros"))
+    repacks_after_loading = True
     contract = MARLIN
 
     @classmethod

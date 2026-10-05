@@ -53,8 +53,8 @@ class PagedMatchesUnpagedBase(CustomTestCase):
     collect the base class itself."""
 
     model: str
-    #: False for MoE kernels that are not batch-invariant: compare prompt logprobs within a
-    #: tolerance, and skip decode, where a near-tie may flip a greedy token.
+    #: False for MoE kernels that are not batch-invariant: compare logprobs within a tolerance,
+    #: decode ones up to the first greedy token the servers differ on.
     exact = True
     max_abs_tolerance = 0.0
     mean_abs_tolerance = 0.0
@@ -73,14 +73,23 @@ class PagedMatchesUnpagedBase(CustomTestCase):
         self._assert_match(reference=reference, paged=paged)
 
     def _assert_match(self, reference, paged):
+        decode_compared = decode_total = 0
         for prompt, ref, got in zip(PROMPTS, reference, paged):
             with self.subTest(prompt=prompt[:30]):
                 if self.exact:
                     self.assertEqual(got, ref)
                     continue
                 diffs = [abs(a - b) for a, b in zip(got[0], ref[0]) if a is not None]
+                for (ref_tok, ref_lp), (tok, lp) in zip(ref[1], got[1]):
+                    if tok != ref_tok:
+                        break
+                    diffs.append(abs(lp - ref_lp))
+                    decode_compared += 1
+                decode_total += len(ref[1])
                 self.assertLessEqual(max(diffs), self.max_abs_tolerance)
                 self.assertLessEqual(sum(diffs) / len(diffs), self.mean_abs_tolerance)
+        if not self.exact:
+            self.assertGreaterEqual(decode_compared, decode_total // 2)
 
 
 def _serve_and_score(model, other_args):

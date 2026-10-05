@@ -54,6 +54,7 @@ breaks.
 - **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
   (use `--disable-shared-experts-fusion`), `--enable-fused-moe-sum-all-reduce` and
   `--load-format dummy` are rejected at startup.
+- **Speculative decoding** is rejected at startup.
 - **CUDA graphs:** decode graphs may use the `full` backend (the default) or be disabled;
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
@@ -81,16 +82,17 @@ time, so the host store holds every expert in the repacked layout.
 
 Every forward step of every MoE layer:
 
-1. The distinct experts the step routes to are split into **waves** of at most K. Decode at
+1. The distinct experts the step routes to are split into **waves** of at most K, the experts
+   already resident first. Decode at
    moderate batch sizes needs one wave; a prefill chunk usually needs several.
 2. Each wave makes its experts resident, evicting the least recently used experts outside the
    wave, and copies the missing ones from the host store into their slots.
-3. The routed expert ids are remapped to slots, every routed entry outside the wave is masked
-   (weight 0), and the wrapped fused-MoE kernel runs over the K slots **without its final top-k
-   sum**, returning each routed (token, expert) output already multiplied by its router weight.
-4. Each entry is taken from the one wave that holds its expert, and the merged entries go
-   through the same top-k sum the kernel would have performed, so the result does not depend
-   on how the experts were split into waves.
+3. The routed expert ids are remapped to slots and the wrapped fused-MoE kernel runs over the
+   wave's own entries **without its final top-k sum**, returning each routed (token, expert)
+   output already multiplied by its router weight.
+4. Each entry is written into one merged buffer by the one wave that holds its expert, and the
+   merged entries go through the same top-k sum the kernel would have performed, so the result
+   does not depend on how the experts were split into waves.
 
 ### Captured decode
 

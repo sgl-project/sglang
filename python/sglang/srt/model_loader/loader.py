@@ -746,10 +746,15 @@ class DefaultModelLoader(BaseModelLoader):
         self,
         model_config: ModelConfig,
         model: nn.Module,
+        resolved_primary: Optional[ResolvedSource] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        if resolved_primary is not None and resolved_primary.source != primary_weights:
+            resolved_primary = None
+        yield from self._get_weights_iterator(
+            primary_weights, resolved_source=resolved_primary
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
@@ -771,30 +776,47 @@ class DefaultModelLoader(BaseModelLoader):
             )
         )
 
-        resolved_sources = []
-        for source in sources:
-            hf_folder, weight_files, use_safetensors = self._prepare_weights(
-                source.model_or_path,
-                source.revision,
-                source.fall_back_to_pt,
-                source.allow_patterns_overrides,
+        return tuple(self._resolve_source(source) for source in sources)
+
+    def _resolve_source(self, source: Source) -> ResolvedSource:
+        hf_folder, weight_files, use_safetensors = self._prepare_weights(
+            source.model_or_path,
+            source.revision,
+            source.fall_back_to_pt,
+            source.allow_patterns_overrides,
+        )
+        if use_safetensors and source.model_config is not None:
+            weight_files = maybe_add_mtp_safetensors(
+                weight_files,
+                hf_folder,
+                "model.safetensors.index.json",
+                source.model_config.hf_config,
             )
-            if use_safetensors and source.model_config is not None:
-                weight_files = maybe_add_mtp_safetensors(
-                    weight_files,
-                    hf_folder,
-                    "model.safetensors.index.json",
-                    source.model_config.hf_config,
-                )
-            resolved_sources.append(
-                DefaultModelLoader.ResolvedSource(
-                    source=source,
-                    hf_folder=hf_folder,
-                    weight_files=tuple(weight_files),
-                    use_safetensors=use_safetensors,
-                )
-            )
-        return tuple(resolved_sources)
+        return DefaultModelLoader.ResolvedSource(
+            source=source,
+            hf_folder=hf_folder,
+            weight_files=tuple(weight_files),
+            use_safetensors=use_safetensors,
+        )
+
+    def _resolve_before_init(
+        self, model_config: ModelConfig
+    ) -> Optional[ResolvedSource]:
+        """Resolve the primary checkpoint before the model is built, for paged experts,
+        which sizes its GPU expert table from it while the layers are created."""
+        from sglang.srt.layers.moe.paged_experts.sizing import (
+            needs_checkpoint,
+            set_checkpoint_files,
+        )
+
+        if not needs_checkpoint():
+            return None
+        model_class, _ = get_model_architecture(model_config)
+        resolved = self._resolve_source(
+            DefaultModelLoader.Source.init_new(model_config, model_class)
+        )
+        set_checkpoint_files(resolved.weight_files if resolved.use_safetensors else ())
+        return resolved
 
     @staticmethod
     def start_checkpoint_prefetch(
@@ -821,6 +843,7 @@ class DefaultModelLoader(BaseModelLoader):
         """Build the final model structure and GPU parameter storage."""
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        self._resolve_before_init(model_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -995,6 +1018,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        resolved_primary = self._resolve_before_init(model_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -1004,7 +1028,9 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model, resolved_primary),
+                target_device,
             )
 
         self.counter_after_loading_weights = time.perf_counter()

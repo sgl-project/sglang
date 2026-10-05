@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Tuple
 
 import torch
 
 
-class ExpertStore(ABC):
+class HostExpertStore:
     """Holds all E experts of each paged tensor on the host, in the layer's GPU layout.
+    Page-locked (``pin``) when it serves paging; a store only staged for a post-load repack
+    stays pageable. ``page_in`` is planned on the host; ``gather`` reads a plan on the GPU.
 
     The GPU tensors are looked up on the layer at every transfer, because a quantization
     method may rebind them after loading.
     """
 
-    def __init__(self, layer, names: Sequence[str], num_experts: int):
+    def __init__(self, layer, names: Sequence[str], num_experts: int, pin: bool = True):
+        self.pin = pin
         self.host: Dict[str, torch.Tensor] = {
             name: self._alloc(
                 shape=(num_experts, *getattr(layer, name).shape[1:]),
@@ -24,46 +26,19 @@ class ExpertStore(ABC):
             for name in names
         }
 
-    @abstractmethod
-    def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
-        """Host buffer for one paged tensor."""
-
-    @abstractmethod
-    def page_in(self, layer, src: torch.Tensor, dst: torch.Tensor) -> None:
-        """Copy expert ``src[i]`` of every paged tensor into GPU slot ``dst[i]``; ``src`` and
-        ``dst`` are int64 CPU tensors (a host-planned step)."""
-
-    @abstractmethod
-    def bind_device_gather(self, layer) -> None:
-        """Prepare ``gather``; called once the layer's tensors are final."""
-
-    @abstractmethod
-    def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:
-        """Copy expert ``src[i]`` into GPU slot ``dst[i]`` for ``i < count[0]``, with every
-        index read on the GPU (a device-planned step): capturable in a CUDA graph."""
-
-
-class HostExpertStore(ExpertStore):
-    """Host memory copied with asynchronous host-to-device copies. Page-locked (``pin``)
-    when it serves paging; a store only staged for a post-load repack stays pageable.
-    ``page_in`` reads its indices on the CPU; ``gather`` reads a plan on the GPU."""
-
-    def __init__(self, layer, names: Sequence[str], num_experts: int, pin: bool = True):
-        self.pin = pin
-        super().__init__(layer, names, num_experts)
-
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=self.pin)
 
-    def page_in(self, layer, src: torch.Tensor, dst: torch.Tensor) -> None:
-        pairs = list(zip(src.tolist(), dst.tolist()))
+    def page_in(self, layer, loads: Sequence[Tuple[int, int]]) -> None:
+        """Copy each ``(expert, slot)`` pair's expert, of every paged tensor, into its slot."""
         for name, host in self.host.items():
             gpu = getattr(layer, name).data
-            for expert, slot in pairs:
+            for expert, slot in loads:
                 gpu[slot].copy_(host[expert], non_blocking=True)
 
     def bind_device_gather(self, layer) -> None:
-        # The gather kernel reads the pinned store directly, through its UVA address.
+        """Prepare ``gather``; called once the layer's tensors are final. The gather kernel
+        reads the pinned store directly, through its UVA address."""
         from sglang.kernels.ops.moe.paged_experts import (
             paged_experts_host_device_pointer,
         )
@@ -89,6 +64,8 @@ class HostExpertStore(ExpertStore):
         ]
 
     def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:
+        """Copy expert ``src[i]`` into GPU slot ``dst[i]`` for ``i < count[0]``, with every
+        index read on the GPU (a device-planned step): capturable in a CUDA graph."""
         from sglang.kernels.ops.moe.paged_experts import paged_experts_gather
 
         paged_experts_gather(*self._gather_args, src, dst, count)

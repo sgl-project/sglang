@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_spec,
     process_model_config,
 )
 
@@ -246,18 +247,21 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
 
 def _cap_decode_capture_batch_sizes(max_bs: int) -> None:
     """Capture full decode graphs only at batch sizes whose routed entries fit the K slots,
-    the steps the device executor serves; larger batches run without a graph. ``max_bs``
-    itself is captured, so batches up to it pad to a graph. Every MoE layer calls this; only
-    the first changes the config."""
+    the steps the device executor serves; larger batches run without a graph. The cap itself
+    is captured, so batches up to it pad to a graph. Every MoE layer calls this; only the
+    first changes the config."""
     decode = get_exec().graph.cuda_graph_config.decode
-    capture_bs = sorted({bs for bs in decode.bs if bs <= max_bs} | {max_bs})
+    if not decode.bs:
+        return
+    cap = min(max_bs, max(decode.bs))
+    capture_bs = sorted({bs for bs in decode.bs if bs <= cap} | {cap})
     if capture_bs != list(decode.bs):
         logger.info(
             "Paged experts: decode CUDA graphs captured at batch sizes %s (at most K // top_k)",
             capture_bs,
         )
     decode.bs = capture_bs
-    decode.max_bs = max_bs
+    decode.max_bs = cap
 
 
 def check_paged_experts_compat(layer, expert_format) -> None:
@@ -271,6 +275,8 @@ def check_paged_experts_compat(layer, expert_format) -> None:
             problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
+    if get_spec().speculative_algorithm:
+        problems.append("speculative decoding is not supported")
     # Host-planned waves run as eager breaks in a breakable prefill graph; a full graph only
     # captures steps that fit one wave, which decode can be limited to and prefill cannot.
     if not (

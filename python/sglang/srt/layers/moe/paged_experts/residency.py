@@ -7,7 +7,6 @@ host-planned steps load that state into the policy and store it back.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import List, Tuple
 
@@ -21,26 +20,17 @@ class Wave(msgspec.Struct, frozen=True):
     loads: List[Tuple[int, int]]  # (expert, slot) pairs to page in before the wave runs
 
 
-class ResidencyPolicy(ABC):
-    """Chooses the slot of each expert of a wave, evicting experts outside the wave."""
+class LRUPolicy:
+    """Chooses the slot of each expert of a wave, evicting the least recently used experts
+    outside it. Slots start holding experts 0..K-1."""
 
     def __init__(self, num_slots: int):
         self.num_slots = num_slots
-
-    @abstractmethod
-    def place(self, experts: List[int]) -> Wave:
-        """Make ``experts`` (at most ``num_slots``) resident and return where they are."""
-
-
-class LRUPolicy(ResidencyPolicy):
-    """Evicts the least recently used experts. Slots start holding experts 0..K-1."""
-
-    def __init__(self, num_slots: int):
-        super().__init__(num_slots)
         # Logical expert -> slot for the resident experts, least recently used first.
         self.resident = OrderedDict((e, e) for e in range(num_slots))
 
     def place(self, experts: List[int]) -> Wave:
+        """Make ``experts`` (at most ``num_slots``) resident and return where they are."""
         for e in experts:
             if e in self.resident:
                 self.resident.move_to_end(e)
@@ -56,13 +46,16 @@ class LRUPolicy(ResidencyPolicy):
         )
 
 
-def plan_waves(policy: ResidencyPolicy, distinct: List[int]) -> List[Wave]:
+def plan_waves(policy: LRUPolicy, distinct: List[int]) -> List[Wave]:
     """Split a step's distinct experts into waves of at most ``num_slots`` and place each.
 
     A step with no routed expert (all padding) still gets one empty wave, so the layer runs.
     """
     k = policy.num_slots
-    groups = [distinct[i : i + k] for i in range(0, len(distinct), k)] or [[]]
+    ordered = [e for e in distinct if e in policy.resident] + [
+        e for e in distinct if e not in policy.resident
+    ]
+    groups = [ordered[i : i + k] for i in range(0, len(ordered), k)] or [[]]
     return [policy.place(group) for group in groups]
 
 

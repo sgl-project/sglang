@@ -1,4 +1,4 @@
-"""Runs a paged forward step: page in, masked GEMM per wave, merge and finish per the runner
+"""Runs a paged forward step: page in, the wave's GEMMs, merge and finish per the runner
 contract.
 
 ``EagerExecutor`` decides residency on the host and serves any step, in as many waves as it
@@ -18,23 +18,8 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     LRUPolicy,
     plan_waves,
 )
-from sglang.srt.layers.moe.paged_experts.runners import RunnerContract
-from sglang.srt.layers.moe.paged_experts.store import ExpertStore
-
-
-def run_wave(base_method, layer, dispatch_output, slots):
-    """Run the base method over the K-slot table: routed entry i goes to GPU slot
-    ``slots[i]``; entries at -1 are outside the wave and contribute nothing (slot 0, weight 0).
-    """
-    masked = slots < 0
-    topk_output = dispatch_output.topk_output
-    wave_output = dispatch_output._replace(
-        topk_output=topk_output._replace(
-            topk_ids=slots.masked_fill(masked, 0),
-            topk_weights=topk_output.topk_weights.masked_fill(masked, 0),
-        ),
-    )
-    return base_method.apply(layer=layer, dispatch_output=wave_output).hidden_states
+from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, run_on_slots
+from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
 
 class EagerExecutor:
@@ -42,7 +27,7 @@ class EagerExecutor:
         self,
         *,
         base_method,
-        store: ExpertStore,
+        store: HostExpertStore,
         policy: LRUPolicy,
         contract: RunnerContract,
         num_experts: int,
@@ -78,20 +63,22 @@ class EagerExecutor:
         topk_ids = topk_output.topk_ids
         distinct = [e for e in torch.unique(topk_ids).tolist() if e >= 0]
         merged = None
-        for wave in plan_waves(policy=self.policy, distinct=distinct):
-            if wave.loads:
-                src, dst = torch.tensor(wave.loads, dtype=torch.int64).unbind(dim=1)
-                self.store.page_in(layer=layer, src=src, dst=dst)
+        waves = plan_waves(policy=self.policy, distinct=distinct)
+        for wave in waves:
+            self.store.page_in(layer=layer, loads=wave.loads)
             # Index E (and -1, which wraps to it) stays -1: padded routing entries are masked.
             to_slot = torch.full((self.num_experts + 1,), -1, dtype=torch.int32)
             to_slot[wave.experts] = torch.tensor(wave.slots, dtype=torch.int32)
             slots = to_slot.to(topk_ids.device)[topk_ids]
-            partial = run_wave(self.base_method, layer, dispatch_output, slots)
-            masked = slots < 0
-            merged = (
-                partial
-                if merged is None
-                else self.contract.merge(merged=merged, partial=partial, masked=masked)
+            if len(waves) == 1:  # only padding is outside the wave
+                merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
+                break
+            merged = self.contract.run_wave(
+                base_method=self.base_method,
+                layer=layer,
+                dispatch_output=dispatch_output,
+                slots=slots,
+                merged=merged,
             )
         return StandardCombineInput(
             hidden_states=self.contract.finish(
@@ -110,7 +97,7 @@ class DeviceExecutor:
         self,
         *,
         base_method,
-        store: ExpertStore,
+        store: HostExpertStore,
         residency: DeviceResidency,
         contract: RunnerContract,
         routed_scaling_factor: float,
@@ -140,7 +127,7 @@ class DeviceExecutor:
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
         # Every routed expert is now resident; padding (-1) stays masked.
         slots = r.expert_slot[topk_ids.clamp(min=0)].masked_fill(topk_ids < 0, -1)
-        partial = run_wave(self.base_method, layer, dispatch_output, slots)
+        partial = run_on_slots(self.base_method, layer, dispatch_output, slots)
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=partial,
