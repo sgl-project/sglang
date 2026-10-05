@@ -19,7 +19,6 @@ Usage::
 
 from __future__ import annotations
 
-import atexit
 import os
 from typing import Optional
 
@@ -146,8 +145,19 @@ def _dist_group() -> Optional[dist.ProcessGroup]:
         return None
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group(backend="nccl")
-    atexit.register(dist.destroy_process_group)
     return dist.group.WORLD
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _destroy_process_group_at_session_end():
+    """Tear the NCCL group down while the interpreter is alive: destroying it
+    from an ``atexit`` hook segfaults under the NVSHMEM symmetric-memory
+    backend (torch 2.13), which torchrun then reports as a failed worker."""
+    yield
+    if dist.is_available() and dist.is_initialized():
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _multi_rank_setup(world_sizes):
