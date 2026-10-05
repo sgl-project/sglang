@@ -169,6 +169,18 @@ register_kernel(
 )
 register_kernel(
     _spec(
+        "kimi_k3_fp8_projection_launcher",
+        "gemm_kimi_k3_fp8_projection",
+        "kimi_k3_fp8_projection_launcher",
+        _SM100_SM103,
+        ("bfloat16", "float8_e4m3fn", "uint8"),
+        "(prepared) -> launcher(x[M,K] BF16, out=None) -> out[M,n_valid]; route plan cached per "
+        "(M, out stride/alignment), workspace cached per M (LRU), call binds tensors only; graph-capturable",
+        "Cake Kimi-K3 FP8 projection per-weight cached launcher distributed by FlashInfer.",
+    )
+)
+register_kernel(
+    _spec(
         "kimi_k3_fp8_projection",
         "gemm_kimi_k3_fp8_projection",
         "kimi_k3_fp8_projection",
@@ -492,6 +504,11 @@ def cake_prepare_kimi_k3_fp8_projection(
 ) -> Any:
     """Explicit Cake entry point; returns a ``KimiK3Fp8ProjectionRunner``."""
     return _cake("prepare_kimi_k3_fp8_projection")(x, prepared, out, workspace)
+
+
+def cake_kimi_k3_fp8_projection_launcher(prepared: Any, *, max_workspaces: int = 64) -> Any:
+    """Explicit Cake entry point; returns a ``KimiK3Fp8ProjectionLauncher``."""
+    return _cake("kimi_k3_fp8_projection_launcher")(prepared, max_workspaces=max_workspaces)
 
 
 def cake_kimi_k3_fp8_projection(

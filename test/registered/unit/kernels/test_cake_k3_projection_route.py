@@ -156,6 +156,7 @@ def cake_stubs():
             side_effect=_fake_prepare_projection(calls["prepare_projection"]),
         ),
         mock.patch.object(mod, "_is_capturing", return_value=False),
+        mock.patch.object(mod, "_make_launcher", return_value=None),  # legacy runner path unless a test overrides
     ):
         calls["supports_projection"] = sup
         yield calls
@@ -301,6 +302,49 @@ def test_apply_admitted_launches_cake_and_memoises_admission(cake_stubs):
     assert x_bound is x and prepared is wrapper.prepared and out_bound is out
     assert workspace == ("q", "sf") and runner.launched == 1
     assert M in wrapper._warm
+
+
+class _Launcher:
+    """Stand-in for FlashInfer's per-weight cached launcher (round 7)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, x, out=None):
+        if out is None:
+            out = torch.empty((x.shape[0], N_ALIGNED), dtype=torch.bfloat16)
+        self.calls.append((x, out))
+        out.fill_(2.0)
+        return out
+
+
+def test_apply_uses_the_cached_launcher_when_flashinfer_has_it(cake_stubs):
+    """With the launcher entry the adapter neither allocates a workspace nor rebuilds a runner per call."""
+    _route(True)
+    launcher = _Launcher()
+    with mock.patch.object(mod, "_make_launcher", return_value=launcher):
+        linear, wrapper, inner = _installed(cake_stubs)
+        x = torch.zeros(M, K, dtype=torch.bfloat16)
+        out = wrapper.apply(linear, x)
+        out2 = wrapper.apply(linear, x)
+    assert wrapper._launcher is launcher
+    assert torch.all(out == 2.0) and torch.all(out2 == 2.0)
+    assert inner.apply_calls == 0
+    assert len(launcher.calls) == 2 and launcher.calls[0][0] is x and launcher.calls[0][1] is out
+    assert cake_stubs["prepare_projection"] == [] and cake_stubs["workspace"] == []
+    assert M in wrapper._warm
+
+
+def test_launcher_host_rejection_falls_back_for_good(cake_stubs):
+    _route(True)
+    launcher = mock.Mock(side_effect=ValueError("out must be a 4-byte aligned bf16"))
+    with mock.patch.object(mod, "_make_launcher", return_value=launcher):
+        linear, wrapper, inner = _installed(cake_stubs)
+        x = torch.zeros(M, K, dtype=torch.bfloat16)
+        wrapper.apply(linear, x)
+        wrapper.apply(linear, x)
+    assert launcher.call_count == 1 and inner.apply_calls == 2
+    assert wrapper._admitted[M] is False
 
 
 def test_apply_falls_back_for_rejected_or_foreign_inputs(cake_stubs):

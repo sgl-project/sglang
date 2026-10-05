@@ -17,18 +17,23 @@ Lifecycle (FlashInfer ``gemm.kimi_k3_fp8_projection`` at ``e4f94f948``):
   padded, 128x128-tiled E4M3 copy: roughly one extra copy of the FP8 weight
   per admitted linear stays resident next to the original (the fallback path
   and the other quant-method consumers keep using the original).
-* workspace: ``allocate_kimi_k3_fp8_projection_workspace(prepared, M)`` per
-  call (``[M, K]`` E4M3 + a small byte buffer). It is not cached: ``M`` is
-  arbitrary during prefill and a cache keyed by ``M`` would either grow
-  unboundedly or free memory that a captured graph still addresses. Inside
-  CUDA-graph capture the allocation comes from the graph pool and stays alive
-  with the graph, exactly like the activations around it.
-* runner: ``prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)`` binds
-  the tensor addresses and depends on ``M`` (route table), so it is rebuilt per
-  call; ``launch()`` is allocation-free and capturable. The JIT modules of a
-  route are loaded on the first eager call for that ``M``; during capture a
+* launcher: ``kimi_k3_fp8_projection_launcher(prepared)`` once per linear
+  (round 7, CAKE-949). ``launcher(x, out)`` resolves the route plan once per
+  ``(M, output row stride, output address class)``, allocates the workspace
+  (``[M, K]`` E4M3 + a small byte buffer) once per ``M`` and reuses it (least
+  recently used ``M`` evicted beyond 64 cached rows; an ``M`` first launched
+  under CUDA-graph capture stays pinned, so a captured graph never addresses
+  freed memory), and binds only the call's tensors before the launches. The
+  per-call host path of round 6 (workspace allocation + runner preparation +
+  launch, ~100 us per call at M = 1024) is what made the route a net loss at
+  batch-1 prefill although its kernels were faster. The JIT modules of a route
+  are loaded on the first eager call for that ``M``; during capture a
   not-yet-warmed ``M`` falls back to the regular FP8 linear (logged once).
   SGLang's graph runner warms every captured batch size eagerly first.
+* legacy runner path (FlashInfer without the launcher entry):
+  ``allocate_kimi_k3_fp8_projection_workspace(prepared, M)`` +
+  ``prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)`` + ``launch()``
+  per call.
 
 Admission (``supports_kimi_k3_fp8_projection_weights`` / ``_projection``):
 SM100a / SM103a, E4M3 ``[N, K]`` weight with ``K % 128 == 0`` and the ModelOpt
@@ -97,6 +102,21 @@ def _prepare_projection(x, prepared, out, workspace):
     from sglang.kernels.ops.gemm.cake import cake_prepare_kimi_k3_fp8_projection
 
     return cake_prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)
+
+
+def _make_launcher(prepared) -> Optional[Any]:
+    """The per-weight cached launcher, or ``None`` with a FlashInfer that predates it."""
+    from sglang.kernels.cake_kernels import gemm_kimi_k3_fp8_projection as cake
+
+    if not cake.supports_kimi_k3_fp8_projection_launcher():
+        return None
+    from sglang.kernels.ops.gemm.cake import cake_kimi_k3_fp8_projection_launcher
+
+    try:
+        return cake_kimi_k3_fp8_projection_launcher(prepared)
+    except _CAKE_ERRORS + (AttributeError, TypeError) as exc:
+        logger.warning("Cake kimi_k3_fp8_projection: launcher unavailable (%s); using the per-call runner path", exc)
+        return None
 
 
 def _is_capturing() -> bool:
@@ -185,6 +205,7 @@ class CakeFp8ProjectionLinearMethod:
         self._prepare_attempted = False
         self._admitted: dict = {}  # M -> adapter admission for that row count
         self._warm: set = set()  # M values launched eagerly (JIT modules loaded)
+        self._launcher: Optional[Any] = None  # per-weight cached launcher (round 7)
         self._logged: set = set()
         if getattr(inner, "apply_into", None) is not None:
             # Only advertise apply_into when the wrapped method has it
@@ -205,6 +226,7 @@ class CakeFp8ProjectionLinearMethod:
     def _prepare(self, layer: torch.nn.Module) -> None:
         self._prepare_attempted = True
         self.prepared = None
+        self._launcher = None
         self._admitted.clear()
         self._warm.clear()
         prepared = prepare_linear_weight(layer, self.name)
@@ -213,6 +235,12 @@ class CakeFp8ProjectionLinearMethod:
         self.prepared = prepared
         self.n_valid = int(prepared.n_valid)
         self.k = int(prepared.K)
+        self._launcher = _make_launcher(prepared)
+        if self._launcher is None:
+            self._log_once(
+                "no-launcher",
+                "FlashInfer has no kimi_k3_fp8_projection_launcher; using the per-call runner path",
+            )
 
     # ---- GEMM ----
 
@@ -308,9 +336,12 @@ class CakeFp8ProjectionLinearMethod:
         if out is None:
             out = torch.empty((m, self.n_valid), dtype=torch.bfloat16, device=x.device)
         try:
-            workspace = _allocate_workspace(self.prepared, m)
-            runner = _prepare_projection(x, self.prepared, out, workspace)
-            runner.launch()
+            if self._launcher is not None:
+                self._launcher(x, out)
+            else:
+                workspace = _allocate_workspace(self.prepared, m)
+                runner = _prepare_projection(x, self.prepared, out, workspace)
+                runner.launch()
         except _CAKE_ERRORS as exc:
             # FlashInfer validates on the host before launching; keep this M
             # on the FP8 linear from now on.

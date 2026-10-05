@@ -238,6 +238,31 @@ def kimi_k3_fp8_projection(
     return run(x, prepared, out, workspace=workspace, backend="cake")
 
 
+def supports_kimi_k3_fp8_projection_launcher() -> bool:
+    """True when the installed FlashInfer exposes the per-weight cached launcher (round 7)."""
+    if not _modules_available():
+        return False
+    import importlib
+
+    return hasattr(importlib.import_module(FI_MODULE), "kimi_k3_fp8_projection_launcher")
+
+
+def kimi_k3_fp8_projection_launcher(prepared: Any, *, max_workspaces: int = 64) -> Any:
+    """Forward to FlashInfer; returns a ``KimiK3Fp8ProjectionLauncher``.
+
+    ``launcher(x, out=None) -> out`` for any ``M``: the route plan is cached per
+    ``(M, output row stride, output address class)`` and the workspace of each
+    ``M`` is allocated once and reused (LRU beyond ``max_workspaces``; an ``M``
+    first launched under CUDA-graph capture stays pinned).  A call binds only the
+    call's tensors -- no per-call route resolution or workspace allocation.
+    """
+    from flashinfer.gemm.kimi_k3_fp8_projection import (
+        kimi_k3_fp8_projection_launcher as make_launcher,
+    )
+
+    return make_launcher(prepared, max_workspaces=max_workspaces)
+
+
 def get_prepared_projection_weight_class() -> type:
     from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
         PreparedProjectionWeight,

@@ -1,6 +1,6 @@
 """Cake Kimi-K3 FP8_PB_WO projection through sglang.kernels.
 
-Checks registry resolution of the four ops, bitwise parity between the facade
+Checks registry resolution of the five ops, bitwise parity between the facade
 (prepared runner and one-shot form) and FlashInfer's direct calls, and
 agreement with an exact quantized-operand torch reference within BF16
 tolerance. Skips (with the reason) when FlashInfer lacks the Cake modules /
@@ -18,6 +18,7 @@ from sglang.kernels.cake_kernels._support import flashinfer_module_available
 from sglang.kernels.ops.gemm.cake import (
     cake_allocate_kimi_k3_fp8_projection_workspace,
     cake_kimi_k3_fp8_projection,
+    cake_kimi_k3_fp8_projection_launcher,
     cake_prepare_kimi_k3_fp8_projection,
     cake_prepare_kimi_k3_fp8_projection_weights,
 )
@@ -30,6 +31,7 @@ OPS = (
     "gemm.allocate_kimi_k3_fp8_projection_workspace",
     "gemm.prepare_kimi_k3_fp8_projection",
     "gemm.kimi_k3_fp8_projection",
+    "gemm.kimi_k3_fp8_projection_launcher",
 )
 BLOCK = 128
 E4M3_MAX = 448.0
@@ -156,3 +158,38 @@ def test_supports_rejects_unpadded_weight_and_fp16_activation():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("m", [64, 512, 1024])
+def test_launcher_matches_one_shot_and_binds_per_call(m):
+    """Round 7: the per-weight cached launcher is bit-identical to the one-shot form for fresh and strided
+    outputs, follows new activations, and reuses its workspace / plan across calls."""
+    _skip_unless_supported()
+    if not cake.supports_kimi_k3_fp8_projection_launcher():
+        pytest.skip("installed FlashInfer lacks kimi_k3_fp8_projection_launcher")
+    device = torch.device("cuda")
+    n_valid, k = 2112, 7168
+    weight, scale = _make_weight(n_valid, k, device, seed=31 + m)
+    if not cake.supports_kimi_k3_fp8_projection_weights(weight, scale, n_valid):
+        pytest.skip("FlashInfer registers no generated program for this device")
+    prepared = cake_prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    launcher = cake_kimi_k3_fp8_projection_launcher(prepared, max_workspaces=4)
+    x = torch.randn((m, k), device=device, dtype=torch.float32).to(torch.bfloat16)
+    if not cake.supports_kimi_k3_fp8_projection(x, prepared):
+        pytest.skip("FlashInfer registers no route for this (M, N, K) on this device")
+    expected = cake_kimi_k3_fp8_projection(x, prepared)
+    out = launcher(x)
+    buf = torch.full((m, n_valid + 32), float("nan"), dtype=torch.bfloat16, device=device)
+    view = buf[:, :n_valid]
+    assert launcher(x, view) is view
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and torch.equal(view, expected)
+    assert torch.isnan(buf[:, n_valid:].float()).all()
+    x2 = torch.randn((m, k), device=device, dtype=torch.float32).to(torch.bfloat16)
+    assert torch.equal(launcher(x2), cake_kimi_k3_fp8_projection(x2, prepared))
+    assert launcher.cached_rows == (m,)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    launcher(x2, view)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] - before == 0
