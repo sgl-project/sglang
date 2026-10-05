@@ -3845,9 +3845,8 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            running_batch.batch_is_full = False
+        # Reset batch_is_full to retry admission with a prefill adder.
+        running_batch.batch_is_full = False
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
