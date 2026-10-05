@@ -100,9 +100,11 @@ def load_mimo_v2_qkv_proj_weight(
     loaded_weight,
     expected_fused_tp_size: Optional[int] = None,
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    *,
+    qkv_proj: QKVParallelLinear,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
+    tp_size = qkv_proj.tp_size
+    tp_rank = qkv_proj.tp_rank
     ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
 
     if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
@@ -193,11 +195,10 @@ def _resolve_deferred_qkv_scale_inv(
     expected_fused_tp_size: int,
     block_size: int = 128,
     config=None,
+    *,
+    model: nn.Module,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
     ckpt_tp = expected_fused_tp_size
-    shards_per_rank = ckpt_tp // tp_size
 
     for scale_name, ckpt_scale in deferred_scale_inv.items():
         weight_name = scale_name.replace(".weight_scale_inv", ".weight")
@@ -207,6 +208,10 @@ def _resolve_deferred_qkv_scale_inv(
                 f"weight {weight_name} not found"
             )
 
+        qkv_proj = model.get_submodule(weight_name.rsplit(".", 1)[0])
+        tp_size = qkv_proj.tp_size
+        tp_rank = qkv_proj.tp_rank
+        shards_per_rank = ckpt_tp // tp_size
         weight_param = params_dict[weight_name]
         scale_param = params_dict[scale_name]
         weight_data = weight_param.data
@@ -1560,6 +1565,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         loaded_weight,
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -1634,6 +1640,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 deferred_qkv_scale_inv,
                 expected_fused_tp_size,
                 config=self.config,
+                model=self,
             )
 
     def get_embed_and_head(self):

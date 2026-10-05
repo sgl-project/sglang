@@ -313,6 +313,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
