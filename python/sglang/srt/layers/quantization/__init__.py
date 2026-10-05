@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
+    GPTQConfig,
     GPTQMarlinConfig,
     GPTQXPUConfig,
 )
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
     is_xpu,
@@ -122,6 +124,14 @@ if is_cpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": CPUGPTQConfig,
+        }
+    )
+
+
+if is_hip():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQConfig,
         }
     )
 

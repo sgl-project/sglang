@@ -11,7 +11,6 @@ load time to the ExLlama-shuffled [N, K/8] layout read by the GEMM below.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 import triton
@@ -70,11 +69,7 @@ def _is_gfx1151() -> bool:
 def _gfx1151_w4a16_config(
     m: int, k: int, n: int, group_size: int
 ) -> tuple[int, int, int, int, int] | None:
-    if (
-        os.getenv("SGLANG_GFX1151_W4A16_TUNING", "1").lower() not in ("1", "true")
-        or group_size != 128
-        or not _is_gfx1151()
-    ):
+    if group_size != 128 or not _is_gfx1151():
         return None
     if m in (8, 12, 16):
         bucket = m
@@ -180,6 +175,8 @@ def _gptq_w4a16_skinny_gemm_kernel(
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # M * K and M * N can exceed int32 for long-context prefill.
+    offs_m_i64 = offs_m.to(tl.int64)
 
     shifts = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
     shifts = tl.reshape(
@@ -193,7 +190,7 @@ def _gptq_w4a16_skinny_gemm_kernel(
         offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
         a = tl.load(
-            a_ptr + offs_m[:, None] * K + offs_k[None, :],
+            a_ptr + offs_m_i64[:, None] * K + offs_k[None, :],
             mask=(offs_m[:, None] < M) & mask_k[None, :],
             other=0.0,
         )
@@ -229,7 +226,7 @@ def _gptq_w4a16_skinny_gemm_kernel(
         accumulator += tl.dot(a, tl.trans(b), out_dtype=tl.float32)
 
     output = accumulator.to(c_ptr.type.element_ty)
-    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    c_ptrs = c_ptr + offs_m_i64[:, None] * N + offs_n[None, :]
     tl.store(
         c_ptrs,
         output,
