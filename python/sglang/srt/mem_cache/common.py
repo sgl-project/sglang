@@ -93,11 +93,12 @@ def free_swa_out_of_window_slots(
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Round the retained window up to a page. A non-aligned window (for
-        # example 511 prior tokens) otherwise leaves too little SWA
-        # history when an exact-repeat match stops one page before the insert.
-        retained_window = ceil_align(max(sliding_window_size, page_size), page_size)
-        evict_threshold = pre_len - retained_window
+        # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
+        # a key that ends at page_floor(pre_len) still has a full window of live SWA,
+        # and the last leaf, below page_floor(seq_len), is never all-tombstone.
+        evict_threshold = pre_len - ceil_align(
+            max(sliding_window_size, page_size), page_size
+        )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained
