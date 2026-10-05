@@ -70,7 +70,7 @@ fn check_case(
     bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
-    let rendered = formatter.render_request(case["request"].clone());
+    let rendered = formatter.render_request(case["request"].clone(), &Default::default());
     if !case["error"].is_null() {
         return match rendered {
             Ok(_) => Err("SGLang rejects this request".into()),
