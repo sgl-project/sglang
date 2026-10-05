@@ -208,9 +208,10 @@ def _try_flux2_norm_modulate_fp8(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_FP8.disabled
+        or not x.is_cuda
         or x.shape[-1] != 6144
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
 
@@ -373,8 +374,9 @@ def _flux2_norm_modulate(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_MOD.disabled
+        or not x.is_cuda
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return norm(x) * (1 + scale) + shift
 
