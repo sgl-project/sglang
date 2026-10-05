@@ -116,6 +116,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        let return_text = request.get_ref().return_text.unwrap_or(false);
         let request = convert::generate(
             request.into_inner(),
             self.config.preferred_sampling_params.as_ref(),
@@ -130,6 +131,7 @@ impl SglangService for GrpcService {
             call,
             self.config.incremental_streaming_output,
             self.config.response_timeout,
+            return_text,
         )))
     }
 
