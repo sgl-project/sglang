@@ -512,8 +512,14 @@ class DSparkV4MarkovHead(nn.Module):
             self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
         )
 
-    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+    def sample_block_greedy_fused(
+        self, base_logits, *, first_prev_tokens, vocab_limit: Optional[int] = None
+    ):
         if not self.supports_sharded_greedy or not base_logits.is_cuda:
+            return None
+        # The sharded kernel already skips lm_head padding; a tighter cap falls
+        # back to the capped block sampler.
+        if vocab_limit is not None and vocab_limit < self.vocab_size:
             return None
         from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
             sharded_greedy_step,
