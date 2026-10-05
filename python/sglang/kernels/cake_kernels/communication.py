@@ -4,19 +4,26 @@ Four kernel families, all built for sm_100a / sm_103a and all multi-rank:
 
 * **All-gather matmul** (``flashinfer.comm.all_gather_matmul(backend="cake")``
   -> ``flashinfer.comm.all_gather_matmul.cake_all_gather_matmul``). Push-wait
-  all-gather of a local BF16/FP16 ``inp [M, 8192]`` (``M % 128 == 0``) fused
-  with ``@ w [8192, 2048]`` into ``out [M * world_size, 2048]``. Needs an
-  initialised NCCL process group with ``world_size in {2, 4, 8}`` and the
-  NVSHMEM ``torch.distributed._symmetric_memory`` backend for FlashInfer's
-  internal symmetric scratch/flags (cached per device, group, dtype, rows; the
-  first use synchronises; a failed collective poisons the state). The host
-  side is nvcc-built from FlashInfer's ``csrc/cake_all_gather_matmul`` at
-  first use.
-  ``prepare_all_gather_matmul(backend="cake")`` returns a replayable launcher
-  for BF16 packed QKV only: ``(world_size, N) == (8, 1280)`` on sm_100a /
-  sm_103a or ``(4, 2560)`` on sm_103a; rows fixed at prepare; the callable
-  re-validates shape/dtype/device, group identity and the weight fingerprint on
-  every call and raises instead of falling back.
+  all-gather of a local BF16/FP16 ``inp [M, 8192]`` (any positive ``M``; the
+  kernel masks the 128-row tile tail) fused with ``@ w`` into
+  ``out [M * world_size, N]``. ``w`` is the logical ``[8192, N]`` weight with
+  ``N`` a positive multiple of 256, either contiguous or the ``weight.t()``
+  view of a contiguous ``[N, 8192]`` parameter (the engine's layout; FlashInfer
+  selects the matching generated kernel from the strides and never copies).
+  Needs an initialised NCCL process group with ``world_size in {2, 4, 8}`` and
+  the NVSHMEM ``torch.distributed._symmetric_memory`` backend for FlashInfer's
+  internal symmetric scratch/flags (cached per device, group and dtype; the
+  scratch grows collectively to the largest padded row count seen; a failed
+  collective poisons the state). The host side is nvcc-built from FlashInfer's
+  ``csrc/cake_all_gather_matmul`` at first use.
+  ``prepare_all_gather_matmul(backend="cake", max_rows=...)`` binds ``w``,
+  the group and a row capacity (default ``inp.shape[0]``) in one collective
+  and returns a launcher serving any contiguous input with ``1 <= rows <=
+  max_rows`` and the same dtype / device / ``K`` with no further collective
+  and no per-call allocation besides the output (``out=`` optional;
+  CUDA-graph capturable). The launcher re-validates the input, the group
+  identity and the bound weight's fingerprint (data pointer, shape, strides,
+  dtype, device) on every call and raises instead of falling back.
 * **Fused norm combine** (``flashinfer.comm.cake_fused_norm_combine``, JIT
   ``flashinfer.jit.cake_fused_norm_combine``). Residual add + two-track RMSNorm
   + eight-peer BF16 combine in one launch per rank: ``x`` / ``residual`` /
@@ -54,9 +61,9 @@ or that every rank selected the same backend.
 
 Not supported here (keep the existing SGLang path): a torch symmetric-memory
 backend other than NVSHMEM (all-gather matmul; the engine selects it before the
-first allocation), other hidden sizes, world sizes outside the sets above, FP8 inputs, ``allreduce_fusion(
-moe_finalize_backend="cake")`` on a non-TRT-LLM workspace, and the private
-``_all_gather_matmul_cake_packed_qkv_sm103_tp4`` experiment.
+first allocation), ``K != 8192`` or ``N % 256 != 0`` for the all-gather matmul,
+other hidden sizes, world sizes outside the sets above, FP8 inputs, and
+``allreduce_fusion(moe_finalize_backend="cake")`` on a non-TRT-LLM workspace.
 """
 
 from __future__ import annotations
@@ -65,9 +72,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.kernels.cake_kernels._support import (
     BLACKWELL_DATACENTER,
-    SM103,
     cuda_tensor_on,
-    device_capability,
     flashinfer_module_available,
 )
 
@@ -81,14 +86,9 @@ ARCHS = BLACKWELL_DATACENTER
 FI_AG_MODULE = "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
 FI_AG_DISPATCH_MODULE = "flashinfer.comm.all_gather_matmul.all_gather_matmul"
 AG_K = 8192
-AG_N = 2048
-AG_BLOCK_M = 128
+# ``N`` granularity of the generated main kernels (FlashInfer ``loader.BLOCK_N``).
+AG_BLOCK_N = 256
 AG_WORLD_SIZES = (2, 4, 8)
-# Prepared packed-QKV launcher: (world_size, N) -> architectures.
-AG_PACKED_QKV_ROUTES = {
-    (8, 1280): BLACKWELL_DATACENTER,
-    (4, 2560): (SM103,),
-}
 
 # Fused norm combine (A40 / A41 / E2-32).
 FI_NC_MODULE = "flashinfer.comm.cake_fused_norm_combine"
@@ -122,66 +122,79 @@ def symm_mem_backend_is_nvshmem(device: torch.device) -> bool:
         return False
 
 
-def _same_cuda_pair(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return (
-        cuda_tensor_on(a, ARCHS)
-        and b.is_cuda
-        and b.device == a.device
-        and b.dtype == a.dtype
-        and a.is_contiguous()
-        and b.is_contiguous()
-    )
-
-
 # --------------------------------------------------------------------------
 # All-gather matmul
 # --------------------------------------------------------------------------
 
 
+def all_gather_matmul_weight_layout(w: torch.Tensor) -> Optional[str]:
+    """FlashInfer's layout class of the logical ``[8192, N]`` weight view.
+
+    ``"n_major"`` for a contiguous ``[K, N]`` tensor, ``"k_major"`` for the
+    ``weight.t()`` view of a contiguous ``[N, K]`` parameter (strides
+    ``(1, K)``), ``None`` for any other shape or stride pattern (FlashInfer
+    rejects those instead of copying; mirrors ``flashinfer.jit.
+    cake_all_gather_matmul.weight_layout``).
+    """
+    if w.ndim != 2 or int(w.shape[0]) != AG_K:
+        return None
+    n = int(w.shape[1])
+    stride_k, stride_n = (int(stride) for stride in w.stride())
+    if stride_n == 1 and stride_k == n:
+        return "n_major"
+    if stride_k == 1 and stride_n == AG_K:
+        return "k_major"
+    return None
+
+
 def supports_all_gather_matmul(
     inp: torch.Tensor, w: torch.Tensor, *, world_size: int
 ) -> bool:
-    """Admission check for ``all_gather_matmul(backend="cake")``; never raises."""
+    """Admission check for ``all_gather_matmul(backend="cake")``; never raises.
+
+    Mirrors FlashInfer's host validation for what one process can see: SM100 /
+    SM103 CUDA tensors of one BF16 or FP16 dtype on one device, contiguous
+    ``inp [M, 8192]`` with ``M >= 1``, ``w`` a ``[8192, N]`` view in either
+    accepted layout with ``N`` a positive multiple of 256, ``world_size`` in
+    {2, 4, 8} and the NVSHMEM symmetric-memory backend. The NCCL process group
+    itself is validated by FlashInfer at the call.
+    """
     import torch
 
     return (
         flashinfer_module_available(FI_AG_MODULE, FI_AG_DISPATCH_MODULE)
-        and _same_cuda_pair(inp, w)
+        and cuda_tensor_on(inp, ARCHS)
+        and w.is_cuda
+        and w.device == inp.device
+        and w.dtype == inp.dtype
         and inp.dtype in (torch.bfloat16, torch.float16)
         and inp.ndim == 2
-        and w.ndim == 2
+        and inp.is_contiguous()
         and inp.shape[0] > 0
-        and inp.shape[0] % AG_BLOCK_M == 0
         and inp.shape[1] == AG_K
-        and tuple(w.shape) == (AG_K, AG_N)
+        and all_gather_matmul_weight_layout(w) is not None
+        and w.shape[1] > 0
+        and w.shape[1] % AG_BLOCK_N == 0
         and world_size in AG_WORLD_SIZES
         and symm_mem_backend_is_nvshmem(inp.device)
     )
 
 
 def supports_prepare_all_gather_matmul(
-    inp: torch.Tensor, w: torch.Tensor, *, world_size: int
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    world_size: int,
+    max_rows: Optional[int] = None,
 ) -> bool:
-    """Admission check for the prepared BF16 packed-QKV launcher; never raises."""
-    import torch
+    """Admission check for the prepared launcher; never raises.
 
-    if not (
-        flashinfer_module_available(FI_AG_MODULE, FI_AG_DISPATCH_MODULE)
-        and _same_cuda_pair(inp, w)
-        and inp.dtype == torch.bfloat16
-        and inp.ndim == 2
-        and w.ndim == 2
-        and inp.shape[0] > 0
-        and inp.shape[0] % AG_BLOCK_M == 0
-        and inp.shape[1] == AG_K
-        and w.shape[0] == AG_K
-    ):
-        return False
-    archs = AG_PACKED_QKV_ROUTES.get((world_size, int(w.shape[1])))
-    return (
-        archs is not None
-        and device_capability(inp.device.index) in archs
-        and symm_mem_backend_is_nvshmem(inp.device)
+    Same operand contract as ``supports_all_gather_matmul`` (the prepared form
+    has no narrower profile table); ``max_rows``, when given, must cover the
+    rows of ``inp``.
+    """
+    return supports_all_gather_matmul(inp, w, world_size=world_size) and (
+        max_rows is None or int(max_rows) >= int(inp.shape[0])
     )
 
 
@@ -192,10 +205,12 @@ def all_gather_matmul(
     *,
     verbose: bool = False,
 ) -> torch.Tensor:
-    """Forward to FlashInfer; returns ``out [M * world_size, 2048]``.
+    """Forward to FlashInfer; returns ``out [M * world_size, N]``.
 
     ``inp`` is local-only (it need not be a symmetric-memory tensor); the
-    backend's own scratch and flags use NVSHMEM symmetric memory.
+    backend's own scratch and flags use NVSHMEM symmetric memory. The first
+    call of a group, and the first call with more rows than any earlier one,
+    is a collective that sizes that scratch.
     """
     from flashinfer.comm.all_gather_matmul.all_gather_matmul import all_gather_matmul
 
@@ -207,19 +222,26 @@ def prepare_all_gather_matmul(
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    max_rows: Optional[int] = None,
     verbose: bool = False,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Forward to FlashInfer; returns the bound packed-QKV launcher.
+) -> Callable[..., torch.Tensor]:
+    """Forward to FlashInfer; returns the launcher bound to ``w`` and ``group``.
 
-    Prepare outside the hot path (it synchronises and builds TMA descriptors);
-    the returned callable accepts a new ``inp`` of the same shape, dtype and
-    device and is CUDA-graph replayable.
+    Prepare outside the hot path and on every rank of ``group`` in the same
+    order (it synchronises, rendezvous the symmetric scratch for ``max_rows``
+    rows -- default ``inp.shape[0]`` -- and compiles the route). The returned
+    ``launcher(inp, *, out=None)`` accepts any contiguous input with
+    ``1 <= rows <= max_rows`` and the dtype / device / ``K`` of ``inp``; it
+    reads ``w`` in place, so an in-place weight reload is visible to it, while
+    a re-bound parameter storage must be re-prepared.
     """
     from flashinfer.comm.all_gather_matmul.all_gather_matmul import (
         prepare_all_gather_matmul,
     )
 
-    return prepare_all_gather_matmul(inp, w, group, backend="cake", verbose=verbose)
+    return prepare_all_gather_matmul(
+        inp, w, group, backend="cake", max_rows=max_rows, verbose=verbose
+    )
 
 
 # --------------------------------------------------------------------------
