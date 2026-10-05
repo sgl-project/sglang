@@ -62,6 +62,13 @@ GEOMETRIES: Tuple[Tuple[str, int, int, int, int], ...] = (
     ("swiglu", 3072, 1536, 256, 8),
     ("swiglu_1.702_1.0_7.0", 6144, 3072, 128, 4),
     ("situ_4.0_25.0", 3584, 3072, 896, 16),
+    # Sharded per-partition slices: Qwen3.5-397B TP2 / TP4 and MiniMax-M2 TP2 / TP4.
+    # (MiniMax-M2 TP8, I = 192, is not admissible: the TRT-LLM FP4 weight view and
+    # the trtllm-gen launcher require intermediate_size % 128 == 0.)
+    ("swiglu", 4096, 512, 512, 10),
+    ("swiglu", 4096, 256, 512, 10),
+    ("swiglu", 3072, 768, 256, 8),
+    ("swiglu", 3072, 384, 256, 8),
 )
 
 

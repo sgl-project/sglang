@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Hashable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -502,11 +502,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         The static composite allocates the two sides independently and records
         a full->swa index mapping. That is not representable here: the two
         sides SHARE one virtual id space (a virtual page names a full-physical
-        page and, if bound, a swa-physical one), which is why
-        `set_full_to_swa_mapping` is a no-op on this allocator and
-        `translate_loc_from_full_to_swa` derives the swa id from the virtual id
-        instead of a table. Running the static body would call `alloc_extend`
-        on the swa sub-allocator, which asserts it is not the id owner.
+        page and, if bound, a swa-physical one). Load-back installs that binding
+        through `set_full_to_swa_mapping`, and `translate_loc_from_full_to_swa`
+        resolves the SWA kernel-facing id from the shared virtual id. Running the
+        static body would call `alloc_extend` on the swa sub-allocator, which
+        asserts it is not the id owner.
 
         The tail is expressed by binding swa for the TAIL's virtual pages only.
         A new page left unbound has no swa-physical page, which reads as the
@@ -678,8 +678,12 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """Binding load-back rows already updates the shared SWA v2p mapping."""
-        return
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
@@ -796,6 +800,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 
     @abstractmethod
     def _ask_float_for_room(self, need_tokens: int) -> None: ...
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
 
 
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
@@ -1204,7 +1212,10 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
-            tree_cache.evict_for_alloc(
+            # The shared-byte plan returns cumulative eviction quotas.
+            # Per-component capacity targets can count the same shared bytes
+            # independently and stop before the joint allocation fits.
+            tree_cache.evict(
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
@@ -1231,6 +1242,57 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             ):
                 return 0
             return fa.flush_opportunistic() + sa.flush_opportunistic()
+
+    def resize(self, config) -> None:
+        """Synchronize allocator capacity after the shared pool is finalized."""
+        if not self.unified_buffer.post_capture_active:
+            raise RuntimeError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires post-capture backing"
+            )
+        final_pool_bytes = config.unified_memory_pool_bytes
+        if final_pool_bytes is None:
+            raise ValueError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires "
+                "config.unified_memory_pool_bytes"
+            )
+        if int(final_pool_bytes) != self.unified_buffer.total_bytes:
+            raise RuntimeError(
+                "UnifiedKVPool.finalize_backing must run before allocator.resize: "
+                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
+                f"{self.unified_buffer.total_bytes} bytes"
+            )
+        for allocator in (self.full_attn_allocator, self.swa_attn_allocator):
+            if allocator.allocated_count() != 0 or allocator._pending_reuse:
+                raise RuntimeError(
+                    f"cannot resize non-empty unified allocator "
+                    f"{allocator.sub_pool_name!r}"
+                )
+        self.full_attn_allocator._set_capacity(self.unified_buffer.max_slots("full"))
+        self.swa_attn_allocator._set_capacity(
+            self.unified_buffer.max_slots("swa"),
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
+        )
+        self._empty_shared_gap_bytes = self.full_attn_allocator._current_gap_bytes()
+        self._size_full = self.full_attn_allocator.available_size()
+        self._size_swa = min(
+            self.swa_attn_allocator.available_size(),
+            len(self.full_attn_allocator.free_virtual_ids) * self.page_size,
+        )
+        self._full_max_total_num_tokens = self._size_full
+        self._swa_max_total_num_tokens = self._size_swa
+        self._kvcache.size = self.full_attn_allocator.max_slots - 1
+        self._kvcache.size_swa = self.swa_attn_allocator.max_slots - 1
+        for allocator, pool, host_capacity in (
+            (self.full_attn_allocator, self._kvcache.full_kv_pool, self._size_full),
+            (self.swa_attn_allocator, self._kvcache.swa_kv_pool, self._size_swa),
+        ):
+            pool._num_pages = allocator.num_pages
+            pool.size = allocator.num_pages * self.page_size - self.page_size
+            pool.host_capacity_tokens = host_capacity
+            pool.host_capacity_bytes = (
+                host_capacity
+                * self.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
+            )
 
 
 class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
