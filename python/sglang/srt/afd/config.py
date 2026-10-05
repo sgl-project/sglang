@@ -55,21 +55,6 @@ def _max_admitted_lanes() -> int:
     )
 
 
-def _max_admitted_attention_lanes() -> int:
-    """Upper bound over registered profiles; the per-profile gate stays authoritative."""
-
-    from .profiles import registered_capability_profiles
-
-    return max(
-        (
-            lanes
-            for profile in registered_capability_profiles()
-            for lanes in profile.attention_lanes
-        ),
-        default=0,
-    )
-
-
 class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     """The sole AFD feature config; all retained allocation is bounded here."""
 
@@ -77,12 +62,8 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
     max_hbm_bytes: int = 8 * 1024 * 1024 * 1024
     attention_backend: str = "fa3"
     lanes: int = 1
-    # FFN ranks are `lanes`; attention ranks are `attention_lanes`, None meaning
-    # symmetric. Only M >= N with N dividing M is expressible, and the direction
-    # is not arbitrary: every FFN rank must stream its whole share of the expert
-    # weights once per step no matter how few rows it got, so the single way to
-    # amortize that fixed cost is to let k = M / N attention lanes feed one FFN
-    # rank. Growing N instead would split the same rows over more weight streams.
+    # FFN ranks are `lanes`; attention ranks are independent positive integers.
+    # None selects the symmetric layout. Model/parallelism checks still apply.
     attention_lanes: int | None = None
     rendezvous_host: str = "127.0.0.1"
     rendezvous_port: int = 1239
@@ -146,9 +127,7 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
                 f"lanes={self.lanes}",
             )
         if self.attention_lanes is not None and (
-            type(self.attention_lanes) is not int
-            or self.attention_lanes < 1
-            or self.attention_lanes > _max_admitted_attention_lanes()
+            type(self.attention_lanes) is not int or self.attention_lanes < 1
         ):
             raise AFDError(
                 "AFD_GRAPH_ATTENTION_LANE_COUNT_INVALID",

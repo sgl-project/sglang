@@ -75,7 +75,7 @@ def _config():
 
 
 @pytest.mark.parametrize("layer_id", [0, 3])
-@pytest.mark.parametrize("tp", [3, 8, 20])
+@pytest.mark.parametrize("tp", [3, 5, 7, 8, 20])
 def test_attention_constructor_never_allocates_router_or_experts(
     routing, monkeypatch, layer_id, tp
 ):

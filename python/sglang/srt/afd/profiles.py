@@ -43,7 +43,6 @@ class AFDCapabilityProfile:
     stages: tuple[int, ...]
     fa_backends: tuple[str, ...]
     lanes: tuple[int, ...]
-    attention_lanes: tuple[int, ...]
     max_nodes: int
     cache_policy: str
 
@@ -60,7 +59,7 @@ class AFDCapabilityProfile:
             "stages": list(self.stages),
             "fa_backends": list(self.fa_backends),
             "lanes": list(self.lanes),
-            "attention_lanes": list(self.attention_lanes),
+            "attention_lane_policy": "positive-integer",
             "max_nodes": self.max_nodes,
             "cache_policy": self.cache_policy,
         }
@@ -85,11 +84,13 @@ class AFDCapabilityProfile:
                 "AFD_TOPOLOGY_LANE_COUNT_UNSUPPORTED",
                 f"lanes={config.lanes} admitted={self.lanes}",
             )
-        if config.attention_lane_count not in self.attention_lanes:
+        if (
+            type(config.attention_lane_count) is not int
+            or config.attention_lane_count < 1
+        ):
             raise AFDError(
                 "AFD_TOPOLOGY_ATTENTION_LANE_COUNT_UNSUPPORTED",
-                f"attention_lanes={config.attention_lane_count} "
-                f"admitted={self.attention_lanes}",
+                f"attention_lanes={config.attention_lane_count}",
             )
 
 
@@ -216,10 +217,9 @@ QWEN3_PAIRED_C1 = AFDCapabilityProfile(
     stage_plan="native-tbo-s2-lane-merged-return-v2",
     stages=(2,),
     fa_backends=("fa3", "fa4"),
+    # Supported FFN degrees for the current native model/quantization paths;
+    # these are not restrictions on the A/F topology or its ratio.
     lanes=(1, 2, 4, 8, 16, 32),
-    # Attention constructs a proxy before experts. These are CPU-checked shape
-    # bounds; current-run model capacity, graph and transport remain GPU gates.
-    attention_lanes=(1, 2, 3, 4, 8, 12, 16, 20, 24, 32),
     max_nodes=8,
     cache_policy="native-capture-sizes-no-eviction-hard-hbm-v2",
 )
@@ -243,13 +243,9 @@ GLM5_PAIRED_C1 = AFDCapabilityProfile(
     stage_plan="native-tbo-s2-lane-merged-return-v2",
     stages=(2,),
     fa_backends=("nsa",),
-    # EP16 divides 256 experts; TP16 divides the 2048-wide FP8 block layout.
-    # The A role now builds only an empty MLP proxy, so A DP
-    # no longer inherits unused expert TP divisibility. DP LM head is still
-    # required when the vocabulary cannot divide the selected A role width.
-    # These are CPU-checked bounds, not a GPU validation or a resource grant.
+    # FFN EP/TP degrees must fit expert ownership and native quantized shards.
+    # A has no experts; its own projections, DP LM head and capacity checks apply.
     lanes=(1, 2, 4, 8, 16, 32),
-    attention_lanes=(1, 2, 3, 4, 8, 12, 16, 20, 24, 32),
     max_nodes=8,
     cache_policy="native-capture-sizes-no-eviction-hard-hbm-v2",
 )
