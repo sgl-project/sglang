@@ -594,7 +594,8 @@ def broadcast_global_expert_location_metadata(
     if not share_expert_map_via_store(
         metadata.physical_to_logical_map,
         is_src=rank_in_group == src_rank,
-        cohort_size=torch.distributed.get_world_size(group=group),
+        # Group ranks are dense by construction, so here the ids are the whole range.
+        cohort_ranks=range(torch.distributed.get_world_size(group=group)),
         group_rank=rank_in_group,
     ):
         torch.distributed.broadcast(
