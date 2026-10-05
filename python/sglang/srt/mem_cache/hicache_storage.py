@@ -44,6 +44,8 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
+    # Page hashes preceding the call's keys, from the sequence start;
+    # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
 
