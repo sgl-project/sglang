@@ -16,13 +16,14 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies::PolicyRegistry;
 use sgl_router::policies_reorg::factory::build_resolver;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
-use sgl_router::state::kv_events::{BlockSizeOracle, HashTree, KvEventIndex};
+use sgl_router::state::kv_events::{
+    BlockSizeOracle, HashTree, KvEventIndex, RadixTreePrefixProvider,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 
