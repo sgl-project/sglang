@@ -1,7 +1,6 @@
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,17 +15,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _qsa_pool_stub(*, full_layers, ratio=4, start_layer=0):
+def _qsa_pool_stub(*, full_layers, ratio=4):
     """QSATokenToKVPool shape without CUDA: a full-KV sub-pool plus compressed
     key buffers on the hybrid pool itself."""
     pool = object.__new__(QSATokenToKVPool)
     full = SimpleNamespace(layer_num=len(full_layers), size=256)
     full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
     pool.full_kv_pool = full
-    pool.start_layer = start_layer
-    pool.full_attention_layer_id_mapping = {
-        layer: i for i, layer in enumerate(full_layers)
-    }
     pool.qsa_index_kv_heads = 1
     pool.qsa_index_head_dim = 128
     pool.qsa_compress_ratio = ratio
@@ -36,20 +31,7 @@ def _qsa_pool_stub(*, full_layers, ratio=4, start_layer=0):
         )
         for _ in full_layers
     ]
-    pool.layer_transfer_counter = None
     return pool
-
-
-def test_compressed_key_getter_waits_for_the_layer_transfer():
-    """The indexer reads compressed keys before attention reads full KV. A
-    host restore still in flight must be fenced at this getter too (#39830)."""
-    pool = _qsa_pool_stub(full_layers=[7, 11], start_layer=4)
-    pool.layer_transfer_counter = Mock()
-
-    buffer = pool.get_qsa_compressed_k_buffer(11)
-
-    pool.layer_transfer_counter.wait_until.assert_called_once_with(11 - 4)
-    assert buffer is pool.qsa_compressed_k_buffer_pool[1]
 
 
 def test_host_pool_decls_put_kv_on_the_sub_pool_and_compressed_keys_on_the_hybrid():

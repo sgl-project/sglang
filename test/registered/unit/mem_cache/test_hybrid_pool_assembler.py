@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _kv_host_budget_share,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
@@ -392,19 +393,17 @@ def _recording_qsa_mirror(seen: list):
     """Stand-in for QSAIndexerPoolHost: records constructor arguments, since the
     real page-row mirror pins host memory."""
 
-    def build(*, decl, anchor_host, allocator_type, packed_draft_device_pools=()):
+    def build(device_pool, anchor_host, *, allocator_type, mtp_draft_device_pools=()):
         seen.append(
             dict(
-                decl=decl,
+                device_pool=device_pool,
                 anchor_host=anchor_host,
-                packed_draft_device_pools=packed_draft_device_pools,
+                mtp_draft_device_pools=mtp_draft_device_pools,
             )
         )
         return SimpleNamespace(
-            layer_num=len(decl.device_pool.qsa_compressed_k_buffer_pool)
-            + sum(
-                len(p.qsa_compressed_k_buffer_pool) for p in packed_draft_device_pools
-            ),
+            layer_num=len(device_pool.qsa_compressed_k_buffer_pool)
+            + sum(len(p.qsa_compressed_k_buffer_pool) for p in mtp_draft_device_pools),
             can_use_write_back_jit=False,
         )
 
@@ -976,7 +975,7 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
         self.assertIs(entries[0].device_pool, pool.full_kv_pool)
         self.assertIs(entries[1].device_pool, pool)
         (build,) = seen
-        self.assertIs(build["decl"].device_pool, pool)
+        self.assertIs(build["device_pool"], pool)
         self.assertIs(build["anchor_host"], entries[0].host_pool)
         self.assertEqual(
             [entries[1].layer_mapper(t) for t in range(4)], [None, 0, None, 1]
@@ -997,10 +996,43 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
         # mirror packs the draft hybrid pool that owns its keys.
         self.assertEqual(kv.packed_draft_device_pools, (draft.full_kv_pool,))
         self.assertEqual(indexer.packed_draft_device_pools, (draft,))
-        self.assertEqual(seen[0]["packed_draft_device_pools"], (draft,))
+        self.assertEqual(seen[0]["mtp_draft_device_pools"], (draft,))
         self.assertEqual(indexer.host_pool.layer_num, 3)
         # packed tail: transfer layer 4 -> device layer 2 on both host_pools
         self.assertEqual((kv.layer_mapper(4), indexer.layer_mapper(4)), (2, 2))
+
+    def test_fixed_host_size_counts_compressed_keys_against_kv(self):
+        pool = _qsa_pool_stub(layer_num=2)
+        draft = _qsa_pool_stub(layer_num=1)
+        kv_bytes = 3 << 20
+        pool.full_kv_pool.get_kv_size_bytes = lambda: kv_bytes
+        config = prepare_host_pool_config(
+            decls=pool.host_pool_decls(),
+            full_layer_mapping={0: 0, 1: 1},
+            transfer_layer_id_max=2,
+            transfer_page_size=64,
+            packed_draft_device_pools=(draft,),
+        )
+        index_bytes = sum(
+            b.nbytes for p in (pool, draft) for b in p.qsa_compressed_k_buffer_pool
+        )
+        self.assertEqual(
+            _kv_host_budget_share(kv_pool=pool.full_kv_pool, config=config),
+            kv_bytes / (kv_bytes + index_bytes),
+        )
+
+    def test_dsa_indexer_stays_on_top_of_the_kv_budget(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        config = prepare_host_pool_config(
+            decls=pool.host_pool_decls(),
+            full_layer_mapping={0: 0, 1: 1},
+            transfer_layer_id_max=2,
+            transfer_page_size=64,
+        )
+        self.assertEqual(
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
+        )
+        self.assertEqual(_kv_host_budget_share(kv_pool=pool, config=config), 1.0)
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):
@@ -1162,7 +1194,7 @@ class TestHostPoolPreflight(CustomTestCase):
     def test_qsa_page_mismatch_does_not_allocate_anchor(self):
         pool = _qsa_pool_stub(layer_num=1)
         with patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate:
-            with self.assertRaisesRegex(ValueError, "multiple"):
+            with self.assertRaisesRegex(ValueError, "divisible"):
                 prepare_host_pool_config(
                     decls=pool.host_pool_decls(),
                     full_layer_mapping={0: 0},
@@ -1171,13 +1203,13 @@ class TestHostPoolPreflight(CustomTestCase):
                 )
             allocate.assert_not_called()
 
-    def test_same_qsa_bytes_do_not_allow_a_different_dtype(self):
+    def test_qsa_page_bytes_must_match_the_declaration(self):
         pool = _qsa_pool_stub(layer_num=1)
         decl = pool.host_pool_decls()[1]
-        pool.qsa_compressed_k_buffer_pool[0] = pool.qsa_compressed_k_buffer_pool[
-            0
-        ].view(torch.int16)
-        with self.assertRaisesRegex(ValueError, "dtype"):
+        pool.qsa_compressed_k_buffer_pool[0] = torch.zeros(
+            1024, 1, 64, dtype=pool.index_state_dtype
+        )
+        with self.assertRaisesRegex(ValueError, "declared"):
             decl.host_pool_builder.validate(
                 decl=decl, transfer_page_size=64, packed_draft_device_pools=()
             )
@@ -1228,8 +1260,8 @@ class TestDeclaredPoolVerification(CustomTestCase):
         )
 
     def test_qsa_stack_without_compressed_keys_is_rejected(self):
-        # The KV + MAMBA stack that restored QSA models before the declaration
-        # existed: valid KV, stale block selection after a host hit.
+        # KV + MAMBA without the compressed keys restores valid KV but stale
+        # block selection after a host hit.
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             _MambaStrategy,
         )

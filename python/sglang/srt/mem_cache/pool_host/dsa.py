@@ -93,6 +93,14 @@ class DSAIndexerHostPoolBuilder:
             allocator_type=allocator_type,
         )
 
+    def kv_budget_bytes(
+        self,
+        *,
+        decl: HostPoolDecl,
+        packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
+    ) -> None:
+        return None
+
 
 def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
