@@ -429,9 +429,14 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # origin stream_interval logic
+                # Send the first token at once, then whenever at least
+                # stream_interval tokens are unsent. A step can append several
+                # tokens (speculative decoding, dLLM), so it can pass a multiple
+                # of the interval without landing on it.
+                num_unsent = len(req.output_ids) - req.send_token_offset
                 should_output = (
-                    len(req.output_ids) % stream_interval == 1
+                    num_unsent >= stream_interval
+                    or (req.send_token_offset == 0 and num_unsent > 0)
                     if stream_interval > 1
                     else len(req.output_ids) % stream_interval == 0
                 )
