@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -16,6 +17,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+    MiniMaxH3DecodingStage,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +45,42 @@ def _temporal_vae() -> AutoencoderKLLegacy:
 
 
 class TestDecodeHandsOutFinishedFrames(CustomTestCase):
+    def test_finished_callbacks_preserve_the_decode_buffer_for_fallback(self):
+        for device in ("cpu", "cuda"):
+            for stream_cat in ("1", "0"):
+                with (
+                    self.subTest(device=device, stream_cat=stream_cat),
+                    mock.patch.dict(
+                        os.environ,
+                        {"MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT": stream_cat},
+                    ),
+                ):
+                    vae = _temporal_vae()
+                    latents = torch.randn(1, 3, 31, 2, 2, device=device)
+                    expected_decode = vae.decode_base(latents)
+                    batch = SimpleNamespace(extra={})
+                    parts = []
+
+                    def finish_frames(frames):
+                        parts.append(
+                            MiniMaxH3DecodingStage._finish_visual_frames(
+                                batch, vae, frames, batch_size=1
+                            )
+                        )
+
+                    decoded = vae.decode_base(latents, on_frames=finish_frames)
+                    torch.testing.assert_close(decoded, expected_decode, rtol=0, atol=0)
+                    expected_output = vae.processor.revert_tensor(expected_decode)
+                    torch.testing.assert_close(
+                        torch.cat(parts, dim=2), expected_output, rtol=0, atol=0
+                    )
+                    fallback = MiniMaxH3DecodingStage._finish_visual_frames(
+                        batch, vae, decoded, batch_size=1, runtime_owned=True
+                    )
+                    torch.testing.assert_close(
+                        fallback, expected_output, rtol=0, atol=0
+                    )
+
     def test_every_frame_arrives_once_in_order_and_final(self):
         vae = _temporal_vae()
         latents = torch.randn(1, 3, 31, 2, 2)

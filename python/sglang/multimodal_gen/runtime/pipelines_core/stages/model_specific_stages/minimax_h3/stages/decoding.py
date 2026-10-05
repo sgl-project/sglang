@@ -394,10 +394,15 @@ class MiniMaxH3DecodingStage(DecodingStage):
 
     @staticmethod
     def _finish_visual_frames(
-        batch: Req, video_vae, frames: torch.Tensor, *, batch_size: int
+        batch: Req,
+        video_vae,
+        frames: torch.Tensor,
+        *,
+        batch_size: int,
+        runtime_owned: bool = False,
     ) -> torch.Tensor:
         frames = _required_tensor(
-            video_vae.processor.revert_tensor(frames),
+            video_vae.processor.revert_tensor(frames, runtime_owned=runtime_owned),
             "video_vae.processor.revert_tensor",
         )
         frames = _canonical_visual_video_frames(frames, batch_size=batch_size)
@@ -498,7 +503,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         stream.abort()
                     raise
                 if output_file_paths is None:
-                    visual_frames = finish_frames(decoded)
+                    # callbacks borrow slices of decoded; only the final output owns it
+                    visual_frames = finish_frames(decoded, runtime_owned=True)
                 del decoded
 
         if visual_frames is not None:
