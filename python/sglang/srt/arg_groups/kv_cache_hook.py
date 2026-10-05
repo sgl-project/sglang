@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -490,13 +490,14 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 
 
 def _assert_spec_verify_backends(
-    server_args: Any, *, algorithm: str, allowed: frozenset = None
+    server_args: Any, *, algorithm: str, allowed: Optional[frozenset] = None
 ) -> None:
     """Refuse target backends whose verify id rails are not translation-audited.
 
-    Only the target's prefill/decode pair is checked. A draft with a KV pool
-    of its own indexes that pool directly by virtual id, so its translator is
-    a passthrough and its backend has nothing to translate."""
+    Only the target's prefill/decode pair is checked here. A draft that fuses
+    into the target's pages must run on the translated rails; the fused-draft
+    decision enforces that by declining fusion otherwise, and a private-pool
+    draft indexes its own pool by virtual id."""
     if allowed is None:
         allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     if resolving_view(server_args).dcp_size > 1:
