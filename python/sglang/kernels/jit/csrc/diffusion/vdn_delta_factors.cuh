@@ -185,11 +185,11 @@ SGL_DEVICE void step(float2 (&t)[8][4], Smem& sm, int kt, int ti, int tj, int i0
 /**
  * \brief transition = diag(alpha) (I + A)^-1, injection = B (I + A)^-1 for a batch of 128x128 SPD A.
  *
- * \param A          [N, 128, 128] fp32, symmetric positive semi-definite (I + A is inverted)
- * \param B          [N, 128, 128] fp32
- * \param alpha      [N, 128] fp32 row scales of the transition
- * \param transition [N, 128, 128] fp32 output
- * \param injection  [N, 128, 128] fp32 output
+ * \param A          [..., 128, 128] fp32, symmetric positive semi-definite (I + A is inverted)
+ * \param B          [..., 128, 128] fp32
+ * \param alpha      [..., 128] fp32 row scales of the transition
+ * \param transition [..., 128, 128] fp32 output
+ * \param injection  [..., 128, 128] fp32 output
  */
 __global__ void __launch_bounds__(kBlockSize, kMinBlocksPerSm) vdn_delta_factors_kernel(
     const float* __restrict__ A,
@@ -305,11 +305,11 @@ struct VdnDeltaFactorsKernel {
   /**
    * \brief Validate the tensors and launch one CTA per matrix.
    *
-   * \param transition [N, 128, 128] fp32 output, diag(alpha) (I + A)^-1
-   * \param injection  [N, 128, 128] fp32 output, B (I + A)^-1
-   * \param A          [N, 128, 128] fp32 SPD statistics (I + A is inverted)
-   * \param B          [N, 128, 128] fp32
-   * \param alpha      [N, 128] fp32
+   * \param transition [..., 128, 128] fp32 output, diag(alpha) (I + A)^-1
+   * \param injection  [..., 128, 128] fp32 output, B (I + A)^-1
+   * \param A          [..., 128, 128] fp32 SPD statistics (I + A is inverted)
+   * \param B          [..., 128, 128] fp32
+   * \param alpha      [..., 128] fp32
    */
   static void
   run(tvm::ffi::TensorView transition,
@@ -318,18 +318,28 @@ struct VdnDeltaFactorsKernel {
       tvm::ffi::TensorView B,
       tvm::ffi::TensorView alpha) {
     using namespace host;
-    auto N = SymbolicSize{"num_matrices"};
+    CHECK_HOST(A.ndim() >= 2 && A.size(-2) == kDim && A.size(-1) == kDim)
+        << "vdn_delta_factors expects [..., 128, 128] matrices";
+    auto dtype = SymbolicDType{};
+    dtype.set_options<fp32_t>();
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({N, kDim, kDim})
-        .with_dtype<fp32_t>()
-        .with_device(device)
-        .verify(transition)
-        .verify(injection)
-        .verify(A)
-        .verify(B);
-    TensorMatcher({N, kDim}).with_dtype<fp32_t>().with_device(device).verify(alpha);
-    const int64_t num = N.unwrap();
+    for (const auto tensor : {A, B, transition, injection, alpha}) {
+      dtype.verify(tensor.dtype());
+      device.verify(tensor.device());
+      CHECK_HOST(tensor.is_contiguous()) << "vdn_delta_factors expects contiguous tensors";
+    }
+    for (const auto tensor : {B, transition, injection}) {
+      CHECK_HOST(tensor.ndim() == A.ndim()) << "vdn_delta_factors matrix ranks must match";
+      for (int64_t dim = 0; dim < A.ndim(); ++dim) {
+        CHECK_HOST(tensor.size(dim) == A.size(dim)) << "vdn_delta_factors matrix shapes must match";
+      }
+    }
+    CHECK_HOST(alpha.ndim() == A.ndim() - 1) << "alpha must have shape A.shape[:-1]";
+    for (int64_t dim = 0; dim < alpha.ndim(); ++dim) {
+      CHECK_HOST(alpha.size(dim) == A.size(dim)) << "alpha must have shape A.shape[:-1]";
+    }
+    const int64_t num = A.numel() / (kDim * kDim);
     if (num == 0) return;
     CHECK_HOST(
         transition.data_ptr() != A.data_ptr() && transition.data_ptr() != B.data_ptr() &&
