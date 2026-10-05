@@ -208,8 +208,10 @@ features below. Functional checks do not establish quality for lossy settings.
   multi-rank roles remain unverified for this model.
 - **Quantized exports:** serialized FP8, native-name Q4_0 GGUF, and calibrated
   ModelOpt NVFP4 component exports were checked on B200, including TP2 with
-  encoder folding and separate offload checks. These results do not establish
-  support for arbitrary community exports, other GGUF types, or other hardware.
+  encoder folding and separate offload checks. A community ComfyUI-GGUF Q4_K_M
+  DiT, which also quantizes the projections outside the blocks, was checked for
+  text-to-image on one RTX 5090. These results do not establish support for
+  arbitrary community exports, other GGUF types, or other hardware.
   The NVFP4 export used six calibration requests; assess image and alpha quality
   on your workload.
 - **LoRA:** synthetic Diffusers-format adapters were checked on one B200 and
