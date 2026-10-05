@@ -22,7 +22,7 @@ message GenerateRequest {
   StringOrList text = 2;
   TokenIdsOrList input_ids = 3;
   optional bool stream = 4 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_bool = false
   ];
   // One set of params, or one per batch item. JSON errors keep serde's
@@ -53,14 +53,14 @@ message GenerateRequest {
 
 message SamplingParamsOrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     SamplingParams one = 1;
     SamplingParamsList many = 2;
   }
 }
 
 message SamplingParamsList {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated SamplingParams items = 1;
 }
 
@@ -69,32 +69,32 @@ message SamplingParamsList {
 // optional: Python emits null for a position with no logprob (the first
 // prefill token; Rust maps the scheduler's NaN to the same null).
 message LogprobEntry {
-  option (sglang.json.v1.message_json).tuple = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TUPLE;
   optional double logprob = 1;
   int64 token_id = 2;
   optional string text = 3;
 }
 
 message LogprobEntries {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated LogprobEntry entries = 1;
 }
 
 // One decode position's top-k alternatives.
 message TopLogprobRow {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated LogprobEntry entries = 1;
 }
 
 // A position's row, or null: a position that recorded no alternatives is
 // null on the wire (Python parity), never [].
 message NullableTopLogprobs {
-  option (sglang.json.v1.message_json).transparent = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
   TopLogprobRow row = 1;
 }
 
 message HiddenStateRow {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated double values = 1;
 }
 

@@ -22,75 +22,104 @@ enum UnknownFields {
   UNKNOWN_FIELDS_DENY = 1;
 }
 
+// How a message is shaped on the JSON wire. One shape per message: an enum,
+// not independent flags, so two cannot be set at once.
+enum MessageShape {
+  // A plain JSON object keyed by field name (the default).
+  MESSAGE_SHAPE_OBJECT = 0;
+
+  // A single-`repeated`-field carrier (TokenIds, StringList, ...): its JSON
+  // is the bare array, not an {items: [...]} object, wherever it appears.
+  MESSAGE_SHAPE_BARE_LIST = 1;
+
+  // A positional tuple: the fields, in declaration order, form a bare array
+  // (e.g. a logprob entry's [logprob, token_id, text|null]). Optional members
+  // serialize as null.
+  MESSAGE_SHAPE_TUPLE = 2;
+
+  // A single-field message that is invisible in JSON: it serializes as its
+  // sole field's value (null when unset). Exists to give proto a presence
+  // wrapper for nullable LIST ELEMENTS (OptionalString, OptionalInt64).
+  MESSAGE_SHAPE_TRANSPARENT = 3;
+}
+
 message MessageJson {
   UnknownFields unknown_fields = 1;
+  MessageShape shape = 2;
+}
 
-  // This message is a single-`repeated`-field carrier (TokenIds, StringList,
-  // ...): its JSON is the bare array, not an {items: [...]} object, wherever
-  // it appears.
-  bool bare_list = 2;
+// How an absent key or an explicit JSON null reads into a field. One policy
+// per field: an enum, not independent flags, so two cannot be set at once.
+// Deserialization only; `emit_null_when_absent` is the serialization side.
+enum NullPolicy {
+  // Absent is unset; an explicit null is a type error (the default).
+  NULL_POLICY_DEFAULT = 0;
 
-  // This message is a positional tuple in JSON: its fields, in declaration
-  // order, form a bare array (e.g. a logprob entry's [logprob, token_id,
-  // text|null]). Optional members serialize as null.
-  bool tuple = 3;
+  // Explicit null (and an absent key) yields the stated default instead of
+  // an error: parity with Python dataclasses whose __post_init__ maps None
+  // back to the default.
+  NULL_POLICY_RESETS_DEFAULT = 1;
 
-  // This single-field message is invisible in JSON: it serializes as its sole
-  // field's value (null when unset). Exists to give proto a presence wrapper
-  // for nullable LIST ELEMENTS (OptionalString, OptionalInt64).
-  bool transparent = 4;
+  // An ABSENT key yields the stated default, but an explicit null clears the
+  // field to no-value (e.g. max_new_tokens: absent = 128, null = no limit).
+  NULL_POLICY_IS_NONE = 2;
 }
 
 message FieldJson {
-  // Explicit JSON null (and an absent key) yields the stated default instead
-  // of an error: parity with Python dataclasses whose __post_init__ maps None
-  // back to the default. Exactly one default_* must accompany it.
-  bool null_resets_default = 1;
+  NullPolicy null_policy = 1;
+  // The default a non-DEFAULT policy yields; exactly one must accompany it.
   optional double default_f64 = 2;
   optional int64 default_i64 = 3;
   optional bool default_bool = 4;
   optional string default_string = 5;
 
-  // An ABSENT key yields the stated default, but an explicit JSON null clears
-  // the field to no-value (e.g. max_new_tokens: absent = 128, null = no
-  // limit). Mutually exclusive with null_resets_default.
-  bool null_is_none = 6;
-
   // The key is always serialized, an unset value as an explicit null (e.g.
   // reasoning_content in chat deltas: Python always emits the key).
-  bool emit_null_when_absent = 7;
+  bool emit_null_when_absent = 6;
 
   // On a string (or repeated string) field: the string holds JSON text, and
   // HTTP (de)serialization passes the VALUE through — integers, nesting, and
   // element shapes intact (google.protobuf.Struct cannot do this: it coerces
   // integers to doubles). gRPC carries the JSON text.
-  bool raw_json = 8;
+  bool raw_json = 7;
 
   // On a map<string, ...> field whose keys are numeric strings (Python
   // parity, e.g. logit_bias token ids).
-  bool int_key_map = 9;
+  bool int_key_map = 8;
 }
 
-message OneofJson {
-  // The union is untagged in JSON: the value's shape picks the variant, and
-  // variant mismatch errors keep serde's field-level texts (never "data did
-  // not match any variant").
-  bool untagged = 1;
+// How a oneof (a union) is spelled on the JSON wire. One shape per union.
+enum OneofShape {
+  // Unset: the message owning the oneof is a plain object.
+  ONEOF_SHAPE_UNSPECIFIED = 0;
+
+  // Untagged: the value's shape picks the variant, and variant mismatch
+  // errors keep serde's field-level texts (never "data did not match any
+  // variant").
+  ONEOF_SHAPE_UNTAGGED = 1;
 
   // On a oneof of exactly { T one; TList many; }: a JSON scalar deserializes
   // as `one`, a JSON array as `many`; serialization flattens the same way.
-  bool one_or_many = 2;
+  ONEOF_SHAPE_ONE_OR_MANY = 2;
 
-  // The union is internally tagged in JSON by this key (e.g. finish_reason's
+  // Internally tagged by the key in `tag` (e.g. finish_reason's
   // {"type": "stop", ...}); variant payload fields inline into the same
   // object, with each variant's tag value being its field name.
-  string tag = 3;
+  ONEOF_SHAPE_TAGGED = 3;
+}
 
-  // JSON input matching no variant is captured verbatim by the designated
-  // catch-all variant (a raw_json Struct member) and round-trips unchanged —
-  // the forward-compatibility escape hatch for values another component may
-  // extend (e.g. finish_reason).
-  bool unknown_variant_passthrough = 4;
+message OneofJson {
+  OneofShape shape = 1;
+
+  // The discriminator key; required with ONEOF_SHAPE_TAGGED, meaningless
+  // otherwise.
+  string tag = 2;
+
+  // With ONEOF_SHAPE_TAGGED: JSON input matching no variant is captured
+  // verbatim by the designated catch-all variant (a raw_json Struct member)
+  // and round-trips unchanged -- the forward-compatibility escape hatch for
+  // values another component may extend (e.g. finish_reason).
+  bool unknown_variant_passthrough = 3;
 }
 
 extend google.protobuf.MessageOptions {

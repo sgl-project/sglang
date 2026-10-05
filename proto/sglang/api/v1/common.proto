@@ -10,7 +10,7 @@ import "sglang/json/v1/options.proto";
 
 // A token-id sequence. i32 matches the server's TokenIds (= Vec<i32>).
 message TokenIds {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated int32 ids = 1;
 }
 
@@ -19,53 +19,53 @@ message TokenIds {
 // option; gRPC clients pick the variant explicitly.
 message StringOrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     string one = 1;
     StringList many = 2;
   }
 }
 
 message StringList {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated string items = 1;
 }
 
 message BoolOrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     bool one = 1;
     BoolList many = 2;
   }
 }
 
 message BoolList {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated bool items = 1;
 }
 
 message Int64OrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     int64 one = 1;
     Int64List many = 2;
   }
 }
 
 message Int64List {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated int64 items = 1;
 }
 
 message TokenIdsOrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     TokenIds one = 1;
     TokenIdsList many = 2;
   }
 }
 
 message TokenIdsList {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated TokenIds items = 1;
 }
 
@@ -73,38 +73,38 @@ message TokenIdsList {
 // batch mixes bootstrapped and plain requests). Proto carries element
 // presence as a per-element oneof-free wrapper.
 message OptionalString {
-  option (sglang.json.v1.message_json).transparent = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
   optional string value = 1;
 }
 
 message OptionalStringOrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     OptionalString one = 1;
     OptionalStringList many = 2;
   }
 }
 
 message OptionalStringList {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated OptionalString items = 1;
 }
 
 message OptionalInt64 {
-  option (sglang.json.v1.message_json).transparent = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
   optional int64 value = 1;
 }
 
 message OptionalInt64OrList {
   oneof value {
-    option (sglang.json.v1.oneof_json).one_or_many = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
     OptionalInt64 one = 1;
     OptionalInt64List many = 2;
   }
 }
 
 message OptionalInt64List {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated OptionalInt64 items = 1;
 }
 

@@ -24,47 +24,47 @@ message SamplingParams {
   // 128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
   // gRPC entry); no limit needs an explicit large value.
   optional int64 max_new_tokens = 1 [
-    (sglang.json.v1.field_json).null_is_none = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_IS_NONE,
     (sglang.json.v1.field_json).default_i64 = 128
   ];
   StringOrList stop = 2;
   Int64List stop_token_ids = 3;
   StringOrList stop_regex = 4;
   optional double temperature = 5 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 1.0
   ];
   optional double top_p = 6 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 1.0
   ];
   // Default 1 << 30 (TOP_K_ALL): "consider the whole vocabulary".
   optional int64 top_k = 7 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_i64 = 1073741824
   ];
   optional double min_p = 8 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 0.0
   ];
   optional double frequency_penalty = 9 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 0.0
   ];
   optional double presence_penalty = 10 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 0.0
   ];
   optional double repetition_penalty = 11 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_f64 = 1.0
   ];
   optional int64 min_new_tokens = 12 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_i64 = 0
   ];
   optional int64 n = 13 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_i64 = 1
   ];
   optional string json_schema = 14;
@@ -72,19 +72,19 @@ message SamplingParams {
   optional string ebnf = 16;
   optional string structural_tag = 17;
   optional bool ignore_eos = 18 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_bool = false
   ];
   optional bool skip_special_tokens = 19 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_bool = true
   ];
   optional bool spaces_between_special_tokens = 20 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_bool = true
   ];
   optional bool no_stop_trim = 21 [
-    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
     (sglang.json.v1.field_json).default_bool = false
   ];
   optional int64 stream_interval = 22;

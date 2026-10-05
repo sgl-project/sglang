@@ -15,7 +15,7 @@ import "sglang/json/v1/options.proto";
 // are disjoint, so shape alone picks the arm (untagged).
 message Matched {
   oneof value {
-    option (sglang.json.v1.oneof_json).untagged = true;
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
     int64 token = 1;
     string str = 2;
     MatchedTokens tokens = 3;
@@ -23,7 +23,7 @@ message Matched {
 }
 
 message MatchedTokens {
-  option (sglang.json.v1.message_json).bare_list = true;
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated int64 ids = 1;
 }
 
@@ -47,6 +47,7 @@ message FinishAbort {
 
 message FinishReason {
   oneof kind {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_TAGGED;
     option (sglang.json.v1.oneof_json).tag = "type";
     option (sglang.json.v1.oneof_json).unknown_variant_passthrough = true;
     FinishStop stop = 1;

@@ -34,6 +34,14 @@ fn opt_bool(options: &prost_reflect::DynamicMessage, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// An enum-typed option as its number; 0 (the unset/default variant) when absent.
+fn opt_enum(options: &prost_reflect::DynamicMessage, name: &str) -> i32 {
+    options
+        .get_field_by_name(name)
+        .and_then(|v| v.as_enum_number())
+        .unwrap_or(0)
+}
+
 fn opt_str(options: &prost_reflect::DynamicMessage, name: &str) -> Option<String> {
     options
         .get_field_by_name(name)
@@ -214,9 +222,9 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
     let mopts = options.get_extension(&ext.message_json);
     let mopts = mopts.as_message();
 
-    let bare_list = mopts.map(|m| opt_bool(m, "bare_list")).unwrap_or(false);
-    let tuple = mopts.map(|m| opt_bool(m, "tuple")).unwrap_or(false);
-    let transparent = mopts.map(|m| opt_bool(m, "transparent")).unwrap_or(false);
+    // `MessageShape`: one shape per message, by construction of the enum.
+    let shape = mopts.map(|m| opt_enum(m, "shape")).unwrap_or(0);
+    let (bare_list, tuple, transparent) = (shape == 1, shape == 2, shape == 3);
     let deny_unknown = mopts
         .and_then(|m| m.get_field_by_name("unknown_fields"))
         .and_then(|v| v.as_enum_number())
@@ -272,9 +280,16 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
         let oopts = oneof.options();
         let oopts = oopts.get_extension(&ext.oneof_json);
         let oopts = oopts.as_message();
-        let one_or_many = oopts.map(|m| opt_bool(m, "one_or_many")).unwrap_or(false);
-        let untagged = oopts.map(|m| opt_bool(m, "untagged")).unwrap_or(false);
+        // `OneofShape`: one spelling per union, by construction of the enum.
+        let shape = oopts.map(|m| opt_enum(m, "shape")).unwrap_or(0);
+        let (untagged, one_or_many, tagged) = (shape == 1, shape == 2, shape == 3);
         let tag = oopts.and_then(|m| opt_str(m, "tag"));
+        assert_eq!(
+            tagged,
+            tag.is_some(),
+            "{}: ONEOF_SHAPE_TAGGED and `tag` go together",
+            msg.full_name()
+        );
         let passthrough_on = oopts
             .map(|m| opt_bool(m, "unknown_variant_passthrough"))
             .unwrap_or(false);
@@ -398,8 +413,9 @@ fn field_model(f: &FieldDescriptor, ext: &Extensions) -> FieldModel {
     };
     let raw_json = get_bool("raw_json");
     let emit_null = get_bool("emit_null_when_absent");
-    let null_resets = get_bool("null_resets_default");
-    let null_is_none = get_bool("null_is_none");
+    // `NullPolicy`: one policy per field, by construction of the enum.
+    let null_policy = fopts.map(|m| opt_enum(m, "null_policy")).unwrap_or(0);
+    let (null_resets, null_is_none) = (null_policy == 1, null_policy == 2);
     let default = fopts.and_then(default_lit);
 
     let kind = if raw_json {
@@ -445,12 +461,15 @@ fn field_model(f: &FieldDescriptor, ext: &Extensions) -> FieldModel {
                     FieldKind::OptScalar {
                         ty,
                         emit_null,
-                        null_is_none_default: null_is_none
-                            .then(|| default.clone().expect("null_is_none requires a default_*")),
+                        null_is_none_default: null_is_none.then(|| {
+                            default
+                                .clone()
+                                .expect("NULL_POLICY_IS_NONE requires a default_*")
+                        }),
                         null_default: null_resets.then(|| {
                             default
                                 .clone()
-                                .expect("null_resets_default requires a default_*")
+                                .expect("NULL_POLICY_RESETS_DEFAULT requires a default_*")
                         }),
                     }
                 } else {
@@ -459,7 +478,7 @@ fn field_model(f: &FieldDescriptor, ext: &Extensions) -> FieldModel {
                         null_default: null_resets.then(|| {
                             default
                                 .clone()
-                                .expect("null_resets_default requires a default_*")
+                                .expect("NULL_POLICY_RESETS_DEFAULT requires a default_*")
                         }),
                     }
                 }
