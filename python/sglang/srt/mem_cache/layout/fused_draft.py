@@ -65,6 +65,9 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    # The KV cache dtype the rows hold, where it differs from how they are
+    # stored: fp8 rows are stored as uint8.
+    kv_dtype: Optional[torch.dtype] = None
 
     def validate(self) -> None:
         assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
@@ -75,6 +78,9 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
 
     def resolved_v_head_dim(self) -> int:
         return self.head_dim if self.v_head_dim is None else self.v_head_dim
+
+    def resolved_kv_dtype(self) -> torch.dtype:
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -237,6 +243,7 @@ def place_fused_draft(
     profile: DraftKVProfile,
     num_runners: int,
     store_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
@@ -284,6 +291,7 @@ def place_fused_draft(
         head_dim=geometry.head_dim,
         v_head_dim=geometry.v_head_dim,
         store_dtype=store_dtype,
+        kv_dtype=kv_dtype,
     )
     return FusedDraftDecision(
         placement=FusedDraftPlacement(region=region, runner_lane_counts=full_counts)

@@ -737,8 +737,6 @@ class KVCacheConfigurator:
         private arm is the rollback lever, not a boot-order bug."""
         if not self.spec_algorithm.is_eagle():
             return None
-        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
-
         placement = alloc.unified_buffer.fused_draft
         if placement is None:
             logger.info(
@@ -746,13 +744,15 @@ class KVCacheConfigurator:
                 "buffer; the draft binds a private pool over the virtual id space."
             )
             return None
-        # The region stores rows in the target's KV dtype; a draft that resolved
-        # its own would read and write them as something else.
-        if _store_dtype_for(self.kv_cache_dtype) != placement.region.store_dtype:
+        # The region holds rows in the target's KV dtype; a draft that resolved
+        # its own would read and write them as something else. Compare the KV
+        # dtypes, not their storage: every fp8 flavor is stored as uint8.
+        region_kv_dtype = placement.region.resolved_kv_dtype()
+        if self.kv_cache_dtype != region_kv_dtype:
             raise ValueError(
                 f"Fused draft KV: the draft resolved its KV cache dtype to "
                 f"{self.kv_cache_dtype}, but its region inside the target's pages "
-                f"stores {placement.region.store_dtype}. Set "
+                f"holds {region_kv_dtype}. Set "
                 "--speculative-draft-kv-cache-dtype to the target's KV cache dtype."
             )
         return placement
@@ -1025,6 +1025,7 @@ class KVCacheConfigurator:
             profile=profile,
             num_runners=num_runners,
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            kv_dtype=self.kv_cache_dtype,
         )
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:

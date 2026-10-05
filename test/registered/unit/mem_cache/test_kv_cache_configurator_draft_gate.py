@@ -45,7 +45,11 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    MHASubPoolSpec,
+    UnifiedKVPool,
+    _store_dtype_for,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -168,10 +172,22 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
+    def _swa_allocator(
+        self,
+        *,
+        with_draft_region: bool,
+        n_full=32,
+        n_swa=16,
+        kv_dtype=torch.bfloat16,
+    ):
+        store_dtype = _store_dtype_for(kv_dtype)
         region = (
             DenseDraftRegion(
-                lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                lane_num=1,
+                head_num=1,
+                head_dim=16,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
             )
             if with_draft_region
             else None
@@ -180,8 +196,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="full",
             layer_num=2,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="down",
             draft_region=region,
         )
@@ -189,8 +205,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="swa",
             layer_num=1,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="up",
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
@@ -320,6 +336,30 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
                 kv_dtype=torch.float8_e4m3fn,
+            )
+
+    def test_an_fp8_region_binds_an_fp8_draft_and_refuses_another_fp8(self):
+        """Every fp8 flavor is stored as uint8, so the bind compares KV dtypes:
+        a draft resolving the target's fp8 binds a pool that casts to that fp8,
+        and one resolving a different fp8 refuses instead of reading e4m3 bytes
+        as e5m2."""
+        alloc = self._swa_allocator(
+            with_draft_region=True, kv_dtype=torch.float8_e4m3fn
+        )
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.EAGLE3,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        self.assertEqual(pools.token_to_kv_pool.dtype, torch.float8_e4m3fn)
+        self.assertEqual(pools.token_to_kv_pool.store_dtype, torch.uint8)
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+                kv_dtype=torch.float8_e5m2,
             )
 
     def test_a_draft_with_state_layers_refuses_to_bind(self):

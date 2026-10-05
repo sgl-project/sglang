@@ -286,6 +286,56 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         host.move_kv_cache(to_tokens(dst_page), to_tokens(src_page))
         self.assertEqual(float(dp.k_buffer[0][dst_t].sum()), 7.0 * 24)
 
+    def test_an_fp8_region_holds_fp8(self):
+        """Under an fp8 KV cache the fused rows are STORED as uint8 but hold
+        fp8: the pool's `dtype` is what `set_kv_buffer` casts to before viewing
+        the result as `store_dtype`, and what a read views the bytes back as.
+        A pool built on the storage dtype turns every write into an integer
+        cast -- silent garbage draft KV."""
+        fp8 = torch.float8_e4m3fn
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=16, store_dtype=torch.uint8, kv_dtype=fp8
+        )
+        host = MHASubPoolSpec(
+            name="full",
+            layer_num=2,
+            head_num=2,
+            head_dim=8,
+            store_dtype=torch.uint8,
+            grow_direction="down",
+            draft_region=region,
+        )
+        swa = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=8,
+            store_dtype=torch.uint8,
+            grow_direction="up",
+        )
+        pool = UnifiedKVPool(
+            total_bytes=self.PAGES * self.PS * (host.entry_bytes() + swa.entry_bytes()),
+            sub_pool_specs=[host, swa],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=_placement(region),
+        )
+        dp = UnifiedDraftKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=object(),
+            layer_lanes={0: 0},
+            page_size=self.PS,
+        )
+        self.assertEqual((dp.dtype, dp.store_dtype), (fp8, torch.uint8))
+        # The fp8 bytes a write stores read back as the same fp8 values.
+        loc = torch.tensor([3, 4], dtype=torch.int64)
+        k = torch.tensor([0.5, -1.0, 2.0, 0.25] * 8).view(2, 1, 16)
+        dp.k_buffer[0][loc] = k.to(fp8).view(torch.uint8)
+        self.assertEqual(dp.get_key_buffer(0).dtype, fp8)
+        torch.testing.assert_close(dp.get_key_buffer(0)[loc].float(), k)
+
     def test_draft_side_moves_and_transfers_fail_loudly(self):
         pool = self._pool()
         dp, _ = self._draft_pool(pool)

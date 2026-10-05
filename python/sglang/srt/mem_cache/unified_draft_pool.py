@@ -62,7 +62,9 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         super().__init__(
             size=num_pages * page_size - page_size,
             page_size=page_size,
-            dtype=region.store_dtype,
+            # The KV dtype, not its storage: `set_kv_buffer` casts to `dtype`
+            # and views the result as `store_dtype` (uint8 for fp8).
+            dtype=region.resolved_kv_dtype(),
             head_num=region.head_num,
             head_dim=region.head_dim,
             layer_num=len(layer_ids),
