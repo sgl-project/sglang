@@ -152,7 +152,7 @@ async fn rejection_and_load_switches_rebind_the_session() {
         let store = AffinityStore::new(Duration::from_secs(60));
         let mut policy = SessionAwarePolicy::new(store, table.clone());
         policy.config.mode = mode;
-        policy.config.load_gap = 10;
+        policy.config.load_gap = Some(10);
         policy.admission = Arc::new(AdmissionLimits {
             max_inflight_requests: Some(10),
             ..Default::default()

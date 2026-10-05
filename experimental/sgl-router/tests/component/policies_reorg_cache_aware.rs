@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
-use sgl_router::config::{AffinityConfig, AffinityMode};
+use sgl_router::config::{AffinityConfig, AffinityMode, BalancedBy};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource, PrefixMemo};
@@ -404,7 +404,57 @@ async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
             AffinityConfig {
                 mode,
                 load_factor: 2.0,
-                load_gap: 10,
+                load_gap: Some(10),
+                ..config()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy
+                .pick(&engines, &request(&model))
+                .await
+                .unwrap()
+                .engine
+                .id
+                .0,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
+    let engines = [engine("owner", 0), engine("cold", 9)];
+    let model = ModelId("m".into());
+    // Default gap is 4 requests; no native load is reported.
+    for (owner, cold, expected) in [
+        (10, Some(2), "cold"),
+        (10, Some(6), "owner"),
+        (4, Some(0), "owner"),
+        (10, None, "owner"),
+    ] {
+        let table = EngineReportedLoadTable::new();
+        for (engine, running) in [(&engines[0], Some(owner)), (&engines[1], cold)] {
+            let Some(running) = running else { continue };
+            table.set(
+                &engine.url,
+                0,
+                LoadStat {
+                    num_running_reqs: running,
+                    num_waiting_reqs: 0,
+                    num_tokens: 10,
+                    max_total_num_tokens: 100,
+                    native_cache: None,
+                },
+                Instant::now(),
+            );
+        }
+        let policy = CacheAwarePolicy::new(
+            local(&[(&engines[0], 8)]),
+            table,
+            AffinityConfig {
+                mode: AffinityMode::Balanced,
+                balanced_by: BalancedBy::RunningRequests,
                 ..config()
             },
         )
@@ -435,7 +485,7 @@ async fn rejected_owner_falls_back_but_rejected_alternative_preserves_affinity()
             table,
             AffinityConfig {
                 mode: AffinityMode::Balanced,
-                load_gap: 10,
+                load_gap: Some(10),
                 ..config()
             },
         )

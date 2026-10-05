@@ -13,12 +13,13 @@ use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
-    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
+    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
+    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
+    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 
@@ -377,11 +378,16 @@ pub struct AffinityArgs {
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
 
+    /// Reorg balanced affinity: load compared against the alternative
+    /// (default pending-prefill-tokens).
+    #[arg(long, value_enum)]
+    pub affinity_balanced_by: Option<BalancedBy>,
+
     /// Reorg balanced affinity: switch only above this load ratio (>= 1, default 2).
     #[arg(long)]
     pub affinity_load_factor: Option<f64>,
 
-    /// Reorg balanced affinity: minimum waiting uncached token difference (default 1024).
+    /// Reorg balanced affinity: minimum load difference (default 1024 tokens or 4 requests).
     #[arg(long)]
     pub affinity_load_gap: Option<u64>,
 
@@ -458,9 +464,10 @@ impl Cli {
                 self.affinity
                     .affinity_mode
                     .is_none_or(|mode| matches!(mode, AffinityMode::Strict | AffinityMode::Soft))
+                    && self.affinity.affinity_balanced_by.is_none()
                     && self.affinity.affinity_load_factor.is_none()
                     && self.affinity.affinity_load_gap.is_none(),
-                "prefer, balanced and --affinity-load-* require --chat-routing reorg"
+                "prefer, balanced, --affinity-balanced-by and --affinity-load-* require --chat-routing reorg"
             );
             ensure!(
                 self.routing.max_kv_usage.is_none(),
@@ -473,10 +480,11 @@ impl Cli {
             );
         }
         ensure!(
-            (self.affinity.affinity_load_factor.is_none()
+            (self.affinity.affinity_balanced_by.is_none()
+                && self.affinity.affinity_load_factor.is_none()
                 && self.affinity.affinity_load_gap.is_none())
                 || self.affinity.affinity_mode == Some(AffinityMode::Balanced),
-            "--affinity-load-* require --affinity-mode balanced"
+            "--affinity-balanced-by and --affinity-load-* require --affinity-mode balanced"
         );
         let affinity = self
             .affinity
@@ -1003,8 +1011,9 @@ impl AffinityArgs {
             session_eviction_interval_secs,
             stable_pair: self.stable_pair,
             mode: self.affinity_mode.unwrap_or(defaults.mode),
+            balanced_by: self.affinity_balanced_by.unwrap_or(defaults.balanced_by),
             load_factor,
-            load_gap: self.affinity_load_gap.unwrap_or(defaults.load_gap),
+            load_gap: self.affinity_load_gap,
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -1198,10 +1207,30 @@ mod tests {
                 if let Ok(config) = result {
                     let affinity = config.model.affinity.unwrap();
                     assert_eq!(affinity.load_factor, factor.parse::<f64>().unwrap());
-                    assert_eq!(affinity.load_gap, 10);
+                    assert_eq!(affinity.load_gap(), 10);
                 }
             }
+            for (metric, balanced_by, gap) in [
+                ("", BalancedBy::PendingPrefillTokens, 1_024),
+                (
+                    "--affinity-balanced-by running-requests",
+                    BalancedBy::RunningRequests,
+                    4,
+                ),
+            ] {
+                let config = cfg_of(&format!("{base} --affinity-mode balanced {metric}")).unwrap();
+                let affinity = config.model.affinity.unwrap();
+                assert_eq!(
+                    (affinity.balanced_by, affinity.load_gap()),
+                    (balanced_by, gap)
+                );
+            }
             assert!(cfg_of(&format!("{base} --affinity-load-gap 10")).is_err());
+            assert!(cfg_of(&format!("{base} --affinity-balanced-by running-requests")).is_err());
+            assert!(cfg_of(&format!(
+                "--policy {policy} --affinity-balanced-by running-requests"
+            ))
+            .is_err());
             assert!(cfg_of(&format!("--policy {policy} --affinity-mode balanced")).is_err());
         }
     }
@@ -2933,7 +2962,8 @@ mod tests {
             "ttft_slo": "slo_first",
             "buckets": [
                 {"id": "short", "max_input_tokens": 4096, "plain": {
-                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9}
+                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9},
+                    "affinity": {"mode": "balanced", "balanced_by": "running_requests"}
                 }},
                 {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two", "worker_services": ["ns/decode"]}}
             ]
@@ -2944,6 +2974,11 @@ mod tests {
             .map(|b| (b.id.as_str(), b.rank, b.limits.max))
             .collect();
         assert_eq!(shape, [("short", 0, Some(4096)), ("long", 1, None)]);
+        let crate::buckets_reorg::BucketGroups::Plain(short) = &resolver.buckets[0].groups else {
+            panic!("expected plain bucket");
+        };
+        let short = format!("{:?}", short.policy);
+        assert!(short.contains("mode: Balanced, balanced_by: RunningRequests"));
         let crate::buckets_reorg::BucketGroups::Pd { decode, .. } = &resolver.buckets[1].groups
         else {
             panic!("expected PD bucket");
@@ -2978,6 +3013,11 @@ mod tests {
             json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/short/extra"]}}]}),
             json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/ short"]}}]}),
             json!({"buckets": [{"id": "x", "plain": {"worker_ids": ["a"], "worker_services": ["ns/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "strict"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"balanced_by": "running_requests"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "balanced", "load_factor": 0.5}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"load_gap": 1, "mode": "balanced", "extra": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"policy": "power_of_two", "affinity": {"mode": "balanced"}}}]}),
         ] {
             assert!(build(&bad).is_err(), "accepted {bad}");
         }
