@@ -2041,36 +2041,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
-            if envs.SGLANG_OPT_FUSED_TRTLLM_KV_STORE.get():
-                from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
-                    fused_k_norm_rope_uniform_fp8,
-                )
-
-                fused_k_norm_rope_uniform_fp8(
-                    kv,
-                    kv_weight,
-                    eps,
-                    freqs_cis,
-                    positions,
-                    swa_loc,
-                    self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
-                )
-                return
-            # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
-            # then an e4m3 cast + scatter with per-tensor scale 1.0.
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
-                fused_norm_rope_inplace_triton,
+            from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
+                fused_k_norm_rope_uniform_fp8,
             )
 
-            fused_norm_rope_inplace_triton(
+            fused_k_norm_rope_uniform_fp8(
                 kv,
                 kv_weight,
                 eps,
                 freqs_cis,
-                positions=positions,
-            )
-            self.swa_kv_pool.set_key_buffer_fused(
-                self._swa_local_layer_id(layer_id), swa_loc, kv
+                positions,
+                swa_loc,
+                self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
         fused_k_norm_rope_flashmla(
