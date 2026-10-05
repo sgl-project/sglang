@@ -1,6 +1,5 @@
 """Repeated and batched projections retain native checkpoint partitions."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -11,9 +10,10 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -94,7 +94,7 @@ def values(rows, columns, layer, offset=0):
 
 def load_projection(layer):
     rank, size = getattr(layer, "tp_rank", 0), getattr(layer, "tp_size", 1)
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, linear.MergedColumnParallelRepeatedLinear):
             shards = []
             for i, local_size in enumerate(layer.output_partition_sizes):
@@ -167,13 +167,7 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                 linear.MergedColumnParallelRepeatedLinear,
                 linear.ColumnParallelBatchedLinear,
             ):
-                kwargs = {}
-                if group is not None:
-                    kwargs = (
-                        dict(parallel_group=group)
-                        if "parallel_group" in inspect.signature(cls).parameters
-                        else dict(tp_rank=rank, tp_size=size)
-                    )
+                kwargs = {} if group is None else dict(parallel_group=group)
                 layer = (
                     cls(8, [16, 8], [4], **kwargs)
                     if cls is linear.MergedColumnParallelRepeatedLinear
@@ -292,7 +286,7 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                                             else nullcontext()
                                         )
                                         with (
-                                            get_parallel().override(
+                                            parallel_scope(
                                                 tp_group=tp, attn_tp_group=attn
                                             ),
                                             patch(

@@ -13,12 +13,11 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_disagg,
-    get_parallel,
-    publish,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -154,7 +153,7 @@ def load_projection(layer):
             / 128
         ).to(dtype)
 
-    with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
         if isinstance(layer, QKVParallelLinear):
             weights, biases = [], []
             for offset, shard_id in enumerate(("q", "k", "v")):
@@ -295,9 +294,7 @@ class TestVisionParallelGroups(CustomTestCase):
                             tp.all_reduce.reset_mock()
                             attn.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=False,

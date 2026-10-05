@@ -9,15 +9,24 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.linear import (
+    ColumnParallelBatchedLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    derive_parallel_widths,
+    get_parallel,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -46,12 +55,12 @@ class TestLinearParallelGroups(CustomTestCase):
                 shard = self.weight.chunk(size, dim=0)[rank]
                 layer.weight.weight_loader(layer.weight, self.weight)
                 torch.testing.assert_close(layer(self.x)[0], F.linear(self.x, shard))
-                with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+                with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                     layer.weight.weight_loader(layer.weight, self.weight + 1)
                 torch.testing.assert_close(layer.weight, shard + 1)
 
-        with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
-            with get_parallel().override(tp_rank=1, attn_tp_rank=1):
+        with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+            with parallel_scope(tp_rank=1, attn_tp_rank=1):
                 layer = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
         layer.weight.weight_loader(layer.weight, self.weight)
         torch.testing.assert_close(layer.weight, self.weight[4:])
@@ -83,7 +92,7 @@ class TestLinearParallelGroups(CustomTestCase):
                 )
                 expected = torch.cat((q[4:], k[kv_slice], v[kv_slice]))
                 torch.testing.assert_close(qkv(self.x)[0], F.linear(self.x, expected))
-                with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+                with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                     for name, weight in (("q", q), ("k", k), ("v", v)):
                         qkv.weight.weight_loader(qkv.weight, weight + 1, name)
                 torch.testing.assert_close(qkv.weight, expected + 1)
@@ -114,9 +123,7 @@ class TestLinearParallelGroups(CustomTestCase):
                     # Reload under another replica's scope. This model was
                     # constructed on attention rank 1, so Q stays on that rank
                     # and the one-head K/V layout remains replicated.
-                    with get_parallel().override(
-                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
-                    ):
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                         for name, weight in weights.items():
                             qkv.weight.weight_loader(qkv.weight, weight, name)
                             if bias:
@@ -163,9 +170,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         bias=bias,
                     )
                     row = attention.o_proj
-                    with get_parallel().override(
-                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
-                    ):
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                         row.weight.weight_loader(row.weight, self.weight)
                         if bias:
                             row.bias.weight_loader(row.bias, torch.arange(8).float())
@@ -175,7 +180,7 @@ class TestLinearParallelGroups(CustomTestCase):
                     # The boundary reduces this partial result. Its allocation
                     # still uses TP and the DP-padding condition.
                     with (
-                        get_parallel().override(tp_group=tp, attn_tp_group=attn),
+                        parallel_scope(tp_group=tp, attn_tp_group=attn),
                         patch(
                             "sglang.srt.layers.linear.is_allocation_symmetric",
                             return_value=symmetric,
@@ -224,13 +229,13 @@ class TestLinearParallelGroups(CustomTestCase):
                         max_position_embeddings=16,
                     )
                 row = attention.o_proj
-                with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+                with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                     row.weight.weight_loader(row.weight, self.weight)
                 self.assertEqual((row.tp_rank, row.tp_size), (1, 2))
                 self.assertFalse(row.reduce_results)
                 self.assertEqual(row.use_dp_attention_reduce, use_attention_allocation)
                 with (
-                    get_parallel().override(tp_group=tp, attn_tp_group=attn),
+                    parallel_scope(tp_group=tp, attn_tp_group=attn),
                     patch(
                         "sglang.srt.layers.linear.is_allocation_symmetric",
                         return_value=False,
@@ -294,9 +299,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         "k": self.weight[: kv_heads * 2] + 2,
                         "v": self.weight[: kv_heads * 2] + 4,
                     }
-                    with get_parallel().override(
-                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
-                    ):
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                         for name, weight in weights.items():
                             qkv.weight.weight_loader(qkv.weight, weight, name)
                             if qkv.bias is not None:
@@ -317,9 +320,7 @@ class TestLinearParallelGroups(CustomTestCase):
                     gate_weight = (
                         self.weight if mode == "per-element" else self.weight[:4]
                     )
-                    with get_parallel().override(
-                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
-                    ):
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                         gate.weight.weight_loader(gate.weight, gate_weight)
                     torch.testing.assert_close(
                         gate(self.x)[0], F.linear(self.x, gate_weight.chunk(2)[1])
@@ -341,7 +342,7 @@ class TestLinearParallelGroups(CustomTestCase):
             )
         # Reload while a different rank is current. The stored rank still owns
         # the latter half of Q and each MLP matrix, while K/V stay replicated.
-        with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+        with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
             column.weight.weight_loader(column.weight, self.weight)
             row.weight.weight_loader(row.weight, self.weight)
             merged.weight.weight_loader(merged.weight, self.weight, 0)
@@ -365,7 +366,7 @@ class TestLinearParallelGroups(CustomTestCase):
     def test_gather_uses_the_selected_group(self):
         tp = SimpleNamespace(world_size=4, all_gather=Mock())
         attn = SimpleNamespace(world_size=2, all_gather=Mock())
-        with get_parallel().override(tp_group=tp, attn_tp_group=attn):
+        with parallel_scope(tp_group=tp, attn_tp_group=attn):
             for group, rank, size, selected, other in (
                 ("tp", 3, 4, tp, attn),
                 ("attn_tp", 1, 2, attn, tp),
@@ -399,7 +400,7 @@ class TestLinearParallelGroups(CustomTestCase):
             world_size=4, all_reduce=Mock(side_effect=AssertionError("wrong group"))
         )
         with (
-            get_parallel().override(tp_group=tp, attn_tp_group=attn),
+            parallel_scope(tp_group=tp, attn_tp_group=attn),
             patch(
                 "sglang.srt.layers.linear.use_symmetric_memory",
                 return_value=nullcontext(),
@@ -426,7 +427,7 @@ class TestLinearParallelGroups(CustomTestCase):
             layer.reduce_results = False
             torch.testing.assert_close(layer(self.x)[0], partial)
             attn.all_reduce.assert_not_called()
-            with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+            with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                 layer.weight.weight_loader(layer.weight, self.weight + 1)
             torch.testing.assert_close(layer.weight, self.weight[:, 4:] + 1)
 
@@ -460,16 +461,14 @@ class TestLinearParallelGroups(CustomTestCase):
                                 use_dp_attention_reduce=attention_reduce,
                                 reduce_results=reduce_results,
                             )
-                            with get_parallel().override(
+                            with parallel_scope(
                                 tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
                             ):
                                 layer.weight.weight_loader(layer.weight, self.weight)
                             shard = self.weight.chunk(size, dim=1)[rank]
                             partial = F.linear(self.x.chunk(size, dim=1)[rank], shard)
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=symmetric,
@@ -557,9 +556,7 @@ class TestLinearParallelGroups(CustomTestCase):
                     mlp.act_fn._forward_method = mlp.act_fn.forward_native
                     up = getattr(mlp, "gate_up_proj", getattr(mlp, "up_proj", None))
                     down = mlp.down_proj
-                    with get_parallel().override(
-                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
-                    ):
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                         if cls is NemotronHMLP:
                             up.weight.weight_loader(up.weight, self.weight)
                         else:
@@ -580,7 +577,7 @@ class TestLinearParallelGroups(CustomTestCase):
                     if reduces:
                         expected = expected * 2
                     with (
-                        get_parallel().override(tp_group=tp),
+                        parallel_scope(tp_group=tp),
                         patch(
                             "sglang.srt.layers.linear.is_allocation_symmetric",
                             return_value=True,
@@ -632,7 +629,7 @@ class TestLinearParallelGroups(CustomTestCase):
         self.assertFalse(layer.share_expert.down_proj.reduce_results)
 
     def test_replicated_layers_need_no_group_handle(self):
-        with get_parallel().override(tp_group=None, attn_tp_group=None):
+        with parallel_scope(tp_group=None, attn_tp_group=None):
             for cls, kwargs in (
                 (ColumnParallelLinear, dict(gather_output=True)),
                 (RowParallelLinear, dict(input_is_parallel=False)),
@@ -644,7 +641,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         layer(self.x)[0], F.linear(self.x, self.weight)
                     )
 
-    def test_legacy_arguments_remain_available_and_mixing_is_rejected(self):
+    def test_constructor_placement_accepts_groups_and_rejects_integer_arguments(self):
         constructors = (
             lambda **kwargs: ColumnParallelLinear(8, 8, bias=False, **kwargs),
             lambda **kwargs: MergedColumnParallelLinear(
@@ -652,13 +649,21 @@ class TestLinearParallelGroups(CustomTestCase):
             ),
             lambda **kwargs: QKVParallelLinear(8, 2, 4, bias=False, **kwargs),
             lambda **kwargs: RowParallelLinear(8, 8, bias=False, **kwargs),
+            lambda **kwargs: MergedColumnParallelRepeatedLinear(
+                8, [8, 4], [2], **kwargs
+            ),
+            lambda **kwargs: ColumnParallelBatchedLinear(
+                2, 8, 8, torch.float32, **kwargs
+            ),
         )
         for build in constructors:
             self.assertEqual((build().tp_rank, build().tp_size), (3, 4))
-            explicit = build(tp_rank=0, tp_size=1)
-            self.assertEqual((explicit.tp_rank, explicit.tp_size), (0, 1))
+            replicated = build(parallel_group="replicated")
+            self.assertEqual((replicated.tp_rank, replicated.tp_size), (0, 1))
             for kwargs in (dict(tp_rank=0), dict(tp_size=1)):
-                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+                    build(**kwargs)
+                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
                     build(parallel_group="replicated", **kwargs)
             with self.assertRaisesRegex(ValueError, "Unknown linear parallel_group"):
                 build(parallel_group="unknown")
@@ -668,12 +673,130 @@ class TestLinearParallelGroups(CustomTestCase):
             )
             self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
             self.assertEqual(layer.use_dp_attention_reduce, old_reduce)
-        legacy = RowParallelLinear(
-            8, 8, tp_rank=1, tp_size=2, use_dp_attention_reduce=True
+        layer = RowParallelLinear(
+            8, 8, parallel_group="attn_tp", use_dp_attention_reduce=True
         )
-        self.assertTrue(legacy.use_dp_attention_reduce)
-        legacy.use_dp_attention_reduce = False
-        self.assertFalse(legacy.use_dp_attention_reduce)
+        self.assertTrue(layer.use_dp_attention_reduce)
+        layer.use_dp_attention_reduce = False
+        self.assertFalse(layer.use_dp_attention_reduce)
+
+    def test_layers_own_groups_without_rank_or_size_snapshots(self):
+        group = get_parallel().attn_tp_group
+        layer = QKVParallelLinear(8, 2, 4, 1, parallel_group="attn_tp")
+        self.assertIs(layer.tp_group, group)
+        self.assertIs(layer.kv_tp_group, group)
+        for key in ("tp_rank", "tp_size", "kv_tp_rank", "kv_tp_size"):
+            self.assertNotIn(key, layer.__dict__)
+        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+            self.assertIs(layer.tp_group, group)
+            self.assertIsNot(layer.tp_group, get_parallel().attn_tp_group)
+            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+        with parallel_scope(attn_tp_group=None):
+            with self.assertRaisesRegex(ValueError, "group must exist"):
+                ColumnParallelLinear(8, 8, parallel_group="attn_tp")
+
+    def test_quant_initialization_keeps_the_entry_scope_partition(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        observed = []
+
+        class ScopeChangingConfig:
+            def get_quant_method(config, layer, prefix):
+                observed.append((layer.tp_rank, layer.tp_size, layer.parallel_group))
+                scope = parallel_scope(
+                    tp_size=1,
+                    tp_rank=0,
+                    attn_tp_rank=0,
+                    attn_dp_rank=0,
+                    moe_tp_rank=0,
+                    **derive_parallel_widths(
+                        tp_size=1,
+                        attn_cp_size=1,
+                        attn_dp_size=1,
+                        moe_ep_size=1,
+                        moe_dp_size=1,
+                        dcp_size=1,
+                        dcp_enabled=False,
+                    ),
+                )
+                scope.__enter__()
+                method = UnquantizedLinearMethod()
+                native_create = method.create_weights
+
+                def create_weights(**kwargs):
+                    try:
+                        native_create(**kwargs)
+                    finally:
+                        scope.__exit__(None, None, None)
+
+                method.create_weights = create_weights
+                return method
+
+        for group, rank, size in (
+            (None, 3, 4),
+            ("attn_tp", 1, 2),
+            ("replicated", 0, 1),
+        ):
+            config = ScopeChangingConfig()
+            options = dict(bias=False, quant_config=config, parallel_group=group)
+            layers = (
+                ColumnParallelLinear(8, 8, **options),
+                MergedColumnParallelLinear(8, [8, 4], **options),
+                QKVParallelLinear(
+                    8,
+                    2,
+                    4,
+                    1,
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                    **options,
+                ),
+                RowParallelLinear(8, 8, reduce_results=False, **options),
+                MergedColumnParallelRepeatedLinear(
+                    8, [8, 4], [2], quant_config=config, parallel_group=group
+                ),
+            )
+            self.assertEqual(observed[-5:], [(rank, size, group)] * 5)
+            self.assertEqual(get_parallel().tp_size, 4)
+            for layer in layers:
+                with self.subTest(group=group, layer=type(layer).__name__):
+                    self.assertEqual((layer.tp_rank, layer.tp_size), (rank, size))
+                    if isinstance(layer, RowParallelLinear):
+                        expected = self.weight.chunk(size, dim=1)[rank]
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                    elif isinstance(layer, QKVParallelLinear):
+                        pieces = (
+                            ("q", self.weight),
+                            ("k", self.weight[:2] + 2),
+                            ("v", self.weight[:2] + 4),
+                        )
+                        for shard, weight in pieces:
+                            layer.weight.weight_loader(layer.weight, weight, shard)
+                        expected = torch.cat(
+                            (self.weight.chunk(size)[rank], pieces[1][1], pieces[2][1])
+                        )
+                        self.assertEqual((layer.kv_tp_rank, layer.kv_tp_size), (0, 1))
+                    elif isinstance(
+                        layer,
+                        (
+                            MergedColumnParallelLinear,
+                            MergedColumnParallelRepeatedLinear,
+                        ),
+                    ):
+                        pieces = [self.weight, self.weight[:4] + 2]
+                        if isinstance(layer, MergedColumnParallelRepeatedLinear):
+                            pieces.append(self.weight[:2] + 4)
+                        for shard, weight in enumerate(pieces):
+                            layer.weight.weight_loader(layer.weight, weight, shard)
+                        expected = torch.cat(
+                            [
+                                weight.chunk(size)[rank] if i < 2 else weight
+                                for i, weight in enumerate(pieces)
+                            ]
+                        )
+                    else:
+                        expected = self.weight.chunk(size)[rank]
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                    torch.testing.assert_close(layer.weight, expected)
 
 
 if __name__ == "__main__":

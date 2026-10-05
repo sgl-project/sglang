@@ -10,9 +10,10 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.layer_boundary.factories import layer_stack
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -80,7 +81,7 @@ def values(rows, columns, layer, offset=0):
 
 def load_projection(layer):
     rank, size = layer.tp_rank, layer.tp_size
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, linear.QKVParallelLinear):
             shards = []
             for i, name in enumerate(("q", "k", "v")):
@@ -159,9 +160,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                                 x = values(2, shard.shape[1], layer, 7)
                                 tp, attn = Mock(), Mock()
                                 with (
-                                    get_parallel().override(
-                                        tp_group=tp, attn_tp_group=attn
-                                    ),
+                                    parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
                                         "use_symmetric_memory",
@@ -236,7 +235,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
         )
         with self.assertRaises(AssertionError):
             linear.resolve_linear_parallel_group(ReplicatedParallelGroup("tp", 3))
-        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
             linear.QKVParallelLinear(8, 2, 8, 4, kv_parallel_group="tp", kv_tp_size=4)
 
 

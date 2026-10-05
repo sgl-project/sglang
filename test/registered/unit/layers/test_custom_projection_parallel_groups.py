@@ -1,6 +1,5 @@
 """Custom projections retain frozen checkpoint shards and native math."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -12,9 +11,10 @@ from sglang.srt.layers import linear, mova
 from sglang.srt.models.inkling_common import dense_mlp
 from sglang.srt.models.inkling_common.attn import InklingAttention
 from sglang.srt.models.inkling_common.moe import _build_inkling_shared_experts
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -53,7 +53,7 @@ def load_projection(layer):
     weights, biases = [], []
     r, s = layer.tp_rank, layer.tp_size
     row = isinstance(layer, linear.RowParallelLinear)
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if row:
             full = values(
                 (layer.output_size, layer.input_size),
@@ -93,23 +93,7 @@ def load_projection(layer):
 
 
 def build_batch(group=None, *, width=16, linearized=False, execution_group=None):
-    kwargs = {}
-    if group is not None:
-        if (
-            "parallel_group"
-            in inspect.signature(dense_mlp.InklingBatchDenseMLP).parameters
-        ):
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            rank, size = (
-                (0, 1)
-                if group == "replicated"
-                else (parallel.attn_tp_rank, parallel.attn_tp_size)
-                if group == "attn_tp"
-                else (parallel.tp_rank, parallel.tp_size)
-            )
-            kwargs.update(tp_rank=rank, tp_size=size)
+    kwargs = {} if group is None else dict(parallel_group=group)
     return dense_mlp.InklingBatchDenseMLP(
         2,
         width,
@@ -131,7 +115,7 @@ def load_batch(module):
         "w2": values((2, module.hidden_size, full_f), 2, device=device, dtype=dtype),
     }
     full13 = torch.stack([full["w1"], full["w3"]], dim=2).flatten(1, 2)
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         module.weight_loader_fused(module.w13_weight, full13, "w13.weight", "w13")
         module.weight_loader_fused(module.w2_weight, full["w2"], "w2.weight", "w2")
     shards = {
@@ -159,18 +143,7 @@ def batch_reference(x, gamma, shards):
 
 
 def build_values(group="attn_tp", *, width=16):
-    kwargs = dict(parallel_group=group)
-    if "parallel_group" not in inspect.signature(mova.RoutedValueExperts).parameters:
-        parallel = get_parallel()
-        rank, size = (
-            (0, 1)
-            if group == "replicated"
-            else (parallel.attn_tp_rank, parallel.attn_tp_size)
-            if group == "attn_tp"
-            else (parallel.tp_rank, parallel.tp_size)
-        )
-        kwargs = dict(tp_rank=rank, tp_size=size)
-    return mova.RoutedValueExperts(2, width, width, **kwargs)
+    return mova.RoutedValueExperts(2, width, width, parallel_group=group)
 
 
 def load_values(module, rank, size):
@@ -179,7 +152,7 @@ def load_values(module, rank, size):
         device=module.weight.device,
         dtype=module.weight.dtype,
     )
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         module.weight_loader(module.weight, full)
     expected = full.chunk(size, dim=1)[rank]
     torch.testing.assert_close(module.weight, expected)
@@ -215,9 +188,7 @@ class TestCustomProjectionParallelGroups(CustomTestCase):
                             bias if name == "qkvr" or layer.tp_rank == 0 else None
                         )
                         with (
-                            get_parallel().override(
-                                tp_group=Mock(), attn_tp_group=Mock()
-                            ),
+                            parallel_scope(tp_group=Mock(), attn_tp_group=Mock()),
                             patch.object(
                                 linear,
                                 "use_symmetric_memory",
@@ -290,7 +261,7 @@ class TestCustomProjectionParallelGroups(CustomTestCase):
         )
         execution = Mock()
         with (
-            get_parallel().override(tp_group=execution),
+            parallel_scope(tp_group=execution),
             patch(
                 "sglang.srt.models.inkling_common.moe.use_inkling_shared_fused_moe",
                 return_value=False,
