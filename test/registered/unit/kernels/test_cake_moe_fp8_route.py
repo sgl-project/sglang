@@ -340,7 +340,6 @@ def _run_contiguous(weights, acts, *, alignment=128):
         hidden_states_scale=acts.hidden_states_scale,
         use_masked_gemm=False,
         m_indices=acts.m_indices,
-        hidden_states_scale_tma_aligned=True,
         activation_scale_block_size=128,
     )
     running_state = {
