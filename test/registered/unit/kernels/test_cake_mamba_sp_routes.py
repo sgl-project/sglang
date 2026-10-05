@@ -450,6 +450,25 @@ def test_ssd_route_single_chunk_and_partial_chunk_batches_are_routed(lengths):
     assert cake.call_args.kwargs["out"] is inputs["out"]
 
 
+@pytest.mark.parametrize("lengths", [(8,), (64, 60), (127,)], ids=("8", "64+60", "127"))
+def test_ssd_route_batches_shorter_than_one_chunk_fall_back(lengths, caplog):
+    """A packed batch with fewer than 128 tokens stays on the stock kernel: the
+    FlashInfer host pins a 128-row TMA token box and rejects a shorter global
+    extent (a server's first short forward would otherwise crash)."""
+    caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
+    stock = mock.Mock(side_effect=_stock_ssd)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
+    inputs = _ssd_inputs(seqlen=sum(lengths), lengths=lengths)
+    with (
+        _routes(mamba_mod, "mamba_ssd_prefill"),
+        mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
+    ):
+        mamba_mod.ssd_prefill(stock, **inputs)
+    cake.assert_not_called()
+    stock.assert_called_once()
+    assert "fewer than 128 packed tokens" in caplog.text
+
+
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 def test_ssd_route_names_the_engine_pool_state_dtype(state_dtype):
     """``--mamba-ssm-dtype float32`` (the engine default) and ``float16`` are

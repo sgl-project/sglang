@@ -73,6 +73,9 @@ logger = logging.getLogger(__name__)
 CAKE_ROUTE_SSD_PREFILL = "mamba_ssd_prefill"
 CAKE_ROUTE_SSU = "mamba_ssu"
 SSD_CHUNK_SIZE = 128
+# Smallest packed token count the FlashInfer Cake SSD host accepts: its TMA
+# descriptors use a 128-row token box (a shorter global extent is rejected).
+SSD_MIN_TOKENS = 128
 SSD_HEADDIM = 64
 SSD_DSTATE = 128
 _CAKE_LOG_PREFIX = "[cake-route]"
@@ -424,6 +427,19 @@ def _cake_ssd_prefill(
     if cake_chunk_indices is None or cake_chunk_offsets is None:
         _log_cake_route_once(
             route, "fallback", f"no chunk-128 metadata for this batch: {detail}"
+        )
+        return None
+    if seqlen < SSD_MIN_TOKENS:
+        # The FlashInfer host builds the x/B/C/out TMA descriptors with a
+        # fixed 128-row box on the token axis and rejects a smaller global
+        # extent (ValueError in Prepare), so a packed batch shorter than one
+        # chunk cannot run there yet; the kernel itself handles any seqlen
+        # >= 128, including a partial last chunk.
+        _log_cake_route_once(
+            route,
+            "fallback",
+            f"fewer than {SSD_MIN_TOKENS} packed tokens (FlashInfer x_map TMA "
+            f"token box is {SSD_MIN_TOKENS} rows): {detail}",
         )
         return None
     if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
