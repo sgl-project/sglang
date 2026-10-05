@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsv4.cake_routes import CakeDsv41MixedDecodeRoute
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -1127,6 +1128,9 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # ``SGLANG_CAKE_ROUTES=dsv4_sparse_mla_decode``: SM120/121 DSv4.1 decode
+        # kernel route (see dsv4/cake_routes.py); inert unless selected.
+        self._cake_dsv41_mixed_decode = CakeDsv41MixedDecodeRoute()
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -3515,19 +3519,43 @@ class DeepseekV4AttnBackend(
                     if attn_sink is not None and attn_sink.shape[0] > real_heads:
                         attn_sink = attn_sink[:real_heads]
 
-                o = flash_mla_with_kvcache_sm120(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    softmax_scale=self.softmax_scale,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                # Cake route (SGLANG_CAKE_ROUTES=dsv4_sparse_mla_decode): the
+                # DSv4.1 mixed-cache decode reads the same 528-byte FP8 main /
+                # 288-byte FP4 extra pools on the decode-kernel token range.
+                # ``None`` means "use the stock kernel" (route off, admission
+                # rejected, or scratch first needed inside graph capture).
+                o = None
+                if self.is_dsv41 and q.shape[0] <= SM120_DECODE_MAX_TOKENS:
+                    o = self._cake_dsv41_mixed_decode.run(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                        sm_scale=self.softmax_scale,
+                        head_dim_v=self.head_dim_v,
+                    )
+                if o is None:
+                    o = flash_mla_with_kvcache_sm120(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        softmax_scale=self.softmax_scale,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
             else:
+                # No Cake route here: the packed FlashMLA caches (584 bytes per
+                # token for V4, 528 for V4.1 FP8) are not the uniform 512-wide
+                # pools the SM100/SM103 Cake DSv4 kernel reads; that route is
+                # wired in the trtllm backend (deepseek_v4_trtllm_backend.py).
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:

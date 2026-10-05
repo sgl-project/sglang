@@ -82,6 +82,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.dits import (
+    minimax_h3_cake_routes as _cake_routes,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
@@ -762,14 +765,27 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
-            out = attention._attention_impl.forward_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
-            )
+            out = None
+            if _cake_routes.route_enabled():
+                # Cake route (SGLANG_CAKE_ROUTES=minimax_h3_diffusion): the
+                # dense packed-varlen backends only; None -> stock backend.
+                out = _cake_routes.varlen_attention(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    softmax_scale=attention.softmax_scale,
+                )
+            if out is None:
+                out = attention._attention_impl.forward_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_host=cu_seqlens_host,
+                )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
@@ -1083,10 +1099,19 @@ class MiniMaxH3Attention(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+        qkv_override: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        return_pre_out_proj: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
         ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
+
+        ``qkv_override``: Q/K/V ``[T, heads, head_dim]`` already projected,
+        Q/K-normalised and RoPE-rotated (Cake ``minimax_h3_diffusion`` fused
+        pre-attention); the projection / norm / RoPE sequence is skipped.
+        ``return_pre_out_proj``: return the attention-core output
+        ``[T, heads, head_dim]`` instead of running ``out_proj`` (the caller
+        finishes with :meth:`finish_out_proj` or the fused Cake out-projection).
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1107,11 +1132,14 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
+        if qkv_override is not None:
+            q, k, v = qkv_override
+        else:
+            qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
+            q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+            q = q.view(total, self.num_heads, self.head_dim)
+            k = k.view(total, self.num_heads, self.head_dim)
+            v = v.view(total, self.num_heads, self.head_dim)
         if (
             self.hybrid is not None
             and self._attention_backend_enum
@@ -1130,7 +1158,9 @@ class MiniMaxH3Attention(nn.Module):
                 ulysses_active=ulysses_active,
                 ring_active=ring_active,
             )
-        if rope_cache is None:
+        if qkv_override is not None:
+            pass  # already Q/K-normalised and rotated by the fused Cake stage
+        elif rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
                 k,
@@ -1190,9 +1220,28 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
-        out = out.reshape(total, self.num_heads * self.head_dim)
+        if return_pre_out_proj:
+            return out
+        return self.finish_out_proj(out)
+
+    def finish_out_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """Attention-core output ``[T, heads, head_dim]`` -> ``out_proj`` ``[T, hidden]``."""
+        out = out.reshape(out.shape[0], self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         return out
+
+    def cake_fusable(self) -> bool:
+        """Static eligibility of the Cake fused pre-attention / out-projection.
+
+        The Cake stages cover the plain dense path only: no VDN hybrid branch,
+        no video-sparse compression gate, one shared ``eps`` for the input and
+        the Q/K norms (the fused kernel takes a single epsilon).
+        """
+        return (
+            self.hybrid is None
+            and self.to_gate_compress is None
+            and self.q_norm.eps == self.k_norm.eps
+        )
 
 
 class MiniMaxH3MLP(nn.Module):
@@ -1458,6 +1507,18 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h_prequant = None
+        qkv_override = None
+        # Cake route (SGLANG_CAKE_ROUTES=minimax_h3_diffusion): fused stages
+        # are tried on the plain BF16 dense path only; each stage returns None
+        # when it is not admitted and the stock code below runs unchanged.
+        cake_on = (
+            _cake_routes.route_enabled()
+            and x.device.type == "cuda"
+            and not ulysses_active
+            and not ring_active
+            and self.attn.cake_fusable()
+            and not torch.compiler.is_compiling()
+        )
         if _accepts_mxfp8_input(self.attn.qkv_proj):
             h = self.norm1(x)
             if can_use_mxfp8_swizzled(h):
@@ -1471,14 +1532,37 @@ class MiniMaxH3DiTBlock(nn.Module):
                     h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
                 )
         else:
-            h = _modulate_rmsnorm_scale_shift(
-                x,
-                self.norm1,
-                shift_msa,
-                scale_msa,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-            )
+            if (
+                cake_on
+                and rope_cache is not None
+                and self.attn.q_norm.eps == self.attn.k_norm.eps
+            ):
+                qkv_override = _cake_routes.pre_attention(
+                    x,
+                    x_norm_weight=self.norm1.weight,
+                    adaln_shift=shift_msa,
+                    adaln_scale=scale_msa,
+                    adaln_index=combined_indices,
+                    qkv_weight=getattr(self.attn.qkv_proj, "weight", None),
+                    q_norm_weight=self.attn.q_norm.weight,
+                    k_norm_weight=self.attn.k_norm.weight,
+                    rope_cache=rope_cache,
+                    eps=self.norm1.eps,
+                    qk_eps=self.attn.q_norm.eps,
+                )
+            if qkv_override is not None:
+                # norm1 / AdaLN / qkv_proj / qk-norm / RoPE ran fused; the
+                # attention module only needs the row count from ``h``.
+                h = x
+            else:
+                h = _modulate_rmsnorm_scale_shift(
+                    x,
+                    self.norm1,
+                    shift_msa,
+                    scale_msa,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                )
         h = self.attn(
             h,
             x_prequant=h_prequant,
@@ -1489,15 +1573,37 @@ class MiniMaxH3DiTBlock(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            qkv_override=qkv_override,
+            return_pre_out_proj=cake_on,
         )
-        x = _modulate_gate(
-            residual,
-            gate_msa,
-            h,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            allow_inplace=not self.preserve_input_for_cache_dit,
-        )
+        # The fused pre-attention pack (q/k/v views, 3 * T * hidden BF16) is
+        # consumed; drop the last reference before the out-projection and MLP
+        # stages so it does not stay resident through the rest of the block.
+        qkv_override = None
+        fused = None
+        if cake_on:
+            # ``h`` is the attention-core output [T, heads, head_dim]; the Cake
+            # out-projection applies the gated residual in the same launch.
+            fused = _cake_routes.out_proj_gated_residual(
+                h,
+                o_weight=getattr(self.attn.out_proj, "weight", None),
+                gate=gate_msa,
+                gate_index=combined_indices,
+                residual=residual,
+            )
+            if fused is None:
+                h = self.attn.finish_out_proj(h)
+        if fused is not None:
+            x = fused
+        else:
+            x = _modulate_gate(
+                residual,
+                gate_msa,
+                h,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                allow_inplace=not self.preserve_input_for_cache_dit,
+            )
 
         residual = x
         if _accepts_mxfp8_input(self.mlp.fc1):
@@ -1513,15 +1619,30 @@ class MiniMaxH3DiTBlock(nn.Module):
                 )
                 h = self.mlp(h)
         else:
-            h = _modulate_rmsnorm_scale_shift(
-                x,
-                self.norm2,
-                shift_mlp,
-                scale_mlp,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-            )
-            h = self.mlp(h)
+            hidden = None
+            if cake_on and not _accepts_mxfp8_input(self.mlp.fc2):
+                # norm2 / AdaLN / fc1 / SwiGLU fused; fc2 stays the stock linear.
+                hidden = _cake_routes.fc1_swiglu(
+                    x,
+                    x_norm_weight=self.norm2.weight,
+                    adaln_shift=shift_mlp,
+                    adaln_scale=scale_mlp,
+                    adaln_index=combined_indices,
+                    fc1_weight=getattr(self.mlp.fc1, "weight", None),
+                    eps=self.norm2.eps,
+                )
+            if hidden is not None:
+                h, _ = self.mlp.fc2(hidden)
+            else:
+                h = _modulate_rmsnorm_scale_shift(
+                    x,
+                    self.norm2,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                )
+                h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(

@@ -15,6 +15,7 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.distributed import (
     divide,
 )
+from sglang.srt.layers.attention.mamba import cake_routes
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.dp_attention import (
@@ -608,35 +609,38 @@ class MambaMixer2(torch.nn.Module):
                     0,
                 )
 
-            # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
-                hidden_states_p.view(
+            # NOTE: final output is an in-place update of out tensor.
+            # ``cake_routes.ssd_prefill`` calls ``mamba_chunk_scan_combined``
+            # with exactly these arguments unless SGLANG_CAKE_ROUTES selects
+            # ``mamba_ssd_prefill`` and the Cake SSD runner admits the batch.
+            intermediate_states, varlen_state, track_states = cake_routes.ssd_prefill(
+                mamba_chunk_scan_combined,
+                x=hidden_states_p.view(
                     1, num_prefill_tokens, local_num_heads, self.head_dim
                 ),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                dt=dt_p.unsqueeze(0),
+                A=self.A,
+                B=B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                C=C_p.view(1, num_prefill_tokens, local_num_groups, -1),
                 chunk_size=mixed_metadata.chunk_size,
                 D=self.D,
-                z=None,
                 dt_bias=self.dt_bias,
                 seq_idx=mixed_metadata.seq_idx,
                 chunk_indices=mixed_metadata.chunk_indices,
                 chunk_offsets=mixed_metadata.chunk_offsets,
                 cu_seqlens=query_start_loc_p,
                 initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                return_track_states=True,
                 track_seq_idx=metadata.track_ssm_seq_idx,
                 track_end_locs=metadata.track_ssm_end_locs,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
+                cake_chunk_indices=mixed_metadata.cake_chunk_indices,
+                cake_chunk_offsets=mixed_metadata.cake_chunk_offsets,
+                track_states_out=ssm_state,
+                cake_track_checkpoints=mixed_metadata.cake_track_checkpoints,
+                extend_seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
             )
 
             # update ssm states
@@ -713,8 +717,12 @@ class MambaMixer2(torch.nn.Module):
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
+            # ``cake_routes.selective_state_update`` calls the stock dispatcher
+            # with exactly these arguments unless SGLANG_CAKE_ROUTES selects
+            # ``mamba_ssu`` and a promoted Cake row admits the batch.
             if is_target_verify:
-                selective_state_update(
+                cake_routes.selective_state_update(
+                    selective_state_update,
                     ssm_state,
                     hidden_states_d.view(
                         num_decodes,
@@ -749,7 +757,8 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                selective_state_update(
+                cake_routes.selective_state_update(
+                    selective_state_update,
                     ssm_state,
                     hidden_states_d,
                     dt_d,
