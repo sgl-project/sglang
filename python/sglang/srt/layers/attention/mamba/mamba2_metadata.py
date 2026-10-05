@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.mamba.flashinfer_ssd import SSDPrefillMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -90,6 +91,7 @@ class Mamba2Metadata(ForwardMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
+    ssd_prefill: SSDPrefillMetadata | None = None
 
     @dataclass(kw_only=True, frozen=True)
     class MixedMetadata:

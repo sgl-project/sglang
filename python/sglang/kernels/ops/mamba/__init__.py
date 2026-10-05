@@ -20,6 +20,18 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
+        op="mamba.flashinfer_ssd_prefill",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_ssd:flashinfer_ssd_prefill",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
+        ),
+        description="Packed BF16 Mamba2 SSD with FP16/BF16 endpoint checkpoints.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="mamba.verify_mamba2_replay",
         backend=KernelBackend.FLASHINFER,
         target="sglang.kernels.ops.mamba.mamba2_spec_replay:verify_mamba2_replay",

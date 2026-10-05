@@ -373,6 +373,13 @@ class ExecMamba(msgspec.Struct):
             choices=["triton", "flashinfer"],
         ),
     ] = "triton"
+    mamba_prefill_backend: A[
+        str,
+        Arg(
+            help="Mamba2 prefill backend. FlashInfer SSD requires SM100, BF16 activations, head dimension 64 and state dimension 128; decode/verify still use --mamba-backend.",
+            choices=["triton", "flashinfer"],
+        ),
+    ] = "triton"
     mamba_ssm_dtype: A[
         Optional[str],
         Arg(

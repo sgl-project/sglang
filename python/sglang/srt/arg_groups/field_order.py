@@ -219,6 +219,7 @@ POSITIONAL_FIELD_ORDER = (
     "disable_flashinfer_autotune",
     "flashinfer_autotune_skip_ops",
     "mamba_backend",
+    "mamba_prefill_backend",
     "cuda_graph_config",
     "cuda_graph_backend_decode",
     "cuda_graph_backend_prefill",
