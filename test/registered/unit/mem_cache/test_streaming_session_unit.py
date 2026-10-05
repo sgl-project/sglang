@@ -374,9 +374,8 @@ def test_release_session_preserves_component_lock_receipt(uuid):
 
 
 def test_release_session_skips_swa_after_early_release():
-    """A slot saved from a req that early-released its SWA lock
-    (swa_prefix_lock_released) must release with skip_swa, or the session
-    close double-releases the SWA segment."""
+    """A slot whose SWA lock was released early must close with skip_swa, or
+    the SWA segment is released twice."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
