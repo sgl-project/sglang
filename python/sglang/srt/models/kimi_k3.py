@@ -33,6 +33,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -120,7 +124,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -219,6 +223,15 @@ def _k3_bf16_gemm(
 # model hands the output-norm gate to the KDA backend via an attempt-and-verify
 # stash on the attention layer; unconsumed stashes fall back to the unfused
 # chain + o_norm here.
+
+
+def _is_unquantized_mergeable(weights: list[torch.Tensor]) -> bool:
+    """Return whether these weights may be concatenated into one fused buffer.
+
+    _merge_weights_as_views cats .weight alone, so anything carrying a separate
+    scale tensor (per-channel FP8, packed MXFP4) must stay unfused."""
+    dtypes = {weight.dtype for weight in weights}
+    return len(dtypes) == 1 and dtypes.pop() in (torch.bfloat16, torch.float16)
 
 
 def _merge_weights_as_views(
@@ -489,6 +502,7 @@ class KimiK3MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -690,11 +704,11 @@ class KimiK3MoE(nn.Module):
         """
         if not self.use_latent_moe:
             return
-        # These merged layouts feed CUDA-only fused front kernels. Keeping the
+        # These merged layouts feed CUDA and ROCm fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
         # during post-load processing and leaves their native kernels in
         # control of weight layout.
-        if _is_npu:
+        if not (get_platform().is_cuda or get_platform().is_hip):
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -1845,6 +1859,11 @@ class KimiK3DeltaAttention(nn.Module):
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
+            # ROCm Quark checkpoints: leave per-channel FP8 / MXFP4 weights on
+            # the unfused b_proj/f_a_proj GEMVs; the merged buffer would drop
+            # their scales.
+            if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
+                return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
@@ -1900,6 +1919,11 @@ class KimiK3DeltaAttention(nn.Module):
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
+        # Whitelist the dtype rather than only require the three to agree: the
+        # merged buffer carries only .weight, so quantized weights that happen to
+        # match each other still lose their per-channel scales.
+        if not _is_unquantized_mergeable(ws):
+            return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
     def _prepare_fused_decode(self) -> None:
@@ -1916,7 +1940,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_K3_KDA_FUSED_BACKEND", "").lower()
+            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
             backend_available = (
                 backend == "aiter"
                 and kda_fused_decode_aiter_hip.available(f_b_weight.device)
@@ -2862,7 +2886,7 @@ class KimiK3LinearModel(nn.Module):
         # Disable on HIP code path.
         self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
                 layer_idx=idx,
@@ -2871,8 +2895,6 @@ class KimiK3LinearModel(nn.Module):
                 prefix=prefix,
                 alt_streams=self.alt_streams,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -2958,7 +2980,14 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        packs_aux = self.packs_aux_hidden_states
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker.for_batch(
+                forward_batch, len(self.dspark_layers_to_capture)
+            )
+            if packs_aux
+            else []
+        )
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
@@ -3049,9 +3078,18 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if packs_aux:
+            return hidden_states, aux_hidden_states.finalize()
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    @property
+    def packs_aux_hidden_states(self) -> bool:
+        # PP stages keep the list: inherited captures arrive pre-concatenated.
+        return (
+            self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
+        )
 
     def _dspark_capture_stream(
         self,
@@ -3144,6 +3182,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
         )
+
+    def get_aux_hidden_states_width(self) -> int:
+        if not self.model.packs_aux_hidden_states:
+            return 0
+        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
@@ -3430,12 +3473,44 @@ class KimiK3LinearForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = False
                 continue
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
+            scale_folded_into_weight = False
+            if _is_hip and kv_b_weight.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+                if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                    from sglang.srt.models.kimi_k3_rocm_quant import (
+                        _k3_channel_fp8_to_bf16,
+                    )
+
+                    # Fold the per-channel scale while dim 0 is still the
+                    # channel axis it indexes, i.e. before the head split.
+                    kv_b_weight = _k3_channel_fp8_to_bf16(
+                        self_attn.kv_b_proj, kv_b_weight
+                    )
+                    scale_folded_into_weight = True
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if hasattr(self_attn.kv_b_proj, "weight_scale"):
+            kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+            if _is_hip and (
+                scale_folded_into_weight
+                or not (
+                    isinstance(kv_b_scale, torch.Tensor) and kv_b_scale.numel() == 1
+                )
+            ):
+                # aiter's absorb GEMM dereferences w_scale as one scalar. A scale
+                # folded into the now-bf16 w_kc/w_vc, a vector the branch above
+                # could not fold, or the None quark leaves on a dequantized
+                # narrow partition must keep DeepseekV2AttentionMLA's 1.0
+                # default. Skip the assignment rather than reset afterwards:
+                # assigning a Parameter registers it, and nn.Module then refuses
+                # a float in its place.
+                pass
+            elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
         # Post-load: precompute the attn-res combined score weights BEFORE
@@ -3627,6 +3702,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_aux_hidden_states_width(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_aux_hidden_states_width()
 
     def preprocess_mm_for_encoder(
         self,
