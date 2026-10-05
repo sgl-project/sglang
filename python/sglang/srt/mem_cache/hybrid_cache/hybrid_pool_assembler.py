@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
@@ -272,6 +273,13 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
+    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+
+    if isinstance(allocator, MultiEndedAllocator):
+        return dict(
+            device_alloc_fn=allocator.alloc_physical,
+            device_free_fn=allocator.cancel_physical_reservation,
+        )
     if bind is not None:
         assert free_bound is not None
         return dict(
@@ -299,7 +307,9 @@ def _uses_unified_page_envelope_host(
             for pool in (full_kv_pool, swa_kv_pool)
         )
         and {full_kv_pool.grow_direction, swa_kv_pool.grow_direction} == {"up", "down"}
-        and get_memory().hicache_host_memory_mode != "buffer_only"
+        and HybridCacheController.supports_page_envelope_host(
+            get_memory().hicache_storage_backend
+        )
     )
 
 
@@ -1128,6 +1138,7 @@ def build_hybrid_mamba_stack(
     load_cache_event,
     storage_backend: Optional[str],
     use_mla: bool,
+    qsa_pool: Any = None,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
@@ -1141,6 +1152,7 @@ def build_hybrid_mamba_stack(
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
     config = prepare_host_pool_config(
         decls=decls,
         full_layer_mapping=full_layer_mapping,
@@ -1155,6 +1167,14 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+    if qsa_pool is not None and kv_host_size is not None:
+        kv_bytes = sum(kv_pool.get_kv_size_bytes())
+        index_bytes = sum(
+            b.nbytes
+            for pool in (qsa_pool, *qsa_draft_pools)
+            for b in pool.qsa_compressed_k_buffer_pool
+        )
+        kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1191,6 +1211,23 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         )
     ]
+    if qsa_pool is not None:
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=QSAIndexerPoolHost(
+                    qsa_pool,
+                    kv_host_pool,
+                    allocator_type=_get_allocator_type(),
+                    mtp_draft_device_pools=qsa_draft_pools,
+                ),
+                device_pool=qsa_pool,
+                # The KV config carries the packed draft tail layers.
+                layer_mapping=root.layer_mapping,
+                transfer_layer_id_max=root.transfer_layer_id_max,
+                packed_draft_device_pools=qsa_draft_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1422,6 +1459,7 @@ def build_full_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -1483,6 +1521,22 @@ def build_full_draft_pools(
                 device_pool=pool,
                 layer_mapping=draft_layer_mapping,
                 transfer_layer_id_max=indexer_host_pool.layer_num,
+            )
+        )
+
+    if isinstance(draft_kv_pool, QSATokenToKVPool):
+        specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DRAFT_INDEXER,
+                host_pool=QSAIndexerPoolHost(
+                    draft_kv_pool,
+                    draft_host_pool,
+                    allocator_type=_get_allocator_type(),
+                ),
+                device_pool=draft_kv_pool,
+                layer_mapping=draft_layer_mapping,
+                transfer_layer_id_max=draft_host_pool.layer_num,
             )
         )
 
@@ -1766,6 +1820,9 @@ class _MambaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        qsa_pool = kvcache if isinstance(kvcache, QSATokenToKVPool) else None
         full_layer_mapping = _stage_local_layer_mapping(
             kvcache.full_attention_layer_id_mapping, kvcache.start_layer
         )
@@ -1781,6 +1838,7 @@ class _MambaStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=kvcache.use_mla,
+            qsa_pool=qsa_pool,
             host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
             device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,
@@ -1797,11 +1855,18 @@ class _MambaStrategy(StackStrategy):
             },
             sidecars=[
                 c.decl.sidecar_spec() for c in config.pools if not c.decl.is_primary
-            ],
+            ]
+            + (
+                [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)]
+                if qsa_pool is not None
+                else []
+            ),
             pool_declarations=tuple(c.decl for c in config.pools),
             register_req_to_token_counter=True,
             pools_desc=" + ".join(
-                [c.decl.pool_name.value.upper() for c in config.pools] + ["MAMBA"]
+                [c.decl.pool_name.value.upper() for c in config.pools]
+                + ["MAMBA"]
+                + (["INDEXER"] if qsa_pool is not None else [])
             ),
         )
 
