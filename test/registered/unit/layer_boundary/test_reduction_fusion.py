@@ -9,14 +9,14 @@ import torch
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers.layer_boundary import (
     Layout,
-    StageOutput,
+    OutputContract,
     SumGroup,
 )
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.exit import OutputBoundary
-from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.exit import ExitPolicy
+from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
@@ -34,29 +34,29 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _steps(*, output=None, returns_over_dp=False, ffn_sum_is_movable=True):
-    return comm.StageSteps(
-        entry=comm.StageEntry(
+    return comm.StagePath(
+        entry=comm.EntryPath(
             prepare=partial(
-                comm_ops._consumer_step,
+                comm_ops._run_entry,
                 step=partial(
-                    comm_ops._read_input,
-                    layer_input=None,
+                    comm_ops._update_read,
+                    pre_move=None,
                     enters_stack=False,
-                    read=comm.NORM_QUANT_READ,
-                    update=comm.ADD,
+                    read=comm.NORM_QUANT_READOUT,
+                    update=comm.PLAIN_ADD,
                 ),
                 carried_fusions=(),
             ),
             input_rows=comm.Layout(frozenset()),
             input_move=identity_input,
-            handoff=comm_ops._hand_qkv_hook_its_input,
+            attn_input_adapter=comm_ops._attn_input_default,
         ),
         output=output
-        or StageOutput(
+        or OutputContract(
             Layout(frozenset()), group=SumGroup.TP if ffn_sum_is_movable else None
         ),
         returns_over_dp=returns_over_dp,
-        output_move=None if returns_over_dp else identity_output,
+        output_move=None if returns_over_dp else keep_output,
     )
 
 
@@ -64,12 +64,12 @@ def _fake_communicator(ffn_sum_is_movable=True):
     communicator = stub_plan()
     communicator._speculative_algo = None
     # An FFN gathered over MoE-CP or on each rank's own rows has no movable sum.
-    communicator._paths[BatchVariant.ORDINARY] = _steps(
+    communicator.paths[BatchVariant.ORDINARY] = _steps(
         ffn_sum_is_movable=ffn_sum_is_movable
     )
-    communicator._paths[BatchVariant.SEQUENCE_PARALLEL] = None
-    communicator._paths[BatchVariant.INPUT_SCATTERED] = None
-    communicator._paths[BatchVariant.CONTEXT_PARALLEL] = None
+    communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = None
+    communicator.paths[BatchVariant.INPUT_SCATTERED] = None
+    communicator.paths[BatchVariant.CONTEXT_PARALLEL] = None
     communicator.terminal = False
     return communicator
 
@@ -298,7 +298,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         )
         with (
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=True),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=True),
             patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
@@ -310,12 +310,12 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
-            return OutputBoundary(
+            return ExitPolicy(
                 _fake_communicator(ffn_sum_is_movable)
-            )._ffn_sum_can_move_to_next_layer(
-                OutputBoundary(
-                    _fake_communicator(ffn_sum_is_movable)
-                ).plan._batch_steps(forward_batch)
+            )._sum_deferral_allowed(
+                ExitPolicy(_fake_communicator(ffn_sum_is_movable)).plan.path_for(
+                    forward_batch
+                )
             )
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
@@ -334,7 +334,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
     def test_a_layer_gathered_over_moe_cp_does_not_fuse(self):
-        # Fusion skips postprocess_layer, which holds the CP scatter; a dense
+        # Fusion skips the exit's completion, which holds the CP scatter; a dense
         # layer gathered over the MoE-CP group (moe_dp_size == attn_cp_size) is
         # not caught by the is_enable_moe_cp_allgather gate.
         self.assertFalse(
@@ -369,17 +369,17 @@ class TestDeferFfnReduction(CustomTestCase):
         tp_group_object = object()
         communicator = _fake_communicator()
         communicator.terminal = is_last_layer
-        communicator._paths[BatchVariant.SEQUENCE_PARALLEL] = (
+        communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = (
             sp_region_steps() if sp_active else None
         )
-        communicator._paths[BatchVariant.INPUT_SCATTERED] = None
-        communicator._paths[BatchVariant.CONTEXT_PARALLEL] = None
-        communicator._paths[BatchVariant.ORDINARY] = _steps(
-            output=StageOutput(
+        communicator.paths[BatchVariant.INPUT_SCATTERED] = None
+        communicator.paths[BatchVariant.CONTEXT_PARALLEL] = None
+        communicator.paths[BatchVariant.ORDINARY] = _steps(
+            output=OutputContract(
                 Layout(frozenset()),
                 group=SumGroup.MOE_OUTPUT,
-                leaves_for_reduce_scatter=True,
-                leaves_for_reduce_scatterv=True,
+                may_reduce_scatter=True,
+                may_reduce_scatterv=True,
             ),
             returns_over_dp=scatters_to_local_tokens,
         )
@@ -390,12 +390,10 @@ class TestDeferFfnReduction(CustomTestCase):
             residual_stream=types.SimpleNamespace(residual=torch.ones(batch_size, 4)),
         )
         with (
-            patch_communicator(
-                "_reduce_and_redistribute_output_step", return_value=step
-            ),
+            patch_communicator("_select_dp_reduce_scatter", return_value=step),
             get_forward().scoped(sp_active=sp_active),
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fused),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=fused),
             patch_communicator("_use_aiter", False),
             patch_communicator(
                 "post_experts_reduction_group",
@@ -471,10 +469,10 @@ class TestDeferFfnReduction(CustomTestCase):
                 return_value=tp_group_object if tp_group else object(),
             ),
         ):
-            return communicator.output._ffn_sum_moves_to_next_layer(
+            return communicator.output._defers_sum(
                 forward_batch,
-                communicator.output.plan._batch_steps(forward_batch),
-                mlp_reduce_scatter=reduce_scatter,
+                communicator.output.plan.path_for(forward_batch),
+                sum_in_reduce_scatter=reduce_scatter,
                 dp_step=step,
             )
 
@@ -517,11 +515,11 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
         for name, condition in (
             (
                 "reduce-scatter",
-                dict(step=transport_ops._reduce_and_redistribute_output_varlen),
+                dict(step=transport_ops.dp_reduce_scatterv),
             ),
             (
                 "MAX_LEN reduce-scatter",
-                dict(step=transport_ops._reduce_and_redistribute_output_max_len),
+                dict(step=transport_ops.dp_reduce_scatter),
             ),
             ("other postprocess", dict(scatters_to_local_tokens=False)),
             ("LayerNorm SP", dict(sp_active=True)),
