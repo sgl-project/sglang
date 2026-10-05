@@ -10,8 +10,9 @@ import time
 import flashinfer
 import torch
 
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -28,7 +29,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     bcg_mla_bmm_then_unified_attention,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     MockMLAModelRunner,
@@ -43,6 +44,7 @@ class Attention(DeepseekMHAForwardMixin):
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     v_head_dim = 128
+    rotary_emb = None
     use_dsa = False
     kv_cache_dtype = "fp8_e4m3"
 
@@ -63,14 +65,14 @@ class Attention(DeepseekMHAForwardMixin):
 
 
 @torch.inference_mode()
-def run_case(tokens, prefix, pool_tokens, iterations, rounds):
+def run_case(tokens, prefix, pool_tokens, iterations, rounds, backend_name):
     if tokens <= 0 or prefix < 0 or tokens + prefix > pool_tokens:
         raise ValueError(
             "Require tokens > 0, prefix >= 0, and tokens + prefix <= pool_tokens"
         )
     torch.manual_seed(42)
     case = MLAAttentionCase(
-        "k3", "trtllm_mla", ForwardMode.EXTEND, 12, 64, (prefix,), (tokens,)
+        "k3", backend_name, ForwardMode.EXTEND, 12, 64, (prefix,), (tokens,)
     )
     config = TinyMLAModelConfig(
         num_heads=12,
@@ -93,10 +95,13 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
         fp8_kv_cache=True,
     )
     try:
-        with get_context().override_server_args(
-            disable_chunked_prefix_cache=False, flashinfer_mla_disable_ragged=True
+        with (
+            get_context().override_server_args(
+                disable_chunked_prefix_cache=False, flashinfer_mla_disable_ragged=True
+            ),
+            get_parallel().override(attn_dcp_rank=0),
         ):
-            backend = TRTLLMMLABackend(runner)
+            backend = ATTENTION_BACKENDS[backend_name](runner)
             batch = _make_forward_batch(
                 case, runner, max_context_len=pool_tokens, device="cuda"
             )
@@ -130,6 +135,13 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
 
             # Reproduce the pre-change BCG absorbed-MLA path with the existing helper.
             def old_forward():
+                if backend_name == "tokenspeed_mla":
+                    runner.token_to_kv_pool.set_mla_kv_buffer(
+                        attn.attn_mqa,
+                        KVWriteLoc.for_batch(batch),
+                        latent_kv.unsqueeze(1),
+                        k_rope,
+                    )
                 bcg_mla_bmm_then_unified_attention(
                     q[:, :, :128].transpose(0, 1),
                     wk,
@@ -150,12 +162,23 @@ def run_case(tokens, prefix, pool_tokens, iterations, rounds):
                 )
 
             def new_forward():
+                if backend_name == "tokenspeed_mla":
+                    q_native, k, v = backend.prepare_prefill_qkv(
+                        q=q,
+                        q_pe=q[..., 128:],
+                        kv_a=latent_kv,
+                        k_pe=k_rope,
+                        positions=batch.positions,
+                        layer=attn,
+                        forward_batch=batch,
+                    )
+                    return attn.forward_normal_chunked_kv_core(q_native, k, v, batch)
                 kv = attn.kv_b_proj(latent_kv)[0].view(tokens, 12, 256)
                 k = torch.cat((kv[:, :, :128], k_rope.expand(-1, 12, -1)), dim=-1)
                 return attn.forward_normal_chunked_kv_core(q, k, kv[:, :, 128:], batch)
 
             def prepare(mode):
-                backend.fallback_mla_under_breakable_graph = mode == "without"
+                backend.disable_chunked_prefix_cache = mode == "without"
                 batch.num_prefix_chunks = batch.prefix_chunk_len = None
                 batch.attn_attend_prefix_cache = None
                 backend.init_forward_metadata(batch)
@@ -242,6 +265,9 @@ def main():
         "--cases",
         default="256:0:131072,256:16384:131072,265:89600:131072,4096:16384:131072,16384:0:131072,16384:16384:131072,256:16384:1048576",
     )
+    parser.add_argument(
+        "--backend", choices=("trtllm_mla", "tokenspeed_mla"), default="trtllm_mla"
+    )
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--rounds", type=int, default=7)
     args = parser.parse_args()
@@ -259,7 +285,12 @@ def main():
         flush=True,
     )
     for case in args.cases.split(","):
-        run_case(*(int(x) for x in case.split(":")), args.iterations, args.rounds)
+        run_case(
+            *(int(x) for x in case.split(":")),
+            args.iterations,
+            args.rounds,
+            args.backend,
+        )
         gc.collect()
         torch.cuda.empty_cache()
 

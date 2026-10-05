@@ -180,11 +180,6 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_tokenspeed_mla(attn, forward_batch):
-    # tokenspeed_mla shares the trtllm_mla dispatch pattern but keeps the
-    # absorbed-MLA pin under captured prefill graphs; only trtllm_mla routes
-    # through the BCG eager boundary.
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
-        return AttnForwardMethod.MLA
     return handle_attention_trtllm_mla(attn, forward_batch)
 
 

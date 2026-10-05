@@ -6,19 +6,21 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAPrefillMetadata,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_tokenspeed_mla_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 
 
-def _backend():
-    backend = TRTLLMMLABackend.__new__(TRTLLMMLABackend)
+def _backend(cls=TRTLLMMLABackend):
+    backend = cls.__new__(cls)
     backend.data_type = torch.bfloat16
     backend.q_data_type = torch.bfloat16
     backend.workspace_buffer = torch.empty(
@@ -70,9 +72,15 @@ class PrefillCpuLensTest(CustomTestCase):
         )
         cpu_q_lens = torch.tensor([tokens], dtype=torch.int32)
         cum_q = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
-            with self.subTest(dtype=dtype):
-                backend = _backend()
+        for cls, dtype in (
+            (TRTLLMMLABackend, torch.bfloat16),
+            (TRTLLMMLABackend, torch.float8_e4m3fn),
+            (TokenspeedMLABackend, torch.float8_e4m3fn),
+        ):
+            with self.subTest(backend=cls.__name__, dtype=dtype):
+                if cls is TokenspeedMLABackend and not is_tokenspeed_mla_available():
+                    self.skipTest("Tokenspeed MLA unavailable")
+                backend = _backend(cls)
                 backend.data_type = dtype
                 q_ref, k_ref, v_ref = (x.to(dtype).float() for x in (q, k, v))
                 scores = torch.einsum("qhd,khd->hqk", q_ref, k_ref) * layer.scaling
@@ -112,19 +120,26 @@ class PrefillCpuLensTest(CustomTestCase):
                         "flashinfer.prefill.trtllm_ragged_attention_deepseek",
                         wraps=flashinfer.prefill.trtllm_ragged_attention_deepseek,
                     ) as kernel:
+                        native_q, native_k, native_v = (
+                            x.to(dtype) if cls is TokenspeedMLABackend else x
+                            for x in (q, k[start:end], v[start:end])
+                        )
                         output, lse = backend.forward_extend(
-                            q,
-                            k[start:end],
-                            v[start:end],
+                            native_q,
+                            native_k,
+                            native_v,
                             layer,
                             batch,
                             save_kv_cache=False,
                         )
-                    self.assertIs(kernel.call_args.kwargs["q_seq_lens_cpu"], cpu_q_lens)
-                    expected_kv_lens = cpu_q_lens if causal else cpu_kv_lens
-                    self.assertIs(
-                        kernel.call_args.kwargs["kv_seq_lens_cpu"], expected_kv_lens
-                    )
+                    if cls is TRTLLMMLABackend:
+                        self.assertIs(
+                            kernel.call_args.kwargs["q_seq_lens_cpu"], cpu_q_lens
+                        )
+                        expected_kv_lens = cpu_q_lens if causal else cpu_kv_lens
+                        self.assertIs(
+                            kernel.call_args.kwargs["kv_seq_lens_cpu"], expected_kv_lens
+                        )
                     expected_lse = scores[:, :, start:end].logsumexp(-1).T
                     torch.testing.assert_close(
                         lse, expected_lse, rtol=0.001, atol=0.002
@@ -172,7 +187,9 @@ class BreakableGraphDispatchTest(CustomTestCase):
             (h.handle_attention_trtllm_mla, False, False, mha),
             (h.handle_attention_trtllm_mla, True, False, mla),
             (h.handle_attention_trtllm_mla, False, True, mla),
-            (h.handle_attention_tokenspeed_mla, False, False, mla),
+            (h.handle_attention_tokenspeed_mla, False, False, mha),
+            (h.handle_attention_tokenspeed_mla, True, False, mla),
+            (h.handle_attention_tokenspeed_mla, False, True, mla),
         )
         with patch.object(h, "is_in_breakable_cuda_graph", return_value=True):
             for handler, disabled, piecewise, expected in cases:
@@ -197,20 +214,18 @@ class BreakableGraphDispatchTest(CustomTestCase):
                                 expected,
                             )
 
-    def test_chunk_metadata_hook_fallback_only_for_tokenspeed(self):
+    def test_chunk_metadata_fallback_when_chunking_disabled(self):
         from sglang.srt.layers.attention import trtllm_mla_backend as trtllm
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
-        )
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLABackend,
         )
 
         batch = NS(extend_prefix_lens_cpu=[0, 0])
         for cls, disabled, expect_super in (
             (TRTLLMMLABackend, False, False),
             (TRTLLMMLABackend, True, True),
-            (TokenspeedMLABackend, False, True),
+            (TokenspeedMLABackend, False, False),
+            (TokenspeedMLABackend, True, True),
         ):
             backend = cls.__new__(cls)
             backend.disable_chunked_prefix_cache = disabled

@@ -200,9 +200,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Subclasses using absorbed MLA under BCG require FlashInfer metadata.
-    fallback_mla_under_breakable_graph: bool = False
-
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
 
@@ -721,13 +718,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         fallback_to_flashinfer_impl = (
             (self.disable_chunked_prefix_cache and has_prefix)
             or is_in_tc_piecewise_cuda_graph()
-            or (
-                (
-                    self.fallback_mla_under_breakable_graph
-                    or self.disable_chunked_prefix_cache
-                )
-                and is_in_breakable_cuda_graph()
-            )
+            or (self.disable_chunked_prefix_cache and is_in_breakable_cuda_graph())
         )
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
@@ -841,13 +832,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             fallback_to_flashinfer_impl = (
                 (self.disable_chunked_prefix_cache and has_prefix)
                 or is_in_tc_piecewise_cuda_graph()
-                or (
-                    (
-                        self.fallback_mla_under_breakable_graph
-                        or self.disable_chunked_prefix_cache
-                    )
-                    and is_in_breakable_cuda_graph()
-                )
+                or (self.disable_chunked_prefix_cache and is_in_breakable_cuda_graph())
             )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
