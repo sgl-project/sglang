@@ -418,27 +418,26 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     activation_type=activation_type,
                 )
             else:
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    use_fp8_w8a8=True,
-                    w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    a13_scale=layer.w13_input_scale,
-                    a2_scale=layer.w2_input_scale,
-                    block_shape=self.weight_block_size,
-                )
+                quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.weight_quant.strategy
-                == QuantizationStrategy.CHANNEL,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return self.runner.run(dispatch_output, quant_info)
+            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # Shared with FusedMoEWithLoRA so both runners use the same base quantization.
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=(
+                self.weight_block_size
+                if self.weight_quant.strategy == QuantizationStrategy.BLOCK
+                else None
+            ),
+        )

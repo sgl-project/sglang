@@ -146,28 +146,42 @@ class LoRAAdapter(nn.Module):
         revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules for filtering
+        normalized_target_modules = self._get_normalized_target_modules()
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            self._process_weight(name, loaded_weight)
+            self._process_weight(
+                name=name,
+                loaded_weight=loaded_weight,
+                normalized_target_modules=normalized_target_modules,
+            )
 
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        normalized_target_modules = self._get_normalized_target_modules()
         for name, tensor in tensors.items():
-            self._process_weight(name, tensor)
+            self._process_weight(
+                name=name,
+                loaded_weight=tensor,
+                normalized_target_modules=normalized_target_modules,
+            )
 
         self._normalize_weights()
 
-    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
+    def _get_normalized_target_modules(self) -> set[str]:
         from sglang.srt.lora.utils import get_normalized_target_modules
 
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
-        )
+        return get_normalized_target_modules(self.config.target_modules)
 
+    def _process_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        normalized_target_modules: set[str],
+    ):
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -462,7 +476,12 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
+
         for weight_name in weight_names:
+            if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+                # An attention output gate has no up_proj to stack with.
+                continue
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")

@@ -4602,6 +4602,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # Attention output gate on its own; a bare gate_proj also names the MLP gate.
+    "self_attn.gate_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
