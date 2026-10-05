@@ -7,6 +7,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     context_parallel_attn_dp_size,
     is_attention_backend_not_set,
+    mamba_extra_buffer_of,
     resolving_view,
     use_mla_backend,
 )
@@ -141,13 +142,26 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
             else:
                 index_kpool = get_dsa_index_kpool(hf_config)
-                if index_kpool > 1 and getattr(cfg, "dcp_size", 1) > 1:
+                if index_kpool > 1 and cfg.dcp_size > 1:
                     raise ValueError(
                         "--dcp-size > 1 is not supported for DSA with "
                         f"index_kpool={index_kpool}: a pooled index key spans "
                         "positions owned by different DCP ranks."
                     )
+                # A logical page must own a whole pooled index group so that a
+                # prefix hit never ends inside one.
                 page_size = 64 * index_kpool
+                # The earlier Mamba validator runs before this page-size override.
+                if (
+                    index_kpool > 1
+                    and mamba_extra_buffer_of(cfg)
+                    and cfg.mamba_track_interval % page_size != 0
+                ):
+                    raise ValueError(
+                        f"--mamba-track-interval ({cfg.mamba_track_interval}) must be "
+                        f"a multiple of the DSA logical page size ({page_size}) "
+                        f"for index_kpool={index_kpool}."
+                    )
                 overrides["page_size"] = page_size
                 logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
         elif get_platform().is_xpu:

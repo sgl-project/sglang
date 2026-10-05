@@ -850,6 +850,70 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
 
+    def test_dsa_kpool_mamba_track_interval_uses_resolved_page_size(self):
+        """An interval aligned to the input page size can split a pooled index
+        group after the DSA model override enlarges the logical page size."""
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+        from sglang.srt.configs.glm5_next import Glm5NextConfig
+        from sglang.srt.server_args import ServerArgs
+
+        config = Glm5NextConfig(
+            architectures=["Glm5NextForConditionalGeneration"],
+            index_head_dim=128,
+            index_n_heads=4,
+            index_topk=2048,
+            index_kpool=4,
+        )
+        with override_platform(is_cuda=True, is_hip=False, is_npu=False, is_xpu=False):
+            for strategy in ("extra_buffer", "extra_buffer_lazy"):
+                for interval in (64, 128, 256, 512):
+                    with self.subTest(strategy=strategy, interval=interval):
+                        args = ServerArgs(
+                            model_path="dummy",
+                            page_size=64,
+                            mamba_radix_cache_strategy=strategy,
+                            mamba_track_interval=interval,
+                        )
+                        if interval < 256:
+                            with self.assertRaisesRegex(
+                                ValueError, "--mamba-track-interval.*logical page size"
+                            ):
+                                _deepseek_family_overrides(args, config)
+                        else:
+                            self.assertEqual(
+                                _deepseek_family_overrides(args, config)["page_size"],
+                                256,
+                            )
+
+            for options in (
+                {"mamba_radix_cache_strategy": "no_buffer"},
+                {"disable_radix_cache": True},
+            ):
+                with self.subTest(options=options):
+                    kwargs = dict(
+                        model_path="dummy",
+                        page_size=64,
+                        mamba_radix_cache_strategy="extra_buffer",
+                        mamba_track_interval=64,
+                    )
+                    kwargs.update(options)
+                    self.assertEqual(
+                        _deepseek_family_overrides(ServerArgs(**kwargs), config)[
+                            "page_size"
+                        ],
+                        256,
+                    )
+
+            config.index_kpool = 1
+            args = ServerArgs(
+                model_path="dummy",
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=64,
+            )
+            self.assertEqual(_deepseek_family_overrides(args, config)["page_size"], 64)
+
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(
