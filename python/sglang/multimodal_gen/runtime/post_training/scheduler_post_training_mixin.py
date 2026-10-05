@@ -9,7 +9,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class SchedulerPostTrainingMixin:
-    def _weight_group_result(self, result: tuple[bool, str]) -> OutputBatch:
+    def _run_on_all_ranks(self, op, req) -> OutputBatch:
+        """Run a weight-group op that every rank joins; fail if any rank failed."""
+        # Every rank must reach the all-gather, so a raising rank reports a failure.
+        try:
+            result = op(req)
+        except Exception as exc:
+            result = False, f"{type(exc).__name__}: {exc}"
         world = get_world_group()
         results = [None] * world.world_size
         dist.all_gather_object(results, result, group=world.cpu_group)
@@ -22,16 +28,14 @@ class SchedulerPostTrainingMixin:
         return OutputBatch(output={"success": True, "message": result[1]})
 
     def _handle_init_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
-        return self._weight_group_result(self.worker.init_weights_update_group(reqs[0]))
+        return self._run_on_all_ranks(self.worker.init_weights_update_group, reqs[0])
 
     def _handle_destroy_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
-        return self._weight_group_result(
-            self.worker.destroy_weights_update_group(reqs[0])
-        )
+        return self._run_on_all_ranks(self.worker.destroy_weights_update_group, reqs[0])
 
     def _handle_update_weights_from_distributed(self, reqs: List[Any]) -> OutputBatch:
-        return self._weight_group_result(
-            self.worker.update_weights_from_distributed(reqs[0])
+        return self._run_on_all_ranks(
+            self.worker.update_weights_from_distributed, reqs[0]
         )
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:

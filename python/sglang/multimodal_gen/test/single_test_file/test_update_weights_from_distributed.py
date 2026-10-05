@@ -81,7 +81,6 @@ def connect(base_url, num_gpus):
                 group_name="test-update",
             ),
         )
-        options = dist.ProcessGroupNCCL.Options()
         group = init_custom_process_group(
             backend="nccl",
             init_method=f"tcp://127.0.0.1:{port}",
@@ -89,9 +88,7 @@ def connect(base_url, num_gpus):
             world_size=num_gpus + 1,
             group_name="test-update",
             timeout=timedelta(seconds=120),
-            pg_options=options,
         )
-        options.split_from = None
         assert response.result()["success"]
     return group
 

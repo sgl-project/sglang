@@ -3,7 +3,6 @@ import itertools
 import pickle
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import zmq
@@ -49,6 +48,8 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 
 logger = init_logger(__name__)
 
+# All replicas join one process group for these ops, so they must reach every
+# replica at once; a sequential fan-out would deadlock.
 _COLLECTIVE_REQ_TYPES = (
     InitWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -207,15 +208,7 @@ class SchedulerClient:
     def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _COLLECTIVE_REQ_TYPES):
-            with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
-                results = list(
-                    executor.map(
-                        lambda ep: self._forward_one(ep, batch, timeout_ms), endpoints
-                    )
-                )
-            output_batch = _merge_fanout_results(results)
-        elif isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
             output_batch = _merge_fanout_results(results)
         else:

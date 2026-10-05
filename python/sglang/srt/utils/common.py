@@ -2848,17 +2848,29 @@ def init_custom_process_group(
     pg_options_param_name = (
         "backend_options" if torch_release >= (2, 6) else "pg_options"
     )
-    pg, _ = _new_process_group_helper(
-        world_size,
-        rank,
-        [],
-        backend,
-        store,
-        group_name=group_name,
-        **{pg_options_param_name: pg_options},
-        timeout=timeout,
-        device_id=device_id,
-    )
+    # This group spans processes outside the default world, so its communicator
+    # must not be split from the default one, which torch does whenever the
+    # default group is bound to a device. A split here silently gives each
+    # process a group of its own.
+    default_pg = _world.default_pg
+    bound_device_id = default_pg.bound_device_id if default_pg is not None else None
+    if bound_device_id is not None:
+        default_pg.bound_device_id = None
+    try:
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            backend,
+            store,
+            group_name=group_name,
+            **{pg_options_param_name: pg_options},
+            timeout=timeout,
+            device_id=device_id,
+        )
+    finally:
+        if bound_device_id is not None:
+            default_pg.bound_device_id = bound_device_id
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
