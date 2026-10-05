@@ -181,7 +181,6 @@ class StreamingSession:
         )
 
     def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
-        """The slot whose record the request runs on, if any."""
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)

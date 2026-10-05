@@ -24,18 +24,15 @@ if TYPE_CHECKING:
 class SchedulerStats: ...  # type: ignore[no-redef]
 
 
-# What one KV record holds outside the tree. Pool accounting sums these over
-# each owner's records: the requests' own for uncached, the sessions' for
-# session-held, so every row is counted once, by its owner.
+# A KV record's footprint outside the tree, in whole pages. Each row is summed
+# once, under its owner: uncached for a request's own, session-held for a session's.
 
 
 def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
-    """Full-pool tokens past the tree-owned prefix, in whole pages."""
     return ceil_align(kv.kv_allocated_len, page_size) - kv.cache_protected_len
 
 
 def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
-    """SWA-pool tokens past both the tree-owned prefix and the evicted window."""
     allocated = ceil_align(kv.kv_allocated_len, page_size)
     return allocated - max(
         kv.cache_protected_len, kv.get_evicted_seqlen(ComponentType.SWA)
@@ -43,7 +40,6 @@ def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
 
 
 def kv_mamba_slots(kv: ReqKvInfo) -> int:
-    """mamba_pool entries: the state slot and the live ping-pong track slots."""
     total = kv.mamba_pool_idx.numel() if kv.holds_mamba else 0
     if kv.mamba_ping_pong_track_buffer is not None:
         total += int((kv.mamba_ping_pong_track_buffer != -1).sum().item())

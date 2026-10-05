@@ -291,9 +291,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
     def test_session_record_is_counted_once_by_its_owner(self):
         checker = self._make_checker()
         req = self._active_partial_page(checker)
-        # The request runs on a streaming session's record: the session owns
-        # the row, so it is session-held whether the turn is in a batch or
-        # parked between prefill chunks, and never also uncached.
+        # The session owns the row: session-held whether the turn is in a batch
+        # or parked between prefill chunks, never also uncached.
         req.session = SimpleNamespace(session_id="s", streaming=True)
         self.cache.session.slots["s"] = SessionSlot(kv=req.kv)
         for parked in (False, True):
