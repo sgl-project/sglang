@@ -334,6 +334,23 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
             )
 
+        # One rank and one scaling are applied to every module of an adapter.
+        overrides = {
+            "rank_pattern": lora_config.rank_overrides,
+            "alpha_pattern": lora_config.alpha_overrides,
+        }
+        overrides = ", ".join(
+            f"{field} for {sorted(value)[:3]}"
+            for field, value in overrides.items()
+            if value
+        )
+        if overrides:
+            raise ValueError(
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support "
+                f"per-module rank or alpha overrides ({overrides}). Use an adapter with a single r "
+                "and lora_alpha, or drop entries that match none of its modules."
+            )
+
         if lora_config.use_dora:
             raise ValueError(
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
