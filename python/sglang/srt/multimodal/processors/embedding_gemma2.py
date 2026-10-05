@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 import torch
+from transformers.video_utils import VideoMetadata
+
 from sglang.srt.models.embedding_gemma2 import EmbeddingGemma2Model
 from sglang.srt.multimodal.processors.base_processor import Modality
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
@@ -79,8 +81,8 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
     Preprocesses image, video, and audio inputs for EmbeddingGemma v2:
       - Prompt retention: retains prompt task/title prefixes verbatim, disabling the
         anchored prompt suppression used in generative Gemma4.
-      - Video processing: forwards video frames and metadata with do_sample_frames=True,
-        handling 1fps/cap32 uniform frame sampling.
+      - Video processing: samples frame indices with the HF video processor's
+        fps/max_frames rule before decoding, so only sampled frames are materialized.
       - Audio processing: provides unpadded raw waveforms (16kHz mono float32).
     """
 
@@ -124,11 +126,41 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             discard_alpha_channel=discard_alpha_channel,
         )
 
-    def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
-        total = len(vdw)
-        indices = list(range(total))
-        frames_np = vdw.get_frames_at(indices)  # (N, H, W, C)
-        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
+    def _sample_video(self, video: Any) -> tuple[torch.Tensor, VideoMetadata]:
+        """Decode only the frames the HF video processor would keep."""
+        if isinstance(video, VideoDecoderWrapper):
+            total, src_fps = len(video), video.avg_fps
+        else:
+            frames, meta = video if isinstance(video, tuple) else (video, None)
+            if isinstance(meta, VideoMetadata):
+                src_fps = meta.fps
+            elif isinstance(meta, dict):
+                src_fps = meta.get("fps")
+            else:
+                src_fps = None
+            total = len(frames)
+        metadata = VideoMetadata(
+            total_num_frames=total,
+            fps=src_fps,
+            duration=total / src_fps if src_fps else None,
+        )
+        video_processor = self._processor.video_processor
+        indices = video_processor.sample_frames(
+            metadata,
+            fps=self.video_config.get("fps", video_processor.fps),
+            max_frames=self.video_config.get("max_frames", video_processor.max_frames),
+            overflow_strategy=self.video_config.get(
+                "overflow_strategy", video_processor.overflow_strategy
+            ),
+        ).tolist()
+        if isinstance(video, VideoDecoderWrapper):
+            sampled = torch.as_tensor(video.get_frames_at(indices)).permute(0, 3, 1, 2)
+        elif isinstance(frames, torch.Tensor):
+            sampled = frames[indices]
+        else:
+            sampled = torch.as_tensor(np.asarray(frames)[indices])
+        metadata.frames_indices = indices
+        return sampled.contiguous(), metadata
 
     def process_mm_data(  # type: ignore[override]
         self,
@@ -152,63 +184,23 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             loaded_audios = []
             for a in audios:
                 if isinstance(a, (np.ndarray, torch.Tensor, tuple)):
-                    loaded_audios.append(_load_audio_from_memory(a, sr=16000, mono=True))
+                    loaded_audios.append(
+                        _load_audio_from_memory(a, sr=16000, mono=True)
+                    )
                 else:
                     loaded_audios.append(np.asarray(a, dtype=np.float32))
             kwargs["audio"] = loaded_audios
             kwargs.setdefault("audio_kwargs", {})["truncation"] = False
             audios = None
 
-        # 3. Video: forward (frames, metadata) with do_sample_frames=True
+        # 3. Video: frames are sampled here, so the HF processor must not resample.
         if videos:
-            unpacked_videos = []
-            video_metadata_list = []
-            has_metadata = False
-            for v in videos:
-                if isinstance(v, VideoDecoderWrapper):
-                    tensor_v = self._video_decoder_to_tensor(v)
-                    unpacked_videos.append(tensor_v)
-                    total_f = len(tensor_v)
-                    fps = getattr(v, "avg_fps", None)
-                    dur = getattr(v, "duration", None)
-                    if dur is None and fps and fps > 0:
-                        dur = total_f / fps
-                    video_metadata_list.append(
-                        {
-                            "total_num_frames": total_f,
-                            "fps": fps,
-                            "duration": dur,
-                            "frames_indices": list(range(total_f)),
-                        }
-                    )
-                    has_metadata = True
-                elif isinstance(v, tuple) and len(v) == 2:
-                    frames, meta = v
-                    if isinstance(meta, dict):
-                        meta = {
-                            k: val for k, val in meta.items() if k != "do_sample_frames"
-                        }
-                    unpacked_videos.append(frames)
-                    video_metadata_list.append(meta)
-                    has_metadata = True
-                else:
-                    unpacked_videos.append(v)
-                    total_f = len(v) if hasattr(v, "__len__") else 1
-                    video_metadata_list.append(
-                        {
-                            "total_num_frames": total_f,
-                            "fps": None,
-                            "duration": None,
-                            "frames_indices": list(range(total_f)),
-                        }
-                    )
-
-            videos = unpacked_videos
-            if has_metadata:
-                videos_kwargs = kwargs.setdefault("videos_kwargs", {})
-                videos_kwargs.setdefault("video_metadata", video_metadata_list)
-            # EmbeddingGemma2 HF processor requires do_sample_frames=True
-            kwargs.setdefault("do_sample_frames", True)
+            sampled = [self._sample_video(v) for v in videos]
+            videos = [frames for frames, _ in sampled]
+            kwargs.setdefault("videos_kwargs", {})["video_metadata"] = [
+                meta for _, meta in sampled
+            ]
+            kwargs["do_sample_frames"] = False
 
         return super(Gemma4SGLangProcessor, self).process_mm_data(
             input_text, images=images, videos=videos, audios=audios, **kwargs
