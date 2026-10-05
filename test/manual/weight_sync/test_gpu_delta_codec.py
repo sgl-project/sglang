@@ -1,7 +1,7 @@
 """GPU conformance for the prebuilt nvCOMP ABI; no extension compilation.
 
 Manual-only: requires Blackwell, the paired Miles image, nvCOMP 5.3,
-zstandard, and python-snappy. Missing hardware or dependencies fail this suite.
+zstandard, python-snappy, and lz4. Missing hardware or dependencies fail this suite.
 The hardware decoder preserves known bytes. Tests intentionally never feed malformed
 compressed streams to the GPU decoder.
 """
@@ -22,10 +22,15 @@ from sglang.srt.weight_sync.gpu_delta_layout import (
 from sglang.srt.weight_sync.gpu_delta_memory import SharedHostAllocation
 
 
-def _encode(values, offsets=None):
+def _encode(values, codec, offsets=None):
+    import lz4.block
     import snappy
 
-    compress = snappy.compress
+    compress = (
+        snappy.compress
+        if codec == "snappy-zstd"
+        else lambda value: lz4.block.compress(value, store_size=False)
+    )
     payload = bytearray()
     frames = []
     offset = 0
@@ -40,18 +45,23 @@ def _encode(values, offsets=None):
     return payload, frames
 
 
-def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
+@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd"])
+@pytest.mark.parametrize("sort_chunks", ["0", "1"])
+def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
+    codec, sort_chunks, monkeypatch
+):
+    monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sort_chunks)
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(device)
+    decoder = NvcompDecoder(device, codec)
     # Partial final frame, many zero bytes, and valid nonzero XOR values.
     values = [
         [bytes(1 << 20), bytes(range(256)) * 4096, bytes(range(253)) * 3],
         [bytes([7]) * (64 << 10), bytes(range(251)) * 3],
     ]
-    payload_a, frames_a = _encode(values[0])
+    payload_a, frames_a = _encode(values[0], codec)
     # A different frame count, partial final frame and sparse output offsets
     # exercise views whose row stride is the complete metadata slab's width.
-    payload_b, frames_b = _encode(values[1], [128, 128 + (64 << 10) + 256])
+    payload_b, frames_b = _encode(values[1], codec, [128, 128 + (64 << 10) + 256])
     input_b = (len(payload_a) + 15) // 16 * 16
     allocation = SharedHostAllocation(input_b + len(payload_b), device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)

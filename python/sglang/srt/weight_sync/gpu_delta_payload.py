@@ -22,23 +22,25 @@ from concurrent.futures import ThreadPoolExecutor
 def configured_codec():
     """Freeze the launch constraint when the scheduler admits a delta backend."""
     codec = os.environ.get("GPU_DELTA_CODEC", "snappy-zstd")
-    if codec != "snappy-zstd":
-        raise ValueError("GPU_DELTA_CODEC must be snappy-zstd")
+    if codec not in {"snappy-zstd", "lz4-zstd"}:
+        raise ValueError("GPU_DELTA_CODEC must be snappy-zstd or lz4-zstd")
     return codec
 
 
 def validate_codec(manifest, expected):
-    """Authenticate the one wire format before examining any tensor payload."""
+    """Authenticate the negotiated wire codec before examining any tensor payload."""
     if (
         type(manifest.get("protocol_version")) is not int
         or manifest["protocol_version"] != 4
         or manifest.get("codec") != expected
-        or expected != "snappy-zstd"
+        or expected not in {"snappy-zstd", "lz4-zstd"}
         or "codec_profile" in manifest
         or type(manifest.get("frame_bytes")) is not int
         or manifest["frame_bytes"] not in {1 << 16, 1 << 20}
     ):
-        raise ValueError("GPU delta requires protocol 4 with codec snappy-zstd")
+        raise ValueError(
+            "GPU delta requires protocol 4 with the negotiated snappy-zstd or lz4-zstd codec"
+        )
 
 
 def raw_payload_range(entry, files):
@@ -137,7 +139,7 @@ def validate_outer_entries(entries, files, frame_bytes):
                 or decoded_offset < decoded_end
                 or decoded_offset + decoded > entry["nbytes"]
             ):
-                raise ValueError("invalid relative inner Snappy frame")
+                raise ValueError("invalid relative inner compressed frame")
             end, decoded_end = offset + encoded, decoded_offset + decoded
         if end != size:
             raise ValueError("outer decoded length differs from the inner tensor span")
@@ -146,7 +148,7 @@ def validate_outer_entries(entries, files, frame_bytes):
 
 
 def _validate_outer_frames(outer):
-    """GPU Zstd chunks exactly cover one natural tensor's inner Snappy arena."""
+    """GPU Zstd chunks exactly cover one natural tensor's inner compressed arena."""
     chunks = outer["frames"]
     if not chunks:
         raise ValueError("GPU outer Zstd requires independent chunks")

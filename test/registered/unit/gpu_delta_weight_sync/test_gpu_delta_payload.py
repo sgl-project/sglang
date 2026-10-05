@@ -1,12 +1,15 @@
 """Outer CPU Zstd transport tests; no CUDA allocation or model imports."""
 
 import copy
+import os
 import unittest
+from unittest.mock import patch
 
 import zstandard as zstd
 
 from sglang.srt.weight_sync.gpu_delta_payload import (
     OuterZstdPool,
+    configured_codec,
     validate_codec,
     validate_outer_entries,
     validate_zstd_frame,
@@ -55,8 +58,23 @@ def entry(payload, name="weight", size=36):
 class TestOuterZstd(unittest.TestCase):
     def test_manifest_codec_and_frame_geometry_admission(self):
         admitted = dict(protocol_version=4, codec="snappy-zstd", frame_bytes=1 << 20)
-        for size in (1 << 16, 1 << 20):
-            validate_codec(admitted | {"frame_bytes": size}, "snappy-zstd")
+        with patch.dict(os.environ):
+            os.environ.pop("GPU_DELTA_CODEC", None)
+            self.assertEqual(configured_codec(), "snappy-zstd")
+            for codec in ("snappy-zstd", "lz4-zstd"):
+                os.environ["GPU_DELTA_CODEC"] = codec
+                frozen = configured_codec()
+                for size in (1 << 16, 1 << 20):
+                    validate_codec(
+                        admitted | {"codec": codec, "frame_bytes": size}, frozen
+                    )
+                other = "lz4-zstd" if codec == "snappy-zstd" else "snappy-zstd"
+                os.environ["GPU_DELTA_CODEC"] = other
+                with self.assertRaisesRegex(ValueError, "codec"):
+                    validate_codec(admitted | {"codec": other}, frozen)
+            os.environ["GPU_DELTA_CODEC"] = "lz4"
+            with self.assertRaisesRegex(ValueError, "GPU_DELTA_CODEC"):
+                configured_codec()
         for patch_value in (
             {"protocol_version": 2},
             {"protocol_version": 3},

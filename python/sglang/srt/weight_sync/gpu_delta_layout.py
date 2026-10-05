@@ -1126,7 +1126,7 @@ class PreparedDelta:
         self.workspace = self.decode_plan = None
         if self.static_plans:
             if backend.decoder is None:
-                backend.decoder = NvcompDecoder(self.device)
+                backend.decoder = NvcompDecoder(self.device, backend.codec)
             with torch.cuda.stream(self.de_stream):
                 self.workspace = backend.decoder.allocate_workspace(self.frame_plans)
                 self.decode_plan = backend.decoder.prepare_batches(

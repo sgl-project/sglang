@@ -43,20 +43,21 @@ it does not require nvCOMP.
 
 The codec suite is manual-only because registered CI does not provision its
 prebuilt nvCOMP dependency. It requires Blackwell, `nvidia-libnvcomp-cu13==5.3.0.16`,
-`zstandard` and `python-snappy`. It checks hardware Snappy decoding against
-known input bytes from a DE-capable host allocation, reusing two decoded HBM slots. No malformed compressed
+`zstandard`, `python-snappy` and `lz4` (the last two are CPU test oracles). It
+checks hardware Snappy and LZ4 decoding with sorting off/on against known input
+bytes from a DE-capable host allocation, reusing two decoded HBM slots. No malformed compressed
 streams are sent to nvCOMP. Missing hardware or dependencies fail the manual
 suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and derived
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
 Preparation checks compressed artifact SHA-256 and unwraps outer Zstd once per
-host sharing domain. Each rank maps the retained shared Snappy/raw allocation for CPU and GPU access.
+host sharing domain. Each rank maps the retained shared inner-codec/raw allocation for CPU and GPU access.
 Preparation constructs CPU descriptors without reading weights or stopping serving;
 it prepares small GPU metadata/workspace and raw-target inputs, but never
 allocates large decoded-mask slots or runs DE/model application.
 There is no staging selector or full-publication HBM copy. Every retained changed
-matrix frame is Snappy, including inputs whose
+matrix frame uses the selected inner codec, including inputs whose
 compressed representation expands; there is no raw-frame fallback. Once every
 original rank reports `PREPARED`, Miles fans out
 `update_weights_from_delta`. Each local handler closes generation admission,
@@ -157,22 +158,28 @@ has no distributed collectives, and shared IPC weight storage is excluded.
 The `GPU_DELTA_*` environment variables below are development/debug knobs,
 not a stable user-facing configuration API.
 
-`GPU_DELTA_CODEC=snappy-zstd` is the sole contract and the default. The
+`GPU_DELTA_CODEC` accepts `snappy-zstd` (default) and `lz4-zstd`. The
 receiver freezes it at backend admission, advertises it in its participant plan,
 and rejects any unsupported value. The sender and receiver must agree before a
 publication; manifest fields cannot override the launch constraint. Legacy codec
 values and removed encoder/outer selectors have no migration layer.
 
-Protocol 4 carries `codec="snappy-zstd"` and explicit `frame_bytes` (64 KiB or
-1 MiB). Matrix frames contain only input/output offsets and lengths, without
+Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB or
+1 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without
 redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
-covering its aligned Snappy arena. The sender computes both Snappy and outer Zstd
-on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
+covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
+disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
 maps each process's allocation for CPU/GPU access, then decodes model-layer batches
 directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
+
+`GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
+hardware chunk sorting once when the decoder is constructed, for either codec.
+Sorting executes inside the paused decode call; preparation does not sort or
+reorder the frames. The codec extension and sorting options await native GPU
+qualification and matched benchmarks; existing Snappy results do not measure LZ4.
 
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
 One creator uses that many reusable CPU workers, each with its own Zstd context;

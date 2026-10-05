@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.metadata
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -24,6 +25,22 @@ class _SnappyOptions(ctypes.Structure):
         ("sort_before_hw_decompress", ctypes.c_int),
         ("reserved", ctypes.c_char * 56),
     ]
+
+
+class _Lz4Options(ctypes.Structure):
+    _fields_ = [
+        ("backend", ctypes.c_int),
+        ("sort_before_hw_decompress", ctypes.c_int),
+        ("data_type", ctypes.c_int),
+        ("bitshuffle_mode", ctypes.c_int),
+        ("reserved", ctypes.c_char * 48),
+    ]
+
+
+_DECOMPRESS_OPTIONS = {
+    "snappy-zstd": ("Snappy", _SnappyOptions),
+    "lz4-zstd": ("LZ4", _Lz4Options),
+}
 
 
 class _Alignments(ctypes.Structure):
@@ -54,12 +71,12 @@ def _require_hardware_allocator(device: torch.device) -> None:
     # without the hardware-decompression allocation flag. Inspect effective
     # settings, not only the environment (PyTorch can change them at runtime).
     if torch.cuda.memory.get_allocator_backend() != "native":
-        raise RuntimeError("Snappy deltas require native CUDA allocations")
+        raise RuntimeError("GPU deltas require native CUDA allocations")
     snapshot = torch.cuda.memory._snapshot()
     expandable = snapshot.get("allocator_settings", {}).get("expandable_segments")
     if expandable is not False:
         raise RuntimeError(
-            "Snappy hardware decoding requires verifiable expandable_segments:False; "
+            "Hardware decoding requires verifiable expandable_segments:False; "
             "PyTorch expandable VMM buffers are not admitted"
         )
     if any(
@@ -67,22 +84,29 @@ def _require_hardware_allocator(device: torch.device) -> None:
         for segment in snapshot.get("segments", [])
     ):
         raise RuntimeError(
-            "Snappy hardware decoding cannot reuse existing PyTorch expandable VMM segments; "
+            "Hardware decoding cannot reuse existing PyTorch expandable VMM segments; "
             "start the process with expandable_segments:False"
         )
 
 
 class NvcompDecoder:
-    """One device's qualified Snappy hardware decoder.
+    """One device's fixed inner-codec hardware decoder.
 
     Missing libraries and unsupported hardware fail admission. There is no CPU
-    decoder, algorithm substitution or software Snappy fallback.
+    decoder, algorithm substitution or software fallback.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, codec: str = "snappy-zstd"):
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("Delta decoder requires an explicit CUDA device")
+        if codec not in _DECOMPRESS_OPTIONS:
+            raise ValueError("GPU delta codec must be snappy-zstd or lz4-zstd")
+        self.codec = codec
+        self._algorithm, options_type = _DECOMPRESS_OPTIONS[codec]
+        sorting = os.environ.get("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", "0")
+        if sorting not in {"0", "1"}:
+            raise ValueError("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS must be 0 or 1")
         cuda_major = torch.version.cuda.split(".")[0]
         package = f"nvidia-libnvcomp-cu{cuda_major}"
         distribution = importlib.metadata.distribution(package)
@@ -91,21 +115,25 @@ class NvcompDecoder:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 5.3+ ABI")
         self.version = distribution.version
         self.backend = "hardware"
-        self._options = _SnappyOptions()
+        self._options = options_type()
         # Explicit backend selection: DEFAULT can silently select software.
         self._options.backend = 1
+        self._options.sort_before_hw_decompress = int(sorting)
+        if codec == "lz4-zstd":
+            self._options.data_type = 0  # NVCOMP_TYPE_CHAR
+            self._options.bitshuffle_mode = 0  # NVCOMP_BITSHUFFLE_NONE
         if torch.cuda.get_device_capability(self.device)[0] < 10:
-            raise RuntimeError("Snappy deltas require Blackwell hardware decompression")
+            raise RuntimeError("GPU deltas require Blackwell hardware decompression")
         _require_hardware_allocator(self.device)
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
         )
         pointer, size = ctypes.c_void_p, ctypes.c_size_t
         self._temporary = self._bind(
-            "GetTempSizeAsync", [size, size, _SnappyOptions, ctypes.POINTER(size), size]
+            "GetTempSizeAsync", [size, size, options_type, ctypes.POINTER(size), size]
         )
         self._align = self._bind(
-            "GetRequiredAlignments", [_SnappyOptions, ctypes.POINTER(_Alignments)]
+            "GetRequiredAlignments", [options_type, ctypes.POINTER(_Alignments)]
         )
         self._decode = self._bind(
             "Async",
@@ -118,7 +146,7 @@ class NvcompDecoder:
                 pointer,
                 size,
                 pointer,
-                _SnappyOptions,
+                options_type,
                 pointer,
                 pointer,
             ],
@@ -130,14 +158,16 @@ class NvcompDecoder:
     def _bind(self, suffix, arguments):
         function = getattr(
             self._library,
-            "nvcompBatchedSnappyDecompress" + suffix,
+            "nvcompBatched" + self._algorithm + "Decompress" + suffix,
         )
         function.argtypes, function.restype = arguments, ctypes.c_int
         return function
 
     def _check(self, status):
         if status != 0:
-            raise RuntimeError(f"nvCOMP snappy/{self.backend} failed: status={status}")
+            raise RuntimeError(
+                f"nvCOMP {self.codec}/{self.backend} failed: status={status}"
+            )
 
     def temporary_bytes(self, frames: Sequence[DecodeFrame]) -> int:
         if not frames:

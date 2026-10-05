@@ -717,7 +717,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
 
         class CpuLiteralDecoder:
             # CPU oracle only. The native suite qualifies real DE and CUDA races.
-            def __init__(self, device):
+            def __init__(self, device, codec):
+                assert codec == backend.codec
                 self.device = device
 
             def allocate_workspace(self, batches):
