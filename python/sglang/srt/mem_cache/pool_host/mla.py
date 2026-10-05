@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
@@ -60,12 +60,17 @@ if _is_cuda or _is_hip or _is_xpu:
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupLayerOwners
+
 logger = logging.getLogger(__name__)
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
     mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
+    # Rotating MLA host dedup: this rank stores only the target layers it owns.
+    dedup_owners: Optional[MLAHostDedupLayerOwners] = None
 
     def __init__(
         self,
@@ -84,10 +89,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        dedup_owners: Optional[MLAHostDedupLayerOwners] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        self.dedup_owners = None if is_dummy else dedup_owners
 
         if is_dummy:
             self._init_dummy(
@@ -154,6 +161,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             for buf in getattr(pool, "kv_buffer", None) or ()
         )
         self._init_write_back_staging_buffers()
+        if self.dedup_owners is not None:
+            logger.info(
+                "MLA host dedup: rank %d of %d stores KV host layers %s (%d of %d) "
+                "and %d draft layers; %d tokens",
+                self.dedup_owners.rank,
+                self.dedup_owners.size,
+                self._dedup_kv_layers,
+                self.target_layer_num,
+                self.device_pool.layer_num,
+                len(self.mtp_draft_device_pools),
+                self.size,
+            )
 
     def _init_dummy(
         self,
@@ -245,11 +264,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.device_pool, "dsa_kv_cache_store_fp8", False
         )
         self.target_layer_num = self._effective_host_layer_num()
+        capacity_layer_num = self.target_layer_num
+        if self.dedup_owners is not None:
+            self._dedup_kv_layers = self.dedup_owners.owned_kv_layers()
+            self._dedup_host_layer = {
+                layer: i for i, layer in enumerate(self._dedup_kv_layers)
+            }
+            self.target_layer_num = len(self._dedup_kv_layers)
+            # Every rank holds the same tokens: size by the largest share.
+            capacity_layer_num = self.dedup_owners.max_kv_layers
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
-        size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        size_per_token = (
+            self.kv_cache_dim
+            * self.dtype.itemsize
+            * (capacity_layer_num + len(self.mtp_draft_device_pools))
+        )
         if (
             self.layout == "page_first_kv_split"
             and self.device_pool.index_head_dim is not None
@@ -273,6 +305,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        if self.dedup_owners is not None:
+            return layer_id in self._dedup_host_layer
+        return super()._is_device_layer_owned(device_pool, layer_id)
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        if self.dedup_owners is not None:
+            return self._dedup_host_layer[layer_id]
+        return super()._host_layer_index(layer_id, device_pool)
+
+    def _draft_host_layer(self, layer_id: int) -> int:
+        # Packed drafts arrive as ``target_device_layer_num + depth``.
+        if self.dedup_owners is None:
+            return layer_id
+        return self.target_layer_num + layer_id - self.device_pool.layer_num
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -675,7 +723,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device_indices, self.dcp_size, self.dcp_rank
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = (
+            self._draft_host_layer(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
         device_layer_id = 0 if is_draft else layer_id
 
         if io_backend == "kernel":
@@ -979,13 +1031,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_kv_buffers,
-                    dst_ptrs=[self.kv_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
-                )
+                if self.dedup_owners is not None:
+                    # Host layers: the owned target layers, then the packed drafts.
+                    num = self.device_pool.layer_num
+                    device_kv_buffers = [
+                        device_kv_buffers[layer] for layer in self._dedup_kv_layers
+                    ] + list(device_kv_buffers[num:])
+                for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
+                    device_indices, host_indices, slots_per_page=self.page_size
+                ):
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_kv_buffers,
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=chunk_device_indices,
+                        dst_indices=chunk_host_indices,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":

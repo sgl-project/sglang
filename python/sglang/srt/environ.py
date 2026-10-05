@@ -769,9 +769,15 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Direct-I/O D2H backup: issue each all-layer copy batch in batches of this
+    # many pages, so each batch's DMA runs while the next is issued (0 = one batch).
+    SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES = EnvInt(0)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Skip the per-step HiCache ready-count CPU all-reduce while no D<->H
+    # transfer ack is outstanding (aggregated, L2-only, single PP stage).
+    SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

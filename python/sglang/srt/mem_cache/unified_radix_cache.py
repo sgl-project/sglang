@@ -92,7 +92,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -134,6 +139,11 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+# SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP: after this many consecutive skipped
+# ready-count syncs, run one anyway so its piggybacked reclaim-digest check still
+# runs. Arbitrary; a few seconds at typical scheduler step rates.
+_IDLE_SYNC_MAX_SKIPS = 512
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -163,6 +173,10 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Read by check_hicache_events on every step; resolved in init_hicache. The
+    # class default keeps caches built without __init__ on the original path.
+    _idle_sync_skip = False
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -274,6 +288,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP, resolved in init_hicache.
+        self._idle_sync_skip = False
+        self._idle_sync_skips = 0
+        self._idle_sync_skip_logged = False
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -506,6 +524,7 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.tree_core.has_swa_host_pool
         ):
             self.tree_core.enable_swa_write_back_eviction_barrier()
+        self._init_idle_sync_skip()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -3184,6 +3203,66 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
+    def _init_idle_sync_skip(self) -> None:
+        """Resolve SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP.
+
+        The skip is limited to aggregated serving with one PP stage and no
+        buffer-only mode. A storage backend blocks it per step, because one can
+        be attached at runtime."""
+        if not envs.SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP.get():
+            return
+        reasons = []
+        if self.cache_controller is None:
+            reasons.append("no HiCache controller")
+        if self.pp_size > 1:
+            reasons.append(f"pp_size={self.pp_size}")
+        if self.buffer_pipeline is not None:
+            reasons.append("buffer_only host memory mode")
+        disagg_mode = get_disagg().disaggregation_mode
+        if disagg_mode != "null":
+            reasons.append(f"disaggregation_mode={disagg_mode}")
+        if reasons:
+            logger.info(
+                "HiCache idle-sync skip requested (SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP=1) "
+                "but inactive: %s",
+                ", ".join(reasons),
+            )
+            return
+        self._idle_sync_skip = True
+        logger.info(
+            "HiCache idle-sync skip enabled (SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP=1): "
+            "the per-step ready-count all-reduce is skipped while no D<->H ack is "
+            "outstanding and no storage backend is attached (forced every %d skips)",
+            _IDLE_SYNC_MAX_SKIPS,
+        )
+
+    @rank_consensus(same_results=True)
+    def _skip_idle_sync(self) -> bool:
+        """True iff this step's ready-count all-reduce can be skipped.
+
+        With both ack queues empty on every rank the all-reduce returns zeros, so
+        skipping changes no state. Every input is rank-invariant: acks are queued
+        in the same order on every rank and popped only by all-reduced counts or
+        full drains, a broadcast control request sets enable_storage, and only
+        this method updates _idle_sync_skips."""
+        cc = self.cache_controller
+        if (
+            self.enable_storage
+            or cc.ack_write_queue
+            or cc.ack_load_queue
+            or self._idle_sync_skips >= _IDLE_SYNC_MAX_SKIPS
+        ):
+            self._idle_sync_skips = 0
+            return False
+        self._idle_sync_skips += 1
+        if not self._idle_sync_skip_logged:
+            self._idle_sync_skip_logged = True
+            logger.info(
+                "HiCache idle-sync skip engaged: ready-count all-reduce skipped "
+                "(no D<->H ack outstanding)"
+            )
+        return True
+
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
@@ -3434,12 +3513,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
-        (
-            write_finish_count,
-            load_finish_count,
-            storage_queue_sizes,
-            extra_pool_names,
-        ) = self._sync_hicache_ready_counts()
+        if self._idle_sync_skip and self._skip_idle_sync():
+            # No ack is outstanding on any rank, so the all-reduce would return 0s.
+            write_finish_count = load_finish_count = 0
+            storage_queue_sizes, extra_pool_names = (), ()
+        else:
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+                extra_pool_names,
+            ) = self._sync_hicache_ready_counts()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
