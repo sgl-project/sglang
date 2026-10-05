@@ -49,22 +49,6 @@ def _temb_table_slices_kernel(
         tl.store(out_ptr + (j * rows + row) * D + cols, w + t, mask=mask)
 
 
-def can_use_fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> bool:
-    return (
-        temb.is_cuda
-        and temb.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and temb.dim() == 4
-        and temb.shape[2] == 6
-        and temb.is_contiguous()
-        and table.is_cuda
-        and table.device == temb.device
-        and table.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and table.shape == (1, 6, temb.shape[-1])
-        and table.is_contiguous()
-        and temb.numel() > 0
-    )
-
-
 def _fake_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
     batch, seq_len, six, hidden = temb.shape
     return temb.new_empty((six, batch, seq_len, hidden), dtype=torch.float32)
@@ -81,6 +65,20 @@ def fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Te
     ``temb`` is ``(B, S, 6, D)``; ``table`` is the block's ``(1, 6, D)`` fp32
     adaLN table.  ``out[j]`` is the ``j``-th modulation slice, contiguous.
     """
+    if not (
+        temb.is_cuda
+        and temb.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and temb.dim() == 4
+        and temb.shape[2] == 6
+        and temb.is_contiguous()
+        and table.is_cuda
+        and table.device == temb.device
+        and table.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and table.shape == (1, 6, temb.shape[-1])
+        and table.is_contiguous()
+        and temb.numel() > 0
+    ):
+        raise RuntimeError("invalid input for fused_temb_table_slices")
     batch, seq_len, _, hidden = temb.shape
     out = temb.new_empty((6, batch, seq_len, hidden), dtype=torch.float32)
     rows = batch * seq_len

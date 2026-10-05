@@ -213,19 +213,14 @@ These arguments and environment variables are critical for tuning decode perform
   </thead>
   <tbody>
     <tr>
-      <td>`--dp-size` / `--data-parallel-size`</td>
-      <td>Sets the data parallelism degree for the decode server. With DP attention enabled, attention layers are sharded across DP ranks while FFN/MoE layers use tensor parallelism. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides evenly into your total card count, with remaining cards used for TP/EP.</td>
+      <td>`--attn-dp-size` / `--attention-data-parallel-size`</td>
+      <td>Sets the attention DP size for the decode server: the number of data-parallel attention groups inside the TP group. This is a key optimization for decode throughput — attention is DP-sharded to reduce KV cache duplication, while FFN/MoE layers remain TP-sharded to leverage expert parallelism. Best suited for MoE models where attention is not the compute bottleneck. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides the TP size evenly.</td>
       <td>`8`</td>
     </tr>
     <tr>
       <td>`--ep` / `--ep-size` / `--expert-parallel-size`</td>
       <td>Sets the expert parallelism degree. For MoE models, this distributes experts across cards, reducing per-card expert loading overhead and enabling all-to-all dispatch. The code default is `1`; set explicitly for MoE models. The optimal value depends on your model's expert count and architecture. DeepSeek V3.2 with 256 routed experts uses `ep=32`. For models with fewer experts, use a proportionally smaller value.</td>
       <td>`32`</td>
-    </tr>
-    <tr>
-      <td>`--enable-dp-attention`</td>
-      <td>Enables data parallelism for attention layers while keeping tensor parallelism for FFN/MoE layers. This is a key optimization for decode throughput — attention is DP-sharded to reduce KV cache duplication, while MoE layers remain TP-sharded to leverage expert parallelism. Best suited for MoE models where attention is not the compute bottleneck.</td>
-      <td>Enabled</td>
     </tr>
     <tr>
       <td>`--enable-dp-lm-head`</td>
@@ -722,9 +717,9 @@ The symbols used are defined as follows:
 
 Splits model weights across multiple NPU devices so that large models can be loaded and run cooperatively. Each device holds a shard of every weight tensor and communicates via HCCL all-reduce. This is the primary mechanism for deploying models that exceed single-device memory.
 
-### Data Parallelism (`--dp-size`, `--enable-dp-attention`)
+### Data Parallelism (`--dp-size`, `--attn-dp-size`)
 
-Replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. With --enable-dp-attention, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed.
+`--dp-size` replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. `--attn-dp-size` instead runs attention data parallel inside the TP group: the attention layers are replicated across attention DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed. Model replicas (`--dp-size` > 1) cannot be combined with attention DP.
 
 ### Expert Parallelism (`--ep-size`)
 
@@ -774,7 +769,7 @@ On Ascend, this is primarily controlled via environment variable SGLANG_ENABLE_O
 
 ### DP LM Head (`--enable-dp-lm-head`)
 
-Shards the language model head (the final vocabulary projection layer) across DP ranks to reduce memory consumption and improve decode throughput. Without this, each DP rank holds a full copy of the LM head, which is wasteful for large vocabularies. Typically used together with `--enable-dp-attention`.
+Shards the language model head (the final vocabulary projection layer) across DP ranks to reduce memory consumption and improve decode throughput. Without this, each DP rank holds a full copy of the LM head, which is wasteful for large vocabularies. Typically used together with `--attn-dp-size`.
 
 ### MLAPO (`SGLANG_NPU_USE_MLAPO=1`)
 

@@ -118,8 +118,7 @@ do
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
-        --enable-dp-attention \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs-decode 1 \
@@ -293,8 +292,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -490,8 +487,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -686,8 +681,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 16 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -878,8 +871,7 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 2 \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -1013,8 +1005,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
@@ -1122,8 +1113,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 \
@@ -1236,8 +1226,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 5 \
@@ -1348,8 +1337,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 11 12 13 \

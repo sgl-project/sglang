@@ -310,8 +310,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --mem-fraction-static 0.65 \
     --max-running-requests 4 \
     --reasoning-parser minimax-append-think \
@@ -420,8 +419,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --mem-fraction-static 0.53 \
     --max-running-requests 96 \
     --disable-radix-cache \
@@ -525,8 +523,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --mem-fraction-static 0.75 \
     --max-running-requests 320 \
     --disable-radix-cache \

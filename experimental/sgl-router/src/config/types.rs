@@ -1,4 +1,5 @@
 use crate::config::sampling::SamplingOverrides;
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -259,6 +260,8 @@ pub struct ServerConfig {
     pub shutdown_drain_secs: u64,
     /// Declared pod termination grace period; `None` uses the Kubernetes default for advisories.
     pub termination_grace_secs: Option<u64>,
+    /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
+    pub worker_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -288,6 +291,7 @@ impl Default for ServerConfig {
             port: default_port(),
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
+            worker_auth: None,
         }
     }
 }
@@ -327,8 +331,8 @@ impl Default for ObservabilityConfig {
 pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
-    /// Resolved by [`crate::tokenizer::adapter::load`].
-    pub tokenizer_path: String,
+    /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
+    pub tokenizer_path: Option<String>,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
@@ -337,6 +341,8 @@ pub struct ModelConfig {
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
+    /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
+    pub dp_aware: bool,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
@@ -436,6 +442,15 @@ pub struct CacheAwareConfig {
     /// Upper bound on the per-fetch timeout derived from `bootstrap_timeout_ms`;
     /// see `snapshot_fetch_timeout`. Validated by `Config::validate`.
     pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep over a non-empty candidate set timed
+    /// out. Bounded at max(3x `bootstrap_timeout_ms`, 60s), after which the
+    /// replica serves cache-blind; nothing re-sweeps during the hold, so this
+    /// delays a failed seed's replica and a fleet-wide restart is a delay, not
+    /// an outage.
+    pub bootstrap_seed_required: bool,
+    /// How long a routed prompt credits its worker before KV events confirm
+    /// it; 0 disables.
+    pub pending_prefix_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -445,6 +460,8 @@ impl Default for CacheAwareConfig {
             kv_indexer_endpoint: None,
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
+            pending_prefix_ttl_ms: 0,
         }
     }
 }
@@ -487,9 +504,13 @@ pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 /// this, so the no-affinity path never drifts from the configured default.
 pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
 
-/// Controls whether admission may select a session-affinity backup.
+/// Affinity preference; legacy routing uses Strict/Soft, reorg uses Prefer/Balanced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
+    /// Reorg: retain admissible affinity, otherwise fall back and rebind.
+    Prefer,
+    /// Reorg: allow a sufficiently less-loaded alternative.
+    Balanced,
     /// Keep the primary after it passes admission.
     #[value(name = "strict")]
     Strict,
@@ -522,6 +543,8 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub load_factor: f64,
+    pub load_gap: u64,
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
@@ -561,6 +584,8 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            load_factor: 2.0,
+            load_gap: 1_024,
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
@@ -675,6 +700,9 @@ pub struct K8sDiscoveryConfig {
     /// Requires the router's ServiceAccount to have `list`/`watch` on
     /// EndpointSlices in that namespace.
     pub peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group.
+    /// Set only in PD mode.
+    pub version_group_label: Option<String>,
 }
 
 /// Validated selector mode. Plain selectors run server-side; PD selectors
