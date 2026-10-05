@@ -1,0 +1,46 @@
+{
+  "defaults": {
+    "role": "assistant"
+  },
+  "start_anchor_pattern": "<\\|start\\|>assistant",
+  "fields": {
+    "thinking": {
+      "open_pattern": "(?:^<\\|channel\\|>analysis<\\|message\\|>|<\\|start\\|>assistant<\\|channel\\|>analysis<\\|message\\|>)",
+      "close": "<|end|>",
+      "content": "text"
+    },
+    "content": {
+      "open_pattern": "(?:<\\|channel\\|>final<\\|message\\|>|<\\|start\\|>assistant<\\|channel\\|>final<\\|message\\|>)",
+      "close": [
+        "<|return|>",
+        "<|end|>"
+      ],
+      "content": "text"
+    },
+    "tool_calls": {
+      "open_pattern": "(?:<\\|start\\|>assistant )?to=(?:refl\\.)?(?P<name>[a-zA-Z_][a-zA-Z0-9_.-]*)<\\|channel\\|>analysis(?: <\\|constrain\\|>xml)?<\\|message\\|>",
+      "close": [
+        "<|end|>",
+        "<|call|>"
+      ],
+      "repeats": true,
+      "content": "xml-inline",
+      "content_args": {
+        "tag_pattern": "<rfl:parameter name=\"(?P<key>[^\"]+)\">\\n?(?P<value>.*?)\\n?</rfl:parameter>",
+        "value_parser": {
+          "name": "text",
+          "args": {
+            "strip": false
+          }
+        }
+      },
+      "transform": {
+        "type": "function",
+        "function": {
+          "name": "{name}",
+          "arguments": "{content}"
+        }
+      }
+    }
+  }
+}

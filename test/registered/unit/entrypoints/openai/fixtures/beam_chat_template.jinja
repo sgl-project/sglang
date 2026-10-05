@@ -1,0 +1,379 @@
+{#-
+  harmony_xml — HEAD training / serving Harmony wire format.
+
+  Matches olympus `FormatterKey.HARMONY_XML` on main:
+  - `valid_channels = (analysis, final)` (no commentary channel)
+  - `tool_call_format = 'xml'` (`rfl:parameter` bodies)
+  - flat TypeScript tool declarations under `# Tools` (same as
+    `olympus.formatters.formats.harmony._flat_tool_declaration`)
+  - system metadata labels from openai-harmony (numeric
+    `Reasoning effort: N`; `# Valid channels: ... every message.`)
+
+  Kwargs:
+  - model_identity
+  - knowledge_cutoff / current_date — optional; omitted from the wire when
+    unset (matches `build_reflection_harmony_system_content`)
+  - reasoning_effort — token-budget RE (emits `Reasoning effort: N` after
+    identity); no RE line when unset. Accepts an int, or the string labels
+    `low`/`medium`/`high`/`max` mapped to 8/32/64/128. Other strings raise.
+  - reasoning_effort_hint — optional verbatim hint body used only with
+    `reasoning_effort`; when set, emits `Reasoning effort: N. <hint>`
+    (producers compose the stated budget and guidance into the hint)
+  - include_system (default true), include_developer (default true)
+  - emit_empty_developer_block (default false)
+  - builtin_tools: OpenAI tool dicts rendered in the system `# Tools` block
+    (before `# Valid channels`). Same declaration shape as `tools=`.
+  - collapse_completed_tool_thinking (default false) — serving-only: when true,
+    drop analysis from a tool turn once a later assistant final exists in the
+    history (tool calls themselves are kept). Default false matches Titan
+    training emission.
+
+  OpenAI role "system" maps to the Harmony developer `# Instructions` block.
+  The Reflection system block is injected automatically when `include_system`.
+
+  Tool wire:
+  - Calls: `to={name}` + analysis + `<|constrain|>xml` + rfl: body.
+    Recipients advertised in `builtin_tools` use `to=refl.{name}` (same
+    prefix on results). `tools=` recipients stay bare. No marker-less raw path.
+  - Results: `{recipient} to=assistant` on analysis
+  - Parallel: `<|end|>` between calls, `<|call|>` on the last
+  - `function.arguments` must be a dict (parse JSON strings before apply)
+
+  Assistant history (training parity, default):
+  - Every assistant turn emits an analysis block (empty if no thinking).
+  - Non-tool turns then emit final + `<|return|>`.
+  - Tool turns then emit the XML tool-call sequence.
+
+  Reasoning field: `message.thinking` is native; `message.reasoning_content`
+  is accepted as an alias.
+-#}
+
+{#- Map JSON-schema type names the way openai-harmony does. #}
+{%- macro ts_type_name(type_val) -%}
+    {%- if type_val == "integer" -%}
+        {{- "number" -}}
+    {%- else -%}
+        {{- type_val -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- Render a JSON-schema node as a TypeScript type (openai-harmony subset used
+   by `_flat_tool_declaration` after namespace stripping).
+
+   `indent` is the leading spaces for properties inside an object. Nested
+   objects bump it by 4 so the wire matches openai-harmony's formatter output.
+   Use `schema["items"]` (not `schema.items`) — attribute access would hit
+   dict.items. #}
+{%- macro json_schema_to_typescript(schema, indent=0) -%}
+    {%- if schema is mapping and schema.get("enum") -%}
+        {%- for val in schema.enum -%}
+            {{- val | tojson -}}
+            {%- if not loop.last %} | {% endif -%}
+        {%- endfor -%}
+    {%- elif schema is mapping and schema.get("type") == "object" -%}
+        {{- "{\n" -}}
+        {%- set required = schema.required if schema.get("required") else [] -%}
+        {%- if schema.get("properties") -%}
+            {#- Preserve insertion order (openai-harmony / serde_json map order). #}
+            {%- for prop_name, prop_spec in schema.properties.items() -%}
+                {%- if prop_spec is mapping and prop_spec.get("description") and not prop_spec.get("oneOf") -%}
+                    {{- (" " * indent) + "// " + prop_spec.description + "\n" -}}
+                {%- endif -%}
+                {{- (" " * indent) + prop_name -}}
+                {%- if prop_name not in required -%}?{%- endif -%}
+                {{- ": " -}}
+                {{- json_schema_to_typescript(prop_spec, indent + 4) -}}
+                {{- "," -}}
+                {%- if prop_spec is mapping and prop_spec.get("default") is not none and not prop_spec.get("oneOf") -%}
+                    {%- if prop_spec.default is string and not prop_spec.get("enum") -%}
+                        {{- ' // default: "' + prop_spec.default + '"' -}}
+                    {%- else -%}
+                        {{- " // default: " + (prop_spec.default | tojson) -}}
+                    {%- endif -%}
+                {%- endif -%}
+                {{- "\n" -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- (" " * indent) + "}" -}}
+    {%- elif schema is mapping and schema.get("type") == "array" -%}
+        {%- if schema.get("items") -%}
+            {{- json_schema_to_typescript(schema["items"], indent) + "[]" -}}
+        {%- else -%}
+            {{- "Array<any>" -}}
+        {%- endif -%}
+    {%- elif schema is mapping and schema.get("type") is string -%}
+        {{- ts_type_name(schema.type) -}}
+    {%- elif schema is mapping and schema.get("type") is sequence -%}
+        {%- for ty in schema.type -%}
+            {{- ts_type_name(ty) -}}
+            {%- if not loop.last %} | {% endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- "any" -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- Flat `# Tools` declaration (training splice shape). String-schema tools use
+   `## name`; others use `type name = (_: {...}) => any;` after namespace strip.
+   Call sites always emit XML regardless. #}
+{%- macro render_tool_declaration(tool) -%}
+    {%- set tool = tool.function if tool.function is defined else tool -%}
+    {%- if tool.parameters is mapping and tool.parameters.get("type") == "string" and (not tool.parameters.get("properties")) -%}
+        {{- "## " + tool.name + "\n\n" -}}
+        {{- tool.description or "" -}}
+    {%- else -%}
+        {%- if tool.description -%}
+            {%- for line in tool.description.split("\n") -%}
+                {{- "// " + line + "\n" -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {%- if tool.parameters -%}
+            {{- "type " + tool.name + " = (_: " + json_schema_to_typescript(tool.parameters) + ") => any;" -}}
+        {%- else -%}
+            {{- "type " + tool.name + " = () => any;" -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- OpenAI tools kwarg → flat `# Tools` section (training splice shape). #}
+{%- macro render_tools_section(tools) -%}
+    {{- "# Tools\n\n" -}}
+    {%- for tool in tools -%}
+        {{- render_tool_declaration(tool) -}}
+        {%- if not loop.last -%}
+            {{- "\n\n" -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endmacro -%}
+
+{#- Codec parity (olympus/formatters/tool_parameters.py): string values as-is;
+   non-strings JSON-encoded in their given order, at every depth. Jinja's
+   `tojson` sorts keys by default, so mappings and sequences recurse through
+   this macro instead of being handed to it. #}
+{%- macro render_json_value(value) -%}
+    {%- if value is mapping -%}
+        {{- "{" -}}
+        {%- for k, v in value.items() -%}
+            {{- k | tojson }}: {{ render_json_value(v) -}}
+            {%- if not loop.last %}, {% endif -%}
+        {%- endfor -%}
+        {{- "}" -}}
+    {%- elif value is sequence and value is not string -%}
+        {{- "[" -}}
+        {%- for item in value -%}
+            {{- render_json_value(item) -}}
+            {%- if not loop.last %}, {% endif -%}
+        {%- endfor -%}
+        {{- "]" -}}
+    {%- else -%}
+        {{- value | tojson -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_parameter_value(value) -%}
+    {%- if value is string -%}
+        {{- value -}}
+    {%- else -%}
+        {{- render_json_value(value) -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_tool_call_body(tool_call) -%}
+    {%- set fn = tool_call.function if tool_call.function is defined else tool_call -%}
+    {%- set args = fn.arguments if fn.arguments is defined else tool_call.arguments -%}
+    {%- if args is mapping -%}
+        {%- for param_name in args -%}
+            {%- set value_text = render_parameter_value(args[param_name]) -%}
+            {%- if "</rfl:parameter>" in value_text -%}
+                {{- raise_exception("Tool-call parameter '" + (param_name | string) + "' contains the reserved delimiter </rfl:parameter>") }}
+            {%- endif -%}
+            {%- if not loop.first %}{{- "\n" }}{%- endif -%}
+            {{- '<rfl:parameter name="' + param_name + '">\n' -}}
+            {{- value_text -}}
+            {{- '\n</rfl:parameter>' -}}
+        {%- endfor -%}
+    {%- elif args is defined and args is not none -%}
+        {{- raise_exception("function.arguments must be a dict; parse JSON strings before apply_chat_template") }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- System message: openai-harmony SystemContent labels, plus optional numeric
+   RE (`Reasoning effort: N`) for formatter-owned programmatic RE. #}
+{%- macro build_system_message() -%}
+    {%- if model_identity is not defined %}
+        {%- set model_identity = "You are Beam, an AI assistant trained by Reflection." %}
+    {%- endif %}
+    {{- model_identity -}}
+    {#- `Reasoning effort: N`. Ints pass through; low/medium/high/max map to
+       8/32/64/128; any other string raises. #}
+    {%- if reasoning_effort is defined %}
+        {%- if reasoning_effort is string %}
+            {%- if reasoning_effort == "low" %}
+                {%- set reasoning_effort = 8 %}
+            {%- elif reasoning_effort == "medium" %}
+                {%- set reasoning_effort = 32 %}
+            {%- elif reasoning_effort == "high" %}
+                {%- set reasoning_effort = 64 %}
+            {%- elif reasoning_effort == "max" %}
+                {%- set reasoning_effort = 128 %}
+            {%- else %}
+                {{- raise_exception("reasoning_effort must be an int or one of: low, medium, high, max") }}
+            {%- endif %}
+        {%- endif %}
+        {%- if reasoning_effort_hint is defined and reasoning_effort_hint %}
+            {#- The hint is verbatim post-directive text (producers compose the
+               stated budget and guidance into it). #}
+            {{- "\n\nReasoning effort: " + (reasoning_effort | string) + ". " + (reasoning_effort_hint | string) }}
+        {%- else %}
+            {{- "\n\nReasoning effort: " + (reasoning_effort | string) }}
+        {%- endif %}
+    {%- endif %}
+    {#- Optional metadata: omit when unset so the template matches
+       build_reflection_harmony_system_content (identity + channels only). #}
+    {%- if knowledge_cutoff is defined %}
+        {{- "\nKnowledge cutoff: " + knowledge_cutoff -}}
+    {%- endif %}
+    {%- if current_date is defined %}
+        {{- "\nCurrent date: " + current_date -}}
+    {%- endif %}
+    {%- if builtin_tools is defined and builtin_tools -%}
+        {{- "\n\n" -}}
+        {{- render_tools_section(builtin_tools) -}}
+    {%- endif -%}
+    {{- "\n\n# Valid channels: analysis, final. Channel must be included for every message." -}}
+{%- endmacro -%}
+
+{#- Call/result recipient: `refl.{name}` when advertised in `builtin_tools`.
+   Definitions stay unprefixed (`type bash`). #}
+{%- macro wire_recipient(name, names) -%}
+    {%- if name in names -%}
+        {{- "refl." + name -}}
+    {%- else -%}
+        {{- name -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- if not messages %}{{ raise_exception("messages cannot be empty") }}{%- endif %}
+
+{%- set builtin_names = namespace(names=[]) -%}
+{%- if builtin_tools is defined and builtin_tools -%}
+    {%- for tool in builtin_tools -%}
+        {%- set spec = tool.function if tool.function is defined else tool -%}
+        {%- if spec.name is defined -%}
+            {%- set builtin_names.names = builtin_names.names + [spec.name] -%}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endif -%}
+
+{%- if include_system is not defined or include_system %}
+{{- "<|start|>system<|message|>" }}
+{{- build_system_message() }}
+{{- "<|end|>" }}
+{%- endif %}
+
+{%- if messages[0].role == "developer" or messages[0].role == "system" %}
+    {%- set developer_message = messages[0].content or "" %}
+    {%- set has_developer_role = true %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set developer_message = "" %}
+    {%- set has_developer_role = false %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+
+{#- emit_empty_developer_block=true: role presence matters (system:"" still emits # Instructions).
+   false: empty content is treated as absent. #}
+{%- if emit_empty_developer_block is defined and emit_empty_developer_block %}
+    {%- set show_developer_instructions = has_developer_role %}
+{%- else %}
+    {%- set show_developer_instructions = developer_message %}
+{%- endif %}
+{%- set has_tools = tools is defined and tools %}
+
+{%- if (include_developer is not defined or include_developer) and (show_developer_instructions or has_tools) %}
+    {{- "<|start|>developer<|message|>" }}
+    {%- if show_developer_instructions %}
+        {{- "# Instructions\n\n" }}
+        {{- developer_message }}
+        {%- if has_tools %}
+            {{- "\n\n" }}
+        {%- endif %}
+    {%- endif %}
+    {%- if has_tools %}
+        {{- render_tools_section(tools) }}
+    {%- endif %}
+    {{- "<|end|>" }}
+{%- endif %}
+
+{%- set tool_call_registry = namespace(entries=[]) %}
+
+{%- for message in loop_messages -%}
+    {%- if message.role == 'assistant' -%}
+        {%- if message.content %}
+            {%- if "<|channel|>analysis<|message|>" in message.content or "<|channel|>final<|message|>" in message.content %}
+                {{- raise_exception("Pass plain text in API fields, not Harmony wire tags. Use 'thinking' for analysis and 'content' for final.") }}
+            {%- endif %}
+        {%- endif %}
+        {%- set thinking_text = message.thinking or message.reasoning_content %}
+        {%- if thinking_text %}
+            {%- if "<|channel|>analysis<|message|>" in thinking_text or "<|channel|>final<|message|>" in thinking_text %}
+                {{- raise_exception("Pass plain text in 'thinking'/'reasoning_content' without Harmony wire tags.") }}
+            {%- endif %}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {#- Optional serving collapse: once a later final exists, skip
+               analysis on this completed tool round (calls stay). #}
+            {%- set future_final = namespace(found=false) %}
+            {%- if collapse_completed_tool_thinking is defined and collapse_completed_tool_thinking %}
+                {%- for future_message in loop_messages[loop.index:] %}
+                    {%- if future_message.role == 'assistant' and not future_message.tool_calls %}
+                        {%- set future_final.found = true %}
+                    {%- endif %}
+                {%- endfor %}
+            {%- endif %}
+            {%- if not future_final.found %}
+                {{- "<|start|>assistant<|channel|>analysis<|message|>" + (thinking_text or "") + "<|end|>" }}
+            {%- endif %}
+            {%- for tool_call in message.tool_calls %}
+                {%- set fn = tool_call.function if tool_call.function is defined else tool_call %}
+                {%- set tool_name = fn.name if fn.name is defined else tool_call.name %}
+                {%- set recipient = wire_recipient(tool_name, builtin_names.names) %}
+                {%- set call_id = tool_call.id if tool_call.id is defined else (fn.id if fn.id is defined else none) %}
+                {%- if call_id and tool_name %}
+                    {%- set tool_call_registry.entries = tool_call_registry.entries + [{"id": call_id, "name": tool_name}] %}
+                {%- endif %}
+                {{- "<|start|>assistant to=" + recipient + "<|channel|>analysis <|constrain|>xml<|message|>" }}
+                {{- render_tool_call_body(tool_call) }}
+                {%- if loop.last %}
+                    {{- "<|call|>" }}
+                {%- else %}
+                    {{- "<|end|>" }}
+                {%- endif %}
+            {%- endfor %}
+        {%- else %}
+            {{- "<|start|>assistant<|channel|>analysis<|message|>" + (thinking_text or "") + "<|end|>" }}
+            {{- "<|start|>assistant<|channel|>final<|message|>" + (message.content or "") + "<|return|>" }}
+        {%- endif %}
+    {%- elif message.role == 'tool' -%}
+        {%- set resolved_tool = namespace(name=none) %}
+        {%- if message.name is defined and message.name %}
+            {%- set resolved_tool.name = message.name %}
+        {%- elif message.tool_call_id is defined %}
+            {%- for entry in tool_call_registry.entries %}
+                {%- if entry.id == message.tool_call_id %}
+                    {%- set resolved_tool.name = entry.name %}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {%- if resolved_tool.name is none %}
+            {{- raise_exception("Tool message needs 'name' or a matching prior tool_call 'id' / 'tool_call_id'.") }}
+        {%- endif %}
+        {{- "<|start|>" + wire_recipient(resolved_tool.name, builtin_names.names) + " to=assistant<|channel|>analysis<|message|>" + (message.content or "") + "<|end|>" }}
+    {%- elif message.role == 'user' -%}
+        {{- "<|start|>user<|message|>" + (message.content or "") + "<|end|>" }}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+<|start|>assistant
+{%- endif -%}

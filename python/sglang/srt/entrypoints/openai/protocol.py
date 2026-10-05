@@ -1741,6 +1741,7 @@ RESPONSE_TOOL_TYPES = Literal[
     "image_generation",
     "computer_use_preview",
     "local_shell",
+    "shell",
     "mcp",
     "custom",
     "namespace",
@@ -1787,7 +1788,52 @@ class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
     namespace: Optional[str]
 
 
+class ShellAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    commands: List[str]
+    timeout_ms: Optional[int] = Field(default=None, gt=0)
+    max_output_length: Optional[int] = Field(default=None, gt=0)
+
+
+class ShellCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["shell_call"]
+    id: Optional[str] = None
+    call_id: str
+    action: ShellAction
+    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+
+
+class ShellExit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["exit"]
+    exit_code: int
+
+
+class ShellTimeout(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["timeout"]
+
+
+class ShellResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stdout: str
+    stderr: str
+    outcome: Union[ShellExit, ShellTimeout]
+
+
+class ShellCallOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["shell_call_output"]
+    id: Optional[str] = None
+    call_id: str
+    output: List[ShellResult] = Field(min_length=1)
+    max_output_length: Optional[int] = Field(default=None, gt=0)
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ShellCall,
+    ShellCallOutput,
     NamespacedFunctionCallParam,
     NamespacedCustomCallParam,
     ResponseInputMessageParam,
@@ -1987,12 +2033,13 @@ class ResponsesRequest(PDRoutingFields):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` / ``custom`` tool survives, the
-        rest (web_search, mcp, ...) can't be forced through the tool-call
-        parser."""
+        """Normalize supported choices; unsupported built-ins fall back to auto."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice == {"type": "shell"} and any(
+            tool.type == "shell" for tool in self.tools
+        ):
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
@@ -2112,6 +2159,7 @@ class ResponsesResponse(BaseModel):
 
     output: List[
         Union[
+            ShellCall,
             ResponseOutputMessage,
             ResponseOutputItem,
             ResponseReasoningItem,

@@ -2105,6 +2105,11 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
     ) -> tuple[List[int], Optional[str]]:
+        # Model adapters may render built-ins separately from function tools,
+        # while retaining all tool schemas for parsing and constrained decoding.
+        template_kwargs = dict(template_kwargs)
+        tools = template_kwargs.pop("tools", tools)
+
         cache_key = None
         if use_cache:
             try:

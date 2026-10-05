@@ -37,6 +37,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
 from openai_harmony import Message as OpenAIMessage
+from pydantic import TypeAdapter
 
 from sglang.srt.entrypoints.context import (
     ConversationContext,
@@ -64,12 +65,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponseOutputMessage,
     ResponsesRequest,
     ResponsesResponse,
-    ResponseTool,
     Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
-    ResponseToolState,
+    ResponseToolChoiceError,
     custom_tool_description,
     custom_tool_names,
     custom_tool_parameters,
@@ -79,13 +79,11 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_custom_tool_input,
     encode_reasoning_state,
     flatten_response_input,
-    flatten_response_tools,
     harmony_custom_input,
-    harmony_custom_tool,
     label_developer_content,
-    response_tool_choice,
     response_tool_name,
 )
+from sglang.srt.entrypoints.openai.responses_tools.adapter import get_tool_adapter
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _incomplete_tool_call_indices,
@@ -163,6 +161,9 @@ def _should_emit_normal_text_as_message(
     return True
 
 
+_RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -191,6 +192,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_server.has_tool("python") if tool_server else False
         )
         self.tool_server = tool_server
+        self._tool_adapter_cls = get_tool_adapter(
+            self.tokenizer_manager.model_config.hf_config.model_type
+        )
         # Get from model config
         self.use_harmony = (
             self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
@@ -296,31 +300,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
     async def create_responses(self, request, raw_request=None):
+        if not self.tokenizer_manager:
+            return self.create_error_response("Model not loaded")
         original_request = request
         try:
-            flat_tools, names = flatten_response_tools(request.tools)
-            try:
-                choice = response_tool_choice(request.tool_choice, flat_tools, names)
-            except ValueError as exc:
-                return self.create_error_response(str(exc), param="tool_choice")
-            custom_names = {t["name"] for t in flat_tools if t["type"] == "custom"}
-            if self.use_harmony:
-                flat_tools = [harmony_custom_tool(t) for t in flat_tools]
-            request = request.model_copy(
-                update={
-                    "tools": [ResponseTool.model_validate(t) for t in flat_tools],
-                    "tool_choice": choice,
-                }
+            request, adapter = self._tool_adapter_cls.from_request(
+                request,
+                use_harmony=self.use_harmony,
+                tool_call_parser=self.tool_call_parser,
             )
-            request._tool_state = ResponseToolState(
-                public_tools=original_request.tools,
-                public_choice=original_request.effective_tool_choice(),
-                names=names,
-                custom_names=custom_names,
-            )
+        except ResponseToolChoiceError as exc:
+            return self.create_error_response(str(exc), param="tool_choice")
         except ValueError as exc:
             return self.create_error_response(str(exc), param="tools")
-        result = await self._create_responses(request, raw_request)
+        result = await self._create_responses(
+            request, raw_request, tool_adapter=adapter
+        )
         original_request._response_parser_prefix = request._response_parser_prefix
         return result
 
@@ -328,6 +323,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
+        *,
+        tool_adapter=None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
         # Validate model
         if not self.tokenizer_manager:
@@ -440,7 +437,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_prompts,
                     engine_prompts,
                     processed_messages,
-                ) = await self._make_request(request, prev_response, tokenizer)
+                ) = await self._make_request(
+                    request, prev_response, tokenizer, tool_adapter=tool_adapter
+                )
                 require_reasoning = processed_messages.require_reasoning
 
         except _MediaInputValidationError as e:
@@ -683,6 +682,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         created_time,
                         require_reasoning=require_reasoning,
+                        tool_adapter=tool_adapter,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -714,6 +714,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
+                    tool_adapter=tool_adapter,
                 )
             try:
                 result: Union[
@@ -727,6 +728,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
+                    tool_adapter=tool_adapter,
                 )
                 return result
             except Exception as e:
@@ -738,8 +740,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
+        *,
+        tool_adapter=None,
     ):
-        messages = self._construct_input_messages(request, prev_response)
+        messages = self._construct_input_messages(
+            request, prev_response, tool_adapter=tool_adapter
+        )
 
         chat_tools = self._response_tools_to_chat_tools(request)
         chat_request = ChatCompletionRequest(
@@ -761,6 +767,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
         )
+
+        if tool_adapter is not None:
+            chat_request.chat_template_kwargs = tool_adapter.template_kwargs(
+                chat_request
+            )
 
         media_error = self._validate_media_content(chat_request)
         if media_error:
@@ -812,6 +823,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         engine_prompt = prompt_token_ids
         return messages, [prompt_token_ids], [engine_prompt]
 
+    @staticmethod
+    def _build_response(
+        request, sampling_params, *, output, status, tool_adapter=None, **kwargs
+    ):
+        error = None
+        if tool_adapter is not None and tool_adapter.builtins:
+            fields = tool_adapter.response(
+                {
+                    "output": [item.model_dump() for item in output],
+                    "status": status,
+                }
+            )
+            output = _RESPONSE_OUTPUT.validate_python(fields["output"])
+            status, error = fields["status"], fields.get("error")
+        response = ResponsesResponse.from_request(
+            request, sampling_params, output=output, status=status, **kwargs
+        )
+        response.error = error
+        return response
+
     async def responses_full_generator(
         self,
         request: ResponsesRequest,
@@ -825,6 +856,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         output_items: Optional[list] = None,
+        tool_adapter=None,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -937,9 +969,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
-        response = ResponsesResponse.from_request(
+        response = self._build_response(
             request,
             sampling_params,
+            tool_adapter=tool_adapter,
             model_name=model_name,
             created_time=created_time,
             output=output,
@@ -947,7 +980,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
-        response.error = self._error_from_finish_reason(finish_reason)
+        response.error = self._error_from_finish_reason(finish_reason) or response.error
         if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -1544,6 +1577,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse] = None,
+        *,
+        tool_adapter=None,
     ) -> list[ChatCompletionMessageParam]:
         messages: list[ChatCompletionMessageParam] = []
         if request.instructions:
@@ -1555,6 +1590,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         for input_item in self._response_input_history(request):
+            if tool_adapter is not None:
+                input_item = tool_adapter.input_item(input_item)
             normalized = self._normalize_response_message_for_chat(
                 flatten_response_input(input_item)
             )
@@ -1660,6 +1697,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        tool_adapter=None,
     ):
         try:
             # Update the status to "in_progress"
@@ -1678,6 +1716,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_metadata,
                 created_time,
                 require_reasoning=require_reasoning,
+                tool_adapter=tool_adapter,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1991,6 +2030,40 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     async def responses_stream_generator_non_harmony(
         self,
+        request,
+        sampling_params,
+        result_generator,
+        model_name,
+        tokenizer,
+        request_metadata,
+        created_time=None,
+        *,
+        require_reasoning,
+        tool_adapter=None,
+    ):
+        events = self._responses_stream_events_non_harmony(
+            request,
+            sampling_params,
+            result_generator,
+            model_name,
+            tokenizer,
+            request_metadata,
+            created_time,
+            require_reasoning=require_reasoning,
+            tool_adapter=tool_adapter,
+        )
+        sequence_number = 0
+        async for payload in events:
+            if tool_adapter is not None:
+                payload = tool_adapter.event(payload)
+                if payload is None:
+                    continue
+            payload["sequence_number"] = sequence_number
+            sequence_number += 1
+            yield f"event: {payload['type']}\ndata: {orjson.dumps(payload).decode()}\n\n"
+
+    async def _responses_stream_events_non_harmony(
+        self,
         request: ResponsesRequest,
         sampling_params: Any,
         result_generator: AsyncIterator[Any],
@@ -2000,7 +2073,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
+        tool_adapter=None,
+    ) -> AsyncGenerator[dict, None]:
         pending: list[dict] = []
         can_call_tools = (
             bool(self._response_tools_to_chat_tools(request))
@@ -2015,11 +2089,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time,
             require_reasoning=require_reasoning,
+            tool_adapter=tool_adapter,
         ):
             if not can_call_tools:
                 yield event
                 continue
-            payload = orjson.loads(event.split("data: ", 1)[1])
+            payload = event
             event_type = payload["type"]
             item_type = payload.get("item", {}).get("type")
             opens_item = event_type == "response.output_item.added"
@@ -2039,7 +2114,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     for buffered in pending:
                         if buffered.get("item", {}).get("type") == "message":
                             buffered["item"]["phase"] = phase
-                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
+                        yield buffered
                     pending.clear()
             else:
                 yield event
@@ -2055,7 +2130,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
+        tool_adapter=None,
+    ) -> AsyncGenerator[dict, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
         and function-call parsers; leftover text becomes
@@ -2063,57 +2139,27 @@ class OpenAIServingResponses(OpenAIServingChat):
         """
 
         created_time = created_time or int(time.time())
-        sequence_number = 0
 
         def _send_event(event):
-            nonlocal sequence_number
-            if hasattr(event, "sequence_number"):
-                event.sequence_number = sequence_number
-            sequence_number += 1
-            event_type = getattr(event, "type", "unknown")
+            if isinstance(event, dict):
+                return event
             payload = event.model_dump()
-            if "response" in payload:
-                tools = request._tool_state.public_tools
-                payload["response"]["tools"] = [
-                    t.model_dump(exclude_none=True)
-                    for t in (tools if tools is not None else request.tools)
-                ]
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
-            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
+            return payload
 
-        # The streaming Response* event models echo ``tools`` through a
-        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
-        # validation failures on extended tool types.
-        def _sanitize_response_dict(d: dict) -> dict:
-            d["tools"] = []
-            return d
-
-        initial_response = _sanitize_response_dict(
-            ResponsesResponse.from_request(
-                request,
-                sampling_params,
-                model_name=model_name,
-                created_time=created_time,
-                output=[],
-                status="in_progress",
-                usage=None,
-            ).model_dump()
-        )
-        yield _send_event(
-            openai_responses_types.ResponseCreatedEvent(
-                type="response.created",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
-        yield _send_event(
-            openai_responses_types.ResponseInProgressEvent(
-                type="response.in_progress",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
+        # Serialize our public response schema directly, as for the terminal event.
+        initial_response = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=[],
+            status="in_progress",
+            usage=None,
+        ).model_dump()
+        for event_type in ("response.created", "response.in_progress"):
+            yield {"type": event_type, "response": initial_response}
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
@@ -2751,25 +2797,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id
             )
-            failed = _sanitize_response_dict(
-                ResponsesResponse.from_request(
-                    request,
-                    sampling_params,
-                    model_name=model_name,
-                    created_time=created_time,
-                    output=[],
-                    status="failed",
-                    usage=None,
-                ).model_dump()
-            )
+            failed = ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="failed",
+                usage=None,
+            ).model_dump()
             failed["error"] = {"code": "server_error", "message": str(e)}
-            yield _send_event(
-                openai_responses_types.ResponseFailedEvent(
-                    type="response.failed",
-                    sequence_number=-1,
-                    response=failed,
-                )
-            )
+            yield {"type": "response.failed", "response": failed}
             return
 
         for ev in _close_reasoning_item():
@@ -2794,16 +2832,19 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
-        final_response = ResponsesResponse.from_request(
+        final_response = self._build_response(
             request,
             sampling_params,
+            tool_adapter=tool_adapter,
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
             status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
-        final_response.error = self._error_from_finish_reason(finish_reason)
+        final_response.error = (
+            self._error_from_finish_reason(finish_reason) or final_response.error
+        )
         if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored = self.response_store.get(final_response.id)
@@ -2816,9 +2857,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         for item in final_response.output
                     ]
 
-        response_dict = _sanitize_response_dict(final_response.model_dump())
-
-        yield _send_event(self._terminal_stream_event(response_dict))
+        yield _send_event(
+            {
+                "type": f"response.{final_response.status}",
+                "response": final_response.model_dump(),
+            }
+        )
 
     async def _generate_with_builtin_tools(
         self,

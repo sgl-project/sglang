@@ -134,6 +134,27 @@ def test_replayed_call_requires_name(kind, name):
     assert "require a name" in json.loads(response.body)["error"]["message"]
 
 
+@pytest.mark.parametrize("use_harmony", [False, True])
+def test_tool_translation_keeps_request_and_private_state_separate(use_harmony):
+    from sglang.srt.entrypoints.openai.responses_tools.adapter import (
+        ResponseToolAdapter,
+    )
+
+    request = ResponsesRequest(input="hi", tools=[namespace("custom")])
+    public = request.model_dump()
+    translated, _ = ResponseToolAdapter.from_request(
+        request, use_harmony=use_harmony, tool_call_parser=None
+    )
+    assert request.model_dump() == public
+    assert translated.tools[0].name == "office__weather"
+    assert translated.tools[0].type == ("function" if use_harmony else "custom")
+    assert translated._tool_state.public_tools == request.tools
+    assert translated._tool_state.custom_names == {"office__weather"}
+    assert translated.model_dump().keys() == public.keys()
+    assert "_tool_state" not in ResponsesRequest.model_json_schema()["properties"]
+    assert request._tool_state.names == {}
+
+
 def test_namespace_mapping_preserves_extra_tool_options():
     tool = namespace()
     tool["tools"][0]["vendor_option"] = "kept"

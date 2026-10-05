@@ -90,15 +90,17 @@ class MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+def make_serving(
+    *, is_multimodal: bool = False, model_type: str = "llama"
+) -> OpenAIServingResponses:
     """The serving layer reads its config from the bags, so the fixture
     publishes one. Idempotent: a caller that already published keeps its own,
     which is how a test states a value the default record does not carry."""
     if not get_context().is_config_namespace_published("serving"):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    return OpenAIServingResponses(
-        MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
-    )
+    manager = MockTokenizerManager(is_multimodal=is_multimodal)
+    manager.model_config.hf_config.model_type = model_type
+    return OpenAIServingResponses(manager, MockTemplateManager())
 
 
 async def collect_stream_events(stream: AsyncIterator[str]) -> list[str]:
@@ -181,3 +183,43 @@ class StreamFixture:
         """``run`` plus (event type, payload) pairing, the common assertion shape."""
         events = self.run(chunks)
         return list(zip(event_types(events), event_payloads(events)))
+
+
+def load_beam_response_template():
+    """Load checkpoint metadata independently of SGLang's fallback template."""
+    from pathlib import Path
+
+    return json.loads(
+        (Path(__file__).parent / "fixtures/beam_response_template.json").read_text()
+    )
+
+
+def install_beam_chat_template(serving, parser="beam"):
+    """Use the real Harmony XML template with a reversible test token codec."""
+    from pathlib import Path
+
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    source = (Path(__file__).parent / "fixtures/beam_chat_template.jinja").read_text()
+    template = _compile_jinja_template(source)
+    tokenizer = serving.tokenizer_manager.tokenizer
+    tokenizer.chat_template = source
+    tokenizer.init_kwargs = {}
+    serving.tool_call_parser = "beam" if parser == "beam_checkpoint" else parser
+    tokenizer.response_template = (
+        None if parser == "beam" else load_beam_response_template()
+    )
+    tokenizer.encode.side_effect = lambda text, **kwargs: list(map(ord, text))
+    tokenizer.decode.side_effect = lambda ids, **kwargs: "".join(map(chr, ids))
+    serving.template_manager.chat_template_name = None
+    serving.template_manager.jinja_template_content_format = "string"
+    serving._prompt_text_round_trip_is_lossy = False
+    prompts = []
+
+    def render(messages, *, tokenize=False, **kwargs):
+        prompt = template.render(messages=messages, **kwargs)
+        prompts.append(prompt)
+        return tokenizer.encode(prompt) if tokenize else prompt
+
+    tokenizer.apply_chat_template.side_effect = render
+    return prompts
