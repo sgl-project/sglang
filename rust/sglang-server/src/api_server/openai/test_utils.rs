@@ -293,18 +293,127 @@ async fn chat_handler_validates_before_submit() {
             "max_completion_tokens=0",
         ),
     ];
-    for (body, label) in cases {
-        let response = post_json(app.clone(), "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    for path in ["/v1/chat/completions", "/invocations"] {
+        for (body, label) in &cases {
+            let response = post_json(app.clone(), path, body.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{path}: {label}"
+            );
+        }
+        // A valid request with no loaded chat template → 400 (template gate).
+        let response = post_json(
+            app.clone(),
+            path,
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = oneshot(
+            app.clone(),
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    // A valid request with no loaded chat template → 400 (template gate).
-    let response = post_json(
-        app.clone(),
-        "/v1/chat/completions",
-        json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]}),
+}
+
+async fn invoke_sagemaker(stream: bool) -> Response {
+    use super::template::{LegacyFormatter, builtin_template};
+    use crate::message::request::RequestKind;
+    use crate::tokenizer_manager::wiring::TmEvent;
+
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let mut state = app_state(senders());
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.senders.tok_manager_tx = tm_tx;
+    state_mut.chat_formatter = Some(super::ChatFormatter::Legacy(Box::new(LegacyFormatter {
+        spec: builtin_template("chatml").unwrap(),
+    })));
+    let app = routes().with_state(state);
+
+    let backend = tokio::spawn(async move {
+        let TmEvent::Intake(request) = tm_rx.recv_async().await.unwrap() else {
+            panic!("expected a generation request");
+        };
+        let RequestKind::Generate(generate) = &request.kind else {
+            panic!("expected a chat request lowered to generation");
+        };
+        assert!(generate.text.as_ref().unwrap().contains("Say hello"));
+        assert_eq!(generate.stream, stream);
+        assert_eq!(generate.sampling_params.max_new_tokens, Some(8));
+        request
+            .sink
+            .try_send(chunk(request.rid.client_facing(), "Hello!", true))
+            .unwrap();
+    });
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        post_json(
+            app,
+            "/invocations",
+            json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "Say hello"}],
+                "max_tokens": 8,
+                "stream": stream
+            }),
+        ),
     )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    .await
+    .expect("invocation did not complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    backend.await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn sagemaker_invocations_returns_chat_completion() {
+    let response = invoke_sagemaker(false).await;
+    let body = body_json(response).await;
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "model");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 5);
+    assert_eq!(body["usage"]["completion_tokens"], 1);
+}
+
+#[tokio::test]
+async fn sagemaker_invocations_streams_chat_completion() {
+    let response = invoke_sagemaker(true).await;
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    let chunks: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["object"] == "chat.completion.chunk")
+    );
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, "Hello!");
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
 }
 
 #[tokio::test]

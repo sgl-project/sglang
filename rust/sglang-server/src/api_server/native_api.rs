@@ -80,6 +80,8 @@ impl RequestTiming {
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate))
+        // Python's SageMaker ping checks HTTP liveness, without a generation probe.
+        .route("/ping", get(|| async { StatusCode::OK }))
         .merge(health_routes())
 }
 
@@ -526,6 +528,32 @@ mod tests {
                 e2e_latency: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn sagemaker_ping_returns_empty_liveness_response() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let state = Arc::new(AppState {
+            senders: senders(),
+            response_buf: 8,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+            response_activity: Default::default(),
+            startup_readiness: Default::default(),
+        });
+        let response = routes()
+            .with_state(state)
+            .oneshot(Request::get("/ping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
