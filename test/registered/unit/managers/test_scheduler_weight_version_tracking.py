@@ -139,6 +139,15 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         patcher = patch("torch.distributed.barrier")
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = patch("torch.distributed.get_world_size", return_value=1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, value, **kwargs: outputs.__setitem__(0, value),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -324,6 +333,36 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("already open", output.message)
         target.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_incomplete_draft_update_keeps_every_runner_session_open(self):
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        draft.weight_updater.validate_weight_update.side_effect = ValueError(
+            "missing QKV rows"
+        )
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+        self.assertFalse(output.success)
+        self.assertIn("missing QKV rows", output.message)
+        self.assertIsNotNone(manager._session)
+        for runner in (target, draft):
+            runner.weight_updater.end_weight_update.assert_not_called()
+        draft.weight_updater.validate_weight_update.side_effect = None
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
+        self.assertIsNone(manager._session)
+
+    def test_incomplete_update_on_another_rank_rejects_before_finalization(self):
+        target = _runner()
+        manager = self._manager(target)
+
+        def gather(outputs, value, **kwargs):
+            outputs[:] = [None, "missing rows on another rank"]
+
+        with patch("torch.distributed.all_gather_object", side_effect=gather):
+            output = manager.end_weight_update(EndWeightUpdateReqInput())
+        self.assertFalse(output.success)
+        self.assertIn("another rank", output.message)
+        self.assertIsNotNone(manager._session)
+        target.weight_updater.end_weight_update.assert_not_called()
 
     def test_end_without_session_is_rejected(self):
         """Finalizing runners begin never restored would repack weights twice."""

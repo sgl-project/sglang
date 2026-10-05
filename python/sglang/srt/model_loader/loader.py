@@ -1074,6 +1074,7 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def postprocess_weights(model, target_device):
         if QuantizedRLModelLoader.is_reload_scenario(model):
+            QuantizedRLModelLoader.end_weight_update(model)
             return
         for module, quant_method in _modules_with_quant_method(model):
             # When quant methods need to process weights after loading
@@ -1088,6 +1089,7 @@ class DefaultModelLoader(BaseModelLoader):
     def restore_weights_before_loading(model, target_device):
         """Undo in-place quant packing so fresh weights can be loaded."""
         if QuantizedRLModelLoader.is_reload_scenario(model):
+            QuantizedRLModelLoader.begin_weight_update(model)
             return
         for module, quant_method in _modules_with_quant_method(model):
             # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
@@ -1310,8 +1312,30 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return name, None, None
 
     @staticmethod
+    def begin_weight_update(model):
+        if hasattr(model, "_quantized_rl_pending"):
+            raise ValueError("A quantized weight-update session is already open")
+        model._quantized_rl_pending = {}
+
+    @staticmethod
+    def validate_weight_update(model):
+        pending = getattr(model, "_quantized_rl_pending", {})
+        if pending:
+            raise ValueError(
+                "Incomplete per-tensor FP8 updates: "
+                + ", ".join(sorted(pending))
+                + ". Supply all destination rows before ending the update session."
+            )
+
+    @staticmethod
+    def end_weight_update(model):
+        QuantizedRLModelLoader.validate_weight_update(model)
+        if hasattr(model, "_quantized_rl_pending"):
+            del model._quantized_rl_pending
+
+    @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
-        """Load native BF16 shards, then quantize in their destination layout."""
+        """Shard new BF16 weights natively, then quantize into their original buffers."""
         from sglang.kernels.ops.quantization.fp8_kernel import (
             per_token_group_quant_fp8,
         )
@@ -1322,71 +1346,137 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             QuantizedRLModelLoader._get_updated_params(weights_list, model)
         )
         params = dict(model.named_parameters())
-        original_data = {
-            name: params[name].data
-            for name in updated_param_names
-            if params[name].dtype == torch.float8_e4m3fn
-        }
-        row_masks = {}
-        for name, data in original_data.items():
-            rebuild = model.original_weights_rebuild_keys[name]
-            layer = model.get_submodule(name.rpartition(".")[0])
-            # Rebuild BF16 staging in checkpoint orientation. Unchanged rows
-            # are restored byte-for-byte after per-channel quantization.
-            local_weight = torch.as_strided(data, rebuild["shape"], rebuild["stride"])
-            scale = layer.weight_scale
-            params[name].data = (local_weight.float() * scale.t()).to(rebuild["dtype"])
-            row_masks[name] = nn.Parameter(
-                torch.zeros((local_weight.shape[0], 1), device=data.device),
-                requires_grad=False,
-            )
-            row_masks[name].output_dim = 0
-
-        # Quantization replaces Parameters during initial load. Restore their
-        # native loaders before asking the model to load BF16 checkpoint shards.
-        for key, loaders in model.recorded_loader.items():
-            for name, loader in loaders.items():
-                if name in original_data and not hasattr(params[name], key):
-                    setattr(
-                        params[name],
-                        key,
-                        QuantizedRLModelLoader._bind_method_to_cls(loader, params[name])
-                        if callable(loader)
-                        else loader,
-                    )
-
-        # Use the same loader to mark updated output rows. This also handles
-        # unequal packed widths, replicated KV heads and independent KV groups.
+        grouped = collections.defaultdict(list)
+        complete_params = set()
         for source_name, weight in weights_list:
             name, _, shard_id = QuantizedRLModelLoader._resolve_stacked_info(
                 source_name
             )
-            if name not in row_masks:
+            grouped[name].append((source_name, weight))
+            if shard_id is None:
+                complete_params.add(name)
+
+        pending = getattr(model, "_quantized_rl_pending", None)
+        row_masks = {}
+        # Check coverage before modifying any model parameter. Per-tensor
+        # quantization needs the original BF16 values for every destination row.
+        for name, sources in grouped.items():
+            if name not in params or params[name].dtype not in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
                 continue
+            rebuild = model.original_weights_rebuild_keys[name]
             layer = model.get_submodule(name.rpartition(".")[0])
-            marker = torch.ones((weight.shape[0], 1), device=params[name].device)
-            args = () if shard_id is None else (shard_id,)
-            layer.weight_loader(row_masks[name], marker, *args)
+            per_channel = layer.weight_scale.shape == (1, rebuild["shape"][0])
+            if name in complete_params:
+                row_masks[name] = (None, per_channel)
+                continue
+            marker = nn.Parameter(
+                torch.zeros((rebuild["shape"][0], 1), device="cpu"), requires_grad=False
+            )
+            marker.output_dim = 0
+            for source_name, weight in sources:
+                _, _, shard_id = QuantizedRLModelLoader._resolve_stacked_info(
+                    source_name
+                )
+                args = () if shard_id is None else (shard_id,)
+                layer.weight_loader(
+                    marker, torch.ones((weight.shape[0], 1), device="cpu"), *args
+                )
+            rows = marker.data[:, 0].bool()
+            if pending is not None and name in pending:
+                rows |= pending[name][1]
+            if not per_channel and not rows.all() and pending is None:
+                raise ValueError(
+                    f"Partial per-tensor FP8 update for {name}: supply all destination "
+                    "rows together, or use begin_weight_update()/end_weight_update() "
+                    "to send a complete matrix in multiple chunks."
+                )
+            row_masks[name] = (rows, per_channel)
 
-        first_time_load_weights(iter(weights_list))
+        def load_destinations():
+            for name, sources in grouped.items():
+                if name not in row_masks:
+                    yield from sources
+                    continue
+                param = params[name]
+                data = param.data
+                rebuild = model.original_weights_rebuild_keys[name]
+                layer = model.get_submodule(name.rpartition(".")[0])
+                rows, per_channel = row_masks[name]
+                complete = rows is None or bool(rows.all())
+                if pending is not None and name in pending and rows is not None:
+                    staging = pending[name][0]
+                else:
+                    # Incomplete per-tensor matrices retain only new BF16 data
+                    # on the host until a session supplies all their rows.
+                    staging = torch.empty_strided(
+                        rebuild["shape"],
+                        rebuild["stride"],
+                        dtype=rebuild["dtype"],
+                        device=data.device if per_channel or complete else "cpu",
+                    )
+                param.data = staging
+                for key, loaders in model.recorded_loader.items():
+                    if name in loaders and not hasattr(param, key):
+                        loader = loaders[name]
+                        setattr(
+                            param,
+                            key,
+                            QuantizedRLModelLoader._bind_method_to_cls(loader, param)
+                            if callable(loader)
+                            else loader,
+                        )
+                try:
+                    # The model consumes each source with its native loader
+                    # before the iterator resumes to finalize this destination.
+                    yield from sources
+                    if not per_channel and not complete:
+                        pending[name] = (staging, rows)
+                        continue
+                    if staging.device != data.device:
+                        staging = staging.to(data.device)
+                    local_weight = torch.as_strided(
+                        data, rebuild["shape"], rebuild["stride"]
+                    )
+                    if per_channel:
+                        # Quantize only the supplied row ranges; old FP8 bytes
+                        # and scales never pass through dequantization.
+                        if complete:
+                            ranges = [(0, staging.shape[0])]
+                        else:
+                            padded = torch.cat(
+                                (rows.new_zeros(1), rows, rows.new_zeros(1))
+                            )
+                            edges = (
+                                (padded[1:] != padded[:-1]).nonzero().flatten().tolist()
+                            )
+                            ranges = zip(edges[::2], edges[1::2])
+                        for begin, end in ranges:
+                            per_token_group_quant_fp8(
+                                staging[begin:end],
+                                staging.shape[-1],
+                                output_q=local_weight[begin:end],
+                                output_s=layer.weight_scale.data[:, begin:end].t(),
+                            )
+                    else:
+                        _, scale = input_to_float8(
+                            staging, dtype=data.dtype, out=local_weight
+                        )
+                        layer.weight_scale.data.copy_(scale)
+                        if pending is not None:
+                            pending.pop(name, None)
+                finally:
+                    param.data = data
+                    # Release this destination before allocating the next one.
+                    del staging
 
-        for name, data in original_data.items():
-            layer = model.get_submodule(name.rpartition(".")[0])
-            param = params[name]
-            updated_rows = row_masks[name].data[:, 0].bool()
-            if layer.weight_scale.shape == (1, param.shape[0]):
-                qweight, scale = per_token_group_quant_fp8(param, param.shape[-1])
-                # Byte views preserve untouched FP8 rows, including their scales.
-                qweight.view(torch.uint8)[~updated_rows] = data.t().view(torch.uint8)[
-                    ~updated_rows
-                ]
-                scale = scale.t().contiguous()
-                scale[:, ~updated_rows] = layer.weight_scale.data[:, ~updated_rows]
-            else:
-                qweight, scale = input_to_float8(param)
-            data.copy_(qweight.t())
-            param.data = data
-            layer.weight_scale.data.copy_(scale)
+        native_weights = load_destinations()
+        try:
+            first_time_load_weights(native_weights)
+        finally:
+            native_weights.close()
 
         if is_last_update:
             gc.collect()
