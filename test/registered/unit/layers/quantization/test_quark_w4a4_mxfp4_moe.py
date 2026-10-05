@@ -72,16 +72,21 @@ def _capturing_runner(store):
     return _Runner()
 
 
-def test_create_moe_runner_translates_activation_to_swiglu_when_clamped(monkeypatch):
+def test_create_moe_runner_keeps_silu_when_clamped(monkeypatch):
     captured = _force_aiter_runner(monkeypatch)
     scheme = _make_scheme()
 
-    cfg = MoeRunnerConfig(activation="silu", gemm1_clamp_limit=7.0)
+    cfg = MoeRunnerConfig(
+        activation="silu",
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
     scheme.create_moe_runner(layer=None, moe_runner_config=cfg)
 
-    assert captured["config"].activation == "swiglu"
-    # The original config is left untouched (dataclasses.replace returns a copy).
-    assert cfg.activation == "silu"
+    # The runner selects SwiGLU from this combo. The scheme must not rewrite it.
+    assert captured["config"].activation == "silu"
+    assert captured["config"] is cfg
 
 
 def test_create_moe_runner_keeps_silu_without_clamp(monkeypatch):
@@ -98,8 +103,15 @@ def test_create_moe_runner_keeps_silu_without_clamp(monkeypatch):
 def test_apply_weights_forwards_swiglu_limit_when_clamped(monkeypatch):
     monkeypatch.delattr(torch, "float4_e2m1fn_x2", raising=False)
     scheme = _make_scheme()
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.moe_runner.aiter.is_gfx95_supported",
+        lambda: True,
+    )
     scheme.moe_runner_config = MoeRunnerConfig(
-        activation="swiglu", gemm1_clamp_limit=7.0
+        activation="silu",
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
     )
     store = {}
     scheme.runner = _capturing_runner(store)
