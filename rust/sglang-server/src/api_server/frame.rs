@@ -472,14 +472,22 @@ mod tests {
             completion_tokens: 1,
             ..Default::default()
         });
-        let capacity = acc.snapshot().token_ids.capacity();
-        assert!(capacity >= 4);
+        assert!(!acc.snapshot().token_ids.spilled());
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "he");
             assert_eq!(s.token_ids.as_slice(), vec![1]);
         }
-        for (id, text) in [(2, "l"), (3, "l"), (4, "o")] {
+        acc.fold(&FrontendOutput {
+            text: "l".into(),
+            token_ids: vec![2].into(),
+            completion_tokens: 1,
+            ..Default::default()
+        });
+        let capacity = acc.snapshot().token_ids.capacity();
+        assert!(acc.snapshot().token_ids.spilled());
+        assert!(capacity >= 4);
+        for (id, text) in [(3, "l"), (4, "o")] {
             acc.fold(&FrontendOutput {
                 text: text.into(),
                 token_ids: vec![id].into(),
@@ -496,6 +504,18 @@ mod tests {
         }
         let out = acc.into_output();
         assert_eq!(out.text, "hello");
+
+        let mut large = OutputAccumulator::default();
+        let ids: Vec<i64> = (1..=9).collect();
+        large.fold(&FrontendOutput {
+            token_ids: ids.clone().into(),
+            completion_tokens: ids.len() as u64,
+            ..Default::default()
+        });
+        assert_eq!(large.snapshot().token_ids.as_slice(), ids);
+        assert_eq!(large.snapshot().completion_tokens, 9);
+        assert!(large.snapshot().token_ids.spilled());
+        assert!(large.snapshot().token_ids.capacity() >= ids.len());
     }
 
     /// A populated text column (decoded on the detok shard) → `Some`; empty

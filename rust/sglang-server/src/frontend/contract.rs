@@ -70,9 +70,12 @@ impl FrontendOutput {
     /// boundary rather than in either wire adapter.
     pub(crate) fn append_delta(&mut self, delta: &Self) {
         self.text.push_str(&delta.text);
-        if self.token_ids.is_empty() && !delta.token_ids.is_empty() {
-            // Cumulative output should skip the extra early growth of an inline buffer.
-            self.token_ids.reserve(delta.token_ids.len().max(4));
+        if !self.token_ids.spilled()
+            && delta.token_ids.len() > self.token_ids.capacity() - self.token_ids.len()
+        {
+            // On the first spill, skip capacity 2 while keeping single-token output inline.
+            self.token_ids
+                .reserve(delta.token_ids.len().max(4 - self.token_ids.len()));
         }
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;

@@ -437,46 +437,75 @@ mod tests {
     use crate::message::types::TokenIds;
     use tokio::sync::mpsc;
 
-    /// Failed delivery removes the request. Only a full sink needs a new abort;
-    /// a closed sink means FrontendCall already queued the abort.
+    /// A non-terminal chunk that can't be delivered (sink full → client
+    /// backpressure) drops the request AND aborts scheduler work — it does not
+    /// silently keep state, which would later read as a clean completion at EOS.
     #[test]
-    fn failed_sink_drops_request_and_only_full_aborts_scheduler() {
-        for closed in [false, true] {
-            let (tx, rx) = mpsc::channel::<ResponseItem>(1);
-            if closed {
-                drop(rx);
-            } else {
-                tx.try_send(ResponseItem::Frame(ChunkEvent::default()))
-                    .unwrap();
-            }
+    fn full_sink_drops_request_and_aborts_scheduler() {
+        // Capacity-1 sink, pre-filled so the next send hits `Full`.
+        let (tx, _rx) = mpsc::channel::<ResponseItem>(1);
+        tx.try_send(ResponseItem::Frame(ChunkEvent::default()))
+            .unwrap();
 
-            let mut table = HashMap::from([(
-                Rid::from("1"),
-                DetokState {
-                    sink: ResponseSink::Local(tx),
-                    decode_logprob_text: false,
-                    no_stop_trim: false,
-                    decoder: None,
-                    fsm: RequestState::Queued,
-                },
-            )]);
-            let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
-            let ev = ChunkEvent {
-                rid: Rid::from("1"),
-                token_ids: vec![5].into(),
-                ..Default::default() // finish_reason None → non-terminal
-            };
-            handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+        let mut table = HashMap::new();
+        table.insert(
+            Rid::from("1"),
+            DetokState {
+                sink: ResponseSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
 
-            assert!(table.is_empty());
-            if !closed {
-                assert!(matches!(
-                    tm_rx.try_recv(),
-                    Ok(AbortSource::Detok(rid)) if rid == Rid::from("1")
-                ));
-            }
-            assert!(matches!(tm_rx.try_recv(), Err(flume::TryRecvError::Empty)));
-        }
+        let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
+        let ev = ChunkEvent {
+            rid: Rid::from("1"),
+            token_ids: vec![5].into(),
+            ..Default::default() // finish_reason None → non-terminal
+        };
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+
+        // Request removed (no lingering state to be mistaken for success)...
+        assert!(!table.contains_key(&Rid::from("1")));
+        // ...and the scheduler was told to abort it.
+        assert!(matches!(
+            tm_rx.try_recv(),
+            Ok(AbortSource::Detok(rid)) if rid == Rid::from("1")
+        ));
+    }
+
+    #[test]
+    fn closed_sink_drops_request_without_another_abort() {
+        let (tx, rx) = mpsc::channel::<ResponseItem>(1);
+        drop(rx);
+        let mut table = HashMap::from([(
+            Rid::from("closed"),
+            DetokState {
+                sink: ResponseSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        )]);
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        handle_chunk(
+            &mut table,
+            ChunkEvent {
+                rid: Rid::from("closed"),
+                token_ids: smallvec::smallvec![5],
+                ..Default::default()
+            },
+            &DetokenizerBackend::Skip,
+            &abort_tx,
+        );
+        assert!(table.is_empty());
+        assert!(matches!(
+            abort_rx.try_recv(),
+            Err(flume::TryRecvError::Empty)
+        ));
     }
 
     /// `trim_stop_str` reproduces the base's stop-string semantics: `stop: "3"` on
