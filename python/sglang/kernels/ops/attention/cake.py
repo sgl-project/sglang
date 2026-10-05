@@ -1341,12 +1341,18 @@ def cake_fp8_paged_mqa_logits(
     weights: torch.Tensor,
     context_lens: torch.Tensor,
     block_table: torch.Tensor,
-    schedule_meta: torch.Tensor,
+    schedule_meta: Optional[torch.Tensor],
     max_context_len: int,
     clean_logits: bool = False,
     indices: Optional[torch.Tensor] = None,
+    *,
+    sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """Explicit DeepGEMM-signature paged indexer logits (one-shot); f32 [B * next_n, max_len] view."""
+    """Explicit DeepGEMM-signature paged indexer logits (one-shot, one launch); f32 [B * next_n, max_len] view.
+
+    ``schedule_meta`` is a signature-parity placeholder (``None`` allowed); ``sm_count`` fixes the CTA
+    budget when it is ``None``.
+    """
     return _k("fp8_paged_mqa_logits")(
         q,
         kv_cache,
@@ -1357,6 +1363,7 @@ def cake_fp8_paged_mqa_logits(
         max_context_len,
         clean_logits=clean_logits,
         indices=indices,
+        sm_count=sm_count,
     )
 
 
