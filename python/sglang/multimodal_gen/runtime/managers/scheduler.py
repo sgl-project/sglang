@@ -80,6 +80,7 @@ logger = init_logger(__name__)
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
+_IDLE_POLL_TIMEOUT_MS = 100
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1282,6 +1283,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             # 1: receive requests
             try:
+                if self.receiver is not None and not self.waiting_queue:
+                    # The ingress rank waits for work; peers wait in recv_reqs'
+                    # broadcast. Keep idle rendezvous bounded by the poll timeout.
+                    self._poller.poll(timeout=_IDLE_POLL_TIMEOUT_MS)
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 now = time.monotonic()
