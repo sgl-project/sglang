@@ -172,6 +172,12 @@ impl<'a> ModelRouting<'a> {
         let mut failed = None;
         let mut duration = None;
         for _ in 0..ctx.config.proxy.max_attempts.get() {
+            // A retry never starts past the request's stale deadline.
+            if failed.is_some()
+                && start.elapsed() >= ctx.router_inflight_load.stale_request_timeout()
+            {
+                break;
+            }
             let workers = match self
                 .select_workers(ctx, &request, &headers, &excluded)
                 .await
@@ -188,13 +194,11 @@ impl<'a> ModelRouting<'a> {
             let attempt =
                 forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
                     .await?;
-            match attempt.retry_excluding {
-                Some(worker) => {
-                    excluded.push(worker);
-                    failed = Some(attempt.response);
-                }
-                None => return Ok(attempt.response),
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
             }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
         }
         Ok(failed.expect("at least one attempt"))
     }
