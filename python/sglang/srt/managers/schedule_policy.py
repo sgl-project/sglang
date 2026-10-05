@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 import os
 import random
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
@@ -69,6 +69,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache.components import (
+    CacheTransferPhase,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -162,6 +167,7 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    max_prefix_len: Optional[int] = None,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -172,6 +178,10 @@ def match_prefix_for_req(
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -1212,14 +1222,23 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode):
-        # Replay the acquire's receipt (SWA boundary uuid, mamba flag) so the
-        # release takes back exactly what this temporary lock took.
-        dec_lock_params = self.tree_cache.inc_lock_ref(last_node).to_dec_params()
+    def _lock_node(self, last_node: TreeNode, *, lock_host: bool = False):
+        host_lock_params = (
+            self.tree_cache.inc_host_lock_ref(last_node).to_dec_params()
+            if lock_host
+            else None
+        )
         try:
-            yield None
+            # Replay the acquire's receipt (SWA boundary uuid, mamba flag) so the
+            # release takes back exactly what this temporary lock took.
+            dec_lock_params = self.tree_cache.inc_lock_ref(last_node).to_dec_params()
+            try:
+                yield None
+            finally:
+                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
         finally:
-            self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
+            if host_lock_params is not None:
+                self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
@@ -1424,14 +1443,55 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                promised_host_hit = req.host_hit_length
-                loaded = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                load_max_new = min(max_new, admission.max_new_tokens)
+                # Reclaim can write back device victims and evict host leaves.
+                # Pin the selected host/aux match until load-back owns its locks.
+                with (
+                    self._lock_node(req.best_match_node, lock_host=True)
+                    if isinstance(self.tree_cache, UnifiedRadixCache)
+                    else nullcontext()
+                ):
+                    full_load_tokens = req.host_hit_length
+                    if (
+                        isinstance(self.tree_cache, UnifiedRadixCache)
+                        and self.tree_cache.buffer_pipeline is None
+                        and not (
+                            self.tree_cache.linker is not None
+                            and self.tree_cache.linker.has_hit(req.rid)
+                        )
+                    ):
+                        # Host hits can include resident FULL behind host-only aux.
+                        # Reuse the FULL transfer spec to count only new slots.
+                        full_transfer = (
+                            self.tree_cache.tree_core.build_hicache_transfers(
+                                ComponentType.FULL,
+                                req.best_match_node,
+                                CacheTransferPhase.LOAD_BACK,
+                            )[0]
+                        )
+                        full_load_tokens = len(full_transfer.host_indices)
+                    if not self.memory_budget.prepare_load_back(
+                        full_tokens=(
+                            full_load_tokens
+                            + admission.extend_len
+                            + load_max_new
+                            + self.page_size
+                            + mamba_gap_reserve
+                        ),
+                        extend_input_len=admission.extend_len,
+                        max_new_tokens=load_max_new,
+                        swa_host_hit_length=req.swa_host_hit_length,
+                        chunk_limit=self.rem_chunk_tokens,
+                    ):
+                        return AddReqResult.NO_TOKEN
+                    promised_host_hit = req.host_hit_length
+                    loaded = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
                     )
-                )
                 if loaded is None:
                     return AddReqResult.OTHER
                 new_indices, req.last_node = loaded
