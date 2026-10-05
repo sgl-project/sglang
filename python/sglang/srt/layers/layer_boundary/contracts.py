@@ -27,19 +27,16 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLA
 
 
 class ProducerReduction(Enum):
-    """Describe compute's cooperation with its output boundary.
+    """Who completes the sum a stage's output owes; compute never does.
 
-    ALWAYS_PARTIAL is attention-only: finish() publishes its partial sum. EXIT_SCOPED
-    follows exit() flags for an FFN or single-stage mixer. TAIL_AFTER_SUM is FFN-only:
-    compute adds a replicated component after its internal sum, so the
-    boundary never defers that sum to the next layer. A selected reduce-scatter
-    still applies, so compute must add the tail only when it completes the sum.
+    ALWAYS_PARTIAL is attention-only: finish() hands the partial sum to the
+    next stage's input as its declared sum. EXIT_SCOPED, for an FFN or a
+    single-stage mixer: the exit completes the sum, or carries it to the next
+    stage's input.
     """
 
     ALWAYS_PARTIAL = auto()
     EXIT_SCOPED = auto()
-    # A replicated component is added after the sum inside compute.
-    TAIL_AFTER_SUM = auto()
 
 
 class ExitRows(Enum):
@@ -80,30 +77,30 @@ class OutputContract(msgspec.Struct, frozen=True):
 
     Fields:
         layout: Token sharding of the producer contribution.
-        group: Named sum group, or None when there is no reduction.
-        always_partial: Compute always returns a partial sum.
-        may_defer_to_next: Compute can skip reduction under the exit scope
-            and let the following layer complete it.
-        may_reduce_scatter: Compute can leave reduction to a fixed-size
-            reduce-scatter selected by the boundary.
-        may_reduce_scatterv: Compute can leave reduction to the selected
-            variable-size attention-DP combine.
+        group: The group the output owes its sum over, or None when it is
+            complete.
+        always_partial: The sum is handed to the next stage's input as its
+            declared sum.
+        may_defer_to_next: The exit may carry the sum to the following
+            stage's input instead of completing it.
+        may_reduce_scatter: A fixed-size reduce-scatter selected by the
+            boundary may complete the sum.
+        may_reduce_scatterv: The selected variable-size attention-DP combine
+            may complete the sum.
         update: Producer residual operation; None on an arrival contract that
             declares capabilities and obtains the actual update from the stream.
         transform: Optional operation on the contribution before residual update.
 
-    These permissions are not evidence that a particular output is partial.
-    The exit decision and ResidualStream record what that output actually owes.
+    These are permissions, not a record of a particular output. The exit
+    decision and ResidualStream record what that output actually owes.
     """
 
     layout: Layout
     # None when there is nothing to sum.
     group: Optional[SumGroup] = None
-    # The producer never reduces its output, e.g. a row-parallel projection
-    # built with reduce_results=False.
+    # The sum is always handed to the next stage's input as a declared sum.
     always_partial: bool = False
-    # Otherwise it leaves the sum only when the boundary publishes the flag for
-    # it: fuse_mlp_allreduce, or mlp_reduce_scatter.
+    # Otherwise the exit completes it, or may carry it to the next input.
     may_defer_to_next: bool = False
     may_reduce_scatter: bool = False
     # Whether the selected attention-DP combine may complete this sum.
@@ -236,8 +233,6 @@ class StagePath(msgspec.Struct, frozen=True):
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
-        complete_output_move: The move for an output compute already reduced,
-            run instead of an output_move that also reduces it.
     """
 
     entry: EntryPath
@@ -247,7 +242,6 @@ class StagePath(msgspec.Struct, frozen=True):
     output_move_completes_sum: bool = False
 
     returns_over_dp: bool = False
-    complete_output_move: Optional[Callable] = None
 
 
 class StageKind(Enum):

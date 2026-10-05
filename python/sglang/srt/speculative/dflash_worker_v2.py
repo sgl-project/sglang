@@ -19,6 +19,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -402,11 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
-        self._tp_sync = SpecTpSync(
-            get_parallel().attn_tp_group
-            if get_parallel().attn_dp_enabled
-            else get_parallel().tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
