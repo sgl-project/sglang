@@ -4,6 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_triton,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 if torch.version.cuda is not None:
@@ -215,6 +218,99 @@ def test_target_only_sampling_cdf_boundaries(
 
     assert predicts[0].item() == expected_token
     assert accept_token_num.item() == expected_accept_token_num
+
+
+CHAIN_VOCAB, CHAIN_GAMMA, CHAIN_DRAFT = 64, 3, 7
+
+
+def _chain_verify(target_probs, draft_probs, candidates, coin, final_coin):
+    batch, slots = candidates.shape
+    predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device="cuda")
+    accept_token_num = torch.empty((batch,), dtype=torch.int32, device="cuda")
+    chain_speculative_sampling_triton(
+        predicts=predicts,
+        accept_index=torch.full((batch, slots), -1, dtype=torch.int32, device="cuda"),
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=torch.arange(batch * slots, device="cuda").view(batch, slots),
+        retrive_next_token=None,
+        retrive_next_sibling=None,
+        uniform_samples=torch.full((batch, slots), coin, device="cuda"),
+        uniform_samples_for_final_sampling=torch.full(
+            (batch,), final_coin, device="cuda"
+        ),
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+    return accept_token_num, predicts
+
+
+def _chain_verify_constant_draft(draft_q, target_p, coin, final_coin=0.5):
+    target_probs = torch.zeros((1, CHAIN_GAMMA + 1, CHAIN_VOCAB), device="cuda")
+    target_probs[:, :, CHAIN_DRAFT] = target_p
+    target_probs[:, :, CHAIN_DRAFT + 1] = 1.0 - target_p
+    draft_probs = torch.zeros((1, CHAIN_GAMMA, CHAIN_VOCAB), device="cuda")
+    draft_probs[:, :, CHAIN_DRAFT] = draft_q
+    candidates = torch.full(
+        (1, CHAIN_GAMMA + 1), CHAIN_DRAFT, dtype=torch.int64, device="cuda"
+    )
+    accept_token_num, predicts = _chain_verify(
+        target_probs, draft_probs, candidates, coin, final_coin
+    )
+    return accept_token_num.item(), predicts[0].item()
+
+
+@pytest.mark.parametrize("overshoot", [2**-23, 5e-4])
+def test_chain_verify_accepts_q_rounded_above_one(overshoot):
+    """A draft q that rounds slightly above 1 must be read as 1, not rejected."""
+    num_accept, _ = _chain_verify_constant_draft(
+        1.0 + overshoot, target_p=1.0, coin=1.0 - 2**-24
+    )
+    assert num_accept == CHAIN_GAMMA
+
+
+@pytest.mark.parametrize(
+    "draft_q", [0.0, float("nan"), float("-inf"), float("inf"), 2.0]
+)
+def test_chain_verify_rejects_non_probability_q(draft_q):
+    """A draft q that is not a probability must never be accepted."""
+    num_accept, _ = _chain_verify_constant_draft(draft_q, target_p=1.0, coin=0.5)
+    assert num_accept == 0
+
+
+def test_chain_verify_residual_excludes_rounded_draft_token():
+    """After rejecting a draft whose q rounds above 1, (p - q)+ has no mass on it."""
+    num_accept, bonus = _chain_verify_constant_draft(
+        1.0 + 8e-6, target_p=0.5, coin=0.99, final_coin=0.25
+    )
+    assert num_accept == 0
+    assert bonus == CHAIN_DRAFT + 1
+
+
+def test_chain_verify_accepts_flashinfer_softmax_draft_equal_to_target():
+    """DSpark's FlashInfer softmax probabilities, used as both p and q, accept every draft."""
+    softmax = pytest.importorskip("flashinfer.sampling").softmax
+    batch, vocab = 16, 32000
+    torch.manual_seed(0)
+    logits = torch.randn(batch * (CHAIN_GAMMA + 1), vocab, device="cuda") * 2
+    logits[:, 0] = logits.max(dim=-1).values + 20.0
+    temperature = torch.full((logits.shape[0],), 0.6, device="cuda")
+    probs = softmax(logits=logits, temperature=temperature).view(
+        batch, CHAIN_GAMMA + 1, vocab
+    )
+    candidates = torch.zeros((batch, CHAIN_GAMMA + 1), dtype=torch.int64, device="cuda")
+    candidates[:, 1:] = probs[:, :CHAIN_GAMMA].argmax(dim=-1)
+    accept_token_num, _ = _chain_verify(
+        probs,
+        probs[:, :CHAIN_GAMMA].contiguous(),
+        candidates,
+        coin=0.999,
+        final_coin=0.5,
+    )
+    assert (accept_token_num == CHAIN_GAMMA).all(), accept_token_num.tolist()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 import triton
 import triton.language as tl
 
+# fp32 softmax rounds a peaked row's top probability up to about 1 + 6e-6
+# (FlashInfer, measured on H100); the 1e-3 margin above that is arbitrary.
+_Q_PROB_MAX = tl.constexpr(1.0 + 1e-3)
+
 
 @triton.jit
 def speculative_sampling_classic_kernel(
@@ -74,7 +78,8 @@ def speculative_sampling_classic_kernel(
         # -inf q, 0 < p for a zero one, and the range guard the residual passes
         # use lets zero through. Reject instead: the residual path resamples
         # from the target, which is the safe direction to fail in.
-        q_is_prob = (q > 0.0) & (q <= 1.0)
+        q_is_prob = (q > 0.0) & (q <= _Q_PROB_MAX)
+        q = tl.minimum(q, 1.0)
 
         if q_is_prob & (coin * q < p):
             num_accept += 1
@@ -122,7 +127,9 @@ def speculative_sampling_classic_kernel(
             # Treat any non-probability q (NaN, +-inf, negative) as 0: the
             # residual falls back to p. A comparison against NaN is false, so
             # the range test rejects it along with the infinities.
-            q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+            q_val = tl.where(
+                (q_val >= 0.0) & (q_val <= _Q_PROB_MAX), tl.minimum(q_val, 1.0), 0.0
+            )
             diff = p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
 
@@ -150,7 +157,11 @@ def speculative_sampling_classic_kernel(
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Same guard as pass 1.
-                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                q_val = tl.where(
+                    (q_val >= 0.0) & (q_val <= _Q_PROB_MAX),
+                    tl.minimum(q_val, 1.0),
+                    0.0,
+                )
                 diff = p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
