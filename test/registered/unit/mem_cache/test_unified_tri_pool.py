@@ -37,6 +37,8 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
+    DraftStateGeometry,
+    DraftStateRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -1241,6 +1243,41 @@ class TestTriFactorySizing(unittest.TestCase):
         self.assertIs(pool.require_draft_host_spec("full"), pool.spec("full"))
         for other in ("swa", "mamba"):
             self.assertIsNone(pool.spec(other).draft_region, other)
+
+    def _state_placement(self):
+        region = DraftStateRegion(
+            lane_num=2,
+            state=DraftStateGeometry(
+                conv_state_shapes=((3, 8),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(0, 0, 0),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        return FusedDraftPlacement.from_counts(
+            counts={"mamba": [1, 1]}, regions={"mamba": region}
+        )
+
+    def test_fused_draft_state_clone_shares_the_request_slot_space(self):
+        """A draft runner's req pool over the fused state block keeps the
+        target's request->slot mappings and slot allocator (the draft's slot
+        ids ARE the target's), and views only its own block."""
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=self._state_placement())
+        )
+        target = bundle.req_to_token_pool
+        clone = target.clone_for_fused_draft(layer_lanes={1: 1})
+        self.assertIs(
+            clone.req_index_to_mamba_index_mapping,
+            target.req_index_to_mamba_index_mapping,
+        )
+        self.assertIs(clone.mamba_allocator, target.mamba_allocator)
+        self.assertIs(clone.req_to_token, target.req_to_token)
+        self.assertEqual(clone.mamba_map, {1: 0})
+        conv = clone.mamba2_layer_cache(1).conv[0]
+        self.assertEqual(tuple(conv.shape), (target.mamba_pool.size + 1, 3, 8))
+        draft_conv, _ = bundle.unified_memory_pool.build_draft_state_views("mamba")
+        self.assertEqual(conv.data_ptr(), draft_conv[0][1].data_ptr())
 
     def test_bs1_floor_fails_loud_before_construction(self):
         """A budget far below one worst-case request must raise BEFORE any

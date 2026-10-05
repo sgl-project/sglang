@@ -604,18 +604,19 @@ class KVCacheConfigurator:
                         req_to_token_pool = self._build_req_to_token_pool(
                             max_num_reqs=sizes.max_running_requests
                         )
+                    runner = self.draft_model_idx or 0
                     # The target placed this draft from its config; the built
                     # model is the ground truth for whether it carries state.
                     state_layers = draft_state_layer_classes(self.model)
-                    if state_layers:
+                    if state_layers and not placement.lanes_for(runner, "mamba"):
                         raise ValueError(
                             "Fused draft KV: the draft model has recurrent / "
                             f"linear-attention layers ({', '.join(state_layers)}) "
-                            "that the fused region gives no state pool."
+                            "that the fused placement gives no state lanes."
                         )
                     binding = bind_fused_draft(
                         placement=placement,
-                        runner=self.draft_model_idx or 0,
+                        runner=runner,
                         unified_buffer=alloc.unified_buffer,
                         host_allocator=alloc,
                         model=self.model,
@@ -758,7 +759,11 @@ class KVCacheConfigurator:
         # The region holds rows in the target's KV dtype; a draft that resolved
         # its own would read and write them as something else. Compare the KV
         # dtypes, not their storage: every fp8 flavor is stored as uint8.
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
         for host in placement.hosts():
+            if HOST_KINDS[host].family != "dense":
+                continue
             region_kv_dtype = placement.region(host).resolved_kv_dtype()
             if self.kv_cache_dtype != region_kv_dtype:
                 raise ValueError(
@@ -1155,7 +1160,11 @@ class KVCacheConfigurator:
         region = placement.region(sub_pool_name)
         if region is None:
             return None
-        builders = {"full": self._full_host_spec, "swa": self._swa_host_spec}
+        builders = {
+            "full": self._full_host_spec,
+            "swa": self._swa_host_spec,
+            "mamba": self._mamba_host_spec,
+        }
         assert sub_pool_name in HOST_KINDS, (
             f"sub-pool {sub_pool_name!r} is not a registered host kind"
         )
@@ -1163,6 +1172,30 @@ class KVCacheConfigurator:
             f"no fused host spec builder for sub-pool {sub_pool_name!r}"
         )
         return builders[sub_pool_name](region).entry_bytes()
+
+    def _mamba_host_spec(self, region):
+        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+
+        assert self.mambaish_config is not None, (
+            "only a mamba-ish host builds a mamba sub-pool"
+        )
+        cp = self.mambaish_config.mamba2_cache_params
+        # This runner's OWN state layers, as the mamba factory slices them.
+        layer_ids = [
+            i
+            for i in cp.layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        return MambaSubPoolSpec(
+            name="mamba",
+            layer_num=len(layer_ids),
+            conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+            conv_dtype=cp.dtype.conv,
+            temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+            temporal_dtype=cp.dtype.temporal,
+            grow_direction="up",
+            draft_region=region,
+        )
 
     def _swa_host_spec(self, region):
         from sglang.srt.mem_cache.unified_memory_pool import (
@@ -2885,9 +2918,15 @@ class KVCacheConfigurator:
         else:
             max_stage_mamba_layers = len(all_mamba_layers)
         pp_layer_scale = max_stage_mamba_layers / max(len(all_mamba_layers), 1)
-        stage_per_req = int(
-            config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
+        # A fused draft state block widens every state slot: price the entry
+        # the unified factory carves out (host + draft + pad), not the host's.
+        fused_state_entry = self.fused_entry_bytes("mamba")
+        per_req = (
+            config.mamba2_cache_params.mamba_cache_per_req
+            if fused_state_entry is None
+            else fused_state_entry
         )
+        stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget

@@ -25,6 +25,7 @@ compaction only mutates those (no reference rewriting).
 
 from __future__ import annotations
 
+import copy
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
+    DraftRegion,
+    DraftStateRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.layout.token_major import (
@@ -119,7 +122,9 @@ class SubPoolSpec(ABC):
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
     # Fused draft region riding in this sub-pool's entries; None = unfused.
-    draft_region: Optional[DenseDraftRegion] = None
+    # Each kind accepts the region kind its entry can lay out, after the host
+    # block at `draft_offset_in_entry()`.
+    draft_region: Optional[DraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -176,6 +181,9 @@ class MHASubPoolSpec(SubPoolSpec):
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
         if self.draft_region is not None:
+            assert isinstance(self.draft_region, DenseDraftRegion), (
+                "dense entries carry dense draft K/V rows, never a state region"
+            )
             self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
@@ -258,6 +266,9 @@ class MLASubPoolSpec(SubPoolSpec):
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
         if self.draft_region is not None:
+            assert isinstance(self.draft_region, DenseDraftRegion), (
+                "dense entries carry dense draft K/V rows, never a state region"
+            )
             self.draft_region.validate()
 
     @property
@@ -305,7 +316,15 @@ class MLASubPoolSpec(SubPoolSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class MambaSubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one Mamba-shaped sub-pool."""
+    """Per-slot layout of one Mamba-shaped sub-pool.
+
+    With `draft_region` (a `DraftStateRegion`) set, the draft's state block
+    follows the host's inside every slot's entry:
+
+        [ conv[0] x L | ... | temporal x L | draft conv[0] x Ld | ... | pad ]
+
+    Unfused, the entry keeps its raw (unaligned) size, byte-identical to before.
+    """
 
     conv_state_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor
     conv_dtype: torch.dtype
@@ -316,9 +335,11 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
-        assert self.draft_region is None, (
-            "mamba state pages carry no fused draft region yet"
-        )
+        if self.draft_region is not None:
+            assert isinstance(self.draft_region, DraftStateRegion), (
+                "mamba state entries carry a draft STATE region, never dense K/V rows"
+            )
+            self.draft_region.validate()
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -326,12 +347,25 @@ class MambaSubPoolSpec(SubPoolSpec):
     def temporal_row_bytes(self) -> int:
         return _prod(self.temporal_state_shape) * self.temporal_dtype.itemsize
 
-    def entry_bytes(self) -> int:
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft block."""
         total = 0
         for i in range(len(self.conv_state_shapes)):
             total += self.layer_num * self.conv_row_bytes(i)
         total += self.layer_num * self.temporal_row_bytes()
         return total
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft state block inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
+    def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return self.host_entry_bytes()
+        return align_entry_bytes(
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
+        )
 
     def get_dtype(self) -> torch.dtype:
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
@@ -747,6 +781,30 @@ class UnifiedKVPool:
             temporal_dtype=spec.temporal_dtype,
             max_slots=max_slots,
             anchor_bytes=anchor_bytes,
+            entry_bytes=spec.entry_bytes(),
+        )
+
+    def build_draft_state_views(
+        self, sub_pool_name: str
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Per-layer conv/temporal views of the DRAFT state block fused into
+        ``sub_pool_name``'s entries: same slots, same v2p table as the host."""
+        spec = self.mamba_spec(sub_pool_name)
+        region = spec.draft_region
+        assert isinstance(region, DraftStateRegion), (
+            f"sub-pool {sub_pool_name!r} carries no fused draft state region"
+        )
+        return build_mamba_entry_views(
+            self._raw,
+            layer_num=region.lane_num,
+            conv_state_shapes=region.state.conv_state_shapes,
+            conv_dtype=region.state.conv_dtype,
+            temporal_state_shape=region.state.temporal_state_shape,
+            temporal_dtype=region.state.temporal_dtype,
+            max_slots=self.max_slots(sub_pool_name),
+            anchor_bytes=self._anchor_bytes[sub_pool_name],
+            entry_bytes=spec.entry_bytes(),
+            offset_bytes=spec.draft_offset_in_entry(),
         )
 
 
@@ -1103,14 +1161,35 @@ class UnifiedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
-    # take PHYSICAL slot ids; callers translate via the slot allocator first.
+    # State ops take PHYSICAL slot ids and act on whole entries, so a fused
+    # draft state block is cleared, copied and moved with the host streams.
+
+    def _entry_view(self) -> torch.Tensor:
+        spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
+        entry_bytes = spec.entry_bytes()
+        anchor = self._unified_buffer.anchor_bytes(self._sub_pool_name)
+        num_slots = self._max_size + 1
+        raw = self._unified_buffer._raw
+        entries = raw[anchor : anchor + num_slots * entry_bytes]
+        return entries.view(num_slots, entry_bytes)
+
+    def clear_slots(self, indices: torch.Tensor):
+        self._entry_view()[indices] = 0
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        assert self.replayssm_write_pos is None
+        entries = self._entry_view()
+        entries[dst_indices] = entries[src_indices]
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Cross-pool physical-move contract, implemented by every pool the
-        # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
-        # takes (src, dst), hence the swap.
-        MambaPool.copy_from(self, src_loc, tgt_loc)
+        # Physical-slot move for the MultiEndedAllocator: the whole entry, so a
+        # fused draft state block travels with the host streams.
+        entries = self._entry_view()
+        entries[tgt_loc] = entries[src_loc]
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[tgt_loc] = 0
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as
@@ -1364,6 +1443,27 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    def clone_for_fused_draft(
+        self, *, layer_lanes: Dict[int, int]
+    ) -> UnifiedHybridReqToTokenPool:
+        """Shallow copy for a draft runner whose recurrent state is fused into
+        this pool's state entries: it shares the request->slot mappings and
+        the slot allocator, and its `mamba_pool` is a view of the draft block
+        keyed by the runner's own layer ids."""
+        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftMambaPool
+
+        clone = copy.copy(self)
+        clone.mamba_pool = UnifiedDraftMambaPool(
+            unified_buffer=self._unified_buffer,
+            sub_pool_name=self._mamba_sub_pool_name,
+            layer_lanes=layer_lanes,
+        )
+        clone.mamba_map = {
+            layer_id: idx for idx, layer_id in enumerate(sorted(layer_lanes))
+        }
+        clone.mamba_ckpt_pool = None
+        return clone
 
     @property
     def mamba_v2p_table(self) -> Optional[torch.Tensor]:
