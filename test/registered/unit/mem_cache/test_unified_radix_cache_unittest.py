@@ -11136,6 +11136,54 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_finish_after_decode_eviction_frees_only_the_requests_pages(self):
+        # Decode evicts at pre_len = seq_len - 1. When the last verify then commits
+        # one token, the finished insert ends at page_floor(pre_len): the frontier
+        # must sit a full window below it although the window is not page-aligned.
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        full_total = allocator.full_available_size()
+        swa_total = allocator.swa_available_size()
+        prompt_len, owned = 4 * page_size, 6 * page_size
+        tokens = list(range(1, owned + 1))
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens[:prompt_len]),
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=owned - prompt_len
+            ),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
+        req.extend_end = prompt_len
+        kv_indices = self._alloc_paged(allocator, owned)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, owned)), kv_indices)
+        req.kv.kv_committed_len = prompt_len
+        req.kv.kv_allocated_len = owned
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        cache.checkpoint(req, up_to=prompt_len)
+
+        req.output_ids = tokens[prompt_len:]
+        req.kv.kv_committed_len = owned
+        cache.evict_sliding_windows(req, owned - 1)
+        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        # Each page is back in the pool or held by the tree, never both.
+        self.assertEqual(
+            allocator.full_available_size() + cache.full_evictable_size(), full_total
+        )
+        self.assertEqual(
+            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+        )
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.
