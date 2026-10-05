@@ -120,7 +120,6 @@ class TestOutputStoreConfig(CustomTestCase):
 
 class _FakeTransfer:
     def __init__(self, store, key_prefix):
-        self.key_prefix = key_prefix
         self.puts = []
         self.removed = []
         self.cleanup_error = None

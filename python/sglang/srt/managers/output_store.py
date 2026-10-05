@@ -28,30 +28,6 @@ OUTPUT_STORE_REF_KEY = "output_store_ref"
 # Arbitrary until measured; bounds concurrent puts and cleanups per tokenizer process.
 _MAX_STORE_WORKERS = 4
 
-_CONFIG_KEYS = frozenset(
-    {
-        "master_server_address",
-        "local_hostname",
-        "local_buffer_size",
-        "protocol",
-        "metadata_server",
-        "device_name",
-        "global_segment_size",
-        "key_prefix",
-        "namespace",
-        "partition",
-        "replica_num",
-        "chunk_bytes",
-    }
-)
-
-_REQUIRED_CONFIG_KEYS = (
-    "master_server_address",
-    "local_hostname",
-    "local_buffer_size",
-    "key_prefix",
-)
-
 _SIZE_UNITS = {
     "kb": 1024,
     "mb": 1024**2,
@@ -82,10 +58,16 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 "--output-store-backend-extra-config must be a JSON object"
             )
-        unknown = sorted(set(raw) - _CONFIG_KEYS)
+        struct_fields = msgspec.structs.fields(cls)
+        known = {field.name for field in struct_fields} | {"global_segment_size"}
+        unknown = sorted(set(raw) - known)
         if unknown:
             raise ValueError(f"Unknown output store config keys: {unknown}")
-        missing = [key for key in _REQUIRED_CONFIG_KEYS if raw.get(key) in (None, "")]
+        missing = [
+            field.name
+            for field in struct_fields
+            if field.required and raw.get(field.name) in (None, "")
+        ]
         if missing:
             raise ValueError(f"Output store config requires {missing}")
 
