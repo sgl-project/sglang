@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{AffinityConfig, AffinityMode};
+use crate::config::{AffinityConfig, AffinityMode, BalancedBy};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
+use super::admission::EngineMetrics;
 use super::{Pick, PickError};
 
 pub(super) fn choose(
@@ -37,15 +38,15 @@ fn prefer_alternative(
     if config.mode != AffinityMode::Balanced {
         return false;
     }
-    let (Some(affinity), Some(alternative)) = (
-        load.fresh_native_cache_load_for_url(&affinity.url),
-        load.fresh_native_cache_load_for_url(&alternative.url),
-    ) else {
+    let metric = |engine| {
+        let metrics = EngineMetrics::observe(engine, load);
+        match config.balanced_by {
+            BalancedBy::PendingPrefillTokens => metrics.pending_prefill_tokens,
+            BalancedBy::RunningRequests => metrics.running_requests,
+        }
+    };
+    let (Some(a), Some(b)) = (metric(affinity), metric(alternative)) else {
         return false;
     };
-    let (a, b) = (
-        affinity.num_waiting_uncached_tokens,
-        alternative.num_waiting_uncached_tokens,
-    );
-    a.saturating_sub(b) > config.load_gap && a as f64 > b as f64 * config.load_factor
+    a.saturating_sub(b) > config.load_gap() && a as f64 > b as f64 * config.load_factor
 }

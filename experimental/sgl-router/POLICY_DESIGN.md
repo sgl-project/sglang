@@ -343,10 +343,12 @@ preserves the old binding and advances to the next bucket.
 
 Both affinity policies support `--affinity-mode prefer` (default) and `balanced`.
 Prefer retains admissible affinity. Balanced compares it with an admitted
-power-of-two alternative and switches only when waiting uncached tokens exceed
-both the alternative times `--affinity-load-factor` (default 2) and the alternative
-plus `--affinity-load-gap` (default 1024). Both reports must be fresh and native;
-missing data or ties preserve affinity. Bindings commit during selection after
+power-of-two alternative and switches only when the `--affinity-balanced-by` load
+exceeds both the alternative times `--affinity-load-factor` (default 2) and the
+alternative plus `--affinity-load-gap`. The load is `pending-prefill-tokens`
+(default; native waiting uncached tokens, gap default 1024) or `running-requests`
+(native or basic reports, gap default 4). Both reports must be fresh; missing data
+or ties preserve affinity. Bindings commit during selection after
 admission, as with initial placement; dispatch failure does not roll them back.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
@@ -450,7 +452,9 @@ selection or dispatch fails. It must not increment dispatch accounting.
 
 Under `--chat-routing reorg`, `--bucket-config` reads a JSON file of complete
 buckets. Each bucket sets `plain`, or both `prefill` and `decode`; each group may
-set `worker_ids` or `worker_services`, plus `policy` and `admission`.
+set `worker_ids` or `worker_services`, plus `policy`, `admission` and `affinity`.
+`affinity` overrides `mode`, `balanced_by`, `load_factor` and `load_gap` for a
+session- or cache-aware group; unset fields take the CLI values.
 
 ```json
 {
