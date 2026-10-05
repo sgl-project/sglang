@@ -2555,9 +2555,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
             if decode_req.req.logprob.token_ids_logprob is not None:
-                # Arbitrary-token logprobs are not transferred for the first
-                # token. Preserve its position so streaming offsets do not
-                # discard logprobs produced by subsequent decode steps.
+                # Prefill omits these scores; reserve a row for the streaming offset.
                 decode_req.req.logprob.output_token_ids_logprobs_val.append([])
                 decode_req.req.logprob.output_token_ids_logprobs_idx.append([])
         if decode_req.req.return_sampling_mask and not replayed_boundary:
