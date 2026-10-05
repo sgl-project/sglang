@@ -130,7 +130,7 @@ prepared weight layouts.
 
 | op id | FlashInfer entry | SM | notes (graph/prepare) |
 |---|---|---|---|
-| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
+| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | two launches (norm/AdaLN -> BF16 `[M, 5376]` workspace, cached per `(M, device)`; persistent QKV GEMM with the Q/K-norm/RoPE/pack epilogue); engine operands, `[kind, head, d]` weight rows (`bd94c5806`) |
 | `minimax_h3_dense_attention` | `diffusion_ops.cake_minimax_h3_dense_attention:minimax_h3_dense_attention` | 9.0-10.3, 12.0-12.1 | one-shot; cc 12.1 admitted but unmeasured |
 | `minimax_h3_fc1_swiglu` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
 | `minimax_h3_fc1_swiglu_fp8` | `diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu:minimax_h3_fc1_swiglu_fp8` | 12.0 | one-shot |

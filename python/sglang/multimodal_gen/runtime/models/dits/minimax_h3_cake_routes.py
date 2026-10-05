@@ -4,8 +4,9 @@
 ``MiniMaxH3DiTBlock`` take the Cake KernelSpecs registered in
 ``sglang.kernels.ops.diffusion.cake`` instead of the stock layer sequence:
 
-* ``bf16_pre_attention`` -- ``norm1`` + indexed AdaLN + fused QKV GEMM + per-head
-  Q/K RMSNorm + partial NeoX RoPE (``diffusion.minimax_h3_bf16_pre_attention``).
+* ``bf16_pre_attention`` -- ``norm1`` + indexed AdaLN + QKV GEMM + per-head
+  Q/K RMSNorm + partial NeoX RoPE (``diffusion.minimax_h3_bf16_pre_attention``;
+  two launches through a cached BF16 activation workspace).
 * ``varlen_attention`` -- the packed-varlen non-causal attention at the BCG
   break point (``diffusion.minimax_h3_varlen_attention``).
 * ``out_proj`` -- output projection fused with the first gated residual
