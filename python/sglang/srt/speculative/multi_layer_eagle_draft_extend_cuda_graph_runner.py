@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -116,6 +117,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     req_pool_indices: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -155,8 +157,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.ps.tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
@@ -284,8 +285,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
-            global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.num_dp_ranks
+            global_num_tokens_for_logprob_cpu = [num_tokens] * self.num_dp_ranks
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
             # DRAFT_EXTEND_V2 produces logits for all tokens, not bs (see mlp branch above)
@@ -332,9 +333,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -493,6 +496,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             spec_info=spec_info,
         )
         if (
@@ -679,10 +684,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    dp_size = runner.dp_size
-                    global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                    num_dp_ranks = runner.num_dp_ranks
+                    global_num_tokens_gpu = torch.zeros(
+                        (num_dp_ranks,), dtype=torch.int32
+                    )
                     global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (dp_size,), dtype=torch.int32
+                        (num_dp_ranks,), dtype=torch.int32
                     )
                 else:
                     global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -700,6 +707,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+                if get_exec().mamba.enable_mamba_extra_buffer
+                else None
+            ),
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
             extend_seq_lens=extend_seq_lens,
@@ -753,6 +765,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens=buffers.seq_lens[:bs],
             extend_seq_lens=buffers.extend_seq_lens[:bs],
             out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
         )
         for backend in backends:
             backend.init_forward_metadata_out_graph(batch)
@@ -770,6 +783,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             bs = self.get_runner(0)._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
+
+        refresh_track_indices(
+            buffers.mamba_track_indices,
+            forward_batch.mamba_track_indices,
+            raw_bs=raw_bs,
+            bs=bs,
+        )
 
         fill_draft_extend_prepare_buffers(
             buffers.input_ids,
