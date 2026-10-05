@@ -639,12 +639,15 @@ def _select_exit_move(
         if not produced.may_reduce_scatter:
             # A complete output: this rank's block of it, nothing summed.
             return ExitMove(cp_moves.take_back)
-        # The FFN leaves its sum: only a take-back that sums over the same
-        # ranks completes it.
-        if cp_moves.reduce_scatter is None or not _same_ranks(
-            _sum_group(produced.group), cp_moves.reduce_scatter_group()
-        ):
+        if cp_moves.reduce_scatter is None:
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
+        # Only a take-back over the FFN's sum group can complete its reduction.
+        # With attention TP > 1, the full TP sum spans more ranks than CP:
+        # let the exit complete that sum, then take this rank's CP rows.
+        if not _same_ranks(_sum_group(produced.group), cp_moves.reduce_scatter_group()):
+            if produced.always_partial:
+                raise NotImplementedError(f"{produced=} {residual=} {to=}")
+            return ExitMove(cp_moves.take_back)
         return ExitMove(cp_moves.reduce_scatter, output_move_completes_sum=True)
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
