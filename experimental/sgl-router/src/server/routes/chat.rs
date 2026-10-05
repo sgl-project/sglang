@@ -7,7 +7,7 @@ mod reorg;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
@@ -60,7 +60,9 @@ pub async fn chat_completions(
         body,
         routing.needs_request_tokens(&ctx),
     )?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    let workers = routing
+        .select_workers(&ctx, &request, &headers, &[])
+        .await?;
     forward_request(&ctx, request, workers, headers, start).await
 }
 
@@ -75,7 +77,9 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    let workers = routing
+        .select_workers(&ctx, &request, &headers, &[])
+        .await?;
     forward_request(&ctx, request, workers, headers, start).await
 }
 
@@ -108,7 +112,9 @@ async fn embedding_input(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    let workers = routing
+        .select_workers(&ctx, &request, &headers, &[])
+        .await?;
     forward_request(&ctx, request, workers, headers, start).await
 }
 
@@ -123,7 +129,9 @@ pub async fn rerank(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, "/v1/rerank")?;
     let request = PreparedRequest::rerank(model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    let workers = routing
+        .select_workers(&ctx, &request, &headers, &[])
+        .await?;
     forward_request(&ctx, request, workers, headers, start).await
 }
 
@@ -162,17 +170,19 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
+    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
+    /// never one in `excluded`.
     async fn select_workers(
         &self,
         ctx: &AppContext,
         request: &PreparedRequest,
         headers: &HeaderMap,
+        excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
                 let candidates = resolver
                     .prefill_candidates(&request.model)
                     .map_err(|error| pool_error(error, &request.model))?;
@@ -186,7 +196,9 @@ impl<'a> ModelRouting<'a> {
                 )
                 .await
             }
-            Self::Reorg(resolver) => reorg::select_workers(ctx, resolver, request, headers).await,
+            Self::Reorg(resolver) => {
+                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+            }
         }
     }
 }
