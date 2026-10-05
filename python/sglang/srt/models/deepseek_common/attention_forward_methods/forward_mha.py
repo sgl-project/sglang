@@ -116,6 +116,10 @@ def forward_dsa_indexer_for_mha(
 
     select = spec_info.dsa_seed_topk_select
     src = topk_indices if select is None else topk_indices[select]
+    backend = resolve_attn_backend(forward_batch)
+    prepare_seed = getattr(backend, "prepare_mtp_seed_indices", None)
+    if prepare_seed is not None:
+        src = prepare_seed(src, forward_batch.forward_mode)
     seed_buf[: src.shape[0]].copy_(src)
 
 
