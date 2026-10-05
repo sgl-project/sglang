@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
-from sglang.kernels.ops.attention.dsv4.q_rope_fp8_store import q_rope_fp8_store
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -13,7 +12,8 @@ register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @pytest.mark.parametrize("rows,heads", [(6, 16), (9, 128), (4097, 16)])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
-def test_fp8_rope_output_padding_and_graph(rows, heads, position_dtype):
+@pytest.mark.parametrize("eps", [None, 1e-6])
+def test_fp8_rope_output_padding_and_graph(rows, heads, position_dtype, eps):
     torch.manual_seed(911)
     q = torch.randn(rows, heads + 1, 512, device="cuda", dtype=torch.bfloat16)[
         :, :heads
@@ -27,16 +27,16 @@ def test_fp8_rope_output_padding_and_graph(rows, heads, position_dtype):
     )
     positions = torch.randint(8192, (rows,), device="cuda", dtype=position_dtype)
     expected = torch.empty_like(q)
-    q_rope_fp8_store(q, output, freqs, positions)
+    fused_q_norm_rope(q, output, eps, freqs, positions)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        q_rope_fp8_store(q, output, freqs, positions)
+        fused_q_norm_rope(q, output, eps, freqs, positions)
     for _ in range(3):
         q.normal_()
         original = q.clone()
         positions.random_(0, 8192)
         graph.replay()
-        fused_q_norm_rope(q, expected, None, freqs, positions)
+        fused_q_norm_rope(q, expected, eps, freqs, positions)
         torch.testing.assert_close(
             output.float(), expected.to(output.dtype).float(), rtol=0, atol=0
         )
@@ -48,14 +48,14 @@ def test_fp8_rope_128_heads_int64_offsets():
     # Both Q and output cross 2**31 elements. Check the rows on either side
     # without allocating another full-sized reference tensor.
     rows, heads = 32769, 128
-    required = rows * heads * 512 * 3
+    required = rows * heads * 512 * 5
     if torch.cuda.mem_get_info()[0] < required + (1 << 30):
-        pytest.skip("Requires about 7 GiB of free GPU memory")
+        pytest.skip("Requires about 11 GiB of free GPU memory")
     q = torch.ones(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(q.shape, device="cuda", dtype=torch.float8_e4m3fn)
     freqs = torch.ones(1, 32, device="cuda", dtype=torch.complex64)
     positions = torch.zeros(rows, device="cuda", dtype=torch.int32)
-    q_rope_fp8_store(q, output, freqs, positions)
+    fused_q_norm_rope(q, output, None, freqs, positions)
     torch.testing.assert_close(output[-2:].float(), q[-2:].float(), rtol=0, atol=0)
 
 

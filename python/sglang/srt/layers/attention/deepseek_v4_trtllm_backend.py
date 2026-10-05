@@ -331,7 +331,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             layer.layer_id, compress_ratio
         )
 
-        # Fused RoPE already emits FP8 on V4.1; to() is a no-op in that path.
+        # Q preparation already returns FP8 on V4.1; to() is a no-op in that path.
         q_fp8 = q.to(torch.float8_e4m3fn).view(bs, 1, num_heads, 512)
 
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
