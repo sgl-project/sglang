@@ -40,7 +40,6 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,

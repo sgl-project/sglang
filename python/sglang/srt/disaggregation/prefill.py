@@ -1507,6 +1507,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        layerwise_kv_done: bool = False,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1519,7 +1520,7 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx, layerwise_kv_done=layerwise_kv_done)
 
     def _send_kv_chunk(
         self: Scheduler,
@@ -1734,14 +1735,14 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             for seg_start, seg_end in segments:
                 is_final_segment = seg_end == end_idx
-                kv_indices = self.req_to_token_pool.req_to_token[
+                raw_kv_indices = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, seg_start:seg_end
                 ]
                 # Unified memory: req_to_token holds VIRTUAL ids; the transfer
                 # physical ones. Per segment, since each is its own gather.
                 kv_indices = (
                     self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                        kv_indices
+                        raw_kv_indices
                     )
                 )
                 page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1750,9 +1751,10 @@ class SchedulerDisaggregationPrefillMixin:
                     len(page_indices), segment_is_last
                 ):
                     continue
+                send_state_indices = state_indices if segment_is_last else None
                 req.disagg_kv_sender.send(
                     page_indices,
-                    state_indices if segment_is_last else None,
+                    send_state_indices,
                     num_kv_tokens=seg_end - seg_start,
                 )
         req.start_send_idx = end_idx

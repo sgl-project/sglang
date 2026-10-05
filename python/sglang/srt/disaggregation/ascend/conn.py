@@ -16,7 +16,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
