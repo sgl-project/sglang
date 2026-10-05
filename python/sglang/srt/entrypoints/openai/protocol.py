@@ -49,8 +49,14 @@ from openai.types.responses import (
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_custom_tool_call_param import (
+    ResponseCustomToolCallParam,
+)
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
+)
+from openai.types.responses.response_function_tool_call_param import (
+    ResponseFunctionToolCallParam,
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
@@ -72,6 +78,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.entrypoints.openai.responses_adapters import ResponseToolState
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -1744,6 +1751,8 @@ RESPONSE_TOOL_TYPES = Literal[
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
+    model_config = ConfigDict(extra="allow")
+
     type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
     name: Optional[str] = None
     description: Optional[str] = None
@@ -1770,7 +1779,17 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
+class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
+    namespace: Optional[str]
+
+
+class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
+    namespace: Optional[str]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    NamespacedFunctionCallParam,
+    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
@@ -1782,6 +1801,7 @@ ResponseInputOutputItem: TypeAlias = Union[
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
+    _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
@@ -1978,7 +1998,10 @@ class ResponsesRequest(PDRoutingFields):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
-            return {"type": "function", "name": name}
+            choice = {"type": tool_choice["type"], "name": name}
+            if "namespace" in tool_choice:
+                choice["namespace"] = tool_choice["namespace"]
+            return choice
         return "auto"
 
     def to_sampling_params(
@@ -2205,6 +2228,7 @@ class ResponsesResponse(BaseModel):
                 {"format": {"type": "text"}} if _is_text_only(output) else None
             )
 
+        tool_state = request._tool_state
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -2217,8 +2241,16 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.effective_tool_choice(),
-            tools=request.tools,
+            tool_choice=(
+                tool_state.public_choice
+                if tool_state.public_choice is not None
+                else request.effective_tool_choice()
+            ),
+            tools=(
+                tool_state.public_tools
+                if tool_state.public_tools is not None
+                else request.tools
+            ),
             # fields for parity with v1/responses
             error=None,
             incomplete_details=(
@@ -2288,7 +2320,17 @@ class ResponseReasoningTextContent(BaseModel):
     type: Literal["reasoning_text"] = "reasoning_text"
 
 
+class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
+    namespace: Optional[str]
+
+
+class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
+    namespace: Optional[str]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    NamespacedFunctionCallParam,
+    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,

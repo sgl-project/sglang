@@ -17,9 +17,160 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from typing import Any, Dict, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
+
+from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
+
+if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.protocol import ResponseTool
+
+
+@dataclass
+class ResponseToolState:
+    """Public tool metadata and mappings for one translated request."""
+
+    public_tools: list[ResponseTool] | None = None
+    public_choice: str | dict[str, Any] | None = None
+    names: dict[str, dict[str, str]] = field(default_factory=dict)
+    custom_names: set[str] = field(default_factory=set)
+
+    def harmony_output_item(self, item, *, partial=False):
+        if item.type != "function_call" or getattr(item, "namespace", None) is not None:
+            return item
+        public_name = response_tool_name(item.name, self.names)
+        if item.name in self.custom_names:
+            decode = (
+                decode_custom_tool_input_prefix if partial else decode_custom_tool_input
+            )
+            return ResponseCustomToolCall(
+                type="custom_tool_call",
+                id=item.id,
+                call_id=item.call_id,
+                input=decode(item.arguments),
+                **public_name,
+            )
+        return item.model_copy(update=public_name)
+
+
+class ResponseToolChoiceError(ValueError):
+    """A tool-choice translation error, reported against tool_choice."""
+
 
 CUSTOM_TOOL_INPUT_KEY = "input"
+
+
+def flat_namespace_tool_name(namespace: str | None, name: str) -> str:
+    return f"{namespace}__{name}" if namespace is not None else name
+
+
+def flatten_response_tools(tools):
+    """Return flat tools and a declared-name map for existing function parsers."""
+    flat_tools, names = [], {}
+    namespaces = set()
+    for tool in tools:
+        tool = tool.model_dump(exclude_none=True)
+        namespace = tool.get("name") if tool["type"] == "namespace" else None
+        if tool["type"] == "namespace":
+            if not isinstance(namespace, str) or not namespace:
+                raise ValueError("Namespaces require a name")
+            if namespace in namespaces:
+                raise ValueError(f"Duplicate namespace {namespace!r}")
+            namespaces.add(namespace)
+            children = tool.get("tools")
+            if not isinstance(children, list) or not children:
+                raise ValueError(f"Namespace {namespace!r} requires tools")
+        else:
+            children = [tool]
+        for child in children:
+            if namespace is not None and (
+                not isinstance(child, dict)
+                or child.get("type") not in ("function", "custom")
+            ):
+                raise ValueError("Namespaces support only function and custom tools")
+            if child["type"] not in ("function", "custom"):
+                flat_tools.append(child)
+                continue
+            name = child.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("Function and custom tools require a name")
+            alias = flat_namespace_tool_name(namespace, name)
+            if alias in names:
+                raise ValueError(
+                    f"Duplicate or colliding tool name: {namespace!r}/{name!r}"
+                )
+            names[alias] = {"name": name}
+            if namespace is not None:
+                names[alias]["namespace"] = namespace
+            flat = {**child, "name": alias}
+            if namespace is not None and tool.get("description"):
+                flat["description"] = (
+                    f"Namespace {namespace}: {tool['description']}\n\n{child.get('description') or ''}"
+                )
+            flat_tools.append(flat)
+    return flat_tools, names
+
+
+def response_tool_choice(choice, flat_tools, names):
+    if not isinstance(choice, dict) or choice.get("type") not in ("function", "custom"):
+        return choice
+    name = choice.get("name") or (choice.get("function") or {}).get("name")
+    alias = flat_namespace_tool_name(choice.get("namespace"), name)
+    declared = response_tool_name(alias, names)
+    if declared["name"] != name or declared.get("namespace") != choice.get("namespace"):
+        raise ResponseToolChoiceError(f"Tool choice {name!r} is not declared in tools")
+    if not any(
+        t["name"] == alias and t["type"] == choice["type"]
+        for t in flat_tools
+        if "name" in t
+    ):
+        raise ResponseToolChoiceError(f"Tool choice {name!r} is not declared in tools")
+    return {"type": "function", "name": alias}
+
+
+def response_tool_name(name, names):
+    return names.get(name, {"name": name})
+
+
+def flatten_response_input(item):
+    if hasattr(item, "model_dump"):
+        item = item.model_dump(exclude_none=True)
+    if isinstance(item, dict) and item.get("type") in (
+        "function_call",
+        "custom_tool_call",
+    ):
+        item = dict(item)
+        item["name"] = flat_namespace_tool_name(
+            item.pop("namespace", None), item["name"]
+        )
+    return item
+
+
+def harmony_custom_tool(tool):
+    """Render a custom tool through Harmony's existing function schema."""
+    if tool["type"] != "custom":
+        return tool
+    tool = {
+        **tool,
+        "type": "function",
+        "parameters": custom_tool_parameters(),
+        "description": custom_tool_description(
+            tool.get("description"), tool.get("format")
+        ),
+    }
+    tool.pop("format", None)
+    return tool
+
+
+def harmony_custom_input(item):
+    if isinstance(item, dict) and item.get("type") == "custom_tool_call":
+        item = dict(item)
+        item.update(
+            type="function_call",
+            arguments=encode_custom_tool_input(item.pop("input", "")),
+        )
+    return item
+
 
 _SIMPLE_ESCAPES = {
     '"': '"',
