@@ -1,0 +1,144 @@
+---
+title: "Paged Experts"
+metatags:
+    description: "SGLang Paged Experts: serve an MoE model whose experts do not fit in GPU memory by keeping K of E experts per layer on the GPU and paging the rest from pinned host memory. Computation stays on the GPU."
+---
+
+Paged Experts serves a Mixture-of-Experts (MoE) model whose expert weights do not fit in GPU
+memory. Each MoE layer keeps **K of its E routed experts in a K-slot table on the GPU** and holds
+all E experts in pinned host memory; every step, the experts the step routes to that are not
+resident are copied into slots before the expert GEMM runs.
+
+## Why Paged Experts?
+
+Expert weights are most of an MoE model's parameters, yet each token is routed to only `top_k`
+of the `E` experts per layer, and consecutive tokens reuse many of the same experts. Paged
+Experts keeps a working set of K experts per layer resident and pages the rest in from host
+memory as routing requires them, so expert capacity is bounded by host RAM rather than VRAM.
+
+**Computation stays on the GPU.** Only expert *storage* is host-backed: experts are copied to the
+GPU and computed there by the model's own fused-MoE kernel. This differs from `--cpu-offload-gb`
+and CPU expert offload, which move the computation to the CPU.
+
+**Results are unchanged.** Routing is untouched (E-wide), and the paged layer produces the same
+output as the unpaged one: bit-identical for unquantized and block-FP8 experts (with
+`--enable-deterministic-inference`), and within the Marlin kernel's own run-to-run noise for
+GPTQ. See [Correctness](#correctness).
+
+## Usage
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
+  --enable-paged-experts
+```
+
+Without `--paged-experts-num-resident`, K is sized from the memory budget (see
+[Sizing K](#sizing-k)). The default CUDA graphs stay on: decode graphs are captured up to
+`K // top_k` concurrent requests, and breakable prefill graphs run the paged MoE layers as eager
+breaks.
+
+## Related Parameters
+
+- **`--enable-paged-experts`**: Enable Paged Experts. Off by default.
+- **`--paged-experts-num-resident K`**: Routed experts per MoE layer kept on the GPU. At least
+  the router's `top_k`; larger values page less but leave less memory for the KV cache. Unset
+  (the default), K is the most that fits the static memory budget next to the other weights and
+  a KV reserve.
+
+## Supported Configurations and Limitations
+
+- **Quantization:** unquantized (bf16/fp16), block-quantized FP8 (e.g. `weight_block_size`
+  `[128, 128]`) on the triton MoE runner, and GPTQ int4/int8 on the Marlin runner. Other
+  quantization methods are rejected at startup.
+- **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
+  (use `--disable-shared-experts-fusion`), `--enable-fused-moe-sum-all-reduce` and
+  `--load-format dummy` are rejected at startup.
+- **CUDA graphs:** decode graphs may use the `full` backend (the default) or be disabled;
+  prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
+  combinations are rejected at startup.
+- **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
+  the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
+  half of system RAM.
+- **Startup:** for GPTQ, the Marlin repack runs over the host store K experts at a time at load.
+
+## How It Works
+
+### The K-slot table and the host store
+
+The paged method wraps the layer's own fused-MoE method. It creates the layer's expert tensors
+with K rows instead of E, so the GPU holds only the K slots, and allocates a host store holding
+all E experts of each per-expert tensor. Each tensor's weight loader is redirected to a one-row
+view of the host store, so checkpoint weights are written by SGLang's native per-expert loader
+(sharding, gate/up placement, scale layout) and the host rows have exactly the layout the GPU
+slots would have.
+
+After loading, the wrapped method's post-load step runs as it would without paging. For methods
+that repack their experts (GPTQ's Marlin repack), it runs over the host store K experts at a
+time, so the host store holds every expert in the repacked layout.
+
+### A step: waves, page-in, merge
+
+Every forward step of every MoE layer:
+
+1. The distinct experts the step routes to are split into **waves** of at most K. Decode at
+   moderate batch sizes needs one wave; a prefill chunk usually needs several.
+2. Each wave makes its experts resident, evicting the least recently used experts outside the
+   wave, and copies the missing ones from the host store into their slots.
+3. The routed expert ids are remapped to slots, every routed entry outside the wave is masked
+   (weight 0), and the wrapped fused-MoE kernel runs over the K slots **without its final top-k
+   sum**, returning each routed (token, expert) output already multiplied by its router weight.
+4. Each entry is taken from the one wave that holds its expert, and the merged entries go
+   through the same top-k sum the kernel would have performed, so the result does not depend
+   on how the experts were split into waves.
+
+### Captured decode
+
+With decode CUDA graphs on, a step whose routed entries fit the K slots (`tokens × top_k ≤ K`,
+i.e. decode up to `K // top_k` requests) is served by a single wave decided and paged on the
+GPU, with no host synchronization, so the decode graph captures it:
+
+- a JIT kernel makes the LRU decision on the device and writes the page-in plan (experts, slots,
+  count) to GPU buffers;
+- a second kernel copies the planned experts of every paged tensor from the pinned host store
+  into their slots, reading the host memory directly through its unified address and the count
+  on the device, so each graph replay moves exactly the experts it decided on.
+
+Decode capture batch sizes are capped at `K // top_k` (logged at startup); larger batches run
+without a graph. Prefill steps plan their waves on the host: under a breakable prefill graph the
+paged MoE layer is an eager break between graph segments, so the rest of the layer stack stays
+captured. Both paths share one LRU state, so residency carries over between captured and
+uncaptured steps.
+
+## Sizing K
+
+The K-slot table counts as model weights in SGLang's memory accounting, so K and the KV cache
+come out of the same static budget. When `--paged-experts-num-resident` is unset, K is the
+largest value for which
+
+```
+K × per_expert_bytes ≤ free_memory × mem_fraction_static − non_expert_bytes − reserve
+```
+
+clamped to `[top_k, E]`, where:
+
+- `per_expert_bytes` and `non_expert_bytes` are read exactly from the checkpoint's safetensors
+  headers (shared experts count as non-expert; draft/MTP layers are not counted);
+- `reserve` is a KV cache for `--max-running-requests` (one request when unset) at the full
+  context length, capped at `--max-total-tokens`, plus 0.5 GB for runtime allocations; on hybrid
+  (mamba / linear-attention) models, the per-request state cache instead when that is larger.
+
+The resolved value is logged at startup (`Paged experts: 102 of 128 experts per layer resident
+(auto)`). Whatever K does not take becomes KV cache, as without paging. For more concurrency,
+set `--max-running-requests` (larger reserve, smaller K); to give K more room, use
+`--kv-cache-dtype fp8` or a shorter `--context-length`.
+
+## Correctness
+
+Prompt and greedy decode logprobs are compared with the unpaged server under
+`--enable-deterministic-inference --attention-backend triton`, eager and with decode captured:
+
+- **unquantized and block-FP8 experts (triton runner):** bit-identical;
+- **GPTQ (Marlin runner):** Marlin's reduction depends on the batch shape, so a paged step (which
+  runs the kernel on a different number of experts) differs from the unpaged one within Marlin's
+  own batch-to-batch noise.
