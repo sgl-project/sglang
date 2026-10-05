@@ -13,9 +13,10 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
+use crate::proxy::grpc::GrpcResponse;
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
-use crate::server::metrics::PolicySelectionFailureReason;
+use crate::server::metrics::{PolicySelectionFailureReason, RequestLogContext};
 use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
@@ -23,7 +24,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, SelectedWorkers};
+use forward::{forward_request, forward_request_grpc, SelectedWorkers};
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
 };
@@ -45,6 +46,29 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
+    let (request, workers) = prepare_chat(&ctx, &headers, body).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// The native gRPC `ChatComplete`: its `json_body` is a chat-completions request,
+/// prepared as over HTTP and sent to the engine's own `ChatComplete`.
+pub async fn chat_completions_grpc(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
+    let start = Instant::now();
+    match prepare_chat(ctx, &headers, body).await {
+        Ok((request, workers)) => forward_request_grpc(ctx, request, workers, headers, start).await,
+        Err(error) => (Err(error), None),
+    }
+}
+
+async fn prepare_chat(
+    ctx: &AppContext,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(PreparedRequest, SelectedWorkers), ApiError> {
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
         fields
@@ -52,16 +76,11 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-    let routing = ModelRouting::lookup(&ctx, &model)?;
-    let request = PreparedRequest::chat(
-        &ctx,
-        model,
-        fields,
-        body,
-        routing.needs_request_tokens(&ctx),
-    )?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    let routing = ModelRouting::lookup(ctx, &model)?;
+    let request =
+        PreparedRequest::chat(ctx, model, fields, body, routing.needs_request_tokens(ctx))?;
+    let workers = routing.select_workers(ctx, &request, headers).await?;
+    Ok((request, workers))
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.

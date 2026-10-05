@@ -52,6 +52,20 @@ impl ErrorClass {
     }
 }
 
+/// The inverse of `into_grpc_status`, close to gRPC's HTTP status mapping.
+fn grpc_error_class(code: tonic::Code) -> ErrorClass {
+    use tonic::Code;
+    match code {
+        Code::InvalidArgument | Code::OutOfRange | Code::FailedPrecondition => {
+            ErrorClass::BadRequest
+        }
+        Code::NotFound => ErrorClass::NotFound,
+        Code::ResourceExhausted => ErrorClass::NoTarget,
+        Code::DeadlineExceeded => ErrorClass::Timeout,
+        _ => ErrorClass::Upstream,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("bad request: {0}")]
@@ -169,6 +183,10 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
+    /// A non-OK status from an engine's gRPC server, relayed to a gRPC client unchanged.
+    #[error("upstream gRPC status: {0}")]
+    UpstreamGrpc(tonic::Status),
+
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -196,6 +214,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
+            ApiError::UpstreamGrpc(status) => grpc_error_class(status.code()),
             ApiError::Internal(_) => ErrorClass::Internal,
         }
     }
@@ -227,6 +246,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
+            ApiError::UpstreamGrpc(_) => "upstream_grpc_status",
             ApiError::Internal(_) => "internal_error",
         }
     }
@@ -253,6 +273,7 @@ impl ApiError {
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
+            | ApiError::UpstreamGrpc(_)
             | ApiError::Internal(_) => None,
         }
     }
@@ -286,9 +307,54 @@ impl IntoResponse for ApiError {
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
-        // Pick a client-facing message that NEVER leaks worker URLs or raw
-        // source chains; full structured details are logged server-side.
-        let message = match &self {
+        let message = self.client_message();
+        let mut resp = (
+            status,
+            Json(ErrorEnvelope {
+                error: ErrorBody { typ, code, message },
+            }),
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        // Preserve the worker's real status when we synthesized our own.
+        if let Some(upstream) = self.upstream_status() {
+            resp.headers_mut().insert(
+                X_ROUTER_UPSTREAM_STATUS,
+                HeaderValue::from(upstream.as_u16()),
+            );
+        }
+        resp
+    }
+}
+
+impl ApiError {
+    /// What a gRPC client receives: an engine's status unchanged, otherwise the
+    /// error's class as a gRPC code, with the HTTP path's message and error code.
+    pub fn into_grpc_status(self) -> tonic::Status {
+        use tonic::Code;
+        if let ApiError::UpstreamGrpc(status) = self {
+            return status;
+        }
+        let code = match self.class() {
+            ErrorClass::BadRequest => Code::InvalidArgument,
+            ErrorClass::NotFound => Code::NotFound,
+            ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
+            ErrorClass::Timeout => Code::DeadlineExceeded,
+            ErrorClass::Internal => Code::Internal,
+        };
+        let mut status = tonic::Status::new(code, self.client_message());
+        status.metadata_mut().insert(
+            "x-router-error-code",
+            tonic::metadata::MetadataValue::from_static(self.error_code()),
+        );
+        status
+    }
+
+    /// The client-facing message; never leaks worker URLs or source chains,
+    /// which are logged here instead.
+    fn client_message(&self) -> String {
+        match self {
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -362,24 +428,8 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. } => self.to_string(),
-        };
-        let mut resp = (
-            status,
-            Json(ErrorEnvelope {
-                error: ErrorBody { typ, code, message },
-            }),
-        )
-            .into_response();
-        resp.headers_mut()
-            .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
-        // Preserve the worker's real status when we synthesized our own.
-        if let Some(upstream) = self.upstream_status() {
-            resp.headers_mut().insert(
-                X_ROUTER_UPSTREAM_STATUS,
-                HeaderValue::from(upstream.as_u16()),
-            );
+            ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
-        resp
     }
 }
 

@@ -19,6 +19,7 @@ mod external_indexer_routing;
 mod failover;
 mod generate_routing;
 mod graceful_shutdown;
+mod grpc_chat;
 mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
