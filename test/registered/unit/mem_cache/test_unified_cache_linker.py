@@ -1100,6 +1100,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
+    cache.decoder_swa_bounded_replay = False
     cache.tree_core = SimpleNamespace(
         enable_hicache=enable_hicache,
         has_swa_host_pool=enable_hicache and not unified_kv,

@@ -448,7 +448,7 @@ def late_layer_tail_layout(
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
@@ -462,7 +462,7 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
 
 
