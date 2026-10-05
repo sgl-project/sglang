@@ -717,6 +717,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def test_bcg_runner_cache_is_per_model_module(self):
         self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
         self.stage._bcg_runners = {}
+        # The cache key is (module, quality level); this one varies the module.
+        self.stage._mounted_quality = "lossless"
 
         def fake_runner(model, device):
             return SimpleNamespace(model=model, device=device)
