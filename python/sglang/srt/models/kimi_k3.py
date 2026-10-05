@@ -444,6 +444,35 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
     return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
 
 
+def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
+    """o_proj under SP-MoE."""
+    # o_proj emits TP-partial sums; _finish_attn_reduce completes the
+    # reduction (RS on the clean attn-res path, AR on fallbacks).
+    o_proj.reduce_results = False
+    if k3_sp_collective.enabled():
+        # The table selects NVLS pull RS for larger token buckets.
+        # Only those o_proj outputs come from the persistent symmetric
+        # buffer; small push RS keeps the regular graph allocator.
+        _sp_inner_o_proj_forward = o_proj.forward
+
+        def _sp_o_proj_forward(x, *args, **kwargs):
+            output_rows = x.shape[0]
+            if k3_sp_collective.requires_symmetric_rs(
+                output_rows, x.device, x.element_size()
+            ):
+                output = k3_sp_collective.get_o_proj_output_buffer(
+                    output_rows, x.dtype, o_proj.output_size
+                )
+                result = _sp_inner_o_proj_forward(
+                    x, *args, output_tensor=output[: x.shape[0]], **kwargs
+                )
+                k3_sp_collective.register_o_proj_output(result[0], output)
+                return result
+            return _sp_inner_o_proj_forward(x, *args, **kwargs)
+
+        o_proj.forward = _sp_o_proj_forward
+
+
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     """Symmetric storage for o_proj's TP-partial output; the fused attention
     all-reduce reduces it in place."""
@@ -1562,6 +1591,7 @@ class KimiK3DeltaAttention(nn.Module):
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         reduce_results: bool = True,
+        sp_moe: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1857,6 +1887,8 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        if sp_moe:
+            _route_sp_o_proj_output(self.o_proj)
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -2216,6 +2248,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
         reduce_results: bool = True,
+        sp_moe: bool = False,
     ) -> None:
         # ModelSlim can quantize K3 latent projections while still storing
         # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
@@ -2366,6 +2399,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+        if sp_moe:
+            _route_sp_o_proj_output(self.o_proj)
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -2517,6 +2552,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 reduce_results=not self._stage_boundaries,
+                sp_moe=self._sp_moe,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -2529,6 +2565,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 reduce_results=not self._stage_boundaries,
+                sp_moe=self._sp_moe,
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
@@ -2587,35 +2624,6 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
-
-        if self._sp_moe:
-            # o_proj emits TP-partial sums; _finish_attn_reduce completes the
-            # reduction (RS on the clean attn-res path, AR on fallbacks).
-            o_proj = getattr(self.self_attn, "o_proj", None)
-            assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
-            o_proj.reduce_results = False
-            if k3_sp_collective.enabled():
-                # The table selects NVLS pull RS for larger token buckets.
-                # Only those o_proj outputs come from the persistent symmetric
-                # buffer; small push RS keeps the regular graph allocator.
-                _sp_inner_o_proj_forward = o_proj.forward
-
-                def _sp_o_proj_forward(x, *args, **kwargs):
-                    output_rows = x.shape[0]
-                    if k3_sp_collective.requires_symmetric_rs(
-                        output_rows, x.device, x.element_size()
-                    ):
-                        output = k3_sp_collective.get_o_proj_output_buffer(
-                            output_rows, x.dtype, o_proj.output_size
-                        )
-                        result = _sp_inner_o_proj_forward(
-                            x, *args, output_tensor=output[: x.shape[0]], **kwargs
-                        )
-                        k3_sp_collective.register_o_proj_output(result[0], output)
-                        return result
-                    return _sp_inner_o_proj_forward(x, *args, **kwargs)
-
-                o_proj.forward = _sp_o_proj_forward
 
         # A latent MoE on this rank's rows adds the residual in its tail add and
         # writes the next stream itself; one gathered over attention DP returns
