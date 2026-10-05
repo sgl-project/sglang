@@ -6,9 +6,10 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
-from transformers import Glm4Config, LlamaConfig, OPTConfig, Qwen2Config
+from transformers import ApertusConfig, Glm4Config, LlamaConfig, OPTConfig, Qwen2Config
 
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -17,10 +18,16 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.models import hunyuan
+from sglang.srt.models.apertus import ApertusModel
+from sglang.srt.models.arcee import ArceeModel
 from sglang.srt.models.glm4 import Glm4Model
+from sglang.srt.models.hunyuan import HunYuanMoEV1ForCausalLM
 from sglang.srt.models.llama import LlamaModel
+from sglang.srt.models.mimo_v2 import MiMoV2Model
 from sglang.srt.models.opt import OPTModel
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.solar import SolarModel
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -33,11 +40,38 @@ MODELS = {
     "qwen2": (Qwen2Model, Qwen2Config),
     "glm4": (Glm4Model, Glm4Config),
     "opt": (OPTModel, OPTConfig),
+    "apertus": (ApertusModel, ApertusConfig),
+    "arcee": (ArceeModel, LlamaConfig),
+    "solar": (SolarModel, LlamaConfig),
+    "hunyuan": (HunYuanMoEV1ForCausalLM, LlamaConfig),
+    "mimo": (MiMoV2Model, LlamaConfig),
 }
 
 
 def build_model(kind):
     cls, cfg = MODELS[kind]
+    extra = {}
+    if kind == "apertus":
+        extra.update(
+            hidden_act="xielu",
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        )
+    if kind == "arcee":
+        extra.update(hidden_act="relu2")
+    if kind == "solar":
+        extra.update(bskcn_1=[0], bskcn_2=[], bskcn_3=[1], bskcn_4=[])
+    if kind == "hunyuan":
+        extra.update(attention_head_dim=16, num_experts=1)
+    if kind == "mimo":
+        extra.update(
+            layernorm_epsilon=1e-6,
+            hybrid_layer_pattern=[0, 1],
+            swa_num_attention_heads=8,
+            swa_num_key_value_heads=4,
+            swa_head_dim=16,
+            sliding_window_size=16,
+            moe_layer_freq=[0, 0],
+        )
     config = cfg(
         hidden_size=128,
         intermediate_size=256,
@@ -52,13 +86,19 @@ def build_model(kind):
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        **extra,
     )
     with torch.device("cuda"):
         return cls(config)
 
 
 def attention_layers(model):
-    layers = model.decoder.layers if isinstance(model, OPTModel) else model.layers
+    if isinstance(model, OPTModel):
+        layers = model.decoder.layers
+    elif isinstance(model, HunYuanMoEV1ForCausalLM):
+        layers = model.model.layers
+    else:
+        layers = model.layers
     return [layer.self_attn.attn for layer in layers]
 
 
@@ -108,6 +148,29 @@ def load_scales(model, directory, *, tp_rank, tp_size, version=0, changed=False)
     data = calibration_data(model, tp_size, version)
     path = Path(directory) / "calibration.json"
     path.write_text(json.dumps(data))
+    if isinstance(model, HunYuanMoEV1ForCausalLM):
+        # This legacy native endpoint parses the file, then rejects the missing
+        # kv_scale attribute. Verify its real selection and preserve that guard.
+        selected = []
+        original = hunyuan.kv_cache_scales_loader
+
+        def record(*args, **kwargs):
+            rows = list(original(*args, **kwargs))
+            selected.extend(rows)
+            return rows
+
+        with (
+            patch.object(hunyuan, "kv_cache_scales_loader", record),
+            loading_scope(changed),
+        ):
+            try:
+                model.load_kv_cache_scales(str(path))
+            except RuntimeError as error:
+                assert "KV cache scaling factor attribute" in str(error)
+            else:
+                raise AssertionError("Expected the existing HunYuan kv_scale guard")
+        assert selected == list(data["kv_cache"]["scaling_factor"][tp_rank].items())
+        return [(layer.k_scale, layer.v_scale) for layer in attention_layers(model)]
     with loading_scope(changed):
         model.load_kv_cache_scales(str(path))
     result = [(layer.k_scale, layer.v_scale) for layer in attention_layers(model)]
