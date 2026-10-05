@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 from array import array
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -371,6 +371,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
+        self._swa_backup_index_mapper: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+        allocator = params.token_to_kv_pool_allocator
+        if allocator is not None and ComponentType.SWA in self.tree_components:
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
+            )
+
+            if isinstance(allocator, UnifiedSWAAllocatorBase):
+                self._swa_backup_index_mapper = (
+                    allocator.translate_swa_indices_for_transfer
+                )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -555,6 +568,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
+            backup_kv=(
+                _cache_action_from_tagged(binding_result.backup_kv)
+                if binding_result.backup_kv is not None
+                else None
+            ),
             unbacked_tokens=binding_result.unbacked_tokens,
             mamba_backup_node_id=binding_result.mamba_backup_node_id,
             swa_backup_node_id=binding_result.swa_backup_node_id,
@@ -770,6 +788,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
 
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        self._binding.enable_swa_write_back_eviction_barrier()
+
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
@@ -868,11 +889,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
         if not transfers:
             return
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-        )
-
-        if not isinstance(self._allocator, UnifiedSWAAllocatorBase):
+        if self._swa_backup_index_mapper is None:
             return
         for transfer in transfers:
             if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
@@ -883,7 +900,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 self.get_component_device_value(node_id, ComponentType.FULL)
                 for node_id in transfer.nodes_to_load
             ]
-            transfer.device_indices = self._allocator.translate_loc_from_full_to_swa(
+            transfer.device_indices = self._swa_backup_index_mapper(
                 torch.cat(full_values)
             ).to(torch.int64)
 
@@ -971,6 +988,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[Optional[str], Optional[str]]:
         return self._binding.prefetch_anchor_info(node_id)
+
+    def is_write_through_compatible(self) -> bool:
+        return self._binding.is_write_through_compatible()
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
