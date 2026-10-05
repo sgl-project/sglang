@@ -343,7 +343,12 @@ def _bind_entry_path(
     )
 
 
-def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> ExitMove:
+def bind_exit(
+    edge: EdgeContract,
+    *,
+    cp_moves: Optional[CpMoves] = None,
+    attn_tp_gather: Optional[Callable] = None,
+) -> ExitMove:
     """Bind the producer half of a layer or branch exit.
 
     Args:
@@ -351,6 +356,8 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
             must outlive the producer; pipeline handoffs require a plain add
             or a residual already written by the producer.
         cp_moves: Context-parallel return operations, when the edge needs them.
+        attn_tp_gather: The stage's implementation of a gather over attention
+            TP, tried before the default one.
 
     Returns:
         An ExitMove with fixed transport or a marker for batch-dependent DP
@@ -373,6 +380,20 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
         residual=edge.residual,
         to=edge.residual_to,
         cp_moves=cp_moves,
+        attn_tp_gather=attn_tp_gather,
+    )
+
+
+def _read_fusions(read, owes, is_plain_add, *, scatters):
+    """The kernels a read supplies that complete ``owes`` on the rows this
+    entry completes it on. They take the residual add themselves, so only a
+    plain one."""
+    if not is_plain_add:
+        return ()
+    return tuple(
+        f.run
+        for f in getattr(read, "completing_fusions", ())
+        if f.completes is owes and f.scatters == scatters
     )
 
 
@@ -447,14 +468,15 @@ def _select_entry_step(
             or residual not in (produced.layout, need.layout)
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        if owes is SumGroup.ATTN_TP:
+            step = partial(
+                _attn_tp_reduce_scatter_update_read,
+                read_fusions=_read_fusions(read, owes, is_plain_add, scatters=True),
+            )
+        else:
+            step = _attn_tp_slice_update_read
         return (
-            partial(
-                _attn_tp_reduce_scatter_update_read
-                if owes is SumGroup.ATTN_TP
-                else _attn_tp_slice_update_read,
-                scatters_residual=residual != residual_to,
-                read=read,
-            ),
+            partial(step, scatters_residual=residual != residual_to, read=read),
             None,
         )
     if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP}:
@@ -572,12 +594,7 @@ def _select_entry_step(
         ):
             raise NotImplementedError(f"{produced=} {need=}")
         fused = tuple(f for f in fusions if f.completes is owes)
-        # The read's own kernels take its residual add, so only a plain one.
-        read_fused = tuple(
-            f.run
-            for f in getattr(read, "completing_fusions", ())
-            if is_plain_add and f.completes is owes
-        )
+        read_fused = _read_fusions(read, owes, is_plain_add, scatters=False)
         return (
             partial(
                 _reduce_update_read,
@@ -632,6 +649,7 @@ def _select_exit_move(
     residual: Layout,
     to: Layout,
     cp_moves: Optional[CpMoves] = None,
+    attn_tp_gather: Optional[Callable] = None,
 ) -> ExitMove:
     """How the FFN output reaches the rows the layer hands on: by undoing the
     attention-DP gather (the FFN exit and finish run that step), or else the
@@ -645,7 +663,13 @@ def _select_exit_move(
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP}:
             # Each rank's slice back to the attention's rows: write the output
             # into the residual, then gather over attention TP.
-            return ExitMove(partial(update_attn_tp_gather_output, update=update))
+            return ExitMove(
+                partial(
+                    update_attn_tp_gather_output,
+                    update=update,
+                    gather=attn_tp_gather,
+                )
+            )
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
     if returned == {TokenAxis.ATTN_TP} and to in (residual, produced.layout):

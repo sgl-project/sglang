@@ -181,6 +181,10 @@ class ReadoutFusion(msgspec.Struct, frozen=True):
     # The group whose sum it completes.
     completes: SumGroup
     run: Callable[..., Optional[torch.Tensor]]
+    # Whether it completes the sum onto this rank's attention-TP slice of the
+    # rows (a reduce-scatter, given the whole residual or its slice) rather
+    # than on every row.
+    scatters: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):

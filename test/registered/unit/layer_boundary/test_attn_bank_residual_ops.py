@@ -19,6 +19,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary import ops as comm_moves
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
 from sglang.srt.layers.layer_boundary.residual import attn_bank
@@ -392,6 +393,79 @@ class TestAttnBankSpMoeStages(CustomTestCase):
             self.assertIs(step.keywords["read"], ffn.declaration.read)
             move = ffn.plan.paths[BatchVariant.ORDINARY].output_move
             self.assertIs(move.func, update_attn_tp_gather_output)
+
+    def test_the_exit_gather_falls_back_when_its_kernel_declines(self):
+        class Update:
+            def update(self, hidden_states, residual):
+                return hidden_states + 1
+
+        shard = torch.zeros(2, HIDDEN)
+        with patch.object(comm_moves, "attn_tp_gather", lambda h: torch.cat([h, h])):
+            tuned, _ = update_attn_tp_gather_output(
+                shard,
+                None,
+                None,
+                update=Update(),
+                gather=lambda h: torch.full((4, HIDDEN), 7.0),
+            )
+            fallback, _ = update_attn_tp_gather_output(
+                shard, None, None, update=Update(), gather=lambda h: None
+            )
+        torch.testing.assert_close(tuned, torch.full((4, HIDDEN), 7.0))
+        torch.testing.assert_close(fallback, torch.ones(4, HIDDEN))
+
+    def test_the_shard_entry_reads_the_kernels_stream_as_its_own(self):
+        hidden = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(8))
+        residual = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(9))
+
+        class Update:
+            is_plain_add = True
+
+            def slice_residual_attn_tp(self, residual):
+                return residual[:2]
+
+        def scatter_add(takes):
+            def run(hidden_states, residual, forward_batch):
+                return hidden_states[:2] + residual[:2] if takes else None
+
+            return run
+
+        results = []
+        for takes in (True, False):
+            holder = AttnBank()
+            holder.open(torch.randn(4, HIDDEN), 2).write(
+                torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(10))
+            )
+            ops = AttnBankState(
+                holder,
+                LAYER_LIST[1].attn_proj,
+                LAYER_LIST[1].attn_score_norm,
+                LAYER_LIST[1].ffn_proj,
+                LAYER_LIST[1].ffn_score_norm,
+            ).residual_ops()
+            with (
+                patch.object(attn_residual, "_mix_fused", _mix),
+                patch.object(comm_ops, "attn_tp_reduce_scatter", lambda h: h[:2]),
+                patch.object(
+                    attn_bank,
+                    "get_parallel",
+                    lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=0),
+                ),
+            ):
+                results.append(
+                    comm_ops._attn_tp_reduce_scatter_update_read(
+                        hidden.clone(),
+                        residual.clone(),
+                        None,
+                        LAYER_LIST[1].post_norm,
+                        scatters_residual=True,
+                        read_fusions=(scatter_add(takes),),
+                        read=ops.ffn_readout,
+                        update=Update(),
+                    )
+                )
+        for fused, unfused in zip(*results):
+            torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

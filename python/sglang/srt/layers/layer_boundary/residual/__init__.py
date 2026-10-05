@@ -72,7 +72,7 @@ class ResidualReadout(Protocol):
         reads_before_dp_gather: Preserve this read on source rows before a DP gather.
         completing_fusions: Optional. ReadoutFusion kernels that complete the
             sum the input owes with the residual add ahead of this read, tried
-            before the boundary's own all-reduce.
+            before the boundary's own all-reduce or reduce-scatter.
 
     init_residual initializes the stack residual. read consumes an
     already-written residual; update_and_read first applies the actual

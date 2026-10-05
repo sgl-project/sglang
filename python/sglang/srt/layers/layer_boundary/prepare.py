@@ -360,9 +360,17 @@ def _attn_tp_reduce_scatter_update_read(
     *,
     cache=None,
     scatters_residual: bool,
+    read_fusions: Tuple[Callable, ...] = (),
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
 ):
+    """Complete the attention-TP sum onto this rank's slice, unless one of the
+    read's ``read_fusions`` does it with the residual add, slice the residual
+    the same way, then write the output into it and read the input."""
+    for fused in read_fusions:
+        stream = fused(hidden_states, residual, forward_batch)
+        if stream is not None:
+            return read.read(stream, norm)
     hidden_states = attn_tp_reduce_scatter(hidden_states)
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)

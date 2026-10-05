@@ -438,6 +438,12 @@ def _k3_all_reduce_add(hidden_states, residual, forward_batch):
     return k3_ar_fusion.all_reduce(hidden_states, residual)
 
 
+def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
+    """o_proj's attention-TP sum onto this rank's slice with the pending
+    residual add, in K3's tuned reduce-scatter when it takes the batch."""
+    return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
+
+
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     """Symmetric storage for o_proj's TP-partial output; the fused attention
     all-reduce reduces it in place."""
@@ -2457,12 +2463,16 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
 
 def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
     """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. An attention-residual bank whose MoE runs on its
-    attention-TP token shard (SP-MoE) with K3's tuned SP collectives, which
-    the sharded carry also needs, still runs the layer's own communication."""
-    if not _shards_moe_rows():
-        return True
-    return config.attn_res_block_size is None or not k3_sp_collective.enabled()
+    layer of a stack. The attention-residual carry, which keeps the bank and
+    the stream on each rank's attention-TP shard across SP-MoE layers, still
+    runs the layer's own communication."""
+    return not (
+        _shards_moe_rows()
+        and config.attn_res_block_size is not None
+        and k3_sp_collective.enabled()
+        and envs.SGLANG_K3_SP_ATTN_RES.get()
+        and get_parallel().pp_size == 1
+    )
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2636,11 +2646,7 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
-                ffn_input_fusions=(
-                    (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
-                    if self.all_reduce_fusion
-                    else ()
-                ),
+                ffn_input_fusions=self._ffn_input_fusions(),
             ).residual_ops()
             attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
             ffn_ops = dict(
@@ -2673,10 +2679,32 @@ class KimiK3DecoderLayer(nn.Module):
                     # A latent MoE completes its output sum together with
                     # the latent reduction its norm needs.
                     output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
+                    # The bank path's gather back to every row, in K3's
+                    # tuned all-gather when it takes the batch.
+                    attn_tp_gather=(
+                        k3_sp_collective.all_gather
+                        if self._sp_moe
+                        and self.use_attn_residuals
+                        and k3_sp_collective.enabled()
+                        else None
+                    ),
                 ),
                 self.post_attention_layernorm,
             ),
         )
+
+    def _ffn_input_fusions(self):
+        """K3's kernels that complete the attention output's sum with the
+        pending residual add ahead of the bank's FFN read: the fused
+        all-reduce on every row, or the tuned reduce-scatter onto this rank's
+        attention-TP shard (SP-MoE)."""
+        if self.all_reduce_fusion:
+            return (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
+        if self._sp_moe and k3_sp_collective.enabled():
+            return (
+                ReadoutFusion(SumGroup.ATTN_TP, _k3_reduce_scatter_add, scatters=True),
+            )
+        return ()
 
     def _finish_attn_reduce(
         self,
