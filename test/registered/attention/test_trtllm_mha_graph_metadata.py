@@ -7,10 +7,13 @@ with the SWA -1 sentinel guard.
 """
 
 import contextlib
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
@@ -284,6 +287,170 @@ def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
 
 
 @pytest.mark.parametrize(
+    "host_lens_live,pool_pages,copied_pages",
+    [
+        # The rows' own 3 + 1 pages, not the pool.
+        (True, 64, 4),
+        # No live host lens (seq_lens_sum is None): the whole pool.
+        (False, 64, 64),
+        # The batch's pages are no fewer than the pool's: the whole pool.
+        (True, 4, 4),
+    ],
+)
+def test_fmha_v2_prefill_copies_only_the_batch_pages(
+    make_xqa_backend, monkeypatch, host_lens_live, pool_pages, copied_pages
+):
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim = backend.page_size, 2, 4
+    seq_lens = torch.tensor([70, 20], dtype=torch.int32)
+    row_pages = [[3, 1, 0], [2]]
+    # Past each row's last page the table is unwritten.
+    page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = torch.tensor(pages)
+    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+
+    backend.kv_index_translator = SimpleNamespace(
+        read_table=lambda plan, rows: SimpleNamespace(
+            ids=page_table, is_translated=True
+        ),
+        space=lambda kind: None,
+    )
+    backend.use_sliding_window_kv_pool = False
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    calls = []
+
+    def prefill(qkv, **kwargs):
+        calls.append((qkv[1], kwargs["block_tables"]))
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill)),
+        raising=False,
+    )
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        spec_info=None,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.long(),
+        seq_lens_sum=int(seq_lens.sum()) if host_lens_live else None,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0, 0],
+        req_pool_indices=torch.arange(2),
+        kv_loc_plan=None,
+        _attn_output=None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    backend.init_forward_metadata(fb)
+    q = torch.zeros(int(seq_lens.sum()), heads * head_dim, dtype=torch.bfloat16)
+    backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+
+    assert len(calls) == 1
+    paged_kv, block_tables = calls[0]
+    assert paged_kv.shape == (copied_pages, 2, page_size, heads, head_dim)
+    if copied_pages < pool_pages:
+        # A compact copy's table addresses the copy, past a row's last page too.
+        assert int(block_tables.max()) < copied_pages
+    k_pages = k.view(pool_pages, page_size, heads, head_dim)
+    v_pages = v.view(pool_pages, page_size, heads, head_dim)
+    for row, pages in enumerate(row_pages):
+        for col, page in enumerate(pages):
+            block = block_tables[row, col]
+            assert torch.equal(paged_kv[block, 0], k_pages[page])
+            assert torch.equal(paged_kv[block, 1], v_pages[page])
+
+
+class _LiveBytes(TorchDispatchMode):
+    """Peak bytes held by the tensors the dispatched ops allocate."""
+
+    def __init__(self):
+        super().__init__()
+        self.live = self.peak = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        given = {
+            t.untyped_storage().data_ptr()
+            for t in pytree.tree_leaves((args, kwargs))
+            if isinstance(t, torch.Tensor)
+        }
+        out = func(*args, **kwargs)
+        for t in pytree.tree_leaves(out):
+            if (
+                isinstance(t, torch.Tensor)
+                and t.untyped_storage().data_ptr() not in given
+            ):
+                nbytes = t.untyped_storage().nbytes()
+                self.live += nbytes
+                self.peak = max(self.peak, self.live)
+                weakref.finalize(t, self._release, nbytes)
+        return out
+
+    def _release(self, nbytes):
+        self.live -= nbytes
+
+
+@pytest.mark.parametrize("strided", [False, True], ids=["packed_pool", "strided_pool"])
+@pytest.mark.parametrize("pool_fraction", [0.5, 0.75, 0.97])
+def test_fmha_v2_prefill_copy_peaks_at_its_own_size(
+    make_xqa_backend, strided, pool_fraction
+):
+    """Bug regression: gathering K and V apart and then stacking them held the
+    batch's pages twice, more than the whole-pool copy once they pass half of it."""
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim, pool_pages = backend.page_size, 2, 16, 64
+    batch_pages = int(pool_pages * pool_fraction)
+    row_lens = [batch_pages // 2, batch_pages - batch_pages // 2]
+    perm = torch.randperm(pool_pages)
+    row_pages = [perm[: row_lens[0]], perm[row_lens[0] : batch_pages]]
+    page_table = torch.full((2, max(row_lens)), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = pages.to(torch.int32)
+    shape = (pool_pages, page_size, heads, head_dim)
+    if strided:
+        kv = torch.randn(pool_pages, 2, *shape[1:]).to(torch.bfloat16)
+        k, v = kv[:, 0], kv[:, 1]
+    else:
+        k = torch.randn(shape).to(torch.bfloat16)
+        v = torch.randn_like(k)
+    # A partial last page still counts whole.
+    seq_lens = torch.tensor([n * page_size - 3 for n in row_lens], dtype=torch.int32)
+    metadata = trtllm_mha_backend.TRTLLMMHAMetadata(cache_seqlens_int32=seq_lens)
+    backend._init_fmha_v2_batch_pages(
+        metadata,
+        SimpleNamespace(seq_lens_cpu=seq_lens.long(), seq_lens_sum=int(seq_lens.sum())),
+    )
+    backend.forward_metadata = metadata
+
+    with _LiveBytes() as live:
+        paged_kv, block_table = backend._fmha_v2_paged_kv(k, v, page_table)
+
+    copy_bytes = paged_kv.numel() * paged_kv.element_size()
+    page_bytes = copy_bytes // (2 * batch_pages)
+    assert paged_kv.shape[0] == batch_pages
+    assert live.peak < copy_bytes + page_bytes
+    assert live.peak < 2 * k.numel() * k.element_size()
+    for row, pages in enumerate(row_pages):
+        blocks = block_table[row, : len(pages)].long()
+        assert torch.equal(paged_kv[blocks, 0], k[pages])
+        assert torch.equal(paged_kv[blocks, 1], v[pages])
+
+
+@pytest.mark.parametrize(
     "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
     [
         (32, None, None, 32),
@@ -332,6 +499,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
     backend.use_sliding_window_kv_pool = False
+    backend.use_fmha_v2 = False
     backend._swa_kv_pool = None
     backend._swa_full_to_swa_mapping = None
     backend.speculative_step_id = 0
