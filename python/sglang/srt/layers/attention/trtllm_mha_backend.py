@@ -78,6 +78,9 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+# flashinfer's XQA decode keeps its multi-block semaphores in the first 8 MiB
+# of the workspace and needs them zero at every launch.
+_XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -301,6 +304,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=model_runner.device,
             ),
         )
+        # fmha_v2 prefill leaves tile counters at the base of its workspace, so
+        # it gets the part of the shared buffer past XQA's semaphores.
+        self.fmha_v2_workspace_buffer = self.workspace_buffer[_XQA_SEMAPHORE_BYTES:]
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -1759,7 +1765,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,

@@ -202,6 +202,73 @@ def test_decode_mode_query_dtype_with_fp8_kv(
     assert query_dtypes == [expected_q_dtype]
 
 
+def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(make_xqa_backend, monkeypatch):
+    # XQA decode keeps its multi-block semaphores in the first 8 MiB of the
+    # workspace and needs them zero at launch; fmha_v2 prefill, sharing the
+    # buffer, leaves its tile counters at the base of what it is handed.
+    monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 16)
+    backend = make_xqa_backend(None)
+    heads, head_dim, bs = 2, 4, 2
+    seq_lens = torch.tensor([30, 10], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 30, 40], dtype=torch.int32)
+    backend.forward_metadata = trtllm_mha_backend.TRTLLMMHAMetadata(
+        cache_seqlens_int32=seq_lens,
+        max_seq_len_q=30,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        page_table=torch.arange(bs, dtype=torch.int32)[:, None],
+    )
+    kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    workspaces = {}
+
+    def decode(**kwargs):
+        workspaces["xqa"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(kwargs["query"])
+
+    def prefill(qkv, **kwargs):
+        workspaces["fmha_v2"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode),
+            prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill),
+        ),
+        raising=False,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    q = torch.zeros(40, heads * head_dim, dtype=torch.bfloat16)
+    extend = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, batch_size=bs, _attn_output=None
+    )
+    backend.forward_extend(q, None, None, layer, extend, save_kv_cache=False)
+    decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, batch_size=bs)
+    backend.forward_decode(q[:bs], None, None, layer, decode_batch, save_kv_cache=False)
+
+    semaphores = workspaces["xqa"].data_ptr()
+    fmha_v2 = workspaces["fmha_v2"]
+    start = fmha_v2.data_ptr()
+    end = start + fmha_v2.numel() * fmha_v2.element_size()
+    assert fmha_v2.numel() > 0
+    assert end <= semaphores or start >= semaphores + 8 * 1024 * 1024, (
+        f"fmha_v2 workspace [{start - semaphores}, {end - semaphores}) overlaps "
+        "XQA's semaphores [0, 8 MiB)"
+    )
+
+
 @pytest.mark.parametrize(
     "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
     [
