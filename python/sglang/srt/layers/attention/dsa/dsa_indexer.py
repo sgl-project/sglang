@@ -41,6 +41,13 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.dcp.dsa import (
+    dcp_exchange_topk,
+    dcp_gather_index_k_prefill,
+    dcp_local_index_block_table,
+    dcp_localize_write_loc,
+)
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -632,6 +639,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             out_cache_loc = out_cache_loc.to(torch.int64)
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()
+        out_cache_loc = dcp_localize_write_loc(out_cache_loc)
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
@@ -1013,7 +1021,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
+                dcp_localize_write_loc(out_cache_loc),
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
@@ -1349,6 +1357,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
+        if get_parallel().dcp_enabled and forward_batch.forward_mode.is_decode():
+            # DCP: score this rank's index-K shard, then exchange top-k candidates.
+            assert self.num_init_tokens == 0 and self.num_local_tokens == 0
+            local_lens = get_dcp_lens(
+                seqlens_32, get_parallel().attn_dcp_size, get_parallel().attn_dcp_rank
+            ).to(torch.int32)
+            local_tables, local_max_len = dcp_local_index_block_table(
+                metadata.get_page_table_1(), page_size
+            )
+            local_logits = aiter_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                local_lens,
+                local_tables,
+                local_max_len,
+                preshuffle=_use_aiter_preshuffle,
+                kv_block_size=block_kv,
+            )
+            return dcp_exchange_topk(
+                local_logits, local_lens, self.index_topk, metadata.topk_backend.topk_func
+            )
+
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
@@ -1517,13 +1548,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
-            layer_id,
-            metadata.get_indexer_seq_len(),
-            block_tables,
-            seq_len_sum,
-            max_seq_len,
-        )
+        if get_parallel().dcp_enabled:
+            k_fp8, k_scale = dcp_gather_index_k_prefill(
+                get_token_to_kv_pool(),
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                indexer_seq_lens_cpu,
+                metadata.get_page_table_1(),
+            )
+        else:
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                block_tables,
+                seq_len_sum,
+                max_seq_len,
+            )
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
@@ -1795,6 +1835,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = dcp_localize_write_loc(out_cache_loc)
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
@@ -1830,7 +1871,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             page_size = pool.page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = dcp_localize_write_loc(forward_batch.out_cache_loc)
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(

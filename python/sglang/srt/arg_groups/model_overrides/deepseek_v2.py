@@ -77,6 +77,16 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
                     )
 
+    if is_deepseek_dsa(hf_config) and getattr(cfg, "dcp_size", 1) > 1:
+        # DSA + DCP covers ROCm qlen=1 decode on the plain DSA pool only.
+        if not get_platform().is_hip:
+            raise ValueError("--dcp-size > 1 with DSA models is only supported on ROCm.")
+        if cfg.speculative_algorithm is not None or cfg.enable_hisparse:
+            raise ValueError(
+                "--dcp-size > 1 with DSA models does not support speculative "
+                "decoding or --enable-hisparse yet."
+            )
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
