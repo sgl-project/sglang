@@ -72,7 +72,13 @@ pub(super) fn spawn_pump_with_bootstrap(
             cursors: cursors.clone(),
             live_workers: live_set.clone(),
             bootstrap: bootstrap.clone(),
+            // Empty peer set: a splice probe finds no witness and returns
+            // `Unknown`, so these tests exercise the pump's own gates without
+            // any network. Probe verdicts are driven directly instead.
+            peers: Arc::new(PeerRegistry::new()),
+            snapshot_http: reqwest::Client::new(),
             bootstrap_tx: bootstrap_tx.clone(),
+            ctrl_tx: ctrl_tx.downgrade(),
         },
         cancel.clone(),
         rx,
