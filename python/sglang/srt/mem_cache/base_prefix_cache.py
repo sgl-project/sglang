@@ -660,21 +660,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """The KV records sessions own, by session id."""
         return {}
 
-    def session_held_tokens(self) -> int:
-        return 0
-
-    def session_held_full_tokens(self) -> int:
-        return 0
-
-    def session_held_swa_tokens(self) -> int:
-        return 0
-
-    def session_held_req_count(self) -> int:
-        return 0
-
-    def session_held_mamba_slots(self) -> int:
-        return 0
-
     def supports_prefix_sharing(self) -> bool:
         """Whether a request's prefix stays in the cache for other requests to
         share, including after the request finishes."""

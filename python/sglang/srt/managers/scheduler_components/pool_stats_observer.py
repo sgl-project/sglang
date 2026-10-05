@@ -11,14 +11,43 @@ from typing import (
 )
 
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
+
+
+# What one KV record holds outside the tree. Pool accounting sums these over
+# each owner's records: the requests' own for uncached, the sessions' for
+# session-held, so every row is counted once, by its owner.
+
+
+def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
+    """Full-pool tokens past the tree-owned prefix, in whole pages."""
+    return ceil_align(kv.kv_allocated_len, page_size) - kv.cache_protected_len
+
+
+def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
+    """SWA-pool tokens past both the tree-owned prefix and the evicted window."""
+    allocated = ceil_align(kv.kv_allocated_len, page_size)
+    return allocated - max(
+        kv.cache_protected_len, kv.get_evicted_seqlen(ComponentType.SWA)
+    )
+
+
+def kv_mamba_slots(kv: ReqKvInfo) -> int:
+    """mamba_pool entries: the state slot and the live ping-pong track slots."""
+    total = kv.mamba_pool_idx.numel() if kv.holds_mamba else 0
+    if kv.mamba_ping_pong_track_buffer is not None:
+        total += int((kv.mamba_ping_pong_track_buffer != -1).sum().item())
+    return total
 
 
 @dataclasses.dataclass
@@ -162,20 +191,26 @@ class SchedulerPoolStatsObserver:
             if session.streaming
         )
 
-    def session_held_tokens(self) -> int:
-        return self.tree_cache.session_held_tokens()
+    def _session_kv_rows(self) -> List[ReqKvInfo]:
+        records = self.tree_cache.session_records().values()
+        return [kv for kv in records if kv.holds_kv]
 
-    def session_held_full_tokens(self) -> int:
-        return self.tree_cache.session_held_full_tokens()
+    def session_held_tokens(self) -> int:
+        page_size = self.tree_cache.page_size
+        return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
 
     def session_held_swa_tokens(self) -> int:
-        return self.tree_cache.session_held_swa_tokens()
+        page_size = self.tree_cache.page_size
+        return sum(
+            kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
+        )
 
     def session_held_req_count(self) -> int:
-        return self.tree_cache.session_held_req_count()
+        return len(self._session_kv_rows())
 
     def session_held_mamba_slots(self) -> int:
-        return self.tree_cache.session_held_mamba_slots()
+        records = self.tree_cache.session_records().values()
+        return sum(kv_mamba_slots(kv) for kv in records)
 
     def get_pool_stats(self) -> PoolStats:
         if self.is_hybrid_swa:

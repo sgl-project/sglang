@@ -19,13 +19,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    kv_private_swa_tokens,
+    kv_private_tokens,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -98,7 +99,7 @@ class SchedulerInvariantChecker:
             return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
-            session_held = self.pool_stats_observer.session_held_full_tokens()
+            session_held = self.pool_stats_observer.session_held_tokens()
             total = ps.full_capacity
         elif self.is_hybrid_ssm:
             # `total` is the allocator's `.size`: static for non-unified pools,
@@ -307,17 +308,10 @@ class SchedulerInvariantChecker:
             if not req.kv.holds_kv or self.tree_cache.session_owns_record(req):
                 continue
 
-            allocated_len = req.kv.kv_allocated_len
-            if self.page_size > 1:
-                allocated_len = ceil_align(allocated_len, self.page_size)
-                assert req.kv.cache_protected_len % self.page_size == 0
-
-            full_uncached += allocated_len - req.kv.cache_protected_len
+            assert req.kv.cache_protected_len % self.page_size == 0
+            full_uncached += kv_private_tokens(req.kv, self.page_size)
             if self.is_hybrid_swa:
-                swa_uncached += allocated_len - max(
-                    req.kv.cache_protected_len,
-                    req.kv.get_evicted_seqlen(ComponentType.SWA),
-                )
+                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()

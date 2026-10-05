@@ -3565,21 +3565,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
-    def session_held_tokens(self) -> int:
-        return self.session.session_held_tokens()
-
-    def session_held_full_tokens(self) -> int:
-        return self.session.session_held_full_tokens()
-
-    def session_held_swa_tokens(self) -> int:
-        return self.session.session_held_swa_tokens()
-
-    def session_held_req_count(self) -> int:
-        return self.session.session_held_req_count()
-
-    def session_held_mamba_slots(self) -> int:
-        return self.session.session_held_mamba_slots()
-
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 
