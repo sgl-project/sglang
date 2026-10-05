@@ -84,7 +84,8 @@ pub struct TokenizerConfig {
 }
 
 /// Routing strategies accepted by `--policy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     #[default]
     #[value(name = "round_robin")]
@@ -345,6 +346,11 @@ pub struct ModelConfig {
     pub dp_aware: bool,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
+    /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
+    pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
+    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// and `--max-kv-usage`.
+    pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
