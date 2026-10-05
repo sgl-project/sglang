@@ -39,6 +39,36 @@ pub enum WireProtocol {
     H2c,
 }
 
+/// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineProfile {
+    pub protocol: WireProtocol,
+    /// `dp_size * attn_dp_size`; 0 is treated as 1.
+    pub dp_ranks: u32,
+}
+
+impl From<WireProtocol> for EngineProfile {
+    fn from(protocol: WireProtocol) -> Self {
+        Self {
+            protocol,
+            dp_ranks: 1,
+        }
+    }
+}
+
+/// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
+#[must_use = "dropping a DpRankGuard releases the rank slot"]
+pub struct DpRankGuard {
+    inflight: Arc<[AtomicUsize]>,
+    rank: usize,
+}
+
+impl Drop for DpRankGuard {
+    fn drop(&mut self) {
+        self.inflight[self.rank].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
 /// fall back to `"localhost"` if both fail. The fallback is defensive —
@@ -188,6 +218,11 @@ pub struct Worker {
     /// When this worker joined its current model pools, starting the grace of
     /// [`Self::awaiting_bootstrap_port`]. Tokio's clock so tests can advance it.
     pub(crate) pooled_at: tokio::time::Instant,
+    /// PD pairing scope; carried from `WorkerSpec`. See
+    /// [`crate::discovery::WorkerSpec`].
+    version_group: Option<String>,
+    /// Router in-flight requests per DP rank; one slot per rank.
+    dp_rank_inflight: Arc<[AtomicUsize]>,
 }
 
 impl Worker {
@@ -196,13 +231,14 @@ impl Worker {
     }
 
     /// Construct a worker with an explicit circuit-breaker configuration and
-    /// forwarding protocol. Pass `None` for the default breaker config
-    /// (threshold = 3, cool_down = 30 s).
+    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`
+    /// for the default breaker config (threshold = 3, cool_down = 30 s).
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
-        protocol: WireProtocol,
+        profile: impl Into<EngineProfile>,
     ) -> Self {
+        let EngineProfile { protocol, dp_ranks } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
             None => Arc::new(CircuitBreaker::new()),
@@ -222,6 +258,8 @@ impl Worker {
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
+            version_group: spec.version_group,
+            dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
@@ -259,6 +297,12 @@ impl Worker {
         self.lacks_bootstrap_port() && self.pooled_at.elapsed() < BOOTSTRAP_PORT_GRACE
     }
 
+    /// PD version group. A prefill worker pairs only with decode workers
+    /// of the same group; `None` is a group of its own.
+    pub fn version_group(&self) -> Option<&str> {
+        self.version_group.as_deref()
+    }
+
     /// Returns the current [`WorkerMode`] of this worker.
     ///
     /// Uses `Relaxed` ordering: mode changes are rare discovery events and do
@@ -278,6 +322,23 @@ impl Worker {
     /// The wire protocol the proxy uses when forwarding to this worker.
     pub fn protocol(&self) -> WireProtocol {
         self.protocol
+    }
+
+    pub fn dp_ranks(&self) -> u32 {
+        self.dp_rank_inflight.len() as u32
+    }
+
+    pub fn dp_rank_inflight(&self, rank: u32) -> usize {
+        self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
+        let rank = rank as usize;
+        self.dp_rank_inflight[rank].fetch_add(1, Ordering::Relaxed);
+        DpRankGuard {
+            inflight: Arc::clone(&self.dp_rank_inflight),
+            rank,
+        }
     }
 
     pub fn router_inflight_load(&self) -> usize {
@@ -311,6 +372,16 @@ impl Worker {
     }
 }
 
+/// Prefills whose version group has a decode in `decoders` to receive their KV.
+pub fn paired_prefills(
+    mut prefills: Vec<Arc<Worker>>,
+    decoders: &[Arc<Worker>],
+) -> Vec<Arc<Worker>> {
+    let groups: std::collections::HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
+    prefills.retain(|p| groups.contains(&p.version_group()));
+    prefills
+}
+
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
@@ -318,6 +389,8 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("protocol", &self.protocol)
+            .field("version_group", &self.version_group)
+            .field("dp_ranks", &self.dp_ranks())
             .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
@@ -336,7 +409,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
         assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
@@ -384,7 +457,7 @@ mod tests {
                 url: "http://x".into(),
                 mode: m,
                 model_ids: vec![],
-                bootstrap_port: None,
+                ..Default::default()
             });
             assert_eq!(w.mode(), m);
         }
@@ -397,7 +470,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Prefill,
             model_ids: vec![],
-            bootstrap_port: None,
+            ..Default::default()
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -413,7 +486,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![],
-            bootstrap_port: None,
+            ..Default::default()
         };
         // `new` takes the always-safe default; the resolved protocol reaches a
         // worker only through the constructor the registry uses.
@@ -432,6 +505,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -443,7 +517,7 @@ mod tests {
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![],
-            bootstrap_port: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -456,7 +530,7 @@ mod tests {
                 url: "http://10.0.0.1:30000".into(),
                 mode: WorkerMode::Prefill,
                 model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
-                bootstrap_port: None,
+                ..Default::default()
             })
         };
         let model_less = prefill(&[]);
@@ -480,6 +554,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -492,6 +567,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -508,6 +584,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }
@@ -518,7 +595,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
     }
 

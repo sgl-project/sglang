@@ -349,7 +349,8 @@ class DeepseekSparseAttnBackend(
     extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
-    # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
+    # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
+    # KPool indexer reads the host mirror only for extend, which always has it.
     needs_cpu_seq_lens: bool = False
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
@@ -380,7 +381,6 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
