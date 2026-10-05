@@ -15,13 +15,13 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 from sglang.utils import download_and_cache_file, read_jsonl
@@ -271,7 +271,10 @@ class TestMiniMaxM25TP4EvalMI35x(unittest.TestCase):
                         summary += f"| {config.model_path} | {config.variant or 'N/A'} | {config.tp_size} | {acc:.3f} | {config.accuracy_threshold} | {status} |\n"
 
                     finally:
-                        kill_process_tree(process.pid)
+                        # Wait for the server to exit: a bare kill_process_tree
+                        # only signals it, and the next config's health check
+                        # would pass against this still-serving process.
+                        terminate_and_kill_process_tree(process)
 
                 except Exception as e:
                     summary += f"| {config.model_path} | {config.variant or 'N/A'} | {config.tp_size} | N/A | {config.accuracy_threshold} | ERROR |\n"
