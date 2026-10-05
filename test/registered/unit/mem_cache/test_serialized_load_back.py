@@ -13,6 +13,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from array import array
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -22,7 +23,11 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.group import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
@@ -113,6 +118,22 @@ class _FakeController:
             }
         )
         return device_indices
+
+
+def _swa_binding_controller():
+    """The real side-pool resolution, with unified-memory SWA bound one-to-one
+    onto the Full IDs it is handed."""
+    controller = object.__new__(HybridCacheController)
+    entry = PoolEntry(
+        name=PoolName.SWA,
+        host_pool=None,
+        device_pool=None,
+        layer_mapper=lambda i: i,
+        device_indices_from_anchor_fn=lambda full_ids: full_ids.clone(),
+        device_free_fn=lambda ids: None,
+    )
+    controller.mem_pool_host = SimpleNamespace(entry_map={PoolName.SWA: entry})
+    return controller
 
 
 class SerializedLoadBackTest(CustomTestCase):
@@ -225,6 +246,66 @@ class SerializedLoadBackTest(CustomTestCase):
         self.assertEqual(self.events, [("drain", nid) for nid in chain])
         # Only the final step carries the anchor id, so aux commits once.
         self.assertEqual(self.controller.loads[-1]["node_id"], node_id)
+
+    def test_swa_binds_to_each_nodes_own_full_rows(self):
+        """Unified-memory SWA rows bind to the Full rows of the nodes they cover.
+        Those rows are spread over every per-node load, not packed into the
+        final one, which holds the anchor's rows alone."""
+        node_id, chain = self._build_evicted_chain()
+        kv_xfer, _ = self.tree_core.build_load_back_spec(node_id)
+        window = chain[1:]
+        # Offsets into one Full load of the whole chain, as build_load_back_spec
+        # writes them for SWA.
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(NODE_LEN * len(window)),
+            nodes_to_load=window,
+            anchor_index_parts=[
+                slice(i * NODE_LEN, (i + 1) * NODE_LEN)
+                for i in range(len(chain) - len(window), len(chain))
+            ],
+        )
+
+        resolver = _swa_binding_controller()
+        inner_load = self.controller.load
+
+        def resolving_load(*, host_indices, node_id, extra_pools=None):
+            device_indices = inner_load(
+                host_indices=host_indices, node_id=node_id, extra_pools=extra_pools
+            )
+            if extra_pools:
+                resolved = resolver._resolve_device_transfers(
+                    extra_pools,
+                    kv_device_indices=device_indices,
+                    kv_host_indices=host_indices,
+                )
+                self.assertIsNotNone(resolved)
+            return device_indices
+
+        inner_commit = self.tree_core.commit_load_back
+
+        def commit_without_swa(node_id, device_indices, kv_xfer, comp_xfers):
+            # The FULL-only tree has no SWA component to commit onto.
+            return inner_commit(node_id, device_indices, kv_xfer, {})
+
+        self.controller.load = resolving_load
+        self.tree_core.commit_load_back = commit_without_swa
+        loaded = self.cache._load_back_per_node(
+            anchor_id=node_id,
+            kv_xfer=kv_xfer,
+            comp_xfers={ComponentType.SWA: [swa]},
+            sidecar_xfers=[],
+            ancestor_lock_params=self.cache.inc_lock_ref(node_id).to_dec_params(),
+            host_anchor_params=self.cache.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+
+        self.assertTrue(loaded)
+        last_pools = self.controller.loads[-1]["extra_pools"]
+        (bound,) = [x for x in last_pools if x.name == PoolName.SWA]
+        expected = torch.cat(
+            [self.tree_core.get_component_device_value(nid, FULL) for nid in window]
+        )
+        self.assertEqual(bound.device_indices.tolist(), expected.tolist())
 
     def test_each_acked_node_becomes_a_reclaimable_duplicate(self):
         """The point of the split: a loaded node funds the next node's
