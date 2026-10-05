@@ -92,13 +92,12 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
-    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -998,20 +997,18 @@ class KVCacheConfigurator:
                     "the fused region holds dense MHA K/V rows"
                 )
             )
-        # The backend(s) the draft runner will run. The published draft
-        # backend carries model-hook declarations; without one, a DFLASH-family
-        # draft takes the target's prefill backend as `build_draft_tp_worker`
-        # does (the platform default when that is unset or not a draft
-        # backend), and an EAGLE draft runs the target's prefill/decode pair.
-        draft_backend = get_spec().speculative_draft_attention_backend
+        # The backend(s) the draft runner will run. A DFLASH-family draft
+        # worker resolves one as `build_draft_tp_worker` does; an EAGLE draft
+        # runs the published draft backend, else the target's prefill/decode
+        # pair. A published draft backend carries model-hook declarations.
         if self.spec_algorithm.is_dflash_family():
-            if draft_backend is None:
-                draft_backend, _ = attention_backends()
-            if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
-                platform = get_platform()
-                draft_backend = (
-                    "triton" if (platform.is_xpu or platform.is_hip) else "flashinfer"
-                )
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            draft_backend = resolve_draft_worker_attention_backend()
+        else:
+            draft_backend = get_spec().speculative_draft_attention_backend
         draft_backends = (
             {draft_backend} if draft_backend else set(attention_backends()) - {None}
         )

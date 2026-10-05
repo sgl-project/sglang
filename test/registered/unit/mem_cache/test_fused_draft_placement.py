@@ -262,6 +262,7 @@ class TestFusedDraftDecision(CustomTestCase):
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
+        from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         cfg.is_hybrid_swa = True
@@ -312,6 +313,10 @@ class TestFusedDraftDecision(CustomTestCase):
                 return_value=SimpleNamespace(kv_cache_dtype=kv_cache_dtype_flag),
             ),
             patch.object(kvc, "attention_backends", return_value=target_backends),
+            patch.object(draft_worker_common, "get_spec", return_value=spec),
+            patch.object(
+                draft_worker_common, "attention_backends", return_value=target_backends
+            ),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
             get_parallel().override(attn_tp_size=1, attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
