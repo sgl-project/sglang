@@ -119,7 +119,7 @@ class ExecFeatures(msgspec.Struct):
         "JSON object with the --output-store-backend connection: "
         "master_server_address, local_hostname, local_buffer_size, key_prefix, and "
         "optionally protocol, metadata_server, device_name, namespace, partition, "
-        "replica_num, chunk_bytes. Unset keys fall back to MOONCAKE_* env vars.",
+        "replica_num, chunk_bytes. MOONCAKE_* env vars are not read.",
     ] = None
     disable_outlines_disk_cache: A[
         bool,

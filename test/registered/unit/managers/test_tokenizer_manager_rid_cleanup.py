@@ -444,7 +444,7 @@ class _FakeOutputStore:
         self.cleaned_outputs.extend(outputs)
 
 
-class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase):
+class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     def setUp(self):
         self.tm = _make_tokenizer_manager(self)
         self.tm.request_logger = Mock()

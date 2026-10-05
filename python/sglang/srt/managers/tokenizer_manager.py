@@ -348,7 +348,6 @@ def _slice_streaming_output_meta_info(
 
 
 def _is_failing_abort(finish_reason: Dict[str, Any]) -> bool:
-    """Whether the abort fails the request instead of returning a partial response."""
     return finish_reason.get("type") == "abort" and finish_reason.get(
         "status_code"
     ) in (
@@ -359,11 +358,11 @@ def _is_failing_abort(finish_reason: Dict[str, Any]) -> bool:
 
 
 def _replay_output_at(
+    *,
     raw: Optional[List[Optional[torch.Tensor]]],
     encoded: Optional[List[Optional[Union[str, torch.Tensor]]]],
     i: int,
 ) -> Optional[Union[str, torch.Tensor]]:
-    """Request i's routed_experts / indexer_topk: a tensor, base64 text, or None."""
     if raw is not None:
         return raw[i]
     if encoded:
@@ -1888,7 +1887,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         return out
 
-    async def _put_output_store_stash(self, out: dict, state: ReqState) -> None:
+    async def _put_output_store_stash(self, *, out: dict, state: ReqState) -> None:
         stash = state.output_store_stash
         state.output_store_stash = None
         meta_info = out["meta_info"]
@@ -2010,7 +2009,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if finished:
                 if state.output_store_stash is not None:
-                    await self._put_output_store_stash(out, state)
+                    await self._put_output_store_stash(out=out, state=state)
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -2596,25 +2595,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
                     meta_info["hidden_states"] = hidden_states
-            is_str_output = isinstance(recv_obj, BatchStrOutput)
-            routed_experts = _replay_output_at(
-                recv_obj.routed_experts_raw if is_str_output else None,
-                getattr(recv_obj, "routed_experts", None),
-                i,
-            )
-            if routed_experts is not None and state.output_store_stash is not None:
-                state.output_store_stash.routed_experts = routed_experts
-            elif routed_experts is not None:
-                meta_info["routed_experts"] = _encode_replay_output(routed_experts)
-            indexer_topk = _replay_output_at(
-                recv_obj.indexer_topk_raw if is_str_output else None,
-                getattr(recv_obj, "indexer_topk", None),
-                i,
-            )
-            if indexer_topk is not None and state.output_store_stash is not None:
-                state.output_store_stash.indexer_topk = indexer_topk
-            elif indexer_topk is not None:
-                meta_info["indexer_topk"] = _encode_replay_output(indexer_topk)
+            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+                is_str_output = isinstance(recv_obj, BatchStrOutput)
+                routed_experts = _replay_output_at(
+                    raw=recv_obj.routed_experts_raw if is_str_output else None,
+                    encoded=recv_obj.routed_experts,
+                    i=i,
+                )
+                if routed_experts is not None and state.output_store_stash is not None:
+                    state.output_store_stash.routed_experts = routed_experts
+                elif routed_experts is not None:
+                    meta_info["routed_experts"] = _encode_replay_output(routed_experts)
+                indexer_topk = _replay_output_at(
+                    raw=recv_obj.indexer_topk_raw if is_str_output else None,
+                    encoded=recv_obj.indexer_topk,
+                    i=i,
+                )
+                if indexer_topk is not None and state.output_store_stash is not None:
+                    state.output_store_stash.indexer_topk = indexer_topk
+                elif indexer_topk is not None:
+                    meta_info["indexer_topk"] = _encode_replay_output(indexer_topk)
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 

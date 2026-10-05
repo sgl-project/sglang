@@ -45,6 +45,13 @@ _CONFIG_KEYS = frozenset(
     }
 )
 
+_REQUIRED_CONFIG_KEYS = (
+    "master_server_address",
+    "local_hostname",
+    "local_buffer_size",
+    "key_prefix",
+)
+
 _SIZE_UNITS = {
     "kb": 1024,
     "mb": 1024**2,
@@ -59,10 +66,10 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
     master_server_address: str
     local_hostname: str
     local_buffer_size: int
-    protocol: str
-    metadata_server: str
-    device_name: str
     key_prefix: str
+    protocol: str = envs.MOONCAKE_PROTOCOL.default
+    metadata_server: str = envs.MOONCAKE_TE_META_DATA_SERVER.default
+    device_name: str = envs.MOONCAKE_DEVICE.default
     namespace: str = "default"
     partition: str = "default"
     replica_num: int = 1
@@ -70,7 +77,6 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     @classmethod
     def from_extra_config(cls, extra_config: Optional[str]) -> OutputStoreConfig:
-        """Parse --output-store-backend-extra-config, falling back to MOONCAKE_* env."""
         raw = json.loads(extra_config) if extra_config else {}
         if not isinstance(raw, dict):
             raise ValueError(
@@ -79,46 +85,17 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
         unknown = sorted(set(raw) - _CONFIG_KEYS)
         if unknown:
             raise ValueError(f"Unknown output store config keys: {unknown}")
-        if "global_segment_size" in raw and _parse_size(raw["global_segment_size"]):
+        missing = [key for key in _REQUIRED_CONFIG_KEYS if raw.get(key) in (None, "")]
+        if missing:
+            raise ValueError(f"Output store config requires {missing}")
+
+        values = dict(raw)
+        if _parse_size(values.pop("global_segment_size", 0)):
             raise ValueError(
                 "The output store never contributes a Mooncake segment; "
                 "global_segment_size must be omitted or 0"
             )
-
-        # The env default "localhost" is unreachable from other nodes, so only an
-        # explicitly set MOONCAKE_LOCAL_HOSTNAME counts.
-        local_hostname = raw.get("local_hostname") or (
-            envs.MOONCAKE_LOCAL_HOSTNAME.get()
-            if envs.MOONCAKE_LOCAL_HOSTNAME.is_set()
-            else None
-        )
-        local_buffer_size = raw.get(
-            "local_buffer_size", envs.MOONCAKE_LOCAL_BUFFER_SIZE.get()
-        )
-        values = {
-            "master_server_address": _required(
-                raw.get("master_server_address") or envs.MOONCAKE_MASTER.get(),
-                "master_server_address (or MOONCAKE_MASTER)",
-            ),
-            "local_hostname": _required(
-                local_hostname, "local_hostname (or MOONCAKE_LOCAL_HOSTNAME)"
-            ),
-            "local_buffer_size": _parse_size(
-                _required(
-                    local_buffer_size,
-                    "local_buffer_size (or MOONCAKE_LOCAL_BUFFER_SIZE)",
-                )
-            ),
-            "protocol": raw.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
-            "metadata_server": raw.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.get()
-            ),
-            "device_name": raw.get("device_name", envs.MOONCAKE_DEVICE.get()),
-            "key_prefix": _required(raw.get("key_prefix"), "key_prefix"),
-        }
-        for key in ("namespace", "partition", "replica_num", "chunk_bytes"):
-            if key in raw:
-                values[key] = raw[key]
+        values["local_buffer_size"] = _parse_size(values["local_buffer_size"])
         config = msgspec.convert(values, type=cls)
         if config.replica_num < 1:
             raise ValueError("Output store replica_num must be >= 1")
@@ -159,8 +136,6 @@ class OutputStoreStash(msgspec.Struct):
 
 
 class OutputStore:
-    """Mooncake client that writes replay-output bundles and removes them."""
-
     def __init__(self, config: OutputStoreConfig) -> None:
         try:
             from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -297,12 +272,6 @@ def _bundle_fields(stash: OutputStoreStash) -> Dict[str, np.ndarray]:
             [chunk.logprobs for chunk in chunks]
         )
     return fields
-
-
-def _required(value: Any, name: str) -> Any:
-    if value is None or value == "":
-        raise ValueError(f"Output store config requires {name}")
-    return value
 
 
 def _parse_size(value: Any) -> int:
