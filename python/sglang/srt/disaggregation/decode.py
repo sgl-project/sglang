@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -382,7 +381,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
-        gloo_group: ProcessGroup,
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
@@ -402,7 +400,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.tree_cache = tree_cache
         self.host_pool = None
         self.host_reserved_tokens = 0
-        self.gloo_group = gloo_group
+        self.gloo_group = parallel.attn_tp_group.cpu_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
         self.tp_rank = parallel.tp_rank
@@ -789,12 +787,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        max_prefix_len = None
+        if self._uses_swa_tail_prealloc():
+            fill_len = self._pre_alloc_fill_len(req)
+            max_prefix_len = fill_len - self._swa_tail_len(fill_len)
+        # Match and lock only reusable FULL KV. The entire SWA tail must be
+        # freshly allocated, including when the prefix comes from L2/L3.
         result = match_prefix_for_req(
             self.tree_cache,
             req,
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
+            max_prefix_len=max_prefix_len,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
@@ -802,7 +807,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
-        return self._build_decode_prefix_match(req, result)
+        return self._build_decode_prefix_match(
+            req, result, max_prefix_len=max_prefix_len
+        )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1391,13 +1398,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Hybrid models (e.g. K3 with KDA): guard against prealloc
             # draining the mamba pool before the KV pool (would assert "Not
             # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (only if it manages mamba states;
-            # ChunkCache.evict is a no-op), else stop.
+            # the radix tree first (a no-op with the radix cache disabled),
+            # else stop.
             mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
             if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                supports_mamba = self.tree_cache.supports_mamba()
-                if supports_mamba and hasattr(self.tree_cache, "evict"):
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                 if mamba_allocator.available_size() <= 0:
                     break
 
@@ -1425,20 +1430,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
-
-                # Cap full-attention prefix reuse at the sliding-window start so
-                # the SWA window lands entirely in the fresh delta, keeping
-                # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
-                # of only the last ~window_size full-attention tokens.
-                if uses_swa_tail_prealloc and prefix_len > 0:
-                    swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
-                    if prefix_len > swa_prefix_cap:
-                        prefix_len = swa_prefix_cap
-                        prefix_indices = prefix_indices[:prefix_len]
-                        # Cap the prefill-committed prefix too: tokens past the
-                        # cap are not device-resident, so prefill must transfer
-                        # them.
-                        total_prefix_len = prefix_len
 
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse.
@@ -2321,9 +2312,9 @@ def alloc_for_decode_prealloc(
             # the live window tail.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor(
-                    [prefix_len], dtype=torch.int64, device=device
+                    [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
@@ -2381,14 +2372,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def __init__(
         self,
-        gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
-        self.gloo_group = gloo_group
+        self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers

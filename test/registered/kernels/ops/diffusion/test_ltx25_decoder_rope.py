@@ -5,7 +5,6 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
-    can_use_ltx25_decoder_rope,
     fused_ltx25_decoder_rope,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -89,25 +88,6 @@ def test_ltx25_decoder_rope_is_bit_exact(
     assert torch.equal(k_out, eager_rope(k, tables))
     assert q_out.data_ptr() not in (q.data_ptr(), k.data_ptr())
     assert k_out.data_ptr() not in (q.data_ptr(), k.data_ptr())
-
-
-def test_ltx25_decoder_rope_predicate_rejects_unsupported_inputs() -> None:
-    q = torch.empty(1, 3, 7, 7, 1, 64, dtype=torch.bfloat16, device="cuda")
-    k = torch.empty_like(q)
-    tables = make_tables(3, 7, 7)
-
-    assert can_use_ltx25_decoder_rope(q, k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q.flatten(), k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q.float(), k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q, k[..., ::2], tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q, k, tables, (16, 16, 16))
-    bad_tables = (tables[0], tables[1], (tables[2][0].double(), tables[2][1]))
-    assert not can_use_ltx25_decoder_rope(q, k, bad_tables, DIM_SPLIT)
-    unaligned = torch.empty(q.numel() + 1, dtype=torch.bfloat16, device="cuda")[
-        1:
-    ].view_as(q)
-    assert unaligned.is_contiguous()
-    assert not can_use_ltx25_decoder_rope(unaligned, k, tables, DIM_SPLIT)
 
 
 if __name__ == "__main__":

@@ -100,6 +100,18 @@ place the replay base at least dp_size ports past the PUB base. The engine keeps
 the last `buffer_steps` batches (default 10000); older gaps stay unrepaired.
 `sgl_router_kv_event_replays_total{outcome}` counts the attempts.
 
+### Pending prefixes
+
+Until the engine's KV events arrive, requests that share a cold prefix see no
+cached owner and spread across workers, each prefilling the same prefix. This
+is common with parallel sampling, RL rollouts and agent fan-out.
+`--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
+long after routing it there, so the burst stays together. It is off by default
+and needs `--policy cache_aware` with the Router-local radix tree.
+`sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
+prefix matched deeper than any confirmed one; the policy's candidate and
+admission filters still decide whether that worker is picked.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic
@@ -149,7 +161,7 @@ all of it, and the `sgl_router_kv_bootstrap_*` series in
 ### Reorg routing
 
 Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
-and cache/session flags configure its policies; no separate file is required.
+and cache/session flags configure its policies; a bucket file is optional.
 
 ```bash
 sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
@@ -159,9 +171,36 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
 settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. Unsupported legacy options
-fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
-buckets and are not accepted on this path.
+with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
+an engine whose KV tokens have reached 95% of its capacity.
+Unsupported legacy options fail at startup.
+
+`--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
+bucket is plain or P/D, and each group may set its own engines, policy and
+admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+
+```json
+{"buckets": [{
+  "id": "default",
+  "prefill": {"worker_services": ["inference/prefill"], "admission": {"max_pending_prefill_tokens": 32768}},
+  "decode": {"worker_services": ["inference/decode"], "admission": {"max_kv_usage": 0.9}}
+}]}
+```
+
+`worker_services` matches Kubernetes Services by `namespace/name`, using the
+`kubernetes.io/service-name` label on watched EndpointSlices. Replacement pods
+and new replicas join the same group automatically. The router's discovery
+selectors must include those EndpointSlices; this field does not expand the watch.
+A worker selected by several Services belongs to each of them.
+
+For static URL discovery, use `"worker_ids": ["http://worker:30000"]`: each ID
+is the configured worker URL. Kubernetes worker IDs are `namespace/pod-UID`
+(and change when a pod is replaced), so use `worker_services` for durable pools.
+Set only one membership field, or omit both for every engine of the group's role.
+Empty membership lists and blank worker IDs are rejected at startup.
+
+Admission fields left unset or set to `null` inherit CLI defaults. To apply a
+limit only to selected groups, omit that CLI default and set it on those groups.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
@@ -184,8 +223,9 @@ and queue/saturation gates in favor of these shared affinity settings.
 `--no-tokenizer` skips tokenizer loading for load-only policies such as
 `power_of_two` and `session_aware`, on either routing path. Workers tokenize the
 original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
-Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
-require a tokenizer.
+Cache-aware routing, prefix-cache terms or filters, and buckets with token-length
+or context limits require a tokenizer. Reorg buckets that only select membership
+and load-based policies can use `--no-tokenizer`.
 
 ### DP-rank routing
 

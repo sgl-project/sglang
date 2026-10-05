@@ -11,9 +11,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -40,13 +40,13 @@ from sglang.srt.utils import make_pp_layers
 from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
-def _make_stages(layer, config, layer_idx: int):
+def _make_stages(layer):
     """Both kinds of layer scale their mixer and FFN outputs by
     residual_multiplier, add them in the activation dtype and normalize the sum
     as a separate step."""
     scale = OutputTransform(layer._scale_output)
     sparse = layer.block_sparse_moe is not None
-    return make_stages(
+    return append_stages(
         (
             declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
             layer.input_layernorm,
@@ -60,12 +60,6 @@ def _make_stages(layer, config, layer_idx: int):
             ),
             layer.post_attention_layernorm,
         ),
-        previous=(
-            declare_ffn(sparse=sparse, next_layer_sparse=sparse)
-            if layer_idx != 0
-            else None
-        ),
-        terminal=layer_idx == config.num_hidden_layers - 1,
     )
 
 
@@ -124,7 +118,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = _make_stages(self, config, layer_idx)
+        self.attn_boundary, self.ffn_boundary = _make_stages(self)
 
     def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states * self.residual_multiplier
@@ -315,7 +309,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = _make_stages(self, config, layer_idx)
+        self.attn_boundary, self.ffn_boundary = _make_stages(self)
 
     def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states * self.residual_multiplier
