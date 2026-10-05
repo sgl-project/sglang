@@ -5,7 +5,7 @@ use super::forward::SelectedWorkers;
 use super::preparation::PreparedRequest;
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
-    X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
+    record_prefill_route, X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
 };
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::ModelId;
@@ -62,6 +62,7 @@ pub(super) async fn select_workers(
         prefix: Some(&prefix),
         model: &request.model,
         input_tokens,
+        total_input_tokens: request.input_token_count as u64,
         expected_peak_tokens,
         token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         session_key: ctx
@@ -82,6 +83,11 @@ pub(super) async fn select_workers(
     for bucket in buckets {
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
+                record_prefill_route(
+                    ctx,
+                    prefix.local_signal().as_deref(),
+                    &picks.prefill.engine.url,
+                );
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,

@@ -83,12 +83,16 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
-def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
+def host_memory_budget_bytes(
+    requested_bytes: int = 0, *, auto_size: bool = False
+) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     Bound machine availability by the visible cgroup limits before splitting
     among local ranks. Independent engines with separate container budgets
     therefore size against their own remaining allowance.
+    Auto-sizing requires successful cgroup discovery; explicit pool sizing
+    can fall back to checking host availability when discovery fails.
 
     Inside host_memory_budget_scope, requested_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
@@ -99,7 +103,10 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
             _host_memory_budget.set(available - requested_bytes)
         return available
 
-    free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    free = (
+        available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
+        - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    )
     return free // ranks_per_host()
 
 
@@ -158,6 +165,7 @@ class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
     shared_allocation_domain = None
+    stores_page_envelope = False
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
