@@ -41,6 +41,9 @@ class AFDStage(msgspec.Struct, kw_only=True):
     # contribution to the merge; empty on the attention role, one entry per lane
     # the rank serves on the FFN role.
     group_widths: tuple[int, ...] = ()
+    # Empty-ingress F ranks still own a device/dtype template and compute experts.
+    collective_input: Any = None
+    graph_output: Any = None
 
     @property
     def rows(self) -> int:
@@ -220,7 +223,9 @@ class AFDDecoderAdapter:
         """
 
         for index, layer in enumerate(self.inner.layers):
-            if getattr(getattr(layer, "mlp", None), "_shared_expert_tp1", False):
+            if getattr(
+                getattr(layer, "mlp", None), "_shared_expert_tp1", False
+            ) and not (getattr(layer, "afd_shared_expert_partial", False)):
                 raise AFDError(
                     "AFD_FFN_MERGE_REDUCE_SCATTER_SHARED_TP1",
                     f"layer={index}",
@@ -280,7 +285,8 @@ class AFDDecoderAdapter:
     ) -> tuple[list[AFDStage], list[Any]]:
         group = shape.group_lanes(ffn_ordinal=lane)
         stage_count = len(shape.lane_stage_rows[0])
-        if len(buffers) != stage_count * len(group):
+        slots = max(1, len(group))
+        if len(buffers) != stage_count * slots:
             raise AFDError(
                 "AFD_FFN_STAGE_BUFFER_COUNT_INVALID",
                 f"buffers={len(buffers)} stages={stage_count} group={len(group)}",
@@ -289,7 +295,7 @@ class AFDDecoderAdapter:
         views = []
         token_start = 0
         for index in range(stage_count):
-            offset = index * len(group)
+            offset = index * slots
             lane_rows = tuple(
                 descriptor.stage_rows(lane=member)[index] for member in group
             )
@@ -314,6 +320,7 @@ class AFDDecoderAdapter:
                     forward_batch=None,
                     merge_sizes=shape.merge_plan(stage=index),
                     merge_lane=lane,
+                    collective_input=buffers[offset] if not group else None,
                     group_widths=tuple(
                         shape.lane_bucket_rows[member][index] for member in group
                     ),
@@ -492,7 +499,12 @@ class AFDDecoderAdapter:
                 offset += stride
             return packed
 
-        local = pack(lane_hidden_states)
+        if lane_hidden_states:
+            local = pack(lane_hidden_states)
+        else:
+            local = stage.collective_input
+            if local is None or local.shape[0] != 0:
+                raise AFDError("AFD_FFN_EMPTY_INGRESS_TEMPLATE_INVALID")
         merged_tensors = [local]
         tp_group = get_parallel().tp_group
         sizes = list(stage.merge_sizes)
@@ -510,6 +522,10 @@ class AFDDecoderAdapter:
             with get_forward().scoped(mlp_reduce_scatter=True):
                 partial = decoder_layer.compute_ffn_output(merged, stage.forward_batch)
             output = tp_group.reduce_scatterv(partial, sizes=sizes)
+            if not lane_hidden_states:
+                # Expose real expert work to the replay sentinel, not an empty
+                # reduce-scatter result or a made-up constant.
+                stage.graph_output = partial
         else:
             output = decoder_layer.compute_ffn_output(merged, stage.forward_batch)
         if len(strides) == 1 and rows[0] == output.shape[0]:

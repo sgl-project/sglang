@@ -166,6 +166,9 @@ class _BoundNCCL:
 class AFDPairedP2PTransport:
     """Point-to-point transport for one lane, owning one stream per direction."""
 
+    _control_followers: tuple[int, ...] = ()
+    _control_upstream: int | None = None
+
     def __init__(
         self,
         *,
@@ -194,10 +197,20 @@ class AFDPairedP2PTransport:
         self._rank = local.transport_rank
         self._peer_ranks = tuple(peer.transport_rank for peer in peers)
         self._peer_coordination_ranks = tuple(peer.coordination_rank for peer in peers)
+        self._control_upstream = 0 if role == AFDRole.FFN and not peers else None
+        self._control_followers = (
+            tuple(
+                topology.local(role=AFDRole.FFN, ordinal=j).coordination_rank
+                for j in range(topology.lanes)
+                if not topology.peers(role=AFDRole.FFN, ordinal=j)
+            )
+            if role == AFDRole.FFN and lane == 0
+            else ()
+        )
         # Receives and sends are posted in edge order, so that order has to be
         # the peers' own wire order or the two sides pair up different tensors.
         if (
-            not self._peer_ranks
+            (not self._peer_ranks and role != AFDRole.FFN)
             or self._rank in self._peer_ranks
             or len(set(self._peer_ranks)) != len(self._peer_ranks)
             or list(self._peer_ranks) != sorted(self._peer_ranks)
@@ -441,7 +454,12 @@ class AFDPairedP2PTransport:
             # gather, so a divergence means the lanes left lockstep and the rows
             # this rank is about to receive no longer match the plan it was told.
             received = []
-            for source in self._peer_coordination_ranks:
+            sources = (
+                (self._control_upstream,)
+                if self._control_upstream is not None
+                else self._peer_coordination_ranks
+            )
+            for source in sources:
                 item = self._control.recv_obj(src=source)
                 if not isinstance(item, AFDStepDescriptor):
                     raise AFDError(
@@ -478,6 +496,8 @@ class AFDPairedP2PTransport:
                 # peers' copies differ by design.
                 close_usage=received[0].close_usage,
             )
+            for follower in self._control_followers:
+                self._control.send_obj(result, dst=follower)
             if result.kind == "CLOSE":
                 if result.close_usage is None:
                     raise AFDError("AFD_TRANSPORT_CLOSE_USAGE_MISSING")
@@ -505,8 +525,14 @@ class AFDPairedP2PTransport:
             if acknowledgement != {"event": "AFD_CAPTURE_READY"}:
                 raise AFDError("AFD_CAPTURE_READY_ACK_INVALID")
         else:
+            acknowledgement = {"event": "AFD_CAPTURE_READY"}
+            if self._control_upstream is not None:
+                self._control.send_obj(acknowledgement, dst=self._control_upstream)
+            for follower in self._control_followers:
+                if self._control.recv_obj(src=follower) != acknowledgement:
+                    raise AFDError("AFD_CAPTURE_READY_ACK_INVALID")
             for destination in self._peer_coordination_ranks:
-                self._control.send_obj({"event": "AFD_CAPTURE_READY"}, dst=destination)
+                self._control.send_obj(acknowledgement, dst=destination)
         self._retime_control_store(self._idle_timeout_seconds)
 
     def exchange_close(self, *, usage: dict[str, Any]) -> dict[str, Any]:
@@ -546,6 +572,23 @@ class AFDPairedP2PTransport:
             else:
                 if self._peer_close_usage is None:
                     raise AFDError("AFD_TRANSPORT_CLOSE_NOT_RECEIVED")
+                if self._control_upstream is not None or self._control_followers:
+                    self._retime_control_store(self._close_timeout_seconds)
+                acknowledgement = {"event": "AFD_CLOSE_ACK", "usage": usage}
+                if self._control_upstream is not None:
+                    self._control.send_obj(acknowledgement, dst=self._control_upstream)
+                follower_usage = {}
+                for follower in self._control_followers:
+                    reply = self._control.recv_obj(src=follower)
+                    if (
+                        not isinstance(reply, dict)
+                        or reply.get("event") != "AFD_CLOSE_ACK"
+                        or not isinstance(reply.get("usage"), dict)
+                    ):
+                        raise AFDError("AFD_TRANSPORT_CLOSE_ACK_INVALID")
+                    follower_usage[str(follower)] = reply["usage"]
+                if follower_usage:
+                    usage = {**usage, "control_followers": follower_usage}
                 # Every lane in the group, or the ones left unanswered sit out
                 # their whole close timeout before the service can exit.
                 for destination in self._peer_coordination_ranks:
@@ -685,7 +728,8 @@ class AFDPairedP2PTransport:
         return ready
 
     def wait(self, event: Any) -> None:
-        self._torch.cuda.current_stream(self._device).wait_event(event)
+        if event is not None:
+            self._torch.cuda.current_stream(self._device).wait_event(event)
 
     def rejoin_streams(self) -> None:
         """Order the current stream after every side stream this step forked.
@@ -752,7 +796,8 @@ class AFDPairedP2PTransport:
         # on the receiving stream. Order that write once per new backing.
         # Retained lookups and eager per-layer receives add no dependency here.
         stream = self._a2e_stream if self.role == AFDRole.FFN else self._e2a_stream
-        self._fork(stream=stream)
+        if any(buffer.numel() for buffer in buffers):
+            self._fork(stream=stream)
         return buffers
 
     def release_buffers(self, *, key: str) -> None:

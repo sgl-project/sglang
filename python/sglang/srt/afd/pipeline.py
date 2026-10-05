@@ -556,7 +556,7 @@ class AFDFFNPipeline:
                 residual=None,
             )
             self._connector.transport.return_result(output)
-            last[index] = output
+            last[index] = output or (stage.graph_output,)
             if not prefetch and has_next:
                 events[next_index] = receive(next_index)
 

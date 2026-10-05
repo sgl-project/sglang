@@ -71,28 +71,29 @@ class AFDTopology(Protocol):
     def expects_dp_attention(self, *, role: AFDRole) -> bool: ...
 
 
+def attention_lane_group(
+    *, attention_lanes: int, ffn_lanes: int, ffn_ordinal: int
+) -> tuple[int, ...]:
+    """Partition A lanes once, in F rank order, allowing empty ingress groups."""
+
+    if ffn_ordinal < 0 or ffn_ordinal >= ffn_lanes:
+        raise AFDError("AFD_TOPOLOGY_ROLE_IDENTITY_INVALID", f"ffn={ffn_ordinal}")
+    width, extra = divmod(attention_lanes, ffn_lanes)
+    start = ffn_ordinal * width + min(ffn_ordinal, extra)
+    stop = start + width + (ffn_ordinal < extra)
+    return tuple(range(start, stop))
+
+
 class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
-    """M attention lanes fanning into N FFN lanes, M an integer multiple of N.
+    """Contiguous A ingress groups over F shards; all F ranks execute the FFN.
 
-    FFN takes coordination ranks [0, N) and attention [N, N + M) in a single
-    descriptor-agreement world. Wire traffic runs in N groups, one per FFN rank,
-    each holding that rank at wire rank 0 and the k = M / N attention lanes that
-    feed it at wire ranks [1, k]. Every transfer inside a group is still a
-    point-to-point send/recv between the FFN rank and one lane; the group only
-    exists so an FFN rank addresses its k lanes without k separate rendezvous.
-
-    The k lanes an FFN rank owns are **contiguous** (`[f*k, (f+1)*k)`). That is
-    what lets the FFN rank concatenate their rows into one block whose position
-    in the group-wide row order is still a single offset, which in turn keeps
-    the cross-rank `all_gatherv` a plain one-size-per-rank collective. k == 1 is
-    the symmetric case, where a group is the old two-rank pair, and reduces to
-    plain 1A1F at N == 1.
+    Integral A/F layouts retain their original per-F wire groups. Other layouts
+    use one F-first A/F wire world, including F ranks with no ingress. Empty
+    ingress never removes a rank from the separate F compute collectives.
     """
 
     endpoints: tuple[AFDEndpoint, ...]
     lanes: int
-    # None means symmetric. Kept optional rather than defaulted to `lanes` so a
-    # symmetric topology stays exactly the value it always was.
     attention_lanes: int | None = None
 
     @property
@@ -105,9 +106,13 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def lanes_per_ffn(self) -> int:
-        """Attention lanes feeding one FFN rank; 1 in the symmetric case."""
+        """Maximum ingress group width; uniform for legacy integral layouts."""
 
-        return self.attention_size // self.lanes
+        return (self.attention_size + self.lanes - 1) // self.lanes
+
+    @property
+    def shared_wire(self) -> bool:
+        return bool(self.attention_size % self.lanes)
 
     @classmethod
     def paired(
@@ -116,26 +121,28 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
         lanes: int = 1,
         attention_lanes: int | None = None,
     ) -> AFDPairedTopology:
-        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        if type(lanes) is not int or lanes < 1:
             raise AFDError("AFD_TOPOLOGY_LANE_COUNT_INVALID", f"lanes={lanes!r}")
         if attention_lanes is not None and (
-            isinstance(attention_lanes, bool)
-            or not isinstance(attention_lanes, int)
-            or attention_lanes < lanes
-            or attention_lanes % lanes
+            type(attention_lanes) is not int or attention_lanes < 1
         ):
             raise AFDError(
                 "AFD_TOPOLOGY_LANE_GROUP_RATIO_INVALID",
                 f"attention_lanes={attention_lanes!r} lanes={lanes}",
             )
         attention_size = lanes if attention_lanes is None else attention_lanes
-        group = attention_size // lanes
+        shared = bool(attention_size % lanes)
+        group = (attention_size + lanes - 1) // lanes
         return cls(
             endpoints=tuple(
                 AFDEndpoint(
                     role=role,
                     ordinal=ordinal,
-                    transport_rank=(0 if role == AFDRole.FFN else 1 + ordinal % group),
+                    transport_rank=(
+                        (ordinal if role == AFDRole.FFN else lanes + ordinal)
+                        if shared
+                        else (0 if role == AFDRole.FFN else 1 + ordinal % group)
+                    ),
                     coordination_rank=(
                         ordinal if role == AFDRole.FFN else lanes + ordinal
                     ),
@@ -156,45 +163,22 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def pair_world_size(self) -> int:
-        """Ranks in one wire group: the FFN rank plus the k lanes feeding it."""
-
-        return 1 + self.lanes_per_ffn
+        return (
+            self.coordination_world_size if self.shared_wire else 1 + self.lanes_per_ffn
+        )
 
     def validate(self) -> None:
         if (
-            self.lanes < 1
-            or self.attention_size < self.lanes
-            or self.attention_size % self.lanes
+            type(self.lanes) is not int
+            or self.lanes < 1
+            or type(self.attention_size) is not int
+            or self.attention_size < 1
         ):
-            raise AFDError(
-                "AFD_TOPOLOGY_PAIRED_LAYOUT_REQUIRED",
-                f"lanes={self.lanes} attention_lanes={self.attention_lanes} "
-                f"endpoints={self.endpoints!r}",
-            )
-        group = self.lanes_per_ffn
-        expected = tuple(
-            (
-                role,
-                ordinal,
-                0 if role == AFDRole.FFN else 1 + ordinal % group,
-                ordinal if role == AFDRole.FFN else self.lanes + ordinal,
-            )
-            for role, size in (
-                (AFDRole.FFN, self.lanes),
-                (AFDRole.ATTENTION, self.attention_size),
-            )
-            for ordinal in range(size)
-        )
-        actual = tuple(
-            (
-                item.role,
-                item.ordinal,
-                item.transport_rank,
-                item.coordination_rank,
-            )
-            for item in self.endpoints
-        )
-        if actual != expected:
+            raise AFDError("AFD_TOPOLOGY_PAIRED_LAYOUT_REQUIRED")
+        expected = self.paired(
+            lanes=self.lanes, attention_lanes=self.attention_lanes
+        ).endpoints
+        if self.endpoints != expected:
             raise AFDError(
                 "AFD_TOPOLOGY_PAIRED_LAYOUT_REQUIRED",
                 f"lanes={self.lanes} attention_lanes={self.attention_lanes} "
@@ -215,35 +199,44 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
             )
         return matches[0]
 
-    def peers(self, *, role: AFDRole, ordinal: int) -> tuple[AFDEndpoint, ...]:
-        """One FFN peer per attention lane; k attention peers per FFN rank."""
+    def ingress_ffn(self, *, attention_ordinal: int) -> int:
+        self.local(role=AFDRole.ATTENTION, ordinal=attention_ordinal)
+        return next(
+            rank
+            for rank in range(self.lanes)
+            if attention_ordinal in self.attention_lane_group(ffn_ordinal=rank)
+        )
 
+    def peers(self, *, role: AFDRole, ordinal: int) -> tuple[AFDEndpoint, ...]:
+        self.local(role=role, ordinal=ordinal)
         if role == AFDRole.ATTENTION:
-            self.local(role=role, ordinal=ordinal)
             return (
                 self.local(
                     role=AFDRole.FFN,
-                    ordinal=ordinal // self.lanes_per_ffn,
+                    ordinal=self.ingress_ffn(attention_ordinal=ordinal),
                 ),
             )
-        self.local(role=role, ordinal=ordinal)
         return tuple(
             self.local(role=AFDRole.ATTENTION, ordinal=lane)
             for lane in self.attention_lane_group(ffn_ordinal=ordinal)
         )
 
     def attention_lane_group(self, *, ffn_ordinal: int) -> tuple[int, ...]:
-        """The contiguous attention lanes this FFN rank receives rows from."""
-
-        group = self.lanes_per_ffn
-        return tuple(range(ffn_ordinal * group, (ffn_ordinal + 1) * group))
+        return attention_lane_group(
+            attention_lanes=self.attention_size,
+            ffn_lanes=self.lanes,
+            ffn_ordinal=ffn_ordinal,
+        )
 
     def group_ordinal(self, *, role: AFDRole, ordinal: int) -> int:
-        """Which FFN rank's wire group this rank belongs to."""
-
-        if role == AFDRole.FFN:
-            return ordinal
-        return ordinal // self.lanes_per_ffn
+        self.local(role=role, ordinal=ordinal)
+        if self.shared_wire:
+            return 0
+        return (
+            ordinal
+            if role == AFDRole.FFN
+            else self.ingress_ffn(attention_ordinal=ordinal)
+        )
 
     def expected_parallelism(self, *, role: AFDRole) -> tuple[int, int, int, int]:
         if role == AFDRole.ATTENTION:
@@ -251,8 +244,6 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
         return (self.lanes, 1, self.lanes, 1)
 
     def expects_dp_attention(self, *, role: AFDRole) -> bool:
-        """DP attention is a metadata channel here; rows stay lane-local."""
-
         return role == AFDRole.ATTENTION and self.attention_size > 1
 
 
@@ -341,15 +332,23 @@ class AFDPairedShape(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def lanes_per_ffn(self) -> int:
-        return self.attention_lanes // self.ffn_size
+        return (self.attention_lanes + self.ffn_size - 1) // self.ffn_size
 
     @property
     def stage_rows(self) -> tuple[int, ...]:
-        return self.lane_stage_rows[self.lane]
+        return (
+            self.lane_stage_rows[self.lane]
+            if self.lane < self.attention_lanes
+            else (0,) * len(self.lane_stage_rows[0])
+        )
 
     @property
     def bucket_rows(self) -> tuple[int, ...]:
-        return self.lane_bucket_rows[self.lane]
+        return (
+            self.lane_bucket_rows[self.lane]
+            if self.lane < self.attention_lanes
+            else (0,) * len(self.lane_bucket_rows[0])
+        )
 
     @property
     def digest(self) -> str:
@@ -364,10 +363,13 @@ class AFDPairedShape(msgspec.Struct, frozen=True, kw_only=True):
         return ":".join(fields)
 
     def group_lanes(self, *, ffn_ordinal: int) -> tuple[int, ...]:
-        """The contiguous attention lanes whose rows this FFN rank receives."""
+        """This rank's ingress lanes, possibly empty; no A lane is replicated."""
 
-        group = self.lanes_per_ffn
-        return tuple(range(ffn_ordinal * group, (ffn_ordinal + 1) * group))
+        return attention_lane_group(
+            attention_lanes=self.attention_lanes,
+            ffn_lanes=self.ffn_size,
+            ffn_ordinal=ffn_ordinal,
+        )
 
     def group_bucket_rows(self, *, ffn_ordinal: int) -> tuple[int, ...]:
         """One padded width per (stage, lane) this FFN rank holds, stage-major.
@@ -377,6 +379,9 @@ class AFDPairedShape(msgspec.Struct, frozen=True, kw_only=True):
         """
 
         lanes = self.group_lanes(ffn_ordinal=ffn_ordinal)
+        if not lanes:
+            # Device/dtype templates retained per stage, with no wire edge.
+            return (0,) * len(self.lane_bucket_rows[0])
         return tuple(
             self.lane_bucket_rows[lane][stage]
             for stage in range(len(self.lane_bucket_rows[0]))
@@ -402,24 +407,15 @@ class AFDPairedShape(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def merge_plan(self, *, stage: int) -> tuple[int, ...]:
-        """Padded rows each FFN rank contributes to this stage's merged tensor.
+        """One collective width per F, preserving global A order and zero slots."""
 
-        Padded rather than real, so a captured merge stays valid while real row
-        counts move inside the bucket. One entry per FFN rank, not per attention
-        lane: a rank holding k lanes gathers them into one contiguous block, so
-        the collective stays a plain one-size-per-rank `all_gatherv`. Each FFN rank holds a shard of the experts
-        and therefore processes the rows from all FFN ranks.
-        """
-
-        group = self.lanes_per_ffn
-        widths = tuple(
+        return tuple(
             sum(
                 self.lane_bucket_rows[lane][stage]
-                for lane in range(ordinal * group, (ordinal + 1) * group)
+                for lane in self.group_lanes(ffn_ordinal=ordinal)
             )
             for ordinal in range(self.ffn_size)
         )
-        return widths
 
 
 class AFDModelAdapter(Protocol):

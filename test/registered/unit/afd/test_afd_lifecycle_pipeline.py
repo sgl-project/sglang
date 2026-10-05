@@ -523,6 +523,8 @@ class CloseTransport(FakeTransport):
         self._control = control
         self._peer_ranks = (1,) if role == contracts.AFDRole.FFN else (0,)
         self._peer_coordination_ranks = self._peer_ranks
+        self._control_upstream = None
+        self._control_followers = ()
         self._closed = False
         self._stats = {"steps": 0}
         self._forked_streams = []
