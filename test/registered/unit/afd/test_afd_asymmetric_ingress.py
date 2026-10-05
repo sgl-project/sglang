@@ -4,10 +4,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -25,31 +25,8 @@ from sglang.srt.afd.contracts import (
 from sglang.srt.afd.model_adapters import base
 from sglang.srt.afd.pipeline import AFDFFNPipeline
 from sglang.srt.afd.role_graph import AFDRoleGraphService, TorchRoleGraphProgram
-from sglang.srt.afd.transport import AFDPairedP2PTransport
-
-
-@pytest.mark.parametrize("a,f", [(20, 32), (3, 4), (2, 4), (4, 4), (24, 4), (6, 4)])
-def test_unique_ingress_and_shared_wire_identity(a, f):
-    topology = AFDPairedTopology.paired(lanes=f, attention_lanes=a)
-    topology.validate()
-    groups = [topology.attention_lane_group(ffn_ordinal=j) for j in range(f)]
-    assert tuple(i for group in groups for i in group) == tuple(range(a))
-    assert max(map(len, groups)) - min(map(len, groups)) <= 1
-    for i in range(a):
-        (peer,) = topology.peers(role=AFDRole.ATTENTION, ordinal=i)
-        assert i in groups[peer.ordinal]
-        assert topology.local(role=AFDRole.ATTENTION, ordinal=i) in topology.peers(
-            role=AFDRole.FFN, ordinal=peer.ordinal
-        )
-    if a % f:
-        assert topology.pair_world_size == a + f
-        assert [e.transport_rank for e in topology.endpoints] == list(range(a + f))
-        assert all(
-            topology.group_ordinal(role=e.role, ordinal=e.ordinal) == 0
-            for e in topology.endpoints
-        )
-    else:
-        assert topology.pair_world_size == 1 + a // f
+from sglang.srt.afd.transport import AFDPairedP2PTransport, _AFDControlChannels
+from sglang.srt.distributed.utils import StatelessProcessGroup
 
 
 @pytest.mark.parametrize("a,f", [(20, 32), (3, 4), (4, 4), (24, 4)])
@@ -78,8 +55,7 @@ def test_all_expert_shards_contribute_and_return_each_source_row_once(
         for i, vector in enumerate(rows)
     ]
     barrier = threading.Barrier(f, timeout=10)
-    lock = threading.Lock()
-    values, merged, reduced, calls = {}, {}, {}, []
+    values, calls = [None] * f, []
     state = threading.local()
 
     class Group:
@@ -87,28 +63,20 @@ def test_all_expert_shards_contribute_and_return_each_source_row_once(
             self.rank_in_group = rank
             self.step = 0
 
+        def collect(self, tensor, *, reduce=False):
+            values[self.rank_in_group] = tensor
+            barrier.wait()
+            result = torch.stack(values).sum(0) if reduce else torch.cat(values)
+            # Finish reading every rank before the next collective overwrites slots.
+            barrier.wait()
+            return result
+
         def all_gatherv(self, local, sizes):
-            key = (self.step, "gather")
             assert local.shape == (sizes[self.rank_in_group], 4)
-            with lock:
-                values.setdefault(key, {})[self.rank_in_group] = local
-            barrier.wait()
-            if self.rank_in_group == 0:
-                merged[self.step] = torch.cat([values[key][j] for j in range(f)])
-            barrier.wait()
-            return [merged[self.step]]
+            return [self.collect(local)]
 
         def reduce_scatterv(self, partial, sizes):
-            key = (self.step, "reduce")
-            with lock:
-                values.setdefault(key, {})[self.rank_in_group] = partial
-            barrier.wait()
-            if self.rank_in_group == 0:
-                reduced[self.step] = torch.stack(
-                    [values[key][j] for j in range(f)]
-                ).sum(0)
-            barrier.wait()
-            result = reduced[self.step].narrow(
+            result = self.collect(partial, reduce=True).narrow(
                 0, sum(sizes[: self.rank_in_group]), sizes[self.rank_in_group]
             )
             self.step += 1
@@ -237,76 +205,10 @@ def test_empty_wire_edges_do_not_skip_global_s2_compute():
     assert transport._stats == {"a2e_recv": 0, "e2a_send": 0}
 
 
-@pytest.mark.parametrize("kind", ["STEP", "CAPTURE", "READY", "CLOSE"])
-def test_empty_f_receives_same_control_descriptor_and_ready_close_acks(kind):
-    descriptor = AFDStepDescriptor(
-        kind=kind,
-        step_id=-1 if kind in ("READY", "CLOSE") else 1,
-        lane_stage_rows=() if kind in ("READY", "CLOSE") else ((3, 2),) * 20,
-        hidden_size=0 if kind in ("READY", "CLOSE") else 4,
-        dtype="" if kind in ("READY", "CLOSE") else "bfloat16",
-        num_layers=0 if kind in ("READY", "CLOSE") else 2,
-        graph_eligible=kind in ("STEP", "CAPTURE"),
-        close_usage={"owner": "A0"} if kind == "CLOSE" else None,
-    )
-    sent = []
-    leader = object.__new__(AFDPairedP2PTransport)
-    leader.role, leader._closed = AFDRole.FFN, False
-    leader._peer_coordination_ranks, leader._control_followers = (
-        (32,),
-        tuple(range(20, 32)),
-    )
-    leader._control = SimpleNamespace(
-        recv_obj=lambda src: descriptor,
-        send_obj=lambda obj, dst: sent.append((dst, obj)),
-    )
-    leader._stats, leader._forked_streams = {"steps": 0}, []
-    result = leader.begin_step(None)
-    assert [dst for dst, _ in sent] == list(range(20, 32))
-    assert all(item == result for _, item in sent)
-    follower = object.__new__(AFDPairedP2PTransport)
-    follower.role, follower._closed = AFDRole.FFN, False
-    follower._peer_coordination_ranks, follower._control_upstream = (), 0
-    follower._control = SimpleNamespace(
-        recv_obj=lambda src: result, send_obj=lambda obj, dst: sent.append((dst, obj))
-    )
-    follower._stats, follower._forked_streams = {"steps": 0}, []
-    assert follower.begin_step(None) == result
-    for transport in (leader, follower):
-        transport._retime_control_store = lambda timeout: None
-        transport._idle_timeout_seconds, transport._close_timeout_seconds = 100, 1
-        transport._close_exchange, transport._close_exchange_error = None, None
-    if kind == "READY":
-        follower.capture_ready()
-        leader._control.recv_obj = lambda src: {"event": "AFD_CAPTURE_READY"}
-        leader.capture_ready()
-        assert sent[-1] == (32, {"event": "AFD_CAPTURE_READY"})
-    if kind == "CLOSE":
-        assert follower.exchange_close(usage={"owner": "F31"}) == {"owner": "A0"}
-        leader._control.recv_obj = lambda src: {
-            "event": "AFD_CLOSE_ACK",
-            "usage": {"owner": src},
-        }
-        assert leader.exchange_close(usage={"owner": "F0"}) == {"owner": "A0"}
-        assert sent[-1] == (
-            32,
-            {
-                "event": "AFD_CLOSE_ACK",
-                "usage": {
-                    "owner": "F0",
-                    "control_followers": {
-                        str(rank): {"owner": rank} for rank in range(20, 32)
-                    },
-                },
-            },
-        )
-
-
-def test_empty_f_control_lifecycle_with_bounded_message_queues():
-    topology = AFDPairedTopology.paired(lanes=32, attention_lanes=20)
-    channels = {(src, dst): queue.Queue() for src in range(52) for dst in range(52)}
-    follower_ready = threading.Event()
-    follower_closed = threading.Event()
+def _store_transports(a, f, *, timeout=3):
+    topology = AFDPairedTopology.paired(lanes=f, attention_lanes=a)
+    store = torch.distributed.HashStore()
+    store.set_timeout(timedelta(seconds=timeout))
     transports = []
     for endpoint in topology.endpoints:
         rank = endpoint.coordination_rank
@@ -314,92 +216,188 @@ def test_empty_f_control_lifecycle_with_bounded_message_queues():
         transport.role, transport._closed = endpoint.role, False
         peers = topology.peers(role=endpoint.role, ordinal=endpoint.ordinal)
         transport._peer_coordination_ranks = tuple(p.coordination_rank for p in peers)
-        transport._control_upstream = 0 if rank < 32 and not peers else None
-        transport._control_followers = tuple(range(20, 32)) if rank == 0 else ()
-
-        def send(obj, dst, rank=rank):
-            if rank == 31 and isinstance(obj, dict):
-                if obj.get("event") == "AFD_CAPTURE_READY":
-                    follower_ready.set()
-                if obj.get("event") == "AFD_CLOSE_ACK":
-                    follower_closed.set()
-            if rank == 0 and dst == 32 and isinstance(obj, dict):
-                assert (
-                    follower_ready
-                    if obj["event"] == "AFD_CAPTURE_READY"
-                    else follower_closed
-                ).is_set()
-            channels[rank, dst].put(obj)
-
-        transport._control = SimpleNamespace(
-            send_obj=send,
-            recv_obj=lambda src, rank=rank: channels[src, rank].get(timeout=3),
+        transport._control_upstream = 0 if rank < f and not peers else None
+        transport._control_followers = (
+            tuple(
+                j for j in range(f) if not topology.attention_lane_group(ffn_ordinal=j)
+            )
+            if rank == 0
+            else ()
+        )
+        transport._control = _AFDControlChannels(
+            StatelessProcessGroup(rank=rank, world_size=a + f, store=store)
         )
         transport._forked_streams, transport._stats = [], {"steps": 0}
         transport._peer_close_usage = None
         transport._close_exchange = transport._close_exchange_error = None
-        transport._idle_timeout_seconds = transport._close_timeout_seconds = 3
-        transport._retime_control_store = lambda seconds: None
+        transport._idle_timeout_seconds = transport._close_timeout_seconds = timeout
         transports.append(transport)
+    return topology, transports
+
+
+def _store_descriptor(a, kind, step_id=0, **overrides):
+    fields = dict(
+        kind=kind,
+        step_id=step_id,
+        lane_stage_rows=((1, 1),) * a,
+        hidden_size=4,
+        dtype="bfloat16",
+        num_layers=2,
+        graph_eligible=True,
+    )
+    fields.update(overrides)
+    return AFDStepDescriptor(**fields)
+
+
+@pytest.mark.parametrize(
+    "a,f", [(2, 4), (3, 4), (20, 32), (1, 4), (4, 1), (1, 1), (6, 4)]
+)
+def test_control_lifecycle_uses_real_store_with_separate_wire_metadata(a, f):
+    """Replay capture/data boundaries, READY, STEP and CLOSE on native stores.
+
+    The wire group exchanges CPU metadata at the places GPU work completes;
+    this exercises its native broadcast namespace, not CUDA/NCCL execution.
+    """
+    topology, transports = _store_transports(a, f)
+    topology.validate()
+    groups = [topology.attention_lane_group(ffn_ordinal=j) for j in range(f)]
+    assert tuple(i for group in groups for i in group) == tuple(range(a))
+    assert max(map(len, groups)) - min(map(len, groups)) <= 1
+    assert topology.pair_world_size == (a + f if a % f else 1 + a // f)
+    wire_stores = {}
+    wire_groups = []
+    for endpoint in topology.endpoints:
+        ordinal = topology.group_ordinal(role=endpoint.role, ordinal=endpoint.ordinal)
+        store = wire_stores.setdefault(ordinal, torch.distributed.HashStore())
+        store.set_timeout(timedelta(seconds=3))
+        wire_groups.append(
+            StatelessProcessGroup(
+                rank=endpoint.transport_rank,
+                world_size=topology.pair_world_size,
+                store=store,
+            )
+        )
+
+    def data_boundary(rank, kind, step_id):
+        replies = wire_groups[rank].all_gather_obj((rank, kind, step_id))
+        assert len(replies) == topology.pair_world_size
+        assert all(reply[1:] == (kind, step_id) for reply in replies)
+        assert len({reply[0] for reply in replies}) == topology.pair_world_size
 
     def run(rank):
         transport = transports[rank]
-        if rank >= 32:
-            for kind in ("STEP", "CAPTURE"):
-                descriptor = AFDStepDescriptor(
-                    kind=kind,
-                    step_id=1,
-                    lane_stage_rows=((3, 2),) * 20,
-                    hidden_size=4,
-                    dtype="bfloat16",
-                    num_layers=2,
-                    graph_eligible=kind == "CAPTURE",
-                )
-                transport.begin_step(descriptor)
-            transport.capture_ready()
-        else:
-            for kind in ("STEP", "CAPTURE", "READY", "CLOSE"):
-                assert transport.begin_step(None).kind == kind
-                if kind == "READY":
-                    transport.capture_ready()
+        for step_id in (0, 1):
+            expected = _store_descriptor(a, "CAPTURE", step_id)
+            descriptor = transport.begin_step(expected if rank >= f else None)
+            assert descriptor == expected
+            data_boundary(rank, "CAPTURE", step_id)
+        if rank < f:
+            assert transport.begin_step(None).kind == "READY"
+        transport.capture_ready()
+        descriptor = transport.begin_step(
+            _store_descriptor(a, "STEP", 2) if rank >= f else None
+        )
+        assert (descriptor.kind, descriptor.step_id) == ("STEP", 2)
+        data_boundary(rank, "STEP", 2)
+        if rank < f:
+            assert transport.begin_step(None).kind == "CLOSE"
         result = transport.exchange_close(usage={"rank": rank})
         assert transport.exchange_close(usage={}) == result
         return result
 
-    with ThreadPoolExecutor(max_workers=52) as pool:
-        results = list(pool.map(run, range(52)))
-    assert results[32]["control_followers"] == {
-        str(rank): {"rank": rank} for rank in range(20, 32)
-    }
-    assert all(transport._stats["steps"] == 4 for transport in transports[:32])
+    with ThreadPoolExecutor(max_workers=a + f) as pool:
+        results = list(pool.map(run, range(a + f)))
+    followers = transports[0]._control_followers
+    if followers:
+        assert all(results[j] == {"rank": f} for j in followers)
+        assert results[f]["control_followers"] == {
+            str(rank): {"rank": rank} for rank in followers
+        }
+    for j in range(f):
+        group = topology.attention_lane_group(ffn_ordinal=j)
+        if group:
+            assert results[j] == {"rank": f + group[0]}
+            assert all(results[f + i]["rank"] == j for i in group)
+    assert all(transport._stats["steps"] == 5 for transport in transports[:f])
+
+
+@pytest.mark.parametrize("a,f", [(2, 4), (3, 4), (20, 32)])
+@pytest.mark.parametrize("late", [False, True])
+def test_ready_cannot_reuse_one_followers_ack_for_a_missing_peer(a, f, late):
+    _, transports = _store_transports(a, f, timeout=3 if late else 0.05)
+    leader, attention = transports[0], transports[f]
+    for step_id in (0, 1):
+        attention.begin_step(_store_descriptor(a, "CAPTURE", step_id))
+        assert leader.begin_step(None).kind == "CAPTURE"
+    attention.begin_step(_store_descriptor(a, "READY", -1))
+    assert leader.begin_step(None).kind == "READY"
+    missing = leader._control_followers[-1]
+    for follower in leader._control_followers[:-1]:
+        transports[follower].capture_ready()
+    # Native retained keys and earlier followers' identical ACKs must not
+    # satisfy this wait. HashStore supplies a real bounded store timeout.
+    if late:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(leader.capture_ready)
+            with pytest.raises(TimeoutError):
+                pending.result(timeout=0.02)
+            assert not leader._control.store.check([f"afd-control/0/{f}/send_to/{f}/0"])
+            transports[missing].capture_ready()
+            pending.result(timeout=3)
+        assert attention._control.recv_obj(src=0) == {"event": "AFD_CAPTURE_READY"}
+    else:
+        with pytest.raises(torch.distributed.DistStoreError, match="Wait timeout"):
+            leader.capture_ready()
+        assert not leader._control.store.check([f"afd-control/0/{f}/send_to/{f}/0"])
+
+
+@pytest.mark.parametrize("a,f", [(4, 1), (6, 4)])
+@pytest.mark.parametrize("drift", [False, True])
+def test_real_store_fanin_keeps_lane_eligibility_and_descriptor_drift(a, f, drift):
+    topology, transports = _store_transports(a, f)
+    group = topology.attention_lane_group(ffn_ordinal=0)
+    assert len(group) > 1
+    for ordinal in group:
+        transports[f + ordinal].begin_step(
+            _store_descriptor(
+                a,
+                "STEP",
+                7 if drift and ordinal else 0,
+                graph_eligible=ordinal == group[0],
+            )
+        )
+    if drift:
+        with pytest.raises(AFDError, match="AFD_TRANSPORT_LANE_GROUP_DESCRIPTOR_DRIFT"):
+            transports[0].begin_step(None)
+    else:
+        assert not transports[0].begin_step(None).graph_eligible
+
+
+def test_ready_bad_payload_reports_source_and_kind_without_relaxing_validation():
+    _, transports = _store_transports(3, 4)
+    transports[3]._control.send_obj(_store_descriptor(3, "CAPTURE"), dst=0)
+    with pytest.raises(
+        AFDError, match="source=3 type=AFDStepDescriptor kind='CAPTURE'"
+    ):
+        transports[0].capture_ready()
 
 
 @pytest.mark.parametrize("reply", [None, {"event": "WRONG", "usage": {}}])
 def test_empty_f_invalid_close_ack_fails_without_acknowledging_a(reply):
-    transport = object.__new__(AFDPairedP2PTransport)
-    transport.role = AFDRole.FFN
-    transport._peer_close_usage = {"rank": 32}
-    transport._control_upstream, transport._control_followers = None, (31,)
-    transport._peer_coordination_ranks = (32,)
-    transport._close_exchange = transport._close_exchange_error = None
-    transport._close_timeout_seconds = 0.01
-    transport._retime_control_store = lambda seconds: None
-    sent = []
-
-    def receive(src):
-        if reply is None:
-            raise TimeoutError("Missing follower ACK")
-        return reply
-
-    transport._control = SimpleNamespace(
-        recv_obj=receive, send_obj=lambda obj, dst: sent.append((dst, obj))
+    _, transports = _store_transports(3, 4, timeout=0.05)
+    transport, attention = transports[0], transports[4]
+    attention._control.send_obj(
+        _store_descriptor(3, "CLOSE", -1, close_usage={"rank": 4}), dst=0
     )
+    assert transport.begin_step(None).kind == "CLOSE"
+    if reply is not None:
+        transports[3]._control.send_obj(reply, dst=0)
     with pytest.raises(AFDError) as first:
         transport.exchange_close(usage={"rank": 0})
     with pytest.raises(AFDError) as repeated:
         transport.exchange_close(usage={"rank": 0})
     assert repeated.value is first.value
-    assert not sent
+    assert not attention._control.store.check(["afd-control/0/4/send_to/4/0"])
 
 
 def test_glm_tp1_shared_is_computed_once_before_inplace_routed(routing):
@@ -432,3 +430,7 @@ def test_glm_tp1_shared_is_computed_once_before_inplace_routed(routing):
     )
     assert [item for item in calls if item[1] == "shared"] == [(0, "shared")]
     assert calls[:2] == [(0, "shared"), (0, "routed")]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v", "-x"]))
