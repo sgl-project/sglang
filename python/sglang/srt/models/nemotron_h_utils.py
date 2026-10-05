@@ -4,9 +4,9 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.layer_boundary import (
     ExitRows,
     ProducerReduction,
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NormQuantReadout,
@@ -42,16 +42,10 @@ def make_stage_boundary(layer_norm: RMSNorm, *, pattern: str, layer_idx: int):
 
     if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
         raise NotImplementedError("a Nemotron stage with attention CP or LayerNorm SP")
-    previous = _declaration(pattern, layer_idx - 1) if layer_idx > 0 else None
-    (boundary,) = make_stages(
+    (boundary,) = append_stages(
         (
             _declaration(pattern, layer_idx),
             layer_norm,
         ),
-        previous=previous,
-        following=_declaration(pattern, layer_idx + 1)
-        if layer_idx + 1 < len(pattern)
-        else None,
-        terminal=layer_idx == len(pattern) - 1,
     )
     return boundary
