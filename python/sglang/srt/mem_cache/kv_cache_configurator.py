@@ -1071,21 +1071,28 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # A fused draft stores its rows in the host's KV dtype. An explicit
-        # draft dtype resolves without the draft model, so a mismatch is
-        # declined here; `auto` follows the draft's quant config, which only
-        # the draft runner knows, and is checked when it binds.
+        # A fused draft stores its rows in the host's KV dtype, so the draft's
+        # dtype is resolved here as the draft runner resolves it and a
+        # mismatch declines. Without the draft model that is possible for an
+        # explicit draft dtype, and for a DFLASH-family fa4 draft, which the
+        # runner forces to the model dtype (fa4 is already declined as off the
+        # rails; the check does not rely on it). Otherwise `auto` follows the
+        # draft's quant config, which only the draft runner knows, and is
+        # checked when it binds.
+        is_dflash = self.spec_algorithm.is_dflash_family()
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype not in (None, "auto"):
+        if draft_kv_cache_dtype not in (None, "auto") or (
+            is_dflash and draft_backend == "fa4"
+        ):
             from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
             _, draft_kv_dtype = configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=draft_kv_cache_dtype,
+                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
                 model=None,
                 model_dtype=aux.draft_model_config.dtype,
                 is_draft_worker=True,
-                is_dflash=False,
-                speculative_draft_attention_backend=None,
+                is_dflash=is_dflash,
+                speculative_draft_attention_backend=draft_backend,
                 speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
             )
             if draft_kv_dtype != self.kv_cache_dtype:
