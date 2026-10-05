@@ -46,7 +46,7 @@ pub(super) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrappe
 pub(super) fn split_reasoning_unary(
     name: Option<&str>,
     text: &str,
-    token_ids: &[i32],
+    token_ids: &[i64],
 ) -> (String, String) {
     let Some(name) = name else {
         return (String::new(), text.to_owned());
@@ -85,7 +85,7 @@ impl ReasoningStreamSplitter {
     }
 
     /// Split one frame's text into `(reasoning_text, normal_text)` deltas.
-    pub(super) fn split(&mut self, text: &str, token_ids: &[i32]) -> (String, String) {
+    pub(super) fn split(&mut self, text: &str, token_ids: &[i64]) -> (String, String) {
         let Some(name) = self.name.as_deref() else {
             return (String::new(), text.to_owned());
         };

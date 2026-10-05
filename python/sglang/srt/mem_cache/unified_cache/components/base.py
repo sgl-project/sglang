@@ -41,7 +41,18 @@ if TYPE_CHECKING:
 _NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
-_COMPONENT_UUID_COUNTER = 1
+_COMPONENT_UUID_RANGE_SIZE = 100_000_000_000_000
+_COMPONENT_UUID_RANGE_INDEX = {
+    ComponentType.SWA: 0,
+    ComponentType.FULL: 1,
+    ComponentType.MAMBA: 2,
+    ComponentType.C128: 3,
+    ComponentType.AUXILIARY_SWA: 4,
+}
+_COMPONENT_UUID_COUNTERS = {
+    component_type: (range_index + 1) * _COMPONENT_UUID_RANGE_SIZE
+    for component_type, range_index in _COMPONENT_UUID_RANGE_INDEX.items()
+}
 
 
 @dataclasses.dataclass
@@ -64,6 +75,15 @@ class EvictLayer(IntFlag):
 
 
 @dataclasses.dataclass(frozen=True)
+class InternalStateBackup:
+    """Pause eviction for a host backup before freeing internal device state."""
+
+    node_id: NodeId
+    # Host capacity required by the backup, in this component's pool units.
+    num_tokens: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PrepareLoadBackResult:
     """Outcome of prepare_load_back; default = nothing to prepare."""
 
@@ -73,12 +93,11 @@ class PrepareLoadBackResult:
 
 @dataclasses.dataclass(frozen=True)
 class PreparePrefetchResult:
-    """Outcome of prepare_prefetch; default = nothing to prepare."""
+    """Outcome of prepare_prefetch; default = the component takes no part."""
 
-    # Host pool exhausted; the caller aborts the prefetch.
-    alloc_failed: bool = False
-    # The component's pre-allocated host buffer (None = skip the build).
-    host_indices: Optional[torch.Tensor] = None
+    # Host staging the fetch needs from this component, in the component
+    # pool's units. Allocated at hit time, next to the KV staging; 0 = none.
+    staging_tokens: int = 0
 
 
 class CacheTransferPhase(str, Enum):
@@ -113,10 +132,9 @@ def get_and_increase_time_counter() -> float64:
     return ret
 
 
-def next_component_uuid() -> int:
-    global _COMPONENT_UUID_COUNTER
-    _COMPONENT_UUID_COUNTER += 1
-    return _COMPONENT_UUID_COUNTER
+def next_component_uuid(component_type: ComponentType) -> int:
+    _COMPONENT_UUID_COUNTERS[component_type] += 1
+    return _COMPONENT_UUID_COUNTERS[component_type]
 
 
 class TreeComponent(ABC):
@@ -385,6 +403,11 @@ class TreeComponent(ABC):
         - Mamba: performs the copy-on-write into a per-request slot."""
         return result
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        """Constrain the combined effective cache length after every
+        component's `prepare_for_caching_req` truncation has been min'd."""
+        return cache_len
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
@@ -518,11 +541,12 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one eviction step and return a device leaf, if selected.
+    ) -> NodeId | InternalStateBackup | None:
+        """Return a device leaf, an internal backup request, or no selection.
 
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
+        Backup requests leave device state intact until the core resumes eviction.
         """
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
@@ -548,8 +572,8 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance the walk by at most one allocator-relevant mutation."""
+    ) -> NodeId | InternalStateBackup | None:
+        """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
 
     @abstractmethod
@@ -575,7 +599,7 @@ class TreeComponent(ABC):
           node itself (mamba state is per-leaf, not per-path).
 
         When ``lock_host`` is True, the lock applies to host-side state:
-        - Full: single-node host lock.
+        - Full: a one-node UUID-bounded segment that expands across splits.
         - SWA: host window-lock with a dedicated host UUID boundary.
         - Mamba: single-node host lock with host LRU detach."""
         ...
@@ -596,7 +620,8 @@ class TreeComponent(ABC):
         - Mamba: single-node unlock — only decrements lock_ref on the
           node itself.
 
-        When ``lock_host`` is True, the inverse host-side semantics apply."""
+        When ``lock_host`` is True, Full and SWA replay their host boundary
+        UUIDs while Mamba retains its single-node semantics."""
         ...
 
     def prepare_for_caching_req(
@@ -611,7 +636,8 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: copies its eviction cursor into insert_params for finished and
+          unfinished requests; may return a branching boundary.
         - Mamba: prepares mamba_value (finished from ping-pong buffer,
           unfinished fork from req); returns mamba_last_track_seqlen."""
         return None
@@ -666,8 +692,12 @@ class TreeComponent(ABC):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        """Cache-level host pre-allocation before a prefetch builds its transfers."""
+        """Size the host staging a prefetch from node_id needs from this component."""
         return PreparePrefetchResult()
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
+        return None
 
     def build_hicache_transfers(
         self,
@@ -678,6 +708,7 @@ class TreeComponent(ABC):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.

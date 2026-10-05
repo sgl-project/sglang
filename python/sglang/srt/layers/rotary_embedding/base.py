@@ -94,6 +94,7 @@ class RotaryEmbedding(BaseFusedOp):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
+        position_start: int = 0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -102,6 +103,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.position_start = position_start
         self._force_native = (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
@@ -109,7 +111,9 @@ class RotaryEmbedding(BaseFusedOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        # HIP: the fused QSA indexer JIT kernel (qsa_indexer.cuh) requires
+        # fp32 cos_sin_cache. Keep fp32 on HIP, matching CUDA behavior.
+        if not (_is_cuda or _is_hip or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -152,11 +156,19 @@ class RotaryEmbedding(BaseFusedOp):
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel
+            # (qsa_indexer.cuh requires const float* cos_sin_cache).
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -181,7 +193,11 @@ class RotaryEmbedding(BaseFusedOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float,
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -205,8 +221,9 @@ class RotaryEmbedding(BaseFusedOp):
         inv_freq = self._compute_inv_freq(self.base).to(device=device)
 
         # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        start = self.position_start + cur_len
+        end = self.position_start + new_len
+        t_new = torch.arange(start, end, dtype=inv_freq.dtype, device=device)
         if t_new.numel() == 0:
             return
 
@@ -429,9 +446,12 @@ class RotaryEmbedding(BaseFusedOp):
                 assert fused_set_kv_buffer_arg is None, (
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
-                self.cos_sin_cache = self.cos_sin_cache.to(
-                    query.device, dtype=query.dtype
-                )
+                if _is_hip:
+                    self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                else:
+                    self.cos_sin_cache = self.cos_sin_cache.to(
+                        query.device, dtype=query.dtype
+                    )
                 self.fallback_rotary_embedding(
                     positions,
                     query,

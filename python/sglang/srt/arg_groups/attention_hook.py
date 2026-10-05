@@ -27,8 +27,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -174,11 +176,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
-            # The record, via the input snapshot rather than the field: a
-            # hook may not read a field off the record (the guard in
-            # `test_resolution_reads_the_declarations.py`), and what this
-            # needs is the input anyway -- whether the operator asked for a
-            # memory fraction, not the value in effect.
+            # Check whether the operator supplied a memory fraction using
+            # the raw input snapshot; resolution may have filled the value in.
             explicit_mem_fraction = (
                 getattr(server_args, "_raw_input", None) or {}
             ).get("mem_fraction_static") is not None
@@ -278,6 +277,23 @@ def handle_linear_attn_backend(server_args: Any):
     verify = cfg.linear_attn_verify_backend
     if verify is None and decode == "flashinfer":
         verify = "flashinfer"
+    if (
+        pp_spec_stable_rows_enabled()
+        and verify == "flashinfer"
+        and uses_kda_attention(model_config_of(server_args).hf_config)
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_verify_backend="triton",
+        )
+        verify = "triton"
+        logger.warning(
+            "SGLANG_ENABLE_PP_SPEC with KDA does not support the FlashInfer "
+            "target-verify row layout; falling back "
+            "--linear-attn-verify-backend to triton. FlashInfer decode is "
+            "unchanged."
+        )
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
