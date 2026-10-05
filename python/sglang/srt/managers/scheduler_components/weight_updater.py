@@ -81,7 +81,7 @@ def _parse_runner_selector(selector: str) -> Set[str]:
 class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
-    loaded_weights: bool = False
+    loaded_roles: frozenset[str] = frozenset()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -174,6 +174,11 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    def _record_loaded_runner(self, role: str) -> None:
+        self._session = msgspec.structs.replace(
+            self._session, loaded_roles=self._session.loaded_roles | {role}
+        )
+
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -186,6 +191,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("distributed"):
+            target_updated = False
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -201,17 +207,21 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             else:
                 success, message = True, "Succeeded to update parameter online."
-                for _, runner in self._select_runners(recv_req.selector):
-                    success, message = (
-                        runner.weight_updater.load_weights_from_distributed(weights)
-                    )
-                    if not success:
-                        break
+                try:
+                    for role, runner in self._select_runners(recv_req.selector):
+                        success, message = (
+                            runner.weight_updater.load_weights_from_distributed(weights)
+                        )
+                        if not success:
+                            break
+                        self._record_loaded_runner(role)
+                        target_updated |= role == "target"
+                finally:
+                    if target_updated:
+                        self.flush_cache_after_weight_update(recv_req)
             if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.flush_cache_after_weight_update(recv_req)
+                if not target_updated:
+                    self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
@@ -230,18 +240,23 @@ class SchedulerWeightUpdaterManager:
                 recv_req.serialized_named_tensors
             )
             success, message = True, "Success"
-            for _, runner in self._select_runners(recv_req.selector):
-                success, message = runner.weight_updater.update_weights_from_tensor(
-                    named_tensors=named_tensors,
-                    load_format=recv_req.load_format,
-                )
-                if not success:
-                    break
+            target_updated = False
+            try:
+                for role, runner in self._select_runners(recv_req.selector):
+                    success, message = runner.weight_updater.update_weights_from_tensor(
+                        named_tensors=named_tensors,
+                        load_format=recv_req.load_format,
+                    )
+                    if not success:
+                        break
+                    self._record_loaded_runner(role)
+                    target_updated |= role == "target"
+            finally:
+                if target_updated:
+                    self.flush_cache_after_weight_update(recv_req)
             if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.flush_cache_after_weight_update(recv_req)
+                if not target_updated:
+                    self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
@@ -311,9 +326,10 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
-        run_post_load = not self._session.loaded_weights
-        for _, runner in self._select_runners(self._session.selector):
-            runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+        for role, runner in self._select_runners(self._session.selector):
+            runner.weight_updater.end_weight_update(
+                run_post_load=role not in self._session.loaded_roles
+            )
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
