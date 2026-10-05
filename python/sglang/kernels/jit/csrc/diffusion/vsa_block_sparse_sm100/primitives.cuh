@@ -878,4 +878,3 @@ __device__ __forceinline__
 void sts_f32(uint32_t smem_addr, float val) {
   asm volatile("st.shared.f32 [%0], %1;" :: "r"(smem_addr), "f"(val) : "memory");
 }
-

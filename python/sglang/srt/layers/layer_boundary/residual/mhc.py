@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
-from sglang.srt.layers.layer_boundary.residual import LayerResidual
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -28,7 +28,7 @@ class MHCState:
     """A layer's residual as hyper-connection streams: the residual is hc_mult
     streams, a stage's output is written in with hc_post and the next stage's
     input read with hc_pre and the norm. A read produces the h_res / h_post the
-    next write-back consumes; they move with the tokens. ``layer_residual()``
+    next write-back consumes; they move with the tokens. ``residual_ops()``
     gives the reads and updates the layer's two stages declare. Parameters
     belong to the owning layer; this state only holds scratch shared across
     communication stages."""
@@ -50,7 +50,9 @@ class MHCState:
             return None, None
         return out_norm.weight.data, out_norm.variance_epsilon
 
-    def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
+    def read_attn_input(
+        self, hidden_states, out_norm: Optional[torch.nn.Module] = None
+    ):
         residual = hidden_states
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
@@ -60,7 +62,7 @@ class MHCState:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
-    def attn_to_mlp(
+    def update_and_read_ffn_input(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
@@ -90,97 +92,99 @@ class MHCState:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
-    def mlp_combine(self, hidden_states, residual):
+    def apply_post(self, hidden_states, residual):
         return self.hc_post(hidden_states, residual, self.h_res, self.h_post)
 
-    def reset_aux(self):
+    def clear_coefficients(self):
         self.h_res = None
         self.h_post = None
 
-    def residual_to_attn_tp_shard(self, residual):
+    def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
         self.h_res = self.h_res.tensor_split(size)[rank]
         self.h_post = self.h_post.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
 
-    def residual_from_attn_tp_shards(self, residual):
+    def gather_residual_attn_tp(self, residual):
         raise NotImplementedError(
             "Unsupported: h_res/h_post allgather not implemented."
         )
 
-    def layer_residual(self) -> LayerResidual:
-        return LayerResidual(
-            attention_read=_AttentionRead(self),
-            attention_update=_AttentionUpdate(self),
-            ffn_read=_FfnRead(self),
+    def residual_ops(self) -> LayerResidualOps:
+        return LayerResidualOps(
+            attn_readout=_AttnReadout(self),
+            attn_update=_AttnUpdate(self),
+            ffn_readout=_FfnReadout(self),
             ffn_update=_FfnUpdate(self),
         )
 
 
-class _AttentionRead:
+class _AttnReadout:
     """hc_pre and the input norm, from streams that already hold the previous
     layer's output: an MHC layer takes its input written back."""
 
-    norms_plainly = False
-    before_gather = False
+    is_plain_norm = False
+    reads_before_dp_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state
 
-    def enter(self, hidden_states):
+    def init_residual(self, hidden_states):
         return hc_expand(hidden_states, self.state.hc_mult)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         if quant_format:
             raise NotImplementedError(f"an MHC attention input in {quant_format=}")
-        return self.state.attn_split(residual, out_norm=norm)
+        return self.state.read_attn_input(residual, out_norm=norm)
 
     def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
         raise NotImplementedError("an MHC layer takes its input written back")
 
 
-class _AttentionUpdate:
+class _AttnUpdate:
     """hc_post with the coefficients the attention's read produced. It is not a
     plain add, so it runs only once the sum it writes in is complete."""
 
-    adds_plainly = False
-    at_producer = False
-    can_defer_across_layers = False
+    is_plain_add = False
+    applied_at_exit = False
+    outlives_layer = False
 
     def __init__(self, state: MHCState):
         self.state = state
 
     def update(self, hidden_states, residual):
-        return self.state.mlp_combine(hidden_states, residual)
+        return self.state.apply_post(hidden_states, residual)
 
-    def residual_to_attn_tp_shard(self, residual):
-        return self.state.residual_to_attn_tp_shard(residual)
+    def slice_residual_attn_tp(self, residual):
+        return self.state.slice_residual_attn_tp(residual)
 
-    def residual_from_attn_tp_shards(self, residual):
-        return self.state.residual_from_attn_tp_shards(residual)
+    def gather_residual_attn_tp(self, residual):
+        return self.state.gather_residual_attn_tp(residual)
 
 
-class _FfnRead:
+class _FfnReadout:
     """The attention output's hc_post and the FFN input's hc_pre and norm, fused
     in hc_ffn_post_pre when it takes the batch."""
 
-    norms_plainly = False
-    before_gather = False
+    is_plain_norm = False
+    reads_before_dp_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state
 
-    def enter(self, hidden_states):
+    def init_residual(self, hidden_states):
         return hc_expand(hidden_states, self.state.hc_mult)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         raise NotImplementedError("an MHC FFN input read without its attention")
 
     def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
-        if not isinstance(update, _AttentionUpdate) or update.state is not self.state:
+        if not isinstance(update, _AttnUpdate) or update.state is not self.state:
             raise NotImplementedError(f"an MHC FFN input after {update=}")
-        return self.state.attn_to_mlp(hidden_states, residual, out_norm=norm)
+        return self.state.update_and_read_ffn_input(
+            hidden_states, residual, out_norm=norm
+        )
 
 
 class _FfnUpdate:
@@ -188,22 +192,22 @@ class _FfnUpdate:
     layer runs itself; the last layer also contracts the streams into the
     hidden states the layer stack hands on."""
 
-    adds_plainly = False
-    at_producer = True
-    can_defer_across_layers = False
+    is_plain_add = False
+    applied_at_exit = True
+    outlives_layer = False
 
     def __init__(self, state: MHCState):
         self.state = state
 
     def update(self, hidden_states, residual):
-        hidden_states = self.state.mlp_combine(hidden_states, residual)
-        self.state.reset_aux()
+        hidden_states = self.state.apply_post(hidden_states, residual)
+        self.state.clear_coefficients()
         if self.state.is_last_layer:
             hidden_states = hc_contract(hidden_states, self.state.hc_mult)
         return hidden_states
 
-    def residual_to_attn_tp_shard(self, residual):
-        return self.state.residual_to_attn_tp_shard(residual)
+    def slice_residual_attn_tp(self, residual):
+        return self.state.slice_residual_attn_tp(residual)
 
-    def residual_from_attn_tp_shards(self, residual):
-        return self.state.residual_from_attn_tp_shards(residual)
+    def gather_residual_attn_tp(self, residual):
+        return self.state.gather_residual_attn_tp(residual)
