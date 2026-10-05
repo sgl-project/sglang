@@ -19,9 +19,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -783,7 +783,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
         is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
-        is_previous_moe_layer = self._is_layer_sparse(config, self.layer_id - 1)
         is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -821,7 +820,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             if config.attention_type == 1 and self.use_mla
             else None
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -834,12 +833,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _is_layer_sparse(
