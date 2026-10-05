@@ -130,7 +130,7 @@ prepared weight layouts.
 
 | op id | FlashInfer entry | SM | notes (graph/prepare) |
 |---|---|---|---|
-| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | two launches (norm/AdaLN -> BF16 `[M, 5376]` workspace, cached per `(M, device)`; persistent QKV GEMM with the Q/K-norm/RoPE/pack epilogue); engine operands, `[kind, head, d]` weight rows (`bd94c5806`) |
+| `minimax_h3_bf16_pre_attention` | `diffusion_ops.minimax_h3:minimax_h3_bf16_pre_attention` | 10.0-10.3 | two launches (norm/AdaLN -> BF16 `[M, 5376]` workspace, allocated per call by FlashInfer unless the caller passes one; persistent QKV GEMM with the Q/K-norm/RoPE/pack epilogue); engine operands, `[kind, head, d]` weight rows (`745b12352d4`) |
 | `minimax_h3_dense_attention` | `diffusion_ops.cake_minimax_h3_dense_attention:minimax_h3_dense_attention` | 9.0-10.3, 12.0-12.1 | one-shot; cc 12.1 admitted but unmeasured |
 | `minimax_h3_fc1_swiglu` | `diffusion_ops.minimax_h3_fc1_swiglu:minimax_h3_fc1_swiglu` | 10.0-10.3 | one-shot; engine operands (`f62ffa92a12`) |
 | `minimax_h3_fc1_swiglu_fp8` | `diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu:minimax_h3_fc1_swiglu_fp8` | 12.0 | one-shot |
@@ -335,6 +335,11 @@ project, not in this tree.
   stride, 16-byte head and token strides) and writes a contiguous output. The MXFP8 /
   NVFP4 pre-attention chains and `minimax_h3_qkv_quantize_pack` keep the `e4f94f948`
   contract (contiguous `[9, 5376]` tables, int32 index, per-row `rope_cos_sin [M, 96]`).
+- **Re-pin to `745b12352d4`** (MiniMax-H3 BF16 pre-attention, flashinfer-ai/flashinfer#6055): the BF16
+  `minimax_h3_bf16_pre_attention` entry consumes the engine-resident `qkv_proj.weight` row order
+  (`[kind, head, d]` = `[q_all | k_all | v_all]`, what the model's loader holds) and runs as two
+  launches (norm/AdaLN workspace + persistent QKV GEMM with the Q/K-norm/RoPE/pack epilogue); the
+  optional `workspace` operand is allocated per call when absent. Other entries keep `f62ffa92a12`.
 - **Pinned release**: SGLang pins `flashinfer_python 0.7.0.post1`, which ships 11 of the
   117 Cake Python modules present at the baseline. For the other 106, `find_spec` returns
   `None`, `supports_*` returns `False` and callers keep their existing backend: no import

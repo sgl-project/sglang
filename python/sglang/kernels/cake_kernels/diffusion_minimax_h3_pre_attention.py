@@ -1,7 +1,7 @@
 """Cake MiniMax-H3 pre-attention projections (SM100a / SM103a) via FlashInfer.
 
 FlashInfer entries (``flashinfer.diffusion_ops``; the BF16 entry at FlashInfer
-``bd94c5806``, the quantized chains at ``e4f94f9484``):
+``745b12352d4``, the quantized chains at ``e4f94f9484``):
 
 * ``minimax_h3_bf16_pre_attention`` -- input RMSNorm + indexed AdaLN + BF16 QKV
   projection + per-head Q/K RMSNorm + partial 3-D split-half NeoX RoPE +
@@ -206,7 +206,7 @@ def _bf16_pre_attention_inputs(
     eps: float,
     qk_eps: Optional[float],
 ) -> bool:
-    """The engine-operand contract of the BF16 entry (FlashInfer ``bd94c5806``)."""
+    """The engine-operand contract of the BF16 entry (FlashInfer ``745b12352d4``)."""
     import torch
 
     if not (
