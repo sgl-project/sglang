@@ -71,9 +71,11 @@ class _Session:
 class DeltaSession:
     """One original process following the Miles prepare/apply/resume sequence.
 
-    The backend is injected so lifecycle tests do not need CUDA. ``prepare`` may
-    allocate/upload on its own stream; ``apply`` must check decoder status and finish its GPU work
-    and ``close`` must retain buffers until every use of that stream completes.
+    The backend is injected so lifecycle tests do not need CUDA. ``prepare`` owns
+    immutable host inputs, small GPU metadata/workspace and CPU plans. ``apply``
+    allocates large decoded slots after the reader fence, joins DE/application
+    streams and releases scratch before
+    resume. Error cleanup retains buffers until both streams have drained.
     """
 
     def __init__(self, identity: dict, backend: Any, initial_version: int = 0):

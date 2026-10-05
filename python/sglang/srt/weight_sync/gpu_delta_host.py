@@ -11,10 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Engine-local verified publication bytes with reusable CPU/CUDA-pinned capacity.
+"""Engine-local verified publication bytes in shared DE-compatible host memory.
 
-Ranks of one engine on a host share a tmpfs arena. Separate engines use separate
-roots, locks and lifetimes; no distributed or inference collectives run.
+Ranks of one engine share a CUDA HOST_NUMA arena. Tmpfs holds encoded-file
+staging and publication records. Separate engines have separate lifetimes.
 """
 
 import fcntl
@@ -30,6 +30,7 @@ from pathlib import Path
 
 import orjson
 
+from sglang.srt.weight_sync.gpu_delta_memory import SharedHostAllocation
 from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 
 
@@ -251,20 +252,66 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
 
 
 class HostArena:
-    """Backend-owned mapping and CUDA registration, retained across updates.
+    """Backend-owned shared host mapping, retained across updates.
 
     A namespace binds the original engine ranks, delta stream and host tensor union.
     Miles sends resume after all engine ranks apply; it releases the generation.
     Abort/failure retains its bytes and cannot recycle the slot automatically.
     """
 
-    def __init__(self, engine_id):
-        self.engine_id = engine_id
+    def __init__(self, engine_id, device):
+        self.engine_id, self.device = engine_id, device
+        self.allocation = None
         self.mapping = self.tensor = None
-        self.registered = False
         self.identity = None
         self.directory = None
         self.tensor_order = None
+
+    def _attach(self, shared, allocation=None):
+        import torch
+
+        if self.identity == shared["identity"]:
+            return True
+        if allocation is None and shared["capacity"]:
+            allocation = SharedHostAllocation(
+                shared["capacity"], self.device, shared["handle"]
+            )
+        self.close()
+        self.allocation = allocation
+        self.mapping = allocation.view if allocation is not None else None
+        self.tensor = (
+            torch.frombuffer(self.mapping, dtype=torch.uint8)
+            if self.mapping is not None
+            else torch.empty(0, dtype=torch.uint8)
+        )
+        self.identity = shared["identity"]
+        return False
+
+    def _reserve_shared(self, previous, size, metrics):
+        if previous is not None and size <= previous["capacity"]:
+            self._attach(previous)
+            return previous
+        capacity = size if previous is None else 2 * size
+        capacity = (
+            (capacity + _CAPACITY_ALIGNMENT - 1)
+            // _CAPACITY_ALIGNMENT
+            * _CAPACITY_ALIGNMENT
+        )
+        started = time.perf_counter()
+        allocation = SharedHostAllocation(capacity, self.device) if capacity else None
+        capacity = allocation.capacity if allocation is not None else 0
+        generation = previous["generation"] + 1 if previous else 1
+        shared = {
+            "generation": generation,
+            "capacity": capacity,
+            "identity": [uuid.uuid4().hex, generation, capacity],
+            "handle": allocation.shareable if allocation is not None else None,
+        }
+        self._attach(shared, allocation)
+        metrics["host_shared_allocation_s"] += time.perf_counter() - started
+        metrics["host_shared_allocation_calls"] += 1
+        metrics["host_shared_allocation_bytes"] += capacity
+        return shared
 
     def prepare(
         self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
@@ -337,11 +384,12 @@ class HostArena:
             )
         }
         waiting = time.perf_counter()
-        # The mutex covers CPU construction/attachment only. Per-process CUDA
-        # registration and inference work never run while holding this mutex.
+        # The mutex covers CPU construction/attachment, including host VMM setup.
+        # It never encloses GPU stream work or inference collectives.
         # Original participant identities also scope the lock: unrelated engine
         # incarnations may reuse the same controller-assigned engine name.
         directory.mkdir(mode=0o700, exist_ok=True)
+        previous_identity = self.identity
         with (directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             metrics["host_payload_cache_wait_s"] = time.perf_counter() - waiting
@@ -405,9 +453,7 @@ class HostArena:
                 entries = [entries_by_name[name] for name in self.tensor_order]
                 layout, size = _tensor_layout(entries)
                 encoded_size = sum(record["nbytes"] for record in definitions.values())
-                shared = _reserve(
-                    directory,
-                    "shared",
+                shared = self._reserve_shared(
                     previous["shared"] if previous else None,
                     size,
                     metrics,
@@ -461,17 +507,13 @@ class HostArena:
                     )
                     files[name] = view
                     position = end
-                with (directory / shared["file"]).open("r+b") as source:
-                    decoded_map = mmap.mmap(source.fileno(), 0) if size else None
                 decode_hash_started = time.perf_counter()
                 hash_future = pool.hash_executor.submit(
                     _hash_payloads, files, definitions
                 )
                 try:
                     _decode_arena(
-                        memoryview(decoded_map)
-                        if decoded_map is not None
-                        else memoryview(b""),
+                        self.mapping if self.mapping is not None else memoryview(b""),
                         layout,
                         files,
                         entries,
@@ -506,33 +548,19 @@ class HostArena:
                         "generation": shared["generation"],
                     },
                 )
-                # Old registered mappings keep their inodes alive until each
-                # original process attaches the new capacity generation.
+                # Each imported CUDA handle retains its old physical pages
+                # until that rank attaches the new capacity generation.
                 if previous:
-                    for prefix in ("shared", "encoded"):
-                        if previous[prefix]["file"] != index[prefix]["file"]:
-                            (directory / previous[prefix]["file"]).unlink()
+                    if previous["encoded"]["file"] != index["encoded"]["file"]:
+                        (directory / previous["encoded"]["file"]).unlink()
                 metrics["host_payload_cache_created"] = 1
-            identity = index["shared"]["identity"]
-            reused_mapping = self.identity == identity
-            if not reused_mapping:
-                with (directory / index["shared"]["file"]).open("r+b") as source:
-                    if _identity(os.fstat(source.fileno())) != identity:
-                        raise ValueError("host arena inode/capacity changed")
-                    mapping = (
-                        mmap.mmap(source.fileno(), 0)
-                        if index["shared"]["capacity"]
-                        else None
-                    )
-        if not reused_mapping:
-            self.close()  # CUDA unregister never holds the shared build mutex.
-            self.mapping, self.identity = mapping, identity
+            self._attach(index["shared"])
+        reused_mapping = previous_identity == self.identity
         self.directory = directory
         metrics.update(
             host_shared_arena_bytes=index["arena_bytes"],
             host_shared_capacity_bytes=index["shared"]["capacity"],
             host_shared_capacity_generation=index["shared"]["generation"],
-            host_shared_capacity_inode=index["shared"]["identity"][1],
             host_shared_mapping_reused=int(reused_mapping),
             host_encoded_capacity_bytes=index["encoded"]["capacity"],
             host_encoded_capacity_generation=index["encoded"]["generation"],
@@ -542,54 +570,11 @@ class HostArena:
         timings.update(metrics)
         return HostDecodedSnapshot(self, index)
 
-    def register(self, device, timings):
-        import torch
-
-        self.device = device
-        started = time.perf_counter()
-        calls = 0
-        reused = self.registered
-        if self.tensor is None:
-            if self.mapping is not None:
-                self.tensor = torch.frombuffer(self.mapping, dtype=torch.uint8)
-                self.pointer = self.tensor.data_ptr()
-                with torch.cuda.device(device):
-                    result = torch.cuda.cudart().cudaHostRegister(
-                        self.pointer, self.tensor.numel(), 1
-                    )
-                    if int(result) != 0:
-                        raise RuntimeError(
-                            f"shared delta cudaHostRegister failed: {result}"
-                        )
-                    self.registered = True
-                    calls = 1
-                    if not self.tensor.is_pinned():
-                        raise RuntimeError(
-                            "registered delta mapping is not recognized "
-                            "as CUDA pinned memory"
-                        )
-            else:
-                self.tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
-        timings.update(
-            host_shared_register_s=time.perf_counter() - started,
-            host_shared_registered_bytes=self.tensor.numel() if calls else 0,
-            host_shared_register_calls=calls,
-            host_shared_registration_reused=int(reused),
-            host_shared_registration_capacity_bytes=self.tensor.numel(),
-        )
-
     def close(self):
-        if self.registered:
-            import torch
-
-            with torch.cuda.device(self.device):
-                result = torch.cuda.cudart().cudaHostUnregister(self.pointer)
-                if int(result) != 0:
-                    raise RuntimeError(
-                        f"shared delta cudaHostUnregister failed: {result}"
-                    )
-            self.registered = False
         self.tensor = self.mapping = None
+        if self.allocation is not None:
+            self.allocation.close()
+            self.allocation = None
         self.identity = None
 
 
@@ -619,5 +604,5 @@ class HostDecodedSnapshot:
                 _write_record(self.directory, "state", state)
 
     def close(self):
-        # Backend retains its registration; caller has already fenced H2D.
+        # Backend retains host pages; caller has already fenced all DE readers.
         self.arena = None

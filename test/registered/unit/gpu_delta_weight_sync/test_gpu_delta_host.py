@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import mmap
 import multiprocessing
 import os
 import tempfile
@@ -129,6 +130,31 @@ def fake_fallocate(fd, offset, length):
     os.ftruncate(fd, offset + length)
 
 
+class FakeHostAllocation:
+    """CPU backing only; allocator ABI/FD transfer is tested separately."""
+
+    directory = None
+
+    def __init__(self, capacity, device, shared=None):
+        self.capacity = capacity
+        if shared is None:
+            fd, shared = tempfile.mkstemp(dir=self.directory)
+            os.ftruncate(fd, capacity)
+        else:
+            fd = os.open(shared, os.O_RDWR)
+        self.shareable = shared
+        try:
+            self.mapping = mmap.mmap(fd, capacity)
+        finally:
+            os.close(fd)
+        self.view = memoryview(self.mapping)
+
+    def close(self):
+        self.view.release()
+        # Mock call histories/exception tracebacks can retain drained views.
+        self.mapping = None
+
+
 def metadata(version=1, engine="a"):
     return dict(
         stream_id="stream",
@@ -143,7 +169,7 @@ def metadata(version=1, engine="a"):
 
 
 def _child(root, path, digest, manifest, names, barrier, output):
-    pool, arena = OuterZstdPool(2), host.HostArena("a")
+    pool, arena = OuterZstdPool(2), host.HostArena("a", 0)
     try:
         with patch.object(host, "_cache_base", return_value=Path(root)):
             identity = host.host_cache_id("a")
@@ -174,9 +200,11 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.cache = self.root / "cache"
         self.cache.mkdir()
+        FakeHostAllocation.directory = self.cache
         for replacement in (
             patch.object(host, "_cache_base", return_value=self.cache),
             patch.object(host, "_CAPACITY_ALIGNMENT", 1024),
+            patch.object(host, "SharedHostAllocation", FakeHostAllocation),
             patch.object(
                 os, "posix_fallocate", side_effect=fake_fallocate, create=True
             ),
@@ -187,7 +215,7 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.addCleanup(self.pool.close)
 
     def arena(self, engine="a"):
-        arena = host.HostArena(engine)
+        arena = host.HostArena(engine, 0)
         self.addCleanup(arena.close)
         return arena
 

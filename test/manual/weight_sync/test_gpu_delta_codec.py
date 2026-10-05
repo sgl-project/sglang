@@ -19,6 +19,7 @@ from sglang.srt.weight_sync.gpu_delta_layout import (
     _plan_decode,
     _PreparedBatch,
 )
+from sglang.srt.weight_sync.gpu_delta_memory import SharedHostAllocation
 
 
 def _encode(values, offsets=None):
@@ -51,45 +52,72 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
     # A different frame count, partial final frame and sparse output offsets
     # exercise views whose row stride is the complete metadata slab's width.
     payload_b, frames_b = _encode(values[1], [128, 128 + (64 << 10) + 256])
-    batches = [frames_a, frames_b]
-    hosts = []
-    for payload in (payload_a, payload_b):
-        host = torch.empty(
-            len(payload), dtype=torch.uint8, device="cpu", pin_memory=True
-        )
-        host.numpy()[:] = memoryview(payload)
-        hosts.append(host)
+    input_b = (len(payload_a) + 15) // 16 * 16
+    allocation = SharedHostAllocation(input_b + len(payload_b), device.index)
+    host = torch.frombuffer(allocation.view, dtype=torch.uint8)
+    host[: len(payload_a)].numpy()[:] = memoryview(payload_a)
+    host[input_b : input_b + len(payload_b)].numpy()[:] = memoryview(payload_b)
+    batches = [
+        frames_a,
+        [
+            DecodeFrame(
+                input_b + f.input_offset,
+                f.encoded_bytes,
+                f.output_offset,
+                f.decoded_bytes,
+            )
+            for f in frames_b
+        ],
+        frames_a,
+    ]
     stream = torch.cuda.Stream(device=device)
-    encoded = torch.empty(
-        max(host.numel() for host in hosts), dtype=torch.uint8, device=device
-    )
-    decoded = torch.empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
+    de_stream = torch.cuda.Stream(device=device)
     workspace = decoder.allocate_workspace(batches)
-    plans = decoder.prepare_batches(batches, encoded, decoded, workspace, stream)
+    plan = decoder.prepare_batches(batches, host, workspace, de_stream)
+    # Large outputs are allocated only at the paused binding boundary.
+    decoded = [
+        torch.empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
+        for _ in range(2)
+    ]
+    plans = plan.bind_outputs(decoded)
+    del plan
     assert plans[0].metadata.untyped_storage().data_ptr() == (
         plans[1].metadata.untyped_storage().data_ptr()
     )
     assert plans[0].host_metadata.untyped_storage().data_ptr() == (
         plans[1].host_metadata.untyped_storage().data_ptr()
     )
-    assert all(plan.metadata.stride(0) == 5 for plan in plans)
-    assert plans[0].statuses.data_ptr() == plans[1].statuses.data_ptr()
+    assert all(plan.metadata.stride(0) == 8 for plan in plans)
+    assert plans[0].statuses.data_ptr() != plans[1].statuses.data_ptr()
+    assert plans[0].actual_sizes.data_ptr() != plans[1].actual_sizes.data_ptr()
+    assert plans[0].statuses.data_ptr() == plans[2].statuses.data_ptr()
+    assert plans[0].actual_sizes.data_ptr() == plans[2].actual_sizes.data_ptr()
+    assert all(plan.host_input is host for plan in plans)
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.timing_enabled = False
+    prepared.stream, prepared.de_stream = stream, de_stream
+    prepared.decoded_ready = [torch.cuda.Event() for _ in range(2)]
+    prepared.decoded_free = [torch.cuda.Event() for _ in range(2)]
     # B leaves a prefix, an interior hole and a short tail; the rest of the
-    # larger scratch still belongs to A and is not read by B's apply plan.
+    # larger scratch retains its poison and is not read by B's apply plan.
     output_sizes = [
-        decoded.numel(),
+        decoded[0].numel(),
         frames_b[-1].output_offset + frames_b[-1].decoded_bytes + 64,
+        decoded[0].numel(),
     ]
     prepared_batches = []
+    # Output/workspace allocation happened on the current stream. The setup
+    # event below carries this dependency onward to the DE stream as well.
+    stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.device(device), torch.cuda.stream(stream):
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
-        for plan, frames, size in zip(plans, batches, output_sizes):
+        for index, (plan, frames, size) in enumerate(zip(plans, batches, output_sizes)):
+            binding = SimpleNamespace(name="tensor")
             mapped, gaps = _plan_decode(
-                [
-                    (
-                        [
+                [(binding, 0, size)],
+                {
+                    "tensor": {
+                        "frames": [
                             {
                                 "encoded_offset": f.input_offset,
                                 "encoded_bytes": f.encoded_bytes,
@@ -97,52 +125,71 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
                                 "decoded_bytes": f.decoded_bytes,
                             }
                             for f in frames
-                        ],
-                        0,
-                        0,
-                        size,
-                    )
-                ],
-                0,
+                        ]
+                    }
+                },
+                {"tensor": {"offset": 0}},
             )
             assert mapped == frames
             prepared_batches.append(
                 _PreparedBatch(
-                    [],
                     plan,
                     None,
                     [],
-                    [decoded[offset : offset + length] for offset, length in gaps],
+                    [
+                        decoded[index % 2][offset : offset + length]
+                        for offset, length in gaps
+                    ],
                     prepare_status_check(plan, prepared.error),
                 )
             )
+        for output in decoded:
+            output.fill_(0xA5)
+        ready = torch.cuda.Event()
+        ready.record(stream)
+    de_stream.wait_event(ready)
     assert not prepared_batches[0].zero_ranges
     assert [view.numel() for view in prepared_batches[1].zero_ranges] == [128, 256, 64]
     observations = []
-    # A -> B -> A reuses both the encoded slot and shared status/output scratch
-    # on one stream, including the initial metadata upload, with one final fence.
+    # A -> B -> A reads immutable host bytes directly. DE overlaps the previous
+    # apply stream; slot zero is reused only after its output/status readers.
+    # One final apply fence joins all work, including metadata upload on DE.
     with torch.cuda.device(device), torch.cuda.stream(stream):
-        decoded.fill_(0xA5)
-        for index in (0, 1, 0):
-            plan, host = plans[index], hosts[index]
-            encoded[: host.numel()].copy_(host, non_blocking=True)
-            prepared._decode_batch(prepared_batches[index])
+        prepared._decode_batch(prepared_batches[0], 0)
+        for index, (plan, batch) in enumerate(zip(plans, prepared_batches)):
+            stream.wait_event(prepared.decoded_ready[index % 2])
+            prepared._apply_batch(batch)
             observations.append(
-                (decoded.clone(), plan.statuses.clone(), plan.actual_sizes.clone())
+                (
+                    decoded[index % 2].clone(),
+                    plan.statuses.clone(),
+                    plan.actual_sizes.clone(),
+                )
             )
+            prepared.decoded_free[index % 2].record(stream)
+            if index + 1 < len(plans):
+                prepared._decode_batch(prepared_batches[index + 1], index + 1)
         complete = torch.cuda.Event()
         complete.record(stream)
     complete.synchronize()
-    expected = bytearray([0xA5]) * decoded.numel()
-    for index, (output, statuses, sizes) in zip((0, 1, 0), observations):
+    for index, (output, statuses, sizes) in enumerate(observations):
+        expected = bytearray([0xA5]) * decoded[index % 2].numel()
         expected[: output_sizes[index]] = bytes(output_sizes[index])
-        for frame, value in zip(batches[index], values[index]):
+        source_values = values[1 if index == 1 else 0]
+        for frame, value in zip(batches[index], source_values):
             expected[frame.output_offset : frame.output_offset + len(value)] = value
         assert statuses.tolist() == [0] * len(batches[index])
-        assert sizes.tolist() == list(map(len, values[index]))
+        assert sizes.tolist() == list(map(len, source_values))
         assert plans[index].expected_sizes.tolist() == sizes.tolist()
         assert bytes(output.cpu().numpy()) == expected
     assert prepared.error.item() == 0
+    assert bytes(host[: len(payload_a)].numpy()) == payload_a
+    assert bytes(host[input_b : input_b + len(payload_b)].numpy()) == payload_b
+    # Release CPU views only after DE and apply readers have completed.
+    plans.clear()
+    prepared_batches.clear()
+    del plan, batch, host
+    allocation.close()
 
     # Inject status metadata only, never a malformed GPU-compressed stream.
     # Failure in either CTA and a size mismatch all set the same sticky flag;
@@ -172,27 +219,30 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch():
 def test_rejects_frame_range_before_decode():
     device = torch.device("cuda", 0)
     decoder = NvcompDecoder(device)
-    encoded = torch.empty(256, dtype=torch.uint8, device=device)
-    decoded = torch.empty(256, dtype=torch.uint8, device=device)
+    allocation = SharedHostAllocation(256, device.index)
+    host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
+    decoded = tuple(
+        torch.empty(256, dtype=torch.uint8, device=device) for _ in range(2)
+    )
     stream = torch.cuda.Stream(device=device)
     good = [DecodeFrame(0, 32, 0, 128)]
     workspace = decoder.allocate_workspace([good])
     with pytest.raises(ValueError, match="outside input"):
         decoder.prepare_batches(
             [good, [DecodeFrame(240, 32, 0, 128)]],
-            encoded,
-            decoded,
+            host,
             workspace,
             stream,
         )
-    with pytest.raises(ValueError, match="Overlapping"):
-        decoder.prepare_batches(
-            [good, [DecodeFrame(0, 32, 250, 128)]],
-            encoded,
-            decoded,
-            workspace,
-            stream,
-        )
+    plan = decoder.prepare_batches(
+        [good, [DecodeFrame(0, 32, 250, 128)]], host, workspace, stream
+    )
+    with pytest.raises(ValueError, match="Out-of-bounds"):
+        plan.bind_outputs(decoded)
+    stream.synchronize()
+    del plan
+    del host
+    allocation.close()
 
 
 if __name__ == "__main__":

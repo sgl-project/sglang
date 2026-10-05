@@ -44,15 +44,17 @@ it does not require nvCOMP.
 The codec suite is manual-only because registered CI does not provision its
 prebuilt nvCOMP dependency. It requires Blackwell, `nvidia-libnvcomp-cu13==5.3.0.16`,
 `zstandard` and `python-snappy`. It checks hardware Snappy decoding against
-known input bytes, reusing a bounded encoded tensor buffer. No malformed compressed
+known input bytes from a DE-capable host allocation, reusing two decoded HBM slots. No malformed compressed
 streams are sent to nvCOMP. Missing hardware or dependencies fail the manual
 suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and derived
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
 Preparation checks compressed artifact SHA-256 and unwraps outer Zstd once per
-host sharing domain. Each rank registers the retained shared Snappy/raw arena for
-CUDA and constructs descriptors without reading weights or stopping serving.
+host sharing domain. Each rank maps the retained shared Snappy/raw allocation for CPU and GPU access.
+Preparation constructs CPU descriptors without reading weights or stopping serving;
+it prepares small GPU metadata/workspace and raw-target inputs, but never
+allocates large decoded-mask slots or runs DE/model application.
 There is no staging selector or full-publication HBM copy. Every retained changed
 matrix frame is Snappy, including inputs whose
 compressed representation expands; there is no raw-frame fallback. Once every
@@ -81,17 +83,24 @@ non-layer groups hold embeddings, the language-model head, and remaining standal
 weights, in that order; empty groups are omitted.
 `GPU_DELTA_LAYERS_PER_BATCH` defaults to 1; positive values group that many active
 layers in model order, even when unchanged layers are absent. Each complete batch
-must fit HBM; there is no intra-layer streaming. Preparation coalesces adjacent
-rank-owned ranges of the shared pinned Snappy arena into bulk transfers, without
-copying foreign experts or making a second per-rank host arena. GPU scratch fits the
-largest batch, and one nvCOMP call decodes all retained frames in that batch.
-A copy stream prefetches upcoming batches into an encoded ring while the apply
-stream decodes and updates the current batch. `GPU_DELTA_H2D_STAGES` defaults to 2
-and accepts stage counts of at least 2; 3 or 4 provide additional lookahead at the
-cost of one maximum-batch encoded buffer per extra stage. Decoded scratch and
-decoder workspace remain single-buffered. These working buffers are allocated
-during preparation. More layers per batch can increase their capacities; the
-preparation prefill only fills existing encoded slots.
+must fit HBM; there is no intra-layer streaming. DE reads the compressed frames directly from the shared host arena into HBM;
+there is no encoded HBM ring, compressed H2D copy or transfer-stage selector.
+Two decoded slots each fit the largest batch, including non-layer groups. A dedicated DE stream
+decodes the next batch while the apply stream validates and applies the current
+batch. One nvCOMP call handles all retained frames in a batch. Slot reuse waits
+for its previous apply event, including consumption of that slot's size/status
+rows. Temporary DE workspace is shared because DE submissions are ordered.
+
+The two large decoded-mask slots are allocated only after scheduler pause and
+its reader fence. Preparation already allocates the small nvCOMP temporary
+workspace, per-slot status/size rows and descriptor slabs, and uploads immutable
+input metadata and raw targets on feature-owned streams. After pause, one output
+pointer row and the apply pointers are filled/uploaded, then first-use scratch
+tuning runs. Slots are allocated once per update, reused across layers, and
+released after completion before resume. The
+PyTorch native caching allocator may reuse their storage; the feature retains no
+large HBM lease during normal rollout. Host arena capacity and static CPU plans
+remain persistent.
 Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
@@ -108,32 +117,28 @@ row/tail geometry select uint32 XOR; other contracts use byte XOR in the same
 kernel. Contiguous inner tiles need only scalar base-address arithmetic. Irregular
 padded scales retain their explicit transform.
 
-Preparation loads the chosen module and queries CUDA's actual residency once per
-compiled kernel/device, before `PREPARED`. A small first-use search compares one
+Paused setup loads the chosen module and queries CUDA's actual residency once per
+compiled kernel/device. A small first-use search compares one
 CTA per 2048-byte tile with a static grid of at most four resident waves. It uses
 the complete batch's geometry/counts and disjoint synthetic source/target regions
 in unused decoded scratch, never live weights or the decoder. One warmup and three
-timed trials per candidate use events on the preparation stream. The sum of
+timed trials per candidate use events on the paused apply stream. The sum of
 borrowed footprints is capped at 4 GiB per device; no additional weight-size
 allocation is made. Nonfitting batches or an exhausted budget use the measured
 naive policy. Fitting depends on the selected grouping and scratch capacity.
 Both measured and fixed
 choices are cached in-process by complete geometry, counts, proven alignment and
 device. Warm plan reuse performs no fitting check, occupancy query or tuning.
-Cold tuning can compete with serving for bandwidth and its cost is included in
-preparation. The winning launch is bound before pause; apply does no configuration
-selection, counter reset or dynamic work stealing.
+Cold tuning is included in the pause; warm geometry reuses its cached choice.
+No configuration selection, counter reset or dynamic work stealing occurs in the
+layer loop.
 
-Preparation uploads the first batches into every existing encoded ring slot and
-waits for the last copy-ready event before `PREPARED`. When fewer batches exist,
-only those batches are uploaded. This adds no HBM allocation and performs no
-decompression or model writes. During paused apply, each decode/status submission
-releases its encoded slot and queues the next batch into that slot. Ready/free
-events protect reuse; each wait refers to an already-recorded free event.
-Decoded scratch, status checks and updates remain ordered on the
-apply stream. Completion joins the final copy, and cancellation drains both
-streams before releasing shared host views. The existing reader fence and
-device-side decoder failure gate remain in place.
+DE0 is submitted first; the small raw-target apply can overlap it. Apply i is
+queued before submission of DE i+1 because nvCOMP's Async call may wait for earlier
+work on its calling stream. Ready/free events protect decoded-slot reuse. All
+status checks and consumers of the sticky error flag run on the apply stream;
+the DE stream does not race that flag. Completion joins every DE operation and
+mask application before scratch release; failed cleanup drains both streams.
 
 There is no separate global quiesce or commit round. A participant may apply
 before another fails to pause; failed or uncertain activation never authorizes
@@ -164,8 +169,8 @@ redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned Snappy arena. The sender computes both Snappy and outer Zstd
 on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
-registers each process's mapping for CUDA, then transfers model-layer batches for
-hardware decoding and in-place apply. Natural tensor boundaries remain unchanged
+maps each process's allocation for CPU/GPU access, then decodes model-layer batches
+directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
@@ -179,8 +184,9 @@ Workers touch only CPU buffers; CUDA setup remains on each rank's original
 preparation thread.
 
 `GPU_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
-must be a private, user-owned directory on tmpfs with enough space for the wrapped
-payloads and expanded arenas during construction. Ranks of one engine on the
+must be a private, user-owned directory on tmpfs with enough space for wrapped
+payload staging. The larger decoded Snappy/raw arena is CUDA-owned host RAM,
+not a tmpfs mapping. Ranks of one engine on the
 same physical host must see the same directory and IPC/mount namespace; across
 containers, explicitly mount the same host tmpfs there. Engine IDs select separate
 subdirectories and advertised `host_cache_id` values. Independent engines
@@ -213,76 +219,65 @@ only after SHA verification, every decode task and exact chunk/window/output
 check passes. Hash and decode are both joined on failure before ownership is
 dropped; unverified bytes never become available for GPU use.
 
-Each backend retains its MAP_SHARED mapping and CUDA registration across updates.
-The first decoded/encoded allocations reserve the required extent, rounded to
-64 MiB. A later capacity increase reserves twice the newly required extent with
-the same rounding. A fitting later publication reuses both allocations and each
-rank's existing registration. Growth allocates a new inode;
-registered inodes are never resized. Each rank maps/registers the same shared
-physical pages through its own VA; there is no full per-rank Snappy copy. CUDA
-registration/unregistration runs outside the host build mutex. Torch's pinned
-allocator does not own this external memory.
+The decoded Snappy/raw arena uses CUDA 13 `cuMemCreate` with `HOST_NUMA`,
+`PINNED`, `CU_MEM_CREATE_USAGE_HW_DECOMPRESS` and a POSIX export handle. Ordinary
+`cudaHostAlloc`/`cudaHostRegister` memory is insufficient for this contract. A
+feature-owned Unix socket transfers the actual descriptor with `SCM_RIGHTS`;
+peers import/map it at their own addresses and establish local CPU/GPU access.
+Each mapping is admitted with `CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE`.
+There is no per-rank copy of the full Snappy arena, new compiled extension or
+software-decompression fallback. The allocation owner remains alive with its
+engine cohort. See [NVIDIA's DE requirements](https://docs.nvidia.com/cuda/nvcomp/decompression_engine_faq.html).
 
-Miles sends resume only after the engine's ranks have finished H2D and their
-update-stream fences. Successful local resume authorizes shared-arena reuse. Another engine's state does not authorize or block this release. The
-session queues generation-specific release and view cleanup on its existing FIFO
-executor, off the scheduler thread and ahead of the next local prepare. Local
-apply, abort, failure and ordinary close cannot release a shared generation. A
-late old release cannot release a newer publication. BUILDING is recorded before
-overwriting bytes, so a decode failure cannot expose stale READY metadata.
+The initial host allocation reserves the required extent, rounded to its capacity
+granularity. Later growth reserves twice the required extent. Fitting updates
+reuse the same allocation and mappings; growth creates a new immutable capacity
+generation. Encoded publication staging separately retains its tmpfs mapping.
+Independent engines have independent allocations, build locks and release
+lifecycles.
 
-Capacity and registration remain resident for the backend lifetime. Cold/growth
-registration is measured separately; warm reuse does not register again. Failed
-or aborted generations remain nonreusable, and retained tmpfs files require
-explicit cleanup after consumers exit. There is no automatic eviction, pageable
-fallback, per-rank region registration or full Snappy HBM residency.
+Miles sends resume only after all original ranks of that engine have applied.
+Successful resume authorizes shared-arena reuse. The session queues release and
+view cleanup on its existing FIFO executor, ahead of the next prepare. Apply,
+abort and failure cannot release a shared publication. Late old releases cannot
+release newer bytes. BUILDING is recorded before overwrite; failed/aborted
+publications remain nonreusable. Backend teardown closes the allocation broker
+and mappings; retained evidence requires explicit cleanup.
 
 Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
 payload. Preparation packs changed local scalars/vectors into one aligned pinned
-arena, uploads it once and performs any BF16-to-FP32 norm conversion. During the
-pause, dtype-grouped `torch._foreach_copy_` updates existing buffers before matrix
+arena, uploads it and performs any BF16-to-FP32 norm conversion during
+preparation. After pause, dtype-grouped `torch._foreach_copy_` updates existing buffers before matrix
 application; derived NVFP4 scales refresh afterward. Late decoder failure retains
 the same poisoned-session behavior. This small bypass remains one whole-model
 packed path rather than being split into layer batches.
 
 `raw_bytes` counts direct payload bytes; `raw_h2d_bytes` includes arena alignment.
-`host_raw_pack_s` is preparation CPU packing; direct H2D also occurs before pause.
+`host_raw_pack_s` is preparation CPU packing; raw H2D also occurs in preparation.
 
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
 validation (`host_plan_validate_s`), frame validation (`host_frames_validate_s`),
-local tensor preparation (`host_tensor_prepare_s`), arena/decoder setup
-(`host_decoder_prepare_s`) and its final GPU wait (`host_ready_wait_s`).
-`host_prepare_s` covers the complete preparation. Shared construction, registration
-and local tensor metadata are separate phases; nested timings and concurrent
-worker durations must not be summed as wall time.
-`decoder_metadata_uploads` counts metadata slabs and
-`decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
-matrix/raw payload byte counts.
-`layers_per_batch` records the configured grouping. `compressed_batches`,
-`compressed_h2d_spans` and `apply_groups` count batch
-decodes, bulk copies and affine XOR launches. `apply_contracts` separately counts
-the uniform compile-time contracts within those launches. `apply_grid_ctas`
-counts the sum of chosen grid sizes, including naive launches;
-`apply_descriptor_h2d_bytes` is zero because geometry is compiled into the kernel.
-`host_apply_tune_s`, `apply_tuned_batches` and `apply_tune_bytes` record cold tuning
-wall time, batch count and summed private scratch footprints (not allocations).
-`apply_tune_skipped_batches` counts newly cached fixed-policy decisions;
-`apply_tune_cache_hits` counts reused batch/config choices. `apply_word32_contracts`
-counts contracts using uint32 XOR; `apply_static_groups` counts static launches.
-`encoded_buffers` records the
-actual H2D ring stage count. `decoded_zero_ranges`/`decoded_zero_bytes`
-describe only omitted canonical bytes cleared before decode. `host_batch_plan_reused`
-reports reuse of the active tensor plan. Encoded/decoded scratch and decoder
-workspace byte counts describe reserved working buffers, not peak HBM usage.
-`prepared_h2d_bytes`/`prepared_h2d_spans`/`prepared_h2d_batches` count the transfers
-moved into preparation; prefill does not increase encoded capacity.
-With debug timing enabled, `prepared_h2d` measures that preparation
-copy, while `paused_layer_h2d` measures the remaining copy-stream work and
-`paused_copy_wait` measures the apply stream waiting for ready data; these overlap
-with decode/apply and must not be added together. The nvCOMP DE backend may wait
-for preceding calling-stream work inside its Async API, so host enqueue spans
-can include GPU backpressure; they are not CPU-only work measurements.
+local tensor planning (`host_tensor_prepare_s`) and full preparation
+(`host_prepare_s`). `host_metadata_prepare_s` covers small GPU input setup,
+including its own stream waits (`host_metadata_wait_s`). `paused_setup_host_s`
+includes decoded-slot allocation, output-pointer uploads and first-use kernel work; `paused_apply_tune_s` isolates cold tuning.
+`paused_apply_host_wall_s` includes setup, the decode/apply pipeline, completion
+and scratch release, but the scheduler's full `blocked_s` remains the pause metric.
+
+`de_host_input_bytes` counts compressed bytes read directly by DE. `h2d_bytes`
+counts explicit raw-target and metadata transfers; it no longer counts an encoded
+Snappy copy. These are different traffic categories, not a throughput estimate.
+`decoded_scratch_bytes` is the total of the two decoded slots;
+`decoder_workspace_bytes` is temporary DE workspace. Neither is peak HBM usage.
+`decoded_zero_ranges`/`decoded_zero_bytes` count omitted canonical bytes cleared
+before decode. Batch/group/contract/grid and cold tuning counters retain their
+ordinary meanings. `host_batch_plan_reused` reports cached active tensor geometry.
+
+With `GPU_DELTA_TIMING=1`, events report decode on the DE stream and layout apply,
+raw apply and derived refresh on the apply stream. `paused_gpu_pipeline` excludes
+setup. These spans overlap and must not be summed. nvCOMP can wait inside an Async
+call, so host enqueue durations can contain GPU backpressure.
 
 `host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
 creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,
@@ -306,28 +301,18 @@ Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
 The `host_outer_zstd_encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
 counters count each reconstructed host tensor/chunk once.
 `host_shared_build_s` is the same cached build duration for all consumers and must
-not be summed across ranks. `host_shared_arena_bytes` is the publication's used
-extent; `host_shared_capacity_bytes`, `host_shared_capacity_generation` and
-`host_shared_capacity_inode` identify the retained decoded allocation.
-`host_shared_mapping_reused` and `host_shared_registration_reused` describe each
-rank's reuse. `host_shared_registered_bytes`/`host_shared_register_calls` count only
-new registration (zero on warm reuse), while
-`host_shared_registration_capacity_bytes` reports current registered capacity.
-`host_shared_register_s` measures registration or its reuse check.
+not be summed across ranks. `host_shared_arena_bytes` is the publication's used extent; capacity/generation
+and mapping-reuse counters distinguish cold, fitting and growing allocations.
 Creator-only `host_shared_allocation_{s,calls,bytes}` and
-`host_encoded_allocation_{s,calls,bytes}` distinguish cold/growth from warm builds;
-`host_encoded_capacity_bytes`/`host_encoded_capacity_generation` identify staging
-capacity. `host_outer_zstd_cpu_workers` records the creator pool size.
+`host_encoded_allocation_{s,calls,bytes}` report decoded host and encoded staging
+allocations separately. `host_outer_zstd_cpu_workers` records the creator pool.
 
-These costs occur outside explicit scheduler pause but can contend with serving.
-Release/view cleanup runs on the session executor before later preparation;
-unregistration occurs only on capacity replacement or backend teardown. The manual
-two-process oracle exercises cold, fitting and growing updates for both 4/8-worker
-pools: exact asynchronous H2D bytes, unchanged warm VA with zero register calls,
-new inode/registration on growth and final disposal. Its smaller capacity alignment
-keeps the oracle bounded; full-model measurements use production's 64 MiB alignment.
-CPU tests cover corrupt data, creator deduplication, host-union binding, retained
-bytes, worker draining, nonreusable aborts, stale release and scheduler/FIFO ordering.
+Preparation can contend for host bandwidth and performs small GPU input work
+on its own streams while rollout continues. It never reserves the large decoded
+mask slots or runs DE/application/cold scratch tuning before pause. The manual two-process
+CUDA test must qualify actual handle import, CPU/GPU visibility, direct-host DE,
+warm mapping reuse and growth. CPU mocks establish control/byte semantics only;
+CUDA IPC capability, hardware DE and overlap require native validation.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent

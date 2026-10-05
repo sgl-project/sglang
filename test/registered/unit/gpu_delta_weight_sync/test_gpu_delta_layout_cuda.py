@@ -83,7 +83,6 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
         expected_sizes=torch.tensor([size], device="cuda"),
     )
     batch = _PreparedBatch(
-        [],
         decoder,
         apply,
         [
@@ -99,7 +98,7 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
         prepared.error.fill_(prior)
         decoder.statuses.fill_(status)
         decoder.actual_sizes.fill_(actual)
-        prepared._decode_batch(batch)
+        decoder.enqueue()
         prepared._apply_batch(batch)
         assert prepared.error.item() == 1
         for value, before in saved:
@@ -109,14 +108,14 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
     prepared.error.zero_()
     decoder.statuses.zero_()
     decoder.actual_sizes.fill_(size)
-    prepared._decode_batch(batch)
+    decoder.enqueue()
     prepared._apply_batch(batch)
     if all_configs:
         expected = [value.clone() for value, _ in saved]
         for config in _CONFIGS:
             for value, before in saved:
                 value.copy_(before)
-            prepared._decode_batch(batch)
+            decoder.enqueue()
             if group is not None:
                 kernel = _compiled(
                     group.contracts, group.alignments, decoded.device.index, config

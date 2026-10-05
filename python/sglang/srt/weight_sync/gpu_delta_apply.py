@@ -68,7 +68,7 @@ def _check_decode(
 
 
 def prepare_status_check(decoder, error):
-    """Compile/load before PREPARED; the returned call only enqueues validation."""
+    """Compile/load during paused setup; the returned call enqueues validation."""
     count = decoder.statuses.numel()
     arguments = (
         decoder.statuses,

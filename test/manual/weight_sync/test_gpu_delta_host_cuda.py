@@ -1,24 +1,27 @@
-"""Two engines each share one pinned arena between two independent CUDA ranks.
+"""Two engines each share one host-DE arena between two independent CUDA ranks.
 
-Manual-only: Linux shared tmpfs, two CUDA GPUs, Torch and zstandard are required.
+Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy and Zstandard are required.
 The test barriers coordinate the oracle only; production preparation has no
 collectives. Both 4- and 8-worker creator pools exercise the same exact bytes.
 """
 
+import ctypes
 import hashlib
 import json
 import multiprocessing
 import os
+import random
 import tempfile
 from pathlib import Path
 
 import pytest
+import snappy
 import zstandard as zstd
 
 
 def _publication(directory, version, repeat):
     expected = {
-        f"tensor-{i}": bytes((j + i + version) % 256 for j in range(256)) * repeat
+        f"tensor-{i}": random.Random(i + version).randbytes(256 * repeat)
         for i in range(8)
     }
     expected["raw"] = b"unaligned-raw-target"
@@ -26,11 +29,24 @@ def _publication(directory, version, repeat):
     for name, value in expected.items():
         blob.extend(bytes((-len(blob)) % 16))
         start = len(blob)
-        encoded = (
-            value
-            if name == "raw"
-            else zstd.ZstdCompressor(write_checksum=True).compress(value)
-        )
+        inner = value if name == "raw" else snappy.compress(value)
+        encoded, outer_frames = bytearray(), []
+        if name == "raw":
+            encoded.extend(value)
+        else:
+            for offset in range(0, len(inner), 1 << 20):
+                chunk = inner[offset : offset + (1 << 20)]
+                encoded.extend(bytes((-len(encoded)) % 16))
+                compressed = zstd.ZstdCompressor(write_checksum=True).compress(chunk)
+                outer_frames.append(
+                    dict(
+                        encoded_offset=len(encoded),
+                        encoded_bytes=len(compressed),
+                        decoded_offset=offset,
+                        decoded_bytes=len(chunk),
+                    )
+                )
+                encoded.extend(compressed)
         blob.extend(encoded)
         entry = {
             "name": name,
@@ -42,7 +58,7 @@ def _publication(directory, version, repeat):
             else [
                 {
                     "encoded_offset": 0,
-                    "encoded_bytes": len(value),
+                    "encoded_bytes": len(inner),
                     "decoded_offset": 0,
                     "decoded_bytes": len(value),
                 }
@@ -59,15 +75,8 @@ def _publication(directory, version, repeat):
                 "file": "owner.bin",
                 "encoded_offset": start,
                 "encoded_bytes": len(encoded),
-                "decoded_bytes": len(value),
-                "frames": [
-                    {
-                        "encoded_offset": 0,
-                        "encoded_bytes": len(encoded),
-                        "decoded_offset": 0,
-                        "decoded_bytes": len(value),
-                    }
-                ],
+                "decoded_bytes": len(inner),
+                "frames": outer_frames,
             }
         entries.append(entry)
     (directory / "owner.bin").write_bytes(blob)
@@ -91,6 +100,8 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     import torch
 
     from sglang.srt.weight_sync import gpu_delta_host as host
+    from sglang.srt.weight_sync import gpu_delta_memory as memory
+    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
@@ -99,7 +110,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     host._CAPACITY_ALIGNMENT = 1 << 20
     torch.cuda.set_device(rank % 2)
     device = torch.device("cuda", rank % 2)
-    pool, arena = OuterZstdPool(workers), host.HostArena(engine)
+    pool, arena = OuterZstdPool(workers), host.HostArena(engine, device.index)
     stream = torch.cuda.Stream(device=device)
     records = []
     try:
@@ -117,37 +128,80 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             )
             barrier.wait(timeout=90)
             metrics = {}
+            manifest = json.loads(Path(path).read_text())
             snapshot = arena.prepare(
                 path,
                 digest,
-                json.loads(Path(path).read_text()),
+                manifest,
                 sorted(expected),
                 pool,
                 metrics,
                 metadata,
             )
-            arena.register(device, metrics)
-            assert arena.tensor.is_pinned() and arena.registered
-            source = arena.tensor[: snapshot.index["arena_bytes"]]
+            source = arena.tensor
+            frames, offsets, size = [], {}, 0
+            for entry in manifest["tensors"]:
+                name = entry["name"]
+                if name == "raw":
+                    assert bytes(snapshot.get(name).numpy()) == expected[name]
+                    continue
+                size = (size + 15) // 16 * 16
+                offsets[name] = size
+                frames.append(
+                    DecodeFrame(
+                        snapshot.index["tensors"][name]["offset"],
+                        entry["frames"][0]["encoded_bytes"],
+                        size,
+                        len(expected[name]),
+                    )
+                )
+                size += len(expected[name])
+            decoder = NvcompDecoder(device)
             with torch.cuda.stream(stream):
-                copied = source.to(device=device, non_blocking=True)
+                workspace = decoder.allocate_workspace([frames])
+            plan = decoder.prepare_batches([frames], source, workspace, stream)
+            decoded = [
+                torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)
+            ]
+            stream.wait_stream(torch.cuda.current_stream(device))
+            plans = plan.bind_outputs(decoded)
+            with torch.cuda.stream(stream):
+                plans[0].enqueue()
                 complete = torch.cuda.Event()
                 complete.record(stream)
             complete.synchronize()
-            host_copy = copied.cpu()
-            for name, value in expected.items():
-                record = snapshot.index["tensors"][name]
-                actual = host_copy[
-                    record["offset"] : record["offset"] + record["nbytes"]
-                ]
-                assert bytes(actual.numpy()) == value
+            assert plans[0].statuses.tolist() == [0] * len(frames)
+            assert plans[0].actual_sizes.tolist() == [
+                frame.decoded_bytes for frame in frames
+            ]
+            host_copy = decoded[0].cpu()
+            for name, offset in offsets.items():
+                assert (
+                    bytes(host_copy[offset : offset + len(expected[name])].numpy())
+                    == expected[name]
+                )
             # Substitute the Miles all-original-engine-rank completion barrier with
             # an explicit two-process completion barrier in this isolated oracle.
             barrier.wait(timeout=90)
             snapshot.mark_reusable()
             snapshot.close()
             source = None
-            assert arena.registered  # Per-update disposal retains registration.
+            assert arena.allocation is not None
+            del plan, plans, workspace, decoded
+            properties, granularity = memory._AllocationProperties(), ctypes.c_size_t()
+            driver = arena.allocation.driver
+            memory._check(
+                driver.cuMemGetAllocationPropertiesFromHandle(
+                    ctypes.byref(properties), arena.allocation.handle.value
+                ),
+                "native allocation properties",
+            )
+            memory._check(
+                driver.cuMemGetAllocationGranularity(
+                    ctypes.byref(granularity), ctypes.byref(properties), 0
+                ),
+                "native allocation granularity",
+            )
             records.append(
                 dict(
                     version=version,
@@ -155,14 +209,15 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     arena_identity=arena.identity,
                     mapping_pointer=arena.tensor.data_ptr(),
                     metrics=metrics,
-                    exact_h2d_bytes=True,
+                    exact_host_de_bytes=True,
+                    allocation_granularity=granularity.value,
                 )
             )
         stream.synchronize()
         arena.close()
-        assert not arena.registered and arena.mapping is None
+        assert arena.allocation is None and arena.mapping is None
         output.put(
-            dict(rank=rank, engine_id=engine, updates=records, final_unregistered=True)
+            dict(rank=rank, engine_id=engine, updates=records, final_unmapped=True)
         )
     finally:
         stream.synchronize()
@@ -171,7 +226,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
 
 
 @pytest.mark.parametrize("workers", [4, 8])
-def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
+def test_two_engines_reuse_host_de_capacity_and_grow(workers):
     context = multiprocessing.get_context("spawn")
     with tempfile.TemporaryDirectory(
         prefix="gpu-delta-native-", dir="/dev/shm"
@@ -236,13 +291,7 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
                     row["metrics"]["host_shared_allocation_calls"] for row in rows
                 ) == (0 if version == 1 else 1)
                 assert all(
-                    row["metrics"]["host_shared_register_calls"]
-                    == (0 if version == 1 else 1)
-                    for row in rows
-                )
-                assert all(
-                    row["metrics"]["host_shared_registration_reused"]
-                    == int(version == 1)
+                    row["metrics"]["host_shared_mapping_reused"] == int(version == 1)
                     for row in rows
                 )
         assert len({record["updates"][0]["host_cache_id"] for record in records}) == 2
@@ -252,8 +301,8 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
         )
         for record in records:
             a, b, c = record["updates"]
-            alignment = 1 << 20
             for row, multiplier in ((a, 1), (c, 2)):
+                alignment = max(1 << 20, row["allocation_granularity"])
                 assert row["metrics"]["host_shared_capacity_bytes"] == (
                     (
                         multiplier * row["metrics"]["host_shared_arena_bytes"]
@@ -269,13 +318,12 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
                 row["metrics"]["host_shared_capacity_generation"]
                 for row in record["updates"]
             ] == [1, 1, 2]
-            assert b["metrics"]["host_shared_registered_bytes"] == 0
             assert all(
                 row["metrics"]["host_shared_arena_bytes"]
                 <= row["metrics"]["host_shared_capacity_bytes"]
                 for row in record["updates"]
             )
-            assert record["final_unregistered"]
+            assert record["final_unmapped"]
         print(
             json.dumps(
                 dict(

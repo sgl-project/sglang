@@ -36,7 +36,7 @@ def _bytes(tensor):
 
 @contextmanager
 def cpu_host_snapshot(backend, metadata, directory):
-    """Real shared CPU decode; explicitly mock CUDA registration in CPU tests."""
+    """Real outer decode and file checks with CPU-only host allocation backing."""
     from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 
@@ -45,17 +45,19 @@ def cpu_host_snapshot(backend, metadata, directory):
         "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
     }
     backend.outer_pool = OuterZstdPool(2)
-    backend.host_arena = host.HostArena("cpu-engine")
+    backend.host_arena = host.HostArena("cpu-engine", 0)
+    backend.apply_stream = backend.de_stream = backend.decoder = None
     metadata.update(session_id="cpu-1", participants=[backend.identity])
     cache = Path(directory) / "cache"
     cache.mkdir()
 
-    def register(snapshot, device, timings):
-        snapshot.tensor = (
-            torch.frombuffer(snapshot.mapping, dtype=torch.uint8)
-            if snapshot.mapping is not None
-            else torch.empty(0, dtype=torch.uint8)
-        )
+    class CpuHostAllocation:
+        def __init__(self, capacity, device):
+            self.capacity, self.shareable = capacity, "cpu-allocation"
+            self.view = memoryview(bytearray(capacity))
+
+        def close(self):
+            self.view.release()
 
     try:
         with (
@@ -66,7 +68,8 @@ def cpu_host_snapshot(backend, metadata, directory):
                 side_effect=lambda fd, offset, size: os.ftruncate(fd, offset + size),
                 create=True,
             ),
-            patch.object(host.HostArena, "register", register),
+            patch.object(host, "SharedHostAllocation", CpuHostAllocation),
+            patch.object(host, "_CAPACITY_ALIGNMENT", 64),
         ):
             yield
     finally:
@@ -257,25 +260,23 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     [[2, 10], [5, 13]],
                 )
                 prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-                prepared.encoded = torch.empty_like(canonical)
-                prepared.decoded = torch.zeros_like(canonical)
+                host_input = torch.empty_like(canonical)
+                decoded = torch.zeros_like(canonical)
                 prepared.error = torch.zeros(1, dtype=torch.int32)
                 prepared.timing_enabled = False
-                payload = binding.selected_bytes(prepared.decoded)
+                payload = binding.selected_bytes(decoded)
                 self.assertEqual(
                     payload.untyped_storage().data_ptr(),
-                    prepared.decoded.untyped_storage().data_ptr(),
+                    decoded.untyped_storage().data_ptr(),
                 )
                 self.assertFalse(payload.is_contiguous())
                 decoder = SimpleNamespace(
-                    enqueue=lambda: prepared.decoded.copy_(prepared.encoded),
+                    enqueue=lambda: decoded.copy_(host_input),
                     statuses=torch.zeros(1, dtype=torch.int32),
                     actual_sizes=torch.tensor([size]),
                     expected_sizes=torch.tensor([size]),
                 )
-                pinned = torch.empty_like(canonical)
                 batch = layout._PreparedBatch(
-                    [(prepared.encoded, pinned)],
                     decoder,
                     None,
                     [(binding.xor, payload)],
@@ -289,14 +290,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 # Two successful decodes observe new scratch values. An error
                 # then gates both that mask and every later mask in the batch.
                 for status in (0, 0, 1, 0):
-                    pinned.random_(256)
+                    host_input.random_(256)
                     decoder.statuses.fill_(status)
                     if not status and not prepared.error.item():
-                        mask = pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
+                        mask = host_input.view(dtype).reshape(12, 20)[2:10, 5:13]
                         expected.bitwise_xor_(_bytes(mask))
-                    for destination, source in batch.copies:
-                        destination.copy_(source)
-                    prepared._decode_batch(batch)
+                    decoder.enqueue()
                     prepared._apply_batch(batch)
                     torch.testing.assert_close(_bytes(target), expected)
                     self.assertEqual(target.data_ptr(), pointer)
@@ -454,7 +453,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     prepared.device = torch.device("cpu")
                     prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
                     prepared.timing_enabled = False
-                    prepared.h2d_stages = 2
                     prepared.raw_copies, prepared.batches = {}, []
                     prepared.matrix_tensor_count = 0
                     prepared.raw_tensor_count = 0
@@ -505,6 +503,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     # Exercise apply's actual tensor logic with CPU tensors;
                     # only the CUDA scheduling boundary is stubbed here.
                     with (
+                        patch.object(prepared, "_allocate_paused"),
                         patch.object(torch.cuda, "device", return_value=nullcontext()),
                         patch.object(torch.cuda, "stream", return_value=nullcontext()),
                         patch.object(torch.cuda, "default_stream", return_value=None),
@@ -588,7 +587,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
-    def test_layer_batches_share_host_spans_and_reuse_decoder_scratch(self):
+    def test_host_direct_batches_defer_outputs_and_reuse_two_decoded_slots(self):
         import zstandard as zstd
 
         targets = [
@@ -694,29 +693,57 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 check_identity=lambda: None,
             ),
         )
-        copies, decoded_batches = [], []
-        copy_batch = layout.PreparedDelta._copy_batch
+        operations, decoded_batches, slots = [], [], []
 
-        def record_copy(prepared, batch, index, phase="paused_layer_h2d"):
-            copies.append((index, phase))
-            copy_batch(prepared, batch, index, phase)
+        class CpuStream:
+            def __init__(self, device):
+                pass
+
+            def wait_stream(self, stream):
+                operations.append(("wait_stream", self, stream))
+
+            def wait_event(self, event):
+                operations.append(("wait", self, event))
+
+            def synchronize(self):
+                operations.append(("drain", self))
+
+        class CpuEvent:
+            def record(self, stream):
+                operations.append(("record", stream, self))
+
+            def synchronize(self):
+                operations.append(("complete", self))
 
         class CpuLiteralDecoder:
-            # Explicit CPU test substitute; this does not qualify nvCOMP/CUDA.
+            # CPU oracle only. The native suite qualifies real DE and CUDA races.
             def __init__(self, device):
                 self.device = device
 
             def allocate_workspace(self, batches):
                 return SimpleNamespace(temporary=torch.empty(0))
 
-            def prepare_batches(self, batches, encoded, decoded, workspace, stream):
-                return [self._prepare(frames, encoded, decoded) for frames in batches]
+            def prepare_batches(self, batches, host, workspace, stream):
+                operations.append(("prepare_decoder", len(batches)))
 
-            def _prepare(self, frames, encoded, decoded):
+                def bind_outputs(decoded):
+                    operations.append(("bind_outputs", len(decoded)))
+                    slots.extend(decoded)
+                    for slot in decoded:
+                        slot.fill_(0xA5)
+                    return [
+                        self._prepare(index, frames, host, decoded[index % 2])
+                        for index, frames in enumerate(batches)
+                    ]
+
+                return SimpleNamespace(bind_outputs=bind_outputs)
+
+            def _prepare(self, index, frames, host, decoded):
                 def enqueue():
-                    decoded_batches.append(frames)
+                    operations.append(("decode", index))
+                    decoded_batches.append((index, decoded.data_ptr(), frames))
                     for frame in frames:
-                        data = encoded[
+                        data = host[
                             frame.input_offset : frame.input_offset
                             + frame.encoded_bytes
                         ]
@@ -727,13 +754,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             + frame.decoded_bytes
                         ].copy_(data[2:])
 
-                sizes = torch.tensor([f.decoded_bytes for f in frames])
-                return SimpleNamespace(
-                    enqueue=enqueue,
-                    statuses=torch.zeros(len(frames)),
-                    actual_sizes=sizes,
-                    expected_sizes=sizes,
-                )
+                return SimpleNamespace(enqueue=enqueue, index=index)
+
+        def status_check(decoder, error):
+            return lambda: operations.append(("check", decoder.index))
 
         empty = torch.empty
 
@@ -750,26 +774,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             with (
                 cpu_host_snapshot(backend, metadata, directory),
                 patch.object(torch, "empty", side_effect=unpinned),
-                patch.object(
-                    torch.cuda,
-                    "Stream",
-                    return_value=SimpleNamespace(
-                        wait_event=lambda _: None,
-                        wait_stream=lambda _: None,
-                        synchronize=lambda: None,
-                    ),
-                ),
+                patch.object(torch.cuda, "Stream", side_effect=CpuStream) as streams,
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
                 patch.object(torch.cuda, "device", return_value=nullcontext()),
                 patch.object(torch.cuda, "default_stream", return_value=object()),
-                patch.object(
-                    torch.cuda,
-                    "Event",
-                    return_value=SimpleNamespace(
-                        record=lambda _: None, synchronize=lambda: None
-                    ),
-                ),
-                patch.object(layout.PreparedDelta, "_copy_batch", record_copy),
+                patch.object(torch.cuda, "Event", side_effect=CpuEvent) as events,
                 patch(
                     "sglang.srt.weight_sync.gpu_delta_codec.NvcompDecoder",
                     CpuLiteralDecoder,
@@ -779,7 +788,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     {
                         "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
                             plan_apply=lambda outputs: (None, outputs),
-                            prepare_status_check=lambda decoder, error: lambda: None,
+                            prepare_status_check=status_check,
                         )
                     },
                 ),
@@ -790,47 +799,58 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.timings["host_payload_cache_created"], 1)
                 self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 8)
                 self.assertEqual(prepared.timings["host_outer_zstd_frames"], 8)
-                self.assertEqual(prepared.encoded.numel(), 64)
-                self.assertEqual(prepared.timings["encoded_slot_bytes"], 32)
-                self.assertEqual(prepared.timings["encoded_buffers"], 2)
-                self.assertEqual(prepared.decoded.numel(), 28)
-                self.assertEqual(prepared.h2d_bytes, 126)
+                self.assertEqual(streams.call_count, 2)
+                self.assertEqual(events.call_count, 6)
+                self.assertIsNotNone(backend.decoder)
+                self.assertEqual(slots, [])
+                self.assertFalse(any(row[0] == "wait_stream" for row in operations))
+                self.assertFalse(any(row[0] == "bind_outputs" for row in operations))
+                self.assertEqual(prepared.batches, [])
                 self.assertEqual(prepared.timings["compressed_batches"], 7)
-                self.assertEqual(prepared.timings["compressed_h2d_spans"], 7)
+                self.assertEqual(prepared.timings["de_host_input_bytes"], 120)
                 self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
                 self.assertEqual(prepared.timings["decoded_zero_ranges"], 0)
-                self.assertEqual(len(prepared.batches[0].decoder.statuses), 1)
-                self.assertEqual(prepared.timings["prepared_h2d_spans"], 2)
-                self.assertEqual(prepared.timings["prepared_h2d_bytes"], 42)
-                self.assertEqual(copies, [(0, "prepared_h2d"), (1, "prepared_h2d")])
                 self.assertFalse(decoded_batches)
-                for batch in prepared.batches[:2]:
-                    for destination, source in batch.copies:
-                        torch.testing.assert_close(destination, source)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
-                pointer = prepared.encoded.data_ptr()
-                prepared.decoded.fill_(0xA5)
-                for batch in prepared.batches:
-                    for _, source in batch.copies:
-                        self.assertEqual(
-                            source.untyped_storage().data_ptr(),
-                            backend.host_arena.tensor.untyped_storage().data_ptr(),
-                        )
-                prepared.apply()
+                result = prepared.apply()
+                self.assertEqual(streams.call_count, 2)
+                self.assertEqual(result["timings"]["decoded_buffers"], 2)
+                self.assertEqual(result["timings"]["decoded_scratch_bytes"], 56)
                 self.assertEqual(
-                    copies,
+                    result["h2d_bytes"], 8 * 32
+                )  # Descriptor metadata only.
+                self.assertEqual(len(decoded_batches), 7)
+                self.assertEqual(
                     [
-                        (0, "prepared_h2d"),
-                        (1, "prepared_h2d"),
-                        (2, "paused_layer_h2d"),
-                        (3, "paused_layer_h2d"),
-                        (4, "paused_layer_h2d"),
-                        (5, "paused_layer_h2d"),
-                        (6, "paused_layer_h2d"),
+                        (kind, index)
+                        for kind, index, *rest in operations
+                        if kind in {"decode", "check"}
+                    ],
+                    [
+                        operation
+                        for index in range(7)
+                        for operation in (("decode", index), ("check", index))
                     ],
                 )
-                self.assertEqual(len(decoded_batches), 7)
-                self.assertEqual(prepared.encoded.data_ptr(), pointer)
+                self.assertEqual(
+                    [pointer for _, pointer, _ in decoded_batches],
+                    [slots[index % 2].data_ptr() for index in range(7)],
+                )
+                # Every reuse waits for the preceding apply on that same slot;
+                # the next decode is submitted only after current status/apply.
+                for index in range(2, 7):
+                    event = prepared.decoded_free[index % 2]
+                    position = operations.index(("decode", index))
+                    self.assertEqual(
+                        operations[position - 1], ("wait", prepared.de_stream, event)
+                    )
+                    self.assertIn(
+                        ("record", prepared.stream, event), operations[:position]
+                    )
+                self.assertIsNone(prepared.decoded)
+                self.assertIsNone(prepared.workspace)
+                self.assertIsNone(prepared.apply_metadata)
+                self.assertEqual(prepared.batches, [])
                 for target in targets:
                     torch.testing.assert_close(
                         target,
@@ -904,7 +924,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     )
                 self.assertTrue(torch.all(targets[0] == 0))
 
-    def test_backend_reads_inventory_once_and_cleans_failed_stream_creation(self):
+    def test_backend_reads_inventory_once_and_drains_both_streams_on_failure(self):
         fake_plan = SimpleNamespace(
             check_identity=lambda: None,
             rank_plan_digest="digest",
@@ -919,6 +939,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             patch.dict(sys.modules, {"sglang.srt.runtime_context": runtime}),
             patch.object(layout, "_require_fixed_moe_topology"),
             patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
+            patch("sglang.srt.weight_sync.gpu_delta_host.HostArena"),
             patch(
                 "sglang.srt.weight_sync.gpu_delta_checkpoint.read_canonical_checkpoint_inventory",
                 return_value={"weight": {"shape": [1], "dtype": "U8"}},
@@ -927,32 +948,25 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             backend = layout.GpuDeltaBackend(
                 SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
             )
-            with (
-                patch.object(torch.cuda, "device", return_value=nullcontext()),
-                patch.object(
-                    torch.cuda,
-                    "Stream",
-                    side_effect=RuntimeError("stream creation failed"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "stream creation failed"),
-            ):
-                backend.prepare("unused-manifest", "unused-sha", {})
+            self.assertIsNone(backend.decoder)
+            self.assertIsNone(backend.apply_stream)
+            self.assertIsNone(backend.de_stream)
             backend.describe()
             backend.describe()
             read_inventory.assert_called_once()
 
         drains = []
 
-        def copy_failure():
-            drains.append("copy")
-            raise RuntimeError("copy stream failed")
+        def decode_failure():
+            drains.append("decode")
+            raise RuntimeError("decode stream failed")
 
         prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-        prepared.copy_stream = SimpleNamespace(synchronize=copy_failure)
+        prepared.de_stream = SimpleNamespace(synchronize=decode_failure)
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
-        with self.assertRaisesRegex(RuntimeError, "copy stream failed"):
+        with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
             prepared.close()
-        self.assertEqual(drains, ["copy", "compute"])
+        self.assertEqual(drains, ["decode", "compute"])
 
     def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
         root = torch.nn.Module()
@@ -1066,6 +1080,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 bindings=bindings,
                 excluded={},
                 derived=[],
+                check_identity=lambda: None,
                 inventory={
                     b.name: {"dtype": b.dtype, "shape": list(b.shape)} for b in bindings
                 },
@@ -1086,7 +1101,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             with (
                 cpu_host_snapshot(backend, metadata, directory),
                 patch.object(torch, "empty", side_effect=unpinned),
-                patch.object(torch.cuda, "Stream", return_value=object()),
+                patch.object(
+                    torch.cuda,
+                    "Stream",
+                    return_value=SimpleNamespace(
+                        wait_stream=lambda _: None, wait_event=lambda _: None
+                    ),
+                ) as streams,
+                patch.object(torch.cuda, "device", return_value=nullcontext()),
+                patch.object(torch.cuda, "default_stream", return_value=object()),
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
                 patch.object(
                     torch.cuda,
@@ -1099,23 +1122,24 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
-            self.assertFalse(prepared.batches)
-            self.assertEqual(prepared.timings["prepared_h2d_bytes"], 0)
-            self.assertEqual(prepared.timings["prepared_h2d_spans"], 0)
-            self.assertIsNone(prepared.decoder)
-            self.assertEqual(prepared.timings["raw_tensors"], 4)
-            self.assertEqual(prepared.timings["raw_bytes"], len(blob))
-            self.assertEqual(prepared.h2d_bytes, 36)  # Includes dtype alignment gaps.
-            self.assertTrue(torch.all(vector == 7))
-            self.assertTrue(torch.all(indexer == 9))
-            for targets, sources in prepared.raw_copies.values():
-                torch._foreach_copy_(targets, sources)
-            torch.testing.assert_close(odd, values[0])
-            torch.testing.assert_close(vector, values[1][2:6])
-            torch.testing.assert_close(scalar, values[2])
-            torch.testing.assert_close(indexer, values[3].float())
-            torch.testing.assert_close(unchanged, torch.ones(3))
-            self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
+                self.assertEqual(streams.call_count, 2)
+                self.assertFalse(prepared.batches)
+                self.assertIsNone(backend.decoder)
+                self.assertEqual(prepared.timings["raw_tensors"], 4)
+                self.assertEqual(prepared.timings["raw_bytes"], len(blob))
+                self.assertEqual(prepared.timings["raw_h2d_bytes"], 36)
+                self.assertTrue(torch.all(vector == 7))
+                self.assertTrue(torch.all(indexer == 9))
+                result = prepared.apply()
+                self.assertEqual(result["h2d_bytes"], 36)
+                self.assertEqual(result["timings"]["decoded_buffers"], 0)
+                self.assertIsNone(backend.decoder)
+                torch.testing.assert_close(odd, values[0])
+                torch.testing.assert_close(vector, values[1][2:6])
+                torch.testing.assert_close(scalar, values[2])
+                torch.testing.assert_close(indexer, values[3].float())
+                torch.testing.assert_close(unchanged, torch.ones(3))
+                self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
 
     def test_movable_or_reordered_experts_rejected_before_plan(self):
         defaults = dict(
