@@ -815,6 +815,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self.metrics.finish(id(processed_req), error=output_batch.error is not None)
         is_warmup = is_warmup_req(processed_req)
         self._log_warmup_result(output_batch, processed_req, is_warmup)
+        if not is_warmup and self._req_based_warmup_failed:
+            self._req_based_warmup_failed = False
+            if output_batch.metrics is not None:
+                output_batch.metrics.warmup_failed = True
 
         if self._should_return_lightweight_warmup_result(processed_req):
             output_batch.drop_payload_for_warmup()

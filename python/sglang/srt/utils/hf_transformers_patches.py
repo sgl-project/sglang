@@ -62,6 +62,7 @@ def apply_all():
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
     _patch_layer_types_validation()
+    _patch_nested_rope_validation()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
@@ -233,6 +234,36 @@ def _patch_layer_types_validation():
                     self.num_hidden_layers = num_hidden_layers
 
         validators[index] = validate_layer_type
+        break
+
+
+def _patch_nested_rope_validation():
+    from transformers import PretrainedConfig
+
+    validators = PretrainedConfig.__class_validators__
+    for index, validator in enumerate(validators):
+        if validator.__name__ != "validate_rope":
+            continue
+
+        def validate_rope(self, _orig=validator):
+            try:
+                return _orig(self)
+            except AttributeError:
+                # Backport of huggingface/transformers#48798; drop once transformers >= 5.18.
+                rope_parameters = getattr(self, "rope_parameters", None)
+                layer_types = getattr(self, "layer_types", None) or ()
+                if not isinstance(rope_parameters, dict):
+                    raise
+                nested = {k: v for k, v in rope_parameters.items() if k in layer_types}
+                if not nested or len(nested) == len(rope_parameters):
+                    raise
+                self.rope_parameters = nested
+                try:
+                    return _orig(self)
+                finally:
+                    self.rope_parameters = rope_parameters
+
+        validators[index] = validate_rope
         break
 
 
