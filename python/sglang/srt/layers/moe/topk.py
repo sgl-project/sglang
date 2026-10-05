@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
@@ -215,6 +216,105 @@ def _cake_fused_topk_deepseek_kernels() -> Tuple[Callable[..., bool], Callable]:
     return supports_fused_topk_deepseek, cake_fused_topk_deepseek
 
 
+# Opt-in per-call diagnostics for the dsv3_grouped_routing route (eager runs only:
+# the check synchronises).  SGLANG_CAKE_DSV3_ROUTING_CHECK=1 runs the stock
+# FlashInfer router next to every Cake call on identical inputs and logs how the
+# expert ids / weights differ; SGLANG_CAKE_DSV3_ROUTING_DUMP_DIR=<dir> saves the
+# first mismatching calls (scores, bias, parameters, both outputs) for replay.
+_CAKE_DSV3_CHECK = os.environ.get("SGLANG_CAKE_DSV3_ROUTING_CHECK", "0") == "1"
+_CAKE_DSV3_DUMP_DIR = os.environ.get("SGLANG_CAKE_DSV3_ROUTING_DUMP_DIR", "")
+_cake_dsv3_check_state = {
+    "calls": 0,
+    "rows": 0,
+    "set_rows": 0,
+    "order_rows": 0,
+    "wmax": 0.0,
+    "dumps": 0,
+}
+
+
+def _cake_dsv3_routing_check(
+    scores, bias, n_group, topk_group, topk, scaling_factor, cake_w, cake_ids
+) -> None:
+    st = _cake_dsv3_check_state
+    stock_w = torch.empty_like(cake_w)
+    stock_ids = torch.empty_like(cake_ids)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        scaling_factor,
+        stock_w,
+        stock_ids,
+        True,
+    )
+    c_ids_s, c_perm = torch.sort(cake_ids.to(torch.int64), dim=-1)
+    s_ids_s, s_perm = torch.sort(stock_ids.to(torch.int64), dim=-1)
+    set_mismatch = (c_ids_s != s_ids_s).any(dim=-1)
+    order_only = (~set_mismatch) & (cake_ids != stock_ids).any(dim=-1)
+    c_w_s = torch.gather(cake_w, -1, c_perm)
+    s_w_s = torch.gather(stock_w, -1, s_perm)
+    same = ~set_mismatch
+    wdiff = (c_w_s - s_w_s).abs()
+    wmax = float(wdiff[same].max()) if bool(same.any()) else 0.0
+    n_set = int(set_mismatch.sum())
+    n_order = int(order_only.sum())
+    st["calls"] += 1
+    st["rows"] += int(scores.shape[0])
+    st["set_rows"] += n_set
+    st["order_rows"] += n_order
+    st["wmax"] = max(st["wmax"], wmax)
+    anomaly = n_set > 0 or n_order > 0 or wmax > 1e-6
+    if anomaly and st["dumps"] < 4 and _CAKE_DSV3_DUMP_DIR:
+        os.makedirs(_CAKE_DSV3_DUMP_DIR, exist_ok=True)
+        st["dumps"] += 1
+        path = os.path.join(
+            _CAKE_DSV3_DUMP_DIR,
+            f"dsv3_routing_dev{scores.device.index}_{st['dumps']}.pt",
+        )
+        torch.save(
+            {
+                "scores": scores.cpu(),
+                "bias": bias.cpu(),
+                "n_group": n_group,
+                "topk_group": topk_group,
+                "topk": topk,
+                "scaling_factor": scaling_factor,
+                "cake_weights": cake_w.cpu(),
+                "cake_ids": cake_ids.cpu(),
+                "stock_weights": stock_w.cpu(),
+                "stock_ids": stock_ids.cpu(),
+            },
+            path,
+        )
+        logger.info("%s dsv3_grouped_routing CHECK dump %s", _CAKE_LOG_PREFIX, path)
+    if anomaly and st["calls"] <= 20 or st["calls"] % 200 == 0:
+        bad = (
+            int(set_mismatch.nonzero()[0])
+            if n_set
+            else (int(order_only.nonzero()[0]) if n_order else -1)
+        )
+        logger.info(
+            "%s dsv3_grouped_routing CHECK call=%d T=%d set_mismatch_rows=%d order_only_rows=%d "
+            "wmax_same_set=%.3e | cumulative rows=%d set=%d order=%d wmax=%.3e | first_bad_row=%d cake=%s stock=%s",
+            _CAKE_LOG_PREFIX,
+            st["calls"],
+            scores.shape[0],
+            n_set,
+            n_order,
+            wmax,
+            st["rows"],
+            st["set_rows"],
+            st["order_rows"],
+            st["wmax"],
+            bad,
+            cake_ids[bad].tolist() if bad >= 0 else None,
+            stock_ids[bad].tolist() if bad >= 0 else None,
+        )
+
+
 def _cake_biased_grouped_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -291,6 +391,17 @@ def _cake_biased_grouped_topk(
         )
         return None
     _log_cake_route_once(CAKE_ROUTE_DSV3_GROUPED_ROUTING, "taken", detail)
+    if _CAKE_DSV3_CHECK:
+        _cake_dsv3_routing_check(
+            scores,
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk_routed,
+            scaling_factor,
+            topk_weights,
+            topk_ids,
+        )
     return topk_weights, topk_ids
 
 
