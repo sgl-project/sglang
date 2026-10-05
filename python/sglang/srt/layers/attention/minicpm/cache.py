@@ -42,6 +42,7 @@ class MiniCPMCompressedCache:
             [0] * pool._alloc_size,
             [0] * pool._alloc_size,
         ]
+        self._valid_layers: dict[int, set[int]] = {}
         self.reserved_slots = torch.empty(0, dtype=torch.int64, device=pool.device)
         self.free_slots = self.reserved_slots
         self.reset_allocator()
@@ -153,12 +154,27 @@ class MiniCPMCompressedCache:
 
         if allocated:
             self._free_reserved(torch.cat(allocated))
+        for valid_requests in self._valid_layers.values():
+            valid_requests.discard(req_pool_idx)
+
+    def mark_valid(self, layer_id: int, req_pool_indices: torch.Tensor) -> None:
+        """Record that compressed keys for these request slots are usable."""
+        valid_requests = self._valid_layers.setdefault(layer_id, set())
+        valid_requests.update(int(index) for index in req_pool_indices.tolist())
+
+    def is_valid(self, layer_id: int, req_pool_indices: torch.Tensor) -> bool:
+        """Return whether every request slot has a persistent index."""
+        valid_requests = self._valid_layers.get(layer_id)
+        if valid_requests is None:
+            return False
+        return all(int(index) in valid_requests for index in req_pool_indices.tolist())
 
     def clear(self) -> None:
         self.pool.req_to_sparse_k1_token.zero_()
         self.pool.req_to_sparse_k2_token.zero_()
         for lengths in self.allocated_lens:
             lengths[:] = [0] * len(lengths)
+        self._valid_layers.clear()
         self.free_slots = self.reserved_slots
 
 

@@ -234,6 +234,7 @@ class RadixAttention(nn.Module):
                     "aux_tensors",
                     "rel_bias",
                     "return_lse",
+                    "forecast_query",
                     "q_descale",
                     "k_descale",
                     "v_descale",
@@ -635,6 +636,7 @@ def attention_with_output_extra_kwargs(
         "q_descale",
         "k_descale",
         "v_descale",
+        "forecast_query",
         "mxfp8_norm_rope_positions",
         "mxfp8_norm_rope_temp_scale",
     ):

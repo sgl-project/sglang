@@ -1,30 +1,8 @@
 from __future__ import annotations
 
 import logging
-
-from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.runtime_context import get_exec
-
-logger = logging.getLogger(__name__)
-
 from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class KVCacheBuildResult:
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
-    sliding_window_size: Optional[int]
-    full_tokens_per_layer: Optional[int]
-    swa_tokens_per_layer: Optional[int]
-    req_to_token_pool: object
-    token_to_kv_pool_allocator: object
-    disable_radix_cache: bool
-    tree_cache: object
-
-
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
@@ -36,6 +14,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -51,12 +30,29 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class KVCacheBuildResult:
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: Optional[int]
+    full_tokens_per_layer: Optional[int]
+    swa_tokens_per_layer: Optional[int]
+    req_to_token_pool: object
+    token_to_kv_pool_allocator: object
+    disable_radix_cache: bool
+    tree_cache: object
+
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -387,6 +383,39 @@ def build_kv_cache(
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
+            )
+
+    if get_memory().enable_sparda:
+        cache_controller = getattr(tree_cache, "cache_controller", None)
+        transfer_engine = getattr(cache_controller, "l2_transfer_engine", None)
+        from sglang.srt.mem_cache.sparda_prefetch import (
+            SparDAKVPrefetcher,
+            TreeCachePrefetchResolver,
+        )
+
+        # A cache-side resolver may use a remote logical-key connector instead
+        # of HiCache's in-process transfer engine.  Keep the coordinator
+        # attach point common to both paths; the resolver owns the actual
+        # transfer contract.
+        resolver = TreeCachePrefetchResolver(tree_cache)
+        if resolver.is_available():
+            prefetcher = SparDAKVPrefetcher(
+                transfer_engine,
+                resolver=resolver,
+                submit_on_wait=(
+                    getattr(get_memory(), "sparda_prefetch_mode", "async") == "demand"
+                ),
+            )
+            tp_worker.register_sparda_prefetcher(prefetcher)
+            register_cache_prefetcher = getattr(
+                tree_cache, "register_sparda_prefetcher", None
+            )
+            if register_cache_prefetcher is not None:
+                register_cache_prefetcher(prefetcher)
+        else:
+            logger.info(
+                "SparDA KV prefetch resolver is unavailable; forecast selection "
+                "remains enabled."
             )
 
     if retraction_backup == "host_pool":

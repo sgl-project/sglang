@@ -535,6 +535,10 @@ class TpModelWorker(BaseTpWorker):
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
 
+    def register_sparda_prefetcher(self, prefetcher) -> None:
+        """Install the optional request-local SparDA KV prefetcher."""
+        self.model_runner.sparda_prefetcher = prefetcher
+
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
         kv_capacity = (

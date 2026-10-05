@@ -168,6 +168,14 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
+    sparda_enabled = getattr(cfg, "enable_sparda", False)
+    sparda_indexer_path = getattr(cfg, "sparda_indexer_path", None)
+    if sparda_indexer_path is not None and not sparda_enabled:
+        raise ValueError("--sparda-indexer-path requires --enable-sparda to be set.")
+    if sparda_enabled:
+        from sglang.srt.configs.model_config import _apply_sparda_config
+
+        _apply_sparda_config(hf_config, cfg)
     if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
