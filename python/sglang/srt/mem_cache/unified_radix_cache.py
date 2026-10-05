@@ -98,7 +98,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
@@ -3559,20 +3559,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_tokens(active_pool_idxs)
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_full_tokens(active_pool_idxs)
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_swa_tokens(active_pool_idxs)
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_req_count(active_pool_idxs)
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_mamba_slots(active_pool_idxs)
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
