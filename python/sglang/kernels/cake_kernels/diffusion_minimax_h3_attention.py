@@ -1,6 +1,6 @@
 """Cake MiniMax-H3 diffusion attention kernels via FlashInfer.
 
-Three FlashInfer families (FlashInfer ``e4f94f9484``):
+Three FlashInfer families (FlashInfer ``58171ea83f``):
 
 **Packed-varlen attention, SM100a / SM103a** (public entries
 ``flashinfer.prefill.minimax_h3_varlen_attention`` /
@@ -9,16 +9,24 @@ Three FlashInfer families (FlashInfer ``e4f94f9484``):
 ``...cake_jit``: one generated program per stage shared by both targets and
 compiled per exact arch, ``load_cake_minimax_h3_varlen_attention_module(name,
 arch)``; routes are keyed ``<variant>__sm_10{0,3}a``). BF16 THD ``q, k, v
-[T, H, 128]`` contiguous, int32 CUDA
-``cu_seqlens [B+1]`` (starts at 0, non-decreasing, ends at ``T``; empty and
-unaligned segments allowed), non-causal self-attention with ``H_q == H_kv``,
-no mask / bias / window / LSE / dropout, ``softmax_scale`` default
-``1/sqrt(128)``, BF16 ``out [T, H, 128]``.
+[T, H, 128]``, int32 CUDA ``cu_seqlens [B+1]`` (starts at 0, non-decreasing,
+ends at ``T``; empty and unaligned segments allowed), non-causal
+self-attention with ``H_q == H_kv``, no mask / bias / window / LSE / dropout,
+``softmax_scale`` default ``1/sqrt(128)``, contiguous BF16 ``out [T, H, 128]``.
 
-* ``minimax_h3_varlen_attention`` -- BF16 operands; the one-shot form syncs
-  once to read ``cu_seqlens`` unless ``cu_seqlens_host`` is given.
-* ``minimax_h3_varlen_nvfp4_attention`` -- NVFP4 QK (``pv_mode="fp8"``: E4M3 PV
-  with a per-tensor V scale; ``"fp4"``: NVFP4 PV); validated by FlashInfer at
+* ``minimax_h3_varlen_attention`` -- BF16 operands **read in place** (FlashInfer
+  PR #6039): any token-major view with ``stride(2) == 1``, a head stride that
+  is a 16-byte multiple of at least 128 elements, a token stride that is a
+  16-byte multiple of at least ``H * head_stride`` and a 16-byte-aligned base
+  -- the column chunks of the fused QKV projection ``[T, 3 * H * 128]``
+  (strides ``(3 * H * 128, 128, 1)``), the kind slices of the Cake
+  pre-attention pack ``[T, H, 3, 128]`` (strides ``(H * 384, 384, 1)``) and
+  contiguous tensors; the three may differ in strides. Head-major views are
+  rejected. The one-shot form syncs once to read ``cu_seqlens`` unless
+  ``cu_seqlens_host`` is given.
+* ``minimax_h3_varlen_nvfp4_attention`` -- contiguous THD operands (the
+  quantizers read contiguous THD); NVFP4 QK (``pv_mode="fp8"``: E4M3 PV with
+  a per-tensor V scale; ``"fp4"``: NVFP4 PV); validated by FlashInfer at
   ``atol=1.0, rtol=0.1``.
 * ``prepare_minimax_h3_varlen_attention`` / ``prepare_minimax_h3_varlen_nvfp4_attention``
   -- every allocation at prepare (out, plan tables, split partials, packed
@@ -76,6 +84,9 @@ DENSE_MAX_TOKENS = 131072
 DENSE_QUERY_SCALE_BF16 = 0.08837890625
 MAX_HEADS = 1 << 15
 PV_MODES = ("fp8", "fp4")
+# Element multiple that keeps a BF16 stride 16-byte aligned (TMA global
+# strides and the BF16 kernel's 16-byte ragged-tail copies).
+THD_STRIDE_ALIGN = 16 // 2
 
 FI_VARLEN_MODULE = "flashinfer.experimental.minimax_h3_varlen_attention.cake_backend"
 FI_VARLEN_JIT_MODULE = "flashinfer.experimental.minimax_h3_varlen_attention.cake_jit"
@@ -103,6 +114,20 @@ FI_JIT_MODULE = FI_VARLEN_JIT_MODULE
 ARCHS = VARLEN_ARCHS
 
 
+def _thd_view_ok(t: torch.Tensor, num_heads: int) -> bool:
+    """Token-major ``[T, H, 128]`` view the BF16 kernel reads in place
+    (FlashInfer ``_check_thd(contiguous=False)``)."""
+    row_stride, head_stride, elem_stride = (int(s) for s in t.stride())
+    return (
+        elem_stride == 1
+        and head_stride >= HEAD_DIM
+        and head_stride % THD_STRIDE_ALIGN == 0
+        and row_stride >= num_heads * head_stride
+        and row_stride % THD_STRIDE_ALIGN == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
 def _thd_inputs_ok(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -110,24 +135,29 @@ def _thd_inputs_ok(
     cu_seqlens: torch.Tensor,
     out: Optional[torch.Tensor],
     archs,
+    *,
+    strided_qkv: bool = False,
 ) -> bool:
+    """``strided_qkv=True`` (BF16 SM100/103 route) admits strided token-major
+    q/k/v views; ``False`` requires contiguous operands. ``out`` is always
+    contiguous."""
     import torch
 
     if not (
         cuda_tensor_on(q, archs)
         and q.ndim == 3
         and q.dtype == torch.bfloat16
-        and q.is_contiguous()
         and q.shape[2] == HEAD_DIM
         and 1 <= q.shape[1] < MAX_HEADS
     ):
         return False
-    for t in (k, v):
+    num_heads = int(q.shape[1])
+    for t in (q, k, v):
         if not (
             t.dtype == torch.bfloat16
-            and t.is_contiguous()
             and tuple(t.shape) == tuple(q.shape)
             and t.device == q.device
+            and (_thd_view_ok(t, num_heads) if strided_qkv else t.is_contiguous())
         ):
             return False
     if out is not None and not (
@@ -169,11 +199,17 @@ def supports_minimax_h3_varlen_attention(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Admission check mirroring the FlashInfer BF16 contract; never raises."""
+    """Admission check mirroring the FlashInfer BF16 contract; never raises.
+
+    Strided token-major ``query`` / ``key`` / ``value`` views (fused-QKV column
+    chunks, pre-attention pack slices) are admitted and read in place.
+    """
     try:
         return (
             flashinfer_module_available(FI_VARLEN_MODULE, FI_VARLEN_JIT_MODULE)
-            and _thd_inputs_ok(query, key, value, cu_seqlens, out, VARLEN_ARCHS)
+            and _thd_inputs_ok(
+                query, key, value, cu_seqlens, out, VARLEN_ARCHS, strided_qkv=True
+            )
             and _varlen_route_available("bf16", query.device.index)
         )
     except Exception:
@@ -192,7 +228,8 @@ def minimax_h3_varlen_attention(
 ) -> torch.Tensor:
     """Forward to ``flashinfer.prefill.minimax_h3_varlen_attention``; returns BF16 ``out``.
 
-    One host sync to read ``cu_seqlens`` unless ``cu_seqlens_host`` is given.
+    The operands are read where they live (no THD copies). One host sync to
+    read ``cu_seqlens`` unless ``cu_seqlens_host`` is given.
     """
     from flashinfer.prefill import minimax_h3_varlen_attention
 

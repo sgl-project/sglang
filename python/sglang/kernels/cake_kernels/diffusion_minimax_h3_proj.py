@@ -1,7 +1,7 @@
 """Cake MiniMax-H3 FC1+SwiGLU and gated-residual out-projection (SM100a / SM103a).
 
 FlashInfer entries (``flashinfer.diffusion_ops.minimax_h3_fc1_swiglu`` and
-``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``e4f94f9484``;
+``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``58171ea83f``;
 JIT loaders ``flashinfer.jit.minimax_h3_fc1_swiglu`` /
 ``flashinfer.jit.minimax_h3_out_proj`` compile the ``cake_minimax_h3_*_sm100a /
 _sm103a.cu`` sources).
@@ -30,9 +30,9 @@ with ``fc1_weight`` gate rows ``[0, 14336)`` first, then up rows):
   / ``prepare_minimax_h3_fc1_weight_nvfp4_sm120``.
 
 Out-projection (``attn_out [P, M, 56 // P, 128]`` Ulysses receive layout,
-``o_weight [5376, 7168]``, ``gate [9, 5376]``, int32 ``gate_index [M]`` (outside
-``[0, 9)`` -> gate 0 -> ``out = residual``), ``residual [M, 5376]`` ->
-``out = bf16(residual + bf16(gate * bf16(A @ W^T)))``):
+``o_weight [5376, 7168]``, ``gate [rows, 5376]``, int64 ``gate_index [M]``
+(outside ``[0, rows)`` -> gate 0 -> ``out = residual``), ``residual [M, 5376]``
+-> ``out = bf16(residual + bf16(gate * bf16(A @ W^T)))``):
 
 * ``minimax_h3_out_proj`` -- BF16, one persistent 2-CTA tcgen05 launch; only
   ``out`` may be allocated, so supply it for graphs.
@@ -45,12 +45,24 @@ Out-projection (``attn_out [P, M, 56 // P, 128]`` Ulysses receive layout,
   -- offline weight preparation for the SM100/103 routes (not the layout the
   SM120 ``quantize_minimax_h3_o_weight_*`` entries expect).
 
+AdaLN / gate operand contract (engine-native, FlashInfer PR #6039; shared by
+the BF16, MXFP8 and NVFP4 SM100/103 entries): BF16 ``[rows >= 1, 5376]``
+tables with ``stride(1) == 1``, ``stride(0)`` a multiple of 8 elements (16
+bytes) -- column chunks of the engine's ``[rows, 6 * 5376]`` modulation
+projection pass as they are -- and a 16-byte-aligned data pointer; the FC1
+``adaln_scale`` / ``adaln_shift`` pair shares one row count; the out-proj
+``gate`` row stride lies in ``[5376, 2**32)``. Contiguous int64 index ``[M]``
+(out-of-range rows are device-guarded). ``eps`` is a runtime argument (any
+finite float). Nothing is copied on the host.
+
 All compute entries require exact compute capability 10.0 / 10.3 (FlashInfer
 raises ``RuntimeError`` otherwise, except the NVFP4 FC1 dispatcher on 12.x),
-CUDA >= 12.9, ``1 <= M <= 2**24`` and ``eps == 1e-5``.
+CUDA >= 12.9 and ``1 <= M <= 2**24``. The cc 12.x branch of the NVFP4 FC1
+dispatcher keeps the SM120 operand contract (contiguous ``[9, 5376]`` tables,
+int32 index, positive finite ``eps``).
 
 Not supported here: other hidden sizes, SM90, SM120 (use
-:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`), ``eps != 1e-5``.
+:mod:`sglang.kernels.cake_kernels.diffusion_minimax_h3_sm120`).
 """
 
 from __future__ import annotations
@@ -83,10 +95,15 @@ FC1_ROWS = 2 * FFN  # 28672
 NUM_HEADS = 56
 HEAD_DIM = 128
 ATTN_DIM = NUM_HEADS * HEAD_DIM  # 7168
+# Production default table row count (3 modulation rows x 3 timestep groups);
+# the SM100/103 entries accept any ``rows >= 1``, the SM120 FC1 route needs 9.
 ADALN_ROWS = 9
 GATE_ROWS = 9
 EPS = 1.0e-5
 MAX_ROWS = 1 << 24
+# AdaLN / gate tables are read with 16-byte vector loads.
+TABLE_ALIGN_ELEMENTS = 8
+TABLE_ALIGN_BYTES = 16
 SEQUENCE_PARALLEL_DEGREES = (1, 2, 4, 8)
 MXFP8_FC1_SCALE_TILE_BYTES = 112 * 42 * 1024  # 4_816_896
 NVFP4_FC1_SCALE_TILE_BYTES = 128 * 84 * 1024  # 11_010_048
@@ -140,6 +157,44 @@ def _opt_min_bytes(t: Optional[torch.Tensor], nbytes: int, device) -> bool:
     )
 
 
+def _finite(value) -> bool:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return False
+    return f == f and f not in (float("inf"), float("-inf"))
+
+
+def _table_ok(t: torch.Tensor, device) -> bool:
+    """Engine-native BF16 table ``[rows >= 1, 5376]`` (FlashInfer ``_check_table``):
+    unit last stride, 16-byte row pitch and base pointer. Column chunks of a
+    wider projection pass as-is."""
+    import torch
+
+    return (
+        isinstance(t, torch.Tensor)
+        and t.ndim == 2
+        and t.shape[0] >= 1
+        and t.shape[1] == HIDDEN
+        and t.dtype == torch.bfloat16
+        and t.device == device
+        and t.stride(1) == 1
+        and t.stride(0) % TABLE_ALIGN_ELEMENTS == 0
+        and t.data_ptr() % TABLE_ALIGN_BYTES == 0
+    )
+
+
+def _index_ok(t: torch.Tensor, m: int, device) -> bool:
+    """Contiguous int64 ``[M]`` table row per activation row."""
+    import torch
+
+    return (
+        isinstance(t, torch.Tensor)
+        and _shape(t, (m,), torch.int64)
+        and t.device == device
+    )
+
+
 def _f32_scalar(t: Scalar, device) -> bool:
     import torch
 
@@ -162,7 +217,16 @@ def _fc1_common(
     out: Optional[torch.Tensor],
     eps: float,
     archs,
+    *,
+    sm120_contract: bool = False,
 ) -> bool:
+    """Shared FC1 operand admission.
+
+    ``sm120_contract=False`` is the SM100/103 engine-native contract (strided
+    ``[rows, 5376]`` tables sharing one row count, int64 index, any finite
+    ``eps``); ``True`` is the SM120 route's contract (contiguous ``[9, 5376]``
+    tables, int32 index, positive finite ``eps``).
+    """
     import torch
 
     if not (
@@ -174,17 +238,29 @@ def _fc1_common(
         return False
     m = x.shape[0]
     bf16 = torch.bfloat16
-    return (
-        float(eps) == EPS
-        and _shape(x_norm_weight, (HIDDEN,), bf16)
-        and _shape(adaln_scale, (ADALN_ROWS, HIDDEN), bf16)
-        and _shape(adaln_shift, (ADALN_ROWS, HIDDEN), bf16)
-        and _shape(adaln_index, (m,), torch.int32)
-        and all(
-            t.device == x.device
-            for t in (x_norm_weight, adaln_scale, adaln_shift, adaln_index)
-        )
+    if not (
+        _shape(x_norm_weight, (HIDDEN,), bf16)
+        and x_norm_weight.device == x.device
         and _opt(out, (m, FFN), bf16, x.device)
+    ):
+        return False
+    if sm120_contract:
+        return (
+            _finite(eps)
+            and float(eps) > 0.0
+            and _shape(adaln_scale, (ADALN_ROWS, HIDDEN), bf16)
+            and _shape(adaln_shift, (ADALN_ROWS, HIDDEN), bf16)
+            and _shape(adaln_index, (m,), torch.int32)
+            and all(
+                t.device == x.device for t in (adaln_scale, adaln_shift, adaln_index)
+            )
+        )
+    return (
+        _finite(eps)
+        and _table_ok(adaln_scale, x.device)
+        and _table_ok(adaln_shift, x.device)
+        and adaln_scale.shape[0] == adaln_shift.shape[0]
+        and _index_ok(adaln_index, m, x.device)
     )
 
 
@@ -347,9 +423,11 @@ def supports_minimax_h3_fc1_swiglu_nvfp4(
     """Admission check mirroring the FlashInfer dispatcher; never raises.
 
     On cc 10.0/10.3 ``fc1_scale_tiles`` must be the SM100/103 combined tiles
-    (11,010,048 bytes) and ``eps == 1e-5``; on cc 12.x the SM120 route accepts
-    ``fc1_scale_tiles`` of ``28672 * 336`` bytes (``prepare_..._nvfp4_sm120``),
-    any positive ``eps`` and a dense ``workspace_sf`` of ``M * 336`` bytes.
+    (11,010,048 bytes) and the AdaLN operands follow the engine-native
+    contract; on cc 12.x the SM120 route accepts ``fc1_scale_tiles`` of
+    ``28672 * 336`` bytes (``prepare_..._nvfp4_sm120``), contiguous ``[9, 5376]``
+    tables with an int32 index, any positive ``eps`` and a dense
+    ``workspace_sf`` of ``M * 336`` bytes.
     """
     import torch
 
@@ -364,8 +442,9 @@ def supports_minimax_h3_fc1_swiglu_nvfp4(
         if sm120 and not flashinfer_module_available(FI_SM120_FC1_JIT_MODULE):
             return False
         if sm120:
-            # The SM120 route accepts any positive finite eps.
-            eps_ok = float(eps) > 0.0 and float(eps) == float(eps)
+            # The SM120 route keeps its own operand contract (contiguous
+            # [9, 5376] tables, int32 index, any positive finite eps).
+            eps_ok = True
             base = _fc1_common(
                 x,
                 x_norm_weight,
@@ -373,8 +452,9 @@ def supports_minimax_h3_fc1_swiglu_nvfp4(
                 adaln_shift,
                 adaln_index,
                 out,
-                EPS,
+                eps,
                 NVFP4_FC1_DISPATCH_ARCHS,
+                sm120_contract=True,
             )
             tiles = FC1_ROWS * (HIDDEN // 16)
             sf_bytes = x.shape[0] * (HIDDEN // 16)
@@ -545,10 +625,13 @@ def _out_proj_common(
         p in SEQUENCE_PARALLEL_DEGREES
         and 1 <= m <= MAX_ROWS
         and tuple(attn_out.shape) == (p, m, NUM_HEADS // p, HEAD_DIM)
-        and _shape(gate, (GATE_ROWS, HIDDEN), bf16)
-        and _shape(gate_index, (m,), torch.int32)
+        and _table_ok(gate, attn_out.device)
+        # The epilogue forms the gate offset as a 32x32->64-bit multiply of
+        # row index and row pitch: rows must not overlap, pitch fits 32 bits.
+        and HIDDEN <= gate.stride(0) < 2**32
+        and _index_ok(gate_index, m, attn_out.device)
         and _shape(residual, (m, HIDDEN), bf16)
-        and all(t.device == attn_out.device for t in (gate, gate_index, residual))
+        and residual.device == attn_out.device
         and _opt(out, (m, HIDDEN), bf16, attn_out.device)
     )
 

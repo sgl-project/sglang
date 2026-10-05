@@ -58,8 +58,11 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         True,
-        "BF16 x [M,5376] -> caller-owned out [P,M,56/P,3,128]; P in {1,2,4,8}",
-        "Cake MiniMax-H3 fused RMSNorm+AdaLN+BF16 QKV+QK-norm+RoPE+pack (SM100/103).",
+        "BF16 x [M,5376] + engine operands (strided AdaLN tables [rows,5376], "
+        "int64 index, RoPE cache [S,96] + int64 positions, eps/qk_eps) -> "
+        "caller-owned out [P,M,56/P,3,128] via workspace [M,5376]; P in {1,2,4,8}",
+        "Cake MiniMax-H3 two-launch RMSNorm+AdaLN+BF16 QKV+QK-norm+RoPE+pack "
+        "(SM100/103).",
     ),
     (
         "prepare_minimax_h3_mxfp8_pre_attention",
@@ -108,7 +111,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "BF16 x [M,5376] + fc1_weight [28672,5376] -> out [M,14336]",
+        "BF16 x [M,5376] + strided AdaLN tables [rows,5376] + int64 index + "
+        "fc1_weight [28672,5376] -> out [M,14336]",
         "Cake MiniMax-H3 BF16 norm+AdaLN+FC1+SwiGLU (SM100/103 tcgen05).",
     ),
     (
@@ -157,8 +161,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "attn_out [P,M,56/P,128] receive layout + o_weight [5376,7168] -> "
-        "bf16(residual + bf16(gate * bf16(A@W^T)))",
+        "attn_out [P,M,56/P,128] receive layout + o_weight [5376,7168] + strided "
+        "gate [rows,5376] + int64 index -> bf16(residual + bf16(gate * bf16(A@W^T)))",
         "Cake MiniMax-H3 BF16 gated-residual out-projection (SM100/103 tcgen05).",
     ),
     (
@@ -204,8 +208,8 @@ _SPECS: Tuple[Tuple[str, str, frozenset, Tuple[str, ...], bool, str, str], ...] 
         _SM100_103,
         ("bfloat16",),
         False,
-        "BF16 THD q,k,v [T,H,128] + int32 cu_seqlens [B+1] -> out [T,H,128]; "
-        "noncausal, H_q == H_kv",
+        "BF16 THD q,k,v [T,H,128] (strided token-major views read in place) + "
+        "int32 cu_seqlens [B+1] -> contiguous out [T,H,128]; noncausal, H_q == H_kv",
         "Cake MiniMax-H3 packed-varlen BF16 attention (SM100/103).",
     ),
     (
@@ -411,6 +415,9 @@ def cake_minimax_h3_bf16_pre_attention(
     ulysses_degree: int,
     out: torch.Tensor,
     eps: float = 1.0e-5,
+    qk_eps: Optional[float] = None,
+    rope_positions: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Explicit Cake entry point; callers gate on the adapter's ``supports_*``."""
     return _k("minimax_h3_bf16_pre_attention")(
@@ -426,6 +433,9 @@ def cake_minimax_h3_bf16_pre_attention(
         ulysses_degree=ulysses_degree,
         out=out,
         eps=eps,
+        qk_eps=qk_eps,
+        rope_positions=rope_positions,
+        workspace=workspace,
     )
 
 
