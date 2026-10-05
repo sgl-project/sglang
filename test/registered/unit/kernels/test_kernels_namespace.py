@@ -174,7 +174,7 @@ def test_import_stays_metadata_only():
         "('sgl_kernel', 'cutlass', 'flydsl', 'aiter', "
         "'sglang.kernels.ops.gemm.kimi_k3', "
         "'sglang.kernels.ops.activation.softcap', "
-        "'sglang.kernels.ops.attention.dense_kv', "
+        "'sglang.kernels.ops.attention.dllm_kv_pack', "
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
@@ -245,7 +245,7 @@ def test_reclassified_public_entry_points_are_inventoried():
     root = Path(K.__file__).resolve().parent / "ops"
     targets = {spec.target for spec in K.registry.all_specs()}
     modules = (
-        "attention.dense_kv",
+        "attention.dllm_kv_pack",
         "attention.gemma_qkv_norm_rope",
         "attention.minicpm_sala.get_block_table",
         "attention.fast_topk",

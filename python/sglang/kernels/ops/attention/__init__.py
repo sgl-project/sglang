@@ -364,7 +364,7 @@ register_kernel(
     KernelSpec(
         op="attention.pack_prefix_current",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.dense_kv:pack_prefix_current",
+        target="sglang.kernels.ops.attention.dllm_kv_pack:pack_prefix_current",
         capabilities=frozenset({CapabilityRequirement.CUDA}),
         description="Pack CSR prefix and current K/V into caller-provided dense buffers.",
     )

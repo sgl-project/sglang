@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import torch
 
-from sglang.kernels.ops.attention.dense_kv import pack_prefix_current
+from sglang.kernels.ops.attention.dllm_kv_pack import pack_prefix_current
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd_unified
 from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_gqa_512
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
