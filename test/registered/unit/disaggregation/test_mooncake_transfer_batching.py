@@ -487,6 +487,10 @@ class TestMooncakeEarlySend(unittest.TestCase):
             _prefill_unique_rank=lambda: 0,
             session_lock=Lock(),
             failed_sessions=set(),
+            # Read under session_lock alongside failed_sessions on every
+            # non-dummy req, and invoked by the worker's except path.
+            state_layout_rejections={},
+            poison_deferred_ack_room=MagicMock(),
             decode_kv_args_table={"peer": registration},
             _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
             kv_args=SimpleNamespace(kv_data_ptrs=[1]),
