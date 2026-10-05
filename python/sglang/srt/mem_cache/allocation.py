@@ -304,8 +304,8 @@ def alloc_req_slots(
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
+        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x without prefix sharing.
+        if tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
                 if req_to_token_pool.enable_mamba_extra_buffer_lazy

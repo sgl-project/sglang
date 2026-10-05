@@ -24,9 +24,9 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -61,21 +61,6 @@ def _find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
-
-
-def _previous_stage(block_configs, layer_idx: int):
-    """The declaration of the last attention or FFN before this layer, or None
-    when this layer's first stage starts the layer stack."""
-    for block in reversed(block_configs[:layer_idx]):
-        if not block.ffn.no_op:
-            return declare_ffn()
-        if not block.attention.no_op:
-            return declare_attn()
-    return None
-
-
-def _has_stage(block) -> bool:
-    return not (block.attention.no_op and block.ffn.no_op)
 
 
 class DeciLMDecoderLayer(nn.Module):
@@ -162,12 +147,8 @@ class DeciLMDecoderLayer(nn.Module):
             )
         self.entry_boundary = None
         if stages:
-            boundaries = make_stages(
+            boundaries = append_stages(
                 *stages,
-                previous=_previous_stage(config.block_configs, layer_idx),
-                terminal=not any(
-                    _has_stage(block) for block in config.block_configs[layer_idx + 1 :]
-                ),
             )
             self.entry_boundary = boundaries[0]
             if not self._is_no_op_attention:

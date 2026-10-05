@@ -284,17 +284,24 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
-        # off-grid chunk leaves the rest of the prompt uncacheable.
+        # off-grid chunk leaves the rest of the prompt uncacheable. Without
+        # prefix sharing nothing is cached, so the chunk stays exact.
         self.mock_token_allocator.available_size.return_value = 32768
-        self.mock_tree_cache.supports_prefix_sharing.return_value = False
-        for supports_mamba, expected in ((False, 100), (True, 64)):
+        cases = ((False, True, 100), (True, True, 64), (True, False, 100))
+        for supports_mamba, supports_prefix_sharing, expected in cases:
             with (
-                self.subTest(supports_mamba=supports_mamba),
+                self.subTest(
+                    supports_mamba=supports_mamba,
+                    supports_prefix_sharing=supports_prefix_sharing,
+                ),
                 patch.object(
                     schedule_policy, "_use_exact_chunk_fill", return_value=True
                 ),
             ):
                 self.mock_tree_cache.supports_mamba.return_value = supports_mamba
+                self.mock_tree_cache.supports_prefix_sharing.return_value = (
+                    supports_prefix_sharing
+                )
                 adder = self.create_adder(
                     self.create_running_batch(), page_size=64, rem_chunk_tokens=100
                 )
