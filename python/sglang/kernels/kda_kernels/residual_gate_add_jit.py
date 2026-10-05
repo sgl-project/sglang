@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -170,6 +171,155 @@ def _residual_gate_add_transposed(residual, update, gate):
     return out
 
 
+@triton.jit
+def _rocm_round16_f32(x, IS_BF16: tl.constexpr):
+    """Round to 16-bit precision on AMD without NVIDIA PTX."""
+    if IS_BF16:
+        return round_bf16_to_fp32(x)
+    bits = tl.inline_asm_elementwise(
+        "v_cvt_f16_f32 $0, $1",
+        "=v,v",
+        [x],
+        dtype=tl.int16,
+        is_pure=True,
+        pack=1,
+    )
+    return bits.to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _rocm_store16(out_ptr, offs, value_f32, mask, IS_BF16: tl.constexpr):
+    if IS_BF16:
+        value = value_f32.to(tl.bfloat16)
+    else:
+        value = value_f32.to(tl.float16)
+    tl.store(out_ptr + offs, value, mask=mask)
+
+
+@triton.jit
+def _rga_rocm_flat(
+    out,
+    res,
+    upd,
+    gate,
+    numel,
+    hid,
+    MODE: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    IS_16: tl.constexpr,
+    BLK: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLK + tl.arange(0, BLK).to(tl.int64)
+    mask = offs < numel
+    rv = tl.load(res + offs, mask=mask)
+    uv = tl.load(upd + offs, mask=mask)
+    if MODE == 1:
+        gv = tl.load(gate + (offs % hid), mask=mask)
+    elif MODE == 2:
+        gv = tl.load(gate + (offs // hid), mask=mask)
+    else:
+        gv = tl.load(gate + offs, mask=mask)
+    if IS_16:
+        value = rv.to(tl.float32) + _rocm_round16_f32(
+            uv.to(tl.float32) * gv.to(tl.float32), IS_BF16
+        )
+        _rocm_store16(out, offs, value, mask, IS_BF16)
+    else:
+        tl.store(out + offs, rv + uv * gv, mask=mask)
+
+
+@triton.jit
+def _rga_rocm_transposed(
+    out,
+    res,
+    upd,
+    gate,
+    tokens,
+    hid: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    IS_16: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    pid_b = tl.program_id(2).to(tl.int64)
+    t = pid_t * TILE + tl.arange(0, TILE).to(tl.int64)
+    h = pid_h * TILE + tl.arange(0, TILE).to(tl.int64)
+    mt = t < tokens
+    mh = h < hid
+    gv = tl.load(gate + h, mask=mh, other=0.0)
+    base = pid_b * tokens * hid
+    mask = mh[:, None] & mt[None, :]
+    roffs = h[:, None] * tokens + t[None, :]
+    rv = tl.load(res + base + roffs, mask=mask, other=0.0)
+    uv = tl.load(upd + base + t[None, :] * hid + h[:, None], mask=mask, other=0.0)
+    if IS_16:
+        value = rv.to(tl.float32) + _rocm_round16_f32(
+            uv.to(tl.float32) * gv[:, None].to(tl.float32), IS_BF16
+        )
+        _rocm_store16(out, base + roffs, value, mask, IS_BF16)
+    else:
+        tl.store(out + base + roffs, rv + uv * gv[:, None], mask=mask)
+
+
+def _residual_gate_add_rocm_triton(residual, update, gate):
+    out = torch.empty_strided(
+        residual.shape, residual.stride(), dtype=residual.dtype, device=residual.device
+    )
+    is_bf16 = residual.dtype == torch.bfloat16
+    is_16 = residual.dtype in (torch.float16, torch.bfloat16)
+    if _is_transposed_dense_residual(residual, update, gate):
+        _, tokens, hidden = residual.shape
+        tile = (
+            16
+            if residual.numel() <= 65536
+            else 64
+            if residual.numel() >= 1 << 20
+            else 32
+        )
+        warps = 4 if tile == 16 else 8
+        _rga_rocm_transposed[
+            (triton.cdiv(tokens, tile), triton.cdiv(hidden, tile), residual.shape[0])
+        ](
+            out,
+            residual,
+            update,
+            gate,
+            tokens,
+            hidden,
+            is_bf16,
+            is_16,
+            TILE=tile,
+            num_warps=warps,
+        )
+        return out
+
+    numel = residual.numel()
+    hidden = residual.shape[-1]
+    if gate.shape == residual.shape:
+        mode = 0
+    elif _is_row_broadcast_gate(residual, gate):
+        mode = 1
+    else:
+        mode = 2
+    block = 256 if numel <= 8192 else 1024
+    _rga_rocm_flat[(triton.cdiv(numel, block),)](
+        out,
+        residual,
+        update,
+        gate,
+        numel,
+        hidden,
+        mode,
+        is_bf16,
+        is_16,
+        BLK=block,
+        num_warps=4,
+    )
+    return out
+
+
 @register_custom_op(
     op_name="diffusion_residual_gate_add",
     mutates_args=[],
@@ -185,6 +335,18 @@ def _residual_gate_add_custom_op(
         if _is_transposed_dense_residual(residual, update, gate):
             return _residual_gate_add_transposed(residual, update, gate)
         return _residual_gate_add_cuda_impl(residual, update, gate)
+
+
+@register_custom_op(
+    op_name="diffusion_residual_gate_add_rocm",
+    mutates_args=[],
+    fake_impl=_fake_impl,
+)
+def _residual_gate_add_rocm_custom_op(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    with torch.cuda.device(residual.device):
+        return _residual_gate_add_rocm_triton(residual, update, gate)
 
 
 def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
@@ -262,11 +424,12 @@ def can_use_residual_gate_add_cuda(
         residual, update, gate
     )
 
-def can_use_residual_gate_add_cuda(
+
+def can_use_residual_gate_add_rocm(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
-    """Return whether the NVIDIA-only JIT/Triton dispatch can handle the input."""
-    return torch.version.hip is None and _can_use_residual_gate_add_common(
+    """Return whether the dedicated ROCm Triton path can handle the input."""
+    return torch.version.hip is not None and _can_use_residual_gate_add_common(
         residual, update, gate
     )
 
@@ -279,19 +442,30 @@ def residual_gate_add_cuda(
     return _residual_gate_add_custom_op(residual, update, gate)
 
 
+def residual_gate_add_rocm(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    if not can_use_residual_gate_add_rocm(residual, update, gate):
+        raise RuntimeError("unsupported input for residual_gate_add ROCm")
+    return _residual_gate_add_rocm_custom_op(residual, update, gate)
+
+
 def residual_gate_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """Use the bit-exact fast path for supported layouts, otherwise eager."""
-    if residual.dtype in _BIT_EXACT_DTYPES and can_use_residual_gate_add_cuda(
-        residual, update, gate
-    ):
-        return _residual_gate_add_custom_op(residual, update, gate)
+    """Use the backend's bit-exact fast path for supported layouts, otherwise eager."""
+    if residual.dtype in _BIT_EXACT_DTYPES:
+        if can_use_residual_gate_add_cuda(residual, update, gate):
+            return _residual_gate_add_custom_op(residual, update, gate)
+        if can_use_residual_gate_add_rocm(residual, update, gate):
+            return _residual_gate_add_rocm_custom_op(residual, update, gate)
     return residual + update * gate
 
 
 __all__ = [
     "can_use_residual_gate_add_cuda",
+    "can_use_residual_gate_add_rocm",
     "residual_gate_add",
     "residual_gate_add_cuda",
+    "residual_gate_add_rocm",
 ]
