@@ -2,7 +2,6 @@
 
 import concurrent.futures
 import json
-import os
 import sys
 import types
 import unittest
@@ -40,14 +39,6 @@ _BASE_CONFIG = {
 }
 
 
-def _without_mooncake_env():
-    return patch.dict(
-        os.environ,
-        {k: v for k, v in os.environ.items() if not k.startswith("MOONCAKE_")},
-        clear=True,
-    )
-
-
 def _parse(**overrides):
     return OutputStoreConfig.from_extra_config(
         json.dumps({**_BASE_CONFIG, **overrides})
@@ -63,11 +54,6 @@ def _chunk(lengths, token_ids, logprobs):
 
 
 class TestOutputStoreConfig(CustomTestCase):
-    def setUp(self):
-        env = _without_mooncake_env()
-        env.start()
-        self.addCleanup(env.stop)
-
     def test_defaults_match_mooncake_client_defaults(self):
         config = _parse()
         self.assertEqual(config.local_buffer_size, 2 * 1024**3)
@@ -88,22 +74,14 @@ class TestOutputStoreConfig(CustomTestCase):
         self.assertEqual((config.partition, config.replica_num), ("run-1", 2))
         self.assertEqual(config.chunk_bytes, 64 * 1024**2)
 
-    def test_unset_keys_fall_back_to_mooncake_env(self):
-        with (
-            envs.MOONCAKE_MASTER.override("10.0.0.9:50051"),
-            envs.MOONCAKE_LOCAL_HOSTNAME.override("10.0.0.8"),
-            envs.MOONCAKE_LOCAL_BUFFER_SIZE.override("512mb"),
-            envs.MOONCAKE_PROTOCOL.override("tcp"),
-        ):
-            config = OutputStoreConfig.from_extra_config('{"key_prefix": "p"}')
-        self.assertEqual(config.master_server_address, "10.0.0.9:50051")
-        self.assertEqual(config.local_hostname, "10.0.0.8")
-        self.assertEqual(config.local_buffer_size, 512 * 1024**2)
-        self.assertEqual(config.protocol, "tcp")
+    def test_mooncake_env_does_not_configure_the_store(self):
+        """MOONCAKE_* env vars belong to SGLang's other Mooncake users; the output
+        store reads only its JSON config."""
+        with envs.MOONCAKE_PROTOCOL.override("tcp"):
+            config = _parse()
+        self.assertEqual(config.protocol, "rdma")
 
     def test_rejects_configs_it_cannot_serve(self):
-        """local_hostname defaults to "localhost" in envs, which other nodes cannot
-        reach, so only an explicit value counts."""
         cases = {
             "not an object": "[]",
             "unknown key": json.dumps({**_BASE_CONFIG, "check_server": True}),
@@ -114,13 +92,10 @@ class TestOutputStoreConfig(CustomTestCase):
             "chunk_bytes 0": json.dumps({**_BASE_CONFIG, "chunk_bytes": 0}),
             "replica_num as text": json.dumps({**_BASE_CONFIG, "replica_num": "2"}),
         }
-        for key in ("master_server_address", "local_hostname", "local_buffer_size"):
+        for key in _BASE_CONFIG:
             cases[f"no {key}"] = json.dumps(
                 {k: v for k, v in _BASE_CONFIG.items() if k != key}
             )
-        cases["no key_prefix"] = json.dumps(
-            {k: v for k, v in _BASE_CONFIG.items() if k != "key_prefix"}
-        )
         for name, extra_config in cases.items():
             with (
                 self.subTest(name),
