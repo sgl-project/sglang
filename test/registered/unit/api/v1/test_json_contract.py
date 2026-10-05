@@ -12,7 +12,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import json
 import unittest
 
-from sglang.api.v1.types import (
+from sglang.api.v1.api_types import (
     FinishAbort,
     FinishLength,
     FinishStop,
@@ -21,14 +21,18 @@ from sglang.api.v1.types import (
     GenerateResponse,
     JsonContractError,
     LogprobEntry,
+    MediaRef,
     SamplingParams,
     decode_FinishReason,
+    decode_MediaInput,
     decode_OptionalInt64OrList,
     decode_OptionalStringOrList,
     decode_SamplingParamsOrList,
+    decode_StringListOrList,
     decode_StringOrList,
     decode_TokenIdsOrList,
     encode_FinishReason,
+    encode_MediaInput,
     encode_OptionalStringOrList,
     encode_StringOrList,
 )
@@ -133,11 +137,43 @@ class TestGenerateRequest(CustomTestCase):
         )
         self.assertEqual(req.text, "hi")
 
-    def test_raw_json_passthrough(self):
+    def test_media_input_shapes_dispatch(self):
+        """Typed media: the value's shape picks the container form, nulls are
+        kept per element, and a ref object decodes to a MediaRef."""
         req = GenerateRequest.from_json_value(
-            {"image_data": [["data:image/png;base64,xx"], None]}
+            {"image_data": [["data:image/png;base64,xx"], None, []]}
         )
-        self.assertEqual(req.image_data, [["data:image/png;base64,xx"], None])
+        self.assertEqual(req.image_data, [["data:image/png;base64,xx"], None, []])
+        flat = decode_MediaInput(["a", None, {"url": "b", "detail": "high"}])
+        self.assertEqual(flat[:2], ["a", None])
+        self.assertIsInstance(flat[2], MediaRef)
+        self.assertEqual((flat[2].url, flat[2].detail), ("b", "high"))
+        self.assertEqual(decode_MediaInput("u"), "u")
+        self.assertEqual(decode_MediaInput([]), [])
+        for value in (
+            ["a", None, {"url": "b", "detail": "high"}],
+            [["a", None], None, []],
+            "u",
+        ):
+            self.assertEqual(encode_MediaInput(decode_MediaInput(value)), value)
+
+    def test_media_ref_is_typed_and_strict(self):
+        with self.assertRaises(JsonContractError) as ctx:
+            decode_MediaInput(
+                {"url": "u", "max_dynamic_patc": 6}
+            )  # codespell:ignore patc
+        self.assertIn("unknown field", str(ctx.exception))
+        with self.assertRaises(JsonContractError):
+            decode_MediaInput([{"format": "processor_output"}])
+        with self.assertRaises(JsonContractError):
+            decode_MediaInput(["a", ["b"]])
+
+    def test_string_list_or_list_shape_dispatch(self):
+        self.assertEqual(decode_StringListOrList(["a", "b"]), ["a", "b"])
+        self.assertEqual(
+            decode_StringListOrList([["a"], ["b", "c"]]), [["a"], ["b", "c"]]
+        )
+        self.assertEqual(decode_StringListOrList([]), [])
 
     def test_stream_null_resets_default(self):
         self.assertIs(GenerateRequest.from_json_value({"stream": None}).stream, False)

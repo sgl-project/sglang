@@ -7,12 +7,16 @@
 //! unions, per-field null/default/presence rules, raw_json passthrough, and
 //! the IGNORE/DENY unknown-key policies with serde's own error texts.
 
+use std::collections::HashMap;
+
 use crate::model::{self, FieldKind, FieldModel, MessageKind, MessageModel, ScalarTy};
 use prost_reflect::DescriptorPool;
 
 pub fn emit_serde(descriptor_bytes: &[u8], package: &str) -> String {
     let pool = DescriptorPool::decode(descriptor_bytes).expect("decode descriptor set");
     let models = model::build_models(&pool, package);
+    let by_name: HashMap<&str, &MessageModel> =
+        models.iter().map(|m| (m.rust_name.as_str(), m)).collect();
 
     let mut out = String::new();
     out.push_str(
@@ -30,12 +34,12 @@ pub fn emit_serde(descriptor_bytes: &[u8], package: &str) -> String {
                 oneof_mod,
                 one,
                 many,
-            } => emit_one_or_many(&mut out, m, oneof_mod, one, many),
+            } => emit_one_or_many(&mut out, m, oneof_mod, one, many, &by_name),
             MessageKind::Untagged {
                 oneof_mod,
                 oneof_ident,
                 variants,
-            } => emit_untagged(&mut out, m, oneof_mod, oneof_ident, variants),
+            } => emit_untagged(&mut out, m, oneof_mod, oneof_ident, variants, &by_name),
             MessageKind::TaggedUnion {
                 oneof_mod,
                 oneof_ident,
@@ -177,6 +181,7 @@ fn emit_one_or_many(
     oneof_mod: &str,
     one: &model::VariantModel,
     many: &model::VariantModel,
+    models: &HashMap<&str, &MessageModel>,
 ) {
     let name = &m.rust_name;
     let one_v = &one.rust_variant;
@@ -268,22 +273,21 @@ fn emit_one_or_many(
     // Sequence handling. For a message-typed `one` whose JSON is ITSELF an
     // array (TokenIds), the outer array is ambiguous: dispatch on the first
     // element's shape (number => one flat id list, array/other => many).
-    let seq_visit = if matches!(&one.kind, FieldKind::Message { rust_path, .. } if rust_path == "TokenIds")
-    {
+    let seq_visit = if let Some((one_ty, first_check)) = bare_scalar_list(&one.kind, models) {
         format!(
             r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {{
                 let Some(first) = seq.next_element::<::serde_json::Value>()? else {{
-                    // [] is one empty id list (the untagged first-arm rule).
-                    return Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}(TokenIds::default())) }});
+                    // [] is one empty list (the untagged first-arm rule).
+                    return Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}({one_ty}::default())) }});
                 }};
-                let is_number = first.is_number();
+                let is_number = {first_check};
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {{
                     rest.push(v);
                 }}
                 let reparse = ::serde_json::Value::Array(rest);
                 if is_number {{
-                    let one: TokenIds = ::serde_json::from_value(reparse)
+                    let one: {one_ty} = ::serde_json::from_value(reparse)
                         .map_err(::serde::de::Error::custom)?;
                     Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}(one)) }})
                 }} else {{
@@ -344,53 +348,317 @@ impl<'de> ::serde::Deserialize<'de> for {name} {{
     ));
 }
 
+/// The JSON value shapes a field or message can take; the untagged dispatch
+/// keys on these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum JsonShape {
+    Str,
+    Int,
+    Float,
+    Bool,
+    Map,
+    Seq,
+    Null,
+}
+
+fn scalar_shapes(ty: &ScalarTy) -> Vec<JsonShape> {
+    match ty {
+        ScalarTy::Str => vec![JsonShape::Str],
+        ScalarTy::I32 | ScalarTy::I64 | ScalarTy::U32 | ScalarTy::U64 => vec![JsonShape::Int],
+        ScalarTy::F64 => vec![JsonShape::Int, JsonShape::Float],
+        ScalarTy::Bool => vec![JsonShape::Bool],
+    }
+}
+
+fn kind_shapes(kind: &FieldKind, models: &HashMap<&str, &MessageModel>) -> Vec<JsonShape> {
+    match kind {
+        FieldKind::Scalar { ty, .. } | FieldKind::OptScalar { ty, .. } => scalar_shapes(ty),
+        FieldKind::Message { rust_path, .. } => message_shapes(rust_path, models),
+        FieldKind::RepeatedScalar { .. }
+        | FieldKind::RepeatedMessage { .. }
+        | FieldKind::RepeatedRawJson => vec![JsonShape::Seq],
+        FieldKind::Map { .. } => vec![JsonShape::Map],
+        FieldKind::RawJson { .. } => vec![
+            JsonShape::Str,
+            JsonShape::Int,
+            JsonShape::Float,
+            JsonShape::Bool,
+            JsonShape::Map,
+            JsonShape::Seq,
+            JsonShape::Null,
+        ],
+    }
+}
+
+fn message_shapes(name: &str, models: &HashMap<&str, &MessageModel>) -> Vec<JsonShape> {
+    let m = models
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown message {name}"));
+    match &m.kind {
+        MessageKind::Struct { .. } | MessageKind::TaggedUnion { .. } => vec![JsonShape::Map],
+        MessageKind::Tuple { .. } | MessageKind::BareList { .. } => vec![JsonShape::Seq],
+        MessageKind::Transparent { field } => {
+            let mut s = kind_shapes(&field.kind, models);
+            s.push(JsonShape::Null);
+            s
+        }
+        MessageKind::Untagged { variants, .. } => {
+            let mut s = Vec::new();
+            for v in variants {
+                for shape in kind_shapes(&v.kind, models) {
+                    if !s.contains(&shape) {
+                        s.push(shape);
+                    }
+                }
+            }
+            s
+        }
+        MessageKind::OneOrMany { one, .. } => {
+            let mut s = kind_shapes(&one.kind, models);
+            if !s.contains(&JsonShape::Seq) {
+                s.push(JsonShape::Seq);
+            }
+            s
+        }
+        MessageKind::Skip => panic!("{name}: a gRPC-only message has no JSON shape"),
+    }
+}
+
+/// For a bare-list message: the shapes of one ELEMENT.
+fn element_shapes(name: &str, models: &HashMap<&str, &MessageModel>) -> Vec<JsonShape> {
+    let m = models
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown message {name}"));
+    match &m.kind {
+        MessageKind::BareList { item } => match &item.kind {
+            FieldKind::RepeatedScalar { ty } => scalar_shapes(ty),
+            FieldKind::RepeatedMessage { rust_path } => message_shapes(rust_path, models),
+            other => panic!("{name}: bare_list item must be repeated, got {other:?}"),
+        },
+        other => panic!("{name}: not a bare list ({other:?})"),
+    }
+}
+
+/// A `one` arm that is a bare list of scalars: its Rust type and the
+/// `serde_json::Value` test that recognizes one of its elements.
+fn bare_scalar_list(
+    kind: &FieldKind,
+    models: &HashMap<&str, &MessageModel>,
+) -> Option<(String, &'static str)> {
+    let FieldKind::Message { rust_path, .. } = kind else {
+        return None;
+    };
+    let m = models.get(rust_path.as_str())?;
+    let MessageKind::BareList { item } = &m.kind else {
+        return None;
+    };
+    let FieldKind::RepeatedScalar { ty } = &item.kind else {
+        return None;
+    };
+    let check = match ty {
+        ScalarTy::Str => "first.is_string()",
+        ScalarTy::Bool => "first.is_boolean()",
+        _ => "first.is_number()",
+    };
+    Some((rust_path.clone(), check))
+}
+
+/// A message-typed arm built from a visited scalar `v`: the message's own
+/// `Deserialize` runs over a value deserializer, so its rules (unknown-key
+/// policy, nested unions) apply unchanged.
+fn via_value_deserializer(ty: &str, de: &str) -> String {
+    format!("<{ty} as ::serde::Deserialize>::deserialize(::serde::de::value::{de}::<E>::new(v))?")
+}
+
 fn emit_untagged(
     out: &mut String,
     m: &MessageModel,
     oneof_mod: &str,
     oneof_ident: &str,
     variants: &[model::VariantModel],
+    models: &HashMap<&str, &MessageModel>,
 ) {
     let name = &m.rust_name;
+    let wrap = |var: &str, expr: &str| {
+        format!("Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}({expr})) }})")
+    };
     let mut ser_arms = String::new();
-    let mut visits = String::new();
+    // shape -> the arms claiming it, in declaration order.
+    let mut claims: Vec<(JsonShape, Vec<&model::VariantModel>)> = Vec::new();
     for v in variants {
-        let var = &v.rust_variant;
         ser_arms.push_str(&format!(
-            "            Some({oneof_mod}::{oneof_ident}::{var}(v)) => v.serialize(serializer),\n"
+            "            Some({oneof_mod}::{oneof_ident}::{}(v)) => v.serialize(serializer),\n",
+            v.rust_variant
         ));
-        match &v.kind {
-            FieldKind::Scalar { ty: ScalarTy::I64, .. }
-            | FieldKind::OptScalar { ty: ScalarTy::I64, .. } => visits.push_str(&format!(
+        for shape in kind_shapes(&v.kind, models) {
+            match claims.iter_mut().find(|(s, _)| *s == shape) {
+                Some((_, arms)) => arms.push(v),
+                None => claims.push((shape, vec![v])),
+            }
+        }
+    }
+
+    let mut visits = String::new();
+    for (shape, arms) in &claims {
+        if *shape != JsonShape::Seq && arms.len() > 1 {
+            panic!(
+                "{name}: untagged arms {:?} all accept a JSON {shape:?}; the value's shape cannot pick one",
+                arms.iter().map(|a| &a.json_name).collect::<Vec<_>>()
+            );
+        }
+        let arm = arms[0];
+        let var = &arm.rust_variant;
+        // A scalar arm takes the value as-is; a message arm runs the message's
+        // own deserializer over it.
+        let scalar_arm = matches!(
+            arm.kind,
+            FieldKind::Scalar { .. } | FieldKind::OptScalar { .. }
+        );
+        let msg_ty = match &arm.kind {
+            FieldKind::Message { rust_path, .. } => Some(rust_path.as_str()),
+            _ => None,
+        };
+        let build = |de: &str, direct: &str| -> String {
+            if scalar_arm {
+                wrap(var, direct)
+            } else {
+                wrap(
+                    var,
+                    &via_value_deserializer(msg_ty.expect("message arm"), de),
+                )
+            }
+        };
+        let unit = |var: &str| {
+            wrap(
+                var,
+                &format!(
+                    "<{} as ::serde::Deserialize>::deserialize(::serde::de::value::UnitDeserializer::<E>::new())?",
+                    msg_ty.expect("null arm is a message")
+                ),
+            )
+        };
+        match shape {
+            JsonShape::Str => visits.push_str(&format!(
+                r#"            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {{
+                {}
+            }}
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {{
+                {}
+            }}
+"#,
+                build("StrDeserializer", "v.to_owned()"),
+                build("StringDeserializer", "v")
+            )),
+            JsonShape::Int => visits.push_str(&format!(
                 r#"            fn visit_i64<E: ::serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {{
-                Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}(v)) }})
+                {}
             }}
             fn visit_u64<E: ::serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {{
                 let v = i64::try_from(v).map_err(|_| E::custom("integer out of range"))?;
-                Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}(v)) }})
+                {}
             }}
-"#
+"#,
+                build("I64Deserializer", "v"),
+                build("I64Deserializer", "v")
             )),
-            FieldKind::Scalar { ty: ScalarTy::Str, .. }
-            | FieldKind::OptScalar { ty: ScalarTy::Str, .. } => visits.push_str(&format!(
-                r#"            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {{
-                Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}(v.to_owned())) }})
+            JsonShape::Float => visits.push_str(&format!(
+                r#"            fn visit_f64<E: ::serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {{
+                {}
             }}
-            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {{
-                Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}(v)) }})
-            }}
-"#
+"#,
+                build("F64Deserializer", "v")
             )),
-            FieldKind::Message { rust_path, .. } => visits.push_str(&format!(
-                r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {{
-                let v = <{rust_path} as ::serde::Deserialize>::deserialize(
+            JsonShape::Bool => visits.push_str(&format!(
+                r#"            fn visit_bool<E: ::serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {{
+                {}
+            }}
+"#,
+                build("BoolDeserializer", "v")
+            )),
+            JsonShape::Null => visits.push_str(&format!(
+                r#"            fn visit_unit<E: ::serde::de::Error>(self) -> Result<Self::Value, E> {{
+                {}
+            }}
+            fn visit_none<E: ::serde::de::Error>(self) -> Result<Self::Value, E> {{
+                {}
+            }}
+"#,
+                unit(var),
+                unit(var)
+            )),
+            JsonShape::Map => visits.push_str(&format!(
+                r#"            fn visit_map<A: ::serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {{
+                let v = <{ty} as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                {}
+            }}
+"#,
+                wrap(var, "v"),
+                ty = msg_ty.expect("map arm is a message")
+            )),
+            JsonShape::Seq => {
+                if arms.len() == 1 {
+                    visits.push_str(&format!(
+                        r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {{
+                let v = <{ty} as ::serde::Deserialize>::deserialize(
                     ::serde::de::value::SeqAccessDeserializer::new(seq),
                 )?;
-                Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}(v)) }})
+                {}
             }}
-"#
-            )),
-            other => panic!("{name}: untagged variant kind {other:?} unsupported"),
+"#,
+                        wrap(var, "v"),
+                        ty = msg_ty.expect("seq arm is a message")
+                    ));
+                } else {
+                    // Two array-shaped arms: the one whose ELEMENTS are arrays
+                    // is the nested form; the first element decides, and `[]`
+                    // is the flat form.
+                    assert_eq!(arms.len(), 2, "{name}: more than two array-shaped untagged arms");
+                    let elem_is_seq = |a: &model::VariantModel| match &a.kind {
+                        FieldKind::Message { rust_path, .. } => {
+                            element_shapes(rust_path, models).contains(&JsonShape::Seq)
+                        }
+                        _ => false,
+                    };
+                    let (nested, flat) = match (elem_is_seq(arms[0]), elem_is_seq(arms[1])) {
+                        (true, false) => (arms[0], arms[1]),
+                        (false, true) => (arms[1], arms[0]),
+                        _ => panic!(
+                            "{name}: array-shaped arms {} and {} cannot be told apart by their first element",
+                            arms[0].json_name, arms[1].json_name
+                        ),
+                    };
+                    let ty_of = |a: &model::VariantModel| match &a.kind {
+                        FieldKind::Message { rust_path, .. } => rust_path.clone(),
+                        _ => unreachable!(),
+                    };
+                    visits.push_str(&format!(
+                        r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {{
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {{
+                    items.push(v);
+                }}
+                let nested = items.first().is_some_and(|f| f.is_array());
+                let reparse = ::serde_json::Value::Array(items);
+                if nested {{
+                    let v: {nested_ty} = ::serde_json::from_value(reparse)
+                        .map_err(::serde::de::Error::custom)?;
+                    {nested_ok}
+                }} else {{
+                    let v: {flat_ty} = ::serde_json::from_value(reparse)
+                        .map_err(::serde::de::Error::custom)?;
+                    {flat_ok}
+                }}
+            }}
+"#,
+                        nested_ty = ty_of(nested),
+                        flat_ty = ty_of(flat),
+                        nested_ok = wrap(&nested.rust_variant, "v"),
+                        flat_ok = wrap(&flat.rust_variant, "v"),
+                    ));
+                }
+            }
         }
     }
     out.push_str(&format!(

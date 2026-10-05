@@ -30,6 +30,22 @@ message StringList {
   repeated string items = 1;
 }
 
+// A flat string list for one request, or one list per batch entry. JSON:
+// `["a", "b"]` is `one`; `[["a"], ["b", "c"]]` is `many` (first element
+// decides, `[]` is an empty `one`).
+message StringListOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    StringList one = 1;
+    StringListList many = 2;
+  }
+}
+
+message StringListList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated StringList items = 1;
+}
+
 message BoolOrList {
   oneof value {
     option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;

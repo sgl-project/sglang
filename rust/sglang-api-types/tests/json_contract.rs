@@ -257,21 +257,90 @@ fn generate_response_matches_frame_value_shape() {
     );
 }
 
-/// raw_json passthrough: image_data et al. cross untouched (stored as JSON
-/// text; integers keep their integer-ness).
+/// Typed media input: every container form Python's `/generate` accepts, with
+/// the value's shape picking the arm (string/object = one item, array = flat
+/// list, array of arrays = per batch entry) and JSON null kept per element.
 #[test]
-fn raw_json_passthrough() {
-    let req: GenerateRequest = serde_json::from_str(
-        r#"{"image_data": [["data:image/png;base64,xx"], null], "custom_params": {"k": 3}}"#,
-    )
-    .unwrap();
-    let stored = req.image_data.expect("image_data present");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
-        serde_json::json!([["data:image/png;base64,xx"], null])
+fn media_input_shapes_dispatch() {
+    use media_input::Value;
+    let parse = |json: &str| -> MediaInput { serde_json::from_str(json).unwrap() };
+    assert!(matches!(parse(r#""u""#).value, Some(Value::Item(_))));
+    assert!(matches!(
+        parse(r#"{"url": "u", "detail": "high"}"#).value,
+        Some(Value::Item(_))
+    ));
+    let flat = parse(r#"["a", null, {"url": "b"}]"#);
+    let Some(Value::Many(items)) = flat.value else {
+        panic!("flat list")
+    };
+    assert_eq!(items.items.len(), 3);
+    assert!(items.items[1].item.is_none(), "null element kept");
+    assert!(
+        matches!(parse("[]").value, Some(Value::Many(_))),
+        "[] is an empty flat list"
     );
-    let sp = req.sampling_params;
-    let _ = sp; // custom_params rides SamplingParams, checked below
+    let nested = parse(r#"[["a", null], null, []]"#);
+    let Some(Value::Nested(lists)) = nested.value else {
+        panic!("nested list")
+    };
+    assert_eq!(lists.items.len(), 3);
+    assert!(lists.items[1].items.is_none(), "null entry kept");
+    assert_eq!(lists.items[2].items.as_ref().unwrap().items.len(), 0);
+    // Round trip keeps the client's spelling.
+    for json in [
+        r#""u""#,
+        r#"["a",null,{"url":"b"}]"#,
+        r#"[["a",null],null,[]]"#,
+    ] {
+        assert_eq!(serde_json::to_string(&parse(json)).unwrap(), json);
+    }
+}
+
+/// A media object is a MediaRef with named hints; an unknown hint is an error
+/// (it used to be silently dropped), and a preprocessed-input dict is not an
+/// HTTP shape at all.
+#[test]
+fn media_ref_is_typed_and_strict() {
+    let r: MediaRef =
+        serde_json::from_str(r#"{"url": "u", "max_dynamic_patch": 6, "fps": 2.5}"#).unwrap();
+    assert_eq!(
+        (r.url.as_str(), r.max_dynamic_patch, r.fps),
+        ("u", Some(6), Some(2.5))
+    );
+    let err = serde_json::from_str::<MediaInput>(r#"{"url": "u", "max_dynamic_patc": 6}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `max_dynamic_patc`"), "{err}");
+    let err = serde_json::from_str::<MediaInput>(r#"[{"format": "processor_output"}]"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `format`"), "{err}");
+    let err = serde_json::from_str::<MediaInput>(r#"["a", ["b"]]"#)
+        .unwrap_err()
+        .to_string();
+    assert!(!err.is_empty(), "mixed flat/nested is rejected");
+}
+
+/// mm_hashes: a flat string list for one request, nested for a batch; the
+/// first element decides (the bare-scalar-list rule, generalized past ids).
+#[test]
+fn string_list_or_list_shape_dispatch() {
+    use string_list_or_list::Value;
+    let parse = |json: &str| -> StringListOrList { serde_json::from_str(json).unwrap() };
+    assert!(matches!(parse(r#"["a", "b"]"#).value, Some(Value::One(_))));
+    assert!(matches!(
+        parse(r#"[["a"], ["b", "c"]]"#).value,
+        Some(Value::Many(_))
+    ));
+    assert!(matches!(parse("[]").value, Some(Value::One(_))));
+    let req: GenerateRequest =
+        serde_json::from_str(r#"{"mm_hashes": ["a1b2", "0xff"], "image_data": "u"}"#).unwrap();
+    assert!(req.mm_hashes.is_some() && req.image_data.is_some());
+}
+
+/// custom_params is the one remaining raw_json passthrough on a request.
+#[test]
+fn custom_params_raw_json_passthrough() {
     let p: SamplingParams = serde_json::from_str(r#"{"custom_params": {"k": 3}}"#).unwrap();
     assert_eq!(p.custom_params.as_deref(), Some(r#"{"k":3}"#));
 }

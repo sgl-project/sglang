@@ -202,6 +202,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     logit_bias: Dict[str, float] = {}
     sampling_seed: Optional[int] = None
     custom_params: Optional[Any] = None
+    beam_width: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -234,10 +235,10 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     decode_tp_size: Optional[OptionalInt64OrList] = None
     routed_dp_rank: Optional[int] = None
     disagg_prefill_dp_rank: Optional[int] = None
-    image_data: Optional[Any] = None
-    mm_hashes: Optional[Any] = None
-    video_data: Optional[Any] = None
-    audio_data: Optional[Any] = None
+    image_data: Optional[MediaInput] = None
+    mm_hashes: Optional[StringListOrList] = None
+    video_data: Optional[MediaInput] = None
+    audio_data: Optional[MediaInput] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -324,6 +325,34 @@ class GenerateStreamError(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateStreamError(self)
+
+
+class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.MediaRef: JSON object (unknown keys rejected)."""
+
+    url: str = ""
+    detail: Optional[str] = None
+    max_dynamic_patch: Optional[int] = None
+    content_hash: Optional[str] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    total_max_pixels: Optional[int] = None
+    fps: Optional[float] = None
+    num_frames: Optional[int] = None
+    min_frames: Optional[int] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
+    use_audio: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "MediaRef":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_MediaRef(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_MediaRef(self)
 
 
 class HealthCheckRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -432,6 +461,9 @@ TokenIds = List[int]
 # sglang.api.v1.StringList: JSON bare array.
 StringList = List[str]
 
+# sglang.api.v1.StringListList: JSON bare array.
+StringListList = List[StringList]
+
 # sglang.api.v1.BoolList: JSON bare array.
 BoolList = List[bool]
 
@@ -474,8 +506,29 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
 
+# sglang.api.v1.MediaItem: JSON: the value's shape picks the arm.
+MediaItem = Union[str, MediaRef]
+
+# sglang.api.v1.OptionalMediaItem: JSON: the wrapped value itself, null when unset.
+OptionalMediaItem = Optional[MediaItem]
+
+# sglang.api.v1.MediaItems: JSON bare array.
+MediaItems = List[OptionalMediaItem]
+
+# sglang.api.v1.OptionalMediaItems: JSON: the wrapped value itself, null when unset.
+OptionalMediaItems = Optional[MediaItems]
+
+# sglang.api.v1.MediaItemsList: JSON bare array.
+MediaItemsList = List[OptionalMediaItems]
+
+# sglang.api.v1.MediaInput: JSON: the value's shape picks the arm.
+MediaInput = Union[MediaItem, MediaItems, MediaItemsList]
+
 # sglang.api.v1.StringOrList: JSON: one value or an array of values.
 StringOrList = Union[str, StringList]
+
+# sglang.api.v1.StringListOrList: JSON: one value or an array of values.
+StringListOrList = Union[StringList, StringListList]
 
 # sglang.api.v1.BoolOrList: JSON: one value or an array of values.
 BoolOrList = Union[bool, BoolList]
@@ -530,6 +583,29 @@ def encode_StringList(v: StringList) -> List[Any]:
     return list(v)
 
 
+def decode_StringListOrList(value: Any) -> StringListOrList:
+    if isinstance(value, list):
+        # [] and [scalar, ...] are one flat list; anything else is a batch.
+        if not value or isinstance(value[0], str):
+            return decode_StringList(value)
+        return decode_StringListList(value)
+    raise _invalid_type(value, expected="a value or an array of values for StringListOrList")
+
+
+def encode_StringListOrList(v: StringListOrList) -> Any:
+    if v and isinstance(v[0], list):
+        return encode_StringListList(v)
+    return encode_StringList(v)
+
+
+def decode_StringListList(value: Any) -> StringListList:
+    return [decode_StringList(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_StringListList(v: StringListList) -> List[Any]:
+    return [encode_StringList(e) for e in v]
+
+
 def decode_BoolOrList(value: Any) -> BoolOrList:
     if isinstance(value, list):
         return decode_BoolList(value)
@@ -572,7 +648,7 @@ def encode_Int64List(v: Int64List) -> List[Any]:
 
 def decode_TokenIdsOrList(value: Any) -> TokenIdsOrList:
     if isinstance(value, list):
-        # [] and [number, ...] are one id list; anything else is a batch.
+        # [] and [scalar, ...] are one flat list; anything else is a batch.
         if not value or _is_number(value[0]):
             return decode_TokenIds(value)
         return decode_TokenIdsList(value)
@@ -668,9 +744,9 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
 
 
 def decode_Matched(value: Any) -> Matched:
-    if _is_int(value):
-        return value
     if isinstance(value, str):
+        return value
+    if _is_int(value):
         return value
     if isinstance(value, list):
         return decode_MatchedTokens(value)
@@ -678,7 +754,11 @@ def decode_Matched(value: Any) -> Matched:
 
 
 def encode_Matched(v: Matched) -> Any:
-    if isinstance(v, list):
+    if isinstance(v, (int,)):
+        return v
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (list,)):
         return encode_MatchedTokens(v)
     return v
 
@@ -793,7 +873,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -850,6 +930,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["sampling_seed"] = None if x is None else _expect_int(x, expected="i64")
         elif key == "custom_params":
             kw["custom_params"] = x
+        elif key == "beam_width":
+            kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -907,6 +989,8 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["sampling_seed"] = v.sampling_seed
     if v.custom_params is not None:
         d["custom_params"] = v.custom_params
+    if v.beam_width is not None:
+        d["beam_width"] = v.beam_width
     return d
 
 
@@ -951,13 +1035,13 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "disagg_prefill_dp_rank":
             kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
         elif key == "image_data":
-            kw["image_data"] = x
+            kw["image_data"] = None if x is None else decode_MediaInput(x)
         elif key == "mm_hashes":
-            kw["mm_hashes"] = x
+            kw["mm_hashes"] = None if x is None else decode_StringListOrList(x)
         elif key == "video_data":
-            kw["video_data"] = x
+            kw["video_data"] = None if x is None else decode_MediaInput(x)
         elif key == "audio_data":
-            kw["audio_data"] = x
+            kw["audio_data"] = None if x is None else decode_MediaInput(x)
     return GenerateRequest(**kw)
 
 
@@ -1000,13 +1084,13 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
     if v.disagg_prefill_dp_rank is not None:
         d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
     if v.image_data is not None:
-        d["image_data"] = v.image_data
+        d["image_data"] = encode_MediaInput(v.image_data)
     if v.mm_hashes is not None:
-        d["mm_hashes"] = v.mm_hashes
+        d["mm_hashes"] = encode_StringListOrList(v.mm_hashes)
     if v.video_data is not None:
-        d["video_data"] = v.video_data
+        d["video_data"] = encode_MediaInput(v.video_data)
     if v.audio_data is not None:
-        d["audio_data"] = v.audio_data
+        d["audio_data"] = encode_MediaInput(v.audio_data)
     return d
 
 
@@ -1182,6 +1266,148 @@ def encode_GenerateStreamError(v: GenerateStreamError) -> Dict[str, Any]:
     if v.index is not None:
         d["index"] = v.index
     return d
+
+
+_FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio",)
+
+
+def decode_MediaRef(value: Any) -> MediaRef:
+    m = _expect_map(value, expected="struct MediaRef")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "url":
+            kw["url"] = _expect_str(x, expected="a string")
+        elif key == "detail":
+            kw["detail"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_dynamic_patch":
+            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "content_hash":
+            kw["content_hash"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "min_pixels":
+            kw["min_pixels"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_pixels":
+            kw["max_pixels"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "total_max_pixels":
+            kw["total_max_pixels"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "fps":
+            kw["fps"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "num_frames":
+            kw["num_frames"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_frames":
+            kw["min_frames"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_frames":
+            kw["max_frames"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_tokens_per_frame":
+            kw["max_tokens_per_frame"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_image_tokens":
+            kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "use_audio":
+            kw["use_audio"] = None if x is None else _expect_bool(x, expected="a boolean")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_MediaRef)
+    return MediaRef(**kw)
+
+
+def encode_MediaRef(v: MediaRef) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["url"] = v.url
+    if v.detail is not None:
+        d["detail"] = v.detail
+    if v.max_dynamic_patch is not None:
+        d["max_dynamic_patch"] = v.max_dynamic_patch
+    if v.content_hash is not None:
+        d["content_hash"] = v.content_hash
+    if v.min_pixels is not None:
+        d["min_pixels"] = v.min_pixels
+    if v.max_pixels is not None:
+        d["max_pixels"] = v.max_pixels
+    if v.total_max_pixels is not None:
+        d["total_max_pixels"] = v.total_max_pixels
+    if v.fps is not None:
+        d["fps"] = float(v.fps)
+    if v.num_frames is not None:
+        d["num_frames"] = v.num_frames
+    if v.min_frames is not None:
+        d["min_frames"] = v.min_frames
+    if v.max_frames is not None:
+        d["max_frames"] = v.max_frames
+    if v.max_tokens_per_frame is not None:
+        d["max_tokens_per_frame"] = v.max_tokens_per_frame
+    if v.max_image_tokens is not None:
+        d["max_image_tokens"] = v.max_image_tokens
+    if v.use_audio is not None:
+        d["use_audio"] = v.use_audio
+    return d
+
+
+def decode_MediaItem(value: Any) -> MediaItem:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return decode_MediaRef(value)
+    raise _invalid_type(value, expected="one of the MediaItem shapes")
+
+
+def encode_MediaItem(v: MediaItem) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (MediaRef,)):
+        return encode_MediaRef(v)
+    return v
+
+
+def decode_OptionalMediaItem(value: Any) -> OptionalMediaItem:
+    return None if value is None else decode_MediaItem(value)
+
+
+def encode_OptionalMediaItem(v: OptionalMediaItem) -> Any:
+    return None if v is None else encode_MediaItem(v)
+
+
+def decode_MediaItems(value: Any) -> MediaItems:
+    return [decode_OptionalMediaItem(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_MediaItems(v: MediaItems) -> List[Any]:
+    return [encode_OptionalMediaItem(e) for e in v]
+
+
+def decode_OptionalMediaItems(value: Any) -> OptionalMediaItems:
+    return None if value is None else decode_MediaItems(value)
+
+
+def encode_OptionalMediaItems(v: OptionalMediaItems) -> Any:
+    return None if v is None else encode_MediaItems(v)
+
+
+def decode_MediaItemsList(value: Any) -> MediaItemsList:
+    return [decode_OptionalMediaItems(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_MediaItemsList(v: MediaItemsList) -> List[Any]:
+    return [encode_OptionalMediaItems(e) for e in v]
+
+
+def decode_MediaInput(value: Any) -> MediaInput:
+    if isinstance(value, str):
+        return decode_MediaItem(value)
+    if isinstance(value, dict):
+        return decode_MediaItem(value)
+    if isinstance(value, list):
+        if value and isinstance(value[0], list):
+            return decode_MediaItemsList(value)
+        return decode_MediaItems(value)
+    raise _invalid_type(value, expected="one of the MediaInput shapes")
+
+
+def encode_MediaInput(v: MediaInput) -> Any:
+    if isinstance(v, (str, MediaRef,)):
+        return encode_MediaItem(v)
+    if isinstance(v, list) and not (v and isinstance(v[0], list)):
+        return encode_MediaItems(v)
+    if isinstance(v, list) and (v and isinstance(v[0], list)):
+        return encode_MediaItemsList(v)
+    return v
 
 
 def decode_HealthCheckRequest(value: Any) -> HealthCheckRequest:

@@ -93,4 +93,8 @@ message SamplingParams {
   optional int64 sampling_seed = 24;
   // Opaque JSON forwarded to a custom logit processor; never inspected here.
   optional string custom_params = 25 [(sglang.json.v1.field_json).raw_json = true];
+
+  // beam_width > 1 turns the request into a beam search request; `n` is then
+  // the number of returned sequences (n <= beam_width).
+  optional int64 beam_width = 26;
 }

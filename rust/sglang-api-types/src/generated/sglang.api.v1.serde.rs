@@ -76,6 +76,86 @@ impl<'de> ::serde::Deserialize<'de> for StringList {
     }
 }
 
+impl ::serde::Serialize for StringListOrList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(string_list_or_list::Value::One(v)) => v.serialize(serializer),
+            Some(string_list_or_list::Value::Many(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for StringListOrList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = StringListOrList;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("a value or an array of values for StringListOrList")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let one = <StringList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(StringListOrList {
+                    value: Some(string_list_or_list::Value::One(one)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Some(first) = seq.next_element::<::serde_json::Value>()? else {
+                    // [] is one empty list (the untagged first-arm rule).
+                    return Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::One(StringList::default())),
+                    });
+                };
+                let is_number = first.is_string();
+                let mut rest = vec![first];
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    rest.push(v);
+                }
+                let reparse = ::serde_json::Value::Array(rest);
+                if is_number {
+                    let one: StringList =
+                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
+                    Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::One(one)),
+                    })
+                } else {
+                    let many: StringListList =
+                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
+                    Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::Many(many)),
+                    })
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for StringListList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for StringListList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(StringListList {
+            items: <::prost::alloc::vec::Vec<StringList> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
 impl ::serde::Serialize for BoolOrList {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.value {
@@ -226,7 +306,7 @@ impl<'de> ::serde::Deserialize<'de> for TokenIdsOrList {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let Some(first) = seq.next_element::<::serde_json::Value>()? else {
-                    // [] is one empty id list (the untagged first-arm rule).
+                    // [] is one empty list (the untagged first-arm rule).
                     return Ok(TokenIdsOrList {
                         value: Some(token_ids_or_list::Value::One(TokenIds::default())),
                     });
@@ -1022,6 +1102,9 @@ impl ::serde::Serialize for SamplingParams {
                     .unwrap_or(::serde_json::Value::Null),
             )?;
         }
+        if let Some(v) = &self.beam_width {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "beam_width", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1054,6 +1137,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "logit_bias",
             "sampling_seed",
             "custom_params",
+            "beam_width",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1090,6 +1174,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_logit_bias = None;
                 let mut f_sampling_seed = None;
                 let mut f_custom_params = None;
+                let mut f_beam_width = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1290,6 +1375,12 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                                     .map(|v| v.to_string()),
                             );
                         }
+                        "beam_width" => {
+                            if f_beam_width.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("beam_width"));
+                            }
+                            f_beam_width = Some(map.next_value::<Option<i64>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1322,6 +1413,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     logit_bias: f_logit_bias.unwrap_or_default(),
                     sampling_seed: f_sampling_seed.flatten(),
                     custom_params: f_custom_params.flatten(),
+                    beam_width: f_beam_width.flatten(),
                 })
             }
         }
@@ -1404,36 +1496,16 @@ impl ::serde::Serialize for GenerateRequest {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "disagg_prefill_dp_rank", v)?;
         }
         if let Some(v) = &self.image_data {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "image_data",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_data", v)?;
         }
         if let Some(v) = &self.mm_hashes {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "mm_hashes",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "mm_hashes", v)?;
         }
         if let Some(v) = &self.video_data {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "video_data",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "video_data", v)?;
         }
         if let Some(v) = &self.audio_data {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "audio_data",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_data", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -1609,37 +1681,25 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             if f_image_data.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("image_data"));
                             }
-                            f_image_data = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_image_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
                         "mm_hashes" => {
                             if f_mm_hashes.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("mm_hashes"));
                             }
-                            f_mm_hashes = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_mm_hashes = Some(map.next_value::<Option<StringListOrList>>()?);
                         }
                         "video_data" => {
                             if f_video_data.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("video_data"));
                             }
-                            f_video_data = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_video_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
                         "audio_data" => {
                             if f_audio_data.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("audio_data"));
                             }
-                            f_audio_data = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_audio_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
@@ -2206,6 +2266,401 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamError {
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for MediaRef {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "url", &self.url)?;
+        if let Some(v) = &self.detail {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "detail", v)?;
+        }
+        if let Some(v) = &self.max_dynamic_patch {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_dynamic_patch", v)?;
+        }
+        if let Some(v) = &self.content_hash {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content_hash", v)?;
+        }
+        if let Some(v) = &self.min_pixels {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "min_pixels", v)?;
+        }
+        if let Some(v) = &self.max_pixels {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_pixels", v)?;
+        }
+        if let Some(v) = &self.total_max_pixels {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "total_max_pixels", v)?;
+        }
+        if let Some(v) = &self.fps {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "fps", v)?;
+        }
+        if let Some(v) = &self.num_frames {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "num_frames", v)?;
+        }
+        if let Some(v) = &self.min_frames {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "min_frames", v)?;
+        }
+        if let Some(v) = &self.max_frames {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_frames", v)?;
+        }
+        if let Some(v) = &self.max_tokens_per_frame {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_tokens_per_frame", v)?;
+        }
+        if let Some(v) = &self.max_image_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_image_tokens", v)?;
+        }
+        if let Some(v) = &self.use_audio {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "use_audio", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaRef {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &[
+            "url",
+            "detail",
+            "max_dynamic_patch",
+            "content_hash",
+            "min_pixels",
+            "max_pixels",
+            "total_max_pixels",
+            "fps",
+            "num_frames",
+            "min_frames",
+            "max_frames",
+            "max_tokens_per_frame",
+            "max_image_tokens",
+            "use_audio",
+        ];
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = MediaRef;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct MediaRef")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_url = None;
+                let mut f_detail = None;
+                let mut f_max_dynamic_patch = None;
+                let mut f_content_hash = None;
+                let mut f_min_pixels = None;
+                let mut f_max_pixels = None;
+                let mut f_total_max_pixels = None;
+                let mut f_fps = None;
+                let mut f_num_frames = None;
+                let mut f_min_frames = None;
+                let mut f_max_frames = None;
+                let mut f_max_tokens_per_frame = None;
+                let mut f_max_image_tokens = None;
+                let mut f_use_audio = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "url" => {
+                            if f_url.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("url"));
+                            }
+                            f_url = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "detail" => {
+                            if f_detail.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("detail"));
+                            }
+                            f_detail =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_dynamic_patch" => {
+                            if f_max_dynamic_patch.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_dynamic_patch",
+                                ));
+                            }
+                            f_max_dynamic_patch = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "content_hash" => {
+                            if f_content_hash.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content_hash"));
+                            }
+                            f_content_hash =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "min_pixels" => {
+                            if f_min_pixels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("min_pixels"));
+                            }
+                            f_min_pixels = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "max_pixels" => {
+                            if f_max_pixels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_pixels"));
+                            }
+                            f_max_pixels = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "total_max_pixels" => {
+                            if f_total_max_pixels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "total_max_pixels",
+                                ));
+                            }
+                            f_total_max_pixels = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "fps" => {
+                            if f_fps.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("fps"));
+                            }
+                            f_fps = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "num_frames" => {
+                            if f_num_frames.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("num_frames"));
+                            }
+                            f_num_frames = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "min_frames" => {
+                            if f_min_frames.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("min_frames"));
+                            }
+                            f_min_frames = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "max_frames" => {
+                            if f_max_frames.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_frames"));
+                            }
+                            f_max_frames = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "max_tokens_per_frame" => {
+                            if f_max_tokens_per_frame.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_tokens_per_frame",
+                                ));
+                            }
+                            f_max_tokens_per_frame = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "max_image_tokens" => {
+                            if f_max_image_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_image_tokens",
+                                ));
+                            }
+                            f_max_image_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "use_audio" => {
+                            if f_use_audio.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("use_audio"));
+                            }
+                            f_use_audio = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        other => {
+                            return Err(::serde::de::Error::unknown_field(other, FIELDS));
+                        }
+                    }
+                }
+                Ok(MediaRef {
+                    url: f_url.unwrap_or_default(),
+                    detail: f_detail.flatten(),
+                    max_dynamic_patch: f_max_dynamic_patch.flatten(),
+                    content_hash: f_content_hash.flatten(),
+                    min_pixels: f_min_pixels.flatten(),
+                    max_pixels: f_max_pixels.flatten(),
+                    total_max_pixels: f_total_max_pixels.flatten(),
+                    fps: f_fps.flatten(),
+                    num_frames: f_num_frames.flatten(),
+                    min_frames: f_min_frames.flatten(),
+                    max_frames: f_max_frames.flatten(),
+                    max_tokens_per_frame: f_max_tokens_per_frame.flatten(),
+                    max_image_tokens: f_max_image_tokens.flatten(),
+                    use_audio: f_use_audio.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for MediaItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(media_item::Value::Source(v)) => v.serialize(serializer),
+            Some(media_item::Value::Ref(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = MediaItem;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the MediaItem shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(MediaItem {
+                    value: Some(media_item::Value::Source(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(MediaItem {
+                    value: Some(media_item::Value::Source(v)),
+                })
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <MediaRef as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(MediaItem {
+                    value: Some(media_item::Value::Ref(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for OptionalMediaItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.item.serialize(serializer)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OptionalMediaItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OptionalMediaItem {
+            item: <Option<MediaItem> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for MediaItems {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaItems {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(MediaItems {
+            items:
+                <::prost::alloc::vec::Vec<OptionalMediaItem> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OptionalMediaItems {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(serializer)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OptionalMediaItems {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OptionalMediaItems {
+            items: <Option<MediaItems> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for MediaItemsList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaItemsList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(MediaItemsList {
+            items:
+                <::prost::alloc::vec::Vec<OptionalMediaItems> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for MediaInput {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(media_input::Value::Item(v)) => v.serialize(serializer),
+            Some(media_input::Value::Many(v)) => v.serialize(serializer),
+            Some(media_input::Value::Nested(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaInput {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = MediaInput;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the MediaInput shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(MediaInput {
+                    value: Some(media_input::Value::Item(
+                        <MediaItem as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::StrDeserializer::<E>::new(v),
+                        )?,
+                    )),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(MediaInput {
+                    value: Some(media_input::Value::Item(
+                        <MediaItem as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::StringDeserializer::<E>::new(v),
+                        )?,
+                    )),
+                })
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <MediaItem as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(MediaInput {
+                    value: Some(media_input::Value::Item(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let nested = items.first().is_some_and(|f| f.is_array());
+                let reparse = ::serde_json::Value::Array(items);
+                if nested {
+                    let v: MediaItemsList =
+                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
+                    Ok(MediaInput {
+                        value: Some(media_input::Value::Nested(v)),
+                    })
+                } else {
+                    let v: MediaItems =
+                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
+                    Ok(MediaInput {
+                        value: Some(media_input::Value::Many(v)),
+                    })
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
     }
 }
 

@@ -28,6 +28,29 @@ pub struct StringList {
     #[prost(string, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// A flat string list for one request, or one list per batch entry. JSON:
+/// `\["a", "b"\]` is `one`; `\[["a"\], \["b", "c"]\]` is `many` (first element
+/// decides, `\[\]` is an empty `one`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StringListOrList {
+    #[prost(oneof = "string_list_or_list::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<string_list_or_list::Value>,
+}
+/// Nested message and enum types in `StringListOrList`.
+pub mod string_list_or_list {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        One(super::StringList),
+        #[prost(message, tag = "2")]
+        Many(super::StringListList),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StringListList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<StringList>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BoolOrList {
     #[prost(oneof = "bool_or_list::Value", tags = "1, 2")]
@@ -276,6 +299,10 @@ pub struct SamplingParams {
     /// Opaque JSON forwarded to a custom logit processor; never inspected here.
     #[prost(string, optional, tag = "25")]
     pub custom_params: ::core::option::Option<::prost::alloc::string::String>,
+    /// beam_width > 1 turns the request into a beam search request; `n` is then
+    /// the number of returned sequences (n \<= beam_width).
+    #[prost(int64, optional, tag = "26")]
+    pub beam_width: ::core::option::Option<i64>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
@@ -323,14 +350,18 @@ pub struct GenerateRequest {
     pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
     /// Multimodal payloads pass through untyped (data URIs, URLs, file paths, or
     /// nested batch lists) to the MM pipeline, which owns their validation.
-    #[prost(string, optional, tag = "19")]
-    pub image_data: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "20")]
-    pub mm_hashes: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "21")]
-    pub video_data: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "22")]
-    pub audio_data: ::core::option::Option<::prost::alloc::string::String>,
+    /// Media inputs, one container per modality (see MediaInput). The item
+    /// hints a modality does not support are rejected at the processor.
+    #[prost(message, optional, tag = "19")]
+    pub image_data: ::core::option::Option<MediaInput>,
+    /// Per-item content hashes overriding the computed ones, in item order; a
+    /// flat list for one request (the batch form is rejected downstream).
+    #[prost(message, optional, tag = "20")]
+    pub mm_hashes: ::core::option::Option<StringListOrList>,
+    #[prost(message, optional, tag = "21")]
+    pub video_data: ::core::option::Option<MediaInput>,
+    #[prost(message, optional, tag = "22")]
+    pub audio_data: ::core::option::Option<MediaInput>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
@@ -463,6 +494,108 @@ pub mod generate_stream_item {
         Frame(super::GenerateResponse),
         #[prost(message, tag = "2")]
         Error(super::GenerateStreamError),
+    }
+}
+/// One media item's source and per-item hints. Unknown keys are an error: a
+/// hint this schema does not name would otherwise be silently dropped.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaRef {
+    /// URL, `file://` / absolute path, `data:` URI, or bare base64.
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    /// Image: "auto" | "low" | "high" (the OpenAI detail hint).
+    #[prost(string, optional, tag = "2")]
+    pub detail: ::core::option::Option<::prost::alloc::string::String>,
+    /// Image/video: dynamic-patch budget (InternVL-style processors).
+    #[prost(int64, optional, tag = "3")]
+    pub max_dynamic_patch: ::core::option::Option<i64>,
+    /// Image: a caller-supplied content hash that overrides the computed one.
+    #[prost(string, optional, tag = "4")]
+    pub content_hash: ::core::option::Option<::prost::alloc::string::String>,
+    /// Video/image budgets read by the GLM and MiMo processors.
+    #[prost(int64, optional, tag = "5")]
+    pub min_pixels: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_pixels: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub total_max_pixels: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "8")]
+    pub fps: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "9")]
+    pub num_frames: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub min_frames: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub max_frames: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "12")]
+    pub max_tokens_per_frame: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "13")]
+    pub max_image_tokens: ::core::option::Option<i64>,
+    /// Video: also decode the audio track.
+    #[prost(bool, optional, tag = "14")]
+    pub use_audio: ::core::option::Option<bool>,
+}
+/// One media item. JSON: a bare string is the source; an object is a MediaRef.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaItem {
+    #[prost(oneof = "media_item::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<media_item::Value>,
+}
+/// Nested message and enum types in `MediaItem`.
+pub mod media_item {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Source(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Ref(super::MediaRef),
+    }
+}
+/// A list element that may be JSON null (Python's `\[img, None\]`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OptionalMediaItem {
+    #[prost(message, optional, tag = "1")]
+    pub item: ::core::option::Option<MediaItem>,
+}
+/// One request's items (`\[a, null, b\]`), or one batch entry's items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaItems {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OptionalMediaItem>,
+}
+/// A batch entry whose item list may be JSON null.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OptionalMediaItems {
+    #[prost(message, optional, tag = "1")]
+    pub items: ::core::option::Option<MediaItems>,
+}
+/// One item list per batch entry (`\[[a, b\], null, \[]\]`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaItemsList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OptionalMediaItems>,
+}
+/// The three container forms Python's `_normalize_image_data` distinguishes.
+/// JSON: a string or object is `item` (one item; a broadcast in a batch); an
+/// array whose first element is not an array is `many` (a flat list; `\[\]` is
+/// an empty `many`); an array whose first element is an array is `nested`
+/// (one list per batch entry). Which forms a request may use depends on
+/// whether it is a batch, and is checked downstream, not here.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaInput {
+    #[prost(oneof = "media_input::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<media_input::Value>,
+}
+/// Nested message and enum types in `MediaInput`.
+pub mod media_input {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Item(super::MediaItem),
+        #[prost(message, tag = "2")]
+        Many(super::MediaItems),
+        #[prost(message, tag = "3")]
+        Nested(super::MediaItemsList),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
