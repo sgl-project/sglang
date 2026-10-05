@@ -409,6 +409,8 @@ class BeamAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         ssmax_scale: torch.Tensor | None,
+        *,
+        skip_all_reduce: bool = False,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -442,7 +444,7 @@ class BeamAttention(nn.Module):
             self.gate_bias,
             self.head_dim,
         )
-        output, _ = self.o_proj(attention_output)
+        output, _ = self.o_proj(attention_output, skip_all_reduce=skip_all_reduce)
         return output
 
 
@@ -534,6 +536,7 @@ class BeamDecoderLayer(nn.Module):
         next_norm_weight: Optional[torch.Tensor],
         ssmax_scale: torch.Tensor | None,
         all_reduce_comm=None,
+        attention_all_reduce_comm=None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Same arithmetic as `forward` with the two norm/residual transitions fused.
 
@@ -542,15 +545,33 @@ class BeamDecoderLayer(nn.Module):
         when `next_norm_weight` is None, on the last layer of a pipeline stage
         that does not own the final norm) and the new residual stream.
         """
-        attn = self.self_attn(positions, normed, forward_batch, ssmax_scale)
-        normed, residual = self.sandwich_residual_norm(
-            attn,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.pre_feedforward_layernorm.weight,
-            self.rms_norm_eps,
-            self.attn_residual_scales,
-        )
+        if attention_all_reduce_comm is not None:
+            from sglang.kernels.ops.communication.beam_all_reduce import (
+                beam_all_reduce_norm,
+            )
+
+            attn = self.self_attn(
+                positions, normed, forward_batch, ssmax_scale, skip_all_reduce=True
+            )
+            normed, residual = beam_all_reduce_norm(
+                attention_all_reduce_comm,
+                attn,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.rms_norm_eps,
+                self.attn_residual_scales,
+            )
+        else:
+            attn = self.self_attn(positions, normed, forward_batch, ssmax_scale)
+            normed, residual = self.sandwich_residual_norm(
+                attn,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.rms_norm_eps,
+                self.attn_residual_scales,
+            )
         if (
             all_reduce_comm is not None
             and isinstance(self.mlp, BeamMoE)
@@ -629,6 +650,8 @@ class BeamModel(nn.Module):
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
         self.fuse_all_reduce = quant_config is None and config.num_experts_per_tok == 8
+        self._beam_all_reduce_comm = None
+        self._beam_all_reduce_attention_max_tokens = 0
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
         # A custom PP partition can leave a stage with no layer to fuse from.
@@ -638,7 +661,7 @@ class BeamModel(nn.Module):
             and self.start_layer < self.end_layer
         )
 
-    def _all_reduce_comm(self, hidden_states, forward_batch):
+    def _all_reduce_comm(self, hidden_states):
         if not hidden_states.is_cuda or torch.version.hip is not None:
             return None
         execution = get_exec()
@@ -649,25 +672,22 @@ class BeamModel(nn.Module):
             or not hidden_states.is_contiguous()
             or hidden_states.data_ptr() % 16 != 0
             or hidden_states.shape[1] != 5120
-            or not 0 < hidden_states.shape[0] <= 8
-            or not forward_batch.forward_mode.is_decode()
+            or not 0 < hidden_states.shape[0] <= 64
             or not self.fuse_all_reduce
         ):
             return None
-        # The native TP communicator owns the storage and its lifecycle. Keep
-        # other parallel/reduction ownership arrangements on their old path.
+        # Require native TP reduction ownership. Keep other parallel/reduction
+        # arrangements on their existing path.
         from sglang.kernels.fused_op import get_fused_op_backend
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
 
         parallel = get_parallel()
+        architecture = torch.cuda.get_device_capability(hidden_states.device)[0]
         if (
-            # Only enable the measured small-batch TP8 configuration.
-            parallel.tp_size != 8
-            # Hopper's trained-checkpoint probe showed larger norm-order drift.
-            # Keep its existing boundary until that numerical delta is resolved.
-            or torch.cuda.get_device_capability(hidden_states.device)[0] < 10
+            parallel.tp_size not in (2, 4, 8)
+            or architecture not in (9, 10)
             or get_lora().enable_lora
             or get_forward().sp_active
             or should_skip_post_experts_all_reduce(is_tp_path=True)
@@ -680,10 +700,45 @@ class BeamModel(nn.Module):
             or get_fused_op_backend() is not None
         ):
             return None
+        # Keep the existing collective above the measured one-shot crossover.
+        # Attention and MoE have different savings: only MoE removes a local sum.
+        attention_max_tokens, moe_max_tokens = (
+            {2: (32, 32), 4: (32, 64), 8: (8, 16)}[parallel.tp_size]
+            if architecture == 9
+            else (64, 64)
+        )
+        max_tokens = max(attention_max_tokens, moe_max_tokens)
+        if hidden_states.shape[0] > max_tokens:
+            return None
+        self._beam_all_reduce_attention_max_tokens = attention_max_tokens
         comm = parallel.tp_group.ca_comm
         if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
             return None
-        if hidden_states.numel() * 2 > comm.max_push_size:
+        if self._beam_all_reduce_comm is None:
+            # Initialize once in eager warmup, before any CUDA graph capture.
+            # Hopper's native push plane is tuned for much smaller messages.
+            # Share one bounded plane across all attention and MoE boundaries.
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            required_bytes = max_tokens * hidden_states.shape[1] * 2
+            if (
+                comm.max_push_size < required_bytes
+                or comm._push_counter.numel() < max_tokens
+            ):
+                from sglang.kernels.ops.communication.mp import register_comm_cleanup
+
+                comm = CustomAllReduceV2(
+                    comm.group,
+                    comm.device,
+                    max_pull_size=0,
+                    max_pull_blocks=0,
+                    max_push_size=required_bytes,
+                    max_push_blocks=max_tokens,
+                )
+                register_comm_cleanup(comm)
+            self._beam_all_reduce_comm = comm
+        comm = self._beam_all_reduce_comm
+        if comm.disabled or hidden_states.numel() * 2 > comm.max_push_size:
             return None
         if hidden_states.shape[0] > comm._push_counter.numel():
             return None
@@ -734,7 +789,13 @@ class BeamModel(nn.Module):
     ):
         # Each fused transition also produces the next layer's normalized input,
         # so the first norm of this stage is the only standalone one.
-        all_reduce_comm = self._all_reduce_comm(hidden_states, forward_batch)
+        all_reduce_comm = self._all_reduce_comm(hidden_states)
+        attention_all_reduce_comm = (
+            all_reduce_comm
+            if all_reduce_comm is not None
+            and hidden_states.shape[0] <= self._beam_all_reduce_attention_max_tokens
+            else None
+        )
         residual = hidden_states
         normed = self.layers[self.start_layer].input_layernorm(residual)
         for layer_id in range(self.start_layer, self.end_layer):
@@ -752,6 +813,7 @@ class BeamModel(nn.Module):
                 next_norm_weight,
                 ssmax_scale,
                 all_reduce_comm,
+                attention_all_reduce_comm,
             )
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(residual)
