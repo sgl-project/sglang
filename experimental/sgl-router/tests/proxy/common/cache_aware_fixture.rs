@@ -16,11 +16,14 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
+use sgl_router::policies::PolicyRegistry;
+use sgl_router::policies_reorg::factory::build_resolver;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
-use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::{BlockSizeOracle, HashTree};
+use sgl_router::server::app_context::{AppContext, ChatRouting};
+use sgl_router::state::kv_events::{
+    BlockSizeOracle, HashTree, KvEventIndex, RadixTreePrefixProvider,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 
@@ -47,6 +50,8 @@ pub fn config() -> Config {
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
             affinity: None,
@@ -64,9 +69,8 @@ pub fn config() -> Config {
     }
 }
 
-/// A cache-aware router over `workers` whose KV prefixes come from the local `tree`.
-#[allow(dead_code)] // Only some test files route by a local radix tree.
-pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> axum::Router {
+/// [`config`] with prefixes from the local radix tree and a single cache candidate.
+fn radix_config() -> Config {
     let mut cfg = config();
     cfg.model.cache_aware.as_mut().unwrap().prefix_provider = CachePrefixProvider::RadixTree;
     cfg.model.affinity = Some(AffinityConfig {
@@ -76,6 +80,10 @@ pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> ax
         cache_candidate_max_workers: 1,
         ..Default::default()
     });
+    cfg
+}
+
+fn registry_of(workers: &[(&MockWorker, WorkerMode)]) -> WorkerRegistry {
     let registry = WorkerRegistry::default();
     for &(worker, mode) in workers {
         let spec = WorkerSpec {
@@ -88,6 +96,13 @@ pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> ax
         };
         registry.add(spec).unwrap();
     }
+    registry
+}
+
+/// A cache-aware router over `workers` whose KV prefixes come from the local `tree`.
+#[allow(dead_code)] // Only some test files route by a local radix tree.
+pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> axum::Router {
+    let cfg = radix_config();
     let (tree, oracle) = (Arc::new(tree), BlockSizeOracle::new());
     oracle.try_set(1).unwrap();
     let policies = build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap();
@@ -95,10 +110,36 @@ pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> ax
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
         Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
-        Arc::new(registry),
+        Arc::new(registry_of(workers)),
         Arc::new(policies),
     );
     ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(tree, Arc::clone(&oracle)));
+    ctx.block_size_oracle = oracle;
+    build_router(Arc::new(ctx))
+}
+
+/// [`radix_router`] on the bucket-first (reorg) selection path, over `state`'s tree.
+#[allow(dead_code)] // Only some test files route by a local radix tree.
+pub fn reorg_radix_router(
+    workers: &[(&MockWorker, WorkerMode)],
+    state: &KvEventIndex,
+) -> axum::Router {
+    let cfg = radix_config();
+    let oracle = state.block_size_oracle();
+    oracle.try_set(1).unwrap();
+    let (resolver, _) = build_resolver(&cfg.model, state, None).unwrap();
+    let mut ctx = AppContext::new(
+        cfg.clone(),
+        Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
+        Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
+        Arc::new(registry_of(workers)),
+        Arc::new(PolicyRegistry::default()),
+    );
+    ctx.chat_routing = ChatRouting::Reorg([(ModelId(MODEL.into()), resolver)].into());
+    ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(
+        state.tree(),
+        Arc::clone(&oracle),
+    ));
     ctx.block_size_oracle = oracle;
     build_router(Arc::new(ctx))
 }
