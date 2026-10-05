@@ -134,8 +134,7 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
             out = model.experts.forward(x.clone(), topk_output)
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
-            method = model.experts.quant_method
-            return (method.weight_block_size, method.w2_weight_block_size), out.float()
+            return model.experts.quant_method, out.float()
 
     def _assert_ranks_match_tp1(self, backend, *, blocks, num_tokens):
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -154,10 +153,12 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
         _, tp1 = self._forward(backend, shards, x, topk_output, tp_size=1, tp_rank=0)
         summed = torch.zeros_like(tp1)
         for rank in range(TP):
-            block_sizes, out = self._forward(
+            method, out = self._forward(
                 backend, shards, x, topk_output, tp_size=TP, tp_rank=rank
             )
-            self.assertEqual(block_sizes, blocks)
+            self.assertEqual(
+                (method.weight_block_size, method.w2_weight_block_size), blocks
+            )
             summed += out
         # Rounding activations to FP8 dominates both errors (5-7%); misplaced
         # weights or scales would be off by about the size of the output.
