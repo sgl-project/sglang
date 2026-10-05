@@ -142,7 +142,8 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
-    /// Per-request upstream timeout in seconds.
+    /// Upstream timeout in seconds: the whole response of a non-streaming request,
+    /// the response headers of a streaming one.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
