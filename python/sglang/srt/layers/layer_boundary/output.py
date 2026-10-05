@@ -37,8 +37,6 @@ class OutputTransform(msgspec.Struct, frozen=True):
     before_reduce_scatter: bool = False
 
 
-# Per-forward values are plain classes, not msgspec.Struct;
-# Dynamo cannot build a Struct inside a compiled layer.
 class UnreducedOutput:
     """Internal adapter value describing an unfinished reduction.
 
@@ -60,8 +58,8 @@ class UnreducedOutput:
         self,
         partial: torch.Tensor,
         group: Optional[GroupCoordinator] = None,
-        # Under attention DP: reduces ``partial`` and moves it to this rank's tokens,
-        # by a reduce-scatter or by an all-reduce then a scatter.
+        # Under attention DP: the reduction that also brings ``partial`` back to this
+        # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
         reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ):
         self.partial = partial

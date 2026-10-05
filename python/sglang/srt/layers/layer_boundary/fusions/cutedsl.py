@@ -75,8 +75,6 @@ def _resolve_max_m(*, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-# A plain class, not msgspec.Struct;
-# Dynamo cannot build a Struct inside a compiled layer.
 class MoeDeferredFinalize(DeferredFinalize):
     """Unfinalized routed output plus the separately gated shared contribution.
     The next layer's fused finalize + AR + add + norm takes it; ``finish`` is

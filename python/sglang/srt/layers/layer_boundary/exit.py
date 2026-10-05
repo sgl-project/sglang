@@ -375,8 +375,6 @@ def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bo
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-# A plain class, not msgspec.Struct;
-# Dynamo cannot build a Struct inside a compiled layer.
 class ExitDecision:
     """One decision shared by compute flags and the matching output completion.
 

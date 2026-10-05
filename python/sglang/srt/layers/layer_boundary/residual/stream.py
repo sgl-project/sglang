@@ -22,8 +22,6 @@ from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedO
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-# Per-forward values are plain classes, not msgspec.Struct;
-# Dynamo cannot build a Struct inside a compiled layer.
 class DeclaredSum:
     """A sum every output of this producer owes to its declared input edge."""
 
@@ -36,7 +34,6 @@ class DeclaredSum:
         return _sum_group(self.group).all_reduce(value)
 
 
-# Also mutated per forward, which Dynamo cannot do to a msgspec.Struct.
 class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 

@@ -3509,8 +3509,6 @@ def _warn_if_called_from_outside(name: str, replacement: str):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            # Dynamo cannot trace `sys._getframe`;
-            # in-package calls never mark `name` as warned, so they always reach it.
             if not torch.compiler.is_compiling() and name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
