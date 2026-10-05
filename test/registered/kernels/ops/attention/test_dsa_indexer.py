@@ -1161,6 +1161,14 @@ class TestDSAIndexer(CustomTestCase):
 
         torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
+        # Values alone do not cover the padding this fallback does: topk_v2.cuh
+        # does a 16-byte vectorised load and needs score_stride % 4 == 0, but
+        # num_kv is the real key count and is unaligned for most prompts. Before
+        # the padding this returned stride 11 for num_kv=11 and the kernel read
+        # out of bounds, which surfaced as HTTP 500 on a 64K prompt.
+        self.assertEqual(actual.stride(1), 1)
+        self.assertEqual(actual.stride(0) % 4, 0)
+
     def test_fp8_paged_mqa_logits_torch_matches_reference(self):
         """Test paged pure-torch MQA logits fallback against a direct reference."""
         if not self.supports_fp8:
