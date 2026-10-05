@@ -14,10 +14,11 @@ use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixOutcome};
 use tokio::sync::OnceCell;
 
 use crate::config::{AffinityConfig, AffinityMode};
-use crate::policies::admission::FreshLoadLookup;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
-use crate::policies::ExternalPrefixSignal;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle};
+use crate::state::kv_events::{
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, PrefixLookupResult,
+    RadixTreePrefixProvider,
+};
+use crate::state::load_monitor::engine_ranking::CandidateLoads;
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable,
 };
@@ -28,7 +29,7 @@ use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-type Signal = Option<Arc<ExternalPrefixSignal>>;
+type Signal = Option<Arc<PrefixLookupResult>>;
 type Lookup = Arc<OnceCell<Signal>>;
 
 /// Local radix tree or remote indexer. Groups sharing an index namespace share
@@ -74,9 +75,10 @@ impl CacheSource {
             return Ok(None);
         }
         match index.match_prefix(hashes).await {
-            Ok(outcome) => Ok(Some(Arc::new(ExternalPrefixSignal {
+            Ok(outcome) => Ok(Some(Arc::new(PrefixLookupResult {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             }))),
             Err(PrefixIndexError::Rejected(code)) => Err(PickError::InvalidSignal(format!(
                 "KV Indexer rejected the query: {code}"
@@ -103,6 +105,15 @@ impl fmt::Debug for PrefixMemo {
 }
 
 impl PrefixMemo {
+    /// The local tree's answer, once a policy has looked it up.
+    pub fn local_signal(&self) -> Option<Arc<PrefixLookupResult>> {
+        let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
+        cells
+            .iter()
+            .filter(|(source, _)| matches!(**source, CacheSource::Local(_)))
+            .find_map(|(_, cell)| cell.get().cloned().flatten())
+    }
+
     fn cell(&self, source: &Arc<CacheSource>) -> Lookup {
         let mut cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
         match cells.iter().find(|(s, _)| Arc::ptr_eq(s, source)) {
@@ -123,10 +134,10 @@ struct Candidate<'a> {
 }
 
 /// Less uncached work first, then lower prefill pressure, then worker id.
-fn rank(loads: &FreshLoadLookup<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
+fn rank(loads: &CandidateLoads<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(left.engine, right.engine))
+        .then_with(|| loads.compare_prefill_engines(left.engine, right.engine))
         .then_with(|| left.engine.id.0.cmp(&right.engine.id.0))
 }
 
@@ -175,12 +186,13 @@ impl CacheAwarePolicy {
         &self,
         engines: &'e [Arc<Worker>],
         request: &PickRequest<'_>,
-        signal: Option<&ExternalPrefixSignal>,
+        signal: Option<&PrefixLookupResult>,
         load: &EngineReportedLoadSnapshot,
     ) -> Vec<Candidate<'e>> {
-        let Some(ExternalPrefixSignal {
+        let Some(PrefixLookupResult {
             outcome: PrefixOutcome::Matched { matches, .. },
             query_blocks,
+            ..
         }) = signal.filter(|signal| signal.query_blocks > 0)
         else {
             return Vec::new();
@@ -218,7 +230,7 @@ impl CacheAwarePolicy {
             .len()
             .min(config.cache_candidate_max_workers)
             .min(config.cache_candidate_min_workers.max(proportional));
-        let loads = FreshLoadLookup::new(Some(load), candidates.iter().map(|c| c.engine));
+        let loads = CandidateLoads::new(Some(load), candidates.iter().map(|c| c.engine));
         candidates.sort_by(|left, right| rank(&loads, left, right));
         candidates.truncate(limit);
         candidates

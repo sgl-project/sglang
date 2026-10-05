@@ -39,22 +39,23 @@ def handle_deprecated_dp_attention(server_args: Any):
 
     Runs before any handler reads the DP layout. The old spelling counted
     attention-DP groups with `dp_size`; that width moves to `attn_dp_size`, and
-    `dp_size` counts replicas again.
+    `dp_size` counts replicas again. Next to `--attn-dp-size` the flag adds
+    nothing: a serialized config reports it set whenever attention DP runs
+    (`ServerArgs.resolved_dict`), so reading one back resolves the same layout.
     """
     cfg = resolving_view(server_args)
-    if cfg.enable_dp_attention:
-        if cfg.attn_dp_size != 1:
-            raise ValueError(
-                "--enable-dp-attention is the deprecated spelling of "
-                "--attn-dp-size; pass --attn-dp-size alone."
-            )
+    if not cfg.enable_dp_attention:
+        return
+    if cfg.attn_dp_size == 1:
         declare_resolution(
             server_args,
             "_handle_deprecated_dp_attention",
             attn_dp_size=cfg.dp_size,
             dp_size=1,
-            enable_dp_attention=False,
         )
+    declare_resolution(
+        server_args, "_handle_deprecated_dp_attention", enable_dp_attention=False
+    )
 
 
 def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
@@ -82,7 +83,7 @@ def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
     # position must also win here, or a package permitting prefill CP on its
-    # own qualified HIP/NPU/MUSA build would still hit the original rejection
+    # own qualified NPU/MUSA build would still hit the original rejection
     # at this later, nested call.
     run_hook(validate_prefill_cp_platform, server_args)
 
@@ -98,6 +99,15 @@ def handle_context_parallelism(server_args: Any):
                 cfg, model_config.hf_text_config.model_type
             ),
         )
+        if (
+            cfg.enable_prefill_cp
+            and get_platform().is_hip
+            and model_arch != "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError(
+                "Prefill CP on HIP is only supported for "
+                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+            )
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
@@ -775,7 +785,7 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
+    if cfg.enable_prefill_cp and platform.is_musa:
         raise ValueError(
-            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )

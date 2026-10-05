@@ -77,11 +77,11 @@ from sglang.srt.layers.dcp.planner import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -1107,6 +1107,8 @@ class DeepseekV2MoE(nn.Module):
         # The mHC post-split consumes the reduced row without an RMSNorm.
         use_fused_finalize_all_reduce = (
             self._fuse_finalize_all_reduce
+            # The kernel completes the tensor-parallel sum itself.
+            and self.reduce_results
             and has_shared_output
             and hidden_states.shape[-1] == 5120
             and not self._shared_expert_tp1
@@ -2629,6 +2631,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2679,14 +2682,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self._stage_enters_stack = (layer_id) == 0
-        self._stage_terminal = (layer_id) == (
-            1 if is_nextn else config.num_hidden_layers
-        ) - 1
-        self._stage_previous_sparse = is_previous_layer_sparse
         self._stage_next_sparse = is_next_layer_sparse
 
         if self.is_layer_sparse:
@@ -2724,11 +2721,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        self.attn_boundary, self.ffn_boundary = self._build_stages(
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
-        )
+        # A subclass that brings its own norms builds the stages after them.
+        if build_stages:
+            self.attn_boundary, self.ffn_boundary = self._build_stages(
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            )
 
     def _build_stages(
         self,
@@ -2752,7 +2751,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
-        attn_boundary, ffn_boundary = make_stages(
+        attn_boundary, ffn_boundary = append_stages(
             (
                 declare_attn(output_transform=attn_output),
                 input_layernorm,
@@ -2767,13 +2766,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 post_attention_layernorm,
                 {"fusions": fusions},
             ),
-            previous=declare_ffn(
-                sparse=self._stage_previous_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-            )
-            if not self._stage_enters_stack
-            else None,
-            terminal=self._stage_terminal,
         )
         return attn_boundary, ffn_boundary
 

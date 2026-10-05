@@ -23,7 +23,7 @@ on:
           - '2-gpu-large'
           - '4-gpu-h100'
           - '4-gpu-b200'
-          - '4-gpu-gb300'
+          # - '4-gpu-gb300'  # Temporarily disabled while the GB300 runner is unavailable.
           - '8-gpu-h200'
           - '8-gpu-b200'
           - 'diffusion'
