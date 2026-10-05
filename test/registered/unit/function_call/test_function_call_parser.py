@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -3329,6 +3330,29 @@ class TestGlm47MoeDetector(unittest.TestCase):
             ),
         ]
         self.detector = Glm47MoeDetector()
+
+    def test_unpaired_tags_parse_in_linear_time(self):
+        """Unclosed tool-call tags and argument keys without values must not stall
+        the parser (it runs on the event loop); complete calls still parse."""
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            + "<arg_key>city</arg_key>" * 10000
+            + "</tool_call>"
+            + "<tool_call> " * 10000
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(
+            [(call.name, call.parameters) for call in result.calls],
+            [("get_weather", '{"city": "Beijing"}'), ("get_weather", "{}")],
+        )
 
     def test_multiple_tool_calls(self):
         text = (
