@@ -8,8 +8,8 @@ The language-independent contract remains in
 at build time with a vendored `protoc`, so consumers do not need a system
 protobuf compiler.
 
-The generated API currently uses Tonic 0.12 to remain compatible with
-SGLang's existing gRPC server.
+The generated API uses Tonic 0.14 (`tonic-prost`), shared by SGLang's gRPC
+server and `experimental/sgl-router`.
 
 This crate contains protocol types only. SGLang's request handling and server
 implementation remain in their respective frontend crates.
