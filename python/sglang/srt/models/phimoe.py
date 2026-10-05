@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -188,7 +189,6 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_parallel().tp_size
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -282,6 +282,12 @@ class PhiMoEAttention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,

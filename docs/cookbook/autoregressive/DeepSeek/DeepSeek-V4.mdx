@@ -390,9 +390,9 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 - **Model checkpoints** — for correct accuracy, the FP4 model uses the stock `deepseek-ai/DeepSeek-V4-{Flash,Pro}`, and the FP8 model uses the repackaged `sgl-project/DeepSeek-V4-{Flash,Pro}-FP8`.
 - **Supported models** — **MI300X** supports DeepSeek-V4-Flash in FP8; **MI355X** supports DeepSeek-V4-Flash / Pro in both FP4 and FP8. All recipes run single-node.
-- **TP / DP setting (MI355X)** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP** (balanced / high-throughput recipes). The verified MI355X DP recipes additionally set `--dp 8 --enable-dp-attention --enable-dp-attention-local-control-broadcast --tokenizer-worker-num 8 --stream-interval 20 --prefill-decode-interval 10`.
-- **MTP** — speculative decoding on the original Flash / Pro checkpoints; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The 0813 Pro Official checkpoint keeps its MTP head too, so the same flags work there as a fallback to DSpark.
-- **DSpark (MI355X Pro Official 0813)** — the 0813 checkpoint bundles the DSpark draft head. Prefer it over EAGLE on 0813 for ordinary serving: enable `--speculative-algorithm DSPARK` (low-latency) and see the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) for the long-context path. DSpark also runs under **PD disaggregation** — see the Pro Official pairs in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io).
+- **TP / DP setting (MI355X)** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP** (balanced / high-throughput recipes). The verified MI355X DP recipes additionally set `--attn-dp-size 8 --enable-dp-attention-local-control-broadcast --tokenizer-worker-num 8 --stream-interval 20 --prefill-decode-interval 10`.
+- **MTP** — speculative decoding on the original Flash / Pro checkpoints, which bundle an MTP head; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Pro Official (0813) has no MTP head, so these flags do not apply there and the Playground does not offer them.
+- **DSpark (MI355X Pro Official 0813)** — the 0813 checkpoint bundles the DSpark draft head, and DSpark is the only speculative algorithm it supports. Enable `--speculative-algorithm DSPARK` (low-latency) and see the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) for the long-context path. DSpark also runs under **PD disaggregation** — see the Pro Official pairs in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io).
 - **Kernels** — uses the Unified KV attention and the flydsl MoE.
 - **FP4 indexer (MI355X)** — FP4 C4 indexer is supported via `--enable-deepseek-v4-fp4-indexer` on top of the standard ROCm recipe.
 
@@ -408,7 +408,7 @@ export SGLANG_MORI_RECV_BOUND=1
 
 sglang serve \
   --model-path {MODEL_PATH} \
-  --tp 8 --dp 8 --enable-dp-attention \
+  --tp 8 --attn-dp-size 8 \
   --ep-size 8 --moe-a2a-backend mori --deepep-mode normal \
   <other args from the Deploy panel>
 ```
@@ -654,7 +654,7 @@ For AMD devices,
 
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 
-For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache). For the alternative that skips the host tier entirely, see [§3.9 UMBP](#3-9-umbp-direct-external-kv-store) — it is a sibling of HiCache, not a storage backend for it, and the two cannot be enabled together.
+For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache). For the alternative that skips the host tier entirely, see [§3.9 UMBP](#3-9-unified-cache-external-linker-umbp) — it is a sibling of HiCache, not a storage backend for it, and the two cannot be enabled together.
 
 ### 3.4 DSpark (Speculative Decoding)
 
@@ -769,8 +769,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --dp 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --enable-dp-lm-head \
   --ep-size 8 \
   --moe-a2a-backend megamoe \
@@ -792,7 +791,7 @@ python3 -m sglang.launch_server \
   --hicache-mem-layout page_first_direct
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 6144 tokens per rank.
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so this keeps 6144 tokens per rank.
 
 **Disaggregated 1P1D (DEP8 prefill / DEP8 decode), concurrency 64–128.** Prefill, on one 8-GPU node:
 ```bash Command
@@ -804,8 +803,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --dp 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --enable-dp-lm-head \
   --ep-size 8 \
   --moe-dense-tp-size 1 \
@@ -841,8 +839,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --dp 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --enable-dp-lm-head \
   --ep-size 8 \
   --moe-dense-tp-size 1 \
@@ -877,11 +874,23 @@ Concurrency 256 uses 2P1D — two prefill workers, one node each, added with a s
 
 ### 3.7 Agentic Long-Context with HiCache DRAM Offload (MI355X FP4, DSpark)
 
-DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every arm.
+Three commands follow, one per concurrency range. They share the model, parser, attention and DSpark flags, and differ in parallelism, MoE path and host offload:
 
-- **BCG**: conc 1–4 — `--cuda-graph-backend-prefill breakable`
-- **Grouped ASM**: TP-only, conc ≥ 16 — `SGLANG_DSV4_GROUPED_ASM=1`
-- **EP**: MegaMoE; at concurrency 384 lower `--prefill-decode-interval` to `15`
+| | TP8 | TP8 + HiCache | DP8 | DP8 EP8 MegaMoE |
+|---|---|---|---|---|
+| Concurrency | 1–16 | 32–48 | 128 | 128–384 |
+| Parallelism | TP8 | TP8 | TP8+DP8 | TP8+DP8+EP8 |
+| MoE | replicated | replicated | replicated | MegaMoEv2 |
+| HiCache | off | on | on | on |
+| `--mem-fraction-static` | 0.86 | 0.86 | 0.92 | 0.85 |
+
+DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every command. The first three use `--enforce-shared-experts-fusion`; the MegaMoE command uses `--disable-shared-experts-fusion` instead.
+
+Three adjustments are not in the commands below. Add them when they apply:
+
+- `--cuda-graph-backend-prefill breakable` at concurrency 1–4.
+- `SGLANG_DSV4_GROUPED_ASM=1` on the TP-only commands at concurrency 16 and above — the kernel needs at least 16 requests per draft token.
+- `--prefill-decode-interval 15` on the MegaMoE command at concurrency 384, replacing the `20` it ships with.
 
 **TP8, concurrency 1–16:**
 ```bash Command
@@ -913,7 +922,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-Concurrency 32–48 keeps the same TP-only command and adds HiCache DRAM offload. DSv4 HiCache sizes the host tier with `--hicache-ratio` (host/device token ratio). Ratio `1.5` is the value that stays under a ~2.7 TB host DRAM budget at TP8:
+**TP8 + HiCache, concurrency 32–48:** the same command with HiCache DRAM offload added. `--hicache-ratio` is the host/device token ratio; `1.5` is what stays under a ~2.7 TB host DRAM budget at TP8. The same five flags appear in the two DP commands below.
 
 ```bash Command
   --enable-hierarchical-cache \
@@ -941,8 +950,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --dp 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --enable-dp-lm-head \
   --enable-prefill-delayer \
   --enable-dp-attention-local-control-broadcast \
@@ -971,7 +979,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware` so multi-turn sessions land on the rank holding the longest radix/HiCache prefix; above concurrency 160 add `--balance-abs-threshold 32`.
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 65536 keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
 
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
@@ -996,9 +1004,8 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --dp 8 \
+  --attn-dp-size 8 \
   --ep 8 \
-  --enable-dp-attention \
   --enable-dp-lm-head \
   --enable-prefill-delayer \
   --enable-dp-attention-local-control-broadcast \
@@ -1032,9 +1039,13 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
+This command adds expert parallelism on top of the DP8 one. [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only.
+
 ### 3.8 PD Disaggregation on MI355X (MORI-IO)
 
-On ROCm the prefill and decode roles talk over **MORI-IO** rather than Mooncake or NiXL, so the **PD Disagg** card in the [Playground above](#playground) hides the CUDA-only transports once MI300X / MI355X is selected and defaults the IB device list to the node's `rdmaN` NICs instead of ConnectX `mlx5_*` names.
+The prefill and decode roles can use any transport the **PD Disagg** card in the [Playground above](#playground) offers. On MI300X / MI355X that is **MORI-IO**, **Mooncake** and **NiXL**, and all three stay selectable. This section covers MORI-IO only, because it is the transport every AMD recipe in this cookbook was measured with. It is also what the card selects by default on those two platforms, and it is the one transport that is ROCm-only, so the card hides it on the CUDA platforms.
+
+The IB device list works the other way around. ROCm nodes enumerate their NICs as `rdmaN`, so on MI300X / MI355X the card defaults to the node's `rdmaN` list and hides the ConnectX `mlx5_*` names. On the CUDA platforms it hides the `rdmaN` list instead.
 
 Both roles need the RDMA NICs passed into the container, so the **Docker** output adds the fabric flags below on top of the usual ROCm device access from the [Install panel](#install). `/dev/infiniband` covers `rdma_cm` and the per-NIC `uverbs0`…`uverbs7` nodes, and the memlock/`IPC_LOCK` pair is what lets MORI-IO pin the buffers it registers with the NICs:
 
@@ -1047,67 +1058,201 @@ docker run \
     --ulimit nofile=1048576:1048576 \
     --network host --ipc=host --shm-size 32g \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923 \
+    lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001 \
     python3 -m sglang.launch_server <role args below>
 ```
 
-The Pro Official (0813) PD pairs ran end-to-end on this `v0.5.20` build, and the Playground's Docker output uses it for that variant. `--network host` replaces the single-node `-p` mapping because the two roles rendezvous across hosts. Long agentic runs on the 1.6T checkpoint may need more than `--shm-size 32g`; raise it if the workers die during weight load.
+The Playground's Docker output uses this `v0.5.21` build for Pro Official. It is the build the PD roles ran on, and the first one carrying the Aiter MegaMoEv2 kernels the high-throughput prefill role needs. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
-Selecting either role with **MORI** on MI355X emits the shared MORI-IO transport env — `SGLANG_MORI_COMBINE_DTYPE` plus the RDMA send-queue tuning `MORI_IO_SQ_BACKOFF_TIMEOUT_US` / `MORI_IO_QP_MAX_SEND_WR` — together with that role's sizing. `--max-running-requests` is deliberately small on both: the pair streams KV between workers rather than holding a large running batch.
+Selecting a role with **MORI** emits the MORI-IO transport env — `MORI_IO_SQ_BACKOFF_TIMEOUT_US` and `MORI_IO_QP_MAX_SEND_WR` — together with that role's sizing.
 
-The roles are sized per **Strategy**, so the Deploy panel's operating point carries through to the PD command:
+#### Role-based configuration
 
-- **Low-Latency** — TP-only, `--mem-fraction-static 0.86`, and a running-request ceiling of 8. Decode captures graphs for batches 1–8. No offload tier: the KV pool is all there is.
-  - **Pro Official (0813)** has its own low-latency pair: a **TP4 prefill** in front of a **TP8 decode**, both keeping the bundled **DSpark** head with `--speculative-dspark-block-size 6` (SGLang derives steps 1 / topk 1 / 7 draft tokens from it). The ceiling is `--max-running-requests 32` on both roles and decode ladders 1–32. Prefill adds a 16384 chunked-prefill budget, `--optimistic-prefill-attempts 2`, `--enable-cache-report`, and a **UMBP** tier (see [§3.9](#3-9-umbp-direct-external-kv-store)) that the Playground turns on by default. Both roles drop the base cell's `--prefill-decode-interval`, which only applies to aggregated serving.
-- **Balanced** — still TP-only, with the ceiling at `--max-running-requests 96` and a 16384 chunked-prefill budget. Decode ladders all the way to 96, since without DP the server-wide ceiling *is* the per-rank batch. Prefill runs a **HiCache** host tier (`--hicache-ratio 2.5`, `page_first`, write-through, best-effort prefetch); decode does not, because HiCache is not recommended on the decode role with MORI.
-  - **Pro Official (0813)** runs balanced as the same asymmetric pair as its low-latency one, re-sized: a **TP4 prefill** in front of a **TP8 decode**, both with **DSpark** at `--speculative-dspark-block-size 3` (steps 1 / topk 1 / 4 draft tokens), a ceiling of `--max-running-requests 96` on both roles, and a decode ladder of 1–96. The balanced base cell is target-only DP, so the roles add `--speculative-algorithm DSPARK` back. Prefill keeps the 16384 chunked-prefill budget and adds `--optimistic-prefill-attempts 2` and `--enable-cache-report`. Its offload tier is **UMBP** rather than HiCache, on by default in the Playground; switch the UMBP card off to fall back to the HiCache tier above.
-- **High-Throughput** — inherits TP8 / DP8 and the 65536 chunked-prefill budget from the base cell, raises the ceiling to `--max-running-requests 256` and `--mem-fraction-static 0.92`, and ladders decode to 32 — the per-rank batch 256 leaves across DP 8. It adds `--enable-cache-report`, which surfaces the prefix hit rate you need to judge whether an offload tier is paying for itself at that concurrency.
-  - **Pro Official (0813)** keeps TP8 / DP8 on both roles and adds **DSpark** at `--speculative-dspark-block-size 3`, the same draft shape as its balanced pair, plus `--enable-dp-lm-head`. The ceiling is `--max-running-requests 512` on both roles at `--mem-fraction-static 0.92`, which is 64 per DP rank, so decode ladders 1–64. Prefill keeps the base cell's 65536 chunked-prefill budget and `--swa-full-tokens-ratio 0.15`, adds `--optimistic-prefill-attempts 2`, and runs **UMBP** on by default in the Playground against the same standalone tier server as the other two Pro Official pairs. Decode drops `--chunked-prefill-size`, and both roles drop `--prefill-decode-interval`.
+Pro Official (0813) has its own pair for each strategy, because it carries a DSpark head:
 
-The offload tier is what actually separates balanced from high-throughput: balanced pairs prefill with HiCache's tiered GPU → host cache, while high-throughput pairs it with UMBP, which links the radix tree straight to MORI with no host tier. Pro Official is the exception, running UMBP under all three of its pairs, including the two TP-only ones. HiCache and UMBP cannot both be on, and the Playground enforces that.
+| | Low-Latency | Balanced | High-Throughput |
+|---|---|---|---|
+| Prefill → Decode | TP8 → TP8 | TP4 → TP8 | TP8+DP8 → TP8+DP8 |
+| `--max-running-requests` | 32 | 96 | 384–1024 |
+| `--speculative-dspark-block-size` | 6 | 3 | 3 |
+| KV offload | linker(UMBP) | linker(UMBP) | linker(UMBP) |
+
+`--cuda-graph-bs-decode` on the decode role covers 1 to `--max-running-requests / attn_dp_size`: the full value on the TP-only rows, an eighth of it on the DP8 rows.
+
+All three Pro Official prefill roles add `--optimistic-prefill-attempts 2` and `--enable-cache-report`, and turn on the [unified cache external linker](#3-9-unified-cache-external-linker-umbp) by default. "Linker" and HiCache are alternatives; SGLang rejects both at once. Every role drops the base cell's `--prefill-decode-interval`, which applies to aggregated serving only.
+
+The high-throughput pair is the one exception to the table above: its prefill role runs **EP8** MoE while decode stays TP8, and it serves a range of concurrencies rather than one. In the Playground, its **Target Concurrency** select moves `--max-running-requests` and `--cuda-graph-bs-decode` together between 192 and 512. The two commands further down are that pair at concurrency 256.
 
 <Note>
-The low-latency and balanced roles are TP-only, and that is exactly why their decode ladders run to the full ceiling. Selecting either role forces DP-Attention off and grays the control: `--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so switching DP on would cut the per-rank batch below the captured graphs without changing either flag in the command. With PD off, the balanced cell stays a DP recipe for aggregated serving.
+Selecting a TP-only role forces **DP-Attention** off and greys the control. `--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so turning DP on would cut the per-rank batch below the captured `--cuda-graph-bs-decode` values without changing either flag in the command.
 </Note>
 
 <Warning>
-**Speculative decoding changes how you size the ceilings.** For a target concurrency of N, set `--max-running-requests N*2` on **both** roles. Sizing them at N caps the served batch below the concurrency you are aiming for. This applies to DSpark and EAGLE/MTP alike: the Pro Official low-latency pair's ceiling of 32 is sized for a concurrency of 16, its balanced pair's 96 for 48, and its high-throughput pair's 512 for 256.
+**Speculative decoding changes how you size `--max-running-requests`.** For a target concurrency of N, set it to `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and the high-throughput Pro Official range serves 192 to 512.
 
-`--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so the decode graph ladder should cover the **per-rank** batch that leaves — `N*2 / dp_size`. That is why the two points above ladder to different places from ceilings that differ by less: balanced is TP-only, so 96 slots are 96 per rank, while high-throughput spreads 256 over DP 8 and only ever sees 32 at a time (Pro Official's 512 over DP 8 is 64).
+The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size`, the per-rank batch. On the Pro Official high-throughput pair the **Target Concurrency** select applies both rules for you.
 </Warning>
 
-The high-throughput prefill role is where [UMBP](#3-9-umbp-direct-external-kv-store) belongs — DP attention is already on, which UMBP otherwise requires, and the concurrency is high enough for the pool to matter. On Pro Official, all three prefill roles enable UMBP by default, and the low-latency and balanced ones do so without DP as the TP-only exceptions. Elsewhere, turn on the **UMBP** card alongside the role; it is a separate card rather than part of the role because the linker flags are its to own, and leaving them implicit would hide the dependency.
+Two things then differ between the two roles regardless of strategy:
 
-Whichever point you pick, the two roles diverge in two places:
+- **CUDA graphs.** Prefill runs `--disable-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
+- **Speculative decoding** is the same on both. Keep `--speculative-dspark-block-size` equal on the two roles. The original Flash and Pro checkpoints have no DSpark head and use their MTP head instead: `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 
-- **Cuda graphs.** Prefill runs eager (`--disable-cuda-graph`) because the FP4 indexer's prefill path is not captured. Decode captures the small batch ladder that matches its running-request ceiling (`--cuda-graph-bs-decode 1 2 3 4 5 6 7 8`).
-- **MORI dispatch budget.** `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is `16384` on prefill, sized for a whole chunked-prefill batch, and `128` on decode, where a step never dispatches more than a token per running request.
+**MoE parallelism differs too, on the high-throughput pair.** Each role uses what suits its batch size. Prefill runs **EP8**, with the experts split across the 8 ranks: it processes a 65536-token chunk, so the split pays for the all-to-all it costs. Decode runs **TP8**, with the experts replicated on every rank, because a few tokens per request per step would not pay for it.
 
-Picking a role keeps an inherited DSpark head on both roles (see [§3.4](#3-4-dspark-speculative-decoding)); keep `--speculative-dspark-block-size` the same on both roles. For the originals, which have no DSpark head, a speculative PD recipe uses the bundled MTP head through the EAGLE path instead:
+The two commands below are that pair at concurrency 256, on one prefill node and one decode node. Run each on its own host, then front them with the router.
+
+**Prefill, EP8:**
 
 ```bash Command
---speculative-algorithm EAGLE --speculative-eagle-topk 1 \
---speculative-num-steps 3 --speculative-num-draft-tokens 4
+GPU_MAX_HW_QUEUES=5 \
+SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
+SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
+MORI_SHMEM_HEAP_SIZE=8G \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_SHARED_EXPERT_TP1=0 \
+SGLANG_DP_SHARED_EXPERT_LOCAL=0 \
+SGLANG_DP_USE_GATHERV=0 \
+SGLANG_DP_USE_REDUCE_SCATTER=0 \
+UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 6100 \
+  --disaggregation-mode prefill \
+  --disaggregation-bootstrap-port 7200 \
+  --disaggregation-transfer-backend mori \
+  --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
+  --tp-size 8 --dp-size 8 --ep-size 8 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --moe-a2a-backend megamoe \
+  --moe-dense-tp-size 1 \
+  --enforce-shared-experts-fusion \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.15 \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 65536 \
+  --max-running-requests 512 \
+  --context-length 1048576 \
+  --disable-cuda-graph \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-unified-cache-external-linker \
+  --unified-cache-external-linker-backend mori \
+  --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}' \
+  --optimistic-prefill-attempts 2 \
+  --enable-cache-report \
+  --load-balance-method round_robin \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-metrics \
+  --watchdog-timeout 3600
 ```
 
-Run the two roles on separate nodes with the same transport and IB device selection, then front them with the router the card prints. On MI355X that router is cache-aware rather than round-robin: `--policy consistent_hashing` keeps a conversation on the worker that already holds its prefix, which is what makes the agentic reuse pay off, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` keep that affinity from starving the peer given how small the running-request ceiling is. Decode holds no reusable prefix, so `--decode-policy round_robin` spreads the decode side evenly. Health checks stay on with a long timeout so a wedged worker is still caught without a multi-minute prefill being mistaken for a failure.
+**Decode, TP8:**
 
-`--dp-aware` only does something when the workers run DP attention — turn on the Playground's **DP-Attention** card if you want it to take effect, otherwise it is inert on the TP-only recipe above.
+```bash Command
+GPU_MAX_HW_QUEUES=5 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_SHARED_EXPERT_TP1=1 \
+SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
+SGLANG_DP_USE_GATHERV=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=1 \
+MORI_MAX_DISPATCH_TOKENS_DECODE=256 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 6100 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mori \
+  --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
+  --tp-size 8 --dp-size 8 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --enforce-shared-experts-fusion \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.15 \
+  --mem-fraction-static 0.92 \
+  --max-running-requests 512 \
+  --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 \
+  --context-length 1048576 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --load-balance-method round_robin \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-metrics \
+  --watchdog-timeout 3600
+```
 
-### 3.9 UMBP (Direct External KV Store)
+Decode sets neither `--ep-size` nor `--moe-a2a-backend`. `--moe-a2a-backend` names the dispatch path for expert parallelism, so at `ep_size` 1 there is nothing for it to name, and the MoE runs replicated across TP.
 
-UMBP is the second way to spill KV off the GPU, and it is an **alternative to [HiCache](#3-3-hicache-hierarchical-kv-caching), not a tier inside it**. HiCache is a hierarchy — GPU, then pinned host memory, then optionally a storage backend. UMBP links the unified radix tree straight to MORI's buffer pool with no host cache tier in between, so pages load and offload against the external store directly. SGLang rejects the two together, so enabling the **UMBP** card in the [Playground above](#playground) strips the whole HiCache flag family from the command:
+The four `SGLANG_*` variables that flip between the two commands drive the `all_gatherv` / `reduce_scatterv` path. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
+
+The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
+
+On the prefill env:
+
+- `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
+- `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is also the default; the command sets it so the dependency stays visible.
+- `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.7](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
+
+<Note>
+`MORI_SHMEM_MODE=STATIC_HEAP` creates the heap and is already the default. Set it only if your launch script exports `MORI_SHMEM_MODE=ISOLATION`, which creates no heap: every rank then prints `Pointer ... is not in symmetric heap [0x0, 0x0)` and the worker fails.
+</Note>
+
+**Both roles set `SGLANG_DSV4_UNIFIED_KV_FP8=1`**, which splits the unified KV cache pool into an FP8 nope pool and a BF16 rope pool. It requires the `unified_kv_triton` kernels, which the base cell already selects through `SGLANG_HACK_FLASHMLA_BACKEND`. The value must match on both roles — the PD handshake compares KV cache layouts and fails if they differ. The DSpark draft worker stays BF16 either way.
+
+#### Router configuration
+
+Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. Decode holds no reusable prefix, so `--decode-policy round_robin` spreads it evenly. `--dp-aware` takes effect only when the workers run DP attention.
+
+The **Pro Official high-throughput** pair, and only that pair, adds `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
+
+<Warning>
+`--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the low-latency and balanced pairs keep the default. Lower it again if you lower the concurrency.
+</Warning>
+
+### 3.9 Unified Cache External Linker (UMBP)
+
+The **unified cache external linker** is the second way to move KV cache off the GPU. The linker is the SGLang feature, and you enable it with `--enable-unified-cache-external-linker`. UMBP is one store the linker can use; you select it with `--unified-cache-external-linker-backend mori`. The Playground card uses the feature name, not the store name.
+
+The linker is an **alternative to [HiCache](#3-3-hicache-hierarchical-kv-caching), not a tier inside it**. HiCache is a hierarchy — GPU, then pinned host memory, then optionally a storage backend. The linker connects the unified radix tree directly to the external store, with no host cache tier in between, so pages load and offload against that store. SGLang rejects the two together, so enabling the **Unified Cache External Linker** card in the [Playground above](#playground) strips the whole HiCache flag family from the command:
 
 ```bash Command
 --enable-unified-cache-external-linker \
 --unified-cache-external-linker-backend mori
 ```
 
-The **Store** knob picks the linker backend. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
+The **Backend** knob picks the linker backend. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
 
-**DP Attention is required**, and the card's Enable chip stays greyed out until you turn it on. This is not a soft preference. The linker keys its objects by rank, and MLA KV is replicated across TP, so a TP8 prefill worker under pure TP opens eight separate keyspaces holding eight copies of the same tokens — the pool's effective distinct-token capacity would be an eighth of what its byte budget suggests, which is easy to mistake for a real measurement. DP attention collapses the keys onto one shared keyspace.
+**The linker does not need PD disaggregation.** It works in aggregated serving as well, with the **PD Disagg** card set to Off. The §3.8 pairs use it on their prefill role because that is where the KV is produced, but that is a property of those recipes, not a requirement of the linker. Turn the card on next to any command whose selection satisfies the condition below.
 
-The exception is the MI355X Pro Official prefill role in the low-latency and balanced pairs of [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io). At TP4 it holds four copies rather than eight, and that TP-only shape has run end-to-end, so the card turns UMBP on for those roles without DP. Every Pro Official prefill role (low-latency, balanced, and the DP8 high-throughput one) uses a **standalone** UMBP tier: a separate `umbp_standalone_server` process on the prefill node owns the DRAM pool, and the prefill server attaches to it over a Unix socket. Start the tier server first; the 1500 GB DRAM budget below is what the verified runs used:
+**DP Attention is not required.** The linker runs under pure TP as well, and the Pro Official low-latency and balanced prefill roles in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io) are exactly that shape.
+
+DP Attention does change how much the tier holds, so it is worth understanding before you size one. The linker keys its objects by rank, and MLA KV is replicated across TP. Under pure TP, a TP8 worker therefore opens eight separate keyspaces, and all eight hold copies of the same tokens: the tier stores an eighth of the distinct tokens that its byte budget suggests. At TP4 it stores a quarter. DP Attention collapses the keys onto one shared keyspace, so the whole budget counts. Size the pool for the copies you will actually get, and do not read the byte budget as a distinct-token figure.
+
+Every Pro Official prefill role (low-latency, balanced, and the DP8 high-throughput one) uses a **standalone** UMBP tier: a separate `umbp_standalone_server` process on the prefill node owns the DRAM pool, and the prefill server attaches to it over a Unix socket. Start the tier server first; the 1500 GB DRAM budget below is what the verified runs used:
 
 ```bash Command
 mkdir -p /tmp/umbp_sa
@@ -1126,4 +1271,4 @@ sglang serve ... \
   --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}'
 ```
 
-Two further limits are worth knowing before you size a run. The pool is a per-node process, so a prefill worker that spans nodes would shard its keyspace by node. And only the prefill worker offloads KV — the decode side is untouched.
+Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.8 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
