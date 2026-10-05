@@ -336,6 +336,7 @@ pub(crate) fn resolve_event_config(
         topic: block.topic,
         load_port_base: block.load_endpoint_port_base,
         load_topic: block.load_topic,
+        replay_port_base: block.replay_endpoint_port_base,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -410,6 +411,8 @@ pub(crate) struct KvEventsBlock {
     pub load_endpoint_port_base: Option<u16>,
     #[serde(default)]
     pub load_topic: Option<String>,
+    #[serde(default)]
+    pub replay_endpoint_port_base: Option<u16>,
     pub block_size: u32,
     pub dp_size: u32,
 }
@@ -538,6 +541,7 @@ mod tests {
                 "topic": "",
                 "block_size": 64,
                 "dp_size": 1,
+                "replay_endpoint_port_base": 5558,
             }
         }))
         .await;
@@ -547,6 +551,7 @@ mod tests {
             .event_config
             .expect("kv_events present");
         assert!(!cfg.is_bigram, "non-speculative worker must not be bigram");
+        assert_eq!(cfg.replay_port_base, Some(5558));
     }
 
     #[tokio::test]

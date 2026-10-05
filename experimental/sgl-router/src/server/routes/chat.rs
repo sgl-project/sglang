@@ -24,7 +24,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, SelectedWorkers};
-use preparation::{parse_embedding_request, parse_routing_fields, PreparedRequest};
+use preparation::{
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -83,19 +85,57 @@ pub async fn embeddings(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    embedding_input(ctx, EMBEDDINGS_PATH, headers, body).await
+}
+
+/// SGLang's `/v1/classify`, which takes the same `input` as embeddings.
+pub async fn classify(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    embedding_input(ctx, CLASSIFY_PATH, headers, body).await
+}
+
+async fn embedding_input(
+    ctx: Arc<AppContext>,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (model, value) = parse_embedding_request(&body)?;
     let routing = ModelRouting::lookup(&ctx, &model)?;
-    // Prefill and decode engines serve generation; embeddings need plain workers.
-    let registered = ctx.registry.workers_for(&model);
-    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
-        return Err(ApiError::BadRequest(
-            "embeddings are not served by prefill-decode workers".into(),
-        ));
-    }
-    let request = PreparedRequest::embeddings(&ctx, model, body, value)?;
+    require_plain_workers(&ctx, &model, path)?;
+    let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
     let workers = routing.select_workers(&ctx, &request, &headers).await?;
     forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
+pub async fn rerank(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    require_plain_workers(&ctx, &model, "/v1/rerank")?;
+    let request = PreparedRequest::rerank(model, body)?;
+    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// Prefill and decode engines serve generation only.
+fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Result<(), ApiError> {
+    let registered = ctx.registry.workers_for(model);
+    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
+        return Err(ApiError::BadRequest(format!(
+            "{path} is not served by prefill-decode workers"
+        )));
+    }
+    Ok(())
 }
 
 /// A model's routing state, resolved before the request is prepared.
@@ -178,11 +218,25 @@ async fn select_workers(
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
+    record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
+}
+
+/// Credit the chosen prefill with the prompt's prefix until KV events confirm
+/// it. Called only once the whole selection succeeded, so a request that is
+/// never dispatched credits nobody.
+fn record_prefill_route(
+    ctx: &AppContext,
+    signal: Option<&ExternalPrefixSignal>,
+    prefill_url: &str,
+) {
+    if let (Some(provider), Some(signal)) = (&ctx.radix_tree_prefix_provider, signal) {
+        provider.record_route(signal, prefill_url);
+    }
 }
 
 /// Keep prefills whose version group has a decode that fits this request, so a
@@ -382,6 +436,7 @@ async fn lookup_prefix_matches(
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.
