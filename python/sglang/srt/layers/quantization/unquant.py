@@ -1011,6 +1011,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         return None
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Restore canonical destinations for loader-free P2P/RDMA refits."""
+        if not self.use_flashinfer_trtllm_moe:
+            return
+
+        self._cache_permute_indices.clear()
+        for name, param in (
+            ("w13_weight", layer.w13_weight),
+            ("w2_weight", layer.w2_weight),
+        ):
+            if tuple(param.data.shape) != self._canonical_expert_weight_shape(
+                layer, name
+            ):
+                self._restore_trtllm_bf16_canonical_layout(layer, param, name)
+
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
         layer: torch.nn.Module,

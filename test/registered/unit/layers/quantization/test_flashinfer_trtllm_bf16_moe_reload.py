@@ -19,7 +19,7 @@ import torch
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
 from sglang.srt.model_executor.model_runner_components import weight_updater
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import CustomTestCase
 
@@ -287,6 +287,7 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
+                    get_parallel().override(tp_rank=0),
                     patch.object(
                         weight_updater, "monkey_patch_torch_reductions", lambda: None
                     ),
@@ -346,64 +347,68 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
 
 
 class TestWeightUpdateSessionFinalization(CustomTestCase):
-    """Session end restores kernel layout after successful or partial copies."""
+    """Session finalization for loader-free copies and LoRA-wrapped models."""
 
-    class _LoadFailed(RuntimeError):
-        pass
-
-    def test_failed_load_repacks_at_session_end(self):
-        for load_format in ("tensor", "flattened_bucket", "distributed"):
+    def test_loader_free_refits_reproduce_cold_load_layout(self):
+        """Raw copies bypass loaders: session start must undo the kernel layout."""
+        for load_format in ("direct", "p2p"):
             with self.subTest(load_format=load_format):
                 method = _make_method()
                 layer = _FakeMoELayer(method, seed=0)
-                new_weights = _FakeMoELayer(method, seed=1)
-                reference = _FakeMoELayer(method, seed=1)
-
-                class ReloadModel(_FakeModel):
-                    def load_weights(self, named_tensors):
-                        super().load_weights(named_tensors)
-                        raise TestWeightUpdateSessionFinalization._LoadFailed(
-                            "load failed mid-update"
-                        )
-
-                model = ReloadModel(layer)
+                model = _FakeModel(layer)
                 updater = _make_updater(model)
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
+                    get_parallel().override(tp_rank=0),
                     patch.object(
                         weight_updater, "monkey_patch_torch_reductions", lambda: None
                     ),
+                    patch.object(
+                        model,
+                        "load_weights",
+                        side_effect=AssertionError(
+                            "A loader-free refit called the loader"
+                        ),
+                    ),
                 ):
                     method.process_weights_after_loading(layer)
-                    method.process_weights_after_loading(reference)
-                    expected = {
-                        "w13_weight": reference.w13_weight.data.clone(),
-                        "w2_weight": layer.w2_weight.data.clone(),
-                    }
                     pointers = {
                         name: param.data_ptr() for name, param in _weights(layer)
                     }
-                    updater.begin_weight_update()
-                    named_tensors = [("w13_weight", new_weights.w13_weight.data)]
-                    if load_format == "distributed":
-                        success, message = _update_bucket(
-                            updater, named_tensors, load_format
-                        )
-                        self.assertFalse(success)
-                        self.assertIn("load failed mid-update", message)
-                    else:
-                        with self.assertRaisesRegex(
-                            self._LoadFailed, "load failed mid-update"
+                    for seed in (1, 2, 3):
+                        new_weights = _FakeMoELayer(method, seed=seed)
+                        reference = _FakeMoELayer(method, seed=seed)
+                        method.process_weights_after_loading(reference)
+                        updater.begin_weight_update()
+                        for name, param in _weights(layer):
+                            self.assertEqual(
+                                tuple(param.shape), _canonical_shapes()[name]
+                            )
+                        if load_format == "p2p":
+                            # Model direct writes as flat copies, without any loader.
+                            for (_, param), (_, new_param) in zip(
+                                _weights(layer), _weights(new_weights)
+                            ):
+                                param.data.view(-1).copy_(new_param.data.view(-1))
+                        else:
+                            success, message = updater.update_weights_from_tensor(
+                                [
+                                    (f"layer.{name}", param.data)
+                                    for name, param in _weights(new_weights)
+                                ],
+                                load_format="direct",
+                            )
+                            self.assertTrue(success, message)
+                        updater.end_weight_update(run_post_load=load_format == "p2p")
+                        for (name, param), (_, ref_param) in zip(
+                            _weights(layer), _weights(reference)
                         ):
-                            _update_bucket(updater, named_tensors, load_format)
-                    self.assertTrue(
-                        torch.equal(layer.w13_weight.data, new_weights.w13_weight.data)
-                    )
-                    updater.end_weight_update(run_post_load=True)
-                    for name, param in _weights(layer):
-                        self.assertTrue(torch.equal(param.data, expected[name]), name)
-                        self.assertEqual(param.data_ptr(), pointers[name])
+                            self.assertEqual(tuple(param.shape), tuple(ref_param.shape))
+                            self.assertTrue(
+                                torch.equal(param.data, ref_param.data), name
+                            )
+                            self.assertEqual(param.data_ptr(), pointers[name])
 
     def test_attention_only_update_with_lora_wrapper(self):
         method = _make_method()
@@ -417,6 +422,7 @@ class TestWeightUpdateSessionFinalization(CustomTestCase):
         with (
             _mock_flashinfer(),
             get_context().override_server_args(weight_cache_mode="off"),
+            get_parallel().override(tp_rank=0),
             patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
         ):
             method.process_weights_after_loading(layer)
