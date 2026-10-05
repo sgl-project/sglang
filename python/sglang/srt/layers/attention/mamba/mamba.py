@@ -231,9 +231,11 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         if is_dp_attention_enabled():
+            parallel_group = "attn_tp"
             self.tp_size = get_parallel().attn_tp_size
             self.tp_rank = get_parallel().attn_tp_rank
         else:
+            parallel_group = "tp"
             self.tp_size = get_parallel().tp_size
             self.tp_rank = get_parallel().tp_rank
 
@@ -284,8 +286,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = MergedColumnParallelLinear(
@@ -300,8 +301,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             # This is the n_groups == 1 case,
@@ -313,8 +313,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = ColumnParallelLinear(
@@ -323,8 +322,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             # - because in_proj is a concatenation of 3 weights, we
@@ -431,8 +429,7 @@ class MambaMixer2(torch.nn.Module):
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group=parallel_group,
             reduce_results=reduce_results,
             use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
