@@ -228,6 +228,24 @@ def _align_fp8_moe_weights(
     return padded_w13, padded_w2, padded_intermediate
 
 
+def shuffle_fp8_moe_weight_to_block_major_k(weight: torch.Tensor) -> torch.Tensor:
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+    num_experts, m, k = weight.shape
+    rows = get_shuffle_matrix_a_row_indices(
+        input_tensor=weight[0].view(torch.uint8),
+        epilogue_tile_m=64,
+    ).to(weight.device)
+    blocked = weight.view(torch.uint8).view(num_experts, m, k // 128, 128)
+    shuffled = blocked.permute(0, 2, 1, 3)[:, :, rows, :].contiguous()
+    return shuffled.view(weight.dtype).view(weight.shape)
+
+
+def _fp8_block_major_k_view(weight: torch.Tensor) -> torch.Tensor:
+    num_experts, m, k = weight.shape
+    return weight.view(num_experts, k // 128, m, 128)
+
+
 def align_fp8_moe_weights_for_flashinfer_trtllm(
     layer: Module, swap_w13_halves: bool = False
 ) -> None:
@@ -705,6 +723,7 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     # Block-quant path
     block_quant: bool
     use_mxfp8: bool = False
+    use_block_major_k: bool = False
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
@@ -729,7 +748,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
 ) -> StandardCombineInput:
-    from flashinfer.fused_moe import Fp8QuantizationType
+    from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
 
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferDispatchOutput,
@@ -767,7 +786,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         if quant_info.use_mxfp8
         else Fp8QuantizationType.DeepSeekFp8
     )
-    use_shuffled_weight = quant_info.use_mxfp8
+    use_shuffled_weight = quant_info.use_mxfp8 or quant_info.use_block_major_k
+    weight_layout = int(
+        WeightLayout.BlockMajorK
+        if quant_info.use_block_major_k
+        else WeightLayout.MajorK
+    )
+    gemm1_weights, gemm2_weights = (
+        (
+            _fp8_block_major_k_view(quant_info.w13_weight),
+            _fp8_block_major_k_view(quant_info.w2_weight),
+        )
+        if quant_info.use_block_major_k
+        else (quant_info.w13_weight, quant_info.w2_weight)
+    )
     defer_finalize = _deferred_finalize_enabled.get()
     if defer_finalize and (
         not quant_info.block_quant
@@ -844,12 +876,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing_bias=None,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
-                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights=gemm1_weights,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                 gemm1_alpha=quant_info.gemm1_alpha,
                 gemm1_beta=quant_info.gemm1_beta,
                 gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
-                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights=gemm2_weights,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
                 top_k=runner_config.top_k,
@@ -869,6 +901,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
                 output=symm_output,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
@@ -882,12 +915,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing_bias=correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
-                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights=gemm1_weights,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                 gemm1_alpha=quant_info.gemm1_alpha,
                 gemm1_beta=quant_info.gemm1_beta,
                 gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
-                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights=gemm2_weights,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
@@ -903,6 +936,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             )
             if defer_finalize:

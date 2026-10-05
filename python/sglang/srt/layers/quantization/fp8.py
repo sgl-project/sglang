@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
+    shuffle_fp8_moe_weight_to_block_major_k,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
@@ -2603,6 +2604,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        self._convert_to_flashinfer_trtllm_block_major_k(layer)
+
         # The runner backend is global, so it is also true for a borrowed delegate,
         # which has no moe_runner_config and whose kernel ignores these params.
         if (
@@ -2621,6 +2624,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "use_mxfp8": self.use_mxfp8,
                 }
             )
+
+    def _should_use_flashinfer_trtllm_fp8_block_major_k(self) -> bool:
+        if not self._owns_moe_runner:
+            return False
+        backend = self.runner.runner_backend
+        return (
+            (backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed())
+            and not backend.is_experimental_sgl_trtllm()
+            and self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and self.quant_config.weight_block_size == [128, 128]
+        )
+
+    def _convert_to_flashinfer_trtllm_block_major_k(self, layer: Module) -> None:
+        layer._flashinfer_trtllm_fp8_block_major_k = (
+            self._should_use_flashinfer_trtllm_fp8_block_major_k()
+        )
+        if not layer._flashinfer_trtllm_fp8_block_major_k:
+            return
+        for param in (layer.w13_weight, layer.w2_weight):
+            param.data.copy_(shuffle_fp8_moe_weight_to_block_major_k(param.data))
 
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
@@ -3157,6 +3182,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
+                use_block_major_k=layer._flashinfer_trtllm_fp8_block_major_k,
                 weight_block_k=(
                     None
                     if self.quant_config.weight_block_size is None

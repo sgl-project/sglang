@@ -51,9 +51,15 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
 
     @staticmethod
     def _make_layer(num_local_experts: int = 2) -> SimpleNamespace:
+        hidden, intermediate = 128, 128
         return SimpleNamespace(
             num_local_experts=num_local_experts,
-            w13_weight=torch.empty(num_local_experts, 4),
+            w13_weight=torch.zeros(
+                num_local_experts, 2 * intermediate, hidden, dtype=torch.float8_e4m3fn
+            ),
+            w2_weight=torch.zeros(
+                num_local_experts, hidden, intermediate, dtype=torch.float8_e4m3fn
+            ),
         )
 
     def _run_post_load(self, method: Fp8MoEMethod, layer: SimpleNamespace) -> None:
@@ -74,6 +80,7 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+        self.assertFalse(layer._flashinfer_trtllm_fp8_block_major_k)
 
     def test_owning_method_prepares_trtllm_activation_params(self):
         """The owning method must still materialize the params it consumes;
@@ -103,6 +110,7 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         )
         # None stays None: a zero-filled tensor would not mean "no clamp".
         self.assertIsNone(layer._flashinfer_trtllm_gemm1_clamp_limit)
+        self.assertTrue(layer._flashinfer_trtllm_fp8_block_major_k)
 
     def test_owning_method_skips_params_on_non_trtllm_backend(self):
         """Ownership alone must not materialize params no kernel consumes."""
@@ -116,6 +124,7 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+        self.assertFalse(layer._flashinfer_trtllm_fp8_block_major_k)
 
 
 class TestFp8MoEAiterQuantInfo(CustomTestCase):
