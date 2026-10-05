@@ -847,12 +847,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
-            # DCP shards the gathered KV, so the kernel's cpu-length sum
-            # checks no longer match; let it fall back to the GPU check there.
-            seq_lens_cpu = (
-                torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32)
-                if not get_parallel().dcp_enabled
-                else None
+            # DCP gathers prefix KV back to global lengths before prefill.
+            seq_lens_cpu = torch.tensor(
+                forward_batch.extend_seq_lens_cpu, dtype=torch.int32
             )
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,

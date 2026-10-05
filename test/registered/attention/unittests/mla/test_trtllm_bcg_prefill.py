@@ -35,9 +35,9 @@ def _backend(cls=TRTLLMMLABackend):
 def _extend_batch():
     return NS(
         forward_mode=ForwardMode.EXTEND,
-        seq_lens=torch.tensor([8, 6], device="cuda"),
-        extend_prefix_lens=torch.zeros(2, dtype=torch.int64, device="cuda"),
-        extend_prefix_lens_cpu=[0, 0],
+        seq_lens=torch.tensor([8, 6], dtype=torch.int32, device="cuda"),
+        extend_prefix_lens=torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+        extend_prefix_lens_cpu=[3, 3],
         extend_seq_lens_cpu=[5, 3],
         batch_size=2,
     )
@@ -166,13 +166,13 @@ class PrefillCpuLensTest(CustomTestCase):
                 backend = _backend()
                 backend.init_forward_metadata(_extend_batch())
                 lengths = backend.forward_prefill_metadata.seq_lens_cpu
-                if dcp:
-                    self.assertIsNone(lengths)
-                else:
-                    self.assertEqual(
-                        (lengths.dtype, lengths.device.type, lengths.tolist()),
-                        (torch.int32, "cpu", [5, 3]),
-                    )
+                self.assertEqual(
+                    (lengths.dtype, lengths.device.type, lengths.tolist()),
+                    (torch.int32, "cpu", [5, 3]),
+                )
+                torch.testing.assert_close(
+                    lengths.cuda(), backend.forward_prefill_metadata.seq_lens
+                )
 
 
 class BreakableGraphDispatchTest(CustomTestCase):
