@@ -48,7 +48,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
-from sglang.srt.distributed import (
+from sglang.srt.distributed.parallel_state import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
 )

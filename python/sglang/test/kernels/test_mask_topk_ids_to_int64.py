@@ -32,7 +32,7 @@ def _ref_mask(
 def test_mask_topk_ids_correctness(
     num_tokens: int, topk: int, frac_valid: float
 ) -> None:
-    from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 
     torch.manual_seed(0)
     topk_ids = torch.randint(
@@ -49,7 +49,7 @@ def test_mask_topk_ids_correctness(
 
 
 def test_mask_topk_ids_no_padding() -> None:
-    from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 
     topk_ids = torch.randint(
         low=0, high=2**30, size=(64, 8), dtype=torch.int32, device="cuda"
@@ -60,7 +60,7 @@ def test_mask_topk_ids_no_padding() -> None:
 
 
 def test_mask_topk_ids_all_padded() -> None:
-    from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 
     topk_ids = torch.randint(
         low=0, high=128, size=(32, 8), dtype=torch.int32, device="cuda"
@@ -81,7 +81,7 @@ def test_mask_topk_ids_all_padded() -> None:
 def test_mask_topk_ids_to_int64_correctness(
     num_tokens: int, topk: int, frac_valid: float
 ) -> None:
-    from sglang.kernels.ops.attention.dsv4.moe import mask_topk_ids_to_int64
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
 
     torch.manual_seed(0)
     topk_ids = torch.randint(
@@ -100,7 +100,7 @@ def test_mask_topk_ids_to_int64_correctness(
 
 
 def test_mask_topk_ids_to_int64_no_padding() -> None:
-    from sglang.kernels.ops.attention.dsv4.moe import mask_topk_ids_to_int64
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
 
     topk_ids = torch.randint(
         low=0, high=2**30, size=(64, 8), dtype=torch.int32, device="cuda"
@@ -113,7 +113,7 @@ def test_mask_topk_ids_to_int64_no_padding() -> None:
 
 
 def test_mask_topk_ids_to_int64_all_padded() -> None:
-    from sglang.kernels.ops.attention.dsv4.moe import mask_topk_ids_to_int64
+    from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
 
     topk_ids = torch.randint(
         low=0, high=128, size=(32, 8), dtype=torch.int32, device="cuda"

@@ -17,13 +17,15 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+)
+from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
     ppu_msa_indexer_fp8_available,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,

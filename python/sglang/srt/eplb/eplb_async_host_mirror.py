@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.distributed import P2POp
 from tqdm.auto import tqdm
 
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
     ModelConfigForExpertLocation,
