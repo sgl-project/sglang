@@ -1274,6 +1274,7 @@ def fp8_paged_mqa_logits(
     ``None`` (default: the device's SM count). Returns the f32 ``[B * next_n,
     max_context_len]`` logits view.
     """
+    import torch
     from flashinfer.paged_mqa import fp8_paged_mqa_logits
 
     if schedule_meta is None and sm_count is not None:
