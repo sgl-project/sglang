@@ -214,6 +214,18 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Forget everything cached for `url` while keeping it registered as a tenant,
+    /// e.g. after the worker's KV cache was flushed. Trees `url` is not in are untouched.
+    pub fn clear_worker_cache(&self, url: &str) {
+        for tree_ref in self.trees.iter() {
+            let tree = tree_ref.value();
+            if tree.tenant_char_count.contains_key(url) {
+                tree.remove_tenant(url);
+                tree.insert("", url);
+            }
+        }
+    }
+
     /// Restore tree state from mesh store
     /// This is called during initialization to rebuild trees from synchronized state
     fn restore_tree_state_from_mesh(&self) {
@@ -1637,5 +1649,48 @@ mod tests {
             assert!(prefill_ca.trees.is_empty());
             assert!(decode_ca.trees.is_empty());
         }
+    }
+
+    /// After a flush, the flushed workers' cached prefixes are forgotten in every
+    /// cache-aware pool, they stay selectable, and other workers keep their entries.
+    #[tokio::test]
+    async fn test_registry_clear_flushed_worker_caches() {
+        let (registry, prefill_ca, decode_ca, prefill0, prefill1, decode0, _decode1) =
+            pd_registry_with_cache_aware_pools();
+        let prefill_tree = prefill_ca
+            .trees
+            .get(&format!("prefill::{}", UNKNOWN_MODEL_ID))
+            .unwrap()
+            .value()
+            .clone();
+        let decode_tree = decode_ca
+            .trees
+            .get(&format!("decode::{}", UNKNOWN_MODEL_ID))
+            .unwrap()
+            .value()
+            .clone();
+        prefill_tree.insert("session a", prefill0.url());
+        prefill_tree.insert("session b", prefill1.url());
+        decode_tree.insert("session a", decode0.url());
+
+        registry.clear_cache_aware_worker_caches(&[
+            prefill0.url().to_string(),
+            decode0.url().to_string(),
+        ]);
+
+        assert_eq!(
+            prefill_tree.prefix_match_tenant("session a", prefill0.url()),
+            ""
+        );
+        assert_eq!(
+            decode_tree.prefix_match_tenant("session a", decode0.url()),
+            ""
+        );
+        assert_eq!(
+            prefill_tree.prefix_match_tenant("session b", prefill1.url()),
+            "session b"
+        );
+        assert!(prefill_tree.tenant_char_count.contains_key(prefill0.url()));
+        assert!(!decode_tree.tenant_char_count.contains_key(prefill0.url()));
     }
 }
