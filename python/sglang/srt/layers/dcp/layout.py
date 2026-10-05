@@ -122,59 +122,16 @@ def remap_dcp_sparse_indices(
     dcp_size: int,
     dcp_rank: int,
     interleave_size: int = 1,
-    return_counts: bool = False,
-    repeat_rows: int = 1,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Map global sparse token indices to one rank's compact DCP KV layout.
 
     Keep indices owned by this rank, convert them to local KV positions, and
     stably move them before ``-1`` padding while preserving their score order.
-    With ``return_counts``, also return int32 valid-prefix lengths for sparse
-    attention kernels that do not skip padding indices.
-    For 2D inputs, ``repeat_rows`` repeats each compact row and its count
-    consecutively, matching a query with head groups folded into the batch.
     """
-    if repeat_rows < 1:
-        raise ValueError(f"repeat_rows must be positive, got {repeat_rows}")
-    if repeat_rows != 1 and topk_indices.ndim != 2:
-        raise ValueError("repeat_rows requires a 2D sparse-index tensor")
     if dcp_size == 1:
-        if repeat_rows != 1:
-            topk_indices = topk_indices.repeat_interleave(repeat_rows, dim=0)
-        if return_counts:
-            return topk_indices, (topk_indices >= 0).sum(dim=-1, dtype=torch.int32)
         return topk_indices
     if interleave_size < 1:
         raise ValueError(f"interleave_size must be positive, got {interleave_size}")
-
-    if topk_indices.is_cuda:
-        from sglang.kernels.ops.attention.dsa.transform_index import (
-            remap_dcp_sparse_indices_cuda,
-        )
-
-        indices, counts = remap_dcp_sparse_indices_cuda(
-            topk_indices, dcp_size, dcp_rank, interleave_size, repeat_rows=repeat_rows
-        )
-        return (indices, counts) if return_counts else indices
-
-    if repeat_rows != 1:
-        topk_indices = topk_indices.repeat_interleave(repeat_rows, dim=0)
-
-    if topk_indices.device.type != "npu":
-        # Keep slot arithmetic integral: float32 rounds global addresses above
-        # 2**24 and can assign a token to the wrong DCP rank.
-        remapped_indices = localize_dcp_indices(
-            topk_indices, dcp_size, dcp_rank, interleave_size
-        )
-        local_owner_mask = remapped_indices >= 0
-        topk_count = topk_indices.shape[-1]
-        original_order = torch.arange(topk_count, device=topk_indices.device)
-        pack_keys = original_order + (~local_owner_mask).to(torch.int64) * topk_count
-        pack_order = torch.argsort(pack_keys, dim=-1)
-        indices = torch.gather(remapped_indices, dim=-1, index=pack_order)
-        if return_counts:
-            return indices, local_owner_mask.sum(dim=-1, dtype=torch.int32)
-        return indices
 
     # Float32 is faster than integer division/remainder on Ascend for this hot
     # path.  Keep the math equivalent to localize_dcp_indices above.
@@ -200,10 +157,7 @@ def remap_dcp_sparse_indices(
     ).expand_as(topk_indices_fp32)
     pack_keys = original_order + (~local_owner_mask).to(torch.float32) * topk_count
     pack_order = torch.argsort(pack_keys, dim=-1).to(torch.int64)
-    indices = torch.gather(remapped_indices, dim=-1, index=pack_order)
-    if return_counts:
-        return indices, local_owner_mask.sum(dim=-1, dtype=torch.int32)
-    return indices
+    return torch.gather(remapped_indices, dim=-1, index=pack_order)
 
 
 def get_dcp_chain_spec_lens(

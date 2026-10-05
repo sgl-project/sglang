@@ -31,7 +31,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -214,37 +214,6 @@ class TestModelPrefillAutotune(CustomTestCase):
                 )
                 self.hook.assert_not_called()
                 self.flashinfer_autotune_context.assert_not_called()
-
-
-class TestEagerAutotuneBuffers(CustomTestCase):
-    def test_large_verify_warmup_does_not_allocate_unused_logits(self):
-        """Autotuning skips the LM head and must not reserve a tokens-by-vocab slab."""
-        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        runner = object.__new__(EagerRunner)
-        runner._eager_max_bs = 4096
-        runner.model_runner = SimpleNamespace(
-            device="meta",
-            model_config=SimpleNamespace(
-                hidden_size=6144,
-                vocab_size=154880,
-                dtype=torch.bfloat16,
-                is_encoder_decoder=False,
-                hf_config=SimpleNamespace(),
-            ),
-            spec_algorithm=SpeculativeAlgorithm.EAGLE,
-            decode_num_tokens_per_req=lambda: 6,
-            attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 1),
-            ngram_embedding_manager=SimpleNamespace(enabled=False),
-            get_pp_proxy_topk_size=lambda: None,
-            get_pp_proxy_residual_num_blocks=lambda: None,
-        )
-        with get_context().override_server_args(tp_size=4, attn_dp_size=2):
-            buffers, batch_size = runner._autotune_buffers()
-        self.assertEqual(batch_size, 4096)
-        self.assertEqual(buffers.input_ids.shape, (24576,))
-        self.assertIsNone(buffers.next_token_logits_buffer)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")

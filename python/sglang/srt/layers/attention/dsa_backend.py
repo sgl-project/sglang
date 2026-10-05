@@ -37,6 +37,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
+    transform_index_page_table_dcp,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
@@ -66,6 +67,12 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    TRTLLM_MAX_BATCH_ROWS,
+    dsa_dcp_head_groups,
+    dsa_dcp_max_query_rows,
+    dsa_dcp_workspace_size_bytes,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
     DSAMetadataManagementMixin,
@@ -92,8 +99,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
-from sglang.srt.mem_cache.kv_cache_configurator import dsa_dcp_head_groups
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -125,16 +130,12 @@ def _dcp_trtllm_sparse_attention(
     cu_seqlens_q: torch.Tensor,
     **attention_kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use short-KV-safe head tiles and respect TRTLLM's 65535 batch limit.
+    """TRT-LLM sparse MLA attention that also returns the per-head LSE.
 
-    FlashInfer 0.7.0.post1's sparse RoPE + return_lse path corrupts some
-    short-KV FP8 rows with >32 heads (observed at 1/63/64/65 active tokens).
-    This helper is limited to CUDA RoPE DSA DCP; <=32 heads use one group.
-    Remove the fold once upstream fixes that kernel condition. Counts vary
-    on device, so selecting short rows on the host would synchronize each
-    layer. Fold head groups into independent batch rows, with sparse metadata
-    already repeated by the ownership-remap kernel. Folding into query length
-    would instead change the vendor kernel's causal masking.
+    FlashInfer 0.7.0.post1 corrupts short-KV FP8 rows when the sparse RoPE
+    kernel returns LSE for more than 32 heads, so ``head_groups`` folds the
+    heads into extra batch rows. The batch is also split to stay within the
+    kernel's 65535-row limit.
     """
     import flashinfer.decode
 
@@ -152,10 +153,9 @@ def _dcp_trtllm_sparse_attention(
     folded_heads = heads // head_groups
     query = query.view(folded_rows, 1, folded_heads, dim)
     folded_lse = lse.view(folded_rows, folded_heads)
-    rows_per_call = (65535 // head_groups) * head_groups
+    rows_per_call = (TRTLLM_MAX_BATCH_ROWS // head_groups) * head_groups
     if folded_rows > rows_per_call:
-        # Each call reuses the same scratch and counter buffers. Keep chunk
-        # launches ordered instead of allowing programmatic overlap.
+        # The calls share one workspace, so they must not overlap.
         attention_kwargs["enable_pdl"] = False
     outputs = []
     for start in range(0, folded_rows, rows_per_call):
@@ -169,7 +169,6 @@ def _dcp_trtllm_sparse_attention(
             **attention_kwargs,
         )
         output = output.view(end - start, folded_heads, -1)
-        # The fixup kernel also puts the batch in a 16-bit grid dimension.
         fixup_zero_kv_rows(
             output,
             folded_lse[start:end],
@@ -310,48 +309,13 @@ class DSAFlashMLAMetadata:
 
 
 @dataclass
-class DcpRemapCache:
-    """One localized top-k table, valid for the next shared-top-k layer only."""
+class DSADcpPageTableCache:
+    """Rank-local page table of the latest top-k, for layers that share it."""
 
     layer_id: int = -1
-    source: Optional[torch.Tensor] = None
-    block_tables: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = None
+    page_table: Optional[torch.Tensor] = None
     seq_lens: Optional[torch.Tensor] = None
-    sparse_mla_top_k: int = 0
-    num_padding_rows: int = 0
-
-    def clear(self) -> None:
-        self.layer_id = -1
-        self.source = self.block_tables = self.seq_lens = None
-
-    def hit(self, layer_id: int, source: torch.Tensor, shares_topk: bool) -> bool:
-        """Reuse only on the shared layer right after the layer that stored it.
-
-        Producers always miss: they may rewrite the same tensor object in place.
-        """
-        return shares_topk and self.layer_id == layer_id - 1 and self.source is source
-
-    def store(
-        self,
-        layer_id: int,
-        source: torch.Tensor,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-        sparse_mla_top_k: int,
-        num_padding_rows: int,
-        next_shares_topk: bool,
-    ) -> None:
-        """Keep the table only while the next layer shares this top-k, so a
-        finished forward or a captured graph never retains it."""
-        if not next_shares_topk:
-            self.clear()
-            return
-        self.layer_id = layer_id
-        self.source = source
-        self.block_tables = block_tables
-        self.seq_lens = seq_lens
-        self.sparse_mla_top_k = sparse_mla_top_k
-        self.num_padding_rows = num_padding_rows
 
 
 @dataclass(frozen=True)
@@ -388,10 +352,10 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
-    # Capture metadata must own the folded offsets even after eager arange growth.
     dcp_cu_seqlens_q: Optional[torch.Tensor] = None
-    # Host-side reuse of the localized top-k table across shared-top-k layers.
-    dcp_remap_cache: DcpRemapCache = field(default_factory=DcpRemapCache)
+    dcp_page_table_cache: DSADcpPageTableCache = field(
+        default_factory=DSADcpPageTableCache
+    )
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -531,7 +495,10 @@ class DeepseekSparseAttnBackend(
         self.dcp_enabled = self.dcp_size > 1
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
         self.dcp_head_groups = dsa_dcp_head_groups(self.num_dcp_q_heads)
-        self._dsa_hf_config = hf_config
+        self.dcp_layer_shares_topk = [
+            dsa_layer_skips_topk(hf_config, layer_id)
+            for layer_id in range(hf_config.num_hidden_layers)
+        ]
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
@@ -542,8 +509,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        # Keep the replicated draft on MLA too: the shared MHA model path
-        # still assumes the process-wide DCP group implies sharded KV.
+        # The MHA one-shot path has no DCP merge.
         self.supports_mha_one_shot: bool = not (
             _is_cuda and self.qk_rope_head_dim > 0 and get_parallel().dcp_enabled
         )
@@ -734,11 +700,6 @@ class DeepseekSparseAttnBackend(
         elif _is_cuda and (
             self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
         ):
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                dsa_dcp_max_query_rows,
-                dsa_dcp_workspace_size_bytes,
-            )
-
             workspace_bytes = dsa_dcp_workspace_size_bytes(
                 num_q_heads=self.num_q_heads,
                 dcp_size=self.dcp_size,
@@ -993,6 +954,46 @@ class DeepseekSparseAttnBackend(
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def _dcp_cu_seqlens_q(self, num_query_rows: int) -> Optional[torch.Tensor]:
+        """Offsets of the one-token queries after folding head groups into rows."""
+        if not self.dcp_enabled:
+            return None
+        return self.get_device_int32_arange(num_query_rows * self.dcp_head_groups + 1)
+
+    def _dcp_local_page_table(
+        self,
+        layer_id: int,
+        topk_indices: Optional[torch.Tensor],
+        page_table_1: torch.Tensor,
+        cache: Optional[DSADcpPageTableCache],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map global KV slots to the slots this DCP rank owns.
+
+        A decode layer that shares the previous layer's top-k reuses its table.
+        """
+        if cache is None or topk_indices is None:
+            return transform_index_page_table_dcp(
+                page_table_1,
+                self.dcp_size,
+                self.dcp_rank,
+                repeat_rows=self.dcp_head_groups,
+            )
+        reuse = (
+            self.dcp_layer_shares_topk[layer_id]
+            and cache.layer_id == layer_id - 1
+            and cache.topk_indices is topk_indices
+        )
+        if not reuse:
+            cache.topk_indices = topk_indices
+            cache.page_table, cache.seq_lens = transform_index_page_table_dcp(
+                page_table_1,
+                self.dcp_size,
+                self.dcp_rank,
+                repeat_rows=self.dcp_head_groups,
+            )
+        cache.layer_id = layer_id
+        return cache.page_table, cache.seq_lens
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -1336,13 +1337,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
-            dcp_cu_seqlens_q=(
-                self.get_device_int32_arange(
-                    len(dsa_cache_seqlens_int32) * self.dcp_head_groups + 1
-                )
-                if self.dcp_enabled
-                else None
-            ),
+            dcp_cu_seqlens_q=self._dcp_cu_seqlens_q(len(dsa_cache_seqlens_int32)),
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
@@ -1722,13 +1717,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
-            dcp_cu_seqlens_q=(
-                self.get_device_int32_arange(
-                    len(dsa_cache_seqlens_int32) * self.dcp_head_groups + 1
-                )
-                if self.dcp_enabled
-                else None
-            ),
+            dcp_cu_seqlens_q=self._dcp_cu_seqlens_q(len(dsa_cache_seqlens_int32)),
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
@@ -3658,35 +3647,17 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # A shared-top-k decode layer consumes the tensor its producer emitted,
-        # so the localized table of the previous layer is still exact. Target
-        # verify and prefill arrive with is_prefill=True and always remap.
-        remap_cache = None
-        remap_hit = False
-        if self.dcp_enabled and not is_prefill and topk_indices is not None:
-            remap_cache = metadata.dcp_remap_cache
-            remap_hit = remap_cache.hit(
-                layer.layer_id,
-                topk_indices,
-                dsa_layer_skips_topk(self._dsa_hf_config, layer.layer_id),
-            )
-        remap_source = topk_indices
+        shared_topk_indices = topk_indices
 
         # Eager DP attention can pad q beyond metadata that was deliberately
         # planned on the real draft batch. Pad top-k to the physical q shape,
         # then run decode attention only on metadata-backed rows. The output is
         # restored below before downstream MLP/EP collectives.
-        if remap_hit:
-            pass
-        elif (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
         num_decode_padding_rows = 0
-        if remap_hit:
-            num_decode_padding_rows = remap_cache.num_padding_rows
-            if num_decode_padding_rows:
-                q_all = q_all[: q_all.shape[0] - num_decode_padding_rows]
-        elif not is_prefill:
+        if not is_prefill:
             q_all, topk_indices, num_decode_padding_rows = (
                 _trim_trtllm_decode_dp_padding(
                     q_all,
@@ -3695,9 +3666,7 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
-        if remap_hit:
-            page_table_1 = None
-        elif self.use_fused_topk:
+        if self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3718,36 +3687,15 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
-        if remap_hit:
-            page_table_1 = remap_cache.block_tables
-            seq_lens = remap_cache.seq_lens
-            sparse_mla_top_k = remap_cache.sparse_mla_top_k
-        else:
-            page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
-                page_table_1
-            )
-            if self.dcp_enabled:
-                # Both top-k producers above emit global KV slots. Localize only
-                # here so fused top-k never gets interpreted as sequence positions.
-                if remap_cache is not None:
-                    # Release the previous table before allocating a new one.
-                    remap_cache.clear()
-                page_table_1, seq_lens = remap_dcp_sparse_indices(
-                    page_table_1,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    return_counts=True,
-                    repeat_rows=self.dcp_head_groups,
-                )
-        if remap_cache is not None:
-            remap_cache.store(
+        page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
+            page_table_1
+        )
+        if self.dcp_enabled:
+            page_table_1, seq_lens = self._dcp_local_page_table(
                 layer.layer_id,
-                remap_source,
+                shared_topk_indices,
                 page_table_1,
-                seq_lens,
-                sparse_mla_top_k,
-                num_decode_padding_rows,
-                dsa_layer_skips_topk(self._dsa_hf_config, layer.layer_id + 1),
+                None if is_prefill else metadata.dcp_page_table_cache,
             )
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
@@ -3815,8 +3763,6 @@ class DeepseekSparseAttnBackend(
             query=q,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            return_lse=False,
-            lse=None,
             **attention_kwargs,
         )
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)

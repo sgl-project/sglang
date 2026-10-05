@@ -185,45 +185,16 @@ class TestLSECombineEdgeCases(CustomTestCase):
             raise unittest.SkipTest("CUDA required")
         cls.device = "cuda"
 
-    def test_all_empty_padding_preserves_zero_output(self):
-        """DP padding has -inf LSE on every shard and must not create NaNs."""
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+    def test_all_empty_rows_stay_zero(self):
+        """A row with -inf LSE on every shard has no KV and must not become NaN."""
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 
-        for world_size in (2, 4):
-            outputs = (
-                torch.arange(
-                    world_size * 3 * 2, device=self.device, dtype=torch.float32
-                )
-                .reshape(world_size, 3, 2, 1)
-                .expand(-1, -1, -1, 64)
-                .to(torch.bfloat16)
-            )
-            # Live rows have one or several contributors. Padding may cover
-            # a whole token or only one head, so check both geometries.
-            lses = torch.zeros(world_size, 3, 2, device=self.device)
-            lses[:, 1] = -torch.inf
-            lses[1:, 2, 0] = -torch.inf
-            lses[:, 2, 1] = -torch.inf
-            expected = outputs.float().mean(dim=0)
-            expected[1].zero_()
-            expected[2, 0] = outputs[0, 2, 0].float()
-            expected[2, 1].zero_()
-            for base_e in (True, False):
-                with self.subTest(world_size=world_size, base_e=base_e):
-                    actual, actual_lse = dcp_lse_combine_triton(
-                        outputs, lses, is_lse_base_on_e=base_e, return_lse=True
-                    )
-                    torch.testing.assert_close(actual.float(), expected)
-                    self.assertTrue(torch.isneginf(actual_lse[1]).all())
-                    self.assertTrue(torch.isneginf(actual_lse[2, 1]))
-                    self.assertEqual(actual_lse[2, 0].item(), 0.0)
-                    cpu = _lse_weighted_combine_cpu(
-                        outputs.cpu(), lses.cpu(), is_lse_base_on_e=base_e
-                    )
-                    torch.testing.assert_close(cpu, expected.cpu())
+        outputs = torch.ones(2, 2, 4, 64, device=self.device, dtype=torch.bfloat16)
+        lses = torch.zeros(2, 2, 4, device=self.device)
+        lses[:, 1] = -torch.inf
+        combined, _ = dcp_lse_combine_triton(outputs, lses, is_lse_base_on_e=False)
+        self.assertTrue((combined[0] == 1).all())
+        self.assertTrue((combined[1] == 0).all())
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""

@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import dsa_indexer_dcp_scale
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -229,8 +230,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
-        from sglang.srt.mem_cache.kv_cache_configurator import dsa_indexer_dcp_scale
-
         self._dcp_pool_padding_bytes = (
             self._cell_size * kvc.page_size
             if is_deepseek_dsa(kvc.model_config.hf_config)
@@ -379,10 +378,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                from sglang.srt.mem_cache.kv_cache_configurator import (
-                    dsa_indexer_dcp_scale,
-                )
-
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,

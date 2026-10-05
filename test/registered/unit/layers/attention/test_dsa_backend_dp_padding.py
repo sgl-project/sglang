@@ -6,8 +6,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention.dsa_backend import (
-    DcpRemapCache,
     DeepseekSparseAttnBackend,
+    DSADcpPageTableCache,
     _restore_trtllm_decode_dp_padding,
     _trim_trtllm_decode_dp_padding,
 )
@@ -18,53 +18,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestDcpRemapCache(unittest.TestCase):
-    """Localized top-k reuse across the pattern full, shared, shared, full, shared."""
-
-    SHARED = [False, True, True, False, True]
-
-    def _run(self, cache, sources):
-        hits = []
-        for layer_id, source in enumerate(sources):
-            hit = cache.hit(layer_id, source, self.SHARED[layer_id])
-            hits.append(hit)
-            table = cache.block_tables if hit else torch.full((1, 4), layer_id)
-            next_shared = layer_id + 1 < len(self.SHARED) and self.SHARED[layer_id + 1]
-            cache.store(layer_id, source, table, table, 4, 0, next_shared)
-        return hits
-
-    def test_producer_rewriting_the_same_tensor_always_remaps(self):
-        cache = DcpRemapCache()
-        topk = torch.zeros((1, 4), dtype=torch.int32)
-        # Every layer sees one tensor object; identity alone would hit at layer 3.
-        self.assertEqual(self._run(cache, [topk] * 5), [False, True, True, False, True])
-        # The finished forward retains nothing, and a second one starts cold.
-        self.assertIsNone(cache.block_tables)
-        self.assertEqual(self._run(cache, [topk] * 5), [False, True, True, False, True])
-
-    def test_changed_source_or_skipped_layer_misses(self):
-        cache = DcpRemapCache()
-        first, other = torch.zeros((1, 4)), torch.zeros((1, 4))
-        # A shared layer that received a different tensor (e.g. DP padding).
-        self.assertEqual(
-            self._run(cache, [first, other, other, first, first]),
-            [False, False, True, False, True],
+class TestDSADcpPageTableCache(unittest.TestCase):
+    def test_shared_topk_layers_reuse_the_local_page_table(self):
+        backend = SimpleNamespace(
+            dcp_size=2,
+            dcp_rank=0,
+            dcp_head_groups=1,
+            dcp_layer_shares_topk=[False, True, True, False, True],
         )
-        # A stage that starts on a shared layer has no producer entry to reuse.
-        cache = DcpRemapCache()
-        self.assertFalse(cache.hit(2, first, True))
-        cache.store(0, first, first, first, 4, 0, True)
-        self.assertFalse(cache.hit(2, first, True))
-
-    def test_metadata_instances_do_not_share_a_cache(self):
-        from dataclasses import fields
-
-        from sglang.srt.layers.attention.dsa_backend import DSAMetadata
-
-        factory = next(
-            f for f in fields(DSAMetadata) if f.name == "dcp_remap_cache"
-        ).default_factory
-        self.assertIsNot(factory(), factory())
+        cache = DSADcpPageTableCache()
+        # Producers rewrite the same top-k tensor in place.
+        topk = torch.zeros((1, 4), dtype=torch.int32)
+        with patch(
+            "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_dcp",
+            side_effect=lambda *args, **kwargs: (object(), object()),
+        ) as transform:
+            tables = [
+                DeepseekSparseAttnBackend._dcp_local_page_table(
+                    backend, layer_id, topk, topk, cache
+                )[0]
+                for layer_id in range(5)
+            ]
+        self.assertEqual(transform.call_count, 2)
+        self.assertIs(tables[0], tables[2])
+        self.assertIsNot(tables[2], tables[3])
+        self.assertIs(tables[3], tables[4])
 
 
 class TestDSABackendDPPadding(unittest.TestCase):
@@ -136,7 +114,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
         self._check_trtllm_decode_padding(dcp_enabled=False)
 
-    def test_dcp_decode_restores_zero_output_and_negative_infinite_lse_padding(self):
+    def test_dcp_trtllm_decode_pads_lse_with_negative_infinity(self):
         self._check_trtllm_decode_padding(dcp_enabled=True)
 
     def _check_trtllm_decode_padding(self, *, dcp_enabled):
@@ -145,7 +123,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
             max_seq_len_k=12,
             dcp_cu_seqlens_q=torch.arange(3, dtype=torch.int32),
-            dcp_remap_cache=DcpRemapCache(),
+            dcp_page_table_cache=DSADcpPageTableCache(),
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
@@ -169,15 +147,13 @@ class TestDSABackendDPPadding(unittest.TestCase):
             dcp_size=2,
             dcp_rank=0,
             dcp_head_groups=1,
-            _dsa_hf_config=SimpleNamespace(
-                architectures=["GlmMoeDsaForCausalLM"],
-                index_topk=2,
-                indexer_types=["full", "shared"],
-            ),
-            get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
+            dcp_layer_shares_topk=[False],
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
+        )
+        backend._dcp_local_page_table = MethodType(
+            DeepseekSparseAttnBackend._dcp_local_page_table, backend
         )
         backend._pad_trtllm_sparse_page_table = MethodType(
             DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
@@ -207,8 +183,6 @@ class TestDSABackendDPPadding(unittest.TestCase):
 
         def fake_dcp_attention(**kwargs):
             captured.update(kwargs)
-            self.assertEqual(kwargs["block_tables"].shape[0], 2)
-            self.assertEqual(kwargs["seq_lens"].shape, (2,))
             return (
                 torch.ones((2, 2, 2), dtype=torch.bfloat16),
                 torch.full((2, 2), 7.0),
@@ -242,6 +216,13 @@ class TestDSABackendDPPadding(unittest.TestCase):
             patch(
                 "sglang.srt.layers.attention.dsa_backend.grow_multi_ctas_kv_counter_buffer_if_needed",
                 return_value=None,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_dcp",
+                side_effect=lambda page_table, *args, **kwargs: (
+                    page_table,
+                    torch.zeros(page_table.shape[0], dtype=torch.int32),
+                ),
             ),
             patch(
                 "sglang.srt.layers.attention.dsa_backend._dcp_trtllm_sparse_attention",

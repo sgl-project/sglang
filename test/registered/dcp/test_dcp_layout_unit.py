@@ -25,7 +25,6 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
-    remap_dcp_sparse_indices,
 )
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -49,92 +48,6 @@ def _owner_count(length: int, n: int, rank: int, start: int) -> int:
 def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
     """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
     return (length - rank - 1) // n + 1
-
-
-class TestRemapDcpSparseIndices(CustomTestCase):
-    def test_repeated_rows_match_folded_query_heads(self):
-        """Folding heads into query rows repeats each token, not whole batches."""
-        indices = torch.tensor(
-            [[9, -1, 4, 13, 0, 5, 8], [0, 4, -1, 8, 12, -1, -1]],
-            dtype=torch.int32,
-        )
-        expected = torch.tensor(
-            [[2, 3, 1, -1, -1, -1, -1]] * 2 + [[-1] * 7] * 2,
-            dtype=torch.int32,
-        )
-        actual, counts = remap_dcp_sparse_indices(
-            indices, 4, 1, return_counts=True, repeat_rows=2
-        )
-        torch.testing.assert_close(actual, expected)
-        self.assertEqual(counts.tolist(), [3, 3, 0, 0])
-        self.assertEqual(counts.dtype, torch.int32)
-        torch.testing.assert_close(
-            remap_dcp_sparse_indices(indices, 4, 1, repeat_rows=2), expected
-        )
-        # DCP1 preserves holes and original slot IDs, including when repeated.
-        actual, counts = remap_dcp_sparse_indices(
-            indices, 1, 0, return_counts=True, repeat_rows=2
-        )
-        self.assertEqual(
-            actual.tolist(), [indices[0].tolist()] * 2 + [indices[1].tolist()] * 2
-        )
-        self.assertEqual(counts.tolist(), [6, 6, 4, 4])
-
-    def test_stable_compaction_and_counts(self):
-        """Sparse kernels scan the counted prefix, so holes would lose KV."""
-        indices = torch.tensor(
-            [[9, -1, 4, 13, 0, 5, 8], [0, 4, -1, 8, 12, -1, -1]],
-            dtype=torch.int32,
-        )
-        actual, counts = remap_dcp_sparse_indices(indices, 4, 1, return_counts=True)
-        self.assertEqual(actual.tolist(), [[2, 3, 1, -1, -1, -1, -1], [-1] * 7])
-        self.assertEqual(counts.tolist(), [3, 0])
-        self.assertEqual(counts.dtype, torch.int32)
-        torch.testing.assert_close(actual, remap_dcp_sparse_indices(indices, 4, 1))
-
-    def test_large_slots_preserve_ownership_and_offset(self):
-        """Ownership must stay integral beyond float32's exact-address range."""
-        indices = torch.tensor(
-            [[2**40 + 1, 2**24 + 3, -1, 2**40, 2**24 + 1]], dtype=torch.int64
-        )
-        actual, counts = remap_dcp_sparse_indices(indices, 4, 1, return_counts=True)
-        self.assertEqual(actual.tolist(), [[2**38, 2**22, -1, -1, -1]])
-        self.assertEqual(counts.tolist(), [2])
-
-    def test_block_interleaving_preserves_offsets_and_partition(self):
-        """Compacted local slots must reconstruct every selected global slot."""
-        indices = torch.tensor([[25, 8, -1, 7, 14, 27, 0, 11]], dtype=torch.int64)
-        for interleave_size in (1, 3, 64):
-            for dcp_size in (2, 4):
-                recovered = []
-                for rank in range(dcp_size):
-                    local, counts = remap_dcp_sparse_indices(
-                        indices, dcp_size, rank, interleave_size, return_counts=True
-                    )
-                    valid = local[0, : counts[0]].tolist()
-                    recovered.extend(
-                        (slot // interleave_size * dcp_size + rank) * interleave_size
-                        + slot % interleave_size
-                        for slot in valid
-                    )
-                    self.assertTrue((local[0, counts[0] :] == -1).all())
-                self.assertEqual(
-                    sorted(recovered), sorted(v for v in indices[0].tolist() if v >= 0)
-                )
-
-    def test_identity_and_empty_rows(self):
-        indices = torch.tensor([[5, -1, 3]], dtype=torch.int32)
-        actual, counts = remap_dcp_sparse_indices(indices, 1, 0, return_counts=True)
-        self.assertIs(actual, indices)
-        self.assertEqual(counts.tolist(), [2])
-        for shape in ((0, 7), (3, 0)):
-            indices = torch.empty(shape, dtype=torch.int32)
-            for repeat_rows in (1, 2):
-                actual, counts = remap_dcp_sparse_indices(
-                    indices, 4, 2, return_counts=True, repeat_rows=repeat_rows
-                )
-                self.assertEqual(actual.shape, (shape[0] * repeat_rows, shape[1]))
-                self.assertEqual(counts.tolist(), [0] * (shape[0] * repeat_rows))
 
 
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):

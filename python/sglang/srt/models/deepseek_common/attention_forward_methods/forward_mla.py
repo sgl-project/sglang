@@ -95,8 +95,7 @@ def is_dcp_mla_enabled() -> bool:
     if _is_cuda:
         backend = get_attn_backend()
         if getattr(backend, "use_dsa", False) and backend.qk_rope_head_dim > 0:
-            # EAGLE target and replicated draft share a process-wide group,
-            # but only the target's attention backend shards KV.
+            # The RoPE DSA draft worker keeps a replicated KV cache.
             return backend.dcp_enabled
     return True
 

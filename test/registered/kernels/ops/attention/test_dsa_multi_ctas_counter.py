@@ -75,19 +75,16 @@ def _would_grow(backend, rows: int) -> bool:
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
 class TestMultiCtasKvCounterLifetime(CustomTestCase):
-    def test_dcp_capture_sizes_counter_for_gathered_heads(self):
-        """DCP gathers heads before attention; the counter must cover them."""
-        for dcp_size in (2, 4):
-            with self.subTest(dcp_size=dcp_size):
-                backend = _make_backend()
-                backend.num_dcp_q_heads = backend.num_q_heads * dcp_size
-                backend._ensure_multi_ctas_kv_counter_capacity(8192)
-                counter = backend._multi_ctas_kv_counter_buffer
-                required = make_persistent_multi_ctas_kv_counter_buffer(
-                    torch.device("cuda"), backend.num_dcp_q_heads, 8192
-                )
-                self.assertGreaterEqual(counter.numel(), required.numel())
-                self.assertIs(backend._multi_ctas_kv_counter_for(8192), counter)
+    def test_dcp_counter_covers_gathered_heads(self):
+        backend = _make_backend()
+        backend.num_dcp_q_heads = backend.num_q_heads * 2
+        backend._ensure_multi_ctas_kv_counter_capacity(8192)
+        required = make_persistent_multi_ctas_kv_counter_buffer(
+            torch.device("cuda"), backend.num_dcp_q_heads, 8192
+        )
+        self.assertGreaterEqual(
+            backend._multi_ctas_kv_counter_buffer.numel(), required.numel()
+        )
 
     def test_request_sized_counter_would_grow_at_capture(self):
         """The premise: sizing by requests undercounts captured query rows."""

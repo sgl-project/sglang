@@ -181,7 +181,7 @@ for _mod, _fn in [
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
-    ("dsa.transform_index", "remap_dcp_sparse_indices_cuda"),
+    ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),

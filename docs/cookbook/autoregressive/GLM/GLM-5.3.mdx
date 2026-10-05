@@ -56,8 +56,6 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-benchmarks.jsx
   All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.3.
 </Warning>
 
-On SM100/SM103, RoPE DSA supports `--dcp-size 2` or `4` inside TP4 with TRT-LLM sparse prefill/decode and FP8 or BF16 KV. DCP increases logical KV capacity while keeping the indexer cache replicated. Checkpoint-native EAGLE/MTP supports a single chain (`topk=1`, draft tokens = steps + 1); TP4/DCP2 was validated with GLM-5.3 NVFP4. Prefill CP, HiCache, PD, HiSparse, and unified memory are rejected in this combination. See the [DCP support matrix and launch example](/docs/advanced_features/dcp#rope-dsa-on-blackwell) before adding DCP to a recipe.
-
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the deployment matrix**. It lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.

@@ -4532,8 +4532,8 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
-        # Replicated draft KV uses global allocator slots, whose padding page
-        # widens with DCP. Kernel pages remain 64 tokens for RoPE DSA.
+        # A DCP-replicated pool is addressed by allocator-global slots, so its
+        # padding page is wider than the page size the kernels read.
         self.alloc_page_size = page_size if alloc_page_size is None else alloc_page_size
         self.dcp_replicated = dcp_replicated
         self.dsa_kv_cache_store_fp8 = (
@@ -5043,8 +5043,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size
-        # The allocator's padding page widens under DCP even though indexer
-        # kernels continue to consume packed 64-token blocks.
+        # Index keys are replicated under DCP and padded by the allocator page.
         self.index_page_size = page_size if index_page_size is None else index_page_size
         if index_buf_size is None:
             index_buf_size = size
@@ -5323,8 +5322,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # The MLA superclass localizes only its KV indices under DCP. Index
-        # keys are replicated and must retain the original virtual indices.
+        # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         cpu_copy = {
             "kv": kv_cache_cpu,
