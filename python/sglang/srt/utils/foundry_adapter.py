@@ -42,7 +42,7 @@ FOUNDRY_INTEGRATION_API_MIN_MINOR = 0
 # Distribution name (import name ``foundry``) and minimum version, checked
 # when the flag is set.
 FOUNDRY_PACKAGE = "foundry-core"
-FOUNDRY_MIN_VERSION = "0.1.0rc1"
+FOUNDRY_MIN_VERSION = "0.1.0rc2"
 FOUNDRY_INSTALL_HINT = (
     'Install it with `pip install "sglang[foundry]"` (package foundry-core; see '
     "docs/advanced_features/cuda_graph_persistence)."

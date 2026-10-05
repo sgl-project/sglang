@@ -80,8 +80,7 @@ _RESOLUTION_STEPS = [
 # get_flags().dp.<name>, get_context().<name>() and the accessors themselves.
 _READ = [
     ("arg_groups/fields/parallel.py", "Parallel",
-     {"tp_size", "pp_size", "enable_dp_attention", "tp_rank", "pp_rank",
-      "dp_rank", "attn_dp_rank"}),
+     {"tp_size", "pp_size", "tp_rank", "pp_rank", "dp_rank", "attn_dp_enabled"}),
     ("arg_groups/fields/device.py", "Device", {"device", "gpu_id"}),
     ("runtime_context.py", "DpFlags", {"prefill_graph_has_dp_gather"}),
     ("runtime_context.py", "RuntimeContext", {"override", "overrides_log"}),

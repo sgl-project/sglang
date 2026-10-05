@@ -161,9 +161,10 @@ fastokens = [
 ]
 
 # CUDA graph persistence (--cuda-graph-persistence). foundry-core (import name
-# foundry) 0.1.0rc1 is the release candidate published from https://github.com/foundry-org/foundry; the bound becomes >=0.1.0 with the final release.
+# foundry) 0.1.0rc2 is the release candidate published from https://github.com/foundry-org/foundry,
+# built against torch 2.14.1 / cu130; the bound becomes >=0.1.0 with the final release.
 foundry = [
-  "foundry-core>=0.1.0rc1,<0.2",
+  "foundry-core>=0.1.0rc2,<0.2",
 ]
 
 test = [
