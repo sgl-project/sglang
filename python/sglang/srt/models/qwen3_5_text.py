@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -60,7 +59,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
             quant_config.packed_modules_mapping = self.packed_modules_mapping
@@ -128,6 +127,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             [layer_id + 1 for layer_id in layer_ids]
         )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = len(self.model.layers)
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_eagle3_layers_to_capture(layers_to_capture)
+
     def get_embed_and_head(self):
         # PP splits embedding and lm_head across first/last stages; the draft keeps
         # its own copy of whichever half its stage cannot receive.
@@ -146,16 +156,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.lm_head.weight = head
         current_platform.empty_cache()
         current_platform.synchronize()
-
-    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
-        if not self.pp_group.is_last_rank:
-            return
-        if layers_to_capture is None:
-            raise ValueError(
-                "DFLASH requires explicit layer ids for aux hidden capture."
-            )
-        self.capture_aux_hidden_states = True
-        self.model.set_dflash_layers_to_capture(layers_to_capture)
 
     @torch.no_grad()
     def forward(

@@ -28,8 +28,8 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
-      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
@@ -54,20 +54,38 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          list-files: json
           filters: |
+            # Baseline list below; any other changed test/registered/ file with a
+            # per-commit register_xpu_ci is also picked up by the next step.
+            registered_tests:
+              - "test/registered/**/*.py"
             main_package:
-              # Extend test/registered/ entries when adding a non-nightly register_xpu_ci.
               - "python/sglang/!(multimodal_gen|kernels|cli|test)/**/!(*.md)"
               - "python/sglang/test/*.py"
               - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
+              - "python/sglang/kernels/ops/speculative/@(reconstruct_tree|ngram_corpus).py"
+              - "python/sglang/kernels/jit/csrc/ngram_corpus/**"
               - "test/registered/xpu/**/!(*.md)"
+              - "test/registered/e2e/xpu/**/!(*.md)"
+              - "test/registered/disaggregation/test_disaggregation_xpu.py"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
               - "test/registered/attention/test_deterministic.py"
+              - "test/registered/kernels/ops/kvcache/test_hisparse.py"
+              - "test/registered/kv_canary/test_self_unit_future_tensor.py"
+              - "test/registered/kv_canary/test_self_unit_plan_input.py"
+              - "test/registered/kv_canary/test_self_unit_req_to_expected_token_ids_manager.py"
+              - "test/registered/kv_canary/test_self_unit_runner_swa_divergence.py"
+              - "test/registered/layers/mamba/test_mamba_slot_fused.py"
               - "test/registered/lora/test_moe_lora_info.py"
               - "test/registered/lora/test_virtual_experts_kernels.py"
+              - "test/registered/unit/layers/test_mamba_state_scatter_triton.py"
+              - "test/registered/unit/managers/test_hisparse_unit.py"
+              - "test/registered/unit/mem_cache/test_mamba_unittest.py"
               - "test/registered/unit/sampling/test_sampling_params.py"
               - "test/registered/unit/spec/test_adaptive_spec_params.py"
+              - "test/registered/unit/spec/test_ngram_corpus.py"
               - "test/run_suite.py"
               - "test/pytest.ini"
               - ".github/workflows/pr-test-xpu.yml"
@@ -92,6 +110,13 @@ jobs:
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
               - "scripts/ci/xpu/**"
+
+      - name: Detect changed per-commit XPU tests
+        id: xpu-tests
+        if: steps.filter.outputs.registered_tests == 'true'
+        env:
+          CHANGED_FILES: ${{ steps.filter.outputs.registered_tests_files }}
+        run: echo "changed=$(python3 scripts/ci/xpu/detect_xpu_test_changes.py)" >> "$GITHUB_OUTPUT"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -134,6 +159,12 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 60
         run: |
+          # Bridge fix: install libssl-dev in the running container so the
+          # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
+          # Can be dropped once intel/sglang-dev:latest is rebuilt from a
+          # docker/xpu.Dockerfile that already ships libssl-dev.
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
@@ -144,6 +175,11 @@ jobs:
           docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
+        continue-on-error: true
+        run: |
+          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir ".[checkpoint-engine]" --extra-index-url https://download.pytorch.org/whl/xpu
 
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
@@ -220,6 +256,12 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 60
         run: |
+          # Bridge fix: install libssl-dev in the running container so the
+          # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
+          # Can be dropped once intel/sglang-dev:latest is rebuilt from a
+          # docker/xpu.Dockerfile that already ships libssl-dev.
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
@@ -234,7 +276,9 @@ jobs:
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          # xpu_b60.json is seeded with this flag on; without it the SYCL queue
+          # is deep enough that step timings record host enqueue, not device time.
+          docker exec -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()

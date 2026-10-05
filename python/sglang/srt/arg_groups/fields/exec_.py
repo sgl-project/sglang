@@ -1,21 +1,15 @@
-"""Config fields of the ``exec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``exec`` bag, which is what ``get_exec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import (
     List,
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -36,10 +30,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
+from sglang.srt.utils.common import human_readable_int
 
 
-@dataclasses.dataclass
-class ExecFeatures:
+class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
@@ -95,6 +89,22 @@ class ExecFeatures:
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    enable_encoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
+    ] = False
+    enable_decoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
+    ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -105,8 +115,7 @@ class ExecFeatures:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecKernel:
+class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
@@ -142,6 +151,21 @@ class ExecKernel:
             resolvable=True,
         ),
     ] = None
+    prefill_kv_cache_dequant_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Online dequantization dtype used by prefill attention when "
+                "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache directly "
+                "without additional dequantization; 'fp8_e4m3' dequantizes it "
+                "into a temporary FP8 workspace. This does not change the stored "
+                "KV-cache dtype. 'auto' selects NVFP4 without additional "
+                "dequantization on SM100 and FP8 E4M3 otherwise."
+            ),
+            choices=["auto", "nvfp4", "fp8_e4m3"],
+            resolvable=True,
+        ),
+    ] = "auto"
     sampling_backend: A[
         Optional[str],
         Arg(
@@ -195,6 +219,7 @@ class ExecKernel:
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -224,6 +249,7 @@ class ExecKernel:
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -300,10 +326,22 @@ class ExecKernel:
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dsa_fused_indexer: A[
+        Optional[bool],
+        Arg(
+            help="Use the four-kernel fused DSA indexer decode path in place of "
+            "the 12-launch aiter/torch chain. By default this is enabled "
+            "wherever it is supported -- gfx950 (MI355X) with aiter preshuffle "
+            "and an fp8 e4m3fn index cache -- and the runtime declines with a "
+            "logged reason wherever any of that is missing. Pass "
+            "--no-enable-dsa-fused-indexer to force the standard path.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
 
 
-@dataclasses.dataclass
-class ExecMamba:
+class ExecMamba(msgspec.Struct):
     """Namespace ``exec.mamba``."""
 
     _NS_PATH = "exec.mamba"
@@ -443,8 +481,7 @@ class ExecMamba:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecGraph:
+class ExecGraph(msgspec.Struct):
     """Namespace ``exec.graph``."""
 
     _NS_PATH = "exec.graph"
@@ -479,6 +516,11 @@ class ExecGraph:
     cuda_graph_max_bs_prefill: A[
         Optional[int], "Maximum batch size captured for the prefill cuda graph."
     ] = None
+    cuda_graph_max_seq_len_prefill: A[
+        Optional[int],
+        "Longest sequence a prefill cuda graph replay admits; longer batches "
+        "run eager prefill. Folds into cuda_graph_config[prefill].max_seq_len.",
+    ] = None
     cuda_graph_bs_decode: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the decode cuda graph.",
@@ -486,6 +528,20 @@ class ExecGraph:
     cuda_graph_bs_prefill: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
+    ] = None
+    cuda_graph_prefill_max_context: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum context length supported by DeepSeek-V4 breakable/full "
+                "prefill CUDA graphs. Context-shaped attention metadata and "
+                "indexer logits are allocated at this fixed size instead of "
+                "the model maximum. Larger live contexts fall back to eager."
+                f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+            aliases=["--context-bucket"],
+        ),
     ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
@@ -533,8 +589,7 @@ class ExecGraph:
     ] = 32
 
 
-@dataclasses.dataclass
-class ExecComm:
+class ExecComm(msgspec.Struct):
     """Namespace ``exec.comm``."""
 
     _NS_PATH = "exec.comm"
@@ -564,7 +619,7 @@ class ExecComm:
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
     ] = False
     enable_torch_symm_mem: A[
         bool,
@@ -578,6 +633,19 @@ class ExecComm:
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
     ] = False
+    boundary_reduction: A[
+        Literal["auto", "ar", "rs", "rsv", "rs+rsv"],
+        Arg(
+            help="Select FFN boundary reduction: ar uses all-reduce then token "
+            "redistribution; rs and rsv permit fixed-size and variable-size "
+            "reduce-scatter respectively; rs+rsv permits both (RSv first). "
+            "Unsupported paths fall back to ar. The option applies to the FFN "
+            "stages of decoders built with stage boundaries, where auto resolves "
+            "the model default; other models ignore it. Required attention and "
+            "MoE collectives and all-reduce fusion are unaffected.",
+            resolvable=True,
+        ),
+    ] = "auto"
     enable_quant_communications: A[
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
@@ -588,7 +656,7 @@ class ExecComm:
         "Enforce disable FlashInfer allreduce fusion.",
     ] = False
     flashinfer_allreduce_fusion_backend: A[
-        Optional[Literal["auto", "trtllm", "mnnvl"]],
+        Optional[Literal["auto", "trtllm", "mnnvl", "cutedsl"]],
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
@@ -599,6 +667,9 @@ class ExecComm:
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
+                "'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also "
+                "fuses the MoE finalize and the shared-expert add into the "
+                "collective when the MoE runner can defer them. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
             resolvable=True,
@@ -607,10 +678,31 @@ class ExecComm:
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
     ] = False
+    disable_aiter_allreduce_fusion_in_prefill: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for prefill batches "
+                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+    disable_aiter_allreduce_fusion_in_decode: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
+                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
 
 
-@dataclasses.dataclass
-class ExecMoe:
+class ExecMoe(msgspec.Struct):
     """Namespace ``exec.moe``."""
 
     _NS_PATH = "exec.moe"
@@ -641,6 +733,7 @@ class ExecMoe:
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -656,6 +749,7 @@ class ExecMoe:
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
             ],
             resolvable=True,
         ),
@@ -700,6 +794,10 @@ class ExecMoe:
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+    ] = None
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
@@ -767,10 +865,6 @@ class ExecMoe:
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
-    elastic_ep_rejoin: A[
-        bool,
-        "[Deprecated] Alias for --elastic-ep-join-mode recover.",
-    ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False
@@ -812,8 +906,7 @@ class ExecMoe:
     ] = None
 
 
-@dataclasses.dataclass
-class ExecOverlap:
+class ExecOverlap(msgspec.Struct):
     """Namespace ``exec.overlap``."""
 
     _NS_PATH = "exec.overlap"
@@ -834,8 +927,7 @@ class ExecOverlap:
     ] = 0.48
 
 
-@dataclasses.dataclass
-class ExecOffload:
+class ExecOffload(msgspec.Struct):
     """Namespace ``exec.offload``."""
 
     _NS_PATH = "exec.offload"
@@ -871,9 +963,32 @@ class ExecOffload:
         ),
     ] = None
 
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
+        ),
+    ] = None
 
-@dataclasses.dataclass
-class ExecDllm:
+
+class ExecDllm(msgspec.Struct):
     """Namespace ``exec.dllm``."""
 
     _NS_PATH = "exec.dllm"
@@ -897,8 +1012,7 @@ class ExecDllm:
     ] = True
 
 
-@dataclasses.dataclass
-class ExecDeterministic:
+class ExecDeterministic(msgspec.Struct):
     """Namespace ``exec.deterministic``."""
 
     _NS_PATH = "exec.deterministic"

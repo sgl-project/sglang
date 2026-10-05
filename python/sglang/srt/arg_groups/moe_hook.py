@@ -13,8 +13,8 @@ from sglang.srt.arg_groups.overrides import (
     _a2a_fusion_adjustments,
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
-    cutedsl_moe_max_num_tokens,
     declare_resolution,
+    flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     model_config_of,
@@ -22,11 +22,15 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.moe_model_registry import (
+    model_deepep_v2_prefill_dispatch_tokens,
+    model_supports_deepep_v2,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +130,111 @@ def handle_moe_kernel_config(server_args: Any):
         )
 
 
+def handle_flashinfer_a2a_dispatch_type(server_args: Any):
+    cfg = resolving_view(server_args)
+    cli_dispatch_type = cfg.flashinfer_a2a_dispatch_type
+    nvfp4_dispatch_env_is_set = envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+
+    if nvfp4_dispatch_env_is_set:
+        raise ValueError(
+            "SGLANG_MOE_NVFP4_DISPATCH cannot be set together with "
+            "--flashinfer-a2a-dispatch-type."
+        )
+
+    dispatch_type = cli_dispatch_type or "auto"
+
+    supports_nvfp4_dispatch = (
+        cfg.quantization == "modelopt_fp4"
+        or model_config_of(server_args).nvfp4_moe_meta is not None
+    )
+    if dispatch_type == "auto":
+        if cfg.quantization == "mxfp8":
+            dispatch_type = "mxfp8"
+        elif supports_nvfp4_dispatch:
+            dispatch_type = "nvfp4"
+        else:
+            dispatch_type = "bf16"
+
+    if dispatch_type == "mxfp8":
+        if cfg.quantization != "mxfp8":
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type mxfp8 requires --quantization mxfp8."
+            )
+        if cfg.moe_runner_backend != "flashinfer_trtllm_routed":
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type mxfp8 requires "
+                "--moe-runner-backend flashinfer_trtllm_routed."
+            )
+    elif dispatch_type == "nvfp4" and not supports_nvfp4_dispatch:
+        raise ValueError(
+            "--flashinfer-a2a-dispatch-type nvfp4 requires NVFP4/"
+            "modelopt-FP4 quantization or hybrid NVFP4 MoE metadata."
+        )
+
+    declare_resolution(
+        server_args,
+        "_handle_flashinfer_a2a_dispatch_type",
+        flashinfer_a2a_dispatch_type=dispatch_type,
+    )
+
+
+def validate_flashinfer_megamoe_envs() -> None:
+    combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+    if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
+            f"'bf16', 'mxfp8', or 'nvfp4', got {combine_dtype!r}."
+        )
+    if (
+        combine_dtype != "bf16"
+        and envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+    ):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE="
+            f"{combine_dtype!r} is incompatible with "
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
+        )
+
+
+def validate_flashinfer_megamoe_model(server_args: Any) -> None:
+    model_config = model_config_of(server_args)
+    architectures = model_config.hf_config.architectures or []
+    validated_architectures = (
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+    )
+    if not any(
+        architecture in validated_architectures for architecture in architectures
+    ):
+        raise ValueError(
+            "FlashInfer MegaMOE is not validated for model architectures "
+            f"{architectures}. Supported architectures: "
+            f"{sorted(validated_architectures)}."
+        )
+
+    quantization = resolved_view(server_args).quantization
+    supports_megamoe_quantization = (
+        quantization in ("mxfp8", "modelopt_fp4")
+        or model_config.is_fp4_experts
+        or model_config.nvfp4_moe_meta is not None
+    )
+    if not supports_megamoe_quantization:
+        raise ValueError(
+            "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
+            "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
+            f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
+            "are not supported."
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -148,6 +257,38 @@ def handle_a2a_moe(server_args: Any):
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
         )
         logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
+    if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
+        None,
+        "auto",
+    ):
+        raise ValueError(
+            "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
+        )
+
+    if a2a_backend == "flashinfer_megamoe":
+        validate_flashinfer_megamoe_model(server_args)
+        validate_flashinfer_megamoe_envs()
+        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
+            "FlashInfer MegaMOE is only supported with --attn-dp-size equal to --tp-size"
+        )
+        if resolved_view(server_args).moe_runner_backend == "auto":
+            declare_resolution(
+                server_args, "_handle_a2a_moe", moe_runner_backend="flashinfer_megamoe"
+            )
+        assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
+            "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+        )
+        if not is_sm100_supported():
+            raise ValueError(
+                "FlashInfer MegaMOE currently requires an SM100-family "
+                "CUDA device for all supported quantization formats."
+            )
+        logger.info(
+            "FlashInfer MegaMOE is enabled. The expert parallel size is "
+            "adjusted to be the same as the tensor parallel size[%s].",
+            cfg.tp_size,
+        )
 
     if a2a_backend == "deepep":
         if cfg.moe_runner_backend == "flashinfer_cutedsl":
@@ -189,13 +330,6 @@ def handle_a2a_moe(server_args: Any):
 
     if a2a_backend == "deepep_v2":
         validate_deepep_v2_model_architecture(server_args)
-        if resolved_view(server_args).enable_deterministic_inference:
-            raise ValueError(
-                "DeepEP v2 does not forward deterministic=True to "
-                "ElasticBuffer, so deterministic sorting remains disabled. "
-                "Disable --enable-deterministic-inference or use "
-                "--moe-a2a-backend deepep."
-            )
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         # Respect model-level runner declarations before resolving auto.
@@ -260,12 +394,9 @@ def handle_a2a_moe(server_args: Any):
             moe_a2a_backend="none",
         )
 
-    if cfg.moe_a2a_backend == "flashinfer":
-        assert (
-            resolved_view(server_args).enable_dp_attention
-            and cfg.dp_size == cfg.tp_size
-        ), (
-            "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+    if a2a_now == "flashinfer":
+        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
+            "Flashinfer MoE A2A is only supported with --attn-dp-size equal to --tp-size"
         )
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
@@ -273,20 +404,44 @@ def handle_a2a_moe(server_args: Any):
             resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
             and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
         )
-        if use_cutedsl_w4a16:
-            if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
-                raise ValueError(
-                    "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
-                    "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
-                )
-        elif not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-            resolved_view(server_args).quantization == "modelopt_fp4"
-            or model_config_of(server_args).nvfp4_moe_meta is not None
-        ):
-            envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
-            logger.warning(
-                "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+        if use_cutedsl_w4a16 and envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+            raise ValueError(
+                "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
+                "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
             )
+        if cfg.flashinfer_a2a_dispatch_type is None:
+            if (
+                not use_cutedsl_w4a16
+                and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+                and (
+                    resolved_view(server_args).quantization == "modelopt_fp4"
+                    or model_config_of(server_args).nvfp4_moe_meta is not None
+                )
+            ):
+                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                logger.warning(
+                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+                )
+        else:
+            if resolved_view(server_args).moe_runner_backend == "flashinfer_trtllm":
+                declare_resolution(
+                    server_args,
+                    "_handle_a2a_moe",
+                    moe_runner_backend="flashinfer_trtllm_routed",
+                )
+                logger.warning(
+                    "Flashinfer MoE A2A is enabled with flashinfer_trtllm. "
+                    "Using flashinfer_trtllm_routed because A2A dispatch "
+                    "provides top-k ids and weights."
+                )
+            if use_cutedsl_w4a16 and cfg.flashinfer_a2a_dispatch_type in (
+                "auto",
+                "nvfp4",
+            ):
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires --flashinfer-a2a-dispatch-type bf16."
+                )
+            handle_flashinfer_a2a_dispatch_type(server_args)
         assert resolved_view(server_args).moe_runner_backend in [
             "flashinfer_cutlass",
             "flashinfer_cutedsl",
@@ -333,12 +488,12 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="low_latency",
             )
             logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
-        # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
+        # pplx-kernels' AllToAll needs numDPGroups (== attn_dp_size) > 1;
         # without DP attention numDPGroups == 1 and construction fails deep in
         # the kernel. This also implies ep_size >= 2.
-        assert resolved_view(server_args).enable_dp_attention and cfg.dp_size >= 2, (
-            "moe_a2a_backend='pplx' requires --enable-dp-attention with at "
-            "least 2 DP groups (--dp-size >= 2)."
+        assert cfg.attn_dp_size >= 2, (
+            "moe_a2a_backend='pplx' requires attention DP with at least 2 "
+            "groups (--attn-dp-size >= 2)."
         )
         # pplx runs the masked DeepGEMM expert path (sm_90a): reject other
         # runners and resolve auto -> deep_gemm. Unquantized bf16 pplx needs
@@ -386,6 +541,40 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         )
 
 
+def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
+    """Largest prefill dispatch on one rank, after model-specific sharding."""
+    view = resolved_view(server_args)
+    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    return model_deepep_v2_prefill_dispatch_tokens(
+        hf_config=model_config_of(server_args).hf_config,
+        cfg=view,
+        default_tokens=tokens,
+    )
+
+
+def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
+    """(requests, tokens per request) of the largest decode/verify CUDA graph on
+    one DP rank; (0, 1) when this instance captures no decode graph."""
+    view = resolved_view(server_args)
+    cg_config = view.cuda_graph_config
+    if (
+        view.disaggregation_mode == "prefill"
+        or cg_config is None
+        or cg_config.decode.backend == Backend.DISABLED
+    ):
+        return 0, 1
+    graph_bs = cg_config.decode.max_bs or 0
+    if view.max_running_requests is not None:
+        per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
+        graph_bs = min(graph_bs, per_rank_pool_bs)
+    tokens_per_req = (
+        max_speculative_num_draft_tokens(server_args) or 1
+        if view.speculative_algorithm
+        else 1
+    )
+    return graph_bs, tokens_per_req
+
+
 def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     """Check the configured prefill and decode-graph buffer bounds."""
     view = resolved_view(server_args)
@@ -394,9 +583,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
-        prefill_tokens = max_prefill_buffer_tokens(server_args) or (
-            view.max_prefill_tokens or 0
-        )
+        prefill_tokens = required_deepep_v2_prefill_tokens_per_rank(server_args)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "
@@ -406,22 +593,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
                 "--max-prefill-tokens."
             )
 
-    if view.disaggregation_mode == "prefill":
-        return
-    decode_config = getattr(view.cuda_graph_config, "decode", None)
-    if decode_config is None or decode_config.backend == Backend.DISABLED:
-        return
-
-    graph_bs = decode_config.max_bs or 0
-    if view.max_running_requests is not None:
-        attn_dp_size = view.dp_size if view.enable_dp_attention else 1
-        per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
-        graph_bs = min(graph_bs, per_rank_pool_bs)
-    tokens_per_req = (
-        max_speculative_num_draft_tokens(server_args) or 1
-        if view.speculative_algorithm
-        else 1
-    )
+    graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
     graph_tokens = graph_bs * tokens_per_req
     if graph_tokens > capacity:
         raise ValueError(
@@ -434,7 +606,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
-    """Allow DeepEP v2 only where its model workflow is validated."""
+    """Allow DeepEP v2 only for registered model architectures."""
 
     if (
         parse_connector_type(resolved_view(server_args).model_path)
@@ -446,63 +618,58 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
             "--moe-a2a-backend deepep."
         )
 
-    architectures = (
-        getattr(model_config_of(server_args).hf_config, "architectures", None) or []
-    )
-
-    architecture = architectures[0] if architectures else None
-    # These architectures take the A2A MoE path and skip post-expert
-    # all-reduce.
-    validated_architectures = (
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    )
-    if architecture not in validated_architectures:
+    hf_config = model_config_of(server_args).hf_config
+    if not model_supports_deepep_v2(hf_config):
+        architectures = getattr(hf_config, "architectures", None) or []
+        architecture = architectures[0] if architectures else None
         raise ValueError(
-            f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-            f"architectures are {sorted(validated_architectures)}. "
-            "Other model workflows may require an all-reduce after A2A "
-            "combine. Use --moe-a2a-backend deepep."
+            f"DeepEP v2 MoE is not validated for {architecture!r}. The model "
+            "package must register its architecture with "
+            "register_deepep_v2_model, because its combine and post-expert "
+            "reduction semantics must be validated first."
         )
 
 
-def validate_cutedsl_a2a_token_budget(server_args: Any):
-    """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
-    largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-    so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
-    cfg = resolving_view(server_args)
-
+def _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Largest token count one DP rank dispatches through FlashInfer A2A in one
+    forward: eager prefill chunks, prefill CUDA graphs, and decode/verify graphs.
+    """
     view = resolved_view(server_args)
-    if not (
-        view.moe_a2a_backend == "flashinfer"
-        and view.moe_runner_backend == "flashinfer_cutedsl"
-        and cfg.max_prefill_tokens > 0
-        and cfg.disaggregation_mode != "decode"
-    ):
+    tokens = 0
+    cg_config = view.cuda_graph_config
+    if view.disaggregation_mode != "decode":
+        tokens = max_prefill_buffer_tokens(server_args)
+        if cg_config is not None and cg_config.prefill.backend != Backend.DISABLED:
+            tokens = max(tokens, cg_config.prefill.max_bs or 0)
+    graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
+    return max(tokens, graph_bs * tokens_per_req)
+
+
+def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
+    """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
+    largest forward; at runtime the dispatcher asserts on the first such batch."""
+    view = resolved_view(server_args)
+    if view.moe_a2a_backend != "flashinfer":
         return
-    required_tokens = cutedsl_moe_max_num_tokens(server_args)
-    max_dispatch_tokens_per_rank = (
-        envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
-    )
-    max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
-    if max_cutedsl_tokens < required_tokens:
-        required_per_rank = (required_tokens + view.ep_size - 1) // view.ep_size
+    if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
         raise ValueError(
-            "FlashInfer MoE A2A with flashinfer_cutedsl requires "
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
-            "ep_size to cover the largest CuteDSL MoE forward "
-            f"({required_tokens} tokens). Otherwise the FlashInfer "
-            "dispatcher can crash at runtime with "
-            "`ValueError: num_tokens (...) exceeds max_num_tokens (...)`. "
-            "Current values: "
-            f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-            f"{max_dispatch_tokens_per_rank}, ep_size={view.ep_size}, "
-            f"capacity={max_cutedsl_tokens}, required={required_tokens}. "
-            f"Set `export "
-            f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-            f"{required_per_rank}` or lower the relevant limit "
-            f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
+            "FlashInfer MoE A2A requires chunked prefill: eager prefill "
+            "dispatches the whole per-rank extend batch through a fixed-size "
+            "workspace, so --chunked-prefill-size must be > 0."
+        )
+
+    required = _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
+    capacity = flashinfer_a2a_max_dispatch_tokens_per_rank(
+        max_prefill_buffer_tokens(server_args)
+    )
+    if required > capacity:
+        raise ValueError(
+            "FlashInfer MoE A2A per-rank token budget exceeds its workspace: "
+            f"required={required} tokens per rank (prefill chunk, prefill "
+            f"graph, or decode/verify graph), capacity={capacity}. Set "
+            f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK>={required}, "
+            "or unset it to size from --chunked-prefill-size, or lower "
+            "--chunked-prefill-size / the CUDA graph max batch sizes."
         )
 
 

@@ -2,7 +2,7 @@
 # Install dependencies for CUDA CI jobs.
 #
 # CU_VERSION (default: cu130) controls PyTorch index URL, FlashInfer JIT cache
-# index, and nvrtc variant selection.
+# index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,12 +32,24 @@ mark_step_done() {
 
 configure_environment() {
     # CU_VERSION controls PyTorch index URL, FlashInfer JIT cache index, and
-    # nvrtc variant selection (cu12 vs cu13).
+    # the sglang wheel index. Only CUDA 13 lanes exist: PyTorch 2.14 publishes
+    # no CUDA 12 wheels for the cu129 index the retired cu12 lane used.
     CU_VERSION="${CU_VERSION:-cu130}"
     CU_STRIP="${CU_VERSION#cu}"
-    CU_MAJOR="${CU_STRIP:0:2}"
+    case "${CU_STRIP}" in
+        13*) ;;
+        *) echo "FATAL: unsupported CU_VERSION=${CU_VERSION}; only CUDA 13 is supported"; exit 1 ;;
+    esac
 
     OPTIONAL_DEPS="${1:-}"
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        export SGLANG_BUILD_RUST_EXTS=none
+        export SGLANG_RUST_BUILD_MODE=never
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
+            echo "SGLANG_RUST_BUILD_MODE=never" >> "$GITHUB_ENV"
+        fi
+    fi
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
     USE_VENV="${USE_VENV:-0}"
@@ -136,6 +148,27 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+repair_stale_nvidia_dkms() {
+    # GDRCopy used to install nvidia-dkms-580, whose nvidia-firmware-580
+    # dependency collides with the host firmware the NVIDIA container runtime
+    # mounts in. The failed install leaves packages unpacked but unconfigured,
+    # and apt then refuses every later install. Drop those packages and finish
+    # configuring the rest. Removable once no runner still has them.
+    local -a stale_nvidia_packages
+    mapfile -t stale_nvidia_packages < <(
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
+            awk 'substr($1, 2, 1) !~ /[nci]/ || substr($1, 3, 1) != "" {print $2}'
+    )
+    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
+        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
+        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
+        dpkg --configure -a
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 is_apt_package_installed() {
     local name
     # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
@@ -183,7 +216,7 @@ install_apt_packages() {
 
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
-    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
     local gpu_count=0
     if command -v nvidia-smi >/dev/null 2>&1; then
         gpu_count=$(
@@ -205,10 +238,10 @@ install_gdrcopy() {
 
     local gdrcopy_root=/opt/gdrcopy
     local gdrcopy_version=2.5.1
-    local -a gdrcopy_packages=(
-        nvidia-dkms-580 devscripts debhelper fakeroot dkms
-        check libsubunit0 libsubunit-dev python3-venv
-    )
+    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host
+    # and must be exposed to the container, and the gdrcopy test tools are
+    # unused.
+    local -a gdrcopy_packages=(devscripts debhelper fakeroot)
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
@@ -225,11 +258,8 @@ install_gdrcopy() {
     git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
+        CUDA=/usr/local/cuda ./build-deb-packages.sh -k -t
         dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
     )
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
@@ -271,6 +301,12 @@ clean_site_packages() {
         rm -rf "$SITE_PACKAGES/sglang"
     fi
 
+    # diffusion does not use the SRT Rust extensions
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -291,7 +327,7 @@ clean_site_packages() {
 
 setup_cargo_cache() {
     if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
-        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        echo "Rust extension compilation disabled; skipping Cargo target setup"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -366,11 +402,6 @@ remove_stale_cuda12_nvidia_wheels() {
     local -a NVIDIA_WHEELS_TO_RESTORE=()
     local -a STALE_CUDA12_NVIDIA_WHEELS=()
 
-    if [ "$CU_MAJOR" != "13" ]; then
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
-
     mapfile -t INSTALLED_NVIDIA_WHEELS < <(
         python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
     )
@@ -411,9 +442,9 @@ uninstall_stale_flashinfer() {
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
     FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
-    FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
-    FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
+    FLASHINFER_CUBIN_INSTALLED=$(python3 -m pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    FLASHINFER_JIT_INSTALLED=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+    FLASHINFER_JIT_CU_VERSION=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
 
     UNINSTALL_CUBIN=true
     UNINSTALL_JIT_CACHE=true
@@ -426,8 +457,13 @@ uninstall_stale_flashinfer() {
     fi
 
     if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
-        UNINSTALL_JIT_CACHE=false
+        # Since 0.7.0 that version is the shim's; it does not imply a provider.
+        if bash "${SCRIPT_DIR}/ci_check_flashinfer_jit_cache.sh"; then
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
+            UNINSTALL_JIT_CACHE=false
+        else
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} installed but serves no cubins, will reinstall"
+        fi
     else
         echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
     fi
@@ -439,7 +475,16 @@ uninstall_stale_flashinfer() {
 
     FLASHINFER_UNINSTALL="flashinfer-python"
     [ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
-    [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
+    if [ "$UNINSTALL_JIT_CACHE" = true ]; then
+        # Which per-arch packages exist varies by release, so drop whatever is
+        # installed rather than a fixed list.
+        JIT_CACHE_PKGS=$(python3 -m pip list --format=freeze) || {
+            echo "ERROR: pip list failed; cannot enumerate per-arch jit-cache packages"
+            return 1
+        }
+        JIT_CACHE_ARCH=$(printf '%s\n' "$JIT_CACHE_PKGS" | sed -n 's/^\(flashinfer-jit-cache-[0-9a-z]*\)==.*/\1/p' | tr '\n' ' ')
+        FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache $JIT_CACHE_ARCH"
+    fi
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
@@ -455,38 +500,31 @@ install_pytorch_stack() {
         fi
     done
 
+    # A cancelled install can leave dist-info without files, which uv then skips.
+    REINSTALL_ARGS=$(python3 -c '
+import importlib.metadata as md
+for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
+    try:
+        dist = md.distribution(name)
+    except md.PackageNotFoundError:
+        continue
+    if not all(dist.locate_file(f).exists() for f in dist.files or []):
+        print("--reinstall-package", name)
+')
+
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
+        $REINSTALL_ARGS \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_cuda12_deepep_wheel() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
+require_prebuilt_rust_exts() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
-
-    local version
-    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
-    if [ -z "$version" ]; then
-        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
-        exit 1
-    fi
-
-    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
-    # local version satisfies the public-version pyproject pin, so the later
-    # editable SGLang install keeps this CUDA-matched wheel.
-    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
-        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
-        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-require_prebuilt_rust_exts() {
     # Stages whose download succeeded set this to none. Runs before
     # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
     # install_sglang below - setup.py reads it from the environment at build time.
@@ -551,14 +589,10 @@ install_sglang() {
 }
 
 install_nccl() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        # PyTorch pins 2.29.7, so this override must run after every command
-        # that resolves Python dependencies (including lmms-eval).
-        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
-            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    else
-        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
-    fi
+    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # after every command that resolves Python dependencies (including lmms-eval).
+    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -628,8 +662,8 @@ install_sglang_kernel() {
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
         # The PyPI default wheel tracks one CUDA version (currently cu130); other
-        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
-        # sglang index, linked against the right libnvrtc.
+        # runners need the +${CU_VERSION}-tagged wheel from the sglang index,
+        # linked against the right libnvrtc.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
         if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
@@ -640,18 +674,11 @@ install_sglang_kernel() {
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
-    if [ "$CU_MAJOR" = "13" ]; then
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}"
-    else
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
-    fi
     # No reject-local: nothing builds sgl-deep-gemm locally.
-    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
-        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
-    elif [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_VERSION}"; then
+        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION} already installed, keeping it"
     else
-        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -737,19 +764,12 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.13"
+    MOONCAKE_VERSION="0.3.13.post1"
     NIXL_VERSION="1.3.0"
-    if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
-        NIXL_BIN_NAME="nixl-cu13"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    else
-        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        NIXL_BIN_NAME="nixl-cu12"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
-    fi
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+    NIXL_BIN_NAME="nixl-cu13"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
@@ -830,24 +850,22 @@ verify_imports() {
 
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
-    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+    SGLANG_CI_OPTIONAL_DEPS="$OPTIONAL_DEPS" SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import ctypes
 import importlib.metadata
 import os
-import sys
 
-if sys.argv[1] == "13":
-    if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
-        raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
-    nccl = ctypes.CDLL("libnccl.so.2")
-    nccl_version = ctypes.c_int()
-    status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-    if status != 0 or nccl_version.value != 23007:
-        raise SystemExit(
-            f"expected NCCL runtime 2.30.7, got status={status}, "
-            f"raw_version={nccl_version.value}"
-        )
-    print("NCCL package and runtime versions are 2.30.7")
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+    raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
+nccl = ctypes.CDLL("libnccl.so.2")
+nccl_version = ctypes.c_int()
+status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
+if status != 0 or nccl_version.value != 23007:
+    raise SystemExit(
+        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"raw_version={nccl_version.value}"
+    )
+print("NCCL package and runtime versions are 2.30.7")
 
 import torch
 print(torch.version.cuda)
@@ -875,14 +893,15 @@ print(f"sglang resolves to {spec.origin}")
 # Import, not find_spec: the finders locate an extension without dlopening it,
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
-for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.rust_extensions._{mod}"
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        raise SystemExit(f"{name} is present but does not load: {exc!r}")
-    print(f"{name} loads")
-' "$CU_MAJOR"
+if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
+    for mod in ("server", "grpc", "multimodal"):
+        name = f"sglang.srt.rust_extensions._{mod}"
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            raise SystemExit(f"{name} is present but does not load: {exc!r}")
+        print(f"{name} loads")
+'
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -896,6 +915,7 @@ main() {
     detect_host
     kill_existing_processes
     cleanup_stale_shm
+    repair_stale_nvidia_dkms
     install_apt_packages
     install_gdrcopy
     clean_site_packages
@@ -904,7 +924,6 @@ main() {
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
-    install_cuda12_deepep_wheel
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock

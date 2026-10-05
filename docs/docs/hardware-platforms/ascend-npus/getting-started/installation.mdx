@@ -137,7 +137,7 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 You can obtain the dependency of a specified version of CANN through an image.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # CANN 9.0.0
@@ -148,7 +148,7 @@ docker pull quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 # CANN 9.0.0
@@ -298,7 +298,7 @@ SGLang images for the CANN 9.1.0 set have not been published yet. For now, pleas
 </Note>
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # Stable release
@@ -309,7 +309,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 # Stable release
@@ -332,7 +332,7 @@ cd sglang/docker
 # Build the docker image
 # Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
 # Optional build arguments:
-#   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
+#   --build-arg DEVICE_TYPE=910b          # Required for Ascend A2 Series
 #   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
 # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
 docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
@@ -343,7 +343,7 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
@@ -366,7 +366,7 @@ drun --env "HF_TOKEN=<secret>" \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
@@ -444,7 +444,7 @@ python3 -m sglang.launch_server \
 1. Launch Prefill Server
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -468,7 +468,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -498,7 +498,7 @@ python3 -m sglang.launch_server \
 2. Launch Decode Server
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # PREFILL_IP: IP address of the first Prefill Server
@@ -518,7 +518,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 # PREFILL_IP: IP address of the first Prefill Server

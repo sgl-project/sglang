@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDFlashDominoFullVocab(CustomTestCase):
@@ -38,7 +38,7 @@ class TestDFlashDominoFullVocab(CustomTestCase):
                 "--dtype",
                 "bfloat16",
                 "--tp-size",
-                "1",
+                "2",
                 "--attention-backend",
                 "triton",
                 "--speculative-algorithm",
@@ -64,6 +64,7 @@ class TestDFlashDominoFullVocab(CustomTestCase):
         response = requests.get(self.base_url + "/server_info", timeout=10)
         response.raise_for_status()
         state = response.json()["internal_states"][0]
+        self.assertEqual(state["tp_size"], 2)
         self.assertEqual(state["speculative_num_draft_tokens"], 16)
         self.assertFalse(state["disable_overlap_schedule"])
         self.assertEqual(
@@ -71,11 +72,11 @@ class TestDFlashDominoFullVocab(CustomTestCase):
         )
         log = Path(self.server_log.name).read_text()
         self.assertIn(
-            "DFLASH Domino rollout enabled (BF16, TP=1, "
+            "DFLASH Domino rollout enabled (BF16, TP=2, "
             f"block-shared candidate pool size={self.candidate_pool_size}).",
             log,
         )
-        self.assertIn("Domino rollout folded into the draft cuda graph", log)
+        self.assertIn("Domino rollout folded into the draft cuda graph (tp=2)", log)
         self.assertIn(
             "Capture draft verify CUDA graph begin. backend=full, num_tokens_per_req=16,",
             log,

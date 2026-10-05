@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_xpu
 
 from ..common.utils import (
     _bitonic_merge,
@@ -16,6 +17,9 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+
+# Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 16384 if torch.version.hip else 4096
 
 
 def _prune_decode_configs(configs, named_args, **kwargs):
@@ -895,7 +899,7 @@ def flash_decode_with_topk_idx(
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and score.shape[2] <= _JIT_TOPK_MAX_NUM_BLOCKS
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
@@ -1039,7 +1043,12 @@ def flash_decode_with_topk_idx(
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
         # sglang/kernels/ops/attention/minimax_decode_topk.py.
-        from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+        if is_xpu():
+            from sgl_kernel import minimax_decode_topk
+        else:
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:

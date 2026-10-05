@@ -58,6 +58,9 @@ def _make_attn(rope, *, eps=EPS, has_bias=False, quantized=False, g=None):
         k_norm.weight.copy_(torch.randn(HEAD_DIM, device=DEVICE, generator=g))
     attn.k_norm = k_norm
     attn.rotary_emb = rope
+    # Real DFlashAttention always sets v_scale in __init__; the mock must match
+    # so kv_proj_only's v_scale read does not AttributeError.
+    attn.v_scale = None
     for name in ("kv_proj_only", "apply_k_norm", "apply_k_rope"):
         setattr(attn, name, types.MethodType(getattr(DFlashAttention, name), attn))
     return attn

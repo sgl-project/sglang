@@ -588,7 +588,21 @@ def calculate_utilization(
     skipped_non_gpu = 0
     skipped_lookback = 0
     for r in all_runs:
-        if _likely_no_gpu_jobs(r.get("name", "")):
+        # Skipped/unapproved runs, and PR/push first attempts that finished
+        # within a minute (gate jobs on ubuntu-latest), never touch a
+        # self-hosted runner. Dispatched runs (e.g. rerun-test) go straight
+        # to a GPU runner, so they are always fetched.
+        if (
+            _likely_no_gpu_jobs(r.get("name", ""))
+            or r.get("conclusion") in ("skipped", "action_required")
+            or (
+                r.get("event") in ("pull_request", "push")
+                and r.get("status") == "completed"
+                and r.get("run_attempt") == 1
+                and parse_time(r["updated_at"]) - parse_time(r["run_started_at"])
+                < timedelta(minutes=1)
+            )
+        ):
             skipped_non_gpu += 1
             continue
         created_at = parse_time(r.get("created_at"))

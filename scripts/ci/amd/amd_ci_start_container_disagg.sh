@@ -19,8 +19,9 @@ else
 fi
 
 
-# Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
+# Default base tags (can be overridden by command line arguments).
+# Keep this aligned with the default AMD PR and Nightly CI lane.
+ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
@@ -194,13 +195,6 @@ find_latest_image() {
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
       else
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
-      fi
-      ;;
-    rocm700)
-      if [[ "${gpu_arch}" == "mi35x" ]]; then
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
-      else
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
       fi
       ;;
     *)
