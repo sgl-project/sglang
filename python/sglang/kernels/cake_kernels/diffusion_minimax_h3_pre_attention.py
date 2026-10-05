@@ -393,6 +393,8 @@ def _activation_workspace(m: int, device: torch.device) -> torch.Tensor:
     pipeline); a persistent buffer keeps the per-call path free of allocator
     traffic and lets CUDA-graph replay reuse the captured address.
     """
+    import torch
+
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (m, index)
     workspace = _ACTIVATION_WORKSPACES.get(key)
