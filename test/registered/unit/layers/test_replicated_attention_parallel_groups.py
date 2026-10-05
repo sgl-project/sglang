@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers import linear
+from sglang.srt.layers.layer_boundary.factories import layer_stack
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,9 +42,10 @@ def build_attention(model, variant, *, width=32, head_dim=8, quant_config=None):
     if model == "qwen":
         from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
 
-        module = Qwen3_5AttentionDecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=variant[0]
-        )
+        with layer_stack():
+            module = Qwen3_5AttentionDecoderLayer(
+                config, 0, quant_config=quant_config, is_nextn=variant[0]
+            )
         names = ("qkv_proj", "o_proj")
     else:
         from sglang.srt.models.minimax_m3 import MiniMaxM3Attention
