@@ -19,7 +19,9 @@ Usage::
 
 from __future__ import annotations
 
+import atexit
 import os
+import sys
 from typing import Optional
 
 import pytest
@@ -149,15 +151,29 @@ def _dist_group() -> Optional[dist.ProcessGroup]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _destroy_process_group_at_session_end():
-    """Tear the NCCL group down while the interpreter is alive: destroying it
-    from an ``atexit`` hook segfaults under the NVSHMEM symmetric-memory
-    backend (torch 2.13), which torchrun then reports as a failed worker."""
+def _finish_torchrun_worker(request):
+    """Torchrun workers: tear the NCCL group down while the interpreter is
+    alive and skip the interpreter's library teardown afterwards. With the
+    NVSHMEM symmetric-memory backend (torch 2.13) the worker segfaults after
+    Python has finalised (no Python frame involved: faulthandler is silent and
+    a last ``atexit`` hook that calls ``os._exit`` avoids it), which torchrun
+    then reports as a failed worker although every test passed. The pytest
+    summary is printed before ``atexit`` runs, and the worker's exit status
+    still reflects the test outcome."""
     yield
-    if dist.is_available() and dist.is_initialized():
-        torch.cuda.synchronize()
-        dist.barrier()
-        dist.destroy_process_group()
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    torch.cuda.synchronize()
+    dist.barrier()
+    dist.destroy_process_group()
+    status = 1 if request.session.testsfailed else 0
+
+    def _hard_exit() -> None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+
+    atexit.register(_hard_exit)
 
 
 def _multi_rank_setup(world_sizes):
