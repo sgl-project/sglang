@@ -562,6 +562,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2
         runner._prefix_capture_variants = (1, 2, 4)
+        runner._dcp_extend_active = False
 
         forward_batch = SimpleNamespace(
             batch_size=1,

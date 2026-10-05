@@ -641,7 +641,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._dcp_extend_active = model_runner.ps.attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
-        self._dcp_kv_buffers: Dict[int, torch.Tensor] = {}
+        self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1199,7 +1199,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # it doubles as the replay buffer for this shape.
             metadata = self._plan_dcp_metadata(forward_batch)
             forward_batch.attn_dcp_metadata = metadata
-            self._dcp_kv_buffers[num_tokens] = metadata.dcp_kv_buffer
+            self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
         attn_backend = self.model_runner.attn_backend
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             if not self.use_captured_attn_metadata:
@@ -1230,7 +1230,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The gather and the attention are breaks reading the live batch: plan
             # live indices, but use the bucket-sized buffer (k_nope/k_pe are padded).
             metadata = self._plan_dcp_metadata(forward_batch)
-            metadata.dcp_kv_buffer = self._dcp_kv_buffers[num_tokens]
+            metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
             forward_batch.attn_dcp_metadata = metadata
             static_forward_batch.attn_dcp_metadata = metadata
         attn_backend = self.model_runner.attn_backend
