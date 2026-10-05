@@ -1034,12 +1034,13 @@ sgl-eval run aime25 \\
     // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
     // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
-    // DSA backend: triton (SGLang's ROCm default).
+    // DSA backend: triton (SGLang's ROCm default). Five-step MTP cells select
+    // the top-k v2 indexer kernel, matching InferenceX PR #3724.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1082,7 +1083,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
