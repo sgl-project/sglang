@@ -1,13 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::ExternalPrefixSignal;
-use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
-};
+use super::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Prefix lookup result from the local radix tree or remote KV indexer,
+/// consumed by cache-aware routing.
+pub struct PrefixLookupResult {
+    pub outcome: PrefixOutcome,
+    pub query_blocks: usize,
+    /// The query's block hashes when the local tree answered, so routing can
+    /// record the placement without rehashing.
+    pub block_hashes: Option<Arc<[i64]>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct RadixTreePrefixProvider {
@@ -23,7 +30,7 @@ impl RadixTreePrefixProvider {
         }
     }
 
-    pub fn match_request_tokens(&self, tokens: &[u32]) -> Option<ExternalPrefixSignal> {
+    pub fn match_request_tokens(&self, tokens: &[u32]) -> Option<PrefixLookupResult> {
         let hashes = self.block_hashes(tokens)?;
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
@@ -55,7 +62,7 @@ impl RadixTreePrefixProvider {
             }
         };
         // Empty is still returned so routing can record where this prompt went.
-        Some(ExternalPrefixSignal {
+        Some(PrefixLookupResult {
             outcome,
             query_blocks: hashes.len(),
             block_hashes: self.tree.pending().is_enabled().then(|| hashes.into()),
@@ -63,7 +70,7 @@ impl RadixTreePrefixProvider {
     }
 
     /// Remember that `signal`'s prompt was just routed to `url`.
-    pub fn record_route(&self, signal: &ExternalPrefixSignal, url: &str) {
+    pub fn record_route(&self, signal: &PrefixLookupResult, url: &str) {
         if let Some(hashes) = &signal.block_hashes {
             self.tree.pending().record(url, hashes);
         }
