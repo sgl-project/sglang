@@ -1742,6 +1742,9 @@ class Envs:
     # of every rank computing all rows. Only when rows >= MIN_ROWS.
     SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
     SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
+    # Opt-in (needs SGLANG_DSA_INDEXER_TP_SPLIT): also split when the indexer
+    # runs as the eager break op of a breakable prefill CUDA graph replay.
+    SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
