@@ -222,8 +222,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if self.beam_width is not None and self.beam_width < 1:
-            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
+        if self.beam_width is not None:
+            if not isinstance(self.beam_width, int) or isinstance(self.beam_width, bool):
+                raise ValueError(
+                    f"beam_width must be an integer, got {type(self.beam_width).__name__}."
+                )
+            if self.beam_width < 1:
+                raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -232,9 +237,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k < 1 or self.top_k == -1:
+        if not isinstance(self.top_k, int) or isinstance(self.top_k, bool):
             raise ValueError(
-                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
+                f"top_k must be an integer, got {type(self.top_k).__name__}."
+            )
+        if self.top_k < 1 or self.top_k == -1 or self.top_k > 2**31 - 1:
+            raise ValueError(
+                f"top_k must be -1 (disable) or in [1, 2147483647], got {self.top_k}."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
@@ -249,12 +258,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 "repetition_penalty must be in (0, 2] (1.0 = no penalty), "
                 f"got {self.repetition_penalty}."
             )
+        if not isinstance(self.min_new_tokens, int) or isinstance(self.min_new_tokens, bool):
+            raise ValueError(
+                f"min_new_tokens must be an integer, got {type(self.min_new_tokens).__name__}."
+            )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
                 f"min_new_tokens must be in [0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
             )
         if self.max_new_tokens is not None:
+            if not isinstance(self.max_new_tokens, int) or isinstance(self.max_new_tokens, bool):
+                raise ValueError(
+                    f"max_new_tokens must be an integer, got {type(self.max_new_tokens).__name__}."
+                )
             if self.max_new_tokens < 0:
                 raise ValueError(
                     f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
@@ -264,6 +281,22 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if not isinstance(self.skip_special_tokens, bool):
+            raise ValueError(
+                f"skip_special_tokens must be a boolean, got {type(self.skip_special_tokens).__name__}."
+            )
+        if not isinstance(self.ignore_eos, bool):
+            raise ValueError(
+                f"ignore_eos must be a boolean, got {type(self.ignore_eos).__name__}."
+            )
+        if not isinstance(self.spaces_between_special_tokens, bool):
+            raise ValueError(
+                f"spaces_between_special_tokens must be a boolean, got {type(self.spaces_between_special_tokens).__name__}."
+            )
+        if not isinstance(self.no_stop_trim, bool):
+            raise ValueError(
+                f"no_stop_trim must be a boolean, got {type(self.no_stop_trim).__name__}."
+            )
         if self.logit_bias is not None:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
@@ -288,6 +321,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             vocab_size=vocab_size,
             strict=True,
         )
+
+        for grammar_name, grammar_val in [
+            ("regex", self.regex),
+            ("json_schema", self.json_schema),
+            ("ebnf", self.ebnf),
+            ("structural_tag", self.structural_tag),
+        ]:
+            if grammar_val is not None and not isinstance(grammar_val, str):
+                raise ValueError(
+                    f"{grammar_name} must be a string, got {type(grammar_val).__name__}."
+                )
 
         grammars = [
             self.json_schema,
