@@ -35,6 +35,72 @@ from sglang.srt.session.streaming_session import SessionSlot
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def test_unified_mamba_stats_and_invariant_use_logical_capacity():
+    allocator = SimpleNamespace(
+        size=1_000,
+        page_size=1,
+        available_size=lambda: 900,
+        logical_token_capacity=100,
+        logical_available_size=lambda: 60,
+    )
+    tree_cache = SimpleNamespace(
+        supports_mamba=lambda: True,
+        supports_prefix_sharing=lambda: True,
+        full_evictable_size=lambda: 10,
+        full_protected_size=lambda: 30,
+        mamba_evictable_size=lambda: 0,
+    )
+    req_to_token_pool = SimpleNamespace(
+        schedulable_token_capacity=lambda capacity: capacity,
+        mamba_allocator=SimpleNamespace(available_size=lambda: 1),
+        mamba_pool=SimpleNamespace(size=1),
+        mamba_ckpt_pool=None,
+    )
+    observer = SchedulerPoolStatsObserver(
+        tree_cache=tree_cache,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
+        session_controller=None,
+        hisparse_coordinator=None,
+        is_hybrid_swa=False,
+        is_hybrid_ssm=True,
+        enable_hisparse=False,
+        full_tokens_per_layer=None,
+        swa_tokens_per_layer=None,
+        max_total_num_tokens=100,
+    )
+
+    stats = observer._get_mamba_token_info()
+
+    assert stats.full_available_size == 60
+    assert stats.full_num_used == 30
+    assert stats.full_token_usage == 0.3
+
+    checker = SchedulerInvariantChecker(
+        is_hybrid_swa=False,
+        is_hybrid_ssm=True,
+        disaggregation_mode=DisaggregationMode.NULL,
+        page_size=1,
+        full_tokens_per_layer=None,
+        swa_tokens_per_layer=None,
+        max_total_num_tokens=100,
+        tree_cache=tree_cache,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
+        pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
+        get_last_batch=lambda: None,
+        get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
+    )
+    with patch.object(
+        invariant_checker,
+        "get_parallel",
+        return_value=SimpleNamespace(dcp_enabled=False),
+    ):
+        leak, message = checker._check_full_pool(stats)
+    assert not leak, message
+
+
 class TestCheckTreeCacheGate(CustomTestCase):
     @contextmanager
     def _without_explicit_sanity_check_setting(self):

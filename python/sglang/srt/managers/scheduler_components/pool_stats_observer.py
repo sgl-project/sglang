@@ -266,6 +266,14 @@ class SchedulerPoolStatsObserver:
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
+        logical_available_size = getattr(
+            self.token_to_kv_pool_allocator, "logical_available_size", None
+        )
+        logical_capacity = getattr(
+            self.token_to_kv_pool_allocator, "logical_token_capacity", None
+        )
+        if logical_available_size is not None and logical_capacity is not None:
+            full_available_size = logical_available_size()
         mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running
         # requests) -- this feeds throttle decisions (get_max_pool_usage) which asserts
@@ -282,7 +290,9 @@ class SchedulerPoolStatsObserver:
             else 0
         )
         full_capacity = self.req_to_token_pool.schedulable_token_capacity(
-            self.token_to_kv_pool_allocator.size
+            logical_capacity
+            if logical_capacity is not None
+            else self.token_to_kv_pool_allocator.size
         )
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (

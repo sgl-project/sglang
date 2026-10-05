@@ -3137,7 +3137,9 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(bool((written[~owned] == 0).all()))
                 self.assertTrue(bool((written[owned] > 0).all()))
 
-    def _build_composite(self, *, page_size, lazy_compaction=False):
+    def _build_composite(
+        self, *, page_size, lazy_compaction=False, logical_token_capacity=None
+    ):
         from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
@@ -3168,7 +3170,46 @@ class TestDcpWidening(unittest.TestCase):
             need_sort=False,
             forward_stream=None,
             lazy_compaction=lazy_compaction,
+            logical_token_capacity=logical_token_capacity,
         )
+
+    def test_composite_logical_token_capacity_is_separate_from_physical_budget(self):
+        page_size = 4
+        cap = 3 * page_size
+        allocator = self._build_composite(
+            page_size=page_size, logical_token_capacity=cap
+        )
+
+        # The shared buffer can lend FULL more physical space than the logical
+        # scheduler limit. Both budgets must remain independently observable.
+        self.assertGreater(allocator.size_full, cap)
+        self.assertGreater(allocator.size, cap)
+        self.assertGreater(allocator.available_size(), cap)
+        self.assertEqual(allocator.logical_available_size(), cap)
+
+        allocated = allocator.alloc(2 * page_size)
+        self.assertIsNotNone(allocated)
+        self.assertEqual(allocator.logical_available_size(), cap - 2 * page_size)
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = False
+        self.assertTrue(
+            allocator.check_decode_capacity(num_tokens=page_size, tree_cache=tree_cache)
+        )
+        self.assertFalse(
+            allocator.check_decode_capacity(
+                num_tokens=page_size + 1, tree_cache=tree_cache
+            )
+        )
+
+        allocator.free(allocated)
+        self.assertEqual(allocator.logical_available_size(), cap)
+
+        with self._dcp(2):
+            allocator = self._build_composite(
+                page_size=page_size, logical_token_capacity=cap
+            )
+            self.assertEqual(allocator.logical_token_capacity, cap * 2)
+            self.assertEqual(allocator.logical_available_size(), cap * 2)
 
     def _build_donor_cache(self, allocator, mamba_slot_allocator, full_leaves):
         cache = object.__new__(UnifiedRadixCache)
