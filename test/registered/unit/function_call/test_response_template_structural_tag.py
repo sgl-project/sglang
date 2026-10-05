@@ -151,9 +151,9 @@ class TestToolCallStructuralTag(CustomTestCase):
                 self.assertIs(_accepts(tag, text), expected)
         self.assertIsNone(_build(ANSWER_TEMPLATE, tools=()))
 
-    def test_required_reasoning_opens_the_message(self):
+    def test_required_reasoning_opens_the_message_with_visible_text(self):
         loaded = load_response_template(ANSWER_TEMPLATE)
-        for required, expected in ((False, True), (True, False)):
+        for required in (False, True):
             tag = tool_call_structural_tag(
                 loaded.fields["tool_calls"],
                 [WEATHER],
@@ -163,9 +163,15 @@ class TestToolCallStructuralTag(CustomTestCase):
                 message_start=["<assistant>"],
                 grammar_requires_reasoning=required,
             )
-            with self.subTest(required=required):
-                self.assertIs(_accepts(tag, "<answer>Sunny."), expected)
-                self.assertTrue(_accepts(tag, "<think></think><answer>Sunny."))
+            cases = [
+                ("<answer>Sunny.", not required),
+                ("<think></think><answer>Sunny.", not required),
+                ("<think> \n</think><answer>Sunny.", not required),
+                ("<think>\nplan</think><answer>Sunny.", True),
+            ]
+            for text, expected in cases:
+                with self.subTest(required=required, text=text):
+                    self.assertIs(_accepts(tag, text), expected)
 
     def test_json_arguments_follow_schema(self):
         template = copy.deepcopy(TEMPLATE)

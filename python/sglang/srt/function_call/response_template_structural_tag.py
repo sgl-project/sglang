@@ -36,6 +36,8 @@ _START = "\0"
 _MAX_LITERALS = 16
 _WHITESPACE = {"type": "regex", "pattern": r"\s*"}
 _ANY_TEXT = {"type": "any_text"}
+# Character classes in XGrammar regexes take whitespace only as escapes.
+_BLANKS = {" ": " ", "\t": r"\t", "\n": r"\n", "\r": r"\r"}
 # Keywords that describe a schema without constraining its values.
 _ANNOTATIONS = frozenset(
     {"title", "description", "default", "examples", "deprecated", "$comment"}
@@ -194,12 +196,32 @@ def _call_opener(
 
 
 def _thinking_format(
-    thinking: ResponseTemplateField, message_start: list[str] | None
+    thinking: ResponseTemplateField,
+    message_start: list[str] | None,
+    visible: bool = False,
 ) -> dict[str, Any] | None:
+    """The reasoning, which holds `visible` text if asked."""
     openers, closers = _openers(thinking, message_start), _closers(thinking)
     if not openers or not closers:
         return None
-    return _one_of([_tag(opener, _ANY_TEXT, closers) for opener in openers])
+    text = _sequence(_visible_start(closers), _ANY_TEXT) if visible else _ANY_TEXT
+    return _one_of([_tag(opener, text, closers) for opener in openers])
+
+
+def _visible_start(excludes: list[str]) -> dict[str, Any]:
+    """Whitespace, then a visible character. None of them starts one of the
+    `excludes`, which the text after them could no longer see."""
+    starts = {text[0] for text in excludes if text}
+    blank = "".join(escape for char, escape in _BLANKS.items() if char not in starts)
+    visible = "".join(map(_class_escape, sorted(starts)))
+    return {
+        "type": "regex",
+        "pattern": (f"[{blank}]*" if blank else "") + rf"[^\s{visible}]",
+    }
+
+
+def _class_escape(char: str) -> str:
+    return "\\" + char if char in "\\]^-[" else char
 
 
 def message_start_anchors(template: ResponseTemplate) -> list[str]:
@@ -761,13 +783,14 @@ def _structural_tag(
     grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     """Frame output at the message start or after reasoning, which is optional
-    unless `grammar_requires_reasoning` makes the message open with it."""
+    unless `grammar_requires_reasoning` makes the message open with visible
+    reasoning."""
     rest = output(None)
     if rest is None:
         return None
     think = None
     if thinking is not None:
-        think = _thinking_format(thinking, message_start)
+        think = _thinking_format(thinking, message_start, grammar_requires_reasoning)
         if think is None:
             return None
     if message_start is None:
