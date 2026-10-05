@@ -1434,6 +1434,7 @@ class InklingForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         loaded_params: Set[str] = set()
         embed_tokens_weight: Optional[torch.Tensor] = None
 
@@ -1454,19 +1455,12 @@ class InklingForConditionalGeneration(nn.Module):
 
             if any(name.endswith(suffix) for suffix in KV_REPLICATED_SUFFIXES):
                 layer_id = get_layer_id(name)
-                if layer_id is not None:
-                    num_kv_heads, head_dim = (
-                        (
-                            self.text_config.swa_num_key_value_heads,
-                            self.text_config.swa_head_dim,
-                        )
-                        if layer_id in set(self.text_config.local_layer_ids)
-                        else (
-                            self.text_config.num_key_value_heads,
-                            self.text_config.head_dim,
-                        )
-                    )
-                    attn_tp_size = get_parallel().attn_tp_size
+                attention = modules_dict.get(name.rsplit(".", 2)[0])
+                if layer_id is not None and attention is not None:
+                    qkvr = getattr(attention.qkvr, "base_layer", attention.qkvr)
+                    num_kv_heads = qkvr.inkling_num_kv_heads
+                    head_dim = qkvr.inkling_head_dim
+                    attn_tp_size = qkvr.inkling_tp_size
                     if (
                         attn_tp_size > num_kv_heads
                         and loaded_weight.shape[0] == num_kv_heads * head_dim
@@ -1480,7 +1474,7 @@ class InklingForConditionalGeneration(nn.Module):
                                 .reshape(attn_tp_size * head_dim, -1)
                             )
                         else:
-                            kv_head_idx = get_parallel().attn_tp_rank // replicas
+                            kv_head_idx = qkvr.tp_rank // replicas
                             loaded_weight = loaded_weight.narrow(
                                 0, kv_head_idx * head_dim, head_dim
                             )
@@ -1517,7 +1511,9 @@ class InklingForConditionalGeneration(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_parallel().attn_tp_rank * shard_size
+                        projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
+                        projection = getattr(projection, "base_layer", projection)
+                        start = projection.tp_rank * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     if lora_compatible_layout_enabled():
                         # Local interleaved rows -> [gate||up] so contiguous swiglu and
@@ -1908,6 +1904,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
@@ -1954,7 +1951,9 @@ class InklingForConditionalGenerationMTP(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_parallel().attn_tp_rank * shard_size
+                        projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
+                        projection = getattr(projection, "base_layer", projection)
+                        start = projection.tp_rank * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     default_weight_loader(param, loaded_weight)
                     loaded_params.add(sgl_name)
