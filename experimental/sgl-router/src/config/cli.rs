@@ -379,7 +379,7 @@ pub struct AffinityArgs {
     pub affinity_mode: Option<AffinityMode>,
 
     /// Reorg balanced affinity: load compared against the alternative
-    /// (default pending-prefill-tokens).
+    /// (default prefill-tokens).
     #[arg(long, value_enum)]
     pub affinity_balanced_by: Option<BalancedBy>,
 
@@ -1211,7 +1211,7 @@ mod tests {
                 }
             }
             for (metric, balanced_by, gap) in [
-                ("", BalancedBy::PendingPrefillTokens, 1_024),
+                ("", BalancedBy::PrefillTokens, 1_024),
                 (
                     "--affinity-balanced-by running-requests",
                     BalancedBy::RunningRequests,

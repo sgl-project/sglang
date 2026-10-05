@@ -8,17 +8,29 @@ use crate::workers::Worker;
 use super::admission::EngineMetrics;
 use super::{Pick, PickError};
 
+/// `uncached_tokens(engine)`: this request's prompt tokens `engine` would prefill.
 pub(super) fn choose(
     config: &AffinityConfig,
     affinity: Option<Pick>,
     alternative: Result<Pick, PickError>,
     load: &EngineReportedLoadSnapshot,
+    uncached_tokens: impl Fn(&Worker) -> u64,
 ) -> Result<Pick, PickError> {
     let Some(affinity) = affinity else {
         return alternative;
     };
     match alternative {
-        Ok(pick) if prefer_alternative(config, &affinity.engine, &pick.engine, load) => Ok(pick),
+        Ok(pick)
+            if prefer_alternative(
+                config,
+                &affinity.engine,
+                &pick.engine,
+                load,
+                uncached_tokens,
+            ) =>
+        {
+            Ok(pick)
+        }
         Ok(_)
         | Err(
             PickError::NoCandidates
@@ -34,14 +46,18 @@ fn prefer_alternative(
     affinity: &Worker,
     alternative: &Worker,
     load: &EngineReportedLoadSnapshot,
+    uncached_tokens: impl Fn(&Worker) -> u64,
 ) -> bool {
     if config.mode != AffinityMode::Balanced {
         return false;
     }
-    let metric = |engine| {
+    // Each engine's load if it takes this request.
+    let metric = |engine: &Worker| {
         let metrics = EngineMetrics::observe(engine, load);
         match config.balanced_by {
-            BalancedBy::PendingPrefillTokens => metrics.pending_prefill_tokens,
+            BalancedBy::PrefillTokens => metrics
+                .pending_prefill_tokens
+                .map(|pending| pending.saturating_add(uncached_tokens(engine))),
             BalancedBy::RunningRequests => metrics.running_requests,
         }
     };

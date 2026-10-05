@@ -382,6 +382,10 @@ async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
         (AffinityMode::Balanced, 100, 50, false, "owner"),
         (AffinityMode::Balanced, 10, 0, false, "owner"),
         (AffinityMode::Balanced, 100, 40, false, "cold"),
+        // The cold engine would also prefill the owner's 8 cached tokens:
+        // 100 vs 45 + 8 misses the factor, and 20 vs 5 + 8 misses the gap.
+        (AffinityMode::Balanced, 100, 45, false, "owner"),
+        (AffinityMode::Balanced, 20, 5, false, "owner"),
         (AffinityMode::Balanced, 100, 40, true, "owner"),
     ] {
         let table = EngineReportedLoadTable::new();
@@ -426,7 +430,8 @@ async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
 async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
     let engines = [engine("owner", 0), engine("cold", 9)];
     let model = ModelId("m".into());
-    // Default gap is 4 requests; no native load is reported.
+    // Default gap is 4 requests; no native load is reported, and the owner's
+    // cached prefix does not count.
     for (owner, cold, expected) in [
         (10, Some(2), "cold"),
         (10, Some(6), "owner"),
