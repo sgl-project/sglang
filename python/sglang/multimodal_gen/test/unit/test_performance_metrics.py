@@ -357,6 +357,7 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     assert scenario.runtime_peak_allocated_mb == 2000.5
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
+    assert config.tolerances.load is None
 
 
 def test_peak_vram_validation_uses_independent_tolerances():
