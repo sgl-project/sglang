@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
@@ -64,9 +63,9 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 int,
                 MSCCLPPEPLayout,
                 bool,
-                Optional[tuple[int, int]],
+                tuple[int, int] | None,
             ],
-            tuple[object, object, Optional[torch.Tensor], int],
+            tuple[object, object, torch.Tensor | None, int],
         ]
     ] = {}
 
@@ -133,8 +132,8 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         allocation_capacity: int,
         output_layout: MSCCLPPEPLayout,
         enable_direct_send: bool,
-        num_blocks: Optional[tuple[int, int]],
-    ) -> tuple[object, object, Optional[torch.Tensor], int]:
+        num_blocks: tuple[int, int] | None,
+    ) -> tuple[object, object, torch.Tensor | None, int]:
         key = (
             group,
             num_experts,
@@ -174,25 +173,24 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 "the new mscclpp.ep API build."
             )
         native_output_layout = getattr(DispatchLayout, output_layout.name)
-        communicator_config = dict(
-            comm=ep_group,
-            device=torch.cuda.current_device(),
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            local_expert_start=ep_group.my_rank * num_local_experts,
-            hidden_size=hidden_size,
-            topk=router_topk,
-            max_tokens_per_rank=allocation_capacity,
-            mode=MoEMode.LATENCY,
-            output_layout=native_output_layout,
-            invalid_token_expert_id=num_experts,
-            num_blocks=num_blocks,
-        )
+        communicator_config = {
+            "comm": ep_group,
+            "device": torch.device("cuda", torch.cuda.current_device()),
+            "num_experts": num_experts,
+            "hidden_size": hidden_size,
+            "topk": router_topk,
+            "max_tokens_per_rank": allocation_capacity,
+            "mode": MoEMode.LATENCY,
+            "output_layout": native_output_layout,
+            "invalid_token_expert_id": num_experts,
+            "num_blocks": num_blocks,
+        }
         if enable_direct_send:
             communicator_config["combine_mode"] = CombineMode.DIRECT_SEND
         moe_comm = MoECommunicator(MoECommunicatorConfig(**communicator_config))
         if not moe_comm.is_available():
             raise RuntimeError("MSCCL++ EP low-latency runtime is unavailable")
+        moe_comm.initialize()
 
         if output_layout == MSCCLPPEPLayout.RANK_MAJOR:
             dispatch_output_buffer = moe_comm.get_dispatch_output_buffer()
@@ -283,6 +281,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         # layers run sequentially, so each layer's dispatch->combine pair owns
         # the shared communicator for the duration of its forward.
         self._combine_handle = None
+        self._active_capacity = None
 
     def _select_active_capacity(self, num_tokens: int) -> int:
         from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
@@ -324,6 +323,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             ),
         )
         self._combine_handle = handle
+        self._active_capacity = active_capacity
 
         hidden_states_scale = (
             None if dispatch_out.quant is None else dispatch_out.quant.block_scales
@@ -336,14 +336,16 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             assert dispatch_out.combine_input_buffer is not None
             active_rows = self.num_ranks * active_capacity
             return MSCCLPPRankMajorLatencyDispatchOutput(
-                hidden_states=dispatch_out.tokens[:active_rows],
+                hidden_states=dispatch_out.tokens.view(active_rows, self.hidden_size),
                 hidden_states_scale=hidden_states_scale,
                 topk_output=StandardTopKOutput(
-                    dispatch_out.weights[:active_rows],
-                    dispatch_out.topk_ids[:active_rows],
+                    dispatch_out.weights.view(active_rows, self.router_topk),
+                    dispatch_out.topk_ids.view(active_rows, self.router_topk),
                     topk_output.router_logits,
                 ),
-                expert_output_buffer=dispatch_out.combine_input_buffer,
+                expert_output_buffer=dispatch_out.combine_input_buffer.view(
+                    active_rows, self.hidden_size
+                ),
                 enable_direct_send=self.enable_direct_send,
             )
 
@@ -360,14 +362,24 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         assert self._combine_handle is not None, (
             "MSCCL++ low-latency combine called before dispatch"
         )
+        assert self._active_capacity is not None
+
+        hidden_states = combine_input.hidden_states
+        if self.output_layout == MSCCLPPEPLayout.RANK_MAJOR:
+            hidden_states = hidden_states.view(
+                self.num_ranks,
+                self._active_capacity,
+                self.hidden_size,
+            )
 
         combined_x = self._moe_comm.combine(
-            combine_input.hidden_states,
+            hidden_states,
             self._combine_handle,
             apply_router_weights=combine_input.apply_router_weights,
         )
 
         self._combine_handle = None
+        self._active_capacity = None
         return combined_x
 
 
@@ -408,7 +420,7 @@ class MSCCLPPDispatcher(BaseDispatcher):
             output_layout=output_layout,
         )
 
-        self._active_dispatcher: Optional[_MSCCLPPDispatcherImplBase] = None
+        self._active_dispatcher: _MSCCLPPDispatcherImplBase | None = None
 
     def _resolve_dispatcher(self) -> _MSCCLPPDispatcherImplBase:
         return self._dispatcher

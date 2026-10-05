@@ -27,14 +27,12 @@ import gc
 import json
 import os
 import statistics
-from contextlib import ExitStack
-from typing import Callable, Optional
+from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
 
 import msgspec
 import torch
 import torch.distributed as dist
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -55,6 +53,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import publish_build_topology
+from torch.profiler import ProfilerActivity, profile
 
 DTYPE = torch.bfloat16
 MSCCLPP_LL_HIDDEN_SIZES = (4096, 4352, 5120, 6656, 7168, 8192, 8704, 9216)
@@ -330,6 +329,35 @@ class FusedMoEPipeline:
         self._stack.close()
 
 
+@contextmanager
+def flashinfer_cutlass_autotune():
+    """Tune CUTLASS tactics consistently across the expert-parallel group."""
+    from flashinfer.autotuner import (
+        autotune,
+        get_autotune_process_group,
+        set_autotune_process_group,
+    )
+
+    tp_group = get_parallel().tp_group
+    process_group = tp_group.cpu_group if tp_group.world_size > 1 else None
+    previous_group = get_autotune_process_group()
+    set_autotune_process_group(process_group)
+    try:
+        with autotune(True):
+            yield
+    finally:
+        set_autotune_process_group(previous_group)
+
+
+def clear_flashinfer_cutlass_autotune() -> None:
+    """Force the next CUTLASS backend to tune independently."""
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.reset_statistics()
+
+
 def synchronize() -> None:
     torch.cuda.synchronize()
     dist.barrier()
@@ -476,7 +504,7 @@ def profile_graph_phase_latencies_us(
 
 
 def _aggregate_profiled_phase_latencies(
-    prof: Optional[profile],
+    prof: profile | None,
     phase_kernel_names: tuple[set[str], set[str], set[str]],
     denominator: int,
 ) -> dict[str, float]:
@@ -628,7 +656,7 @@ def capture_graph(
     synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=torch.cuda.current_stream()):
         for _ in range(graph_iters):
             output = pipeline(inputs)
     synchronize()
@@ -697,62 +725,90 @@ def run_rank_major(
     outputs = {}
     paths = (
         (
-            "flashinfer-rank-major-cutlass",
-            MoeA2ABackend.FLASHINFER,
+            "mscclpp-ll-rank-major-cutlass",
+            MoeA2ABackend.MSCCLPP,
             MoeRunnerBackend.FLASHINFER_CUTLASS,
         ),
         (
-            "mscclpp-ll-rank-major-cutlass",
-            MoeA2ABackend.MSCCLPP,
+            "flashinfer-rank-major-cutlass",
+            MoeA2ABackend.FLASHINFER,
             MoeRunnerBackend.FLASHINFER_CUTLASS,
         ),
     )
     for name, a2a_backend, runner_backend in paths:
         if rank == 0:
             print(f"Preparing {name}...", flush=True)
-        pipeline = FusedMoEPipeline(config, rank, a2a_backend, runner_backend, device)
-        try:
-            if rank == 0:
-                print(f"Running {name} eager warmup...", flush=True)
-            eager = pipeline(inputs).clone()
-            if rank == 0:
-                print(f"Calibrating {name} phase kernel names...", flush=True)
-            phase_kernel_names = calibrate_phase_kernel_names(pipeline.layer, inputs)
-            if rank == 0:
-                print(f"Capturing {name} CUDA Graph...", flush=True)
-            graph, graph_output, graph_iters = capture_graph(
-                pipeline, inputs, config.warmup_iters
+        benchmark_stream = torch.cuda.Stream()
+        graph = None
+        eager = None
+        graph_output = None
+        phase_kernel_names = None
+        with torch.cuda.stream(benchmark_stream):
+            pipeline = FusedMoEPipeline(
+                config, rank, a2a_backend, runner_backend, device
             )
-            graph.replay()
-            synchronize()
-            assert_close(eager, graph_output, config, f"{name} eager vs graph")
-            outputs[name] = graph_output.clone()
-            total_us = median_graph_latency_us(
-                graph, config.warmup_iters, config.benchmark_iters, graph_iters
-            )
-            if rank == 0:
-                print(f"Profiling {name} CUDA Graph kernels...", flush=True)
-            results[name] = profile_graph_phase_latencies_us(
-                graph,
-                phase_kernel_names,
-                total_us,
-                config.warmup_iters,
-                config.benchmark_iters,
-                graph_iters,
-            )
-            if rank == 0:
-                print(f"Finished {name}.", flush=True)
-            graph.reset()
-        finally:
-            pipeline.close()
-        synchronize()
+            try:
+                if rank == 0:
+                    print(f"Autotuning {name} CUTLASS tactics...", flush=True)
+                with flashinfer_cutlass_autotune():
+                    pipeline(inputs)
+                synchronize()
+                if rank == 0:
+                    print(f"Running {name} eager warmup...", flush=True)
+                eager = pipeline(inputs).clone()
+                if rank == 0:
+                    print(f"Calibrating {name} phase kernel names...", flush=True)
+                phase_kernel_names = calibrate_phase_kernel_names(
+                    pipeline.layer, inputs
+                )
+                if rank == 0:
+                    print(f"Capturing {name} CUDA Graph...", flush=True)
+                graph, graph_output, graph_iters = capture_graph(
+                    pipeline, inputs, config.warmup_iters
+                )
+                graph.replay()
+                synchronize()
+                assert_close(eager, graph_output, config, f"{name} eager vs graph")
+                outputs[name] = graph_output.detach().cpu()
+                total_us = median_graph_latency_us(
+                    graph, config.warmup_iters, config.benchmark_iters, graph_iters
+                )
+                if rank == 0:
+                    print(f"Profiling {name} CUDA Graph kernels...", flush=True)
+                results[name] = profile_graph_phase_latencies_us(
+                    graph,
+                    phase_kernel_names,
+                    total_us,
+                    config.warmup_iters,
+                    config.benchmark_iters,
+                    graph_iters,
+                )
+                if rank == 0:
+                    print(f"Finished {name}.", flush=True)
+            finally:
+                synchronize()
+                if graph is not None:
+                    graph.reset()
+                del graph, graph_output, eager, phase_kernel_names
+                pipeline.close()
+                del pipeline
+                if a2a_backend == MoeA2ABackend.MSCCLPP:
+                    MSCCLPPDispatcher.clear_shared_resources()
+                gc.collect()
+                torch.cuda.empty_cache()
+                clear_flashinfer_cutlass_autotune()
+                synchronize()
+        del benchmark_stream
 
+    flashinfer_output = outputs["flashinfer-rank-major-cutlass"].to(device)
+    mscclpp_output = outputs["mscclpp-ll-rank-major-cutlass"].to(device)
     max_abs, max_rel = assert_close(
-        outputs["flashinfer-rank-major-cutlass"],
-        outputs["mscclpp-ll-rank-major-cutlass"],
+        flashinfer_output,
+        mscclpp_output,
         config,
         "MSCCL++ vs FlashInfer rank-major",
     )
+    del flashinfer_output, mscclpp_output
     if rank == 0:
         print(f"Correctness: PASS max_abs={max_abs:.6g} max_rel={max_rel:.6g}")
         for name, latencies in results.items():
@@ -821,7 +877,7 @@ def _reference_dispatch(
     recv_hidden = exchange(send_hidden, (config.hidden_size,), DTYPE)
     recv_ids = exchange(send_ids, (config.top_k,), torch.int32)
     recv_weights = exchange(send_weights, (config.top_k,), torch.float32)
-    recv_token_indices = exchange(send_token_indices, (), torch.int64)
+    exchange(send_token_indices, (), torch.int64)
     recv_topk = StandardTopKOutput(
         recv_weights,
         recv_ids,
@@ -879,38 +935,73 @@ def triton_all_to_all_reference(
 def run_expert_major(
     config: BenchmarkConfig, rank: int, inputs: Inputs, device: torch.device
 ) -> None:
-    mscclpp = FusedMoEPipeline(
-        config,
-        rank,
-        MoeA2ABackend.MSCCLPP,
-        MoeRunnerBackend.TRITON,
-        device,
-    )
-    try:
-        if rank == 0:
-            print("Running mscclpp-ll-expert-major-triton...", flush=True)
-        mscclpp_output = mscclpp(inputs).clone()
-        phase_kernel_names = calibrate_phase_kernel_names(
-            mscclpp.layer,
-            inputs,
-            allow_ambiguous=True,
+    benchmark_stream = torch.cuda.Stream()
+    graph = None
+    eager = None
+    graph_output = None
+    phase_kernel_names = None
+    with torch.cuda.stream(benchmark_stream):
+        mscclpp = FusedMoEPipeline(
+            config,
+            rank,
+            MoeA2ABackend.MSCCLPP,
+            MoeRunnerBackend.TRITON,
+            device,
         )
-        mscclpp_us = median_eager_latency_us(
-            lambda: mscclpp(inputs),
-            config.warmup_iters,
-            config.benchmark_iters,
-        )
-        mscclpp_phases = profile_eager_phase_latencies_us(
-            mscclpp,
-            inputs,
-            phase_kernel_names,
-            config.warmup_iters,
-            config.benchmark_iters,
-        )
-    finally:
-        mscclpp.close()
-        MSCCLPPDispatcher.clear_shared_resources()
-        gc.collect()
+        try:
+            if rank == 0:
+                print("Running mscclpp-ll-expert-major-triton eager...", flush=True)
+            eager = mscclpp(inputs).clone()
+            phase_kernel_names = calibrate_phase_kernel_names(
+                mscclpp.layer,
+                inputs,
+                allow_ambiguous=True,
+            )
+            if rank == 0:
+                print(
+                    "Capturing mscclpp-ll-expert-major-triton CUDA Graph...",
+                    flush=True,
+                )
+            graph, graph_output, graph_iters = capture_graph(
+                mscclpp,
+                inputs,
+                config.warmup_iters,
+            )
+            graph.replay()
+            synchronize()
+            assert_close(
+                eager,
+                graph_output,
+                config,
+                "MSCCL++ expert-major eager vs graph",
+            )
+            mscclpp_output = graph_output.detach().cpu()
+            total_us = median_graph_latency_us(
+                graph,
+                config.warmup_iters,
+                config.benchmark_iters,
+                graph_iters,
+            )
+            mscclpp_latencies = profile_graph_phase_latencies_us(
+                graph,
+                phase_kernel_names,
+                total_us,
+                config.warmup_iters,
+                config.benchmark_iters,
+                graph_iters,
+            )
+        finally:
+            synchronize()
+            if graph is not None:
+                graph.reset()
+            del graph, graph_output, eager, phase_kernel_names
+            mscclpp.close()
+            del mscclpp
+            MSCCLPPDispatcher.clear_shared_resources()
+            gc.collect()
+            torch.cuda.empty_cache()
+            synchronize()
+    del benchmark_stream
     synchronize()
 
     reference = FusedMoEPipeline(
@@ -926,14 +1017,10 @@ def run_expert_major(
         reference_output = triton_all_to_all_reference(
             reference, inputs, config, rank
         ).clone()
-        reference_us = median_eager_latency_us(
-            lambda: triton_all_to_all_reference(reference, inputs, config, rank),
-            config.warmup_iters,
-            config.benchmark_iters,
-        )
     finally:
         reference.close()
 
+    mscclpp_output = mscclpp_output.to(device)
     max_abs, max_rel = assert_close(
         reference_output,
         mscclpp_output,
@@ -942,22 +1029,10 @@ def run_expert_major(
     )
     if rank == 0:
         print(f"Correctness: PASS max_abs={max_abs:.6g} max_rel={max_rel:.6g}")
-        dispatch_us, compute_us, combine_us, unclassified_us = mscclpp_phases
+        print(f"mscclpp-ll-expert-major-triton: {mscclpp_latencies}")
         print(
-            "mscclpp-ll-expert-major-triton: "
-            f"eager median latency={mscclpp_us:.2f} us "
-            f"(rank-0 median CUDA kernels: dispatch={dispatch_us:.2f} us, "
-            f"compute={compute_us:.2f} us, combine={combine_us:.2f} us, "
-            f"unclassified={unclassified_us:.2f} us)"
-        )
-        print(
-            f"triton-all-to-all-reference: eager median latency={reference_us:.2f} us"
-        )
-        print(
-            "Reference phase timing is omitted because its explicit PyTorch "
-            "variable-split all-to-all calls cannot be classified reliably by "
-            "CUDA kernel name. Its performance is not an apples-to-apples "
-            "comparison with MSCCL++."
+            "The Triton all-to-all reference is used for correctness only; its "
+            "explicit variable-split collectives are not graph benchmarked."
         )
 
 
