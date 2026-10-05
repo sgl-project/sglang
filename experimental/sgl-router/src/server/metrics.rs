@@ -179,8 +179,9 @@ pub enum RequestOutcome {
     /// The worker failed to serve the request: a 5xx fault, a transport failure,
     /// a timeout, or a body that never completed.
     Error,
-    /// The router cancelled the request itself — today only the stale-request
-    /// deadline. Never derived from a status; see [`outcome_from_status`].
+    /// The router cancelled the request itself: the stale-request deadline, or
+    /// a PD decode dispatch abandoned because prefill failed first. Never
+    /// derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 
@@ -260,11 +261,14 @@ pub enum StreamOutcome {
     ClientDisconnect,
     /// The router's stale-request deadline aborted the stream.
     Expired,
+    /// The router aborted the stream before its first chunk.
+    Aborted,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
     match end.reason {
         StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::Aborted => StreamOutcome::Aborted,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
         | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
@@ -282,6 +286,7 @@ impl StreamOutcome {
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
             Self::Expired => "expired",
+            Self::Aborted => "aborted",
         }
     }
 }
@@ -1602,6 +1607,7 @@ mod tests {
             (StreamEndReason::IdleTimeout, UpstreamError),
             (StreamEndReason::PumpPanicked, UpstreamError),
             (StreamEndReason::Expired, Expired),
+            (StreamEndReason::Aborted, Aborted),
         ] {
             for saw_error_event in [false, true] {
                 let end = StreamEnd {
