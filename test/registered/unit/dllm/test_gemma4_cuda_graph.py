@@ -26,13 +26,13 @@ class _ReadStream:
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
 
-    def fill_packed_read_stream(
+    def pack_read_stream(
         self,
+        plan,
         *,
         req_pool_indices,
         seq_lens,
         indptr,
-        total_tokens,
         out,
         kv_start_idx=None,
         sliding_window=False,
@@ -91,6 +91,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         requests = torch.tensor([1, 2, 0])
         # Prefixes 3, 11, and an empty padded request; each has a four-token canvas.
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=requests,
             seq_lens=torch.tensor([7, 15, 4]),
@@ -126,6 +127,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             metadata.window_kv_indices.data_ptr(),
         )
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=torch.tensor([3, 1, 0]),
             seq_lens=torch.tensor([4, 9, 4]),

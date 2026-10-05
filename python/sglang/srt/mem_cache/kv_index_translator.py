@@ -342,6 +342,91 @@ class KVIndexTranslator:
             sliding_window_ids=out_swa,
         )
 
+    # -- readers: derive from the plan, never translate -------------------------
+
+    def read_source(
+        self,
+        plan: KVLocPlan,
+        *,
+        req_pool_indices: torch.Tensor,
+        bs: int,
+    ) -> KVIndexTable:
+        """Where lane ``b``'s ids are gathered from: the plan's table on the
+        unified pool (lane ``b`` is the plan's row ``b``, padded lanes reading
+        the sink), ``req_to_token`` at the caller's ``req_pool_indices``
+        otherwise. For a gather kernel that takes a table, its rows and its
+        entry granularity."""
+        table = plan.read_table(rows=bs)
+        if table.is_translated:
+            return table
+        return KVIndexTable(
+            ids=self.req_to_token,
+            row_ids=req_pool_indices,
+            row_stride=self.req_to_token.stride(0),
+            entry_page_size=1,
+            is_translated=False,
+            sliding_window_ids=None,
+        )
+
+    def pack_read_stream(
+        self,
+        plan: KVLocPlan,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        indptr: torch.Tensor,
+        out: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
+        sliding_window: bool = False,
+        token_mapping: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Fill ``out``'s CSR rows with the ids a paged wrapper plans over and
+        report whether they are physical: one gather from `read_source`. A
+        ``False`` return means the ids are still VIRTUAL (a static pool, or
+        DCP, where `translate_dcp_read_ids` finishes them). A static SWA pool
+        can pass its full->swa table as ``token_mapping`` to fuse that
+        translation into the gather."""
+        bs = int(seq_lens.numel())
+        src = self.read_source(plan, req_pool_indices=req_pool_indices, bs=bs)
+        assert token_mapping is None or not src.is_translated
+        ids = src.sliding_window_ids if sliding_window else src.ids
+        assert ids is not None, "pack_read_stream: no sliding-window table here"
+        create_flashinfer_kv_indices_triton[(bs,)](
+            ids,
+            src.row_ids[:bs],
+            seq_lens,
+            indptr,
+            kv_start_idx,
+            out,
+            src.row_stride,
+            ENTRY_PAGE_SIZE=src.entry_page_size,
+            token_mapping=token_mapping,
+        )
+        return src.is_translated or token_mapping is not None
+
+    def copy_page_table(
+        self,
+        plan: KVLocPlan,
+        *,
+        out: torch.Tensor,
+        sliding_window_out: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Copy the plan's page table into ``out``, a capture-stable table a
+        captured graph reads (one row per lane, padded lanes reading the sink).
+        Columns past a row's live prefix keep stale values, which the kernels
+        never read past their own lengths."""
+        assert self.reads_are_translated, (
+            "copy_page_table: reads stay virtual here (a non-unified pool, or "
+            "DCP, where the caller selects this rank's share itself)"
+        )
+        table = plan.read_table(rows=out.shape[0])
+        width = min(out.shape[1], table.ids.shape[1])
+        out[:, :width].copy_(table.ids[: out.shape[0], :width])
+        if sliding_window_out is not None:
+            sliding_window_out[:, :width].copy_(
+                table.sliding_window_ids[: out.shape[0], :width]
+            )
+
     # -- per-batch view --------------------------------------------------------
 
     @property
