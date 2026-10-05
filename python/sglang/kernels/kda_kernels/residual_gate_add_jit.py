@@ -241,12 +241,11 @@ def _is_transposed_dense_residual(
     )
 
 
-def can_use_residual_gate_add_cuda(
+def _can_use_residual_gate_add_common(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
     return (
-        torch.version.hip is None
-        and residual.dtype in _SUPPORTED_DTYPES
+        residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype
         and residual.dtype == gate.dtype
         and residual.is_cuda
@@ -267,6 +266,23 @@ def can_use_residual_gate_add_cuda(
             or _is_transposed_dense_residual(residual, update, gate)
         )
         and (gate.is_contiguous() or _is_batched_row_gate(residual, gate))
+    )
+
+
+def can_use_residual_gate_add_cuda(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    """Return whether the NVIDIA-only JIT/Triton dispatch can handle the input."""
+    return torch.version.hip is None and _can_use_residual_gate_add_common(
+        residual, update, gate
+    )
+
+def can_use_residual_gate_add_cuda(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    """Return whether the NVIDIA-only JIT/Triton dispatch can handle the input."""
+    return torch.version.hip is None and _can_use_residual_gate_add_common(
+        residual, update, gate
     )
 
 
