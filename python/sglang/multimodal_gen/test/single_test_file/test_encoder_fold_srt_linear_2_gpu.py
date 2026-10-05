@@ -24,6 +24,8 @@ def _worker() -> int:
         get_world_group,
         init_distributed_environment,
         initialize_model_parallel,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
         use_tensor_parallel_group,
     )
     from sglang.multimodal_gen.runtime.models.encoders.base import (
