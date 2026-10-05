@@ -109,10 +109,12 @@ jobs:
               - "rust/sglang-renderer/**"
               - "rust/sglang-processor/**"
             server_args_docs:
-              # test_server_args_docs_coverage.py diffs this doc against the CLI,
-              # so a docs only edit can break that test. Kept out of main_package
-              # which also gates every GPU stage. Only the CPU stage reads this.
+              # test_server_args_docs_coverage.py diffs this doc and its allowlist
+              # against the CLI, so a docs only edit can break that test. Kept out
+              # of main_package which also gates every GPU stage. Only the CPU
+              # stage reads this.
               - "docs/docs/advanced_features/server_arguments.mdx"
+              - "docs/docs/advanced_features/server_arguments_undocumented.txt"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"

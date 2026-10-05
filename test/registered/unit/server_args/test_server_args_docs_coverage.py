@@ -1,5 +1,5 @@
 """Every live ServerArgs flag needs a row in server_arguments.mdx and every flag
-the doc names must still register. The allowlist below may only shrink.
+the doc names must still register. The allowlist may only shrink.
 """
 
 import argparse
@@ -20,13 +20,11 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_DOC_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "docs"
-    / "docs"
-    / "advanced_features"
-    / "server_arguments.mdx"
-)
+_DOC_DIR = Path(__file__).resolve().parents[4] / "docs" / "docs" / "advanced_features"
+_DOC_PATH = _DOC_DIR / "server_arguments.mdx"
+# Live flags with no row. May only shrink. Kept beside the doc, outside the
+# main_package CI paths, so a PR that backfills rows runs only the CPU stage.
+_UNDOCUMENTED_PATH = _DOC_DIR / "server_arguments_undocumented.txt"
 
 _DEPRECATED_ACTION_TYPES = (
     DeprecatedAction,
@@ -42,86 +40,15 @@ _DOC_COLUMNS = 4
 # never becomes a fabricated flag name.
 _ROW_FLAG_RE = re.compile(r"`(--[a-zA-Z0-9][\w-]*)`|<code>(--[a-zA-Z0-9][\w-]*)</code>")
 
-# Live flags with no row. May only shrink.
-_UNDOCUMENTED = frozenset(
-    {
-        "--c128-page-size",
-        "--cuda-graph-prefill-max-context",
-        "--decoupled-spec-bind-endpoint",
-        "--decoupled-spec-connect-endpoints",
-        "--decoupled-spec-rank",
-        "--decoupled-spec-role",
-        "--deepep-v2-mode",
-        "--disaggregation-decode-extra-slots",
-        "--disaggregation-decode-retraction-backup",
-        "--disaggregation-enable-kv-checksum",
-        "--dsa-paged-mqa-logits-backend",
-        "--dsv4-attn-backend",
-        "--dsv4-prefill-backend",
-        "--dwdp-size",
-        "--elastic-ep-initial-size",
-        "--elastic-ep-join-mode",
-        "--elastic-ep-join-rank-offset",
-        "--elastic-ep-scale-timeout",
-        "--enable-cp-decode-attn-tp",
-        "--enable-dense-mlp-attn-tp",
-        "--enable-dsa-cache-layer-split",
-        "--enable-flexkv",
-        "--enable-layernorm-sp",
-        "--enable-lean-attention",
-        "--enable-linear-replayssm",
-        "--enable-linear-replayssm-spec",
-        "--enable-response-store",
-        "--enable-scattered-sconv",
-        "--enable-session-radix-cache",
-        "--enable-shared-experts-attn-tp",
-        "--enable-tp-lm-head-all-to-all",
-        "--enable-unified-cache-external-linker",
-        "--enable-w4a4-mxfp4-megamoe",
-        "--flexkv-config-file",
-        "--fuseep-mode",
-        "--gated-launch-port",
-        "--grpc-port",
-        "--hicache-host-memory-mode",
-        "--hicache-storage-prefetch-retry-max-attempts",
-        "--hicache-storage-prefetch-retry-poll-interval",
-        "--http2-initial-connection-window-size",
-        "--linear-attn-verify-backend",
-        "--linear-replayssm-cache-len",
-        "--mamba-max-states-per-path",
-        "--max-ep-size",
-        "--min-free-slots-delay",
-        "--mm-feature-transport",
-        "--mm-global-cache-backend",
-        "--mm-io-worker-num",
-        "--mm-preprocess-cache-size-mb",
-        "--mm-processor-worker-num",
-        "--otlp-service-name",
-        "--prefill-decode-interval",
-        "--radix-eviction-policy-config",
-        "--return-input-ids",
-        "--return-output-ids",
-        "--sampling-mask-max-tokens",
-        "--sidecar",
-        "--sidecar-args",
-        "--smg-grpc-mode",
-        "--spec-trace-dir",
-        "--speculative-domino-candidate-pool-size",
-        "--speculative-draft-kv-cache-dtype",
-        "--speculative-dspark-align-verify-tokens-to-graph-tier",
-        "--speculative-dspark-block-size",
-        "--speculative-dspark-confidence-sts-path",
-        "--speculative-dspark-sps-table-path",
-        "--speculative-use-rejection-sampling",
-        "--startup-weight-load-mode",
-        "--trust-mm-content-hashes",
-        "--unified-cache-external-linker-backend",
-        "--uno-lora-path",
-        "--weight-cache-mode",
-        "--weight-cache-socket",
-        "--weight-cache-timeout",
-    }
-)
+
+def _undocumented() -> frozenset[str]:
+    lines = _UNDOCUMENTED_PATH.read_text(encoding="utf-8").splitlines()
+    return frozenset(
+        line.strip() for line in lines if line.strip() and not line.startswith("#")
+    )
+
+
+_UNDOCUMENTED = _undocumented()
 
 
 def _parser_actions() -> tuple[list[argparse.Action], list[argparse.Action]]:
@@ -187,7 +114,7 @@ class TestServerArgsDocsCoverage(CustomTestCase):
             "these live flags have no row in server_arguments.mdx and are not "
             "on the allow list. Add a row (lift the help text from the "
             "field's Arg(help=...)) or if it is a deliberate omission, add "
-            f"it to _UNDOCUMENTED in {Path(__file__).name}:\n  " + "\n  ".join(added),
+            f"it to {_UNDOCUMENTED_PATH.name}:\n  " + "\n  ".join(added),
         )
 
     def test_undocumented_allowlist_is_current(self):
@@ -198,8 +125,8 @@ class TestServerArgsDocsCoverage(CustomTestCase):
             outdated.append(f"{flag} ({reason})")
         self.assertFalse(
             outdated,
-            "these entries in _UNDOCUMENTED are out of date. Remove them from "
-            f"the set in {Path(__file__).name}:\n  " + "\n  ".join(outdated),
+            f"these entries in {_UNDOCUMENTED_PATH.name} are out of date. "
+            "Remove them from the file:\n  " + "\n  ".join(outdated),
         )
 
     def test_no_stale_rows(self):
