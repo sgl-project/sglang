@@ -12,9 +12,11 @@ compares the headroom against what an actual decode step asks for rather than
 against a restatement of the formula.
 """
 
-import ast
-import pathlib
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 import sglang.srt.mem_cache.kv_cache_configurator as _kvcfg
 from sglang.srt.environ import envs
@@ -166,43 +168,73 @@ class TestReqToTokenRowHeadroom(CustomTestCase):
 
 
 class TestUnifiedBuildersUseTheSharedHelper(CustomTestCase):
-    """The two unified-pool builders must size from the helper, not a copy.
-
-    `_init_unified_mamba_pools` and `_init_unified_mamba_swa_pools` carried a
-    hand-rolled copy of `get_req_to_token_extra_context_len()` that had drifted
-    narrower than the decode reserve the allocator takes, so the `req_to_token`
-    row could be written past its own end. The calculation itself is asserted by
-    the tests above; what is left to pin is that these builders keep *calling*
-    the helper -- a copy is exactly how the two drifted apart in the first place.
-    """
-
-    BUILDERS = ("_init_unified_mamba_pools", "_init_unified_mamba_swa_pools")
-
-    def _builder_sources(self) -> dict[str, str]:
-        path = pathlib.Path(_kvcfg.__file__)
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        out: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name in self.BUILDERS:
-                out[node.name] = ast.unparse(node)
-        return out
-
-    def test_unified_builders_use_the_shared_helper(self):
-        sources = self._builder_sources()
-        self.assertEqual(set(sources), set(self.BUILDERS), "builders not found by name")
-        for name, src in sources.items():
-            with self.subTest(builder=name):
-                self.assertIn(
-                    "get_req_to_token_extra_context_len()",
-                    src,
-                    f"{name} no longer sizes from the shared helper",
-                )
-                # The specific drift: a literal base plus the raw option.
-                self.assertNotIn(
-                    "extra_max_context_len = 4",
-                    src,
-                    f"{name} reintroduced the hand-rolled copy",
-                )
+    def test_unified_builders_cover_the_decode_reserve(self):
+        config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(layers=[1]),
+            full_attention_layer_ids=[0],
+        )
+        builder = _kvcfg.KVCacheConfigurator.__new__(_kvcfg.KVCacheConfigurator)
+        builder.mambaish_config = config
+        builder.layer_info = SimpleNamespace(
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+        )
+        builder.model_config = SimpleNamespace(
+            context_len=CONTEXT_LEN,
+            head_dim=8,
+            get_num_kv_heads=lambda *args: 1,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            sliding_window_size=128,
+        )
+        builder.device = "cpu"
+        builder.kv_cache_dtype = torch.float32
+        builder.is_draft_worker = False
+        builder.use_mla_backend = False
+        builder.is_hybrid_swa = True
+        builder.is_hybrid_swa_compress = False
+        builder.forward_stream = None
+        cases = (("UNO", 1, 1, 1, 8), ("EAGLE", 64, 3, 2, 6))
+        for algo, page, steps, topk, tokens in cases:
+            builder.page_size = page
+            with (
+                get_context().override_server_args(
+                    speculative_algorithm=algo,
+                    speculative_num_steps=steps,
+                    speculative_eagle_topk=topk,
+                    speculative_num_draft_tokens=tokens,
+                    page_size=page,
+                ),
+                get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+            ):
+                needed = _worst_case_growth()
+                for name, kwargs in (
+                    ("mamba", {"max_total_num_tokens": 32}),
+                    (
+                        "mamba_swa",
+                        {
+                            "full_max_total_num_tokens": 32,
+                            "swa_max_total_num_tokens": 32,
+                        },
+                    ),
+                ):
+                    with (
+                        self.subTest(algo=algo, builder=name),
+                        patch(
+                            "sglang.srt.mem_cache.unified_memory_pool."
+                            f"init_unified_{name}_pools"
+                        ) as pool_factory,
+                    ):
+                        result = getattr(builder, f"_init_unified_{name}_pools")(
+                            max_num_reqs=2, **kwargs
+                        )
+                        self.assertIs(result, pool_factory.return_value)
+                        self.assertGreaterEqual(
+                            pool_factory.call_args.kwargs["extra_max_context_len"],
+                            needed,
+                        )
 
 
 if __name__ == "__main__":
