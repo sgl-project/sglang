@@ -102,10 +102,12 @@ def reference(case):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
     m = case["x"].shape[0]
-    grouped = qkv.view(m, NUM_HEADS, KINDS, HEAD_DIM)
+    # The fused projection is consumed in the engine-resident row order
+    # [qkv_kind, head, head_dim] (the loader's [q_all | k_all | v_all]).
+    grouped = qkv.view(m, KINDS, NUM_HEADS, HEAD_DIM)
     qk_eps = case["eps"] if case["qk_eps"] is None else case["qk_eps"]
-    q = F.rms_norm(grouped[:, :, 0], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps)
-    k = F.rms_norm(grouped[:, :, 1], (HEAD_DIM,), case["k_norm_weight"], eps=qk_eps)
+    q = F.rms_norm(grouped[:, 0], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps)
+    k = F.rms_norm(grouped[:, 1], (HEAD_DIM,), case["k_norm_weight"], eps=qk_eps)
     positions = case["rope_positions"]
     rope = (
         case["rope_cos_sin"][:m]
@@ -114,7 +116,7 @@ def reference(case):
     )
     q = apply_rope(q.to(torch.bfloat16), rope)
     k = apply_rope(k.to(torch.bfloat16), rope)
-    fused = torch.stack((q, k, grouped[:, :, 2]), dim=2)
+    fused = torch.stack((q, k, grouped[:, 2]), dim=2)
     p = case["ulysses_degree"]
     return (
         fused.view(m, p, NUM_HEADS // p, KINDS, HEAD_DIM)
