@@ -14,7 +14,7 @@ tensor and host-int twin agree, so a change to the sharding math fails loudly.
 a sparse MoE's input at all. Masking a gathered buffer with it truncates every
 peer rank's rows, which collapsed gsm8k accuracy under DP attention with
 ``--moe-a2a-backend none``, where each rank sums its own partial output. The
-second table locks that scatter mode x layout x CP decision.
+second table locks that MoE input x layout x CP decision.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,12 +22,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -35,7 +36,27 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded_cpu,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
+
+
+@contextmanager
+def sparse_moe_input(rows):
+    """Where a sparse MoE's input is: on each rank's local rows ("local": a2a
+    dispatch, FP4 all-gather or dwdp), on rows a GQA prefill CP gathers over the
+    MoE-CP group ("moe_cp", on a CP extend only), or on the FFN's rows ("ffn")."""
+    local = rows == "local"
+    with (
+        patch.object(
+            moe_utils, "is_moe_input_scattered_across_dp_ranks", return_value=local
+        ),
+        patch_communicator(
+            "is_moe_input_scattered_across_dp_ranks", return_value=local
+        ),
+        patch_communicator("is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
+        patch_communicator("_cp_gathers_over_attn_cp", return_value=False),
+    ):
+        yield
 
 
 class TestNumTokenNonPaddedLayoutTable(CustomTestCase):
@@ -115,20 +136,20 @@ def _value(batch: ForwardBatch):
 
 
 class TestMoeNumTokenNonPaddedTable(CustomTestCase):
-    # (label, mode, sharded, attn_dp_size, expected). Decode forwards, so the
-    # MOE_FULL rows follow the FULL layout: that config all-gathers over the
-    # MoE-CP group on a context-parallel extend only, which is the case below.
+    # (label, MoE input, sharded, attn_dp_size, expected). Decode forwards, so
+    # the MoE-CP rows follow the FFN rows' layout: that config all-gathers over
+    # the MoE-CP group on a context-parallel extend only, which is the case below.
     _TABLE = [
-        ("scattered.replicated", ScatterMode.SCATTERED, False, 1, LOCAL),
-        ("scattered.sharded", ScatterMode.SCATTERED, True, 1, LOCAL),
-        ("scattered.dp", ScatterMode.SCATTERED, True, 4, LOCAL),
-        ("moe_full.decode.replicated", ScatterMode.MOE_FULL, False, 1, LOCAL),
-        ("moe_full.decode.sharded", ScatterMode.MOE_FULL, True, 1, GLOBAL),
-        ("moe_full.decode.dp", ScatterMode.MOE_FULL, True, 4, None),
-        ("full.dp_gathered", ScatterMode.FULL, True, 4, None),
-        ("full.dp_gathered.replicated", ScatterMode.FULL, False, 4, None),
-        ("full.tp_sharded", ScatterMode.FULL, True, 1, GLOBAL),
-        ("full.replicated", ScatterMode.FULL, False, 1, LOCAL),
+        ("scattered.replicated", "local", False, 1, LOCAL),
+        ("scattered.sharded", "local", True, 1, LOCAL),
+        ("scattered.dp", "local", True, 4, LOCAL),
+        ("moe_full.decode.replicated", "moe_cp", False, 1, LOCAL),
+        ("moe_full.decode.sharded", "moe_cp", True, 1, GLOBAL),
+        ("moe_full.decode.dp", "moe_cp", True, 4, None),
+        ("full.dp_gathered", "ffn", True, 4, None),
+        ("full.dp_gathered.replicated", "ffn", False, 4, None),
+        ("full.tp_sharded", "ffn", True, 1, GLOBAL),
+        ("full.replicated", "ffn", False, 1, LOCAL),
     ]
 
     def test_table(self):
@@ -136,21 +157,19 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
             with (
                 self.subTest(case=label),
                 get_parallel().override(attn_dp_size=attn_dp_size, attn_cp_size=1),
-                patch.object(comm, "sparse_mlp_scatter_mode", return_value=mode),
+                sparse_moe_input(mode),
             ):
                 self.assertEqual(_value(_forward_batch(sharded=sharded)), expected)
 
     def test_cp_gathered_full_is_unmasked(self):
-        """A CP prefill must route every row: DSA / MLA CP take the FULL mode
-        but all-gather across CP, which zigzag-permutes the real rows."""
+        """A CP prefill must route every row: DSA / MLA CP put a MoE on the
+        FFN rows but all-gather across CP, which zigzag-permutes the real rows."""
         for sharded in (False, True):
             for dsa_cp, mla_cp in ((True, False), (False, True)):
                 with (
                     self.subTest(sharded=sharded, dsa_cp=dsa_cp),
                     get_parallel().override(attn_dp_size=1, attn_cp_size=2),
-                    patch.object(
-                        comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
-                    ),
+                    sparse_moe_input("ffn"),
                     patch(
                         "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
                         return_value=dsa_cp,
@@ -163,22 +182,21 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                     self.assertIsNone(_value(_forward_batch(sharded=sharded)))
 
     def test_moe_full_gathers_only_on_a_context_parallel_extend(self):
+        cp_metadata = SimpleNamespace(per_rank_actual_token=[2, 2])
         """A moe-cp config keeps its bound on every forward but the CP extend,
         which is the only one that all-gathers over the MoE-CP group."""
         # get_moe_cp_size reads a live process group, so it is stubbed rather
         # than reached through a topology published without distributed init.
         for label, forward_mode, metadata, expected in [
-            ("cp_extend", ForwardMode.EXTEND, object(), None),
+            ("cp_extend", ForwardMode.EXTEND, cp_metadata, None),
             ("extend_without_cp_metadata", ForwardMode.EXTEND, None, LOCAL),
-            ("decode", ForwardMode.DECODE, object(), LOCAL),
+            ("decode", ForwardMode.DECODE, cp_metadata, LOCAL),
         ]:
             with (
                 self.subTest(case=label),
                 get_parallel().override(attn_dp_size=1, attn_cp_size=2),
-                patch.object(
-                    comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.MOE_FULL
-                ),
-                patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=2),
+                sparse_moe_input("moe_cp"),
+                patch_communicator("get_moe_cp_size", return_value=2),
                 patch(
                     "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
                     return_value=False,
@@ -198,23 +216,21 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
 
     def test_graph_replay_without_global_count_skips_masking(self):
         """A captured batch carries the LOCAL buffer alone, so the attn-TP
-        sharded FULL case has no bound to mask with and must not use it."""
+        sharded case on the FFN rows has no bound to mask with and must not use it."""
         with (
             get_parallel().override(attn_dp_size=1, attn_cp_size=1),
-            patch.object(
-                comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
-            ),
+            sparse_moe_input("ffn"),
         ):
             self.assertIsNone(_value(_forward_batch(sharded=True, glob=None)))
 
     def test_absent_local_count_stays_absent(self):
         """Without expert parallelism the count is never filled, and routing
         must not mask every row against the unfilled buffer."""
-        for mode in (ScatterMode.SCATTERED, ScatterMode.FULL, ScatterMode.MOE_FULL):
+        for mode in ("local", "ffn", "moe_cp"):
             with (
                 self.subTest(mode=mode),
                 get_parallel().override(attn_dp_size=1, attn_cp_size=1),
-                patch.object(comm, "sparse_mlp_scatter_mode", return_value=mode),
+                sparse_moe_input(mode),
             ):
                 self.assertIsNone(_value(_forward_batch(sharded=False, local=None)))
 
