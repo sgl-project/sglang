@@ -870,6 +870,7 @@ class Envs:
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
+    SGLANG_AITER_TINY_GLM_MOE = EnvBool(False)
     SGLANG_USE_AITER = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.

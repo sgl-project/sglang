@@ -661,6 +661,8 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
+        # Exact-M GLM target-verify caller; tensor lifetime is one MoE forward.
+        "aiter_tiny_glm_input": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,

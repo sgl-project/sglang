@@ -1704,7 +1704,26 @@ def _mask_topk_ids_padded_region(
     elif _is_npu:
         return
     elif _can_fuse_padded_region(topk_ids):
-        _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
+        from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import enabled
+        from sglang.srt.runtime_context import get_forward
+
+        tiny_x = (
+            get_forward().aiter_tiny_glm_input
+            if enabled() and not torch.compiler.is_compiling()
+            else None
+        )
+        canonical = (
+            tiny_x is not None
+            and fill_value == 0
+            and tuple(topk_ids.shape) == (tiny_x.shape[0], 8)
+        )
+        _fill_padded_rows(
+            topk_ids,
+            num_token_non_padded,
+            fill_value,
+            unique_ids=canonical,
+            hidden_states=tiny_x if canonical else None,
+        )
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value

@@ -17,6 +17,10 @@ def _fill_padded_rows_kernel(
     n_cols,
     fill_value,
     stride_row,
+    hidden_ptr,
+    hidden_stride,
+    UNIQUE_IDS: tl.constexpr,
+    HIDDEN_WIDTH: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -26,7 +30,14 @@ def _fill_padded_rows_kernel(
         mask = cols < n_cols
         ptrs = out_ptr + row * stride_row + cols
         fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        if UNIQUE_IDS:
+            fill = cols.to(out_ptr.dtype.element_ty)
         tl.store(ptrs, fill, mask=mask)
+        if HIDDEN_WIDTH:
+            hcols = tl.arange(0, 256)
+            for offset in range(tl.cdiv(HIDDEN_WIDTH, 256)):
+                h = offset * 256 + hcols
+                tl.store(hidden_ptr + row * hidden_stride + h, 0.0, h < HIDDEN_WIDTH)
 
 
 def _can_fuse_padded_region(x: torch.Tensor) -> bool:
@@ -39,6 +50,9 @@ def _fill_padded_rows(
     x: torch.Tensor,
     num_token_non_padded: torch.Tensor,
     fill_value,
+    *,
+    unique_ids=False,
+    hidden_states=None,
 ) -> None:
     """Set ``x[row, :] = fill_value`` for every padded row (row index
     ``>= num_token_non_padded``) using a single Triton launch.
@@ -67,6 +81,14 @@ def _fill_padded_rows(
         )
     if num_token_non_padded.device != x.device:
         raise ValueError("num_token_non_padded and x must be on the same device")
+    if unique_ids and x.shape[1] != 8:
+        raise ValueError("canonical tiny GLM padding requires eight routed columns")
+    if hidden_states is not None and (
+        hidden_states.shape != (x.shape[0], 6144)
+        or not hidden_states.is_contiguous()
+        or hidden_states.device != x.device
+    ):
+        raise ValueError("tiny GLM padding hidden tensor must be contiguous Mx6144")
     n_rows, n_cols = x.shape
     _fill_padded_rows_kernel[(n_rows,)](
         x,
@@ -74,5 +96,9 @@ def _fill_padded_rows(
         n_cols,
         fill_value,
         x.stride(0),
+        hidden_states if hidden_states is not None else x,
+        hidden_states.stride(0) if hidden_states is not None else 0,
+        UNIQUE_IDS=unique_ids,
+        HIDDEN_WIDTH=hidden_states.shape[1] if hidden_states is not None else 0,
         BLOCK_COLS=triton.next_power_of_2(n_cols),
     )

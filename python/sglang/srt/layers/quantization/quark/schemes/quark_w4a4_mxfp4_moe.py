@@ -949,6 +949,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
+        from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import PreparedTinyGlm
+
+        self.runner.runner_core._tiny_glm = PreparedTinyGlm(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):

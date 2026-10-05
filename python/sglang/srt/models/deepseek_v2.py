@@ -706,6 +706,15 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import model_supported
+
+        self.experts._aiter_tiny_glm_target = (
+            model_supported(
+                config, tp=self.tp_size, ep=self.moe_ep_size, nextn=is_nextn
+            )
+            and self.num_fused_shared_experts == 1
+        )
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -950,6 +959,56 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import (
+            enabled,
+            record_routing_count,
+            target_supported,
+        )
+
+        if not enabled() or torch.compiler.is_compiling():
+            return self._forward_impl(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global,
+                skip_shared_experts,
+            )
+        active = (
+            enabled()
+            and self.experts._aiter_tiny_glm_target
+            and not self._enable_a2a_moe
+            and not self.is_hash
+            and not get_exec().moe.enable_eplb
+            and get_exec().moe.init_expert_location == "trivial"
+            and get_exec().moe.ep_num_redundant_experts == 0
+            and not torch.compiler.is_compiling()
+            and target_supported(forward_batch)
+            and hidden_states.shape[0] in (4, 8)
+        )
+        if active:
+            record_routing_count(self.experts, forward_batch, hidden_states.shape[0])
+        with get_forward().scoped(
+            aiter_tiny_glm_input=hidden_states if active else None
+        ):
+            return self._forward_impl(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global,
+                skip_shared_experts,
+            )
+
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
