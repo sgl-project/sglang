@@ -346,8 +346,8 @@ class TestFusedDraftDecision(CustomTestCase):
         off the translated rails, so they are widened to see the check alone."""
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
 
-        rails = kvc._TRANSLATED_MHA_RAILS | {"fa4"}
-        with patch.object(kvc, "_TRANSLATED_MHA_RAILS", rails):
+        rails = kvc.TRANSLATED_MHA_RAILS | {"fa4"}
+        with patch.object(kvc, "TRANSLATED_MHA_RAILS", rails):
             declined = self._decide(
                 algorithm="DFLASH",
                 draft_backend="fa4",

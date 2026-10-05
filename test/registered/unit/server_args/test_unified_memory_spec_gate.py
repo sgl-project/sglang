@@ -131,10 +131,9 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         "flashinfer",
         "fa3",
     )
-    # Verify-audited backends for the EAGLE (fused-draft) arm.
-    EAGLE_BACKENDS = ("triton", "flashinfer", "fa3")
-    # Verify-audited backends for the DFLASH arm.
-    DFLASH_BACKENDS = ("triton", "fa3", "flashinfer")
+    # The translated MHA rails: the EAGLE and DFLASH arms' target backends
+    # on an MHA host, and every fused draft's backend.
+    MHA_RAILS = ("triton", "flashinfer", "fa3")
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
@@ -219,13 +218,13 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         """DFLASH's target verifies on triton / fa3 / flashinfer. fa4 and
         trtllm_mha have no translated spec verify path, and the MLA verify
         family the DSPARK arm admits must not leak into this arm."""
-        for backend in self.DFLASH_BACKENDS:
+        for backend in self.MHA_RAILS:
             self.assertTrue(
                 _accepts("DFLASH", backend=backend),
                 f"DFLASH should pass on verify-audited backend {backend}",
             )
         for backend in ("fa4", "trtllm_mha") + tuple(
-            b for b in self.DSPARK_BACKENDS if b not in self.DFLASH_BACKENDS
+            b for b in self.DSPARK_BACKENDS if b not in self.MHA_RAILS
         ):
             self.assertFalse(
                 _accepts("DFLASH", backend=backend),
@@ -238,7 +237,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         resolved or unset topk, every audited backend."""
         for algorithm in ("EAGLE", "EAGLE3"):
             for topk in (None, 1):
-                for backend in self.EAGLE_BACKENDS:
+                for backend in self.MHA_RAILS:
                     self.assertTrue(
                         _accepts(algorithm, topk=topk, backend=backend),
                         f"{algorithm} topk={topk} backend={backend} should "
@@ -308,7 +307,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         """Unaudited backends stay out, and the MLA verify set from the
         DSPARK arm must not leak into the EAGLE arm."""
         for backend in ("fa4", "trtllm_mha") + tuple(
-            b for b in self.DSPARK_BACKENDS if b not in self.EAGLE_BACKENDS
+            b for b in self.DSPARK_BACKENDS if b not in self.MHA_RAILS
         ):
             self.assertFalse(_accepts("EAGLE", backend=backend))
 
@@ -323,7 +322,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         target's (triton here), an explicit triton / flashinfer / fa3 passes,
         and anything else refuses."""
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
-        for draft_backend in self.EAGLE_BACKENDS:
+        for draft_backend in self.MHA_RAILS:
             self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
         for draft_backend in ("fa4", "trtllm_mha"):
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))

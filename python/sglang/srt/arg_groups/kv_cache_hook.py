@@ -488,6 +488,11 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
     }
 )
 
+# The MHA backends that read through the KV-index translator on every path a
+# draft forward takes. A fused draft region holds dense K/V rows, so a fused
+# draft runs only on these.
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3"})
+
 
 def _assert_spec_verify_backends(
     server_args: Any, *, algorithm: str, allowed: Optional[frozenset] = None
@@ -605,13 +610,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "fused inside the full-attention page envelope (or falls back "
             "to a private pool over the unified virtual id space)."
         )
-        # The translated MHA rails. A fused draft is MHA-shaped on every host
-        # (its region holds dense K/V rows), and these three also serve a
-        # draft that keeps an MLA pool of its own.
-        mha_rails = {"triton", "flashinfer", "fa3"}
         # The target verifies on its own pages: the MLA family on an MLA host.
         eagle_allowed = (
-            _SPEC_VERIFY_AUDITED_BACKENDS if use_mla_backend(server_args) else mha_rails
+            _SPEC_VERIFY_AUDITED_BACKENDS
+            if use_mla_backend(server_args)
+            else TRANSLATED_MHA_RAILS
         )
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
         assert (
@@ -623,13 +626,16 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"spec-verify-audited attention backends {sorted(eagle_allowed)} "
             f"(got {sorted(eagle_backends, key=str)})."
         )
-        # An unset draft backend inherits the target's pair.
+        # An unset draft backend inherits the target's pair. A fused draft is
+        # MHA-shaped on every host, and these rails also serve a draft that
+        # keeps an MLA pool of its own.
         draft_backend = cfg.speculative_draft_attention_backend
         draft_backends = {draft_backend} if draft_backend else eagle_backends
-        assert draft_backends <= mha_rails, (
+        assert draft_backends <= TRANSLATED_MHA_RAILS, (
             "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
             f"{sorted(draft_backends)}, but a fused draft is MHA-shaped and "
-            f"reads its KV through the translated MHA rails {sorted(mha_rails)}. "
+            "reads its KV through the translated MHA rails "
+            f"{sorted(TRANSLATED_MHA_RAILS)}. "
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
@@ -638,7 +644,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         _assert_spec_verify_backends(
             server_args,
             algorithm="DFLASH",
-            allowed=frozenset({"triton", "fa3", "flashinfer"}),
+            allowed=TRANSLATED_MHA_RAILS,
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
