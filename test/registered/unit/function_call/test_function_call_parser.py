@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -4210,6 +4211,24 @@ class TestLfm2Detector(unittest.TestCase):
         """Test that partial markers are detected (start token present)."""
         text = '<|tool_call_start|>[get_weather(city="Paris")'
         self.assertTrue(self.detector.has_tool_call(text))
+
+    def test_unclosed_tool_call_tags_parse_in_linear_time(self):
+        """Many opening tags without an end tag must not stall the parser (it
+        runs on the event loop); the complete call before them still parses."""
+        text = (
+            '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>'
+            + "<|tool_call_start|> " * 10000
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in result.calls],
+            [("get_weather", {"city": "Paris"})],
+        )
 
     # ==================== detect_and_parse tests (Pythonic format) ====================
 
