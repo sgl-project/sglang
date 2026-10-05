@@ -1052,9 +1052,9 @@ def supports_fp8_mqa_logits(
     """Admission for ``fp8_mqa_logits`` on the exact engine tensors; never raises.
 
     Beyond the dtype / layout contract, the shipped FlashInfer catalog is
-    consulted (``dense_route_available``) so only points with exported programs
-    are admitted (32 heads, ``K % 256 == 0`` and ``Q <= max_queries()`` today;
-    the 64-head and KV-tail routes admit once exported).
+    consulted (``dense_route_available`` with this device's architecture) so
+    only points with exported programs admitted on this architecture are taken
+    (``policy.dense_admission`` is per arch for the 64-head family).
     """
     try:
         import torch
@@ -1099,7 +1099,13 @@ def supports_fp8_mqa_logits(
         runtime = _fp8_mqa_logits_runtime()
         if not hasattr(runtime, "dense_route_available"):
             return False
-        return bool(runtime.dense_route_available(heads, queries, keys))
+        # Dense admission is decided per architecture too (policy.dense_admission: a 64-head tier
+        # withheld on one architecture keeps its record but is not served there).
+        return bool(
+            runtime.dense_route_available(
+                heads, queries, keys, arch=runtime.device_arch(q.device)
+            )
+        )
     except Exception:
         return False
 
@@ -1149,8 +1155,9 @@ def supports_fp8_paged_mqa_logits(
     int32 2-D ``context_lens [B, next_n]``, int32 ``block_table [B, S]`` with
     unit column stride; the shipped catalog must carry the ``(H, 64, next_n)``
     program (``paged_route_available``) and admit it on this device's
-    architecture up to ``max_context_len`` (the catalog's per-architecture
-    ``policy.paged.max_context_len`` bound; a withheld (arch, route, context)
+    architecture for this call's batch (``context_lens.shape[0]``) and
+    ``max_context_len`` (the catalog's per-architecture
+    ``policy.paged.admission`` rules; a withheld (arch, route, batch, context)
     falls back to stock DeepGEMM). Without ``max_context_len`` the block table's
     capacity ``S * 64`` is the conservative stand-in.
     """
@@ -1205,9 +1212,16 @@ def supports_fp8_paged_mqa_logits(
         arch = _fp8_mqa_logits_runtime().device_arch(q.device)
         if max_context_len is None:
             max_context_len = int(block_table.shape[1]) * page
+        # batch = requests of this call (context_lens.shape[0], the engine's per-call chunk);
+        # the catalog's admission rules are (arch, route, batch, max_context_len).
         return bool(
             runtime.paged_route_available(
-                heads, page, next_n, arch=arch, max_context_len=int(max_context_len)
+                heads,
+                page,
+                next_n,
+                arch=arch,
+                batch=int(context_lens.shape[0]),
+                max_context_len=int(max_context_len),
             )
         )
     except Exception:

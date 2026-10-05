@@ -255,7 +255,19 @@ def test_ragged_admission_rules():
     )
     from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as runtime
 
-    assert admitted_tail == bool(runtime.dense_route_available(32, 16, 4091))
+    arch = runtime.device_arch(device)
+    assert admitted_tail == bool(runtime.dense_route_available(32, 16, 4091, arch=arch))
+    # The dense verdict is per architecture (policy.dense_admission): the adapter's answer for the
+    # 64-head family equals the runtime's for this device's arch, including a withheld tier (sm_100a
+    # fallback) where the arch-less query would refuse to decide.
+    q64, kv64, sc64, w64, ks64, ke64 = _ragged_inputs(16, 4096, 64, device)
+    assert cake.supports_fp8_mqa_logits(q64, kv64, sc64, w64, ks64, ke64) == bool(
+        runtime.dense_route_available(64, 16, 4096, arch=arch)
+    )
+    withheld = runtime.h64_admission(arch)["withheld_routes"]
+    if withheld:
+        # A tier withheld on this device's architecture never reaches the Cake path here.
+        assert all(not r.endswith(":h32") for r in withheld)
 
 
 # ---------------------------------------------------------------------------
@@ -411,33 +423,41 @@ def test_paged_admission_rules():
     assert not cake.supports_fp8_paged_mqa_logits(
         q, kv_cache, weights.to(torch.bfloat16), ctx_2d, block_table
     )
-    # Per-architecture context bound of the shipped catalog (policy.paged.max_context_len):
-    # admitted at the bound, refused above it, the block table's capacity when no length is given.
+    # Per-architecture admission rules of the shipped catalog (policy.paged.admission, keyed by the call's
+    # batch and max_context_len): the adapter's verdict equals the runtime's for the exact call, and the
+    # block table's capacity stands in for a missing max_context_len.
     from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
 
     arch = dense_mqa.device_arch(device)
-    route = runtime.paged_route_name(64, 64, 2)
-    bound = runtime.paged_context_bound(arch, route)
     wide = torch.zeros(4, (1 << 20) // 64, device=device, dtype=torch.int32)
     wide[:, : block_table.shape[1]] = block_table
-    if bound is None:
+    for ctx in (1024, 8192, 32768, 32769, 131072, 1 << 20):
         assert cake.supports_fp8_paged_mqa_logits(
-            q, kv_cache, weights, ctx_2d, wide, 1 << 20
-        ) == bool(runtime.paged_route_available(64, 64, 2))
-    else:
-        assert cake.supports_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, wide, bound)
-        assert not cake.supports_fp8_paged_mqa_logits(
-            q, kv_cache, weights, ctx_2d, wide, bound + 1
-        )
-        assert not cake.supports_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, wide)
+            q, kv_cache, weights, ctx_2d, wide, ctx
+        ) == bool(runtime.paged_route_available(64, 64, 2, arch=arch, batch=4, max_context_len=ctx)), ctx
+    assert cake.supports_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, wide) == bool(
+        runtime.paged_route_available(64, 64, 2, arch=arch, batch=4, max_context_len=1 << 20)
+    )
+    rules = runtime.paged_admission_rules(arch, runtime.paged_route_name(64, 64, 2))
+    if rules is not None and rules[0][0] is not None:
+        # One request above the first rule's batch ceiling at a context only that rule admits falls back.
+        big = rules[0][0] + 1
+        q_b, kv_b, w_b, ctx_b, bt_b, _ = _paged_inputs(big, 2, 64, 1024, device)
+        wide_b = torch.zeros(big, (1 << 20) // 64, device=device, dtype=torch.int32)
+        wide_b[:, : bt_b.shape[1]] = bt_b
+        assert not cake.supports_fp8_paged_mqa_logits(q_b, kv_b, w_b, ctx_b, wide_b, 1 << 20)
 
 
-@pytest.mark.parametrize("next_n,avg_ctx", [(2, 4096), (2, 40000), (4, 4096), (4, 12000)])
-def test_paged_route_honours_the_arch_context_bound(next_n, avg_ctx):
+@pytest.mark.parametrize(
+    "next_n,batch,avg_ctx",
+    [(2, 2, 4096), (2, 2, 40000), (4, 2, 4096), (4, 2, 12000), (2, 17, 1024), (2, 65, 40000), (1, 129, 40000)],
+)
+def test_paged_route_honours_the_arch_admission_rules(next_n, batch, avg_ctx):
     """The engine route helper takes the Cake path where the catalog admits the
-    (arch, route, max_context_len) and falls back (``None``) where the shipped
-    policy withholds it (sm_100a long-context n2/n4 tiers); the taken path
-    matches DeepGEMM inside every row's length."""
+    (arch, route, batch, max_context_len) and falls back (``None``) where the
+    shipped policy withholds it (sm_100a batch > 16; sm_103a large-batch
+    long-context n1/n2); the taken path matches DeepGEMM inside every row's
+    length."""
     _skip_unless_device(cake.FI_PAGED_MQA_MODULE, cake.FI_PAGED_MQA_BACKEND_MODULE)
     deep_gemm = _deep_gemm()
     from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
@@ -448,12 +468,11 @@ def test_paged_route_honours_the_arch_context_bound(next_n, avg_ctx):
     if not runtime.paged_route_available(64, 64, next_n):
         pytest.skip(f"installed FlashInfer catalog does not serve H=64, page 64, next_n={next_n}")
     q, kv_cache, weights, ctx_2d, block_table, max_len = _paged_inputs(
-        2, next_n, 64, avg_ctx, device
+        batch, next_n, 64, avg_ctx, device
     )
-    bound = runtime.paged_context_bound(
-        dense_mqa.device_arch(device), runtime.paged_route_name(64, 64, next_n)
+    admitted = runtime.paged_route_admitted(
+        dense_mqa.device_arch(device), runtime.paged_route_name(64, 64, next_n), batch, max_len
     )
-    admitted = bound is None or max_len <= bound
     num_sms = deep_gemm.get_num_sms()
     with _route_on():
         got = cake_indexer_routes.cake_fp8_paged_mqa_logits(
@@ -469,8 +488,8 @@ def test_paged_route_honours_the_arch_context_bound(next_n, avg_ctx):
         torch.cuda.synchronize()
     cake_indexer_routes.reset_cake_route_state_for_tests()
     if not admitted:
-        assert got is None, f"route taken above the {bound} bound (max_context_len {max_len})"
-        with pytest.raises(ValueError, match="admitted on"):
+        assert got is None, f"route taken outside the admission rules (batch {batch}, max_context_len {max_len})"
+        with pytest.raises(ValueError, match="is not admitted on"):
             cake_fp8_paged_mqa_logits(
                 q,
                 kv_cache,
