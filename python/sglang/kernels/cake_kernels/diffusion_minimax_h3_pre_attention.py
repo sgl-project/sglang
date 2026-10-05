@@ -10,9 +10,9 @@ FlashInfer entries (``flashinfer.diffusion_ops``; the BF16 entry at FlashInfer
   that the persistent QKV GEMM streams through TMA; its epilogue applies the
   Q/K norms, RoPE and pack). JIT module
   ``flashinfer.jit.cake_minimax_h3_bf16_pre_attention``. Caller-owned ``out``;
-  the workspace is a cached per-``(M, device)`` buffer here, so after the first
-  call of an ``M`` there is no allocation and no host sync: CUDA-graph
-  capturable after the first build.
+  the workspace is a per-call allocation from the caching allocator (FlashInfer
+  default), freed when the stage returns, so the route holds no persistent
+  scratch between calls; no host sync, CUDA-graph capturable.
   Takes the diffusion engine's own operands: AdaLN tables ``[rows, 5376]`` with
   any ``rows >= 1`` and a 16-byte-aligned row pitch (column chunks of the
   ``[rows, 6 * 5376]`` modulation projection pass as they are), int64
@@ -360,7 +360,9 @@ def minimax_h3_bf16_pre_attention(
     is faster than the segmented norm + cuBLAS + fused-postprocess chain at
     every production center for ``ulysses_degree in {1, 2, 4, 8}`` (SM100a and
     SM103a), so no segmented path is kept for ``P=1``.  The BF16 ``[M, 5376]``
-    activation workspace is cached per ``(M, device)``.
+    activation workspace is a per-call allocation inside FlashInfer (freed on
+    return): the route keeps no persistent scratch, so the pipeline's peak
+    memory is not raised by a cached buffer.
     """
     from flashinfer.diffusion_ops.minimax_h3 import minimax_h3_bf16_pre_attention
 
@@ -379,31 +381,7 @@ def minimax_h3_bf16_pre_attention(
         eps=eps,
         qk_eps=qk_eps,
         rope_positions=rope_positions,
-        workspace=_activation_workspace(int(x.shape[0]), x.device),
     )
-
-
-_ACTIVATION_WORKSPACES: Dict[Tuple[int, int], torch.Tensor] = {}
-
-
-def _activation_workspace(m: int, device: torch.device) -> torch.Tensor:
-    """Cached BF16 ``[M, 5376]`` scratch for the two-launch stage (one per ``(M, device)``).
-
-    The cache is bounded (the engine sees a handful of distinct ``M`` per
-    pipeline); a persistent buffer keeps the per-call path free of allocator
-    traffic and lets CUDA-graph replay reuse the captured address.
-    """
-    import torch
-
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (m, index)
-    workspace = _ACTIVATION_WORKSPACES.get(key)
-    if workspace is None:
-        if len(_ACTIVATION_WORKSPACES) >= 16:
-            _ACTIVATION_WORKSPACES.clear()
-        workspace = torch.empty((m, HIDDEN), dtype=torch.bfloat16, device=device)
-        _ACTIVATION_WORKSPACES[key] = workspace
-    return workspace
 
 
 # ---------------------------------------------------------------------------
