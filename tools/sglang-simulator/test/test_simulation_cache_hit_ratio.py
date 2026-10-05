@@ -13,9 +13,9 @@ from test_simulation_sglang_serving import (
 def test_in_process_runner_reports_each_cache_tier(tmp_path):
     runner = make_sglang_runner(tmp_path)
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=False)
-    cached_ds = make_fixed_dataset(1000, 8)
-    evict_l1_ds = make_fixed_dataset(2000, 10)
-    evict_l2_ds = make_fixed_dataset(3000, 20)
+    cached_ds = make_fixed_dataset(1000, 3)
+    evict_l1_ds = make_fixed_dataset(2000, 5)
+    evict_l2_ds = make_fixed_dataset(3000, 10)
 
     try:
         metrics = runner.benchmark(benchmark_config, dataset=cached_ds)

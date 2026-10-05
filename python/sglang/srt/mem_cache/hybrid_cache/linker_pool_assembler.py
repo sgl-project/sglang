@@ -263,6 +263,7 @@ def _build_deepseek_v4_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_compressed_region_buffers,
         _dsv4_indexer_regions,
+        _require_single_row_dsv4_swa_pages,
         _resolve_deepseek_v4_layer_mappings,
     )
 
@@ -273,6 +274,11 @@ def _build_deepseek_v4_device_pool_group(
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     entries = []
     if not is_unified_kv:
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=kvcache.swa_page_size,
+            physical_page_size=kvcache.swa_kv_pool.page_size,
+            consumer="DeepSeek-V4 direct external linker",
+        )
         if kvcache.swa_page_size != page_size:
             raise ValueError(
                 "DeepSeek V4 SWA page size must match the tree page size: "
@@ -339,6 +345,23 @@ def _build_deepseek_v4_device_pool_group(
         c128_buffers,
         mappings.c128,
     )
+
+    # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
+    # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
+    # pool only -- shipping that alone restores 512 of every 640 bytes and leaves stale
+    # rope, which is wrong output rather than a crash. Mirrors _dsv4_rope_sibling() on
+    # the HiCache side; returns None on non-fp8 layouts, so bf16 is untouched.
+    for ratio, rope_name, rope_pool, rope_mapping in (
+        (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
+        (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
+    ):
+        rope_region = (
+            kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
+        )
+        if rope_region is None:
+            continue
+        rope_buffers, _ = rope_region
+        add(rope_name, PoolName.KV, rope_pool, rope_buffers, rope_mapping)
     if not is_unified_kv:
         add(
             PoolName.DEEPSEEK_V4_C4_STATE,
@@ -362,7 +385,7 @@ def _build_deepseek_v4_device_pool_group(
         )
     return DevicePoolGroup(
         entries,
-        mappings.transfer_layer_num,
+        mappings.transfer_layer_id_max,
         page_size,
         rank_replicated=True,
     )
