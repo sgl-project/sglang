@@ -205,6 +205,34 @@ async fn exhausted_workers_return_the_last_failure() {
     }
 }
 
+/// A retry waits out its jittered backoff, at least half the initial delay.
+#[tokio::test]
+async fn retry_backs_off_before_the_next_attempt() {
+    let a = MockWorker::start_returning_error(StatusCode::SERVICE_UNAVAILABLE, rejected()).await;
+    let b = MockWorker::start_returning_error(StatusCode::SERVICE_UNAVAILABLE, rejected()).await;
+    let mut ctx = router_ctx(
+        &[
+            ("a", &a.url, WorkerMode::Plain),
+            ("b", &b.url, WorkerMode::Plain),
+        ],
+        2,
+        false,
+    );
+    Arc::get_mut(&mut ctx)
+        .unwrap()
+        .config
+        .proxy
+        .initial_backoff_ms = 400;
+    let started = std::time::Instant::now();
+    let response = build_router(ctx).oneshot(chat(false)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 /// Client errors and the default single attempt are never retried.
 #[tokio::test]
 async fn client_errors_and_the_default_are_not_retried() {

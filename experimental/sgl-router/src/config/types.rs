@@ -24,6 +24,27 @@ pub struct ProxyConfig {
     pub stream_idle_timeout_secs: u64,
     /// Dispatch attempts per request, including the first; 1 disables retries.
     pub max_attempts: NonZeroU32,
+    /// Backoff before the first retry, doubling per retry up to `max_backoff_ms`.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on any one backoff.
+    pub max_backoff_ms: u64,
+}
+
+impl ProxyConfig {
+    /// Delay before retry `retry` (1-based): a random wait in `[d/2, d]`, where
+    /// `d = min(initial_backoff_ms * 2^(retry-1), max_backoff_ms)`. The jitter
+    /// keeps clients that failed together from retrying in lockstep.
+    pub fn backoff(&self, retry: u32) -> std::time::Duration {
+        use rand::Rng;
+        let factor = 1u64
+            .checked_shl(retry.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        let ms = self
+            .initial_backoff_ms
+            .saturating_mul(factor)
+            .min(self.max_backoff_ms);
+        std::time::Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms))
+    }
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -36,6 +57,8 @@ impl Default for ProxyConfig {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
             max_attempts: NonZeroU32::MIN,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 2000,
         }
     }
 }
@@ -1157,5 +1180,47 @@ mod k8s_discovery_config_tests {
         )
         .expect("distinct selectors must validate");
         assert!(matches!(m, K8sDiscoveryMode::PdDisaggregation { .. }));
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn proxy(initial_backoff_ms: u64, max_backoff_ms: u64) -> ProxyConfig {
+        ProxyConfig {
+            initial_backoff_ms,
+            max_backoff_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_with_jitter_up_to_the_cap() {
+        let config = proxy(100, 1000);
+        for (retry, ceiling) in [
+            (1, 100),
+            (2, 200),
+            (3, 400),
+            (4, 800),
+            (5, 1000),
+            (u32::MAX, 1000),
+        ] {
+            for _ in 0..100 {
+                let delay = config.backoff(retry);
+                assert!(
+                    delay >= Duration::from_millis(ceiling / 2)
+                        && delay <= Duration::from_millis(ceiling),
+                    "retry {retry}: {delay:?} outside [{}, {ceiling}] ms",
+                    ceiling / 2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_initial_backoff_retries_immediately() {
+        assert_eq!(proxy(0, 1000).backoff(3), Duration::ZERO);
     }
 }
