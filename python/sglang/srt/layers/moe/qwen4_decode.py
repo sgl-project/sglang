@@ -15,6 +15,7 @@ from sglang.kernels.ops.moe.shared_expert_gate import shared_expert_gate
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.dp_attention import is_enable_moe_cp_allgather
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_spec
 
@@ -49,6 +50,7 @@ def prepare_qwen4_decode_comm(
         or get_lora().enable_lora
         or get_spec().speculative_algorithm is not None
         or get_exec().overlap.enable_two_batch_overlap
+        or is_enable_moe_cp_allgather()
         or not mlp.supports_deferred_finalize
         or mlp.num_experts != 512
         or mlp.experts.w13_weight.dtype != torch.bfloat16

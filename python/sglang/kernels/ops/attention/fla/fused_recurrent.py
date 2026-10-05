@@ -1238,7 +1238,11 @@ def fused_recurrent_gated_delta_rule_update(
                     f"The number of initial states is expected to be equal to the number of input sequences, "
                     f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
                 )
-            if initial_state_indices.shape[0] != intermediate_state_indices.shape[0]:
+            if (
+                intermediate_state_indices is not None
+                and initial_state_indices.shape[0]
+                != intermediate_state_indices.shape[0]
+            ):
                 raise ValueError(
                     f"The number of intermediate state indices is expected to be equal to the number of input sequences, "
                     f"i.e., {initial_state_indices.shape[0]} != {intermediate_state_indices.shape[0]}."
