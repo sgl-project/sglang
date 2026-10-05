@@ -6,6 +6,8 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import zmq
+
 from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
@@ -156,6 +158,58 @@ class TestPlatformLifecycleHooks(unittest.TestCase):
             )
 
         apply_defaults.assert_called_once_with(server_args)
+
+
+class TestSchedulerEndpoints(unittest.TestCase):
+    def test_host_normalization_preserves_replica_ports(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.dp_size = 2
+        args.scheduler_port = 23000
+        for host, expected_host in (
+            (None, "127.0.0.1"),
+            ("localhost", "127.0.0.1"),
+            ("::", "127.0.0.1"),
+            ("::1", "127.0.0.1"),
+            ("2001:db8::1", "127.0.0.1"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("scheduler.example", "scheduler.example"),
+        ):
+            for ports in (None, [23100, 23200]):
+                with self.subTest(host=host, ports=ports):
+                    args.host = host
+                    args.scheduler_ports = ports
+                    expected = [
+                        f"tcp://{expected_host}:{port}"
+                        for port in (ports or [23000, 23001])
+                    ]
+                    self.assertEqual(args.scheduler_endpoint, expected[0])
+                    self.assertEqual(args.scheduler_endpoints, expected)
+                    for replica, endpoint in enumerate(expected):
+                        self.assertEqual(args.scheduler_endpoint_for(replica), endpoint)
+
+    def test_ipv6_http_host_allows_internal_zmq_round_trip(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.host = "::1"
+        args.scheduler_port = 0
+        args.scheduler_ports = None
+        self.assertEqual(args.url(), f"http://[::1]:{args.port}")
+
+        with zmq.Context() as context:
+            with context.socket(zmq.REP) as receiver, context.socket(zmq.REQ) as sender:
+                for socket in (receiver, sender):
+                    socket.setsockopt(zmq.LINGER, 0)
+                    socket.setsockopt(zmq.RCVTIMEO, 2000)
+                    socket.setsockopt(zmq.SNDTIMEO, 2000)
+                receiver.bind(args.scheduler_endpoint)
+                bound_endpoint = receiver.getsockopt_string(zmq.LAST_ENDPOINT)
+                args.scheduler_port = int(bound_endpoint.rsplit(":", 1)[1])
+                sender.connect(args.scheduler_endpoint)
+                sender.send(b"ping")
+                self.assertEqual(receiver.recv(), b"ping")
+                receiver.send(b"pong")
+                self.assertEqual(sender.recv(), b"pong")
 
 
 class TestServerArgsPathExpansion(unittest.TestCase):
