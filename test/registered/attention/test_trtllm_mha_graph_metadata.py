@@ -270,6 +270,90 @@ def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(make_xqa_backend, monkey
 
 
 @pytest.mark.parametrize(
+    "host_lens_live,pool_pages,copied_pages",
+    [
+        # 2 rows x the longest row's 3 pages, not the pool.
+        (True, 64, 6),
+        # No live host max (seq_lens_sum is None): the whole pool.
+        (False, 64, 64),
+        # The batch's pages are no fewer than the pool's: the whole pool.
+        (True, 5, 5),
+    ],
+)
+def test_fmha_v2_prefill_copies_only_the_batch_pages(
+    make_xqa_backend, monkeypatch, host_lens_live, pool_pages, copied_pages
+):
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim = backend.page_size, 2, 4
+    seq_lens = torch.tensor([70, 20], dtype=torch.int32)
+    row_pages = [[3, 1, 4], [2]]
+    # Past each row's last page the table is unwritten.
+    page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = torch.tensor(pages)
+    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+
+    backend.kv_index_translator = SimpleNamespace(
+        read_table=lambda plan, rows: SimpleNamespace(
+            ids=page_table, is_translated=True
+        ),
+        space=lambda kind: None,
+    )
+    backend.use_sliding_window_kv_pool = False
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    calls = []
+
+    def prefill(qkv, **kwargs):
+        calls.append((qkv[1], kwargs["block_tables"]))
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill)),
+        raising=False,
+    )
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.long(),
+        seq_lens_sum=int(seq_lens.sum()) if host_lens_live else None,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0, 0],
+        req_pool_indices=torch.arange(2),
+        kv_loc_plan=None,
+        _attn_output=None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    backend.init_forward_metadata(fb)
+    q = torch.zeros(int(seq_lens.sum()), heads * head_dim, dtype=torch.bfloat16)
+    backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+
+    assert len(calls) == 1
+    paged_kv, block_tables = calls[0]
+    assert paged_kv.shape == (copied_pages, 2, page_size, heads, head_dim)
+    k_pages = k.view(pool_pages, page_size, heads, head_dim)
+    v_pages = v.view(pool_pages, page_size, heads, head_dim)
+    for row, pages in enumerate(row_pages):
+        for col, page in enumerate(pages):
+            block = block_tables[row, col]
+            assert torch.equal(paged_kv[block, 0], k_pages[page])
+            assert torch.equal(paged_kv[block, 1], v_pages[page])
+
+
+@pytest.mark.parametrize(
     "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
     [
         (32, None, None, 32),
@@ -318,6 +402,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
     backend.use_sliding_window_kv_pool = False
+    backend.use_fmha_v2 = False
     backend._swa_kv_pool = None
     backend._swa_full_to_swa_mapping = None
     backend.speculative_step_id = 0

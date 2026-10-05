@@ -161,6 +161,10 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # fmha_v2 prefill: the [bs, max_pages] page-table entries this batch reads,
+    # and the block table over a copy that holds only those pages.
+    fmha_v2_page_mask: torch.Tensor = None
+    fmha_v2_block_table: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -1274,6 +1278,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+            if self.use_fmha_v2 and not forward_batch.forward_mode.is_draft_extend_v2():
+                self._init_fmha_v2_batch_pages(metadata, forward_batch)
 
         kv_view = self.kv_index_translator.read_table(
             forward_batch.kv_loc_plan, rows=forward_batch.batch_size
@@ -1333,6 +1339,53 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         self.forward_metadata = metadata
+
+    def _init_fmha_v2_batch_pages(
+        self, metadata: TRTLLMMHAMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Index the pages this batch reads, for the fmha_v2 prefill copy.
+
+        Sized by the host max of seq_lens, which is live only alongside
+        seq_lens_sum (a GPU-only batch keeps a stale seq_lens_cpu); without it
+        the prefill copies the whole pool.
+        """
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if (
+            forward_batch.seq_lens_sum is None
+            or seq_lens_cpu is None
+            or seq_lens_cpu.numel() == 0
+        ):
+            return
+        max_pages = -(-int(seq_lens_cpu.max()) // self.page_size)
+        num_pages = (
+            metadata.cache_seqlens_int32 + self.page_size - 1
+        ) // self.page_size
+        device = num_pages.device
+        metadata.fmha_v2_page_mask = (
+            torch.arange(max_pages, device=device) < num_pages[:, None]
+        )
+        metadata.fmha_v2_block_table = torch.arange(
+            num_pages.numel() * max_pages, dtype=torch.int32, device=device
+        ).view(-1, max_pages)
+
+    def _fmha_v2_paged_kv(
+        self, k_cache: torch.Tensor, v_cache: torch.Tensor, page_table: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """K and V as the [pages, 2, page_size, heads, head_dim] tensor fmha_v2
+        takes, and the block table that addresses it.
+
+        fmha_v2 derives strides from shapes, so this is a copy: of the batch's
+        pages only, unless that is no smaller than the whole pool.
+        """
+        mask = self.forward_metadata.fmha_v2_page_mask
+        if mask is None or mask.numel() >= k_cache.shape[0]:
+            return torch.stack([k_cache, v_cache], dim=1), page_table
+        # Past a row's last page the table may be unwritten; read page 0 there.
+        pages = torch.where(mask, page_table[:, : mask.shape[1]], 0).flatten()
+        paged_kv = torch.stack(
+            [k_cache.index_select(0, pages), v_cache.index_select(0, pages)], dim=1
+        )
+        return paged_kv, self.forward_metadata.fmha_v2_block_table
 
     def _reshape_paged_kv_cache(
         self,
@@ -1760,7 +1813,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            paged_kv, block_tables = self._fmha_v2_paged_kv(
+                k_cache, v_cache, page_table
+            )
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
@@ -1774,7 +1829,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=page_table,
+                block_tables=block_tables,
                 out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
                 mask_mode=(
