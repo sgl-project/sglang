@@ -1,10 +1,14 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
     _NegotiateOutput,
+    _State,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -137,6 +141,51 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
             tracker.observe_attempt(0)
 
         self.assertEqual(tracker.max_prefill_bs, 0)
+
+
+class TestPrefillDelayerClockSkew(CustomTestCase):
+    def test_release_uses_gathered_timeout_not_local_clock(self):
+        obj = PrefillDelayer.__new__(PrefillDelayer)
+        obj._max_delay_passes = 100
+        obj._token_usage_low_watermark = None
+        obj._queue_min_ratio = 0.5
+        obj._max_delay_ms = 500
+        obj._queue_trigger_enabled = True
+        obj._prefill_max_requests = 4
+        obj.attn_dp_enabled = False
+        obj.num_dp_ranks = 1
+        obj.skip_first_delayer = False
+        for global_expired in (False, True):
+            for local_expired in (False, True):
+                with self.subTest(
+                    global_expired=global_expired, local_expired=local_expired
+                ):
+                    obj._gather_info = MagicMock(
+                        return_value=torch.tensor(
+                            [[1, 0, 8, 4, 1, int(global_expired)]], dtype=torch.int64
+                        )
+                    )
+                    state = _State(
+                        delayed_count=10, start_time=9.499 if local_expired else 9.501
+                    )
+                    with patch(
+                        "sglang.srt.managers.prefill_delayer.time.perf_counter",
+                        return_value=10.0,
+                    ):
+                        result = obj._negotiate_should_allow_prefill_pure(
+                            prev_state=state,
+                            local_prefillable=True,
+                            token_usage=0.8,
+                            running_batch=8,
+                            max_prefill_bs=4,
+                            max_running_requests=128,
+                            waiting_queue_len=1,
+                        )
+                    self.assertEqual(result.output_allow, global_expired)
+                    self.assertEqual(
+                        obj._gather_info.call_args.kwargs["queue_timeout_expired"],
+                        local_expired,
+                    )
 
 
 if __name__ == "__main__":
