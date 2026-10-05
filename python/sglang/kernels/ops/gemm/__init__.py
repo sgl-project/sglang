@@ -319,7 +319,7 @@ def tiny_gemm_bf16(
     out_dtype: Optional[torch.dtype] = None,
     max_m: int = 16,
 ) -> torch.Tensor:
-    """Tiny bf16 GEMM ``x[m, k] @ w[n, k].T``, support bf16/fp32 out"""
+    """BF16 activations, BF16/FP32 output; FP32 weights are supported for N < K."""
     impl = get_kernel("gemm.tiny_gemm", KernelBackend.JIT)
     return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
 

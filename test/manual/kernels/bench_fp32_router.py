@@ -1,10 +1,10 @@
-"""Compare the router boundary against FP32 cuBLAS with 49 rotating weights.
+"""Compare cuBLAS, the PR84 router, and mixed-weight tiny_gemm.
 
 Run with the candidate Python package on CUDA SM90+:
     python test/manual/kernels/bench_fp32_router.py
 
 Times are microseconds per layer under CUDA graph replay. The baseline includes
-BF16-to-FP32 activation conversion; weights stay FP32 for both implementations.
+BF16-to-FP32 activation conversion; weights stay FP32 for all implementations.
 The 245 MiB weight working set exceeds H200/B300 L2. Compilation is untimed.
 """
 
@@ -14,6 +14,7 @@ import statistics
 import torch
 
 from sglang.kernels.ops.gemm.fp32_router import fp32_router_gemm
+from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 
 torch.manual_seed(42)
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -53,16 +54,28 @@ def bench(fn):
     return statistics.median(samples)
 
 
-for m in (*range(1, 17), 24, 32, 48, 64):
+for m in range(1, 17):
     x = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
     base = bench(lambda w: torch.nn.functional.linear(x.float(), w))
     ref = x.double() @ weights[0].double().T
-    fn = lambda w: fp32_router_gemm(x, w)
-    out = fn(weights[0])
-    torch.cuda.synchronize()
-    err = (out.double() - ref).abs().max().item()
-    us = bench(fn)
-    print(
-        json.dumps(dict(m=m, base_us=base, us=us, speedup=base / us, max_error=err)),
-        flush=True,
-    )
+    for name, fn in (
+        ("pr84", lambda w: fp32_router_gemm(x, w)),
+        ("tiny", lambda w: tiny_gemm_bf16(x, w, out_dtype=torch.float32)),
+    ):
+        out = fn(weights[0])
+        torch.cuda.synchronize()
+        err = (out.double() - ref).abs().max().item()
+        us = bench(fn)
+        print(
+            json.dumps(
+                dict(
+                    m=m,
+                    variant=name,
+                    base_us=base,
+                    us=us,
+                    speedup=base / us,
+                    max_error=err,
+                )
+            ),
+            flush=True,
+        )
