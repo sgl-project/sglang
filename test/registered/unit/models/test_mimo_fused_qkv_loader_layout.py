@@ -14,9 +14,10 @@ from sglang.srt.models.mimo_v2 import (
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -28,7 +29,7 @@ SCALE_NAME = WEIGHT_NAME.replace(".weight", ".weight_scale_inv")
 def loading_scope(changed):
     if not changed:
         return nullcontext()
-    return get_parallel().override(
+    return parallel_scope(
         tp_size=1,
         tp_rank=0,
         tp_group=None,
@@ -268,9 +269,7 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
         )
         _, projection = build_projection()
         model, fp8_projection = build_projection(fp8=True)
-        with get_parallel().override(
-            tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0
-        ):
+        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0):
             load_fused(projection, ckpt_tp=8)
             load_deferred(model, fp8_projection)
 

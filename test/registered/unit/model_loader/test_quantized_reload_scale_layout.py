@@ -8,7 +8,6 @@ from contextlib import nullcontext
 import torch
 from transformers import Qwen2Config, Qwen3Config
 
-from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -17,9 +16,8 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.layers.linear import MergedColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.model_loader.loader import QuantizedRLModelLoader
+from sglang.srt.model_loader.loader import DefaultModelLoader, QuantizedRLModelLoader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
@@ -36,10 +34,13 @@ def values(shape, version=0):
     ).float() / 64
     if len(shape) == 2:
         base *= ((torch.arange(shape[0], device="cuda") + version) % 17 + 1)[:, None]
+        base *= (torch.arange(shape[1], device="cuda") // max(shape[1] // 4, 1) + 1)[
+            None, :
+        ]
     return (base + version / 128).to(torch.bfloat16)
 
 
-def checkpoint(version=0, kind="qwen2"):
+def checkpoint(version=0, kind="qwen2", kv_heads=8):
     weights = []
     for name, shape in {
         "model.embed_tokens.weight": (512, 512),
@@ -48,11 +49,16 @@ def checkpoint(version=0, kind="qwen2"):
         "model.layers.0.input_layernorm.weight": (512,),
         "model.layers.0.post_attention_layernorm.weight": (512,),
         **{
-            f"model.layers.0.self_attn.{p}.weight": (512, 512)
+            f"model.layers.0.self_attn.{p}.weight": (
+                kv_heads * 64 if p in ("k_proj", "v_proj") else 512,
+                512,
+            )
             for p in ("q_proj", "k_proj", "v_proj", "o_proj")
         },
         **{
-            f"model.layers.0.self_attn.{p}.bias": (512,)
+            f"model.layers.0.self_attn.{p}.bias": (
+                kv_heads * 64 if p in ("k_proj", "v_proj") else 512,
+            )
             for p in ("q_proj", "k_proj", "v_proj")
             if kind == "qwen2"
         },
@@ -71,7 +77,7 @@ def checkpoint(version=0, kind="qwen2"):
     return weights
 
 
-def build_model(kind="qwen2"):
+def build_model(kind="qwen2", *, kv_heads=8, version=0, weights=None, per_tensor=False):
     config_class, model_class = {
         "qwen2": (Qwen2Config, Qwen2ForCausalLM),
         "qwen3": (Qwen3Config, Qwen3ForCausalLM),
@@ -81,7 +87,7 @@ def build_model(kind="qwen2"):
         intermediate_size=1024,
         num_hidden_layers=1,
         num_attention_heads=8,
-        num_key_value_heads=8,
+        num_key_value_heads=kv_heads,
         head_dim=64,
         vocab_size=512,
         max_position_embeddings=32,
@@ -92,9 +98,17 @@ def build_model(kind="qwen2"):
     )
     with torch.device("cuda"):
         model = model_class(config, Fp8Config(is_checkpoint_fp8_serialized=False))
+    if per_tensor:
+        for module in model.modules():
+            method = getattr(module, "quant_method", None)
+            if hasattr(method, "cutlass_fp8_supported"):
+                method.cutlass_fp8_supported = False
+                method.use_marlin = False
     loader = QuantizedRLModelLoader(LoadConfig(load_format=LoadFormat.FLASH_RL))
     loader.load_weights_and_postprocess(
-        model, checkpoint(kind=kind), torch.device("cuda")
+        model,
+        checkpoint(version, kind, kv_heads) if weights is None else weights,
+        torch.device("cuda"),
     )
     return model
 
@@ -123,34 +137,36 @@ def loading_scope(changed):
     )
 
 
-def check_reload(model, version=13, changed=False):
-    source = checkpoint(version, model.config.model_type)
-    if model.config.model_type == "qwen3":
-        # Q/K norms are outside the current quantized reload exclude list.
-        # Keep their initial values while updating the native projections.
-        source = [(n, t) for n, t in source if "_norm.weight" not in n]
-    params = dict(model.named_parameters())
-    pointers = {n: t.data_ptr() for n, t in params.items()}
+def assert_same_parameters(actual, expected):
+    expected_params = dict(expected.named_parameters())
+    for name, param in actual.named_parameters():
+        reference = expected_params[name]
+        assert param.shape == reference.shape, name
+        assert param.stride() == reference.stride(), name
+        assert param.dtype == reference.dtype, name
+        torch.testing.assert_close(
+            param.contiguous().reshape(-1).view(torch.uint8),
+            reference.contiguous().reshape(-1).view(torch.uint8),
+            rtol=0,
+            atol=0,
+            msg=name,
+        )
+
+
+def check_reload(model, version=13, changed=False, per_tensor=False):
+    kind, kv_heads = model.config.model_type, model.config.num_key_value_heads
+    source = checkpoint(version, kind, kv_heads)
+    pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
+    DefaultModelLoader.restore_weights_before_loading(model, torch.device("cuda"))
     with loading_scope(changed):
         model.load_weights(source)
-    for name, ptr in pointers.items():
-        assert dict(model.named_parameters())[name].data_ptr() == ptr, name
-    for prefix, shards in (
-        ("model.layers.0.self_attn.qkv_proj", ("q_proj", "k_proj", "v_proj")),
-        ("model.layers.0.mlp.gate_up_proj", ("gate_proj", "up_proj")),
-    ):
-        layer = model.get_submodule(prefix)
-        parent_prefix = prefix.rpartition(".")[0]
-        expected = []
-        for shard in shards:
-            full = dict(source)[f"{parent_prefix}.{shard}.weight"]
-            _, scale = per_token_group_quant_fp8(full, full.shape[-1])
-            rows = full.shape[0] // layer.tp_size
-            start = layer.tp_rank * rows
-            expected.append(scale[start : start + rows].t().contiguous())
-        torch.testing.assert_close(
-            layer.weight_scale, torch.cat(expected, dim=-1), rtol=0, atol=0
-        )
+    DefaultModelLoader.postprocess_weights(model, torch.device("cuda"))
+    for name, param in model.named_parameters():
+        assert param.data_ptr() == pointers[name], name
+    reference = build_model(
+        kind, kv_heads=kv_heads, version=version, per_tensor=per_tensor
+    )
+    assert_same_parameters(model, reference)
     return model
 
 
@@ -194,54 +210,43 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
         check_reload(model, changed=True)
         check_reload(model, version=29, changed=True)
 
-    def test_replicated_stacked_scale_keeps_full_rows(self):
-        for cls in (MergedColumnParallelLinear, ReplicatedLinear):
-            with torch.device("cuda"):
-                config = Fp8Config(is_checkpoint_fp8_serialized=False)
-                if cls is MergedColumnParallelLinear:
-                    layer = cls(
-                        512,
-                        [512, 512],
-                        bias=False,
-                        quant_config=config,
-                        parallel_group="replicated",
-                    )
-                else:
-                    layer = cls(512, 1024, bias=False, quant_config=config)
-                layer.weight.copy_(values(layer.weight.shape))
-                layer.quant_method.process_weights_after_loading(layer)
-            scale_info = {}
-            for index in (0, 1):
-                _, scale_info[index] = per_token_group_quant_fp8(
-                    values((512, 512), 13 + index), 512
-                )
-            before_ptr = layer.weight_scale.data_ptr()
-            with loading_scope(True):
-                QuantizedRLModelLoader._apply_scale_update(
-                    {"gate_up_proj.weight_scale": layer.weight_scale},
-                    "gate_up_proj.weight",
-                    scale_info,
-                    layer=layer,
-                )
-            expected = torch.cat([scale_info[i].t() for i in (0, 1)], dim=-1)
-            torch.testing.assert_close(layer.weight_scale, expected, rtol=0, atol=0)
-            self.assertEqual(layer.weight_scale.data_ptr(), before_ptr)
+    def test_unequal_qkv_and_replicated_kv_match_cold_load(self):
+        for kv_heads in (1, 2, 4):
+            with self.subTest(kv_heads=kv_heads):
+                check_reload(build_model("qwen3", kv_heads=kv_heads), changed=True)
 
-    def test_missing_scale_and_none_updates_keep_existing_values(self):
-        model = build_model()
-        layer = model.model.layers[0].self_attn.qkv_proj
-        before = layer.weight_scale.detach().clone()
-        with loading_scope(True):
-            QuantizedRLModelLoader._apply_scale_update(
-                {}, "missing.weight", torch.ones(1, device="cuda"), layer=layer
-            )
-            QuantizedRLModelLoader._apply_scale_update(
-                dict(model.named_parameters()),
-                "model.layers.0.self_attn.qkv_proj.weight",
-                None,
-                layer=layer,
-            )
-        torch.testing.assert_close(layer.weight_scale, before, rtol=0, atol=0)
+    def test_partial_qkv_and_mlp_updates_preserve_other_rows(self):
+        for kind in ("qwen2", "qwen3"):
+            for shard in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
+                with self.subTest(kind=kind, shard=shard):
+                    model = build_model(kind, kv_heads=1)
+                    before = checkpoint(kind=kind, kv_heads=1)
+                    update = {
+                        n: t for n, t in checkpoint(13, kind, 1) if f".{shard}." in n
+                    }
+                    pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
+                    with loading_scope(True):
+                        model.load_weights(list(update.items()))
+                    expected = [(n, update.get(n, t)) for n, t in before]
+                    reference = build_model(kind, kv_heads=1, weights=expected)
+                    assert_same_parameters(model, reference)
+                    for name, param in model.named_parameters():
+                        self.assertEqual(param.data_ptr(), pointers[name], name)
+
+    def test_per_tensor_quantization_matches_native_cold_load(self):
+        model = build_model("qwen3", kv_heads=1, per_tensor=True)
+        check_reload(model, version=0, changed=True, per_tensor=True)
+        check_reload(model, version=13, changed=True, per_tensor=True)
+
+    def test_empty_session_keeps_native_layout_and_memory(self):
+        model = build_model("qwen3", kv_heads=1)
+        pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
+        DefaultModelLoader.restore_weights_before_loading(model, torch.device("cuda"))
+        model.load_weights([])
+        DefaultModelLoader.postprocess_weights(model, torch.device("cuda"))
+        assert_same_parameters(model, build_model("qwen3", kv_heads=1))
+        for name, param in model.named_parameters():
+            self.assertEqual(param.data_ptr(), pointers[name], name)
 
 
 if __name__ == "__main__":

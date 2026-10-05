@@ -141,7 +141,10 @@ def _resolve_linear_group(
     if name not in ("tp", "attn_tp", "shared_experts_tp"):
         raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
     parallel = get_parallel()
-    group = getattr(parallel, f"{name}_group")
+    try:
+        group = getattr(parallel, f"{name}_group")
+    except RuntimeError:
+        group = None
     if group is None and (
         name == "shared_experts_tp" or getattr(parallel, f"{name}_size") > 1
     ):
