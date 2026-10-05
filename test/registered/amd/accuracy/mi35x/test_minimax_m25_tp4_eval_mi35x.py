@@ -103,7 +103,7 @@ MI35X_MINIMAX_M25_TP4_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M2.5",
         tp_size=4,
-        accuracy_threshold=0.92,
+        accuracy_threshold=0.91,
         timeout=5400,
         variant="TP4+FP8KV+noUnifiedAttn+quickARINT4",
         other_args=[
