@@ -13,30 +13,32 @@
 # ==============================================================================
 """`--enable-unified-memory` speculative-decoding allow-list.
 
-Two audited arms (see `handle_unified_memory_pool`), each with its own
-constraints because each rides a different draft-KV story:
-  * DSPARK: chain draft with a private draft pool; verify runs on the MLA
-    backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`
-    / `flashmla` / `flashinfer` / `fa3`)
-    and the draft chain must be linear (`--speculative-eagle-topk` in
-    {None, 1}).
-  * EAGLE/EAGLE3: unified targets (hybrid-SWA or mamba hybrids, either
+Three audited arms (see `handle_unified_memory_pool`), each with its own
+backend constraints:
+  * DSPARK: the target verifies on the audited verify set (`triton` /
+    `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla` / `flashmla` /
+    `flashinfer` / `fa3`, which includes the MLA family). Its draft fuses
+    into the target's pages when the fused-draft decision allows, else keeps
+    a private pool, so the gate leaves the draft backend unconstrained.
+  * DFLASH: the target verifies on `triton` / `fa3` / `flashinfer`; the MLA
+    verify family must not leak into this arm.
+  * EAGLE/EAGLE3: unified targets only (hybrid-SWA or mamba hybrids, either
     full-pool kind) -- the draft's KV lives fused inside the full pool's
     page envelope (`DenseDraftRegion`), with an automatic private-pool
-    fallback when no region resolves. MLA hosts verify on the MLA backend
-    family; MHA hosts on the translated MHA rails. Chain
-    only, and verify is audited on `triton` / `flashinfer` / `fa3` --
-    demanded EXPLICITLY (an unset backend could resolve to an unaudited
-    default), for the draft worker too (its backend resolves separately:
-    explicit flag first, else it inherits the target's). The MLA verify
-    backends must not leak into this arm.
+    fallback when no region resolves. The target's verify set follows the
+    host kind: the audited verify set on an MLA host, `triton` /
+    `flashinfer` / `fa3` on an MHA host, and an unresolved backend is
+    refused. The draft worker (its backend resolves separately: explicit
+    flag first, else it inherits the target's) runs on `triton` /
+    `flashinfer` / `fa3`.
 
+Every arm drafts a linear chain (`--speculative-eagle-topk` in {None, 1}).
 Everything else (NGRAM / STANDALONE / registered customs) stays refused.
 NGRAM's refusal is load-bearing, not pending: like tree verify it relocates
 accepted tokens one at a time inside the target pool, which the unified
 pool's page-granular `move_kv_cache` cannot express. Pinned so no arm silently
-widens to an unaudited algorithm, family, tree shape, or backend -- and so the
-EAGLE arm's addition never perturbs the DSPARK arm.
+widens to an unaudited algorithm, family, tree shape, or backend -- and so one
+arm's addition never perturbs another.
 
     python -m pytest test/registered/unit/server_args/test_unified_memory_spec_gate.py -v
 """
@@ -119,7 +121,7 @@ def _accepts(
 
 
 class TestUnifiedMemorySpecGate(unittest.TestCase):
-    # Verify-audited backends for the DSPARK (MLA-family) arm.
+    # Verify-audited backends for the DSPARK arm (includes the MLA family).
     DSPARK_BACKENDS = (
         "triton",
         "trtllm_mla",
@@ -131,6 +133,8 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     )
     # Verify-audited backends for the EAGLE (fused-draft) arm.
     EAGLE_BACKENDS = ("triton", "flashinfer", "fa3")
+    # Verify-audited backends for the DFLASH arm.
+    DFLASH_BACKENDS = ("triton", "fa3", "flashinfer")
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
@@ -157,20 +161,21 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     def test_tree_drafting_refused(self):
         """Tree verify needs a per-token move inside the TARGET pool, which
         the unified pool's page-granular `move_kv_cache` cannot express.
-        DSPARK is the only admitted algorithm today, so it is the only one
-        that can demonstrate the rule; the check itself is unconditional, so
-        it keeps holding as further arms are admitted."""
+        DSPARK demonstrates the rule here; the check itself is unconditional,
+        so it holds for every admitted arm."""
         for topk in (2, 4, 8):
             self.assertFalse(_accepts("DSPARK", topk=topk))
         # The shape knob must not disturb spec-off.
         self.assertTrue(_accepts(None, topk=None))
 
     def test_dspark_draft_backend_is_not_constrained(self):
-        """DSPARK's draft owns a KV pool indexed directly by virtual id, so
-        its translator is a passthrough and any draft backend reads correctly.
-        Model hooks declare one on the operator's behalf -- Kimi-Linear /
-        Kimi-K3 + DSPARK on SM100 declares `trtllm_mha` -- so refusing it
-        would refuse a configuration the operator never touched."""
+        """The gate does not constrain DSPARK's draft backend: a draft whose
+        backend is off the translated rails keeps a private pool (the
+        fused-draft decision declines fusion), where its translator is a
+        passthrough and any backend reads correctly. Model hooks declare one
+        on the operator's behalf -- Kimi-Linear / Kimi-K3 + DSPARK on SM100
+        declares `trtllm_mha` -- so refusing it would refuse a configuration
+        the operator never touched."""
         for draft_backend in (None, *self.DSPARK_BACKENDS, "fa4", "trtllm_mha"):
             self.assertTrue(
                 _accepts("DSPARK", draft_backend=draft_backend),
@@ -209,6 +214,23 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 attention_arch=AttentionArch.MLA,
             )
         )
+
+    def test_dflash_admitted_only_on_its_verify_backends(self):
+        """DFLASH's target verifies on triton / fa3 / flashinfer. fa4 and
+        trtllm_mha have no translated spec verify path, and the MLA verify
+        family the DSPARK arm admits must not leak into this arm."""
+        for backend in self.DFLASH_BACKENDS:
+            self.assertTrue(
+                _accepts("DFLASH", backend=backend),
+                f"DFLASH should pass on verify-audited backend {backend}",
+            )
+        for backend in ("fa4", "trtllm_mha") + tuple(
+            b for b in self.DSPARK_BACKENDS if b not in self.DFLASH_BACKENDS
+        ):
+            self.assertFalse(
+                _accepts("DFLASH", backend=backend),
+                f"DFLASH must be refused on backend {backend}",
+            )
 
     def test_eagle_family_admitted_on_hybrid_swa(self):
         """EAGLE/EAGLE3 chain on a hybrid-SWA target with audited verify
@@ -291,13 +313,15 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             self.assertFalse(_accepts("EAGLE", backend=backend))
 
     def test_eagle_refused_unset_backend(self):
-        """An unset backend defaults to fa3/flashinfer later in resolution --
-        the EAGLE arm demands an explicit triton, never a None slip."""
+        """A real boot resolves the default backend before this gate runs, so
+        an unset one here is unresolved: the gate refuses it rather than
+        trusting it."""
         self.assertFalse(_accepts("EAGLE", backend=None))
 
     def test_eagle_draft_backend_pinned(self):
         """The draft worker resolves its own backend: unset inherits the
-        target's triton, explicit triton passes, anything else refuses."""
+        target's (triton here), an explicit triton / flashinfer / fa3 passes,
+        and anything else refuses."""
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
         for draft_backend in self.EAGLE_BACKENDS:
             self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
@@ -307,8 +331,9 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     def test_hierarchical_cache_refused_with_an_eagle_draft(self):
         """HiCache builds a draft host pool off the draft's device pool, and a
         fused draft view has no transfer surface of its own: the page-envelope
-        host pool refuses per-layer draft loads. Without a draft, or with
-        DSPARK's private pool, HiCache is not this gate's to refuse."""
+        host pool refuses per-layer draft loads. Without a draft HiCache is
+        not this gate's to refuse, and with DSPARK HiCache declines draft
+        fusion, so the draft keeps its private pool."""
         hicache = {"enable_hierarchical_cache": True}
         for algorithm in ("EAGLE", "EAGLE3"):
             self.assertFalse(_accepts(algorithm, fields=hicache))
