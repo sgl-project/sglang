@@ -275,9 +275,12 @@ def finalize_all_reduce_push_norm(
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Deferred MoE finalize + 1shot push all-reduce + RMSNorm on EVERY row.
+    """Deferred MoE finalize + 1shot push all-reduce + latent RMSNorm.
 
-    ``out`` ([T, 3584] bf16) is output-only; each rank's partial latent
+    ``out`` is [T, 3584] bf16, or flattened [latent | shared] with 3*T rows
+    of width 3584. Optional shared rows must contain rank-local sums; they
+    are reduced without normalization. Leading latent rows are output-only;
+    each rank's partial latent
     (``sum_k expert_weights[t, k] * gemm2_out[idx[t*16 + k]]``, -1 slots
     skipped) is computed during the multicast staging pass from the
     trtllm-gen deferred-finalize triple (``do_finalize=False``) and never
