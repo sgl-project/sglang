@@ -38,6 +38,43 @@ def _shared_step(descriptor: AFDStepDescriptor) -> tuple[Any, ...]:
     )
 
 
+class _AFDControlChannels:
+    """Isolate native metadata queues by directed AFD edge.
+
+    StatelessProcessGroup's point-to-point keys contain destination and sequence,
+    but not source. AFD fan-in needs a separate namespace for each sender; retain
+    native counters, expiration and store deadlines inside each edge.
+    """
+
+    def __init__(self, group: Any) -> None:
+        self._group = group
+        self.store = group.store
+        self._channels: dict[tuple[int, int], Any] = {}
+
+    def _channel(self, src: int, dst: int) -> Any:
+        import torch
+
+        from sglang.srt.distributed.utils import StatelessProcessGroup
+
+        edge = (src, dst)
+        if edge not in self._channels:
+            self._channels[edge] = StatelessProcessGroup(
+                rank=self._group.rank,
+                world_size=self._group.world_size,
+                store=torch.distributed.PrefixStore(
+                    f"afd-control/{src}/{dst}", self.store
+                ),
+                data_expiration_seconds=self._group.data_expiration_seconds,
+            )
+        return self._channels[edge]
+
+    def send_obj(self, obj: Any, dst: int) -> None:
+        self._channel(self._group.rank, dst).send_obj(obj, dst=dst)
+
+    def recv_obj(self, src: int) -> Any:
+        return self._channel(src, self._group.rank).recv_obj(src=src)
+
+
 def _store_host(rendezvous_host: str) -> str:
     """Where this rank would bind a store server its peers can reach."""
 
@@ -241,6 +278,9 @@ class AFDPairedP2PTransport:
         # ordinal indexes the owner directly.
         group_ordinal = topology.group_ordinal(role=role, ordinal=lane)
         store_hosts = self._control.all_gather_obj(_store_host(config.rendezvous_host))
+        # Startup consensus keeps the native broadcast namespace. Subsequent
+        # descriptors and acknowledgements must distinguish every source.
+        self._control = _AFDControlChannels(self._control)
         comm_group = StatelessProcessGroup.create(
             host=store_hosts[group_ordinal] or config.rendezvous_host,
             port=config.rendezvous_port + 1 + group_ordinal,
@@ -519,21 +559,29 @@ class AFDPairedP2PTransport:
                     graph_eligible=False,
                 )
             )
-            acknowledgement = self._control.recv_obj(
-                src=self._peer_coordination_ranks[0]
-            )
-            if acknowledgement != {"event": "AFD_CAPTURE_READY"}:
-                raise AFDError("AFD_CAPTURE_READY_ACK_INVALID")
+            self._receive_capture_ready(self._peer_coordination_ranks[0])
         else:
             acknowledgement = {"event": "AFD_CAPTURE_READY"}
             if self._control_upstream is not None:
                 self._control.send_obj(acknowledgement, dst=self._control_upstream)
             for follower in self._control_followers:
-                if self._control.recv_obj(src=follower) != acknowledgement:
-                    raise AFDError("AFD_CAPTURE_READY_ACK_INVALID")
+                self._receive_capture_ready(follower)
             for destination in self._peer_coordination_ranks:
                 self._control.send_obj(acknowledgement, dst=destination)
         self._retime_control_store(self._idle_timeout_seconds)
+
+    def _receive_capture_ready(self, source: int) -> None:
+        reply = self._control.recv_obj(src=source)
+        if reply != {"event": "AFD_CAPTURE_READY"}:
+            detail = (
+                f"event={reply.get('event')!r}"
+                if isinstance(reply, dict)
+                else f"kind={getattr(reply, 'kind', None)!r}"
+            )
+            raise AFDError(
+                "AFD_CAPTURE_READY_ACK_INVALID",
+                f"source={source} type={type(reply).__name__} {detail}",
+            )
 
     def exchange_close(self, *, usage: dict[str, Any]) -> dict[str, Any]:
         if self._close_exchange is not None:
