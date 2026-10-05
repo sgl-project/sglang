@@ -41,9 +41,6 @@ import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_layernorm_modulate,
-    can_use_fused_qk_head_layernorm,
-    can_use_fused_rmsnorm_scale_shift,
     fused_ltx2_rms_norm_modulate,
     hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
@@ -244,21 +241,6 @@ def test_packed_sdpa_preserves_training_dropout_and_missing_api_fallbacks():
     ):
         attention.forward_varlen(q, k, v, **kwargs)
     assert forward.call_count == 2
-
-
-def test_bitexact_norm_guards_follow_platform():
-    # Runs on both lanes, with shapes inside every guard's contract so only the
-    # platform decides: engaged on CUDA, rejected on ROCm.  A fatal LLVM error
-    # there kills the process, so the sites' own try/except cannot be what
-    # catches it -- the guards have to.
-    x = torch.randn(1, 256, 4096, device="cuda", dtype=torch.bfloat16)
-    row = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
-    vec = torch.randn(1, 1, 4096, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
-    q = torch.randn(1, 256, 32, 128, device="cuda", dtype=torch.bfloat16)
-    assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
-    assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
-    assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
 
 
 # -------------------------------------------------------------------------

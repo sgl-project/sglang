@@ -7,9 +7,9 @@ from transformers import Exaone4Config
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.post_norm import (
@@ -275,7 +275,7 @@ class Exaone4DecoderLayer(nn.Module):
         # Post-LN: each stage reads the residual as it is, and its output is
         # normalized before it is added. The layer writes the FFN's itself.
         ffn_update = PostNormAdd(self.post_feedforward_layernorm, applied_at_exit=True)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=PLAIN_READOUT,
@@ -292,8 +292,6 @@ class Exaone4DecoderLayer(nn.Module):
                 ),
                 None,
             ),
-            previous=declare_ffn(update=ffn_update) if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
