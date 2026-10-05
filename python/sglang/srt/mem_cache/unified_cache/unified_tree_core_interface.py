@@ -45,12 +45,19 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` and
+    ``swa_backup_node_id`` pause an internal eviction until the Controller
+    finishes its best-effort host backup. ``swa_backup_num_tokens`` includes
+    all unbacked SWA segments in the backup window, not just the victim.
     """
 
     node_id: Optional[NodeId] = None
+    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
+    swa_backup_node_id: Optional[NodeId] = None
+    swa_backup_num_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -174,6 +181,14 @@ class UnifiedTreeCoreInterface(ABC):
         its tree node.
 
         TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        ...
+
+    @abstractmethod
+    def is_write_through_compatible(self) -> bool:
+        """Whether current host ownership satisfies write-through invariants.
+
+        Read-only; the caller must have drained in-flight cache operations.
         """
         ...
 
@@ -317,6 +332,24 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> EvictDeviceLeafResult:
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
+        ...
+
+    @abstractmethod
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal Mamba eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal SWA eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
         ...
 
     @abstractmethod
@@ -486,6 +519,13 @@ class UnifiedTreeCoreInterface(ABC):
         """Mark the host tier (HiCache) as wired."""
         ...
 
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        """Enable a backend-managed barrier when needed.
+
+        The Python core demotes through SWAComponent directly. Native cores
+        may return a backup action to the cache executor before eviction.
+        """
+
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
         """Mark the host tier as buffer-only: one node staged per backup intent."""
@@ -640,6 +680,29 @@ class UnifiedTreeCoreInterface(ABC):
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        ...
+
+    @abstractmethod
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod
