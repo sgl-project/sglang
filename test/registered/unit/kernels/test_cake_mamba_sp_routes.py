@@ -1,13 +1,18 @@
 """CPU unit tests for the ``mamba_ssd_prefill`` / ``mamba_ssu`` Cake routes of
-the Mamba2 mixer and the ``sp_all_gather_matmul`` route of the LayerNorm-SP
-column-parallel participant (``SGLANG_CAKE_ROUTES``).
+the Mamba2 mixer, plus the route-table / import-hygiene checks shared with the
+``sp_all_gather_matmul`` route of the LayerNorm-SP column-parallel participant
+(``SGLANG_CAKE_ROUTES``). The SP route's own behaviour (engine weight view,
+capacity-bound launcher, refusals, NVSHMEM selection) is covered by
+``test_cake_sp_engine_view_routes.py``.
 
 Everything is mocked: the route switch, the adapter admission, the Cake
 forwarders and the stock kernels. The tests only check *which* callable
 receives the engine's tensors, that the Cake branch is handed the contract
-arguments (chunk-128 metadata, FP32 broadcasts, int64 indices, K-major
-weight) and that its return contract matches the stock branch. CPU tensors;
-no FlashInfer, Triton, CUDA or process group involved.
+arguments (chunk-128 metadata, the explicit pool state dtype, the plain-int
+sequence count, the engine's token-major buffer; the engine's raw BF16 /
+int32 storage on the rows whose programs read it and FP32 broadcasts / int64
+indices on the others) and that its return contract matches the stock branch.
+CPU tensors; no FlashInfer, Triton, CUDA or process group involved.
 """
 
 import contextlib
@@ -251,14 +256,17 @@ def test_ssd_route_on_admitted_uses_cake_with_contract_args(caplog):
     assert kw["chunk_indices"] is inputs["cake_chunk_indices"]
     assert kw["chunk_offsets"] is inputs["cake_chunk_offsets"]
     # Varlen without a prefix: ``None`` initial states plus the sequence count
-    # (no zero buffer); the engine's token-major buffer is the kernel's out.
+    # (no zero buffer); the engine's token-major buffer is the kernel's out;
+    # the engine's pool dtype is the kernel's state dtype (explicit).
     assert kw["initial_states"] is None and kw["num_seqs"] == 2
     assert kw["out"] is inputs["out"]
+    assert kw["state_dtype"] is torch.bfloat16
     # Admission saw the same tensors at chunk 128.
     s_args, s_kw = supports.call_args
     assert s_args[0] is inputs["x"] and s_args[3] is inputs["B"]
     assert s_kw["chunk_size"] == 128 and s_kw["out"] is inputs["out"]
     assert s_kw["initial_states"] is None and s_kw["num_seqs"] == 2
+    assert s_kw["state_dtype"] is torch.bfloat16
     assert s_kw["chunk_indices"] is inputs["cake_chunk_indices"]
     assert s_kw["seq_idx"] is inputs["seq_idx"] and s_kw["z"] is None
     # Stock return contract: (None, varlen_state, None) and the engine out filled.
@@ -442,11 +450,16 @@ def test_ssd_route_single_chunk_and_partial_chunk_batches_are_routed(lengths):
     assert cake.call_args.kwargs["out"] is inputs["out"]
 
 
-def test_ssd_route_admits_fp32_state():
-    """``--mamba-ssm-dtype float32`` (the engine default) is routed."""
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+def test_ssd_route_names_the_engine_pool_state_dtype(state_dtype):
+    """``--mamba-ssm-dtype float32`` (the engine default) and ``float16`` are
+    routed with the pool dtype named explicitly, also for a prefix-less batch
+    (``initial_states=None``), so the final states scattered back into the
+    pool are computed in the pool dtype rather than FlashInfer's BF16
+    inference."""
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
-    inputs = _ssd_inputs(state_dtype=torch.float32)
+    inputs = _ssd_inputs(state_dtype=state_dtype)
     with (
         _routes(mamba_mod, "mamba_ssd_prefill"),
         mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
@@ -454,6 +467,99 @@ def test_ssd_route_admits_fp32_state():
         mamba_mod.ssd_prefill(stock, **inputs)
     cake.assert_called_once()
     stock.assert_not_called()
+    assert cake.call_args.kwargs["initial_states"] is None
+    assert cake.call_args.kwargs["state_dtype"] is state_dtype
+    assert supports.call_args.kwargs["state_dtype"] is state_dtype
+
+
+def _fake_flashinfer_mamba():
+    """A stand-in ``flashinfer.mamba`` recording which entry the adapter uses."""
+    module = types.ModuleType("flashinfer.mamba")
+    runners = []
+
+    class SSDCombined:
+        def __init__(self, *args, **kwargs):
+            self.args, self.kwargs = args, kwargs
+            self.run = mock.Mock(
+                side_effect=lambda *a, **kw: (kw["out"], torch.zeros(1))
+            )
+            runners.append(self)
+
+    module.SSDCombined = SSDCombined
+    module.ssd_combined_fwd = mock.Mock(
+        side_effect=lambda *a, **kw: (kw["out"], torch.zeros(1))
+    )
+    return module, runners
+
+
+def test_adapter_explicit_state_dtype_uses_a_prepared_runner_once_per_config():
+    """``state_dtype=`` cannot be expressed through FlashInfer's functional
+    entry for a prefix-less call (it infers BF16), so the adapter serves it
+    through ``SSDCombined(..., backend="cake", state_dtype=...)`` cached per
+    device / stream / configuration; ``state_dtype=None`` stays functional."""
+    from sglang.kernels.cake_kernels import mamba as cake_mamba
+
+    cake_mamba._cached_ssd_runner.cache_clear()
+    module, runners = _fake_flashinfer_mamba()
+    inputs = _ssd_inputs(state_dtype=torch.float32)
+    call = dict(
+        D=inputs["D"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=True,
+        seq_idx=inputs["seq_idx"],
+        chunk_indices=inputs["cake_chunk_indices"],
+        chunk_offsets=inputs["cake_chunk_offsets"],
+        num_seqs=2,
+        out=inputs["out"],
+    )
+    positional = (inputs["x"], inputs["dt"], inputs["A"], inputs["B"], inputs["C"])
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "flashinfer": sys.modules.get(
+                    "flashinfer", types.ModuleType("flashinfer")
+                ),
+                "flashinfer.mamba": module,
+            },
+        ),
+        mock.patch.object(torch.cuda, "current_device", lambda: 0),
+        mock.patch.object(
+            torch.cuda, "current_stream", lambda *_: SimpleNamespace(cuda_stream=7)
+        ),
+        mock.patch.object(torch.cuda, "device", lambda *_: contextlib.nullcontext()),
+    ):
+        out, final = cake_mamba.ssd_combined_fwd(
+            *positional, state_dtype=torch.float32, **call
+        )
+        cake_mamba.ssd_combined_fwd(*positional, state_dtype=torch.float32, **call)
+        cake_mamba.ssd_combined_fwd(*positional, **call)
+    try:
+        assert out is inputs["out"] and final is not None
+        # One prepared runner for the configuration, reused by the second call.
+        assert len(runners) == 1
+        runner = runners[0]
+        assert runner.args == (128, H, HEADDIM, DSTATE, G)
+        assert runner.kwargs["backend"] == "cake"
+        assert runner.kwargs["state_dtype"] is torch.float32
+        assert runner.kwargs["io_dtype"] is torch.bfloat16
+        assert runner.kwargs["has_d"] and not runner.kwargs["d_has_hdim"]
+        assert runner.kwargs["has_varlen"] and not runner.kwargs["has_initial_states"]
+        assert not runner.kwargs["has_z"]
+        assert runner.kwargs["seq_idx_dtype"] is torch.int32
+        assert runner.run.call_count == 2
+        run_kw = runner.run.call_args.kwargs
+        assert run_kw["num_seqs"] == 2 and run_kw["out"] is inputs["out"]
+        assert run_kw["initial_states"] is None and run_kw["dt_softplus"] is True
+        assert run_kw["chunk_indices"] is inputs["cake_chunk_indices"]
+        assert "state_dtype" not in run_kw  # a constructor argument, not a run one
+        # Without an explicit dtype the functional entry is used unchanged.
+        module.ssd_combined_fwd.assert_called_once()
+        fn_kw = module.ssd_combined_fwd.call_args.kwargs
+        assert fn_kw["num_seqs"] == 2 and fn_kw["out"] is inputs["out"]
+        assert "state_dtype" not in fn_kw
+    finally:
+        cake_mamba._cached_ssd_runner.cache_clear()
 
 
 @pytest.mark.parametrize("case", ["tracking", "no_metadata", "fp64_state"])
@@ -607,7 +713,10 @@ def test_ssu_route_off_uses_stock_with_exact_kwargs():
     assert torch.all(inputs["kwargs"]["out"] == 1.0)
 
 
-def test_ssu_verify_route_on_admitted_uses_cake_with_contract_args(caplog):
+def test_ssu_verify_small_batch_passes_the_engine_storage_without_copies(caplog):
+    """Below batch 32 the six-token cache row runs the ``mtp_cache_c4_t6``
+    program, which reads the engine's BF16 coefficient broadcasts, int32 slot
+    tables and projection views as they are: no per-call conversion."""
     caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
     stock = mock.Mock(side_effect=_stock_ssu)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssu)
@@ -626,18 +735,15 @@ def test_ssu_verify_route_on_admitted_uses_cake_with_contract_args(caplog):
     state, x, dt, A, B, C, D = args
     assert state is inputs["state"] and x is inputs["x"] and A is inputs["A"]
     assert B is inputs["B"] and C is inputs["C"]
-    # FP32 per-head broadcasts with the stride-0 trailing axes preserved.
-    assert dt.dtype == torch.float32 and dt.stride(-1) == 0
-    assert tuple(dt.shape) == tuple(inputs["dt"].shape)
-    assert torch.equal(dt, inputs["dt"].to(torch.float32))
-    assert D.dtype == torch.float32 and D.stride(1) == 0 and torch.all(D == 1.0)
-    assert kw["dt_bias"].dtype == torch.float32 and kw["dt_bias"].stride(1) == 0
-    assert torch.all(kw["dt_bias"] == 0.5)
-    # int64 slot / buffer indices, same values as the engine's int32 ones.
-    assert kw["state_batch_indices"].dtype == torch.int64
-    assert kw["state_batch_indices"].tolist() == [1, 2]
-    assert kw["intermediate_state_indices"].dtype == torch.int64
-    assert kw["intermediate_state_indices"].tolist() == [0, 1]
+    assert dt is inputs["dt"] and D is inputs["D"]
+    assert kw["dt_bias"] is inputs["kwargs"]["dt_bias"]
+    assert kw["state_batch_indices"] is inputs["kwargs"]["state_batch_indices"]
+    assert kw["state_batch_indices"].dtype == torch.int32
+    assert (
+        kw["intermediate_state_indices"]
+        is inputs["kwargs"]["intermediate_state_indices"]
+    )
+    assert kw["intermediate_state_indices"].dtype == torch.int32
     assert kw["out"] is inputs["kwargs"]["out"]
     assert kw["disable_state_update"] is True and kw["dt_softplus"] is True
     assert (
@@ -645,16 +751,19 @@ def test_ssu_verify_route_on_admitted_uses_cake_with_contract_args(caplog):
         is (inputs["kwargs"]["intermediate_states_buffer"])
     )
     assert kw["cache_steps"] == 6 and kw["algorithm"] == "auto" and kw["z"] is None
-    # Admission saw the converted tensors.
+    # Admission saw the engine's tensors.
     s_args, s_kw = supports.call_args
-    assert s_args[0] is state and s_args[2].dtype == torch.float32
-    assert s_kw["state_batch_indices"].dtype == torch.int64
+    assert s_args[0] is state and s_args[2] is inputs["dt"]
+    assert s_kw["state_batch_indices"].dtype == torch.int32
     assert s_kw["algorithm"] == "auto" and s_kw["cache_steps"] == 6
     assert torch.all(inputs["kwargs"]["out"] == 2.0)
     assert "[cake-route] mamba_ssu: Cake kernel selected" in caplog.text
 
 
-def test_ssu_verify_large_batch_requests_horizontal_algorithm():
+def test_ssu_verify_large_batch_converts_to_the_canonical_abi_and_horizontal():
+    """From batch 32 on only the canonical-ABI ``mtp_horizontal`` program
+    serves the cache row: FP32 per-head broadcasts (stride-0 trailing axes
+    preserved), int64 tables, ``algorithm="horizontal"``."""
     stock = mock.Mock(side_effect=_stock_ssu)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssu)
     inputs = _ssu_verify_inputs(batch=32)
@@ -664,8 +773,28 @@ def test_ssu_verify_large_batch_requests_horizontal_algorithm():
         mock.patch.object(mamba_mod, "_cake_ssu_kernels", lambda: (supports, cake)),
     ):
         _call_ssu(stock, inputs)
-    assert cake.call_args.kwargs["algorithm"] == "horizontal"
-    assert supports.call_args.kwargs["algorithm"] == "horizontal"
+    stock.assert_not_called()
+    args, kw = cake.call_args
+    state, x, dt, A, B, C, D = args
+    assert state is inputs["state"] and x is inputs["x"] and A is inputs["A"]
+    assert dt.dtype == torch.float32 and dt.stride(-1) == 0
+    assert tuple(dt.shape) == tuple(inputs["dt"].shape)
+    assert torch.equal(dt, inputs["dt"].to(torch.float32))
+    assert D.dtype == torch.float32 and D.stride(1) == 0 and torch.all(D == 1.0)
+    assert kw["dt_bias"].dtype == torch.float32 and kw["dt_bias"].stride(1) == 0
+    assert torch.all(kw["dt_bias"] == 0.5)
+    assert kw["state_batch_indices"].dtype == torch.int64
+    assert torch.equal(
+        kw["state_batch_indices"],
+        inputs["kwargs"]["state_batch_indices"].to(torch.int64),
+    )
+    assert kw["intermediate_state_indices"].dtype == torch.int64
+    assert kw["intermediate_state_indices"].tolist() == list(range(32))
+    assert kw["algorithm"] == "horizontal"
+    s_args, s_kw = supports.call_args
+    assert s_args[2].dtype == torch.float32
+    assert s_kw["state_batch_indices"].dtype == torch.int64
+    assert s_kw["algorithm"] == "horizontal"
 
 
 def test_ssu_route_on_rejected_falls_back_and_logs_once(caplog):
@@ -880,218 +1009,6 @@ def _linear(sp_env, bias=None, quantized=False):
         SimpleNamespace(apply=mock.Mock()) if quantized else sp_env.method_cls()
     )
     return linear
-
-
-def _sp_kernels(
-    *, prepare_ok=True, ag_ok=True, prepare_raises=False, raise_type=NotImplementedError
-):
-    supports_ag = mock.Mock(return_value=ag_ok)
-    supports_prepare = mock.Mock(return_value=prepare_ok)
-    ag = mock.Mock(
-        side_effect=lambda inp, w, group: torch.full(
-            (inp.shape[0] * TP, w.shape[1]), 3.0, dtype=inp.dtype
-        )
-    )
-    launchers = []
-
-    def _prepare(inp, w, group):
-        if prepare_raises:
-            raise raise_type("no packed-QKV row")
-        launcher = mock.Mock(
-            side_effect=lambda x: torch.full(
-                (x.shape[0] * TP, w.shape[1]), 2.0, dtype=x.dtype
-            )
-        )
-        launchers.append(launcher)
-        return launcher
-
-    prepare = mock.Mock(side_effect=_prepare)
-    kernels = (supports_ag, supports_prepare, ag, prepare)
-    return kernels, launchers
-
-
-def _patch_sp_kernels(kernels):
-    return mock.patch.object(sp_mod, "_cake_sp_kernels", lambda: kernels)
-
-
-def test_sp_route_off_uses_stock_gather_and_matmul(sp_env):
-    kernels, _ = _sp_kernels()
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod), _patch_sp_kernels(kernels):
-        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
-    linear.quant_method.apply.assert_called_once()
-    gathered = linear.quant_method.apply.call_args.args[1]
-    assert tuple(gathered.shape) == (NUM_TOKENS, K)
-    for fn in kernels:
-        fn.assert_not_called()
-    assert tuple(out.shape) == (NUM_TOKENS, N) and torch.all(out == 1.0)
-
-
-def test_sp_route_on_prepared_launcher_is_prepared_once_and_reused(sp_env, caplog):
-    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
-    kernels, launchers = _sp_kernels()
-    supports_ag, supports_prepare, ag, prepare = kernels
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
-        out2 = sp_mod.column_parallel_g_matmul(linear, inp.clone(), None)
-    linear.quant_method.apply.assert_not_called()
-    ag.assert_not_called()
-    prepare.assert_called_once()
-    p_inp, p_w, p_group = prepare.call_args.args
-    assert p_inp is inp and p_group is sp_env.group
-    # K-major contiguous weight copy (FI contract), equal to weight.T.
-    assert tuple(p_w.shape) == (K, N) and p_w.is_contiguous()
-    assert torch.equal(p_w, linear.weight.detach().t())
-    # Admission runs on the real tensors of every call; the launcher is prepared
-    # once and reused.
-    assert supports_prepare.call_count == 2
-    s_inp, s_w = supports_prepare.call_args_list[0].args
-    assert s_inp is inp and s_w is p_w
-    assert supports_prepare.call_args.kwargs == {"world_size": TP}
-    assert len(launchers) == 1 and launchers[0].call_count == 2
-    assert tuple(out.shape) == (NUM_TOKENS, N) and torch.all(out == 2.0)
-    assert torch.all(out2 == 2.0)
-    assert "[cake-route] sp_all_gather_matmul: Cake kernel selected" in caplog.text
-
-
-def test_sp_route_on_functional_kernel_when_prepared_not_admitted(sp_env):
-    kernels, launchers = _sp_kernels(prepare_ok=False)
-    supports_ag, supports_prepare, ag, prepare = kernels
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
-    prepare.assert_not_called()
-    ag.assert_called_once()
-    a_inp, a_w, a_group = ag.call_args.args
-    assert a_inp is inp and a_group is sp_env.group
-    assert tuple(a_w.shape) == (K, N) and a_w.is_contiguous()
-    assert supports_ag.call_args.args[1] is a_w
-    linear.quant_method.apply.assert_not_called()
-    assert torch.all(out == 3.0) and tuple(out.shape) == (NUM_TOKENS, N)
-
-
-def test_sp_route_on_rejected_falls_back_and_logs_once(sp_env, caplog):
-    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
-    kernels, _ = _sp_kernels(prepare_ok=False, ag_ok=False)
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-    assert linear.quant_method.apply.call_count == 2
-    assert torch.all(out == 1.0)
-    assert caplog.text.count("[cake-route] sp_all_gather_matmul: fallback") == 1
-    assert "adapter admission rejected" in caplog.text
-
-
-def test_sp_prepare_valueerror_is_a_refusal_not_a_crash(sp_env, caplog):
-    # FlashInfer validates the host contract (symmetric-memory backend, K/N,
-    # world size) with ValueError; the route must fall back, not raise.
-    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
-    kernels, _ = _sp_kernels(prepare_raises=True, ag_ok=False, raise_type=ValueError)
-    _, _, ag, prepare = kernels
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-    assert prepare.call_count == 1 and ag.call_count == 0
-    assert linear.quant_method.apply.call_count == 2
-    assert torch.all(out == 1.0)
-    assert caplog.text.count("[cake-route] sp_all_gather_matmul: fallback") == 1
-    assert "FlashInfer refused to prepare" in caplog.text
-
-
-def _fake_symm_mem(*, backend="CUDA", available=True, set_raises=None):
-    state = {"backend": backend}
-
-    def _set(name):
-        if set_raises is not None:
-            raise set_raises
-        state["backend"] = name
-
-    return SimpleNamespace(
-        get_backend=lambda device: state["backend"],
-        is_nvshmem_available=lambda: available,
-        set_backend=mock.Mock(side_effect=_set),
-        state=state,
-    )
-
-
-@pytest.mark.parametrize(
-    "fake, expected, text",
-    [
-        (_fake_symm_mem(backend="CUDA"), True, "set to NVSHMEM"),
-        (_fake_symm_mem(backend="NVSHMEM"), True, ""),
-        (_fake_symm_mem(available=False), False, "unavailable"),
-        (
-            _fake_symm_mem(set_raises=RuntimeError("already allocated")),
-            False,
-            "cannot select the NVSHMEM",
-        ),
-    ],
-)
-def test_sp_symm_mem_backend_selection(sp_env, caplog, fake, expected, text):
-    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
-    sp_mod.reset_cake_sp_state_for_tests()
-    with (
-        _routes(sp_mod, "sp_all_gather_matmul"),
-        mock.patch.object(sp_mod, "_symm_mem_module", lambda: fake),
-        mock.patch.object(torch.cuda, "current_device", lambda: 0),
-    ):
-        assert sp_mod.select_cake_sp_symm_mem_backend() is expected
-    assert (fake.state["backend"] == "NVSHMEM") is expected
-    assert sp_mod._cake_sp_nvshmem_backend is expected
-    if expected:
-        # torch's fused symm-mem ops cannot allocate under NVSHMEM: stock fused
-        # path off for the process, plain gather/scatter + matmul instead.
-        assert sp_mod.sp_fused_matmul_eligible(_linear(sp_env)) is False
-    sp_mod.reset_cake_sp_state_for_tests()
-    assert text in caplog.text
-
-
-def test_sp_prepare_refusal_falls_back_and_is_cached(sp_env):
-    kernels, _ = _sp_kernels(prepare_raises=True, ag_ok=False)
-    _, _, ag, prepare = kernels
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-    assert prepare.call_count == 1
-    assert linear.quant_method.apply.call_count == 2
-
-
-@pytest.mark.parametrize("case", ["bias", "quantized", "capture"])
-def test_sp_route_static_fallbacks_skip_adapter(sp_env, case):
-    kernels, _ = _sp_kernels()
-    bias = torch.zeros(N, dtype=torch.bfloat16) if case == "bias" else None
-    linear = _linear(sp_env, bias=bias, quantized=(case == "quantized"))
-    inp = torch.randn(ROWS, K).bfloat16()
-    capture = _capturing() if case == "capture" else contextlib.nullcontext()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels), capture:
-        sp_mod.column_parallel_g_matmul(linear, inp, bias)
-    linear.quant_method.apply.assert_called_once()
-    for fn in kernels:
-        fn.assert_not_called()
-
-
-def test_sp_weight_reload_reprepares_copy_and_launcher(sp_env):
-    kernels, launchers = _sp_kernels()
-    prepare = kernels[3]
-    linear = _linear(sp_env)
-    inp = torch.randn(ROWS, K).bfloat16()
-    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-        with torch.no_grad():
-            linear.weight.copy_(torch.randn(N, K, dtype=torch.bfloat16))  # reload
-        sp_mod.column_parallel_g_matmul(linear, inp, None)
-    assert prepare.call_count == 2 and len(launchers) == 2
-    assert torch.equal(prepare.call_args.args[1], linear.weight.detach().t())
 
 
 # ---------------------------------------------------------------------------

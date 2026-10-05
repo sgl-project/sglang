@@ -34,8 +34,10 @@ for _op, _target, _signature, _description in (
             in_place=True,
             description=(
                 "prepared Mamba2 SSD combined prefill runner (chunk 128, headdim 64, "
-                "dstate 128, any seqlen): BF16 x/B/C/D/z, BF16/FP16/FP32 state, "
-                "caller-owned token-major out [B,S,nheads,64], selective checkpoints"
+                "dstate 128, any seqlen): BF16 x/B/C/D/z, constructor-selected "
+                "BF16/FP16/FP32 state, caller-owned token-major out [B,S,nheads,64] "
+                "written directly, varlen without initial_states (num_seqs), "
+                "selective checkpoints"
             ),
         ),
         "Cake SSD combined prefill runner (flashinfer.mamba.SSDCombined, "
@@ -49,8 +51,9 @@ for _op, _target, _signature, _description in (
             in_place=True,
             description=(
                 "functional Mamba2 SSD combined prefill (Cake-only, runner cached per "
-                "device/stream/config); returns token-major [B,S,nheads,64] + final "
-                "states"
+                "device/stream/config); returns the token-major out [B,S,nheads,64] + "
+                "final states; state dtype inferred from initial_states/"
+                "checkpoint_states (BF16 default) or named via state_dtype="
             ),
         ),
         "Cake SSD combined prefill (flashinfer.mamba.ssd_combined_fwd) "
@@ -64,8 +67,10 @@ for _op, _target, _signature, _description in (
             in_place=True,
             description=(
                 "Mamba selective state update on a 4-D state pool (BF16 or FP32) with "
-                "BF16 x/B/C and per-head broadcast FP32 dt/A/D/dt_bias; promoted "
-                "T=1 / MTP rows run Cake, others fall back inside FlashInfer"
+                "BF16 x/B/C, per-head broadcast FP32 A and either FP32 dt/D/dt_bias "
+                "+ int64 tables or the engine's BF16 dt/D/dt_bias + int32 tables; "
+                "promoted T=1 (incl. headdim-64 decode) / MTP rows run Cake, others "
+                "fall back inside FlashInfer"
             ),
         ),
         "Cake selective state update (flashinfer.mamba.selective_state_update, "
@@ -142,8 +147,13 @@ def cake_ssd_combined_fwd(
     checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
+    state_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Explicit Cake entry point; gate on ``supports_ssd_combined``."""
+    """Explicit Cake entry point; gate on ``supports_ssd_combined``.
+
+    ``state_dtype`` names the state dtype explicitly (prepared runner); without
+    it FlashInfer infers it from ``initial_states`` / ``checkpoint_states``.
+    """
     return get_kernel("mamba.ssd_combined_fwd", KernelBackend.FLASHINFER)(
         x,
         dt,
@@ -167,6 +177,7 @@ def cake_ssd_combined_fwd(
         checkpoint_states=checkpoint_states,
         out=out,
         return_final_states=return_final_states,
+        state_dtype=state_dtype,
     )
 
 

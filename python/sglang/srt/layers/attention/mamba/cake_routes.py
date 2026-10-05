@@ -22,24 +22,35 @@ FlashInfer contract constraints that shape the wiring (see the adapter
   ``mamba_chunk_size``, 256 for Nemotron-H, so :class:`Mamba2Metadata`
   carries a second, chunk-128 ``chunk_indices`` / ``chunk_offsets`` pair when
   the route is on), any packed token count (the kernel handles a partial last
-  chunk), BF16 / FP16 / FP32 state (every ``--mamba-ssm-dtype``), varlen
-  without a prefix passes ``initial_states=None`` plus the sequence count, and
-  the engine's token-major ``[1, S, H, 64]`` output buffer is the kernel's
-  ``out`` (no copy).
+  chunk; no 128-multiple admission and no single-chunk guard: both were
+  workarounds for kernel bugs fixed in the exact-scan family). The engine's
+  SSM pool dtype (``--mamba-ssm-dtype``: FP32 by default, BF16 / FP16
+  selectable) is passed explicitly as ``state_dtype`` so the final states
+  come back in the pool dtype and the engine's scatter does not cast -- a
+  varlen batch without a prefix passes ``initial_states=None`` plus the
+  plain-int sequence count (``num_seqs``; FlashInfer would otherwise infer a
+  BF16 state). The engine's token-major ``[1, S, H, 64]`` output buffer is
+  the kernel's ``out`` (written directly, no copy).
 * SSD radix-cache tracking (``track_seq_idx`` / ``track_end_locs``): the
   Cake runner exposes selective checkpoints only at logical chunk ends
   (``checkpoint_token_indices`` + ``checkpoint_state_slots``); the mapping
   from the engine's track end locations onto that contract is not wired
   here, so a batch that requests track states keeps the stock kernel.
-* SSU: Cake runs only on its promoted rows: ``(dim, dstate) = (128, 128)``
-  for ``T in {1, 2}`` and the BF16-state MTP cache row ``(64, 128, T=6)``
-  with ``disable_state_update`` + intermediate buffer (Nemotron-H / granite
-  target-verify with six draft tokens).  Those rows take FP32 ``dt`` / ``D``
-  / ``dt_bias`` (per-head broadcasts) and int64 indices; the engine holds
-  BF16 broadcasts and int32 indices, so the route casts the broadcast base
-  (``[H]`` parameters are cached once, ``dt`` / indices per call).  A
-  ``T = 1`` decode of a ``headdim = 64`` model (Nemotron-H, granite) has no
-  promoted row and stays on the stock kernel without consulting FlashInfer.
+* SSU: Cake runs only on its promoted rows. The ``T = 1`` decode of a
+  ``headdim = 64`` model (Nemotron-H, granite; BF16 or FP32 state) and the
+  BF16-state MTP cache row ``(64, 128, T=6)`` with ``disable_state_update``
+  + intermediate buffer below batch 32 (target verify with six draft tokens)
+  read the engine's own storage -- BF16 ``dt`` / ``D`` / ``dt_bias``
+  broadcasts, int32 slot tables, fused-projection views -- so nothing is
+  copied per call. The other rows (``(dim, dstate) = (128, 128)`` for
+  ``T in {1, 2}``, the cache row at batch >= 32 via ``algorithm=
+  "horizontal"``) take FP32 coefficients and int64 indices; the route casts
+  the broadcast base there (``[H]`` parameters are cached once, ``dt`` /
+  indices per call). Shapes outside every row (other ``(dim, dstate)``
+  tiles, other ``T``) stay on the stock kernel without consulting FlashInfer;
+  the adapter admission mirrors FlashInfer's per-row layout and
+  SM-count windows (e.g. the cache row's ``(10 * SMs) // (B * H) >= 4``
+  below batch 32) and names the refusal.
 * A shape first seen inside CUDA-graph capture is not routed (the Cake SSU
   is nvcc-built on first use); the warm-up forward before capture admits it.
 """
@@ -419,7 +430,8 @@ def _cake_ssd_prefill(
         _log_cake_route_once(
             route,
             "fallback",
-            f"state dtype not BF16/FP16/FP32 (--mamba-ssm-dtype): {detail}",
+            f"SSM pool dtype {str(state_dtype).removeprefix('torch.')} has no "
+            f"Cake SSD state program (BF16/FP16/FP32; --mamba-ssm-dtype): {detail}",
         )
         return None
     key = (
@@ -436,7 +448,9 @@ def _cake_ssd_prefill(
     supports, cake_fwd = _cake_ssd_kernels()
     # ``initial_states=None`` is the stock "no prefix" call; the Cake runner
     # takes it as such and learns the packed sequence count from ``num_seqs``.
-    # The engine's token-major output buffer is the kernel's ``out``.
+    # The engine's token-major output buffer is the kernel's ``out``; the
+    # engine's pool dtype is the kernel's state dtype (explicit, so a
+    # prefix-less batch does not fall back to FlashInfer's BF16 inference).
     dt_limit = (0.0, float("inf"))
     admitted = supports(
         x,
@@ -455,6 +469,7 @@ def _cake_ssd_prefill(
         out=out,
         num_seqs=num_seqs,
         chunk_size=SSD_CHUNK_SIZE,
+        state_dtype=state_dtype,
         **checkpoints,
     )
     if not admitted:
@@ -479,6 +494,7 @@ def _cake_ssd_prefill(
             out=out,
             num_seqs=num_seqs,
             return_final_states=True,
+            state_dtype=state_dtype,
             **checkpoints,
         )
     except NotImplementedError as error:  # FlashInfer host-side refusal
@@ -567,6 +583,12 @@ def _int64(indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return indices.to(torch.int64)
 
 
+# Below this batch FlashInfer serves the (64, 128, T=6) cache row with the
+# ``mtp_cache_c4_t6`` program, which reads either coefficient ABI; from this
+# batch on only the canonical-ABI ``mtp_horizontal`` program serves it.
+_SSU_CACHE_ROW_HORIZONTAL_MIN_BATCH = 32
+
+
 def _ssu_raw_abi_row(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -575,14 +597,17 @@ def _ssu_raw_abi_row(
     dt_bias: Optional[torch.Tensor],
     indices: Optional[torch.Tensor],
     dst_indices: Optional[torch.Tensor],
+    buffer_indices: Optional[torch.Tensor],
+    disable_state_update: bool,
+    has_buffer: bool,
 ) -> bool:
-    """``True`` when the call is the headdim-64 single-token decode row and the
-    engine's own storage (BF16 ``dt``/``D``/``dt_bias`` broadcasts, int32 slot
-    tables, fused-projection views) is the ABI the Cake programs read directly,
-    so no per-call conversion copies are needed."""
-    return (
-        x.ndim == 3
-        and tuple(state.shape[-2:]) == (64, 128)
+    """``True`` when the engine's own storage (BF16 ``dt``/``D``/``dt_bias``
+    broadcasts, int32 slot tables, fused-projection views) is the ABI the Cake
+    program of this row reads directly, so no per-call conversion copies are
+    needed: the headdim-64 single-token decode row, and the ``(64, 128, T=6)``
+    cache row below the horizontal-program batch."""
+    if not (
+        tuple(state.shape[-2:]) == (64, 128)
         and dt.dtype == torch.bfloat16
         and D.dtype == torch.bfloat16
         and dt_bias is not None
@@ -590,6 +615,18 @@ def _ssu_raw_abi_row(
         and indices is not None
         and indices.dtype == torch.int32
         and (dst_indices is None or dst_indices.dtype == torch.int32)
+        and (buffer_indices is None or buffer_indices.dtype == torch.int32)
+    ):
+        return False
+    if x.ndim == 3:
+        return True
+    return (
+        x.ndim == 4
+        and int(x.shape[1]) == 6
+        and int(x.shape[0]) < _SSU_CACHE_ROW_HORIZONTAL_MIN_BATCH
+        and disable_state_update
+        and has_buffer
+        and state.dtype == torch.bfloat16
     )
 
 
@@ -673,9 +710,13 @@ def _cake_selective_state_update(
         dt_bias,
         kw.get("state_batch_indices"),
         kw.get("dst_state_batch_indices"),
+        kw.get("intermediate_state_indices"),
+        disable_state_update,
+        buffer is not None,
     ):
-        # The headdim-64 decode programs read the engine's BF16 coefficient
-        # broadcasts, int32 slot tables and fused-projection views in place.
+        # The headdim-64 decode programs and the small-batch cache program
+        # read the engine's BF16 coefficient broadcasts, int32 slot tables
+        # and fused-projection views in place.
         dt_fi, D_fi, dt_bias_fi = dt, D, dt_bias
         indices_fi = kw.get("state_batch_indices")
         buffer_indices_fi = kw.get("intermediate_state_indices")
@@ -690,7 +731,11 @@ def _cake_selective_state_update(
         buffer_indices_fi = _int64(kw.get("intermediate_state_indices"))
     cache_steps = kw.get("cache_steps")
     cache_steps = 0 if cache_steps is None else int(cache_steps)
-    algorithm = "horizontal" if x.ndim == 4 and x.shape[0] >= 32 else "auto"
+    algorithm = (
+        "horizontal"
+        if x.ndim == 4 and x.shape[0] >= _SSU_CACHE_ROW_HORIZONTAL_MIN_BATCH
+        else "auto"
+    )
     cake_kwargs = dict(
         z=kw.get("z"),
         dt_bias=dt_bias_fi,
