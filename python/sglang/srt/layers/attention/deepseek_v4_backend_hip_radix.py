@@ -60,6 +60,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
@@ -549,10 +550,14 @@ class DSV4AttnMetadata:
                 # the length-fold cache too: a stale entry could match a reused address
                 setattr(self, name, src)
 
-    def init_compression_metadata(self, unified_swa_pages: int = 0):
+    def init_compression_metadata(
+        self, num_tokens: Optional[int] = None, unified_swa_pages: int = 0
+    ):
         assert self.page_table.dim() == 2
-        assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
-            f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
+        if num_tokens is None:
+            num_tokens = self.seq_lens_casual.shape[0]
+        assert self.raw_out_loc.shape[0] == num_tokens, (
+            f"{self.raw_out_loc.shape=}, {num_tokens=}"
         )
 
         (
@@ -589,56 +594,14 @@ class DSV4AttnMetadata:
         ).items():
             setattr(self, name, value)
 
-    _CP_REINDEX_FIELDS = [
-        "seq_lens_casual",
-        "positions_casual",
-        "swa_page_indices",
-        "swa_topk_lengths",
-        "page_table",
-        "c4_topk_lengths_raw",
-        "c4_topk_lengths_clamp1",
-        "c128_page_indices",
-        "c128_topk_lengths_clamp1",
-        "c128_topk_lengths_raw",
-    ]
-    _CP_GLOBAL_FIELDS = [
-        "raw_out_loc",
-        "swa_out_cache_loc",
-        "c4_out_loc",
-        "c128_out_loc",
-    ]
-
-    def apply_cp_reindex(self) -> None:
-        cp_rank = get_parallel().attn_cp_rank
-        cp_size = get_parallel().attn_cp_size
-        idx = slice(cp_rank, None, cp_size)
-        pre_global_len = self.seq_lens_casual.shape[0]
-        assert pre_global_len % cp_size == 0, (
-            f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "
-            "CP round-robin requires padding to ensure divisibility."
-        )
-        expected_local_len = pre_global_len // cp_size
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name, None)
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
-            setattr(self, field_name, val[idx].contiguous())
-
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name)
-            assert val.shape[0] == expected_local_len, (
-                f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
-                f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
-            )
-        for field_name in self._CP_GLOBAL_FIELDS:
-            val = getattr(self, field_name, None)
-            if val is None:
-                continue
-            assert val.shape[0] == pre_global_len, (
-                f"apply_cp_reindex post-condition: global field {field_name}.shape[0]={val.shape[0]} "
-                f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
-            )
+    # Same CP contract as the CUDA metadata; HIP also keeps the raw c128 lengths.
+    _CP_REINDEX_FIELDS = _cuda_backend.DSV4AttnMetadata._CP_REINDEX_FIELDS
+    _CP_REINDEX_OPTIONAL_FIELDS = (
+        _cuda_backend.DSV4AttnMetadata._CP_REINDEX_OPTIONAL_FIELDS
+        + ["c128_topk_lengths_raw"]
+    )
+    _CP_GLOBAL_FIELDS = _cuda_backend.DSV4AttnMetadata._CP_GLOBAL_FIELDS
+    apply_cp_reindex = _cuda_backend.DSV4AttnMetadata.apply_cp_reindex
 
     def init_flashmla_related(self, is_prefill: bool = False):
         assert self.index_topk in (512, 1024), (
@@ -1127,7 +1090,15 @@ class DeepseekV4HipRadixBackend(
         # Whether num_tokens == sum(extend_seq_lens) exactly, which lets the
         # token map skip an implicit D2H.
         exact_num_tokens: bool = True,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
+        padded_num_tokens = out_cache_loc.shape[0]
+        cp_active = forward_batch is not None and is_cp_active(forward_batch)
+        if cp_active:
+            cp_metadata = forward_batch.attn_cp_metadata
+            assert cp_metadata is not None
+            padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+
         from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
             ExpandPrefillCausally,
         )
@@ -1142,7 +1113,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             num_tokens=num_tokens,
-            padded_num_tokens=out_cache_loc.shape[0],
+            padded_num_tokens=padded_num_tokens,
         )
         seq_lens_casual = _expanded.seq_lens_casual
         req_pool_indices_repeated = _expanded.req_pool_indices_repeated
@@ -1154,6 +1125,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
+            num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(req_pool_indices),
         )
@@ -1165,6 +1137,8 @@ class DeepseekV4HipRadixBackend(
             and extend_seq_lens_cpu is not None
             and sum(extend_seq_lens_cpu) == num_tokens
         )
+        # Build unified metadata against the global padded layout before CP
+        # slices the query-side core fields to this rank.
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
@@ -1174,6 +1148,10 @@ class DeepseekV4HipRadixBackend(
             num_tokens,
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
         )
+        if cp_active:
+            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            if need_compress:
+                core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
             # Verify runs the unified_kv DECODE kernel; req_pool_indices_repeated
             # is the per-token (num_draft*bs -> bs) req-slot map.
@@ -2096,6 +2074,7 @@ class DeepseekV4HipRadixBackend(
             need_compress=not is_draft,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             exact_num_tokens=is_draft,
+            forward_batch=forward_batch,
         )
 
     # ---- decoder SWA bounded replay ---------------------------------------
@@ -2722,36 +2701,23 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified.pf_cu_q
         final_pos = core_attn_metadata.unified.pf_final_pos
 
-        # DSA CP: unified_pf_* cover the GLOBAL token layout while q is local and
-        # kv all-gathered; slice per-query fields to this rank, values stay global.
-        from sglang.srt.layers.attention.dsa.utils import (
-            is_dsa_prefill_cp_round_robin_split,
-        )
-
-        _cp_size = get_parallel().attn_cp_size
-        _cp_active = (
-            _cp_size > 1
-            and is_dsa_prefill_cp_round_robin_split()
-            and kv.shape[0] == _cp_size * T
-            and state_slot.shape[0] != T
-        )
+        # Slice CP query metadata while keeping cache-write metadata global.
+        _cp_active = is_cp_active(forward_batch)
         state_slot_full = state_slot
         final_pos_full = final_pos
         positions_full = positions
         if _cp_active:
+            _cp_size = get_parallel().attn_cp_size
+            # pf_* were built on the padded global layout before the reindex.
+            assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
             _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
-            state_slot = state_slot[_sl].contiguous()
-            chunk_start = chunk_start[_sl].contiguous()
-            cu_q = cu_q[_sl].contiguous()
-            final_pos = final_pos[_sl].contiguous()
-            # Local queries sit at this rank's round-robin global positions
-            # {r, r+cp, r+2cp, ...}, not the first T entries of the global layout.
-            positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
-            # Every rank's SWA ring must hold the full window (decode and later
-            # chunks read it), so the store uses the full all-gathered kv.
-            positions_full = forward_batch.positions.to(torch.int64)[
-                : state_slot_full.shape[0]
-            ].contiguous()
+            state_slot, chunk_start, cu_q, final_pos = (
+                v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q, final_pos)
+            )
+            # Already CP-reindexed; padding rows carry the inert expansion position.
+            positions = core_attn_metadata.positions_casual.to(torch.int64)
+            assert positions.shape[0] == T
+            positions_full = forward_batch.positions.to(torch.int64)
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -2808,18 +2774,18 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            _ring_state_slot = state_slot_full if _cp_active else state_slot
-            _ring_final_pos = final_pos_full if _cp_active else final_pos
-            _ring_positions = positions_full if _cp_active else positions
-            n_real = _ring_state_slot.shape[0]
+            # CP gathers only the logical rows; drop the physical padding rows.
+            n_real = kv.shape[0] if _cp_active else state_slot_full.shape[0]
+            # the store launches one program per kv row and never checks these lengths
+            assert min(state_slot_full.shape[0], positions_full.shape[0]) >= n_real
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
-                state_slot=_ring_state_slot,
-                positions=_ring_positions[:n_real],
+                state_slot=state_slot_full[:n_real],
+                positions=positions_full[:n_real],
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=_ring_final_pos,
+                final_pos=final_pos_full[:n_real],
                 kv_rope=None if k_rope is None else k_rope[:n_real],
                 unified_kv_rope=(
                     None if k_rope is None else pool.get_unified_kv_rope(layer_id)
@@ -3285,8 +3251,8 @@ class DeepseekV4HipRadixBackend(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"
                 )
-            # HIP rejects prefill CP, the only caller passing rows_per_request
-            assert rows_per_request is None, "prefill CP is not supported on HIP"
+            # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
+            assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
@@ -3323,6 +3289,7 @@ class DeepseekV4HipRadixBackend(
         out_loc: torch.Tensor,
         need_compress: bool = True,
         is_prefill: bool = False,
+        num_tokens: Optional[int] = None,
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
@@ -3415,7 +3382,10 @@ class DeepseekV4HipRadixBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+                num_tokens=num_tokens,
+                unified_swa_pages=getattr(
+                    self.token_to_kv_pool, "unified_swa_pages", 0
+                ),
             )
             core_attn_metadata.init_flashmla_related()
         else:
