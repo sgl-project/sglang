@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -5433,6 +5434,22 @@ class TestQwen25Detector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertIn("let me check", result.normal_text)
+
+    def test_detect_and_parse_unclosed_tags_in_linear_time(self):
+        """Many opening tags without a closing tag must not stall the parser
+        (it runs on the event loop); earlier complete calls still parse."""
+        text = (
+            '<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "NYC", "state": "NY", "unit": "celsius"}}\n</tool_call>'
+            + "<tool_call>\n " * 20000
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters)["city"], "NYC")
 
     # -- Streaming tests --
 
