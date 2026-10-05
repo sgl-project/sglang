@@ -28,6 +28,7 @@ from sglang.srt.models.beam import (
     BeamModel,
     BeamMoE,
     apply_ssmax,
+    compute_ssmax_scale,
     depth_scaled_residual,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -89,11 +90,13 @@ class AddLayer(torch.nn.Module):
         self.input_layernorm = torch.nn.Linear(1, 1, bias=False)
         self.input_layernorm.weight.data.fill_(1)
 
-    def forward(self, positions, hidden, batch):
+    def forward(self, positions, hidden, batch, ssmax_scale):
         return hidden + self.amount
 
-    def forward_fused(self, positions, normed, residual, batch, next_weight):
-        hidden = self.forward(positions, residual, batch)
+    def forward_fused(
+        self, positions, normed, residual, batch, next_weight, ssmax_scale
+    ):
+        hidden = self.forward(positions, residual, batch, ssmax_scale)
         return hidden * next_weight, hidden
 
 
@@ -106,6 +109,7 @@ def stub_beam_model(layers, norm, layers_to_capture):
     model.norm = norm
     model.start_layer, model.end_layer = 0, len(layers)
     model.layers_to_capture = layers_to_capture
+    model.has_full_attention = False
     return model
 
 
@@ -328,14 +332,16 @@ class TestBeamNumerics(CustomTestCase):
         ).unsqueeze(-1)
         expected = (query.float() * scale).bfloat16()
 
-        actual = apply_ssmax(query, positions)
+        actual = apply_ssmax(query, compute_ssmax_scale(positions))
 
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertFalse(torch.equal(expected, query * scale.bfloat16()))
         # Chunking and cached decode must retain the supplied absolute positions.
         for start, end in ((0, 3), (3, 6), (6, 7)):
             torch.testing.assert_close(
-                apply_ssmax(query[start:end], positions[start:end]),
+                apply_ssmax(
+                    query[start:end], compute_ssmax_scale(positions[start:end])
+                ),
                 actual[start:end],
                 atol=0,
                 rtol=0,
