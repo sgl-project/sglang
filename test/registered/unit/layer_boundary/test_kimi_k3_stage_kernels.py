@@ -1,6 +1,6 @@
 """Kimi K3's own kernels for a layer's sums and gathers serve its
 attention-residual bank only: the standard residual path keeps the
-boundary's collectives, as the decoder did, even where those kernels run.
+boundary's collectives, even where those kernels run.
 With SGLANG_K3_SP_ATTN_RES the bank and the stream stay on each rank's shard
 across SP-MoE layers."""
 

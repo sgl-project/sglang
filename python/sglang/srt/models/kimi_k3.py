@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -42,10 +42,6 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
-    dp_gather_replicate,
-    dp_scatter,
-    get_global_dp_buffer,
-    get_local_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -278,42 +274,6 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# K3 manages its own boundaries: the attn-res aggregation kernels replace
-# input_layernorm / post_attention_layernorm, and the MLP/MoE modules
-# gather/scatter around their own body:
-# attention and the attn-res buffers stay in local (per-DP-rank) token space,
-# the MLP/MoE runs on the DP-gathered global batch, and the delayed prefix_sum
-# add stays local, applied after the scatter back.
-def _dp_local_buffer_group():
-    """Symmetric-memory group holding this DP rank's local token buffer."""
-    parallel = get_parallel()
-    if parallel.tp_size == parallel.attn_dp_size:
-        return get_parallel().tp_group
-    return parallel.attn_tp_group
-
-
-def _sp_all_gather_rows(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Reassemble contiguous token shards, using the tuned K3 AG when covered."""
-    group = get_parallel().attn_tp_group
-    hidden_states = hidden_states.contiguous()
-    full = k3_sp_collective.all_gather(hidden_states)
-    if full is None:
-        full = torch.empty(
-            (hidden_states.shape[0] * group.world_size, hidden_states.shape[1]),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        group.all_gather_into_tensor(full, hidden_states)
-    return full
-
-
-def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
-    """Full-batch row interval owned by this rank's contiguous token shard."""
-    group = get_parallel().attn_tp_group
-    lo = group.rank_in_group * hidden_states.shape[0]
-    return slice(lo, lo + hidden_states.shape[0])
-
-
 class KimiK3MLP(nn.Module):
     """K3 MLP; SiLU or SiTU activation."""
 
@@ -323,7 +283,6 @@ class KimiK3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
@@ -355,7 +314,7 @@ class KimiK3MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=False,
             use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
             parallel_group=parallel_group,
@@ -369,35 +328,11 @@ class KimiK3MLP(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
-        self._dp_attention = is_dp_attention_enabled()
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        prefix_sum: Optional[torch.Tensor] = None,
-        forward_batch: Optional[ForwardBatch] = None,
-    ) -> torch.Tensor:
-        # DP attention only when driven from the decoder layer (forward_batch
-        # given); the shared-experts instance inside KimiK3MoE passes None and
-        # runs on the already-gathered buffer.
-        use_dp = (
-            self._dp_attention and forward_batch is not None and not self._dense_attn_tp
-        )
-        if use_dp:
-            local_hidden_states = hidden_states
-            hidden_states = get_global_dp_buffer(get_parallel().tp_group)
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
-        if use_dp:
-            global_out = hidden_states
-            hidden_states = get_local_dp_buffer(_dp_local_buffer_group())
-            dp_scatter(hidden_states, global_out, forward_batch)
-        # TODO(dark): maybe fuse residual with all reduce of down projection
-        if prefix_sum is not None:
-            hidden_states = hidden_states + prefix_sum
         return hidden_states
 
 
@@ -447,9 +382,10 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
 
 
 def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
-    """o_proj under SP-MoE."""
-    # o_proj emits TP-partial sums, which the stage boundary completes.
-    o_proj.reduce_results = False
+    """Under SP-MoE, write o_proj's TP-partial output into K3's persistent
+    symmetric buffer whenever K3's tuned reduce-scatter for that row count
+    reads through it (the bank's FFN read); otherwise the stage boundary
+    reduce-scatters it from regular memory."""
     if k3_sp_collective.enabled():
         # The table selects NVLS pull RS for larger token buckets.
         # Only those o_proj outputs come from the persistent symmetric
@@ -492,13 +428,8 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
-        reduce_results: bool = True,
     ):
         super().__init__()
-        # Whether this block completes the TP sum of a non-latent output; a
-        # stage boundary completes it otherwise. A latent block completes its
-        # sums together with the latent reduction either way.
-        self.reduce_results = reduce_results
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
@@ -507,7 +438,6 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
-        self._dp_attention = is_dp_attention_enabled()
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -614,8 +544,8 @@ class KimiK3MoE(nn.Module):
 
         # EP a2a backends move each row to its experts directly, so the MoE
         # region consumes whatever rows this rank holds (SP-MoE shard or
-        # DP-local batch) with every global token dispatched exactly once.
-        # No DP gather and no TP reduce anywhere in the region.
+        # DP-local batch). No DP gather and no TP reduce anywhere in the
+        # region.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
@@ -679,7 +609,6 @@ class KimiK3MoE(nn.Module):
                 intermediate_size=shared_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
@@ -859,11 +788,8 @@ class KimiK3MoE(nn.Module):
         )
         from sglang.srt.runtime_context import get_parallel
 
-        # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
-        # output) the incoming rows are already this rank's token shard, so
-        # the fused a2a below dispatches each token exactly once. On the
-        # non-scattered fallback path the rows are the full batch (redundant
-        # across ranks but correct).
+        # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
+        # batch stays on every row.
         num_tokens = routed_input.shape[0]
         num_max_tokens_per_rank = (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -1272,12 +1198,6 @@ class KimiK3MoE(nn.Module):
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
-            # EP combine and the shared-expert subgroup have already completed
-            # each source token. A global TP reduction would mix token shards.
-            if self.tp_size > 1 and not self._ep_a2a and self.reduce_results:
-                expert_output = tensor_model_parallel_all_reduce(expert_output)
-            if prefix_sum is not None:
-                expert_output = expert_output + prefix_sum
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -1541,40 +1461,17 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor] = None,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        """A pending prefix_sum is always consumed here: folded into the
-        3-way JIT tail add when covered, plain adds otherwise (bit-identical
-        either way).
-
-        Under DP attention with TP-sharded experts (a2a none, forward_batch
-        given) the experts run on the DP-gathered global batch — the internal
-        reduces stay over the full TP group, which is exactly right in
-        gathered space — while prefix_sum stays in local token space, added
-        after the scatter back. EP a2a backends skip the gather entirely:
-        dispatching the DP-local rows (or the SP-MoE shard of them the
-        decoder layer already produced) covers every global token exactly
-        once, and prefix_sum is consumed in the tail add like the non-DP
-        path — gathering first would just replicate the whole batch onto
-        every rank (tp-fold redundant compute + a2a traffic)."""
+        """A latent MoE, which writes the next stream itself, takes the pending
+        prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
+        otherwise (bit-identical either way). A non-latent MoE leaves the
+        residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
-        if use_dp:
-            local_hidden_states = hidden_states
-            hidden_states = get_global_dp_buffer(get_parallel().tp_group)
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
-            dp_prefix_sum, prefix_sum = prefix_sum, None
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
-        if use_dp:
-            global_out = out
-            out = get_local_dp_buffer(_dp_local_buffer_group())
-            dp_scatter(out, global_out, forward_batch)
-            if dp_prefix_sum is not None:
-                out = out + dp_prefix_sum
         return out.view(num_tokens, hidden_size)
 
 
@@ -1591,7 +1488,6 @@ class KimiK3DeltaAttention(nn.Module):
         prefix: str = "",
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
-        reduce_results: bool = True,
         sp_moe: bool = False,
         **kwargs,
     ) -> None:
@@ -1844,20 +1740,12 @@ class KimiK3DeltaAttention(nn.Module):
             projection_size,
             self.hidden_size,
             bias=False,
-            # SGLANG_K3_AR_FUSION: keep the o_proj output TP-partial and
-            # complete the reduce at the decoder layer via the fused MNNVL
-            # all-reduce (which can fold the attn-res prefix add in). Only
-            # valid when the attn TP group is the full TP group (the fused
-            # comm lives there).
-            reduce_results=reduce_results and not self.all_reduce_fusion,
+            # The stage boundary completes the attention-TP sum.
+            reduce_results=False,
             quant_config=quant_config,
             parallel_group="attn_tp",
-            # Reduce within the attn-TP group: the default full-TP collective
-            # is the wrong group at attn_tp>1 (sums across DP groups) and
-            # deadlocks idle DP ranks. Off under all_reduce_fusion: the fused
-            # AR reduces in place out of a symmetric buffer, and this flag
-            # would wrap the GEMM in its own symm_ctx, defeating the
-            # caller-owned buffer.
+            # Symmetric memory of the attention-TP group, which sums the output;
+            # off under all_reduce_fusion, whose caller owns the output buffer.
             use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
@@ -1865,7 +1753,6 @@ class KimiK3DeltaAttention(nn.Module):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = reduce_results
             self.o_proj.use_dp_attention_reduce = True
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -2248,7 +2135,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
-        reduce_results: bool = True,
         sp_moe: bool = False,
     ) -> None:
         # ModelSlim can quantize K3 latent projections while still storing
@@ -2272,7 +2158,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
             skip_rope=True,
-            reduce_results=reduce_results and not self.all_reduce_fusion,
+            # The stage boundary completes the attention-TP sum.
+            reduce_results=False,
             alt_stream=alt_stream,
         )
         if split_gguf_kv_b:
@@ -2326,8 +2213,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = reduce_results
-            self.o_proj.use_dp_attention_reduce = True
         if self.all_reduce_fusion:
             # Hand the GEMM a slice of the persistent symmetric buffer
             # (k3_ar_fusion.symm_buffer); the fused AR reduces it in place.
@@ -2347,9 +2232,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
-            # K3 owns its output reduction, so o_proj must reduce within the
-            # attn-TP group itself: the default full-TP collective is the wrong
-            # group at attn_tp>1 and deadlocks idle DP ranks.
+            # Allocate o_proj's output in the attention-TP group's symmetric
+            # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
@@ -2521,12 +2405,6 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     return not (spec.is_eagle3() or spec.is_dflash_family())
 
 
-def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
-    """Whether the layers build stage boundaries, which every configuration
-    does."""
-    return True
-
-
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
 
@@ -2544,19 +2422,10 @@ class KimiK3DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self._dp_attention = is_dp_attention_enabled()
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
-        self._stage_boundaries = _uses_stage_boundaries(config)
-        # SP-MoE (EP a2a backend): o_proj defers its attention-TP reduction;
-        # this layer completes it as a reduce-scatter so the whole MoE region
-        # runs on 1/attn_tp of the rows, then all-gathers back after the tail
-        # add. RS+AG moves the same bytes the AR did, the shared-expert AR
-        # disappears via tp1 weights, and each rank dispatches only its shard
-        # through the a2a. Same under DP attention. Dense layers excluded: no
-        # per-token decomposition survives a token shard.
+        # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
+        # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
 
-        # Mutually exclusive with SP-MoE: both complete o_proj's deferred
-        # reduction, but SP-MoE reduce-scatters to a shard whereas the fusion
-        # produces the full batch in a symm buffer.
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
 
         # Attention
@@ -2568,7 +2437,6 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
-                reduce_results=not self._stage_boundaries,
                 sp_moe=self._sp_moe,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
@@ -2581,14 +2449,13 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
-                reduce_results=not self._stage_boundaries,
                 sp_moe=self._sp_moe,
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
 
         # the attention drops the fusion when its o_proj cannot write into
-        # caller-owned storage; the layer's own AR call-site must agree
+        # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
         # MLP / MoE
@@ -2599,7 +2466,6 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
-                reduce_results=not self._stage_boundaries,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -2607,7 +2473,6 @@ class KimiK3DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=not self._stage_boundaries,
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
@@ -2646,14 +2511,12 @@ class KimiK3DecoderLayer(nn.Module):
         # writes the next stream itself; one gathered over attention DP returns
         # its output to this rank's tokens first.
         self._ffn_writes_stream = (
-            self._stage_boundaries
-            and self.use_attn_residuals
+            self.use_attn_residuals
             and self._is_moe_layer
             and self.mlp.use_latent_moe
             and not (self._dp_attention and not self.mlp._ep_a2a)
         )
-        if self._stage_boundaries:
-            self._declare_stages(config, layer_idx, attn_bank)
+        self._declare_stages(config, layer_idx, attn_bank)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
         """Declare this layer's attention and FFN stages: the reads and updates
@@ -2746,39 +2609,6 @@ class KimiK3DecoderLayer(nn.Module):
             )
         return ()
 
-    def _finish_attn_reduce(
-        self,
-        attn_out: torch.Tensor,
-        allow_scatter: bool,
-        residual: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, int, bool]:
-        """Complete o_proj's deferred TP reduction under SP-MoE.
-
-        Returns (reduced tensor, shard row offset, residual_fused); offset is
-        -1 when the result covers the full batch (non-SP mode, or fallback
-        all-reduce for row counts not divisible by attn_tp)."""
-        if not self._sp_moe:
-            return attn_out, -1, False
-        group = get_parallel().attn_tp_group
-        num_tokens = attn_out.shape[0]
-        if allow_scatter and num_tokens > 0 and num_tokens % group.world_size == 0:
-            shard = num_tokens // group.world_size
-            custom_out = k3_sp_collective.reduce_scatter_res(attn_out, residual)
-            if custom_out is not None:
-                return (
-                    custom_out,
-                    group.rank_in_group * shard,
-                    residual is not None,
-                )
-            out = torch.empty(
-                (shard, attn_out.shape[1]),
-                dtype=attn_out.dtype,
-                device=attn_out.device,
-            )
-            group.reduce_scatter_tensor(out, attn_out)
-            return out, group.rank_in_group * shard, False
-        return group.all_reduce(attn_out), -1, False
-
     def _run_self_attn(
         self,
         hidden_states: torch.Tensor,
@@ -2821,201 +2651,25 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        attn_res: Optional[AttnResidual],
         zero_allocator: BumpAllocator,
-        input_sharded: bool = False,
-        keep_sharded: bool = False,
         capture_gathered: Optional[AuxHiddenStateAccumulator] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
-        if attn_res is not None:
-            return self._forward_attn_residual(
-                positions,
-                hidden_states,
-                residual,
-                attn_res,
-                forward_batch,
-                zero_allocator,
-                input_sharded,
-                keep_sharded,
-            )
-
-        assert not input_sharded
-        if self._stage_boundaries:
-            hidden_states = self.attn_boundary.prepare(
-                hidden_states, forward_batch, capture_gathered=capture_gathered
-            )
-            hidden_states = self._run_self_attn(
-                hidden_states, positions, forward_batch, zero_allocator
-            )
-            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-            hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture_gathered=capture_gathered
+        )
+        hidden_states = self._run_self_attn(
+            hidden_states, positions, forward_batch, zero_allocator
+        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
-                prefix_sum=(
-                    residual_batch.written_residual(forward_batch)
-                    if self._ffn_writes_stream
-                    else None
-                ),
+                prefix_sum=residual_batch.written_residual(forward_batch),
             )
-            return self.ffn_boundary.finish(hidden_states, forward_batch), None, False
-
-        # Standard residual path
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
-        # standard path returns a full-size residual to the next layer, so
-        # complete the deferred o_proj reduction as a plain all-reduce
-        hidden_states, _, _ = self._finish_attn_reduce(
-            hidden_states, allow_scatter=False
-        )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        return hidden_states, residual, False
-
-    def _forward_attn_residual(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        prefix_sum: Optional[torch.Tensor],
-        attn_res: AttnResidual,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        input_sharded: bool,
-        keep_sharded: bool,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
-        # Between attn-res layers hidden_states carries the previous layer's
-        # un-added MLP delta and prefix_sum the prefix it extends (None at
-        # stream start / PP entry, where hidden_states already is the head).
-
-        # ---- Aggregation 1: attention side. Write layers snapshot the
-        # pre-attention prefix into the bank in the same call (fused into
-        # the fast kernel; standalone copy on other paths). ----
-        if input_sharded:
-            assert self._sp_moe
-            input_rows = _sp_local_rows(hidden_states)
-            fused_ag = attn_res.forward_sp_all_gather(
-                hidden_states,
-                prefix_sum,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-                rows=input_rows,
-                write=self.is_block_write_layer,
-            )
-            if fused_ag is not None:
-                hidden_states, prefix_sum = fused_ag
-            else:
-                hidden_states, prefix_sum = attn_res.forward(
-                    hidden_states,
-                    prefix_sum,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                    self.input_layernorm,
-                    rows=input_rows,
-                    write=self.is_block_write_layer,
-                )
-                # Aggregate/norm and snapshot only this rank's rows, then
-                # gather the normalized tensor consumed by attention.
-                hidden_states = _sp_all_gather_rows(hidden_states)
-        else:
-            hidden_states, prefix_sum = attn_res.forward(
-                hidden_states,
-                prefix_sum,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-                write=self.is_block_write_layer,
-            )
-        if self.is_block_write_layer:
-            prefix_sum = None
-
-        # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
-
-        # ---- Complete o_proj's deferred reduction ----
-        # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
-        # otherwise the fused all-reduce when enabled; otherwise o_proj already
-        # reduced itself (use_dp_attention_reduce, on when neither is active).
-        rows = None
-        shard_lo = -1
-        agg2_fused = False
-        if self._sp_moe:
-            group = get_parallel().attn_tp_group
-            if (
-                hidden_states.shape[0] > 0
-                and hidden_states.shape[0] % group.world_size == 0
-            ):
-                shard = hidden_states.shape[0] // group.world_size
-                fused_rows = slice(
-                    group.rank_in_group * shard,
-                    (group.rank_in_group + 1) * shard,
-                )
-                fused_rs = attn_res.forward_sp_reduce_scatter(
-                    hidden_states,
-                    prefix_sum,
-                    self.mlp_res_proj,
-                    self.mlp_res_norm,
-                    self.post_attention_layernorm,
-                    rows=fused_rows,
-                )
-            else:
-                fused_rs = None
-            if fused_rs is not None:
-                hidden_states, prefix_sum = fused_rs
-                rows = fused_rows
-                shard_lo = fused_rows.start
-                agg2_fused = True
-            else:
-                hidden_states, shard_lo, residual_fused = self._finish_attn_reduce(
-                    hidden_states, allow_scatter=True, residual=prefix_sum
-                )
-                if shard_lo >= 0:
-                    rows = slice(shard_lo, shard_lo + hidden_states.shape[0])
-                    if residual_fused:
-                        prefix_sum = None
-                    elif prefix_sum is not None:
-                        # Shard carry already holds the destination-local prefix;
-                        # the first sharded layer still holds a full-batch prefix.
-                        if prefix_sum.shape[0] != hidden_states.shape[0]:
-                            prefix_sum = prefix_sum[rows]
-        elif self.all_reduce_fusion:
-            # Complete the o_proj reduce here, folding the pending prefix add
-            # into the fused all-reduce; attn_res then takes the pre-added
-            # tensor through its prefix_sum=None branch (same semantics:
-            # (normed, new_prefix) with new_prefix = prefix + attn_out).
-            hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
-            prefix_sum = None
-
-        # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
-        if not agg2_fused:
-            hidden_states, prefix_sum = attn_res.forward(
-                hidden_states,
-                prefix_sum,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-                rows=rows,
-            )
-
-        # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
-        # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
-        if shard_lo >= 0:
-            if keep_sharded:
-                return out, None, True
-            out = _sp_all_gather_rows(out)
-        return out, None, False
+            hidden_states = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class KimiK3LinearModel(nn.Module):
@@ -3032,7 +2686,6 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._stage_boundaries = _uses_stage_boundaries(config)
         self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
@@ -3062,11 +2715,7 @@ class KimiK3LinearModel(nn.Module):
 
         # The attention-residual bank of one forward, which every layer's
         # stage boundaries read.
-        self.attn_bank = (
-            AttnBank()
-            if self._stage_boundaries and config.attn_res_block_size is not None
-            else None
-        )
+        self.attn_bank = AttnBank() if config.attn_res_block_size is not None else None
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
@@ -3119,32 +2768,22 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        residual = None
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            if self._stage_boundaries:
-                residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         elif self.attn_bank is not None:
             # The bank's wire carries the stream head written: the sending rank
             # folds it in before the handoff.
             hidden_states = residual_batch.set_written(
                 pp_proxy_tensors["hidden_states"], forward_batch
             )
-        elif self._stage_boundaries:
+        else:
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            if self.config.attn_res_block_size is None:
-                residual = pp_proxy_tensors["residual"]
-            if TYPE_CHECKING:
-                assert isinstance(hidden_states, torch.Tensor)
-                assert isinstance(residual, torch.Tensor | None)
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -3154,8 +2793,7 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
-        attn_res = None
-        if self.config.attn_res_block_size is not None:
+        if self.attn_bank is not None:
             attn_res_block_num = _cdiv(self.end_layer, self.config.attn_res_block_size)
             # A later pipeline rank inherits the rows the earlier ones banked.
             inherited = (
@@ -3163,24 +2801,8 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            if self.attn_bank is not None:
-                self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
-            else:
-                attn_res = AttnResidual(
-                    hidden_states, attn_res_block_num, block_residual=inherited
-                )
+            self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
 
-        # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
-        # so those uncommon paths keep the established gather-per-layer flow.
-        sp_attn_res = (
-            attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
-            and self.pp_group.world_size == 1
-            and self.dspark_layers_to_capture is None
-            and k3_sp_collective.enabled()
-        )
-        sp_sharded = False
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
             AuxHiddenStatePacker.for_batch(
@@ -3194,7 +2816,7 @@ class KimiK3LinearModel(nn.Module):
         # next layer's attention input reads, captured there on every row (the
         # final norm's, after the last layer). The bank's is the mixture the
         # next read would form, captured after the layer.
-        captures_at_input = self._stage_boundaries and self.attn_bank is None
+        captures_at_input = self.attn_bank is None
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
@@ -3204,27 +2826,16 @@ class KimiK3LinearModel(nn.Module):
             if self.start_layer - 1 in captures and not captures_at_input:
                 aux_hidden_states.append(
                     self._dspark_capture_stream(
-                        self.start_layer - 1,
-                        hidden_states,
-                        residual,
-                        attn_res,
-                        forward_batch,
+                        self.start_layer - 1, hidden_states, forward_batch
                     )
                 )
         for i in range(self.start_layer, self.end_layer):
-            if sp_sharded and not self.layers[i]._sp_moe:
-                hidden_states = _sp_all_gather_rows(hidden_states)
-                sp_sharded = False
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual, sp_sharded = self.layers[i](
+                hidden_states = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=residual,
-                    attn_res=attn_res,
                     zero_allocator=zero_allocator,
-                    input_sharded=sp_sharded,
-                    keep_sharded=sp_attn_res,
                     capture_gathered=(
                         aux_hidden_states
                         if captures_at_input and i - 1 in captures
@@ -3237,12 +2848,10 @@ class KimiK3LinearModel(nn.Module):
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(
-                        i, hidden_states, residual, attn_res, forward_batch
-                    )
+                    self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
 
-        if not self.pp_group.is_last_rank and self._stage_boundaries:
+        if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
                 # The wire carries the stream head beside the bank.
                 hidden_states = residual_batch.fold(hidden_states, forward_batch)
@@ -3257,77 +2866,20 @@ class KimiK3LinearModel(nn.Module):
                     aux_hidden_states, dim=-1
                 )
             return proxy_tensors
-        if not self.pp_group.is_last_rank:
-            assert not sp_sharded
-            if attn_res is not None:
-                if residual is not None:
-                    # Materialize the delayed MLP add: the wire carries the
-                    # full stream head (bit-identical to the fused fold).
-                    hidden_states = residual + hidden_states
-                proxy_tensors = {
-                    "hidden_states": hidden_states,
-                    "attn_res_bank": attn_res.block_residual,
-                }
-            else:
-                proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
-            if aux_hidden_states:
-                proxy_tensors["dspark_hidden_states"] = torch.cat(
-                    aux_hidden_states, dim=-1
-                )
-            return PPProxyTensors(proxy_tensors)
 
-        if self._stage_boundaries:
-            hidden_states = residual_batch.final_norm(
-                hidden_states,
-                forward_batch,
-                self._final_read,
-                capture=(
-                    aux_hidden_states.capture
-                    if captures_at_input and self.end_layer - 1 in captures
-                    else None
-                ),
-                skip_empty=True,
-            )
-            if self.attn_bank is not None:
-                self.attn_bank.close()
-        elif hidden_states.shape[0] != 0:
-            if attn_res is not None:
-                # ---- Final aggregation (output side, folds delayed add) ----
-                if sp_sharded:
-                    output_rows = _sp_local_rows(hidden_states)
-                    fused_output = attn_res.forward_sp_all_gather(
-                        hidden_states,
-                        residual,
-                        self.output_attn_res_proj,
-                        self.output_attn_res_norm,
-                        self.norm,
-                        rows=output_rows,
-                    )
-                    if fused_output is not None:
-                        hidden_states, _ = fused_output
-                    else:
-                        hidden_states, _ = attn_res.forward(
-                            hidden_states,
-                            residual,
-                            self.output_attn_res_proj,
-                            self.output_attn_res_norm,
-                            self.norm,
-                            rows=output_rows,
-                        )
-                        hidden_states = _sp_all_gather_rows(hidden_states)
-                else:
-                    hidden_states, _ = attn_res.forward(
-                        hidden_states,
-                        residual,
-                        self.output_attn_res_proj,
-                        self.output_attn_res_norm,
-                        self.norm,
-                    )
-            else:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self._final_read,
+            capture=(
+                aux_hidden_states.capture
+                if captures_at_input and self.end_layer - 1 in captures
+                else None
+            ),
+            skip_empty=True,
+        )
+        if self.attn_bank is not None:
+            self.attn_bank.close()
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
@@ -3346,22 +2898,13 @@ class KimiK3LinearModel(nn.Module):
         self,
         layer_idx: int,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        attn_res: Optional[AttnResidual],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Stream value after `layer_idx`: the pre-norm mixture its next
-        consumer would compute (next layer's attention side; output side
-        for the last layer)."""
-        if self._stage_boundaries:
-            # The bank path; the standard one captures at the next input.
-            hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
-            attn_res, residual = self.attn_bank.require(), None
-        if attn_res is None:
-            return hidden_states if residual is None else hidden_states + residual
-        if residual is not None:
-            # Materialize a delayed MLP add (mirrors the PP-wire fold).
-            hidden_states = residual + hidden_states
+        """Stream value after `layer_idx` on the bank path: the pre-norm
+        mixture its next consumer would compute (next layer's attention side;
+        output side for the last layer). The standard path captures at the
+        next input instead."""
+        hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3373,7 +2916,11 @@ class KimiK3LinearModel(nn.Module):
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         return aggregate_stream(
-            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
+            hidden_states,
+            self.attn_bank.require().block_residual,
+            nvb,
+            score_proj,
+            score_norm,
         )
 
 
