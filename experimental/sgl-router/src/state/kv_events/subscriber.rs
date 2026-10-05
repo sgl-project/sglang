@@ -14,13 +14,18 @@
 //!
 //! Frames published by SGLang:
 //! 1. `topic_bytes` — empty by default, present even when empty.
-//! 2. `seq_bytes` — 8-byte big-endian signed `i64`. The publisher emits a
-//!    `-1` sentinel (`ZmqEventPublisher.END_SEQ`) on its replay DEALER
-//!    socket; we defensively recognise the same value on the PUB stream
-//!    and surface it as a [`WorkerEvent::PublisherReset`] so the
-//!    downstream pump can clear its cursor before a reconnecting publisher
-//!    restarts from seq=0.
+//! 2. `seq_bytes` — 8-byte big-endian signed `i64`, dense per publisher. The
+//!    `-1` sentinel (`ZmqEventPublisher.END_SEQ`) ends a replay; seen on the
+//!    PUB stream it becomes a [`WorkerEvent::PublisherReset`].
 //! 3. `payload` — msgpack-encoded [`KvEventBatch`].
+//!
+//! # Sequence repair
+//!
+//! A seq that regresses on one socket is a publisher restart and is
+//! forwarded as a reset, except batch 0, which the pump already resolves from
+//! the stream's origin. A forward gap is re-fetched from the publisher's
+//! replay ROUTER when `/server_info` advertises one; live frames wait in the
+//! SUB socket meanwhile, so the pump always sees this rank in order.
 //!
 //! # Endpoint construction
 //!
@@ -35,13 +40,9 @@
 //!
 //! `zeromq::SubSocket::connect` already spawns a background reconnection
 //! task that re-sends our subscriptions on every reconnect, so we do not
-//! need an outer reconnect loop. The initial `connect` + `subscribe` is
-//! wrapped in a bounded exponential-backoff retry so a worker that just
-//! booted (publisher not yet bound) doesn't permanently disable its
-//! subscriber. Errors surfaced from `recv()` are logged and the task
-//! continues; after [`RECV_ERROR_CEILING`] consecutive errors the task
-//! exits with an `error!` log so the silent-stall failure mode is
-//! detectable.
+//! need an outer reconnect loop. The initial `connect` + `subscribe` retries
+//! with capped backoff until it succeeds or is cancelled, and
+//! [`RECV_ERROR_CEILING`] consecutive `recv()` errors rebuild the socket.
 //!
 //! # Ordering
 //!
@@ -63,37 +64,37 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{anyhow, Context};
+use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-use zeromq::{Socket, SocketRecv, SubSocket, ZmqMessage};
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use super::discovery::EventConfig;
+use super::index::STREAM_ORIGIN_SEQ;
+use super::tally::{EventTally, ReplayOutcome};
 use super::tree::KvWorkerId;
 use super::wire::{decode_event_batch, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::{decode_load_stat, LoadStat};
 
-/// Maximum number of consecutive `recv()` errors before the subscriber
-/// gives up and exits its task. ZMQ's internal reconnect handles transient
-/// network errors, so a stream of consecutive failures means the socket is
-/// dead from our perspective; spinning forever masks the failure.
+/// Consecutive `recv()` errors after which the socket is treated as dead
+/// and rebuilt; ZMQ's own reconnect covers anything shorter.
 const RECV_ERROR_CEILING: u32 = 64;
 
-/// Bounded retry configuration for the initial connect + subscribe handshake.
-/// A worker that just booted may need a few hundred ms before its PUB socket
-/// accepts connections; this absorbs the race.
+/// Connect attempts before a still-unreachable publisher is logged as an
+/// error; retrying continues at [`CONNECT_BACKOFF_CAP`].
 const CONNECT_MAX_ATTEMPTS: u32 = 5;
 const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(50);
 const CONNECT_BACKOFF_CAP: Duration = Duration::from_secs(2);
 
-/// Sentinel sequence number meaning "publisher is shutting down". Mirrors
-/// `ZmqEventPublisher.END_SEQ = (-1).to_bytes(8, 'big', signed=True)`.
-/// SGLang's authoritative emission is on the replay DEALER socket
-/// (`_service_replay`); we accept the same sentinel on the PUB stream as
-/// defense in depth so a future publisher that does broadcast a shutdown
-/// signal is handled correctly.
+/// `ZmqEventPublisher.END_SEQ`: terminates a replay on the ROUTER socket.
+/// Also accepted on the PUB stream, where it means the publisher reset.
 const END_SEQ_SENTINEL: i64 = -1;
+
+/// How long live batches may wait behind one gap replay; arbitrary.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which topic a subscriber task listens on, and therefore what kind of
 /// [`WorkerEvent`] it produces. KV-cache events feed the hash tree (with
@@ -181,6 +182,7 @@ struct Inner {
 pub struct KvEventSubscriberRegistry {
     inner: Arc<Inner>,
     kind: SubKind,
+    tally: Arc<EventTally>,
 }
 
 impl KvEventSubscriberRegistry {
@@ -198,7 +200,14 @@ impl KvEventSubscriberRegistry {
                 handles: Mutex::new(HashMap::new()),
             }),
             kind,
+            tally: Arc::new(EventTally::new()),
         }
+    }
+
+    /// Book gap replays on `tally` instead of a private one.
+    pub fn with_tally(mut self, tally: Arc<EventTally>) -> Self {
+        self.tally = tally;
+        self
     }
 
     /// Open one SUB connection per `dp_rank` in `0..cfg.dp_size`,
@@ -263,13 +272,22 @@ impl KvEventSubscriberRegistry {
                 }
             };
             let endpoint = format!("tcp://{}:{}", cfg.host, port);
+            let replay = cfg
+                .replay_port_base
+                .filter(|_| self.kind == SubKind::Kv)
+                .and_then(|base| u16::try_from(base as u32 + dp_rank).ok())
+                .map(|port| format!("tcp://{}:{}", cfg.host, port));
             let cancel = CancellationToken::new();
             let join = spawn_subscriber_task(
                 id.clone(),
-                endpoint,
+                Endpoints {
+                    live: endpoint,
+                    replay,
+                },
                 topic.clone(),
                 self.kind,
                 self.inner.tx.clone(),
+                Arc::clone(&self.tally),
                 cancel.clone(),
             );
             handles.insert(id, SubscriberHandle { cancel, join });
@@ -343,36 +361,43 @@ impl KvEventSubscriberRegistry {
     }
 }
 
+/// The live SUB endpoint and, if advertised, the replay ROUTER behind it.
+struct Endpoints {
+    live: String,
+    replay: Option<String>,
+}
+
 /// Spawn the background task that owns one SUB socket and forwards
 /// decoded batches.
 fn spawn_subscriber_task(
     id: KvWorkerId,
-    endpoint: String,
+    endpoints: Endpoints,
     topic: String,
     kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
+    tally: Arc<EventTally>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_subscriber(id, endpoint, topic, kind, tx, cancel).await;
+        run_subscriber(id, endpoints, topic, kind, tx, tally, cancel).await;
     })
 }
 
-/// Inner subscriber loop. Returns when:
-///   * the cancellation token fires, OR
-///   * the downstream mpsc receiver is dropped, OR
-///   * the initial connect/subscribe fails after [`CONNECT_MAX_ATTEMPTS`]
-///     attempts with exponential backoff, OR
-///   * `recv()` returns errors [`RECV_ERROR_CEILING`] times in a row
-///     (escalated to `error!` so the silent stall is detectable).
+/// Inner subscriber loop. Returns only when the cancellation token fires or
+/// the downstream mpsc receiver is dropped.
 async fn run_subscriber(
     id: KvWorkerId,
-    endpoint: String,
+    endpoints: Endpoints,
     topic: String,
     kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
+    tally: Arc<EventTally>,
     cancel: CancellationToken,
 ) {
+    let Endpoints {
+        live: endpoint,
+        replay,
+    } = endpoints;
     debug!(
         worker_url = %id.url,
         dp_rank = id.dp_rank,
@@ -382,12 +407,13 @@ async fn run_subscriber(
         "starting kv-event subscriber"
     );
 
-    let mut sub = match connect_with_backoff(&id, &endpoint, &topic, &cancel).await {
-        Some(s) => s,
-        None => return,
+    let Some(mut sub) = connect_with_backoff(&id, &endpoint, &topic, &cancel).await else {
+        return;
     };
 
     let mut errors_in_a_row = 0u32;
+    // Last seq forwarded from this socket's own stream, never a graft cursor.
+    let mut last_seq: Option<i64> = None;
     loop {
         tokio::select! {
             biased;
@@ -403,7 +429,23 @@ async fn run_subscriber(
                 match res {
                     Ok(msg) => {
                         errors_in_a_row = 0;
-                        if let Some(event) = decode_message(&id, msg, kind) {
+                        let events = match decode_message(&id, msg, kind) {
+                            // A gap replay can take REPLAY_TIMEOUT; don't let
+                            // it hold up remove_worker / shutdown.
+                            Some(event) => tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return,
+                                events = sequence(
+                                    &id,
+                                    event,
+                                    &mut last_seq,
+                                    replay.as_deref(),
+                                    &tally,
+                                ) => events,
+                            },
+                            None => Vec::new(),
+                        };
+                        for event in events {
                             if tx.send(event).await.is_err() {
                                 // The pump (or the entire index) is gone.
                                 // This is unexpected mid-stream; warn so
@@ -426,9 +468,16 @@ async fn run_subscriber(
                                 endpoint = %endpoint,
                                 error = %e,
                                 consecutive_errors = errors_in_a_row,
-                                "SUB socket has produced {RECV_ERROR_CEILING} consecutive recv errors; giving up on this subscriber"
+                                "SUB socket has produced {RECV_ERROR_CEILING} consecutive recv errors; reconnecting"
                             );
-                            return;
+                            let Some(fresh) =
+                                connect_with_backoff(&id, &endpoint, &topic, &cancel).await
+                            else {
+                                return;
+                            };
+                            sub = fresh;
+                            errors_in_a_row = 0;
+                            continue;
                         }
                         // SubSocket auto-reconnects internally; transient
                         // errors should resume once a new peer attaches.
@@ -451,13 +500,9 @@ async fn run_subscriber(
 /// supplied `topic` prefix (empty string = receive every message,
 /// matching the prior all-topics behavior).
 ///
-/// Retries with exponential backoff up to [`CONNECT_MAX_ATTEMPTS`] times
-/// so a worker that just booted (publisher not yet bound) doesn't
-/// permanently disable its KV-event subscriber.
-///
-/// Returns `None` if cancelled or if every attempt fails. All operations
-/// are guarded by the cancellation token so shutdown is not delayed by
-/// the backoff.
+/// Retries with capped exponential backoff until it succeeds, so a publisher
+/// that binds late never disables its worker's cache-aware routing. Returns
+/// `None` only when cancelled.
 async fn connect_with_backoff(
     id: &KvWorkerId,
     endpoint: &str,
@@ -465,7 +510,9 @@ async fn connect_with_backoff(
     cancel: &CancellationToken,
 ) -> Option<SubSocket> {
     let mut delay = CONNECT_BACKOFF_BASE;
-    for attempt in 1..=CONNECT_MAX_ATTEMPTS {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         let mut sub = SubSocket::new();
         let connect_res = tokio::select! {
             _ = cancel.cancelled() => {
@@ -505,7 +552,13 @@ async fn connect_with_backoff(
             }
         }
         if attempt == CONNECT_MAX_ATTEMPTS {
-            break;
+            error!(
+                worker_url = %id.url,
+                dp_rank = id.dp_rank,
+                endpoint = %endpoint,
+                "kv-events: SUB socket still unreachable after {CONNECT_MAX_ATTEMPTS} attempts; \
+                 cache-aware routing for this worker waits until it connects"
+            );
         }
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -516,14 +569,143 @@ async fn connect_with_backoff(
         }
         delay = (delay * 2).min(CONNECT_BACKOFF_CAP);
     }
-    error!(
-        worker_url = %id.url,
-        dp_rank = id.dp_rank,
-        endpoint = %endpoint,
-        attempts = CONNECT_MAX_ATTEMPTS,
-        "kv-events: gave up establishing SUB socket after {CONNECT_MAX_ATTEMPTS} attempts; this worker's cache-aware routing is disabled until next add_worker"
-    );
-    None
+}
+
+/// What to forward for `event`. One PUB stream never goes backwards, so a
+/// regressed seq is a publisher restart and becomes a reset (batch 0 is left
+/// to the pump); a forward gap
+/// is filled from the replay socket when one is advertised.
+async fn sequence(
+    id: &KvWorkerId,
+    event: WorkerEvent,
+    last_seq: &mut Option<i64>,
+    replay: Option<&str>,
+    tally: &EventTally,
+) -> Vec<WorkerEvent> {
+    let mut out = Vec::new();
+    match &event {
+        WorkerEvent::Batch { seq, .. } => {
+            match *last_seq {
+                // A restart from batch 0 is left to the pump, which resolves
+                // it from the stream's origin (keeping a bootstrapped rank
+                // warm) instead of failing the rank as a reset would.
+                Some(last) if *seq <= last && *seq != STREAM_ORIGIN_SEQ => {
+                    warn!(
+                        worker = ?id,
+                        last,
+                        seq = *seq,
+                        "kv-events: sequence regressed; publisher restarted, resetting this rank",
+                    );
+                    out.push(WorkerEvent::PublisherReset { worker: id.clone() });
+                }
+                Some(last) if *seq > last + 1 => {
+                    if let Some(endpoint) = replay {
+                        out = fill_gap(id, endpoint, last + 1, *seq, tally).await;
+                    }
+                }
+                _ => {}
+            }
+            *last_seq = Some(*seq);
+        }
+        WorkerEvent::PublisherReset { .. } => *last_seq = None,
+        WorkerEvent::Load { .. } => {}
+    }
+    out.push(event);
+    out
+}
+
+/// Batches `from..to` re-fetched from the replay socket. Whatever comes back
+/// is forwarded; the pump counts anything still missing as lost.
+async fn fill_gap(
+    id: &KvWorkerId,
+    endpoint: &str,
+    from: i64,
+    to: i64,
+    tally: &EventTally,
+) -> Vec<WorkerEvent> {
+    // Keep received batches outside the timed future so cancellation or a
+    // later socket/decode error cannot discard an already recovered removal.
+    let mut batches = Vec::new();
+    let completed = match tokio::time::timeout(
+        REPLAY_TIMEOUT,
+        fetch_replay(endpoint, from, to, &mut batches),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!(worker = ?id, from, to, error = %e, "kv-events: gap replay failed");
+            false
+        }
+        Err(_) => {
+            warn!(worker = ?id, from, to, "kv-events: gap replay timed out");
+            false
+        }
+    };
+    let outcome = if batches.len() as i64 == to - from {
+        ReplayOutcome::Repaired
+    } else if !completed && batches.is_empty() {
+        ReplayOutcome::Failed
+    } else {
+        warn!(
+            worker = ?id,
+            from,
+            to,
+            recovered = batches.len(),
+            "kv-events: replay did not cover the gap",
+        );
+        ReplayOutcome::Incomplete
+    };
+    tally.record_replay(outcome);
+    batches
+        .into_iter()
+        .map(|(seq, batch)| WorkerEvent::Batch {
+            worker: id.clone(),
+            seq,
+            batch,
+        })
+        .collect()
+}
+
+/// Ask the publisher's ROUTER for buffered batches from `from` on, retaining
+/// only `from..to`. The publisher replies in sequence order, so stop once the
+/// gap's end is reached without waiting for newer batches or their END_SEQ.
+/// Wire contract: `ZmqEventPublisher._service_replay` in SGLang's
+/// `disaggregation/kv_events.py`; replies are `[b"", seq, payload]` up to an
+/// `END_SEQ` frame.
+async fn fetch_replay(
+    endpoint: &str,
+    from: i64,
+    to: i64,
+    batches: &mut Vec<(i64, KvEventBatch)>,
+) -> anyhow::Result<()> {
+    let mut dealer = DealerSocket::new();
+    dealer.connect(endpoint).await?;
+    let mut request = ZmqMessage::from(Bytes::new());
+    request.push_back(Bytes::copy_from_slice(&from.to_be_bytes()));
+    dealer.send(request).await?;
+    loop {
+        let reply = dealer.recv().await?;
+        let (3, Some(delim), Some(seq), Some(payload)) =
+            (reply.len(), reply.get(0), reply.get(1), reply.get(2))
+        else {
+            return Err(anyhow!("replay reply has {} frames", reply.len()));
+        };
+        if !delim.is_empty() {
+            return Err(anyhow!("replay reply lacks the empty delimiter frame"));
+        }
+        let seq = i64::from_be_bytes(seq.as_ref().try_into().context("replay seq frame")?);
+        if seq == END_SEQ_SENTINEL || seq >= to {
+            return Ok(());
+        }
+        // Kept strictly increasing, so a full count in fill_gap means no hole.
+        if seq >= from && batches.last().is_none_or(|&(last, _)| seq > last) {
+            batches.push((seq, decode_event_batch(payload.as_ref())?));
+        }
+        if seq == to - 1 {
+            return Ok(());
+        }
+    }
 }
 
 /// Validate, parse, and decode a single 3-frame multipart ZMQ message.
@@ -696,6 +878,7 @@ mod tests {
                 topic: String::new(),
                 load_port_base: None,
                 load_topic: None,
+                replay_port_base: None,
                 block_size: 64,
                 dp_size,
                 is_bigram: false,
@@ -1565,5 +1748,147 @@ mod tests {
         assert_eq!(worker_c.url, worker_url);
 
         registry.shutdown().await;
+    }
+
+    /// A gap on the live stream is filled from the replay ROUTER, in order.
+    #[tokio::test]
+    async fn gap_is_filled_from_replay_socket() {
+        use zeromq::RouterSocket;
+
+        let (mut pub_sock, port) = helpers::make_pub_bound().await;
+        let mut router = RouterSocket::new();
+        let Endpoint::Tcp(_, replay_port) = router.bind("tcp://127.0.0.1:0").await.unwrap() else {
+            panic!("tcp endpoint");
+        };
+        let server = tokio::spawn(async move {
+            let request = router.recv().await.unwrap();
+            let peer = request.get(0).unwrap().clone();
+            assert_eq!(request.get(2).unwrap().as_ref(), 2i64.to_be_bytes());
+            for (seq, payload) in [
+                (2, helpers::encode_all_blocks_cleared_batch(0.0, None)),
+                (3, helpers::encode_all_blocks_cleared_batch(0.0, None)),
+                (-1, Vec::new()),
+            ] {
+                let mut reply = ZmqMessage::from(peer.clone());
+                reply.push_back(Bytes::new());
+                reply.push_back(Bytes::copy_from_slice(&i64::to_be_bytes(seq)));
+                reply.push_back(Bytes::from(payload));
+                router.send(reply).await.unwrap();
+            }
+        });
+        let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
+        let tally = Arc::new(EventTally::new());
+        let registry = KvEventSubscriberRegistry::new(tx).with_tally(Arc::clone(&tally));
+        let cfg = EventConfig {
+            replay_port_base: Some(replay_port),
+            ..helpers::cfg_for("http://127.0.0.1", port, 1)
+        };
+        registry.add_worker("http://127.0.0.1", &cfg).await;
+        helpers::settle().await;
+
+        for seq in [1, 4] {
+            let payload = helpers::encode_all_blocks_cleared_batch(0.0, None);
+            pub_sock
+                .send(helpers::build_multipart(seq, payload))
+                .await
+                .unwrap();
+        }
+        let mut seqs = Vec::new();
+        for _ in 0..4 {
+            let ev = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            seqs.push(helpers::expect_batch(ev).1);
+        }
+        assert_eq!(seqs, [1, 2, 3, 4]);
+        assert_eq!(tally.replays(ReplayOutcome::Repaired), 1);
+        server.await.unwrap();
+        registry.shutdown().await;
+    }
+
+    /// Replay can time out or fail after useful batches have already arrived.
+    #[tokio::test]
+    async fn replay_preserves_batches_before_timeout_or_decode_error() {
+        use zeromq::RouterSocket;
+
+        for (seqs, malformed_tail, expected) in [
+            (vec![2], false, ReplayOutcome::Incomplete),
+            (vec![2], true, ReplayOutcome::Incomplete),
+            (vec![], true, ReplayOutcome::Failed),
+            (vec![2, 3], false, ReplayOutcome::Repaired),
+        ] {
+            let mut router = RouterSocket::new();
+            let endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+            let sent = seqs.clone();
+            let server = tokio::spawn(async move {
+                let request = router.recv().await.unwrap();
+                let peer = request.get(0).unwrap().clone();
+                for seq in sent {
+                    let mut reply = ZmqMessage::from(peer.clone());
+                    reply.push_back(Bytes::new());
+                    reply.push_back(Bytes::copy_from_slice(&i64::to_be_bytes(seq)));
+                    reply.push_back(Bytes::from(helpers::encode_all_blocks_cleared_batch(
+                        0.0, None,
+                    )));
+                    router.send(reply).await.unwrap();
+                }
+                if malformed_tail {
+                    let mut reply = ZmqMessage::from(peer);
+                    reply.push_back(Bytes::new());
+                    reply.push_back(Bytes::copy_from_slice(&3i64.to_be_bytes()));
+                    reply.push_back(Bytes::from_static(&[0xc1])); // Invalid msgpack.
+                    router.send(reply).await.unwrap();
+                }
+                // Keep the socket open without END_SEQ. A complete gap must
+                // finish immediately; a partial one must survive the timeout.
+                std::future::pending::<()>().await;
+            });
+            let id = KvWorkerId::new("http://worker".into(), 0);
+            let tally = EventTally::new();
+            let deadline = if expected == ReplayOutcome::Repaired {
+                REPLAY_TIMEOUT / 2
+            } else {
+                REPLAY_TIMEOUT * 2
+            };
+            let result = timeout(deadline, fill_gap(&id, &endpoint, 2, 4, &tally)).await;
+            server.abort();
+            let _ = server.await;
+            let recovered: Vec<_> = result
+                .expect("replay must finish without waiting for an unrelated tail")
+                .into_iter()
+                .map(|event| helpers::expect_batch(event).1)
+                .collect();
+            assert_eq!(recovered, seqs, "malformed_tail={malformed_tail}");
+            for outcome in ReplayOutcome::ALL {
+                assert_eq!(tally.replays(outcome), u64::from(outcome == expected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_resets_on_regression_and_passes_gaps_without_replay() {
+        let id = KvWorkerId::new("http://w".into(), 0);
+        let tally = EventTally::new();
+        let batch = |seq| WorkerEvent::Batch {
+            worker: id.clone(),
+            seq,
+            batch: decode_event_batch(&helpers::encode_all_blocks_cleared_batch(0.0, None))
+                .unwrap(),
+        };
+        let mut last = None;
+        let mut kinds = Vec::new();
+        // A regression to batch 0 passes through without a reset: the pump
+        // resolves that one from the stream's origin.
+        for seq in [5, 9, 2, 0] {
+            for ev in sequence(&id, batch(seq), &mut last, None, &tally).await {
+                kinds.push(match ev {
+                    WorkerEvent::Batch { seq, .. } => seq,
+                    _ => -1,
+                });
+            }
+        }
+        assert_eq!(kinds, [5, 9, -1, 2, 0]);
+        assert_eq!(tally.replays(ReplayOutcome::Failed), 0);
     }
 }
