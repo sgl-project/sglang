@@ -603,7 +603,7 @@ def bench_release(
 ):
     """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → insert_req + free + unpin.
+    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → checkpoint + free + unpin.
     """
     env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 

@@ -225,6 +225,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             op.pool_transfers,
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
+        controller.mem_pool_device_allocator = mock.Mock()
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
         )
@@ -1139,6 +1140,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=True
         )
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
@@ -1173,6 +1175,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=False
         )
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
@@ -1230,6 +1233,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ]
         )
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
@@ -1296,6 +1300,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.io_backend = "kernel"
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
@@ -1332,6 +1337,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.io_backend = "kernel"
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
