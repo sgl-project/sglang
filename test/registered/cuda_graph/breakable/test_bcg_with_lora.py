@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=178, stage="base-b", runner_config="1-gpu-large")
 
 BASE_MODEL = "Qwen/Qwen3-4B"
 LORA_ADAPTER = "nissenj/Qwen3-4B-lora-v2"

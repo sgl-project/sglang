@@ -37,7 +37,7 @@ class MulAdd(CustomOp):
     def forward_xpu(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ):
-        return self.forward_native(a, b, c, k=k)
+        return self.forward_cuda(a, b, c, k=k)
 
     @torch.compile
     def forward_musa(

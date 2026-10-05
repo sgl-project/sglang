@@ -13,12 +13,14 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
+from sglang.multimodal_gen.configs.utils import expand_path_fields
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
 logger = init_logger(__name__)
 
@@ -57,6 +59,71 @@ def generate_request_id() -> str:
 # is cumulative and may also enable model-owned approximate optimizations.
 QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
 KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+# libx264 presets, fastest first: each spends more encode time for a smaller
+# file at the same CRF.
+X264_PRESETS: tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+
+
+@dataclass(frozen=True)
+class SkipSoftmaxParams:
+    """Validated request-scoped BLASST/Skip-Softmax controls."""
+
+    threshold_scale_factor: float
+    start_step: int = 0
+
+
+def resolve_skip_softmax_params(
+    params: dict[str, Any] | None,
+) -> SkipSoftmaxParams | None:
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        raise ValueError(f"skip_softmax_params must be a dict, got {params!r}")
+
+    valid_keys = {"threshold_scale_factor", "start_step"}
+    unknown = sorted(set(params) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown skip_softmax_params keys: {unknown}. "
+            f"Valid keys: {sorted(valid_keys)}."
+        )
+    if "threshold_scale_factor" not in params:
+        raise ValueError("skip_softmax_params requires 'threshold_scale_factor'.")
+
+    threshold = params["threshold_scale_factor"]
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) <= 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.threshold_scale_factor must be a finite "
+            f"positive number, got {threshold!r}"
+        )
+
+    start_step = params.get("start_step", 0)
+    if (
+        isinstance(start_step, bool)
+        or not isinstance(start_step, int)
+        or start_step < 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.start_step must be a non-negative int, "
+            f"got {start_step!r}"
+        )
+    return SkipSoftmaxParams(float(threshold), start_step)
 
 
 def quality_allows_kernel_fusions(quality: str) -> bool:
@@ -85,20 +152,56 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
     return ascii_name
 
 
-class DataType(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    MESH = auto()
-    ACTION = auto()
+_SEQUENCE_SHARD_PIPELINE_FAMILIES = ("wan", "helios", "joy", "cosmos3")
 
-    def get_default_extension(self) -> str:
-        if self == DataType.IMAGE:
-            return "png"
-        if self == DataType.VIDEO:
-            return "mp4"
-        if self == DataType.ACTION:
-            return "json"
-        return "glb"
+
+def resolve_sequence_shard(
+    pipeline_config: Any, enable_sequence_shard: bool | None
+) -> bool:
+    """Whether this pipeline shards the sequence dim instead of aligning frames.
+
+    Shared by ``SamplingParams._adjust_visual_fields`` and the synthetic
+    warmup builder so warmup requests follow the same frame contract as real
+    requests.
+    """
+    pipeline_name_lower = pipeline_config.__class__.__name__.lower()
+    return any(
+        family in pipeline_name_lower for family in _SEQUENCE_SHARD_PIPELINE_FAMILIES
+    ) and (enable_sequence_shard is None or enable_sequence_shard)
+
+
+def align_num_frames_for_num_gpus(
+    num_frames: int,
+    *,
+    num_gpus: int,
+    vae_config: Any,
+    round_down: bool,
+) -> int:
+    """Align the latent frame count to be divisible by ``num_gpus``."""
+    if num_gpus <= 1:
+        return num_frames
+    use_temporal_scaling_frames = vae_config.use_temporal_scaling_frames
+    temporal_scale_factor = vae_config.arch_config.temporal_compression_ratio
+
+    if use_temporal_scaling_frames:
+        orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
+    else:
+        orig_latent_num_frames = num_frames
+
+    if orig_latent_num_frames % num_gpus == 0:
+        return num_frames
+
+    if round_down:
+        # Ensure we have at least 1 batch per GPU
+        new_latent_num_frames = max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+    else:
+        new_latent_num_frames = math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+
+    if use_temporal_scaling_frames:
+        # Convert back to frames, keeping num_frames-1 a multiple of the
+        # temporal scale factor
+        return (new_latent_num_frames - 1) * temporal_scale_factor + 1
+    return new_latent_num_frames
 
 
 @dataclass
@@ -118,6 +221,8 @@ class SamplingParams:
     """
 
     data_type: DataType = DataType.VIDEO
+    # Included in the dynamic batching signature and retained by replace/pickle.
+    task_type: ModelTaskType | str | None = None
 
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
@@ -141,6 +246,8 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
+    # MP4 encode speed; None keeps the server's default preset
+    x264_preset: str | None = None
     # Model-owned, request-scoped quality level.
     #
     # - "lossless" (default): the exact reference path. Output is expected to
@@ -231,6 +338,11 @@ class SamplingParams:
     # "sage_attn_3"; sage is lossy). Incompatible server settings reject the
     # request; see DenoisingStage._maybe_override_attention_backend.
     attention_backend_override: str | None = None
+
+    # Request-scoped BLASST/Skip-Softmax sparse attention. This is an explicit
+    # lossy opt-in; compatible self-attention layers are dispatched through
+    # FlashInfer while cross-attention remains on its normal backend.
+    skip_softmax_params: dict[str, Any] | None = None
 
     # Spectrum parameters
     enable_spectrum: bool = False
@@ -398,6 +510,11 @@ class SamplingParams:
 
         return frozenset()
 
+    @property
+    def num_samples_per_request(self) -> int:
+        """Number of final samples produced by one expanded scheduler request."""
+        return 1
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""
@@ -490,6 +607,8 @@ class SamplingParams:
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
             )
 
+        resolve_skip_softmax_params(self.skip_softmax_params)
+
         # These are always required to be sane regardless of pipeline.
         if (
             not isinstance(self.num_outputs_per_prompt, int)
@@ -514,6 +633,12 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"seed must be a non-negative int or list of ints, got {self.seed!r}"
+            )
+
+        if self.x264_preset is not None and self.x264_preset not in X264_PRESETS:
+            raise ValueError(
+                f"x264_preset must be one of {', '.join(X264_PRESETS)}, "
+                f"got {self.x264_preset!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -621,13 +746,13 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
             # requires image input
-            if self.image_path is None:
+            if not self.image_path:
                 raise ValueError(
                     f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
@@ -638,6 +763,34 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {task_type.name} models."
                 )
+
+        if task_type.requires_video_input() and not self.video_path:
+            raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+        # Legacy pipelines retain their model-owned video conditioning checks.
+        # Explicit multi-task declarations use the standard per-task contract.
+        if (
+            self.video_path
+            and (
+                getattr(pipeline_config, "supported_task_types", None) is not None
+                or (
+                    hasattr(pipeline_config, "get_supported_task_types")
+                    and len(pipeline_config.get_supported_task_types()) > 1
+                )
+            )
+            and not task_type.accepts_video_input()
+        ):
+            raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+    def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+        resolver = getattr(pipeline_config, "resolve_task_type", None)
+        if resolver is None:
+            # Compatibility with integrations that supply a lightweight config.
+            return ModelTaskType.parse(self.task_type or pipeline_config.task_type)
+        return resolver(
+            self.task_type,
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+        )
 
     def _adjust(
         self,
@@ -650,7 +803,8 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
+        self.task_type = task_type
         self.data_type = task_type.data_type()
 
         self._adjust_output_path(server_args)
@@ -739,14 +893,9 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
-        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
-
-        if (
-            "wan" in pipeline_name_lower
-            or "helios" in pipeline_name_lower
-            or "joy" in pipeline_name_lower
-            or "cosmos3" in pipeline_name_lower
-        ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
+        if resolve_sequence_shard(
+            server_args.pipeline_config, self.enable_sequence_shard
+        ):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
         else:
@@ -758,7 +907,7 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if self.resolve_task_type(pipeline_config).is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -779,43 +928,13 @@ class SamplingParams:
             )
 
             if self.adjust_frames:
-                # Adjust number of frames based on number of GPUs for video task
-                use_temporal_scaling_frames = (
-                    pipeline_config.vae_config.use_temporal_scaling_frames
+                new_num_frames = align_num_frames_for_num_gpus(
+                    self.num_frames,
+                    num_gpus=server_args.num_gpus,
+                    vae_config=pipeline_config.vae_config,
+                    round_down=self.num_frames_round_down,
                 )
-                num_frames = self.num_frames
-                num_gpus = server_args.num_gpus
-                temporal_scale_factor = (
-                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
-                )
-
-                if use_temporal_scaling_frames:
-                    orig_latent_num_frames = (
-                        num_frames - 1
-                    ) // temporal_scale_factor + 1
-                else:
-                    orig_latent_num_frames = num_frames
-
-                if orig_latent_num_frames % server_args.num_gpus != 0:
-                    # Adjust latent frames to be divisible by number of GPUs
-                    if self.num_frames_round_down:
-                        # Ensure we have at least 1 batch per GPU
-                        new_latent_num_frames = (
-                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                        )
-                    else:
-                        new_latent_num_frames = (
-                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                        )
-
-                    if use_temporal_scaling_frames:
-                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                        new_num_frames = (
-                            new_latent_num_frames - 1
-                        ) * temporal_scale_factor + 1
-                    else:
-                        new_num_frames = new_latent_num_frames
-
+                if new_num_frames != self.num_frames:
                     logger.info(
                         "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
                         self.num_frames,
@@ -931,6 +1050,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        add_argument(
+            "--task-type",
+            type=str,
+            help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
+        )
         # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
         add_argument("--auto-duration", action="store_true")
@@ -1118,6 +1242,16 @@ class SamplingParams:
             "--output-compression",
             type=int,
             help="Output compression level (0-100, higher means better quality but larger file size)",
+        )
+        add_argument(
+            "--x264-preset",
+            type=str,
+            choices=list(X264_PRESETS),
+            help=(
+                "libx264 preset for MP4 output. Faster presets encode sooner "
+                "and produce larger files at the same quality setting; "
+                "unset keeps the default (fast)."
+            ),
         )
         add_argument(
             "--quality",

@@ -17,9 +17,6 @@ class FusedSetKVBufferArg:
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     cache_loc: torch.Tensor
-    # Kept for backward compatibility with old sgl_kernel test/bench callsites.
-    k_scale: Optional[float] = None
-    v_scale: Optional[float] = None
 
     def to_jit(self) -> _JitFusedSetKVBufferArg:
         return _JitFusedSetKVBufferArg(

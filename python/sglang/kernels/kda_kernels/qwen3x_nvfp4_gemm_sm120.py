@@ -4,8 +4,6 @@
 # KDA provenance: this kernel was automatically optimized by the Humanize2
 # workflow (https://github.com/PolyArch/humanize) and Kernel Design Agents
 # (https://github.com/mit-han-lab/kernel-design-agents).
-# Source: https://github.com/BBuf/KDA-Pilot/pull/195 @
-# 516c976cee824a236679adf6eb525275a0a9a120.
 
 
 # Redistribution and use in source and binary forms, with or without
