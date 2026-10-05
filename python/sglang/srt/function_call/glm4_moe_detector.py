@@ -173,7 +173,6 @@ class Glm4MoeDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
             r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
         )
@@ -199,6 +198,18 @@ class Glm4MoeDetector(BaseFormatDetector):
             None  # Cache the value type for consistency
         )
 
+    def _iter_tool_call_blocks(self, text: str):
+        # Linear scan on purpose: a `<tool_call>.*?</tool_call>` findall rescans
+        # to the end from every opening tag when the end tag never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            end = text.find(self.eot_token, start + len(self.bot_token))
+            if end == -1:
+                return
+            end += len(self.eot_token)
+            yield text[start:end]
+            start = text.find(self.bot_token, end)
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
@@ -215,7 +226,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        match_result_list = list(self._iter_tool_call_blocks(text))
         calls = []
         try:
             for match_result in match_result_list:
@@ -481,7 +492,11 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
+            # Anchored at the first tag: if a later tag could match, so does the
+            # first, and `search` would retry the failing scan from every tag.
+            partial_match = self._STREAMING_PARTIAL_PATTERN.match(
+                current_text, current_text.find(self.bot_token)
+            )
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
