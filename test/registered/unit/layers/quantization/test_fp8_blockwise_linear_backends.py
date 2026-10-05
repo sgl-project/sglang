@@ -339,6 +339,38 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
                 plain_layer.quant_method.apply(plain_layer, Mxfp8SwizzledInput(q, s))
 
 
+@unittest.skipUnless(get_device_sm() == 90, "Native block32 DeepGEMM requires SM90")
+class TestSm90Block32Linear(_LinearBackendCheck):
+    _build_layer = staticmethod(_build_block32_layer)
+    _shapes = [(1, 96, 288), (6, 5120, 288), (65, 1792, 5120), (512, 512, 512)]
+
+    def test_deepgemm_and_auto_use_native_blocks(self):
+        for backend in ("deep_gemm", "auto"):
+            with self.subTest(backend=backend), mock.patch.object(
+                fp8_utils, "triton_w8a8_block_fp8_linear",
+                side_effect=AssertionError("native block32 unexpectedly fell back to Triton"),
+            ):
+                self._check_backend(backend, [backend], self._shapes, self._build_layer)
+
+    def test_triton_override(self):
+        self._check_backend("triton", ["triton"], self._shapes, self._build_layer)
+
+    def test_preserves_checkpoint_and_prequantized_input(self):
+        torch.manual_seed(7)
+        with mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM):
+            layer, _ = self._build_layer(96, 288)
+            original_weight = layer.weight.detach().clone()
+            layer.quant_method.process_weights_after_loading(layer)
+            torch.testing.assert_close(layer.weight.float(), original_weight.float(), rtol=0, atol=0)
+            self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
+            x = torch.randn(5, 288, device="cuda", dtype=torch.bfloat16) / 10
+            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+            bias = torch.randn(96, device="cuda", dtype=torch.bfloat16)
+            plain = layer.quant_method.apply(layer, x, bias)
+            quantized = layer.quant_method.apply(layer, (q, scales), bias)
+            torch.testing.assert_close(plain, quantized, rtol=0, atol=0)
+
+
 @unittest.skipUnless(
     "flashinfer_cutedsl" in _block32_backends(),
     "block-fp8-as-MXFP8 prefill tuning needs the FlashInfer CuTe-DSL kernel",

@@ -608,12 +608,21 @@ def dispatch_w8a8_block_fp8_linear(
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
-    # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
-    # groupwise kernels and CUTLASS take 128-wide K blocks only.
+    backend = get_fp8_gemm_runner_backend()
+    if (
+        weight_block_size == [32, 32]
+        and get_platform().is_sm90
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and (backend.is_auto() or backend.is_deep_gemm())
+    ):
+        return partial(
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+            act_scale_ue8m0=act_scale_ue8m0,
+        )
+
+    # Other non-128 layouts still require Triton or the separate MXFP8 route.
     if weight_block_size is not None and weight_block_size[1] != 128:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
-
-    backend = get_fp8_gemm_runner_backend()
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
@@ -1236,19 +1245,22 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
+    weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    block32 = list(block_size) == [32, 32] and get_platform().is_sm90
+    shape_supported = (
+        weight.shape[0] % 8 == 0 and weight.shape[1] % 32 == 0
+        if block32
+        else weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    )
+    block_supported = block32 or list(block_size) == [128, 128]
     if input_scale is not None:
-        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
-        # the fp8 per-token-group-128 q with rows padded to a multiple of 4
-        # and ``input_scale`` the matching column-major fp32 scales
-        # (stride == (1, padded_rows)) -- identical to the MN-major
-        # TMA-aligned layout this path's own quant would produce below.
-        # Output keeps the padded row count; the caller slices back.
-        # UE8M0 packed scales (Blackwell DeepGEMM) use a different layout;
-        # the caller gates on it.
+        # Pre-quantized activations retain their per-token group size and
+        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
         assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
-        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0, (
+        assert shape_supported and block_supported, (
             "pre-quantized fp8 input requires DeepGEMM-supported weight shapes "
             f"(got {tuple(weight.shape)})"
         )
@@ -1269,9 +1281,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
-    block_supported = list(block_size) == [128, 128]
-
     if not (shape_supported and dtype_supported and block_supported):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
@@ -1282,13 +1291,26 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
                 weight_scale, weight.shape, block_size
             )
         return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale,
+            bias,
+            act_scale_ue8m0=act_scale_ue8m0,
+            weight_bf16=weight_bf16,
         )
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    if block32 and act_scale_ue8m0:
+        # Keep the checkpoint's power-of-two activation quantization. SM90
+        # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], scale_ue8m0=True
+        )
+    elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],

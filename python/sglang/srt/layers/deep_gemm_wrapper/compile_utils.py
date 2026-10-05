@@ -5,6 +5,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -111,6 +112,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
+    GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
 
@@ -265,6 +267,9 @@ class _BaseWarmupExecutor:
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
+                _NormalWarmupExecutor, block_size=32
+            ),
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
@@ -278,7 +283,7 @@ class _BaseWarmupExecutor:
     ) -> int:
         # Return the required memory space in GB for warmup executor
         _GB = 1 << 30
-        if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+        if kernel_type in (DeepGemmKernelType.GEMM_NT_F8F8BF16, DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32):
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
@@ -310,22 +315,22 @@ class _BaseWarmupExecutor:
         raise NotImplementedError
 
 
-def _empty_token_fp8(size):
+def _empty_token_fp8(size, block_size=128):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
+            (*dims, ceil_div(k, block_size)), device="cuda", dtype=torch.float32
         ),
     )
 
 
-def _empty_block_fp8(size):
+def _empty_block_fp8(size, block_size=128):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
+            (*dims, ceil_div(n, block_size), ceil_div(k, block_size)),
             device="cuda",
             dtype=torch.float32,
         ),
@@ -336,9 +341,12 @@ _BLOCK_SIZE = 128
 
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
+    def __init__(
+        self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
+    ):
+        self.recipe = (1, block_size, block_size)
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
+        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
@@ -346,6 +354,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            recipe=self.recipe,
         )
 
 
