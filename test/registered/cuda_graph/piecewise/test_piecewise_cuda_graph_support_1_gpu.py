@@ -19,7 +19,16 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=250, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=250,
+    stage="nightly",
+    runner_config="1-gpu-large",
+    disabled=(
+        "tc_piecewise prefill graph breaks since #42307: Dynamo cannot build the "
+        "msgspec.Struct layer-boundary values under fullgraph=True. tc_piecewise "
+        "is being removed in #41634."
+    ),
+)
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
 
 
