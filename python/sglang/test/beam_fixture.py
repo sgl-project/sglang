@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.srt.configs.beam import BeamConfig
 
@@ -147,8 +148,13 @@ def write_char_tokenizer(path):
 
 
 @torch.inference_mode()
+@sdpa_kernel(SDPBackend.MATH)
 def eager_beam_logits(config, state, token_ids):
-    """BF16 gates, residuals and head output; FP32 SSMax and output processing."""
+    """BF16 activations; FP32 attention intermediates, SSMax and output processing.
+
+    Pin attention to the math backend so the oracle does not select a fused
+    kernel whose intermediate rounding varies with the device and input shape.
+    """
     device = state["model.embed_tokens.weight"].device
     ids = torch.tensor(token_ids, dtype=torch.long, device=device)
     positions = torch.arange(ids.numel(), device=device)
