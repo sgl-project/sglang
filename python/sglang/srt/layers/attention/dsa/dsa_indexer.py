@@ -41,13 +41,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
-from sglang.srt.layers.dcp.dsa import (
-    dcp_exchange_topk,
-    dcp_gather_index_k_prefill,
-    dcp_local_index_block_table,
-    dcp_localize_write_loc,
-)
-from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -58,6 +51,13 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
+from sglang.srt.layers.dcp.dsa import (
+    dcp_exchange_topk,
+    dcp_gather_index_k_prefill,
+    dcp_local_index_block_table,
+    dcp_localize_write_loc,
+)
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -1377,7 +1377,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 kv_block_size=block_kv,
             )
             return dcp_exchange_topk(
-                local_logits, local_lens, self.index_topk, metadata.topk_backend.topk_func
+                local_logits,
+                local_lens,
+                self.index_topk,
+                metadata.topk_backend.topk_func,
             )
 
         if self.paged_mqa_logits_backend.is_aiter():

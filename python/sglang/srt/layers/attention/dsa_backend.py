@@ -84,7 +84,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.dcp.dsa import dcp_localize_read_table, dcp_prefill_page_table
+from sglang.srt.layers.dcp.dsa import dcp_compact_read_table, dcp_prefill_page_table
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -3226,35 +3226,33 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         layer: RadixAttention,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Attend this rank's share of the global top-k -> (out, natural-log lse)."""
-        from sglang.srt.layers.attention.aiter_mla_gluon import mla_gluon_decode
+        """Attend this rank's share of the global top-k -> (out, natural-log lse).
+
+        Owned slots are packed to the front so the split-K kernel only walks
+        about topk / W of them. A row this rank owns nothing of comes back with
+        zero output and a large negative LSE, so it drops out of the merge.
+        """
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
 
         assert self.dsa_index_kpool <= 1, "DSA + DCP does not support index kpool"
-        bs = q_all.shape[0]
-        local_table = dcp_localize_read_table(page_table_1)
-        counts = (local_table >= 0).sum(dim=1, dtype=torch.int32)
-        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=q_all.device)
-        kv_indptr[1:] = torch.cumsum(counts, dim=0)
-        kv_indices = torch.empty(
-            bs * local_table.shape[1], dtype=torch.int32, device=q_all.device
-        )
-        get_valid_kv_indices(local_table, kv_indptr, kv_indices, bs)
-        result = mla_gluon_decode(
-            q=q_all.reshape(bs, layer.tp_q_head_num, layer.head_dim),
-            k_buffer=kv_cache,
-            layer=layer,
-            kv_indices=kv_indices,
-            kv_indptr=kv_indptr,
+        q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        local_table, local_lens = dcp_compact_read_table(page_table_1)
+        stream_id = int(torch.cuda.current_stream(q_all.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_all[:, :, : layer.v_head_dim],
+            q_rope=q_all[:, :, layer.v_head_dim :],
+            kv=kv_cache,
+            indices=local_table.unsqueeze(1),
             sm_scale=layer.scaling,
-            min_kv_seq_len=1,
+            d_v=layer.v_head_dim,
+            workspace=workspace,
             return_lse=True,
+            lengths=local_lens,
         )
-        assert result is not None, "DSA + DCP decode needs aiter mla_gluon"
-        out, lse = result
-        # A rank that owns none of a row's top-k must contribute zero weight.
-        empty = (counts == 0).view(bs, 1)
-        lse = lse.view(bs, -1).masked_fill(empty, float("-inf"))
-        return out.masked_fill(empty.unsqueeze(-1), 0), lse
+        return out.squeeze(0), lse
 
     def _forward_tilelang(
         self,

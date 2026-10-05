@@ -21,7 +21,11 @@ from typing import Callable, List, Tuple
 
 import torch
 
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.kernels.ops.attention.dcp_kernels import (
+    dcp_compact_owned_slots,
+    dcp_topk_merge,
+    dcp_topk_pack,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -34,12 +38,15 @@ def dcp_localize_write_loc(loc: torch.Tensor) -> torch.Tensor:
     return torch.where(loc % w == r, loc // w, torch.zeros_like(loc))
 
 
-def dcp_localize_read_table(page_table_1: torch.Tensor) -> torch.Tensor:
-    """Widened slot table (-1 = invalid) -> local rows, -1 where another rank owns it."""
+def dcp_compact_read_table(
+    page_table_1: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Widened top-k slot table (-1 = invalid) -> (this rank's local rows packed
+    to the front with a -1 tail, per-row owned count)."""
     parallel = get_parallel()
-    w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
-    owned = (page_table_1 >= 0) & (page_table_1 % w == r)
-    return torch.where(owned, page_table_1 // w, -1).to(torch.int32)
+    return dcp_compact_owned_slots(
+        page_table_1, parallel.attn_dcp_size, parallel.attn_dcp_rank
+    )
 
 
 def dcp_local_index_block_table(page_table_1: torch.Tensor, page_size: int):
@@ -70,6 +77,11 @@ def dcp_exchange_topk(
             local_logits, (0, topk - local_logits.shape[1]), value=-float("inf")
         )
     local_idx = topk_func(local_logits, local_lens, topk)
+    if local_logits.is_cuda:
+        send = dcp_topk_pack(local_logits, local_idx, local_lens, w, r)
+        recv = parallel.dcp_group.all_gather(send, dim=0)
+        return dcp_topk_merge(recv, w, topk_func)
+
     valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
     safe_idx = torch.where(valid, local_idx, torch.zeros_like(local_idx)).long()
     send = torch.empty((2, rows, topk), dtype=torch.float32, device=local_logits.device)
@@ -78,7 +90,8 @@ def dcp_exchange_topk(
     )
     # Pack the global position as int32 bits so one collective moves both planes.
     send.view(torch.int32)[1] = torch.where(valid, local_idx * w + r, -1)
-    recv = parallel.dcp_group.all_gather(send.view(torch.int32), dim=0)
+    # Gather as fp32 (bit-exact) so ROCm can use the custom all-gather.
+    recv = parallel.dcp_group.all_gather(send, dim=0).view(torch.int32)
     recv = recv.view(w, 2, rows, topk).permute(2, 1, 0, 3).reshape(rows, 2, w * topk)
     scores = recv[:, 0].contiguous().view(torch.float32)
     best, pick = torch.topk(scores, topk, dim=1)
@@ -111,7 +124,9 @@ def dcp_gather_index_k_prefill(
     )
     k_all = parallel.dcp_group.all_gather(k_fp8.contiguous().view(torch.uint8), dim=0)
     s_all = parallel.dcp_group.all_gather(k_scale.contiguous(), dim=0)
-    src = _dcp_flat_gather_index(seq_lens_cpu.tolist(), pad_lens_cpu.tolist(), pad_sum, w)
+    src = _dcp_flat_gather_index(
+        seq_lens_cpu.tolist(), pad_lens_cpu.tolist(), pad_sum, w
+    )
     src = src.to(k_fp8.device, non_blocking=True)
     return k_all.index_select(0, src).view(k_fp8.dtype), s_all.index_select(0, src)
 

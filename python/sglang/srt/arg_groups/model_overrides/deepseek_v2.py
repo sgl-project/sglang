@@ -80,7 +80,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_deepseek_dsa(hf_config) and getattr(cfg, "dcp_size", 1) > 1:
         # DSA + DCP covers ROCm qlen=1 decode on the plain DSA pool only.
         if not get_platform().is_hip:
-            raise ValueError("--dcp-size > 1 with DSA models is only supported on ROCm.")
+            raise ValueError(
+                "--dcp-size > 1 with DSA models is only supported on ROCm."
+            )
         if cfg.speculative_algorithm is not None or cfg.enable_hisparse:
             raise ValueError(
                 "--dcp-size > 1 with DSA models does not support speculative "
