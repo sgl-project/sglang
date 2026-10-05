@@ -189,61 +189,69 @@ class TestKimiMLPParallelGroups(CustomTestCase):
 
     def test_moe_shared_consumer_preserves_selection_and_execution_handle(self):
         for rank in range(4):
-            reset_context()
-            server = ServerArgs(
-                model_path="dummy", device="cpu", tp_size=4, attn_dp_size=1
-            )
-            publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
-            initialize_dp_attention_flags(server)
-            attn = SimpleNamespace(world_size=4, rank_in_group=rank)
-            shared = SimpleNamespace(world_size=2, rank_in_group=rank % 2)
-            for ep, requested, enabled, expected_size in (
-                (False, None, False, 4),
-                (True, None, False, 1),
-                (True, 1, False, 1),
-                (True, 2, False, 2),
-                (True, None, True, 4),
-            ):
-                with parallel_scope(
-                    shared_experts_tp_size=requested,
-                    enable_shared_experts_attn_tp=enabled,
-                    shared_experts_tp_group=shared,
-                    attn_tp_group=attn,
+            for dp in (1, 2):
+                reset_context()
+                # Under DP attention the dense MLP shards over attention TP;
+                # without an a2a backend the shared experts stay on full TP.
+                server = ServerArgs(
+                    model_path="dummy",
+                    device="cpu",
+                    tp_size=4,
+                    attn_dp_size=dp,
+                    enable_dense_mlp_attn_tp=dp > 1,
+                )
+                publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
+                initialize_dp_attention_flags(server)
+                attn_tp = 4 // dp
+                attn = SimpleNamespace(world_size=attn_tp, rank_in_group=rank % attn_tp)
+                shared = SimpleNamespace(world_size=2, rank_in_group=rank % 2)
+                for ep, requested, enabled, expected_size in (
+                    (False, None, False, 4),
+                    (True, None, False, 1),
+                    (True, 1, False, 1),
+                    (True, 2, False, 2),
+                    (True, None, True, attn_tp),
                 ):
-                    owner, module = build_shared_experts(ep_a2a=ep)
-                    comm = ep and expected_size > 1
-                    self.assertEqual(owner._shared_experts_tp_comm, comm)
-                    self.assertEqual(
-                        owner._shared_experts_tp1, ep and expected_size == 1
-                    )
-                    self.assertIs(
-                        owner._shared_experts_tp_group,
-                        shared if requested == 2 else attn if comm else None,
-                    )
-                    self.assertFalse(module._dense_attn_tp)
-                    for name in ("gate_up_proj", "down_proj"):
-                        layer = getattr(module, name)
+                    with parallel_scope(
+                        shared_experts_tp_size=requested,
+                        enable_shared_experts_attn_tp=enabled,
+                        shared_experts_tp_group=shared,
+                        attn_tp_group=attn,
+                    ):
+                        owner, module = build_shared_experts(ep_a2a=ep)
+                        comm = ep and expected_size > 1
+                        self.assertEqual(owner._shared_experts_tp_comm, comm)
                         self.assertEqual(
-                            rank_size(layer),
-                            (rank % expected_size, expected_size),
+                            owner._shared_experts_tp1, ep and expected_size == 1
                         )
-                        expected, _ = load_projection(layer)
-                        torch.testing.assert_close(layer.weight, expected)
-                    self.assertFalse(module.down_proj.reduce_results)
-                    self.assertFalse(module.down_proj.use_dp_attention_reduce)
-            with parallel_scope(shared_experts_tp_size=2):
-                with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
-                    build_shared_experts(ep_a2a=False)
-            with parallel_scope(
-                shared_experts_tp_size=3,
-                shared_experts_tp_group=SimpleNamespace(
-                    world_size=3, rank_in_group=rank % 3
-                ),
-            ):
-                with self.assertRaisesRegex(ValueError, "must be divisible"):
-                    build_shared_experts()
-            _, disabled = build_shared_experts(shared=0)
-            self.assertIsNone(disabled)
+                        self.assertIs(
+                            owner._shared_experts_tp_group,
+                            shared if requested == 2 else attn if comm else None,
+                        )
+                        self.assertFalse(module._dense_attn_tp)
+                        for name in ("gate_up_proj", "down_proj"):
+                            layer = getattr(module, name)
+                            self.assertEqual(
+                                rank_size(layer),
+                                (rank % expected_size, expected_size),
+                            )
+                            expected, _ = load_projection(layer)
+                            torch.testing.assert_close(layer.weight, expected)
+                        self.assertFalse(module.down_proj.reduce_results)
+                        self.assertFalse(module.down_proj.use_dp_attention_reduce)
+                with parallel_scope(shared_experts_tp_size=2):
+                    with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
+                        build_shared_experts(ep_a2a=False)
+                with parallel_scope(
+                    shared_experts_tp_size=3,
+                    shared_experts_tp_group=SimpleNamespace(
+                        world_size=3, rank_in_group=rank % 3
+                    ),
+                ):
+                    with self.assertRaisesRegex(ValueError, "must be divisible"):
+                        build_shared_experts()
+                _, disabled = build_shared_experts(shared=0)
+                self.assertIsNone(disabled)
 
 
 if __name__ == "__main__":
