@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import build_pool_entry
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
@@ -659,7 +660,7 @@ class MiniScheduler:
     ``process_batch_result`` makes them:
 
         release the previous step's write-backs, check_hicache_events
-        stash the in-flight chunk         cache_unfinished_req(chunked=True)
+        stash the in-flight chunk         checkpoint_kv_cache
         admit the chunk                   add_chunked_req (no load-back)
         admit new requests                match_prefix -> init_load_back -> lock
         ready_to_load_host_cache          the batched H->D
@@ -740,11 +741,11 @@ class MiniScheduler:
         req = self.chunked_req
         if req is None or req.extend_range.end <= len(req.prefix_indices):
             return
-        self.fx.cache.cache_unfinished_req(req, chunked=True)
+        checkpoint_kv_cache(req, self.fx.cache)
 
     def _admit_chunk(self, req: Req, can_run: list[Req], result: StepResult) -> int:
         """PrefillAdder.add_chunked_req. No match, no load-back: the chunk
-        carries the prefix_indices cache_unfinished_req left on it."""
+        carries the prefix_indices checkpoint_kv_cache left on it."""
         req.init_next_round_input()
         prefix_len = len(req.prefix_indices)
         remaining = len(req.full_untruncated_fill_ids) - prefix_len
