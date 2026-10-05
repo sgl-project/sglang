@@ -300,6 +300,25 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
 
+class TestHybridLinearQuantization(CustomTestCase):
+    def test_dsa_uses_dsa_scale_recipe(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        dsa_quant_method = object()
+        mha_quant_method = object()
+        configurator._build_dsa_fp4_quant_method = MagicMock(
+            return_value=dsa_quant_method
+        )
+        configurator._build_mha_quant_method = MagicMock(return_value=mha_quant_method)
+
+        result = configurator._build_hybrid_quant_method(num_layers=2, use_dsa=True)
+
+        self.assertIs(result, dsa_quant_method)
+        configurator._build_dsa_fp4_quant_method.assert_called_once_with(num_layers=2)
+        configurator._build_mha_quant_method.assert_not_called()
+
+
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 

@@ -405,6 +405,14 @@ class KVCacheConfigurator:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)
 
+    def _build_hybrid_quant_method(self, *, num_layers: int, use_dsa: bool):
+        builder = (
+            self._build_dsa_fp4_quant_method
+            if use_dsa
+            else self._build_mha_quant_method
+        )
+        return builder(num_layers=num_layers)
+
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
@@ -1956,12 +1964,14 @@ class KVCacheConfigurator:
             ]
         )
         extra_args = {}
+        use_dsa = False
         if self.use_mla_backend:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
+                use_dsa = True
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
@@ -1988,8 +1998,8 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
-        quant_method = self._build_mha_quant_method(
-            num_layers=len(full_attention_layer_ids)
+        quant_method = self._build_hybrid_quant_method(
+            num_layers=len(full_attention_layer_ids), use_dsa=use_dsa
         )
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
         # buffers) for the full-attention layers, same as the SWA branch.
