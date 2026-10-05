@@ -24,6 +24,14 @@ def _module(world_size: int, hidden_size: int, cluster: int = 1, topk: int = 1):
     )
 
 
+def _cluster_size(world_size: int, rows: int, topk: int) -> int:
+    # TP8 benefits from distributing the smallest rows across SMs; at larger
+    # batches a single CTA per row avoids cluster synchronization overhead.
+    if world_size == 8:
+        return 5 if rows <= (16 if topk == 8 else 8) else 1
+    return 5 if world_size == 2 and rows == 1 and topk == 8 else 1
+
+
 def beam_all_reduce_norm(
     comm, branch, residual, post_weight, next_weight, eps, scales, *, routed_scale=1.0
 ):
@@ -45,7 +53,10 @@ def beam_all_reduce_norm(
     normalized = torch.empty_like(residual) if next_weight is not None else None
     if branch.shape[0]:
         _module(
-            comm.world_size, branch.shape[-1], 5 if branch.shape[0] <= 8 else 1, topk
+            comm.world_size,
+            branch.shape[-1],
+            _cluster_size(comm.world_size, branch.shape[0], topk),
+            topk,
         ).run(
             comm,
             branch,
