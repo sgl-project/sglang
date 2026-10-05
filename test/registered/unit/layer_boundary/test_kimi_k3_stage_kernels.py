@@ -67,7 +67,8 @@ class TestKimiK3StageKernels(CustomTestCase):
     def kernels(path):
         step = path.entry.prepare.keywords["step"]
         gather = getattr(path.output_move, "keywords", {}).get("gather")
-        return step.func, step.keywords["read_fusions"], gather
+        fusions = tuple(f.run for f in step.keywords["read_fusions"])
+        return step.func, fusions, gather
 
     def test_the_standard_path_keeps_the_boundary_collectives(self):
         for sp_moe in (True, False):

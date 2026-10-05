@@ -47,7 +47,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
-from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_tp_gather_input,
+    update_attn_tp_gather_output,
+)
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
@@ -231,6 +234,7 @@ class StagePlan:
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                     attn_input_adapter=edges.attn_input_adapter,
+                    attn_tp_gather=attn_tp_gather,
                 )
             out = (
                 ExitMove()
@@ -251,6 +255,7 @@ class StagePlan:
             )
         if attn_tp_gather is not None and not any(
             getattr(path.output_move, "func", None) is update_attn_tp_gather_output
+            or getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
             for path in self.paths.values()
         ):
             raise ValueError(

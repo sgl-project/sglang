@@ -91,10 +91,27 @@ def tp_slice(hidden_states, residual):
     return hidden_states, residual
 
 
+class GatheredInput:
+    """A stage input its read already gathered over attention TP, which the
+    entry's gather then passes on as it is."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: torch.Tensor):
+        self.value = value
+
+
 def attn_tp_gather_input(
     hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     forward_batch: ForwardBatch,
+    gather: Optional[Callable] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Gather a stage input from this rank's attention-TP slice of the rows,
+    trying the stage's ``gather`` first for a single tensor (see
+    attn_tp_gather_with); an input its read already gathered (GatheredInput)
+    passes through."""
+    if isinstance(hidden_states, GatheredInput):
+        return hidden_states.value
     parallel = get_parallel()
     if isinstance(hidden_states, tuple):
         gathered_hidden_states = []
@@ -118,7 +135,7 @@ def attn_tp_gather_input(
             gathered_hidden_states.append(output)
         return tuple(gathered_hidden_states)
 
-    return attn_tp_gather(hidden_states)
+    return attn_tp_gather_with(hidden_states, gather)
 
 
 def attn_tp_reduce_scatter(

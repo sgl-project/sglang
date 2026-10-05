@@ -330,9 +330,7 @@ class TestAttnBankFusedAllReduce(CustomTestCase):
                         LAYER_LIST[1].post_norm,
                         gathers_residual=False,
                         fusions=(),
-                        read_fusions=tuple(
-                            f.run for f in ops.ffn_readout.completing_fusions
-                        ),
+                        read_fusions=ops.ffn_readout.completing_fusions,
                         read=ops.ffn_readout,
                         update=ops.ffn_update,
                     )
@@ -459,7 +457,11 @@ class TestAttnBankSpMoeStages(CustomTestCase):
                         None,
                         LAYER_LIST[1].post_norm,
                         scatters_residual=True,
-                        read_fusions=(scatter_add(takes),),
+                        read_fusions=(
+                            ReadoutFusion(
+                                SumGroup.ATTN_TP, scatter_add(takes), scatters=True
+                            ),
+                        ),
                         read=ops.ffn_readout,
                         update=Update(),
                     )
