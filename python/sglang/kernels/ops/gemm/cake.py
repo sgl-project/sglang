@@ -61,9 +61,11 @@ register_kernel(
         "prepare_group_gemm_fp8_nt_groupwise_contiguous",
         _SM100_ONLY,
         ("float8_e4m3fn", "float32", "int32", "bfloat16"),
-        "prepared runner: E4M3 a[M,K] x b[G,N,K] with (M,K/128)/(G,N/128,K/128) "
-        "FP32 scales routed by sorted int32 m_indices[M] -> BF16 out[M,N]; "
-        "launch() submits one kernel (first launch not graph-capturable)",
+        "prepared runner: E4M3 a[M,K] x b[G,N,K] with FP32 (M,K/128)/(G,N/128,K/128) "
+        "or packed UE8M0 int32 (M,ceil(K/512))/(G,N|N/128,ceil(K/512)) scales routed "
+        "by sorted int32 m_indices[M] (-1 rows skipped, expert runs on `alignment` "
+        "row multiples) -> BF16 out[M,N]; launch(a=,a_scale=,m_indices=,out=) rebinds "
+        "the per-token operands and is graph-capturable",
         "Cake contiguous grouped FP8 GEMM (prepare-once / launch-many) distributed by FlashInfer.",
     )
 )
@@ -367,10 +369,25 @@ def cake_prepare_group_gemm_fp8_nt_groupwise_contiguous(
     out: Optional[torch.Tensor] = None,
     *,
     validate_indices: bool = False,
+    fill_padding: bool = False,
+    alignment: int = 128,
 ) -> Any:
-    """Explicit Cake entry point; callers gate on the adapter's ``supports_*``."""
+    """Explicit Cake entry point; callers gate on the adapter's ``supports_*``.
+
+    ``fill_padding`` / ``alignment`` follow the block-scaled FlashInfer contract
+    (int32 UE8M0 scales, native ``-1`` rows, ``launch(a=..., ...)`` rebinding);
+    see :mod:`sglang.kernels.cake_kernels.gemm_grouped_fp8`.
+    """
     return _cake("prepare_group_gemm_fp8_nt_groupwise_contiguous")(
-        a, b, a_scale, b_scale, m_indices, out, validate_indices=validate_indices
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indices,
+        out,
+        validate_indices=validate_indices,
+        fill_padding=fill_padding,
+        alignment=alignment,
     )
 
 

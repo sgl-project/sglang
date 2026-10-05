@@ -356,10 +356,13 @@ class _Stage:
             ["--component-residency", "all=component-offload"],
             "component-offload",
         ),
-        (
+        pytest.param(
             "text_encoder_2",
             ["--component-residency", "text_encoder=snapshot-offload"],
             "snapshot-offload",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="snapshot-offload requires CUDA"
+            ),
         ),
         ("text_encoder_2", ["--text-encoder-cpu-offload", "true"], "component-offload"),
         ("text_encoder_2", ["--text-encoder-cpu-offload", "false"], "resident"),

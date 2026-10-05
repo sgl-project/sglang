@@ -20,6 +20,7 @@ use crate::config::{
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
+use crate::policies_reorg::admission::AdmissionLimits;
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
@@ -226,7 +227,8 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
-    /// Static P/D bucket configuration. Omit to use the global candidate domain.
+    /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
+    /// Omit to use the global candidate domain (default buckets with reorg).
     #[arg(long)]
     pub bucket_config: Option<String>,
 
@@ -243,6 +245,11 @@ pub struct RoutingArgs {
     /// Router-local in-flight limit for `--filter overloaded`.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
+
+    /// Reorg admission: reject an engine whose KV tokens have reached this share
+    /// of its reported capacity, in (0, 1].
+    #[arg(long)]
+    pub max_kv_usage: Option<f64>,
 
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
@@ -263,6 +270,12 @@ pub struct CacheArgs {
     /// Prefix-match source: indexer when --kv-indexer-endpoint is set, otherwise radix_tree.
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,
+
+    /// Credit a worker with a prompt's prefix for this many milliseconds after
+    /// routing it there, before the engine's KV events confirm it, so a burst
+    /// sharing a cold prefix lands together. Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_pending_prefix_ttl_ms: Option<u64>,
 
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
@@ -450,6 +463,10 @@ impl Cli {
                 "prefer, balanced and --affinity-load-* require --chat-routing reorg"
             );
             ensure!(
+                self.routing.max_kv_usage.is_none(),
+                "--max-kv-usage requires --chat-routing reorg"
+            );
+            ensure!(
                 self.affinity.affinity_mode.is_none()
                     || self.routing.policy == PolicyKind::SessionAware,
                 "legacy --affinity-mode requires --policy session_aware"
@@ -465,12 +482,12 @@ impl Cli {
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
         let discovery = self.discovery.into_config()?;
-        let bucket_config = self
-            .routing
-            .bucket_config
-            .as_deref()
-            .map(load_bucket_config)
-            .transpose()?;
+        let path = self.routing.bucket_config.as_deref();
+        let (bucket_config, reorg_buckets) = match path {
+            Some(path) if reorg => (None, Some(load_bucket_config(path)?)),
+            Some(path) => (Some(load_bucket_config(path)?), None),
+            None => (None, None),
+        };
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
@@ -501,6 +518,7 @@ impl Cli {
         }
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
+        let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
             .model
@@ -557,6 +575,8 @@ impl Cli {
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
                 bucket_config,
+                reorg_buckets,
+                reorg_admission,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -740,6 +760,19 @@ impl RoutingArgs {
 
         Ok(eligibility)
     }
+
+    /// Reorg admission for groups without their own limits.
+    fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
+        let limits = AdmissionLimits {
+            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_kv_usage: self.max_kv_usage,
+            ..Default::default()
+        };
+        limits
+            .validate()
+            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+        Ok(limits)
+    }
 }
 
 impl CacheArgs {
@@ -770,6 +803,16 @@ impl CacheArgs {
         ensure!(
             self.kv_indexer_query_max_inflight.is_none() || self.kv_indexer_endpoint.is_some(),
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
+        );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms != Some(0),
+            "--cache-pending-prefix-ttl-ms must be greater than zero"
+        );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms.is_none()
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
@@ -808,6 +851,7 @@ impl CacheArgs {
                 .kv_bootstrap_fetch_timeout_cap_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
+            pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
         }))
     }
 }
@@ -1034,7 +1078,7 @@ impl AffinityArgs {
     }
 }
 
-fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
+fn load_bucket_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     let raw = std::fs::read_to_string(path)
         .map_err(|error| anyhow!("--bucket-config cannot read {path:?}: {error}"))?;
     serde_json::from_str(&raw)
@@ -1110,16 +1154,18 @@ mod tests {
             session.model.affinity.unwrap().session_id_header,
             "x-session"
         );
-        assert_eq!(
-            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
-                .unwrap()
-                .model
-                .eligibility
-                .unwrap()
-                .max_in_flight,
-            Some(2)
-        );
+        let overloaded = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+            .unwrap()
+            .model;
+        assert_eq!(overloaded.eligibility.unwrap().max_in_flight, Some(2));
+        assert_eq!(overloaded.reorg_admission.max_inflight_requests, Some(2));
+        let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
+        assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
+        assert!(kv.eligibility.is_none());
+        let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
+        assert!(legacy_kv.unwrap().into_config().is_err());
         for args in [
+            vec!["--max-kv-usage", "1.5"],
             vec!["--policy", "round_robin"],
             vec!["--decode-policy", "legacy_host_affinity"],
             vec!["--policy", "session_aware", "--stable-pair"],
@@ -2782,6 +2828,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_prefix_ttl_needs_the_local_radix_tree() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(cache.pending_prefix_ttl_ms, 500);
+        for args in [
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 0",
+            "--policy power_of_two --cache-pending-prefix-ttl-ms 500",
+            "--policy cache_aware --kv-indexer-endpoint http://i:1 --cache-pending-prefix-ttl-ms 500",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-ttl-ms"), "{args}: {err}");
+        }
+    }
+
+    #[test]
     fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
         let default_config = cfg_of("--policy power_of_two").unwrap();
         assert_eq!(
@@ -2841,6 +2905,82 @@ mod tests {
             buckets.tps_slo_policy,
             crate::config::SloBucketPolicy::BestEffort
         );
+    }
+
+    #[tokio::test]
+    async fn reorg_bucket_config_builds_complete_buckets_and_rejects_invalid_ones() {
+        use crate::buckets_reorg::{BucketResolver, SloPreference};
+        use serde_json::json;
+        fn build(buckets: &serde_json::Value) -> Result<BucketResolver> {
+            let file = tempfile::NamedTempFile::new()?;
+            std::fs::write(file.path(), buckets.to_string())?;
+            let config = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://worker:30000",
+                "--chat-routing",
+                "reorg",
+                "--policy",
+                "session_aware",
+                "--bucket-config",
+                file.path().to_str().unwrap(),
+            ]))?;
+            let state = crate::state::kv_events::KvEventIndex::new();
+            let (resolver, _) =
+                crate::policies_reorg::factory::build_resolver(&config.model, &state, None)?;
+            Ok(resolver)
+        }
+        let resolver = build(&json!({
+            "ttft_slo": "slo_first",
+            "buckets": [
+                {"id": "short", "max_input_tokens": 4096, "plain": {
+                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9}
+                }},
+                {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two", "worker_services": ["ns/decode"]}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resolver.ttft_slo, SloPreference::SloFirst);
+        let shape: Vec<_> = (resolver.buckets.iter())
+            .map(|b| (b.id.as_str(), b.rank, b.limits.max))
+            .collect();
+        assert_eq!(shape, [("short", 0, Some(4096)), ("long", 1, None)]);
+        let crate::buckets_reorg::BucketGroups::Pd { decode, .. } = &resolver.buckets[1].groups
+        else {
+            panic!("expected PD bucket");
+        };
+        assert_eq!(
+            decode.worker_services.as_ref().unwrap(),
+            &["ns/decode".into()].into()
+        );
+        for bad in [
+            json!({"buckets": []}),
+            json!({"buckets": [{"id": "x", "plain": {}, "prefill": {}}]}),
+            json!({"buckets": [{"id": "x", "prefill": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {}}, {"id": "x", "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"policy": "cache_aware"}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_usage": 2.0}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_tokens": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_running_usage": 0}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_waiting_requests": 0}}}]}),
+            json!({"buckets": [{"id": "", "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_input_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_context_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "max_context_tokens": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "ttft_ms": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "tokens_per_second": 0.0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [""]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [" \t"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/short/extra"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/ short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": ["a"], "worker_services": ["ns/short"]}}]}),
+        ] {
+            assert!(build(&bad).is_err(), "accepted {bad}");
+        }
     }
 
     /// The flag reaches `ModelConfig`, and is opt-in: unset leaves the model

@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 from typing import Optional, Tuple, Union
 
 import torch
@@ -45,6 +46,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
+
+logger = logging.getLogger(__name__)
+
+# Dispatcher-level safe-gate reroutes already reported (one line per kernel
+# class and mode), so a long decode run does not repeat the notice.
+_safe_gate_reroute_logged: set = set()
 
 
 class KDAKernelDispatcher:
@@ -262,14 +269,8 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
-        ):
-            raise NotImplementedError(
-                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
-                f"got {self.decode_kernel.__class__.__name__}."
-            )
-        return self.decode_kernel.decode(
+        kernel = self.effective_decode_kernel(lower_bound)
+        return kernel.decode(
             q,
             k,
             v,
@@ -307,14 +308,10 @@ class KDAKernelDispatcher:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
         (FlashInfer decode -> recurrent_kda; Triton / CuTe DSL decode -> the Triton
         fused KDA verify)."""
-        if lower_bound is not None and not isinstance(
-            self.verify_kernel, TritonKDAKernel
-        ):
-            raise NotImplementedError(
-                "lower_bound (safe gate) target verify is only supported by "
-                f"TritonKDAKernel; got {self.verify_kernel.__class__.__name__}."
-            )
-        return self.verify_kernel.target_verify(
+        kernel = self._safe_gate_kernel(
+            self.verify_kernel, lower_bound, "target_verify"
+        )
+        return kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -333,6 +330,37 @@ class KDAKernelDispatcher:
             # Forward extras (e.g. the fused ring-write cache_ring/replayssm_*).
             **kwargs,
         )
+
+    def _safe_gate_kernel(self, kernel, lower_bound: Optional[float], mode: str):
+        """Safe-gate models (``lower_bound`` set, e.g. Kimi-K3 ``-5``) run
+        ``decode`` / ``target_verify`` on the Triton kernel unless the selected
+        kernel declares ``supports_safe_gate``: the Triton kernels are the
+        reference the KDA safe-gate tests assert against, so a backend chosen
+        for its unbounded-gate kernels keeps serving instead of failing the
+        first decode step (the engine used to raise ``NotImplementedError``
+        here, which took the whole server down for Kimi-K3 under
+        ``--linear-attn-decode-backend flashinfer``)."""
+        if (
+            lower_bound is None
+            or isinstance(kernel, TritonKDAKernel)
+            or getattr(kernel, "supports_safe_gate", False)
+        ):
+            return kernel
+        key = (kernel.__class__.__name__, mode)
+        if key not in _safe_gate_reroute_logged:
+            _safe_gate_reroute_logged.add(key)
+            logger.warning(
+                "KDA %s: %s does not support the safe gate (lower_bound=%s); "
+                "running it on TritonKDAKernel.",
+                mode,
+                kernel.__class__.__name__,
+                lower_bound,
+            )
+        return self.triton_kernel
+
+    def effective_decode_kernel(self, lower_bound: Optional[float]):
+        """The kernel ``decode`` will actually run (see ``_safe_gate_kernel``)."""
+        return self._safe_gate_kernel(self.decode_kernel, lower_bound, "decode")
 
     def effective_extend_kernel(self, lower_bound: Optional[float]):
         """The kernel ``extend`` will actually run: safe-gate models reroute

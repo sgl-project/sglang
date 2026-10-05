@@ -161,23 +161,6 @@ def situ_and_mul_masked_post_quant(
 __all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
 
 
-# Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
-# registered for inventory. Import them from their modules.
-_TRITON_KERNELS = [
-    ("fused_moe_lora_kernel", "fused_moe_lora"),
-    ("virtual_experts", "merged_experts_fused_moe_lora_add"),
-]
-for _mod, _fn in _TRITON_KERNELS:
-    register_kernel(
-        KernelSpec(
-            op=f"moe.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
-        )
-    )
-del _mod, _fn
-
-
 # Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);
 # registered for inventory. Import them from their modules.
 _PHASE25_TRITON_KERNELS = [
