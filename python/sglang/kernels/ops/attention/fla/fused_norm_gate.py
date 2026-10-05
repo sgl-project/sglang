@@ -225,9 +225,16 @@ def layer_norm_gated_fwd(
     if D <= 512:
         use_pdl = is_arch_support_pdl()
         BT = 32
-        if use_pdl and (T, D, x.dtype) == (64, 128, torch.bfloat16):
+        use_bt8 = (
+            8 <= T <= 256
+            if is_rms_norm and activation == "sigmoid"
+            else T == 64
+        )
+        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
             arch = get_jit_cuda_arch()
             if (arch.major, arch.minor) == (10, 3):
+                # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
+                # Other norm modes retain their T=64 selection.
                 BT = 8
         pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](

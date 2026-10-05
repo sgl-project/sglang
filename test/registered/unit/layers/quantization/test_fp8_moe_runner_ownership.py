@@ -65,39 +65,6 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         for name in _ACTIVATION_PARAMS:
             self.assertFalse(hasattr(layer, f"_flashinfer_trtllm_{name}"))
 
-    def test_block_layout_views_follow_live_weights(self):
-        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as trtllm
-
-        layer = torch.nn.Module()
-        for name, shape in (
-            ("w13_weight", (2, 128, 256)),
-            ("w2_weight", (2, 256, 128)),
-        ):
-            setattr(
-                layer,
-                name,
-                torch.nn.Parameter(
-                    torch.zeros(shape, dtype=torch.float8_e4m3fn), requires_grad=False
-                ),
-            )
-        layer.forward = lambda: trtllm.get_fp8_moe_weights(layer)
-        trtllm.prepare_fp8_moe_block_layout(layer)
-        for weight in layer.parameters():
-            weight.data = weight.data.clone()
-        trtllm.prepare_fp8_moe_block_layout(layer)
-        for weight, view in zip(layer.parameters(), layer()):
-            self.assertEqual(view.data_ptr(), weight.data_ptr())
-            e, n, k = weight.shape
-            self.assertEqual(view.shape, (e, k // 128, n, 128))
-
-        trtllm.prepare_fp8_moe_block_layout(layer, cache_views=False)
-        replacements = {
-            name: weight.detach().clone() for name, weight in layer.named_parameters()
-        }
-        views = torch.func.functional_call(layer, replacements, ())
-        for weight, view in zip(replacements.values(), views):
-            self.assertEqual(view.data_ptr(), weight.data_ptr())
-
     def test_borrowed_delegate_skips_trtllm_activation_params(self):
         """A method with no MoeRunner must not read moe_runner_config; doing so
         aborts weight loading whenever a TRT-LLM runner backend is selected."""

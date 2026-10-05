@@ -4,12 +4,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import (
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_sm90_supported,
+)
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
+_is_sm103 = is_cuda() and get_device_sm() == 103
 
 
 def _select_recurrent_launch_config(
@@ -20,8 +27,10 @@ def _select_recurrent_launch_config(
     v: int,
     is_kda: bool,
     target_verify: bool = False,
+    *,
+    cache_steps: int = 0,
 ) -> tuple[int, int]:
-    """Select the value tile and warp count for recurrent GDN."""
+    """Select the value tile and warp count for recurrent GDN/KDA."""
     if (
         _is_hip
         and _is_gfx95
@@ -45,6 +54,14 @@ def _select_recurrent_launch_config(
         # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
         # with narrow tiles but not bit-identical to BV=32. Only the dense
         # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
+        return 4, 1
+    if (
+        _is_sm103
+        and is_kda
+        and target_verify
+        and (n, h, hv, k, v, cache_steps) == (1, 8, 8, 128, 128, 8)
+    ):
+        # GLM TP8 DFlash verification: 256 CTAs instead of 32.
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 
@@ -182,7 +199,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
-    ROUND_STATE_PRODUCT: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -445,8 +461,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif ROUND_STATE_PRODUCT:
-            # Round the FP32 product and addition separately, without FMA contraction.
+        elif IS_KDA and V == 128 and BV == 4:
+            # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
                 constraints="=f,f,f",
@@ -574,22 +590,22 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BV, num_warps = _select_recurrent_launch_config(
-        N, H, HV, K, V, is_kda, target_verify=intermediate_states_buffer is not None
-    )
     use_pdl = is_arch_support_pdl()
-    round_state_product = False
-    if (
-        is_kda
-        and disable_state_update
-        and not match_cutedsl_decode
-        and (N, H, HV, K, V, cache_steps) == (1, 8, 8, 128, 128, 8)
-        and use_pdl
-    ):
-        arch = get_jit_cuda_arch()
-        if (arch.major, arch.minor) == (10, 3):
-            BV = 4
-            round_state_product = True
+    target_verify = (
+        disable_state_update and not match_cutedsl_decode
+        if is_kda
+        else intermediate_states_buffer is not None
+    )
+    BV, num_warps = _select_recurrent_launch_config(
+        N,
+        H,
+        HV,
+        K,
+        V,
+        is_kda,
+        target_verify=target_verify,
+        cache_steps=cache_steps,
+    )
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -722,7 +738,6 @@ def fused_sigmoid_gating_delta_rule_update(
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,
-        ROUND_STATE_PRODUCT=round_state_product,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

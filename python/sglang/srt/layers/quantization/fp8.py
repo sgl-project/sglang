@@ -32,7 +32,6 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
-    get_fp8_moe_weights,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
@@ -90,7 +89,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
-    get_exec,
     get_parallel,
     get_platform,
 )
@@ -2612,21 +2610,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
-            if (
-                envs.SGLANG_FLASHINFER_FP8_MOE_BLOCK_LAYOUT.get()
-                and self.weight_block_size == [128, 128]
-                and layer.w13_weight.dtype == torch.float8_e4m3fn
-            ):
-                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                    prepare_fp8_moe_block_layout,
-                )
-
-                offload = get_exec().offload
-                prepare_fp8_moe_block_layout(
-                    layer,
-                    cache_views=offload.cpu_offload_gb == 0
-                    and offload.offload_group_size == 0,
-                )
 
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
@@ -3161,12 +3144,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
-            weight_layout = getattr(layer, "_flashinfer_weight_layout", 0)
-            w13, w2 = get_fp8_moe_weights(layer)
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
-                w13_weight=w13,
-                w2_weight=w2,
-                weight_layout=weight_layout,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
                 global_num_experts=global_num_experts,
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
