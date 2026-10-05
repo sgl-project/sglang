@@ -225,7 +225,7 @@ fn load_model_identity(config_file: &str) -> Result<ModelIdentity, String> {
     })
 }
 
-pub(super) fn resolve_dsv4_profile(
+pub(crate) fn resolve_dsv4_profile(
     profile: Option<&str>,
     model_source: &str,
     revision: Option<&str>,

@@ -6,7 +6,7 @@ pub enum DeepSeekV4Profile {
     Official,
 }
 
-pub(super) fn dynamo_reasoning_effort(
+pub(crate) fn dynamo_reasoning_effort(
     profile: DeepSeekV4Profile,
     effort: Option<&str>,
 ) -> &'static str {

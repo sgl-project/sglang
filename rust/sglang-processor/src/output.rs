@@ -447,7 +447,7 @@ fn from_dynamo_finish_reason(reason: FinishReason) -> ChatFinishReason {
     }
 }
 
-fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
+pub(super) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
     let name = match server_name {
         "deepseek-r1" | "step3p5" => "deepseek_r1",
         "kimi_k2" => "kimi_k25",

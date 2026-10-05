@@ -93,7 +93,7 @@ pub enum ChatFormatter {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum ThinkingPolicy {
+pub(super) enum ThinkingPolicy {
     #[default]
     Unknown,
     Always,
@@ -109,7 +109,7 @@ enum ThinkingPolicy {
 }
 
 impl ThinkingPolicy {
-    fn apply(
+    pub(super) fn apply(
         self,
         args: &mut Option<HashMap<String, Value>>,
         named_tool_choice: bool,
@@ -178,7 +178,7 @@ impl ThinkingTemplates {
         }
     }
 
-    fn for_request(self, tools_enabled: bool) -> ThinkingPolicy {
+    pub(super) fn for_request(self, tools_enabled: bool) -> ThinkingPolicy {
         if tools_enabled {
             self.tool_use.unwrap_or(self.default)
         } else {
@@ -186,7 +186,7 @@ impl ThinkingTemplates {
         }
     }
 
-    fn from_config(config: &Value) -> Self {
+    pub(super) fn from_config(config: &Value) -> Self {
         let Some(template) = config.get("chat_template") else {
             return Self::default();
         };
@@ -1286,7 +1286,7 @@ pub fn load_chat_formatter(
 /// built-in template from the model path, optionally consulting the model's
 /// `config.json` `model_type`. `None` when nothing matches — the HF template
 /// is the fallback then, as in Python.
-fn infer_legacy_template_from_model_path(
+pub(super) fn infer_legacy_template_from_model_path(
     model_path: &str,
     model_type: Option<&str>,
 ) -> Option<LegacySpec> {
@@ -1427,7 +1427,7 @@ impl ChatFormatter {
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`
 /// exactly (missing `sep2`/`image_token`/`audio_token` stay at Python defaults).
-fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, TemplateError> {
+pub(super) fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, TemplateError> {
     let object = value
         .as_object()
         .ok_or_else(|| TemplateError::LegacyNotObject {
