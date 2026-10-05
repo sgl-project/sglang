@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=33, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -370,38 +370,38 @@ class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
         from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 
         shapes = [
-            (8, 1, 1, False),
-            (8, 2, 1, True),
-            (8, 4, 1, True),
-            (8, 2, 2, True),
-            (16, 4, 2, True),
+            (8, 1, 1),
+            (8, 2, 1),
+            (8, 4, 1),
+            (8, 2, 2),
+            (16, 4, 2),
         ]
-        for tp_size, dp_size, attn_cp_size, dp_attn in shapes:
+        for tp_size, attn_dp_size, attn_cp_size in shapes:
             for tp_rank in range(tp_size):
                 reset_context()
                 publish(
                     ServerArgs(
                         model_path="dummy",
                         tp_size=tp_size,
-                        dp_size=dp_size,
+                        attn_dp_size=attn_dp_size,
                         attn_cp_size=attn_cp_size,
-                        enable_dp_attention=dp_attn,
                     ),
                     role="test",
                     ranks=SpawnRanks(world_rank=tp_rank),
                 )
                 want_tp, _, want_dp, _ = compute_dp_attention_world_info(
-                    dp_attn, tp_rank, tp_size, dp_size, attn_cp_size
+                    tp_rank, tp_size, attn_dp_size, attn_cp_size
                 )
-                msg = f"tp={tp_size} dp={dp_size} cp={attn_cp_size} rank={tp_rank}"
+                msg = (
+                    f"tp={tp_size} attn_dp={attn_dp_size} cp={attn_cp_size} "
+                    f"rank={tp_rank}"
+                )
                 self.assertEqual(get_parallel().attn_tp_rank, want_tp, msg)
                 self.assertEqual(get_parallel().attn_dp_rank, want_dp, msg)
 
     def test_the_rank_reads_without_a_process_group(self):
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=2),
             role="test",
             ranks=SpawnRanks(world_rank=5),
         )
@@ -485,9 +485,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -512,9 +510,7 @@ class TestStampedRanks(_IsolatedOverrides):
         self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -630,9 +626,7 @@ class TestAWidthReadStaysTraceable(_IsolatedOverrides):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=2),
             role="test",
         )
 
@@ -1420,8 +1414,6 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 1
             if fwd.is_extend_in_batch:
                 x = x + 2
-            if fwd.fuse_mlp_allreduce:
-                x = x + 4
             if fwd.mlp_reduce_scatter:
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
@@ -1435,11 +1427,10 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 2)
         get_forward().set("is_extend_in_batch", False)
         with get_forward().scoped(
-            fuse_mlp_allreduce=True,
             mlp_reduce_scatter=True,
             flashinfer_trtllm_bypass=True,
         ):
-            self.assertEqual(probe(torch.zeros(())).item(), 28)
+            self.assertEqual(probe(torch.zeros(())).item(), 24)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
@@ -1584,23 +1575,17 @@ class TestForwardFlags(_IsolatedServerArgs):
 
         reset_context()
         fwd = get_forward()
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(fwd.mlp_reduce_scatter)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
-        self.assertFalse(should_skip_mlp_all_reduce())
-
-        with fwd.scoped(fuse_mlp_allreduce=True):
-            self.assertTrue(fwd.fuse_mlp_allreduce)
-            self.assertTrue(should_skip_mlp_all_reduce())
-            # Fusion alone is enough to skip post-experts AR.
-            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(mlp_reduce_scatter=True):
             self.assertTrue(fwd.mlp_reduce_scatter)
             self.assertTrue(should_skip_mlp_all_reduce())
+            # The reduce-scatter alone is enough to skip post-experts AR.
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
         self.assertFalse(fwd.mlp_reduce_scatter)
+        self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(flashinfer_trtllm_bypass=True):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
@@ -1945,9 +1930,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=2),
             role="test",
         )
         self.assertEqual(get_parallel().attn_tp_size, 4)
@@ -2068,9 +2051,7 @@ class TestDerivedWidths(_IsolatedOverrides):
             side_effect=AssertionError("the group must not be consulted"),
         ):
             publish(
-                ServerArgs(
-                    model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
-                ),
+                ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=2),
                 role="test",
             )
             self.assertEqual(get_parallel().attn_tp_size, 4)
@@ -2108,9 +2089,9 @@ class TestDerivedWidths(_IsolatedOverrides):
         widths from the same derivation `override_permanently`'s callers use."""
         from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 
-        for tp_size, dp_size, attn_cp_size in ((8, 2, 1), (8, 2, 2), (16, 4, 2)):
+        for tp_size, dp_width, attn_cp_size in ((8, 2, 1), (8, 2, 2), (16, 4, 2)):
             _, attn_tp_size, _, attn_dp_size = compute_dp_attention_world_info(
-                True, 0, tp_size, dp_size, attn_cp_size
+                0, tp_size, dp_width, attn_cp_size
             )
             widths = derive_parallel_widths(
                 tp_size=tp_size,
@@ -2127,7 +2108,7 @@ class TestDerivedWidths(_IsolatedOverrides):
     def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
         shapes = (
             dict(tp_size=8),
-            dict(tp_size=8, dp_size=2, enable_dp_attention=True),
+            dict(tp_size=8, attn_dp_size=2),
             dict(tp_size=8, ep_size=4, moe_dp_size=2),
             dict(tp_size=8, dcp_size=8),
         )
@@ -2151,9 +2132,7 @@ class TestDerivedWidths(_IsolatedOverrides):
                 recomputed = derive_parallel_widths(
                     tp_size=parallel.tp_size,
                     attn_cp_size=parallel.attn_cp_size,
-                    attn_dp_size=(
-                        parallel.dp_size if parallel.enable_dp_attention else 1
-                    ),
+                    attn_dp_size=parallel.attn_dp_size,
                     moe_ep_size=parallel.ep_size,
                     moe_dp_size=parallel.moe_dp_size,
                     dcp_size=parallel.dcp_size,
@@ -2244,7 +2223,10 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
             self.assertTrue(callable(getattr(importlib.import_module(module), attr)))
 
     def test_the_arithmetic_produces_nothing_that_is_not_declared(self):
-        from sglang.srt.runtime_context import _derived_widths
+        from sglang.srt.runtime_context import (
+            _derived_widths,
+            _parallel_config_leaves,
+        )
 
         produced = set(
             derive_parallel_widths(
@@ -2257,7 +2239,10 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
                 dcp_enabled=False,
             )
         )
-        self.assertEqual(produced - set(_derived_widths()), set())
+        # `attn_dp_size` is a configured leaf the widths carry along, so a
+        # process with nothing published can stamp the whole layout at once.
+        self.assertIn("attn_dp_size", _parallel_config_leaves())
+        self.assertEqual(produced - set(_derived_widths()), {"attn_dp_size"})
 
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
@@ -2441,9 +2426,7 @@ class TestTheTopologyIdentities(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=4, attn_dp_size=2),
             role="scheduler",
             ranks=SpawnRanks(world_rank=3, dp_rank=1),
         )
@@ -2585,8 +2568,7 @@ class TestTheParallelPhase(CustomTestCase):
             ServerArgs(
                 model_path="dummy",
                 tp_size=4,
-                dp_size=2,
-                enable_dp_attention=True,
+                attn_dp_size=2,
                 device="cpu",
             ),
             role="test",
@@ -2630,17 +2612,17 @@ class TestTheParallelPhase(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             device="cpu",
-            tp_size=4,
+            tp_size=8,
+            attn_dp_size=2,
             attn_cp_size=2,
-            enable_dp_attention=True,
         )
         publish(server_args, role="test", ranks=SpawnRanks(world_rank=0))
         # Identical shards contribute equally; reducing across CP replicas
         # would double the output even though the layer uses attention TP.
         tp_group = SimpleNamespace(
-            world_size=4,
+            world_size=8,
             rank_in_group=0,
-            all_reduce=Mock(side_effect=lambda x: x * 4),
+            all_reduce=Mock(side_effect=lambda x: x * 8),
         )
         attn_tp_group = SimpleNamespace(
             world_size=2,
@@ -2779,9 +2761,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=4, attn_dp_size=2),
             role="scheduler",
             ranks=SpawnRanks(world_rank=0, dp_rank=0),
         )
@@ -2798,14 +2778,14 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
             self.assertEqual(parallel.attn_dp_rank, 0)
             self.assertEqual(parallel.attn_cp_size, 1)
             self.assertEqual(parallel.attn_cp_rank, 0)
-            # The scope leaves the deployment's replica count alone.
-            self.assertEqual(parallel.dp_size, 2)
+            # The scope leaves the deployment's DP rank count alone.
+            self.assertEqual(parallel.num_dp_ranks, 2)
             self.assertEqual(
                 parallel.tp_size,
                 parallel.attn_tp_size * parallel.attn_dp_size * parallel.attn_cp_size,
             )
         self.assertEqual(get_parallel().attn_dp_size, 2)
-        self.assertEqual(get_parallel().dp_size, 2)
+        self.assertEqual(get_parallel().num_dp_ranks, 2)
 
     def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
         from sglang.srt.distributed import parallel_state
@@ -2813,9 +2793,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=4, attn_dp_size=2),
             role="scheduler",
             ranks=SpawnRanks(world_rank=0, dp_rank=0),
         )
@@ -2828,7 +2806,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.tp_size, 4)
                 self.assertEqual(parallel.attn_dp_size, 2)
                 self.assertEqual(parallel.attn_tp_size, 2)
-                self.assertEqual(parallel.dp_size, 2)
+                self.assertEqual(parallel.num_dp_ranks, 2)
 
     def test_a_narrowed_draft_still_indexes_the_targets_dp_sync(self):
         """A draft scope that owns its attention answers the DP gather width and
@@ -2839,9 +2817,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=4, attn_dp_size=4),
             role="scheduler",
             ranks=SpawnRanks(world_rank=0, dp_rank=0),
         )
@@ -2866,9 +2842,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(
-            ServerArgs(
-                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
-            ),
+            ServerArgs(model_path="dummy", tp_size=4, attn_dp_size=4),
             role="scheduler",
             ranks=SpawnRanks(world_rank=0, dp_rank=0),
         )
@@ -3024,6 +2998,81 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
         legal = "def f(s):\n    return s[dp_slot_in(s)]\n"
         self.assertEqual(_sequences_indexed_by_the_attention_rank(legal), [])
         self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
+
+
+class TestEveryParallelReadNamesAParallelField(CustomTestCase):
+    """Every ``get_parallel().<name>`` read in the package names a parallel field.
+
+    ``ParallelContext`` rejects an unknown name only when the read runs, so a
+    renamed or mistyped name on a path whose tests stub the context out ships
+    as an ``AttributeError``.
+    """
+
+    #: Reads of a name no parallel field declares yet, each with its reason.
+    UNDECLARED = {
+        # The KV-shard control plane's enable flag has no declared field;
+        # nothing calls that path yet.
+        ("srt/mem_cache/page_interleave.py", "enable_kv_cache_sharding"),
+    }
+
+    def _reads(self):
+        """Yield ``(path, line, name)`` for each attribute read off the context.
+
+        A read goes through ``get_parallel()`` directly or through a name the
+        file binds to it, as in ``parallel = get_parallel()``.
+        """
+        import ast as _ast
+
+        for path in _PACKAGE.rglob("*.py"):
+            tree = _ast.parse(path.read_text(encoding="utf-8-sig"))
+            relative = path.relative_to(_PACKAGE).as_posix()
+            bound = {
+                target.id
+                for node in _ast.walk(tree)
+                if isinstance(node, _ast.Assign)
+                and isinstance(node.value, _ast.Call)
+                and isinstance(node.value.func, _ast.Name)
+                and node.value.func.id == "get_parallel"
+                for target in node.targets
+                if isinstance(target, _ast.Name)
+            }
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Attribute):
+                    continue
+                value = node.value
+                direct = (
+                    isinstance(value, _ast.Call)
+                    and isinstance(value.func, _ast.Name)
+                    and value.func.id == "get_parallel"
+                )
+                if direct or (isinstance(value, _ast.Name) and value.id in bound):
+                    yield relative, node.lineno, node.attr
+
+    def test_every_read_names_a_declared_field(self):
+        from sglang.srt.runtime_context import ParallelContext, _parallel_fields
+
+        known = set(_parallel_fields()) | set(dir(ParallelContext))
+        reads = list(self._reads())
+        self.assertGreater(
+            len(reads), 100, "found almost no context reads; the census is broken"
+        )
+        offenders = sorted(
+            f"{path}:{line} get_parallel().{name}"
+            for path, line, name in reads
+            if name not in known
+            and not name.startswith("_")
+            and (path, name) not in self.UNDECLARED
+        )
+        self.assertEqual(
+            offenders,
+            [],
+            "these read a name the parallel context does not declare; read the "
+            "field under its current name:\n  " + "\n  ".join(offenders),
+        )
+        stale = self.UNDECLARED - {(path, name) for path, _, name in reads}
+        self.assertEqual(
+            stale, set(), f"these are listed as undeclared but no longer read: {stale}"
+        )
 
 
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
@@ -3187,7 +3236,7 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
     def test_no_method_called_before_the_freeze_reads_what_it_freezes(self):
         methods = self._model_runner()
         frozen = self._frozen_names(methods)
-        self.assertGreater(len(frozen), 5, "found no frozen names; census is broken")
+        self.assertIn("pp_group", frozen, "found no frozen group; census is broken")
         offenders = []
         for lineno, name in self._calls_before_the_freeze(methods):
             fn = methods.get(name)
