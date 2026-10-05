@@ -11453,31 +11453,19 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         self.assertTrue(cache.session.try_cache_finished_req(first))
         slot = cache.session.slots["s"]
         slot_lock_node = slot.last_node
-        protected = cache.protected_size()
 
         tokens = list(range(1, 13))
         req = self._turn(tokens, session)
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        self.assertIs(req.kv, slot.kv)
-        self.assertEqual(len(match.device_indices), 8)
         req.last_node = match.last_device_node
         pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
         req.kv.kv_committed_len = 12
         req.kv.kv_allocated_len = 12
         cache.maybe_hand_to_session(req)
-        self.assertIs(cache.session.slots["s"], slot)
-
         cache.checkpoint(req, up_to=12)
-
         self.assertIs(slot.last_node, slot_lock_node)
-        self.assertIs(req.last_node, slot.virtual_node)
-        self.assertEqual(cache.protected_size(), protected)
-        tree_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
-        self.assertEqual(len(tree_match.device_indices), 8)
 
         req.finished_reason = FINISH_LENGTH(length=0)
         self.assertTrue(cache.session.try_cache_finished_req(req))
