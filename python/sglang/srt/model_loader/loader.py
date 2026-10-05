@@ -1346,12 +1346,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         all_params: Dict[str, torch.nn.Parameter],
         param_name: str,
         scale_info: Union[torch.Tensor, Dict[Any, torch.Tensor], None],
+        *,
+        layer: nn.Module,
     ) -> None:
         if scale_info is None:
             return
-        # Get tp rank and size
-        tp_rank = get_parallel().tp_rank
-        tp_size = get_parallel().tp_size
+        tp_rank = getattr(layer, "tp_rank", 0)
+        tp_size = getattr(layer, "tp_size", 1)
 
         def _get_tp_sharded_scale(full_scale_tensor):
             """Get tp sharded scale from full scale tensor"""
@@ -1543,6 +1544,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     all_params,
                     name,
                     quantized_scales.get(name),
+                    layer=model.get_submodule(name.rpartition(".")[0]),
                 )
             elif new_param.dtype == old_fp8_data.dtype:
                 # Same dtype (LayerNorm, etc.): Direct copy
