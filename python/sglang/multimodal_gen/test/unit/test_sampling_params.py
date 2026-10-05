@@ -383,7 +383,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
-        for quality in ("extra-high", "high"):
+        for quality in ("exact", "lossless", "high", "extra-high"):
             with self.subTest(quality=quality):
                 self.assertEqual(
                     self._parse_cli_kwargs(["--quality", quality])["quality"], quality
