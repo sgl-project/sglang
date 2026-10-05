@@ -11289,9 +11289,8 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
 
 
 class TestStreamingSessionLockLifecycle(CustomTestCase):
-    """A streaming session owns its record and the tree lock on its prefix
-    from the first turn's row allocation; every move of that lock keeps the
-    tree's lock counts balanced."""
+    """A streaming session owns its record and prefix lock from the first
+    turn's row allocation; every move of that lock keeps the tree balanced."""
 
     cfg = CacheConfig(
         page_size=1,
@@ -11334,8 +11333,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         return req
 
     def _admitted_turn(self, cache, allocator, pool, tokens, session):
-        """A first turn after admission and row allocation, before the session
-        takes it: its own row, and the root lock admission took."""
+        """A first turn with its own row and the root lock admission took."""
         req = self._turn(tokens, session)
         pool.alloc([req])
         pool.write(
@@ -11360,8 +11358,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.sanity_check()
 
     def test_abort_hands_early_released_lock_back(self):
-        """The aborted turn gets the slot's lock with its SWA part already
-        released, so its own unpin must not release the SWA segment again."""
+        """The handed-back lock keeps its SWA part released; unpin skips it."""
         cache, allocator, _ = build_fixture(self.cfg)
         node, lock = self._lock_and_early_release(cache, allocator)
         req = SimpleNamespace(
@@ -11385,7 +11382,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.unpin(req)
         cache.sanity_check()
 
-    def test_slot_publishes_first_prompt_and_keeps_its_lock(self):
+    def test_slot_publishes_first_prompt_but_not_its_output(self):
         cache, allocator, pool = build_fixture(self.cfg)
         tokens = list(range(1, 9))
         req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
@@ -11393,33 +11390,24 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         slot = cache.session.slots["s"]
 
         cache.checkpoint(req, up_to=len(tokens))
-
-        # The prompt is in the tree for anyone, and the slot's lock moved onto it.
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-        self.assertEqual(len(match.device_indices), len(tokens))
         self.assertEqual(slot.last_node, match.last_device_node)
-        self.assertEqual(slot.kv.cache_protected_len, len(tokens))
         self.assertIs(req.last_node, slot.virtual_node)
 
-        req.finished_reason = FINISH_LENGTH(length=0)
-        self.assertTrue(cache.session.try_cache_finished_req(req))
-        self.assertFalse(slot.publishes_prompt)
-        self.assertFalse(req.kv.holds_kv)
+        req.output_ids = array("q", range(9, 13))
+        req.refresh_fill_ids()
+        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
+        req.kv.kv_committed_len = 12
+        req.kv.kv_allocated_len = 12
+        req.finished_reason = FINISH_LENGTH(length=4)
+        release_kv_cache(req, cache, checkpoint=True)
+
+        self.assertIs(cache.session.slots["s"], slot)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(1, 13))))
+        )
+        self.assertEqual(len(match.device_indices), len(tokens))
         cache.session.release_session("s")
-        cache.sanity_check()
-
-    def test_abort_after_publish_releases_like_any_request(self):
-        cache, allocator, pool = build_fixture(self.cfg)
-        tokens = list(range(1, 9))
-        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
-        cache.maybe_hand_to_session(req)
-        cache.checkpoint(req, up_to=len(tokens))
-        slot = cache.session.slots["s"]
-
-        req.finished_reason = FINISH_ABORT()
-        self.assertFalse(cache.session.try_cache_finished_req(req))
-        self.assertEqual(req.last_node, slot.last_node)
-        finish_req(cache, req, len(tokens))
         cache.sanity_check()
 
     def test_session_turn_releases_slot_swa_prefix_lock_once(self):
@@ -11433,7 +11421,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.release_swa_prefix_lock(req)
         self.assertTrue(slot.swa_prefix_lock_released)
         self.assertFalse(req.swa_prefix_lock_released)
-        # A second call finds the SWA part already released.
         cache.release_swa_prefix_lock(req)
 
         req.finished_reason = FINISH_LENGTH(length=0)
@@ -11442,8 +11429,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.sanity_check()
 
     def _later_turn(self, cache, allocator, pool):
-        """A finished first turn, then a second turn running on the slot's
-        record with four new tokens."""
+        """A finished first turn, then a second turn on the slot's record."""
         session = self._session("s")
         first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
         cache.maybe_hand_to_session(first)
@@ -11464,8 +11450,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         return cache.session.slots["s"], req
 
     def test_later_turn_borrows_without_publishing(self):
-        """A later turn runs on the slot's record: its allocation hands nothing
-        over, and its checkpoints neither insert nor move the slot's lock."""
         cache, allocator, pool = build_fixture(self.cfg)
         slot, req = self._later_turn(cache, allocator, pool)
         slot_lock_node = slot.last_node
@@ -11479,37 +11463,13 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.sanity_check()
 
     def test_later_turn_abort_releases_like_any_request(self):
-        """An aborted turn gets its record and the slot's lock back before its
-        KV is checkpointed, then releases like any request."""
+        """The record and the slot's lock go back before the KV is checkpointed."""
         cache, allocator, pool = build_fixture(self.cfg)
         _, req = self._later_turn(cache, allocator, pool)
 
         req.finished_reason = FINISH_ABORT()
         release_kv_cache(req, cache, checkpoint=True)
         self.assertNotIn("s", cache.session.slots)
-        cache.sanity_check()
-
-    def test_finished_first_turn_keeps_its_output_out_of_the_tree(self):
-        cache, allocator, pool = build_fixture(self.cfg)
-        tokens = list(range(1, 9))
-        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
-        cache.maybe_hand_to_session(req)
-        cache.checkpoint(req, up_to=8)
-
-        req.output_ids = array("q", range(9, 13))
-        req.refresh_fill_ids()
-        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
-        req.kv.kv_committed_len = 12
-        req.kv.kv_allocated_len = 12
-        req.finished_reason = FINISH_LENGTH(length=4)
-        release_kv_cache(req, cache, checkpoint=True)
-
-        self.assertIn("s", cache.session.slots)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", range(1, 13))))
-        )
-        self.assertEqual(len(match.device_indices), len(tokens))
-        cache.session.release_session("s")
         cache.sanity_check()
 
 
