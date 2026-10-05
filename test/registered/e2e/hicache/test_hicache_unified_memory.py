@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=750, stage="extra-a", runner_config="2-gpu-large")
 
 _COMMON_ARGS = [
     "--trust-remote-code",
@@ -66,6 +66,8 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
 
     model: str = ""
     extra_args: list = []
+    # Passed to the HiCache server only.
+    extra_hicache_args: list = []
 
     @classmethod
     def setUpClass(cls):
@@ -74,7 +76,7 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
         base_args = _COMMON_ARGS + cls.extra_args
         cls.hicache_url = "http://127.0.0.1:8157"
         cls.reference_url = "http://127.0.0.1:8158"
-        hicache_args = ["--enable-hierarchical-cache"]
+        hicache_args = ["--enable-hierarchical-cache"] + cls.extra_hicache_args
         if "--hicache-size" not in base_args:
             hicache_args += ["--hicache-ratio", "4"]
         cls.process_hicache = popen_launch_server(
@@ -176,6 +178,12 @@ class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
         "--mem-fraction-static",
         "0.7",
     ]
+
+
+class TestUnifiedMemoryHiCacheSWASerialized(TestUnifiedMemoryHiCacheSWA):
+    """Per-node load-back binds each SWA row to the Full rows its own node loaded."""
+
+    extra_hicache_args = ["--hicache-serialize-load-back"]
 
 
 class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):

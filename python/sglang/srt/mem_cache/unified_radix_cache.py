@@ -127,6 +127,36 @@ def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) 
     return num_pages
 
 
+def _rebase_anchor_index_parts(
+    comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    *,
+    loaded_full: dict[NodeId, torch.Tensor],
+    last_step: PoolTransfer,
+) -> dict[ComponentType, list[PoolTransfer]]:
+    """Re-point anchor slices from one whole-chain Full load to per-node loads.
+
+    Earlier nodes already hold their device rows; the last node's rows are the
+    whole of the final load.
+    """
+    rows: dict[NodeId, torch.Tensor | slice] = dict(loaded_full)
+    if last_step.nodes_to_load:
+        (last_id,) = last_step.nodes_to_load
+        rows[last_id] = slice(0, len(last_step.host_indices))
+
+    def rebase(xfer: PoolTransfer) -> PoolTransfer:
+        if not xfer.anchor_index_parts:
+            return xfer
+        parts = zip(xfer.nodes_to_load, xfer.anchor_index_parts, strict=True)
+        return replace(
+            xfer,
+            anchor_index_parts=[
+                rows[nid] if isinstance(part, slice) else part for nid, part in parts
+            ],
+        )
+
+    return {ct: [rebase(x) for x in xfers] for ct, xfers in comp_xfers.items()}
+
+
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
@@ -1881,12 +1911,12 @@ class UnifiedRadixCache(BasePrefixCache):
         host_anchor_params: DecLockRefParams,
     ) -> bool:
         """Load root-first, acknowledging each node before the next eviction."""
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         # KV-derived sidecars resolve indices from each step's KV operation.
-        aux_xfers.extend(x for x in sidecar_xfers if x.indices_from_pool != PoolName.KV)
+        aux_sidecars = [x for x in sidecar_xfers if x.indices_from_pool != PoolName.KV]
         # Preserve an aux-only load as a single step.
         steps = self.tree_core.split_full_load_back_spec(kv_xfer) or [kv_xfer]
 
+        loaded_full: dict[NodeId, torch.Tensor] = {}
         loaded_locks: list[tuple[NodeId, DecLockRefParams]] = []
         try:
             for i, step_xfer in enumerate(steps):
@@ -1900,8 +1930,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 step_pools = self._build_sidecar_transfers(
                     CacheTransferPhase.LOAD_BACK, step_xfer, {}
                 )
+                step_comp_xfers = {}
                 if is_last:
-                    step_pools = aux_xfers + step_pools
+                    step_comp_xfers = _rebase_anchor_index_parts(
+                        comp_xfers, loaded_full=loaded_full, last_step=step_xfer
+                    )
+                    aux_xfers = [x for xs in step_comp_xfers.values() for x in xs]
+                    step_pools = aux_xfers + aux_sidecars + step_pools
                 device_indices = self.cache_controller.load(
                     host_indices=step_xfer.host_indices,
                     node_id=step_id,
@@ -1913,12 +1948,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
                 self._apply_cache_actions(
                     self.tree_core.commit_load_back(
-                        step_id,
-                        device_indices,
-                        step_xfer,
-                        comp_xfers if is_last else {},
+                        step_id, device_indices, step_xfer, step_comp_xfers
                     )
                 )
+                if not is_last:
+                    loaded_full[step_id] = device_indices
                 self.ongoing_load_back[step_id] = _OngoingLoadBack(
                     step_id,
                     self.inc_lock_ref(step_id).to_dec_params(),
