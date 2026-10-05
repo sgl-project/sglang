@@ -3948,10 +3948,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # Past the window the request no longer reads its prefill's SWA;
+                    # release that part of the tree lock so SWA LRU can reclaim it.
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
