@@ -59,7 +59,6 @@ def _buffers(**overrides):
 
 
 class TestDeepStackReplaySlotRegistration(CustomTestCase):
-
     def test_slot_registration_follows_the_gates(self):
         cases = [
             (dict(), False),
@@ -79,7 +78,6 @@ class TestDeepStackReplaySlotRegistration(CustomTestCase):
 
 
 class TestPrefillInputBuffersDeepStackField(CustomTestCase):
-
     def test_buffer_allocation_follows_the_gates(self):
         cases = [
             (dict(), False),
@@ -117,7 +115,6 @@ class TestPrefillInputBuffersDeepStackField(CustomTestCase):
 
 
 class TestQwen3VLCapabilityOptIn(CustomTestCase):
-
     def test_only_deepstack_capable_models_opt_in(self):
         from sglang.srt.models.qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
