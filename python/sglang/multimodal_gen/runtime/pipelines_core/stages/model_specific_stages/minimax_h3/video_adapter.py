@@ -23,6 +23,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     canonical_minimax_h3_task,
 )
 
+try:
+    # imported with the adapter so the first output check does not pay for it
+    import av
+except ImportError:  # pragma: no cover
+    av = None
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -358,14 +364,7 @@ class MiniMaxH3VideoModelAdapter:
         return final_media_fields
 
 
-def _probe_minimax_h3_output_fields(
-    path: str,
-    *,
-    expected_frame_count: int | None = None,
-    expected_size: tuple[int, int] | None = None,
-) -> dict[str, str]:
-    """Validate one final MiniMax H3 AV file and derive truthful metadata."""
-
+def _ffprobe_output_media(path: str) -> dict[str, Any]:
     try:
         probe = subprocess.run(
             [
@@ -406,6 +405,62 @@ def _probe_minimax_h3_output_fields(
         ) from exc
     if not isinstance(payload, dict):
         raise RuntimeError("ffprobe returned invalid JSON for MiniMax H3 output")
+    return payload
+
+
+def _pyav_stream_entries(stream: Any) -> dict[str, Any]:
+    entries: dict[str, Any] = {"codec_type": stream.type}
+    context = stream.codec_context
+    if context is not None:
+        entries["codec_name"] = context.codec.canonical_name
+        if stream.type == "video":
+            rate = stream.average_rate
+            entries.update(
+                width=context.width,
+                height=context.height,
+                pix_fmt=context.pix_fmt,
+                avg_frame_rate=(
+                    f"{rate.numerator}/{rate.denominator}" if rate else "0/0"
+                ),
+            )
+        elif stream.type == "audio":
+            entries.update(
+                sample_rate=str(context.sample_rate), channels=context.channels
+            )
+    if stream.frames:
+        entries["nb_frames"] = str(stream.frames)
+    if stream.duration is not None and stream.time_base is not None:
+        entries["duration"] = f"{float(stream.duration * stream.time_base):f}"
+    return entries
+
+
+def _read_output_media(path: str) -> dict[str, Any]:
+    """The ``_ffprobe_output_media`` fields the checks read, parsed in-process by PyAV.
+
+    Starting ffprobe costs ~30 ms on the request's critical path.
+    """
+    if av is None:
+        return _ffprobe_output_media(path)
+    try:
+        with av.open(str(path)) as container:
+            streams = [_pyav_stream_entries(stream) for stream in container.streams]
+            format_entries: dict[str, Any] = {"format_name": container.format.name}
+            if container.duration:
+                format_entries["duration"] = f"{container.duration / av.time_base:f}"
+    except (av.error.FFmpegError, OSError) as exc:
+        raise RuntimeError(f"could not read final MiniMax H3 output: {exc}") from exc
+    return {"streams": streams, "format": format_entries}
+
+
+def _probe_minimax_h3_output_fields(
+    path: str,
+    *,
+    expected_frame_count: int | None = None,
+    expected_size: tuple[int, int] | None = None,
+) -> dict[str, str]:
+    """Validate one final MiniMax H3 AV file and derive truthful metadata."""
+
+    payload = _read_output_media(path)
     streams = payload.get("streams") or []
     if not isinstance(streams, list):
         raise RuntimeError("ffprobe returned invalid stream metadata")

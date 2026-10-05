@@ -55,10 +55,12 @@ impl CacheAwarePolicy {
             if entry.matched_prefix_blocks == 0 || !seen.insert(worker.id.clone()) {
                 continue;
             }
+            let matched_prefix_blocks =
+                cap_matched_prefix_blocks(signal.query_blocks, entry.matched_prefix_blocks);
             let matched_prefix_tokens = estimate_matched_prefix_tokens(
                 input_tokens,
                 signal.query_blocks,
-                entry.matched_prefix_blocks,
+                matched_prefix_blocks,
             );
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
                 continue;
@@ -67,6 +69,7 @@ impl CacheAwarePolicy {
                 worker: Arc::clone(worker),
                 matched_prefix_tokens,
                 uncached_tokens: input_tokens.saturating_sub(matched_prefix_tokens),
+                matched_prefix_blocks,
                 candidate_range_id: ctx.candidate_range_id().to_string(),
                 max_pending_prefill_tokens: None,
             });
@@ -75,7 +78,9 @@ impl CacheAwarePolicy {
         if let Some((selector, request)) = ctx.prefill_cache_bucket() {
             candidates = candidates
                 .into_iter()
-                .filter_map(|candidate| selector.bind_prefill_cache_candidate(candidate, request))
+                .filter_map(|candidate| {
+                    selector.prepare_prefill_cache_candidate(candidate, request)
+                })
                 .collect();
         }
 
@@ -104,6 +109,8 @@ impl CacheAwarePolicy {
             pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
             pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
             pressure_rel_threshold: self.config.pressure_rel_threshold,
+            worker_queue_limit: self.config.worker_queue_limit,
+            saturation_queue_floor: self.config.saturation_queue_floor,
         })
     }
 
@@ -174,6 +181,7 @@ impl Policy for CacheAwarePolicy {
             }
         }
         PowerOfTwoChoicesPolicy::new()
+            .with_load_control(self.config.min_load_choices, self.config.worker_queue_limit)
             .propose(workers, ctx)
             .map(PrefillProposal::Pair)
     }
@@ -187,13 +195,24 @@ impl Policy for CacheAwarePolicy {
     }
 }
 
+/// Caps an indexer-supplied matched-block count at the blocks the query
+/// actually asked about: a query cannot match more blocks than it contains.
+/// Both the token estimate and the diverted-overlap histogram read the capped
+/// value, so the clamp lives here rather than at each use.
+fn cap_matched_prefix_blocks(query_blocks: usize, matched_prefix_blocks: u32) -> u32 {
+    matched_prefix_blocks.min(u32::try_from(query_blocks).unwrap_or(u32::MAX))
+}
+
 fn estimate_matched_prefix_tokens(
     input_tokens: u64,
     query_blocks: usize,
     matched_prefix_blocks: u32,
 ) -> u64 {
+    let matched_prefix_blocks = u64::from(cap_matched_prefix_blocks(
+        query_blocks,
+        matched_prefix_blocks,
+    ));
     let query_blocks = u64::try_from(query_blocks).unwrap_or(u64::MAX).max(1);
-    let matched_prefix_blocks = u64::from(matched_prefix_blocks).min(query_blocks);
     input_tokens.saturating_mul(matched_prefix_blocks) / query_blocks
 }
 
@@ -204,5 +223,14 @@ mod tests {
     #[test]
     fn matched_token_estimate_caps_untrusted_block_count() {
         assert_eq!(estimate_matched_prefix_tokens(80, 8, 99), 80);
+    }
+
+    #[test]
+    fn matched_block_cap_is_shared_by_the_estimate_and_the_candidate() {
+        // One clamp, two readers: the histogram must never see a block count
+        // the token estimate would have thrown away.
+        assert_eq!(cap_matched_prefix_blocks(8, 99), 8);
+        assert_eq!(cap_matched_prefix_blocks(8, 3), 3);
+        assert_eq!(cap_matched_prefix_blocks(0, 3), 0);
     }
 }

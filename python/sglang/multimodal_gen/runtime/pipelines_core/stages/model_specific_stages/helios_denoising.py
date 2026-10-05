@@ -128,7 +128,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             return
         if want:
             if mount_helios_gated_residual(self.transformer):
-                logger.info(
+                logger.debug(
                     "Mounted Helios per-token gated residual for quality=%s", quality
                 )
         else:
