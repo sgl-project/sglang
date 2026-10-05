@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -84,9 +85,11 @@ def _effective_prefix_cache_enabled(
     server_args: ServerArgs,
 ) -> bool:
     options = vla_options(batch)
-    return bool(options.get("enable_prefix_cache", True)) and bool(
-        server_args.pipeline_config.enable_global_prefix_cache
-    )
+    return (
+        not server_args.disable_conditioning_cache
+        and server_args.conditioning_cache_max_size_mb > 0
+        and bool(options.get("enable_prefix_cache", True))
+    ) and bool(server_args.pipeline_config.enable_global_prefix_cache)
 
 
 def _cuda_graph_enabled(batch: Req) -> bool:
@@ -264,6 +267,7 @@ class VLAPrefixEncodingStage(PipelineStage):
                 observation,
                 bucket_prompt=_cuda_graph_enabled(batch),
             )
+            cache_key = f"{conditioning_weights_epoch()}:{cache_key}"
             cached_context = self.prefix_cache.get(cache_key)
         else:
             cache_key = None
