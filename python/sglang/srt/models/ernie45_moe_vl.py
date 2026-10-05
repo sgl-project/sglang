@@ -23,9 +23,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -438,19 +438,12 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         next_sparse = layer_id + 1 < config.num_hidden_layers and _is_moe_layer(
             config, layer_id + 1
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=_is_moe_layer(config, layer_id - 1),
-                next_layer_sparse=sparse,
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
