@@ -386,17 +386,17 @@ class BailingGroupRMSNormGate(RMSNormGated):
             dtype=dtype,
             activation="sigmoid",
         )
+        self.tp_size = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.weight.weight_loader = self.weight_loader
 
-    @staticmethod
     def weight_loader(
+        self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_size = get_parallel().attn_tp_size
-        tp_rank = get_parallel().attn_tp_rank
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // self.tp_size
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
         return
 

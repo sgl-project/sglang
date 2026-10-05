@@ -173,6 +173,7 @@ class MultiHeadRMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_world = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -183,16 +184,13 @@ class MultiHeadRMSNorm(nn.Module):
         self.apply_layernorm_1p = apply_layernorm_1p
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_world = get_parallel().attn_tp_size
-        tp_rank = get_parallel().attn_tp_rank
-
-        shard_size = loaded_weight.shape[0] // tp_world
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // self.tp_world
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].reshape_as(param))
 
     def forward(

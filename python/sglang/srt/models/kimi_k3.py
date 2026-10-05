@@ -1739,7 +1739,7 @@ class KimiK3DeltaAttention(nn.Module):
         def _a_log_weight_loader(
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
-            tp_rank = get_parallel().attn_tp_rank
+            tp_rank = self.attn_tp_rank
             shard_size = param.data.shape[2]  # local_num_heads
             start_idx = tp_rank * shard_size
 
