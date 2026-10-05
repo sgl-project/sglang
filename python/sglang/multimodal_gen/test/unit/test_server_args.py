@@ -2156,6 +2156,49 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         self.assertTrue(args.use_fsdp_inference)
 
+    def test_explicit_multi_gpu_fsdp_keeps_the_dit_out_of_component_offload(self):
+        """Explicit multi-GPU FSDP shards the DiT unless its placement is set explicitly."""
+        for dit_cpu_offload in (None, True):
+            with self.subTest(dit_cpu_offload=dit_cpu_offload):
+                kwargs = {
+                    "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                    "use_fsdp_inference": True,
+                }
+                if dit_cpu_offload is not None:
+                    kwargs["dit_cpu_offload"] = dit_cpu_offload
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(), memory_gb=24, kwargs=kwargs
+                )
+
+                self.assertTrue(args.use_fsdp_inference)
+                self.assertEqual(args.dit_cpu_offload, dit_cpu_offload is True)
+                self.assertEqual(
+                    args.should_use_fsdp_for_component("transformer"),
+                    dit_cpu_offload is None,
+                )
+
+    def test_explicit_fsdp_keeps_the_dit_offload_default_where_it_cannot_shard(self):
+        for kwargs in (
+            {"dp_size": 2},
+            {"transformer_weights_path": "/models/wan-14b-q4.gguf"},
+        ):
+            with self.subTest(**kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=24,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "num_gpus": 2,
+                        "performance_mode": "auto",
+                        "use_fsdp_inference": True,
+                        **kwargs,
+                    },
+                )
+
+                self.assertTrue(args.dit_cpu_offload)
+
     def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),

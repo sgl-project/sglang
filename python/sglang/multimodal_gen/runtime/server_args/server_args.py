@@ -940,6 +940,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.vae_cpu_offload = False
             return
 
+        if (
+            self.use_fsdp_inference
+            and self.num_gpus > 1
+            # with data parallelism the FSDP mesh would span the replicas
+            and self.dp_size == 1
+            and self.dit_cpu_offload is None
+            # a GGUF or pre-quantized override may not support FSDP
+            and self.transformer_weights_path is None
+        ):
+            # FSDP shards only resident components; component offload would bypass it
+            self.dit_cpu_offload = False
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info(
@@ -2536,7 +2548,8 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
-            help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+            help="Keep DiT weights on the CPU and move them onto the GPU whole around each "
+            "use. This takes the DiT out of FSDP, which shards only resident components.",
         )
         parser.add_argument(
             "--direct-gpu-weight-loading",
