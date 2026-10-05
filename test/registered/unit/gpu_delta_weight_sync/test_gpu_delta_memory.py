@@ -57,7 +57,8 @@ class Driver:
 
     def cuMemGetAllocationPropertiesFromHandle(self, properties, handle):
         properties._obj.location.type = 3
-        properties._obj.allocFlags.usage = 2
+        # CUDA may not echo HW_DECOMPRESS; the mapped pointer still must admit it.
+        properties._obj.allocFlags.usage = 0
         return 0
 
     def cuMemAddressReserve(self, address, size, alignment, hint, flags):

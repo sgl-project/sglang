@@ -224,10 +224,10 @@ class SharedHostAllocation:
                 ),
                 "cuMemGetAllocationPropertiesFromHandle",
             )
-            if properties.location.type != 3 or not properties.allocFlags.usage & 2:
-                raise RuntimeError(
-                    "GPU-delta shared allocation is not HOST_NUMA HW_DECOMPRESS"
-                )
+            # Drivers may omit the requested usage flags from this query. The
+            # mapped-pointer capability check below admits actual HW-DE support.
+            if properties.location.type != 3:
+                raise RuntimeError("GPU-delta shared allocation is not HOST_NUMA")
             _check(
                 self.driver.cuMemAddressReserve(
                     ctypes.byref(self.address), self.capacity, 0, 0, 0
