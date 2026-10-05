@@ -14,8 +14,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from transformers import AttentionInterface
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    AttentionMaskInterface,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
@@ -76,23 +81,6 @@ def _mimo_local_attention_forward(
         position_bias=position_bias,
         **kwargs,
     )
-
-
-def _register_mimo_local_attention(config, group_size):
-    if not (is_sm90_supported() and config.head_dim == 16 and 0 < group_size <= 4):
-        return "sdpa"
-
-    from transformers import AttentionInterface
-    from transformers.masking_utils import (
-        ALL_MASK_ATTENTION_FUNCTIONS,
-        AttentionMaskInterface,
-    )
-
-    name = "sglang_mimo_local"
-    AttentionInterface.register(name, _mimo_local_attention_forward)
-    # Keep the same mask preparation as the previous SDPA implementation.
-    AttentionMaskInterface.register(name, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"])
-    return name
 
 
 def _compute_default_rope_parameters(
@@ -1292,9 +1280,19 @@ class AudioEncoderMixin:
             partial_rotary_factor=config.partial_rotary_factor,
         )
         input_local_config.head_dim = config.input_local_head_dim
-        input_local_config._attn_implementation = _register_mimo_local_attention(
-            input_local_config, self.audio_group_size
-        )
+        input_local_config._attn_implementation = "sdpa"
+        if (
+            is_sm90_supported()
+            and input_local_config.head_dim == 16
+            and 0 < self.audio_group_size <= 4
+        ):
+            attention_name = "sglang_mimo_local"
+            AttentionInterface.register(attention_name, _mimo_local_attention_forward)
+            # Reuse SDPA's mask preparation for the custom attention implementation.
+            AttentionMaskInterface.register(
+                attention_name, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+            )
+            input_local_config._attn_implementation = attention_name
         self.input_local_transformer = Qwen2Model(input_local_config)
         if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()

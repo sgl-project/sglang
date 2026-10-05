@@ -6,78 +6,88 @@ import triton.language as tl
 
 
 @triton.jit
-def _mimo_local_attention(
+def _mimo_local_attention_kernel(
     Q,
     K,
     V,
     O,
-    COUNT,
-    HEADS: tl.constexpr,
-    TOKENS: tl.constexpr,
-    QB: tl.constexpr,
-    QH: tl.constexpr,
-    QT: tl.constexpr,
-    KB: tl.constexpr,
-    KH: tl.constexpr,
-    KT: tl.constexpr,
-    VB: tl.constexpr,
-    VH: tl.constexpr,
-    VT: tl.constexpr,
+    num_batch_heads,
+    NUM_HEADS: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    stride_qb: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qt: tl.constexpr,
+    stride_kb: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kt: tl.constexpr,
+    stride_vb: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vt: tl.constexpr,
     SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
     bh = tl.program_id(0).to(tl.int64) * 4 + tl.arange(0, 4)
-    batch, head = bh // HEADS, bh % HEADS
+    batch, head = bh // NUM_HEADS, bh % NUM_HEADS
     token, dim = tl.arange(0, 4), tl.arange(0, 16)
-    valid = (bh[:, None, None] < COUNT) & (token[None, :, None] < TOKENS)
+    valid = (bh[:, None, None] < num_batch_heads) & (token[None, :, None] < NUM_TOKENS)
     q = tl.load(
         Q
-        + batch[:, None, None] * QB
-        + head[:, None, None] * QH
-        + token[None, :, None] * QT
+        + batch[:, None, None] * stride_qb
+        + head[:, None, None] * stride_qh
+        + token[None, :, None] * stride_qt
         + dim[None, None, :],
         valid,
         other=0,
     ).to(tl.float32)
     k = tl.load(
         K
-        + batch[:, None, None] * KB
-        + head[:, None, None] * KH
-        + token[None, :, None] * KT
+        + batch[:, None, None] * stride_kb
+        + head[:, None, None] * stride_kh
+        + token[None, :, None] * stride_kt
         + dim[None, None, :],
         valid,
         other=0,
     ).to(tl.float32)
     v = tl.load(
         V
-        + batch[:, None, None] * VB
-        + head[:, None, None] * VH
-        + token[None, :, None] * VT
+        + batch[:, None, None] * stride_vb
+        + head[:, None, None] * stride_vh
+        + token[None, :, None] * stride_vt
         + dim[None, None, :],
         valid,
         other=0,
     ).to(tl.float32)
     scores = tl.sum(q[:, :, None, :] * k[:, None, :, :], axis=3) * SCALE
-    allowed = token[None, None, :] < TOKENS
+    allowed = token[None, None, :] < NUM_TOKENS
     if CAUSAL:
         allowed = allowed & (token[None, None, :] <= token[None, :, None])
     scores = tl.where(allowed, scores, -float("inf"))
-    probabilities = tl.exp(scores - tl.max(scores, axis=2)[:, :, None])
-    denominator = tl.sum(probabilities, axis=2)
+    weights = tl.exp(scores - tl.max(scores, axis=2)[:, :, None])
+    denominator = tl.sum(weights, axis=2)
     # Match the tested cuDNN path: round the unnormalized exponential weights,
     # then normalize the weighted sum. Rounding normalized weights differs.
-    probabilities = probabilities.to(Q.dtype.element_ty).to(tl.float32)
-    result = tl.sum(probabilities[:, :, :, None] * v[:, None, :, :], axis=2)
+    weights = weights.to(Q.dtype.element_ty).to(tl.float32)
+    result = tl.sum(weights[:, :, :, None] * v[:, None, :, :], axis=2)
     result /= denominator[:, :, None]
     offsets = (
-        (batch[:, None, None] * TOKENS + token[None, :, None]) * HEADS
+        (batch[:, None, None] * NUM_TOKENS + token[None, :, None]) * NUM_HEADS
         + head[:, None, None]
     ) * 16 + dim[None, None, :]
     tl.store(O + offsets, result, valid)
 
 
-def mimo_local_attention(q, k, v, scale=0.25, is_causal=False):
-    """Return contiguous [batch, token, head, dim] attention without a mask."""
+def mimo_local_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float = 0.25,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    """Attend within audio groups of 1–4 tokens with head dimension 16.
+
+    Q/K/V have shape [batch, head, token, dim]; output is contiguous
+    [batch, token, head, dim]. Only the optional causal mask is supported.
+    """
     assert q.is_cuda and q.device == k.device == v.device
     assert q.dtype == k.dtype == v.dtype and q.dtype in (torch.bfloat16, torch.float16)
     assert q.shape == k.shape == v.shape and q.ndim == 4
@@ -86,7 +96,7 @@ def mimo_local_attention(q, k, v, scale=0.25, is_causal=False):
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
     out = torch.empty((batch, tokens, heads, dim), device=q.device, dtype=q.dtype)
     if batch * heads:
-        _mimo_local_attention[(triton.cdiv(batch * heads, 4),)](
+        _mimo_local_attention_kernel[(triton.cdiv(batch * heads, 4),)](
             q,
             k,
             v,
