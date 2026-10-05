@@ -9,13 +9,13 @@ use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::config::{AffinityConfig, AffinityMode};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource, PrefixMemo};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, KvWorkerId,
+    RadixTreePrefixProvider,
 };
 use sgl_router::state::load_monitor::engine_reported_load::{
     EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,

@@ -6,12 +6,13 @@ use crate::config::Config;
 use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
+use crate::state::kv_events::{
+    BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;

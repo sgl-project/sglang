@@ -7,7 +7,7 @@ use anyhow::{bail, ensure, Result};
 
 use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, SessionAffinityMode};
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
+use crate::state::kv_events::RadixTreePrefixProvider;
 use crate::state::{
     kv_events::KvEventIndex, load_monitor::router_inflight_load::JanitorHandle, AffinityStore,
 };
