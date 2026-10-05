@@ -119,7 +119,8 @@ jobs:
   rerun-test-cuda:
     name: rerun-test-cuda (partition ${{ matrix.partition }})
     needs: prepare-partitions
-    if: inputs.mode == 'cuda'
+    # Temporarily reject reruns targeting the unavailable GB300 runner.
+    if: inputs.mode == 'cuda' && inputs.runs_on != '4-gpu-gb300'
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}

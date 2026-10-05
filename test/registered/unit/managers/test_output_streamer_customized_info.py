@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     msgpack_decode,
@@ -494,7 +498,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                     support = torch.randn(len(support_reqs), width, generator=generator)
                     output = LogitsProcessorOutput(
                         next_token_logits=None,
-                        sampling_mask_output=SimpleNamespace(
+                        sampling_mask_output=SamplingMaskOutput(
                             token_ids=token_ids,
                             lengths=lengths,
                             selected_logprobs=selected,
