@@ -152,11 +152,11 @@ class Serving(msgspec.Struct):
     # -------------------------------------------------------------------------
     api_key: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        "Set API key of the server. It is also used in the OpenAI API compatible server. Falls back to SGLANG_API_KEY when omitted.",
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key. Falls back to SGLANG_ADMIN_API_KEY when omitted.",
     ] = None
     served_model_name: A[
         Optional[str],
