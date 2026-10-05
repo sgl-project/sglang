@@ -42,8 +42,6 @@
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
-#include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
-
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -531,10 +529,21 @@ __device__ __forceinline__ uint32_t cvt_fp4_word(uint32_t p0, uint32_t p1, uint3
   pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, as_bf16x2(p3), dq, 3);
   return pk;
 #else
+  // gfx942 has no packed fp4 convert. Round onto the e2m1 grid here so this
+  // kernel does not include the DeepSeek-V4 fp4 header.
+  auto e2m1 = [](float x) -> uint32_t {
+    constexpr float kMax = 6.0f;
+    const float mag = fminf(fabsf(x), kMax);
+    const float step = mag < 2.0f ? 0.5f : (mag < 4.0f ? 1.0f : 2.0f);
+    const float q = rintf(mag / step) * step;
+    const uint32_t idx = q < 2.0f ? static_cast<uint32_t>(q * 2.0f)
+                                  : (q < 4.0f ? static_cast<uint32_t>(q) + 2u : static_cast<uint32_t>(q * 0.5f) + 4u);
+    return idx | (__float_as_uint(x) >> 31 << 3);
+  };
   auto nib = [&](uint32_t pair) {
     const float a = __uint_as_float((pair & 0xffffu) << 16) * __builtin_amdgcn_rcpf(dq);
     const float b = __uint_as_float(pair & 0xffff0000u) * __builtin_amdgcn_rcpf(dq);
-    return static_cast<uint8_t>(deepseek_v4::fp4::e2m1x2_code(fp32x2_t{a, b}));
+    return static_cast<uint8_t>(e2m1(a) | (e2m1(b) << 4));
   };
   return static_cast<uint32_t>(nib(p0)) | (static_cast<uint32_t>(nib(p1)) << 8) |
          (static_cast<uint32_t>(nib(p2)) << 16) | (static_cast<uint32_t>(nib(p3)) << 24);

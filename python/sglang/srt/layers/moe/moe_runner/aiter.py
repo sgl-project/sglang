@@ -224,6 +224,10 @@ class AiterRunnerCore(MoeRunnerCore):
             hidden_states = fp4_u8.view(dtypes.fp4x2)
             a1_scale = scale_u8.view(dtypes.fp8_e8m0)
             use_hip_prequant = True
+            # fused_moe uses hidden_states.dtype as the output dtype when dtype
+            # is omitted. This row is fp4x2; the MoE result is bf16.
+            if runner_input.output_dtype is None:
+                runner_input.output_dtype = torch.bfloat16
 
         is_gfx95 = is_gfx95_supported()
         extra: dict = {}
