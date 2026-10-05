@@ -161,6 +161,7 @@ def inplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w2_block_shape: Optional[List[int]] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -195,6 +196,7 @@ def inplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w2_block_shape=w2_block_shape,
     )
 
 
@@ -231,6 +233,7 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w2_block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -265,6 +268,7 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w2_block_shape=w2_block_shape,
     )
 
 
@@ -290,6 +294,7 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w2_block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -329,6 +334,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            w2_block_shape=w2_block_shape,
         )
         return hidden_states
     else:
@@ -364,6 +370,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            w2_block_shape=w2_block_shape,
         )
 
 
@@ -417,6 +424,7 @@ def _prepare_fused_moe_run(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
+    w2_block_shape: Optional[List[int]] = None,
 ):
     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
 
@@ -460,6 +468,13 @@ def _prepare_fused_moe_run(
         logger.warning_once(
             "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "
             "This requires a config produced by the updated tuning script. "
+        )
+    if w2_block_shape is not None:
+        # The kernel applies one scale per K tile, so the down GEMM's tile must
+        # not span w2's finer K blocks.
+        down_config = dict(down_config or config)
+        down_config["BLOCK_SIZE_K"] = min(
+            down_config["BLOCK_SIZE_K"], w2_block_shape[1]
         )
     down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
     down_moe_use_tma = _moe_support_tma() and down_tma_requested
@@ -525,6 +540,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w2_block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -875,7 +891,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
+        block_shape=w2_block_shape or block_shape,
         a_use_tma=down_moe_use_tma,
         b_use_tma=down_moe_use_tma,
         filter_expert=filter_expert,
@@ -1012,6 +1028,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w2_block_shape: Optional[List[int]] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1049,6 +1066,7 @@ def fused_experts_impl(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        w2_block_shape=w2_block_shape,
     )
 
     return _fused_moe_kernel_sequence(
@@ -1092,6 +1110,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w2_block_shape=w2_block_shape,
     )
 
 

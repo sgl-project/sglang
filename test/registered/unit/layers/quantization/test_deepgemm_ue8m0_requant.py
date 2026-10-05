@@ -208,6 +208,8 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         method.is_fp4_expert = False
         method.dequant_fp4_to_fp8 = False
         method.quant_config = unittest.mock.Mock(weight_block_size=BLOCK_SIZE)
+        method.weight_block_size = BLOCK_SIZE
+        method.w2_weight_block_size = None
 
         layer = torch.nn.Module()
         layer.w13_weight, layer.w13_weight_scale_inv = _make_params()
