@@ -254,6 +254,17 @@ In PD mode, decode is ranked by load only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
 
+### Retries
+
+`--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
+a request that fails before any response reaches the client be sent again to a
+worker it has not tried yet. A failure is a transport error, an open circuit
+breaker, a 5xx, or a 429. Once a streaming response's 2xx status has been sent,
+it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
+side is excluded and a new pair gets a new bootstrap room. When every eligible
+worker has failed, the client gets the last failure. `sgl_router_retries_total`
+counts the retried attempts.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
