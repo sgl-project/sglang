@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import zmq
 
@@ -1037,6 +1037,7 @@ class TestOffloadDefaults(unittest.TestCase):
         *,
         memory_gb=80,
         available_memory_gb=None,
+        dit_parameter_count=None,
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1048,6 +1049,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.auto_tune.dit_parameter_count",
+                (
+                    dit_parameter_count
+                    if isinstance(dit_parameter_count, Mock)
+                    else Mock(return_value=dit_parameter_count)
+                ),
+            ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
@@ -2122,6 +2131,108 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.dit_cpu_offload)
+
+    def test_auto_wan2_1_14b_streams_a_dit_that_overflows_the_card(self):
+        """With no placement flags, a Wan2.1 14B DiT OOMed on 24 GB cards."""
+        i2v_path = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+        for pipeline_config, model_path, kwargs in (
+            (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers", {}),
+            (WanI2V480PConfig(), i2v_path, {}),
+            (
+                WanI2V480PConfig(),
+                i2v_path,
+                {"num_gpus": 8, "enable_cfg_parallel": True, "ulysses_degree": 4},
+            ),
+        ):
+            with self.subTest(model_path=model_path, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=24,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": model_path,
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
+        # 16B parameters fit a 48 GB card in BF16 but not in FP32
+        for pipeline_config, kwargs in (
+            (WanI2V480PConfig(dit_precision="fp32"), {}),
+            (WanI2V480PConfig(), {"component_precisions": {"dit": "fp32"}}),
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=48,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_a_dit_whose_config_has_no_precision_field(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=24,
+            dit_parameter_count=16_000_000_000,
+            kwargs={
+                "model_path": "/models/SANA-WM-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_does_not_size_a_dit_it_cannot_or_need_not_size(self):
+        for pipeline_config, memory_gb, model_path in (
+            # above the model's keep-resident threshold
+            (WanI2V480PConfig(), 80, "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
+            # an overlay's source repo
+            (SanaWMPipelineConfig(), 24, "Efficient-Large-Model/SANA-WM_bidirectional"),
+        ):
+            with self.subTest(model_path=model_path):
+                sizer = Mock(return_value=40_000_000_000)
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=memory_gb,
+                    dit_parameter_count=sizer,
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+
+                sizer.assert_not_called()
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
+
+    def test_auto_keeps_the_dit_placement_when_streaming_is_not_needed(self):
+        for memory_gb, params, kwargs in (
+            (24, 1_400_000_000, {}),
+            (48, 16_000_000_000, {}),
+            (24, None, {}),
+            (24, 16_000_000_000, {"num_gpus": 2, "tp_size": 2}),
+            (24, 16_000_000_000, {"quantization": "fp8"}),
+            (24, 16_000_000_000, {"component_quantizations": {"transformer": "fp8"}}),
+        ):
+            with self.subTest(memory_gb=memory_gb, params=params, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=memory_gb,
+                    dit_parameter_count=params,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
