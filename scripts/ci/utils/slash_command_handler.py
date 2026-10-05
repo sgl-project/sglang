@@ -1589,11 +1589,6 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
-    # Echo the originating command so each reply is self-identifying when
-    # several /rerun-test commands are in flight at once. Backtick-wrapping
-    # also keeps any `*` in the pattern from rendering as italics.
-    if command_label:
-        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
