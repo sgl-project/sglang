@@ -699,3 +699,29 @@ def pack_dcp_verify_rows(
     mask = idx < length
     vals = tl.load(table_ptr + row * stride_row + idx, mask=mask, other=0)
     tl.store(out_ptr + dest + idx, vals, mask=mask)
+
+
+@triton.jit
+def repeat_prefix_kv_indices(
+    kv_indices_ptr,
+    kv_indptr_ptr,
+    row_indptr_ptr,
+    out_ptr,
+    Q_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Copy one request's prefix indices onto each of its q_len verify rows.
+
+    ``kv_indptr`` is per request. Row ``r`` belongs to request ``r // Q_LEN``
+    and is written to ``out[row_indptr[r] : row_indptr[r] + prefix_len]``.
+    """
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    req = row // Q_LEN
+    src = tl.load(kv_indptr_ptr + req)
+    length = tl.load(kv_indptr_ptr + req + 1) - src
+    dest = tl.load(row_indptr_ptr + row)
+    idx = block * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < length
+    vals = tl.load(kv_indices_ptr + src + idx, mask=mask, other=0)
+    tl.store(out_ptr + dest + idx, vals, mask=mask)

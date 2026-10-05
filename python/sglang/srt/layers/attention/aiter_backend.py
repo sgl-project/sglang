@@ -74,6 +74,7 @@ except ImportError:
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_mla_kv_page_table_for_dcp,
     pack_dcp_verify_rows,
+    repeat_prefix_kv_indices,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
@@ -211,6 +212,9 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 
 _DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
+# DCP=1 decode stays on gluon, so max_split_per_batch is unset. The verify
+# prefix still needs a persistent split budget.
+_DCP1_VERIFY_ASM_KV_SPLITS = 32
 
 
 # AITER's gfx950 FP8 FMHA ASM kernels only cover these GQA ratios. Other
@@ -665,6 +669,7 @@ class AiterAttnBackend(AttentionBackend):
         *,
         metadata_fast_mode: Optional[bool] = None,
         metadata_intra_batch_mode: Optional[bool] = None,
+        num_kv_splits: Optional[int] = None,
     ):
         # Under DCP this is the gathered head count (num_head * dcp_world_size);
         # equals num_head_padded when DCP is off.
@@ -703,7 +708,9 @@ class AiterAttnBackend(AttentionBackend):
             dtype,
             is_sparse=False,
             fast_mode=metadata_fast_mode,
-            num_kv_splits=self.max_split_per_batch,
+            num_kv_splits=(
+                self.max_split_per_batch if num_kv_splits is None else num_kv_splits
+            ),
             intra_batch_mode=metadata_intra_batch_mode,
         )
 
@@ -1389,6 +1396,21 @@ class AiterAttnBackend(AttentionBackend):
         w = max(self.dcp_world_size, 1)
         return (self.max_context_len + w - 1) // w
 
+    def _use_dcp1_verify_asm_prefix(self) -> bool:
+        """Split a DCP=1 target verify into a q_len=1 ASM prefix plus a gluon window.
+
+        The DCP>1 path already does this. At DCP=1 the whole verify stays on
+        mla_gluon with q_len=num_draft_tokens, and that cost climbs with the
+        number of running requests. ASM cannot take q_len above 4 for this
+        head pad, so only the committed prefix is repacked as q_len=1 rows.
+        """
+        return (
+            self.use_mla
+            and self.dcp_world_size <= 1
+            and self.mla_dcp_decode_backend == "asm"
+            and bool(self.num_draft_tokens)
+        )
+
     def _forward_decode_dcp(self, q, k_buffer, layer, k_descale):
         """Attend this rank's KV shard for decode -> (out, natural-log lse)."""
         fm = self.forward_metadata
@@ -1463,15 +1485,29 @@ class AiterAttnBackend(AttentionBackend):
             )
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         q_mla = q.view(n_rows, num_heads, layer.qk_head_dim)
+        # DCP gathers heads (12*8=96). DCP=1 stays at 12, and mla_decode_fwd
+        # only has the qh16 instantiation, so zero-pad the same way prefill does.
+        kernel_heads = num_heads
+        if (
+            self.dcp_world_size <= 1
+            and getattr(self, "head_pad_mode", "none") == "zero"
+        ):
+            kernel_heads = self.num_head_padded
+            q_pad = q_mla.new_zeros((n_rows, kernel_heads, layer.qk_head_dim))
+            q_pad[:, :num_heads, :] = q_mla
+            q_mla = q_pad
         q_scale = k_descale
         if q_mla.dtype != fp8_dtype:
             q_mla, q_scale = scaled_fp8_quant(q_mla.reshape(n_rows, -1))
-            q_mla = q_mla.view(n_rows, num_heads, layer.qk_head_dim)
+            q_mla = q_mla.view(n_rows, kernel_heads, layer.qk_head_dim)
         out = torch.empty(
-            (n_rows, num_heads, layer.v_head_dim),
+            (n_rows, kernel_heads, layer.v_head_dim),
             dtype=self.input_dtype,
             device=q.device,
         )
+        num_kv_splits = self.max_split_per_batch
+        if num_kv_splits is None:
+            num_kv_splits = _DCP1_VERIFY_ASM_KV_SPLITS
         _, lse = mla_decode_fwd(
             q_mla,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -1483,7 +1519,7 @@ class AiterAttnBackend(AttentionBackend):
             1,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
-            num_kv_splits=self.max_split_per_batch,
+            num_kv_splits=num_kv_splits,
             work_meta_data=self._verify_asm_work_metadata,
             work_indptr=self._verify_asm_work_indptr,
             work_info_set=self._verify_asm_work_info_set,
@@ -1497,7 +1533,8 @@ class AiterAttnBackend(AttentionBackend):
         )
         if lse is None:
             raise RuntimeError("aiter mla_decode_fwd(return_lse=True) returned no LSE")
-        return out, lse.view(n_rows, num_heads)
+        out = out[:, :num_heads, :]
+        return out, lse.view(n_rows, kernel_heads)[:, :num_heads]
 
     def _plan_dcp_verify_asm_prefix(self, local_kv_lens, token_table, *, graph: bool):
         """Flatten the repeated prefix table into q_len=1 MLA-ASM metadata."""
@@ -1575,6 +1612,101 @@ class AiterAttnBackend(AttentionBackend):
         self._verify_asm_reduce_final_map = reduce_final_map
         self._verify_asm_reduce_partial_map = reduce_partial_map
 
+    def _plan_dcp1_verify_asm_prefix(
+        self,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        bs: int,
+        q_len: int,
+        *,
+        graph: bool,
+        max_prefix: int,
+    ) -> torch.Tensor:
+        """Repeat each request's committed prefix onto its q_len verify rows.
+
+        No DCP shard table: at world size 1 the prefix indices are already the
+        token ids. Duplicating them keeps kv_indptr monotonic for mla_decode_fwd.
+        """
+        n_rows = bs * q_len
+        prefix_lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+        if graph:
+            row_lens = self.verify_asm_row_lens[:n_rows]
+            qo = self.verify_asm_qo_indptr[: n_rows + 1]
+            row_indptr = self.verify_asm_kv_indptr[: n_rows + 1]
+            kv_out = self.verify_asm_kv_indices
+            kv_last = self.verify_asm_kv_last_page_len[:n_rows]
+            work_metadata = self.verify_asm_work_metadata
+            work_indptr = self.verify_asm_work_indptr
+            work_info_set = self.verify_asm_work_info_set
+            reduce_indptr = self.verify_asm_reduce_indptr
+            reduce_final_map = self.verify_asm_reduce_final_map
+            reduce_partial_map = self.verify_asm_reduce_partial_map
+        else:
+            device = kv_indptr.device
+            row_lens = torch.empty(n_rows, dtype=torch.int32, device=device)
+            qo = torch.arange(n_rows + 1, dtype=torch.int32, device=device)
+            row_indptr = torch.zeros(n_rows + 1, dtype=torch.int32, device=device)
+            kv_out = torch.empty(
+                max(n_rows * max(max_prefix, 1), 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            kv_last = torch.ones(n_rows, dtype=torch.int32, device=device)
+            (
+                work_metadata,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(
+                1,
+                max(n_rows, 1),
+                metadata_fast_mode=True,
+                metadata_intra_batch_mode=False,
+                num_kv_splits=_DCP1_VERIFY_ASM_KV_SPLITS,
+            )
+        if n_rows:
+            row_lens.view(bs, q_len).copy_(prefix_lens.view(bs, 1).expand(bs, q_len))
+        row_indptr.zero_()
+        if n_rows:
+            torch.cumsum(row_lens, dim=0, out=row_indptr[1:])
+        if n_rows and max_prefix > 0:
+            repeat_prefix_kv_indices[(n_rows, triton.cdiv(max_prefix, 128))](
+                kv_indices,
+                kv_indptr,
+                row_indptr,
+                kv_out,
+                Q_LEN=q_len,
+                BLOCK=128,
+            )
+        self.make_mla_meta_data(
+            qo,
+            row_indptr,
+            kv_last,
+            work_metadata,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            1,
+            fast_mode=True,
+            max_split_per_batch=_DCP1_VERIFY_ASM_KV_SPLITS,
+            intra_batch_mode=False,
+        )
+        self._verify_asm_qo = qo
+        self._verify_asm_kv_indptr = row_indptr
+        self._verify_asm_kv_indices = kv_out
+        self._verify_asm_kv_last = kv_last
+        self._verify_asm_work_metadata = work_metadata
+        self._verify_asm_work_indptr = work_indptr
+        self._verify_asm_work_info_set = work_info_set
+        self._verify_asm_reduce_indptr = reduce_indptr
+        self._verify_asm_reduce_final_map = reduce_final_map
+        self._verify_asm_reduce_partial_map = reduce_partial_map
+        return row_lens
+
     def _forward_verify_dcp(self, q, k_window, layer, k_descale):
         """Attend the committed prefix and the verify window separately, then
         merge -> (out, natural-log lse).
@@ -1589,9 +1721,9 @@ class AiterAttnBackend(AttentionBackend):
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
 
-        if self.use_mla_dcp_asm:
+        if self.use_mla_dcp_asm or self._use_dcp1_verify_asm_prefix():
             # Prefix rows are independent q_len=1 decodes. The window below
-            # still needs the global-position mask, which this kernel cannot do.
+            # still needs a causal mask, which q_len=1 ASM does not apply.
             out_a, lse_a = self._forward_verify_asm_prefix(
                 q, layer, k_descale, n_rows, num_heads
             )
@@ -1630,7 +1762,14 @@ class AiterAttnBackend(AttentionBackend):
             qlen=q_len,
             return_lse=True,
         )
-        return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
+        merged, merged_lse = merge_state_triton(
+            out_a, lse_a, out_b, lse_b.view(n_rows, num_heads)
+        )
+        # DCP>1 unpacks (out, lse) for the cross-rank reduce. DCP=1 goes
+        # through attn_mqa, which expects the merged tensor alone.
+        if self.dcp_world_size <= 1:
+            return merged
+        return merged, merged_lse
 
     def mla_fp8_prefill_attn(
         self,
@@ -2032,7 +2171,7 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                if self.dcp_world_size > 1:
+                if self.dcp_world_size > 1 or self._use_dcp1_verify_asm_prefix():
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
                 else:
@@ -2085,6 +2224,19 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     self._plan_dcp_verify_asm_prefix(
                         local_kv_lens, verify_token_table, graph=False
+                    )
+                elif self._use_dcp1_verify_asm_prefix():
+                    if forward_batch.seq_lens_cpu is not None:
+                        max_prefix = int(forward_batch.seq_lens_cpu[:bs].max().item())
+                    else:
+                        max_prefix = int(kv_lens.max().item()) if bs else 0
+                    local_kv_lens = self._plan_dcp1_verify_asm_prefix(
+                        kv_indptr,
+                        kv_indices,
+                        bs,
+                        draft_num,
+                        graph=False,
+                        max_prefix=max_prefix,
                     )
 
                 if _use_mla_ps_kernel and self.dcp_world_size <= 1:
@@ -2625,6 +2777,44 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_final_map = None
             self.reduce_partial_map = None
 
+        if self._use_dcp1_verify_asm_prefix():
+            n_verify_rows = max_bs * self.num_draft_tokens
+            self.verify_asm_qo_indptr = torch.arange(
+                n_verify_rows + 1, dtype=torch.int32, device=self.device
+            )
+            self.verify_asm_kv_indptr = torch.zeros(
+                n_verify_rows + 1, dtype=torch.int32, device=self.device
+            )
+            self.verify_asm_row_lens = torch.empty(
+                n_verify_rows, dtype=torch.int32, device=self.device
+            )
+            self.verify_asm_kv_indices = torch.empty(
+                n_verify_rows * self.max_context_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.verify_asm_kv_last_page_len = torch.ones(
+                n_verify_rows, dtype=torch.int32, device=self.device
+            )
+            (
+                self.verify_asm_work_metadata,
+                self.verify_asm_work_indptr,
+                self.verify_asm_work_info_set,
+                self.verify_asm_reduce_indptr,
+                self.verify_asm_reduce_final_map,
+                self.verify_asm_reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(
+                1,
+                n_verify_rows,
+                metadata_fast_mode=True,
+                metadata_intra_batch_mode=False,
+                num_kv_splits=_DCP1_VERIFY_ASM_KV_SPLITS,
+            )
+            logger.info(
+                "DCP=1 verify prefix uses MLA ASM as q_len=1 rows (max %s)",
+                n_verify_rows,
+            )
+
         if self.use_sliding_window_kv_pool:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -2841,7 +3031,7 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 kv_lens = (
                     seq_lens
-                    if self.dcp_world_size > 1
+                    if self.dcp_world_size > 1 or self._use_dcp1_verify_asm_prefix()
                     else seq_lens + self.num_draft_tokens
                 )
             else:
@@ -2900,6 +3090,19 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 self._plan_dcp_verify_asm_prefix(
                     local_kv_lens, verify_token_table, graph=True
+                )
+            elif self.use_mla and self._use_dcp1_verify_asm_prefix():
+                if seq_lens_cpu is not None:
+                    max_prefix = int(seq_lens_cpu[:bs].max().item())
+                else:
+                    max_prefix = self.max_context_len
+                local_kv_lens = self._plan_dcp1_verify_asm_prefix(
+                    kv_indptr,
+                    kv_indices,
+                    bs,
+                    self.num_draft_tokens,
+                    graph=True,
+                    max_prefix=max_prefix,
                 )
 
             if self.use_mla:
@@ -3346,9 +3549,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and self.dcp_world_size > 1
+            if forward_batch.forward_mode.is_target_verify() and (
+                self.dcp_world_size > 1 or self._use_dcp1_verify_asm_prefix()
             ):
                 # two-stage dcp verify, dispatched before the dims below: the
                 # model provides the per rank kvcache slices.
