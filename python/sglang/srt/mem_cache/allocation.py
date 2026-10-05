@@ -298,15 +298,8 @@ def ensure_mamba_capacity(
         if not req.kv.holds_mamba:
             needed += 1
 
-        if not req_to_token_pool.enable_mamba_extra_buffer:
-            continue
-        if req.kv.mamba_ping_pong_track_buffer is not None:
-            continue
-
-        if req_to_token_pool.enable_mamba_extra_buffer_lazy:
-            needed += 1
-        else:
-            needed += req_to_token_pool.mamba_ping_pong_track_buffer_size
+        if req.kv.mamba_ping_pong_track_buffer is None:
+            needed += req_to_token_pool.mamba_initial_tracking_slots
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = req_to_token_pool.mamba_allocator
