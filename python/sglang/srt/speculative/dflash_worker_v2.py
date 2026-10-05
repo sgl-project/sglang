@@ -1759,6 +1759,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+        `cache_loc_2d` holds the same ids as `cache_loc`, row-major.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1844,10 +1845,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # The translate returns a fresh tensor (identity on a plain pool), so
+        # the callers' locs stay virtual: the post-verify 2-D buffer is re-read
+        # as virtual ids by the compact req_to_token rebuild.
         translator = self.draft_model_runner.kv_index_translator
         cache_loc = translator.translate_full_attn_ids(cache_loc)
         if cache_loc_2d is not None:
-            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+            # Same ids, so reshape the translated copy rather than translate
+            # them a second time.
+            cache_loc_2d = cache_loc.reshape(cache_loc_2d.shape)
 
         with (
             torch.inference_mode(),
