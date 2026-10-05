@@ -3919,9 +3919,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Auxiliary windows check their own cursors and prefix locks.
             has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
-            release_leaf_lock = (
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
-                and hasattr(self.tree_cache, "dec_swa_lock_only")
+            release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
+                self.tree_cache, "dec_swa_lock_only"
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())

@@ -7,7 +7,7 @@ of alignment slack, so this reproduces the historical trip conditions rather
 than a line that still exists.
 
 Trip conditions (all required):
-  1. Fork-only SWA leaf early-release on (`SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
+  1. Fork-only SWA leaf early-release on (`SGLANG_OPT_RELEASE_PREFILL_SWA=1`)
   2. Multiple requests share a long prefix (so one req's tombstoned leaf
      poisons match_prefix for others walking the same radix path).
   3. Memory pressure forces retract while at least one req has tombstoned
