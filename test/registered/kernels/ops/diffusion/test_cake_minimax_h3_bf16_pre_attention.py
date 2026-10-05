@@ -65,7 +65,7 @@ def make_rope_cache(m, device):
 
 def apply_rope(x, rope_cos_sin):
     rotary = x[..., :ROPE_DIM].float()
-    tail = x[..., ROPE_DIM:]
+    tail = x[..., ROPE_DIM:].to(torch.bfloat16)
     cos = torch.cat((rope_cos_sin[:, :48], rope_cos_sin[:, :48]), -1).float()[:, None]
     sin = torch.cat((rope_cos_sin[:, 48:], rope_cos_sin[:, 48:]), -1).float()[:, None]
     rotated_half = torch.cat((-rotary[..., 48:], rotary[..., :48]), dim=-1)
@@ -106,16 +106,23 @@ def reference(case):
     # [qkv_kind, head, head_dim] (the loader's [q_all | k_all | v_all]).
     grouped = qkv.view(m, KINDS, NUM_HEADS, HEAD_DIM)
     qk_eps = case["eps"] if case["qk_eps"] is None else case["qk_eps"]
-    q = F.rms_norm(grouped[:, 0], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps)
-    k = F.rms_norm(grouped[:, 1], (HEAD_DIM,), case["k_norm_weight"], eps=qk_eps)
+    # The kernel keeps the per-head norm in FP32 through RoPE and rounds once at
+    # the pack; rounding Q/K to BF16 before RoPE would add a second rounding
+    # that the cancellation inside the rotation amplifies.
+    q = F.rms_norm(
+        grouped[:, 0].float(), (HEAD_DIM,), case["q_norm_weight"].float(), eps=qk_eps
+    )
+    k = F.rms_norm(
+        grouped[:, 1].float(), (HEAD_DIM,), case["k_norm_weight"].float(), eps=qk_eps
+    )
     positions = case["rope_positions"]
     rope = (
         case["rope_cos_sin"][:m]
         if positions is None
         else case["rope_cos_sin"][positions]
     )
-    q = apply_rope(q.to(torch.bfloat16), rope)
-    k = apply_rope(k.to(torch.bfloat16), rope)
+    q = apply_rope(q, rope)
+    k = apply_rope(k, rope)
     fused = torch.stack((q, k, grouped[:, 2]), dim=2)
     p = case["ulysses_degree"]
     return (
