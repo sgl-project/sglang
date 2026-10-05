@@ -70,10 +70,12 @@ def _move_tree_lock(src: Any, dst: Any) -> None:
 
 
 class StreamingSession:
-    """Streaming-session KV save/restore, owned by ``UnifiedRadixCache``.
+    """Streaming-session KV records, owned by ``UnifiedRadixCache``.
 
-    The cache calls the ``try_*`` entries first; each runs the session body
-    when it applies and tells the cache whether to run its own path.
+    A session takes its first turn's record and tree lock at row allocation
+    (``take``); every turn then borrows them. The cache calls the ``try_*``
+    entries first; each runs the session body when it applies and tells the
+    cache whether to run its own path.
     """
 
     def __init__(self, cache: UnifiedRadixCache):
@@ -174,25 +176,6 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
-        """The slot whose record the request runs on, if any."""
-        if not _is_streaming(req):
-            return None
-        slot = self.slots.get(req.session.session_id)
-        return slot if slot is not None and slot.kv is req.kv else None
-
-    def take(self, req: Req) -> None:
-        """A streaming turn's first row allocation: the session takes the
-        request's record and the tree lock it took at admission, and the
-        request borrows them from here on."""
-        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
-            return
-        session_id = req.session.session_id
-        assert session_id not in self.slots, f"{session_id=} already has a slot"
-        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
-        self._lock_to_slot(req, slot)
-        self.slots[session_id] = slot
-
     def try_cache_finished_req(self, req: Req) -> bool:
         """Keeps a finished or retracted turn's record in the session slot.
         An aborted turn gets the record and the tree lock back and is released
@@ -246,6 +229,27 @@ class StreamingSession:
         ]
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
+
+    # -- Record ownership --
+
+    def take(self, req: Req) -> None:
+        """A streaming turn's first row allocation: the session takes the
+        request's record and the tree lock it took at admission, and the
+        request borrows them from here on."""
+        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
+            return
+        session_id = req.session.session_id
+        assert session_id not in self.slots, f"{session_id=} already has a slot"
+        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        self._lock_to_slot(req, slot)
+        self.slots[session_id] = slot
+
+    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
+        """The slot whose record the request runs on, if any."""
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        return slot if slot is not None and slot.kv is req.kv else None
 
     def lock_holder(self, req: Req) -> Any:
         """Whoever holds the tree lock on the request's prefix: its slot for a
