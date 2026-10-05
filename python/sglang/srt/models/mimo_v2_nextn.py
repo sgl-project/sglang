@@ -252,7 +252,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
