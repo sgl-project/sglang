@@ -89,6 +89,47 @@ MI35X_MINIMAX_M25_TP4_MODELS = [
             "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
         },
     ),
+    # Long-context variant. Measured on MI355X at ISL 70000 / OSL 300 this is
+    # ~24-44% faster in total token throughput than the config above (the gain
+    # grows with concurrency) and roughly halves median TTFT, at the same
+    # accuracy. Three differences:
+    #   * unified attention OFF - the dominant factor; the unified-attn path
+    #     costs throughput on prefill-bound long-context workloads.
+    #   * no --page-size (defaults to 1). Page 16 is slower here, and page 64
+    #     is slower still.
+    #   * INT4 quick-reduce. The ROCm images already default
+    #     ROCM_QUICK_REDUCE_QUANTIZATION=INT8, so this selects INT4, worth a
+    #     further ~3-5%.
+    ModelConfig(
+        model_path="MiniMaxAI/MiniMax-M2.5",
+        tp_size=4,
+        accuracy_threshold=0.92,
+        timeout=5400,
+        variant="TP4+FP8KV+noUnifiedAttn+quickARINT4",
+        other_args=[
+            "--ep-size",
+            "1",
+            "--dtype",
+            "bfloat16",
+            "--trust-remote-code",
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--disable-radix-cache",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--watchdog-timeout",
+            "1200",
+        ],
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "ROCM_QUICK_REDUCE_QUANTIZATION": "INT4",
+            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": "1",
+        },
+    ),
 ]
 
 
