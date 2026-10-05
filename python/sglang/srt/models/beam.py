@@ -25,7 +25,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.elementwise import BeamAttentionGateOp
-from sglang.kernels.ops.gemm.fp32_router import fp32_router_gemm
+from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
@@ -280,7 +280,9 @@ class BeamMoE(nn.Module):
                 # full BF16 decode step; retain cuBLAS outside this envelope.
                 and hidden_states.shape[0] <= 16
             ):
-                router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
+                router_logits = tiny_gemm_bf16(
+                    hidden_states, self.gate.weight, out_dtype=torch.float32
+                )
             else:
                 router_logits, _ = self.gate(hidden_states.float())
             if self.refresh_correction_bias:

@@ -209,10 +209,10 @@ register_kernel(
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
         capabilities=_CUDA,
         format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="skinny [m, k] @ [n, k].T with m in [1, max_m]; serves MoE routers and gate projections",
+            supported_dtypes=("bfloat16", "float32"),
+            description="BF16 activations, BF16 weights or FP32 weights for N < K; m in [1, max_m]",
         ),
-        description="Tiny bf16 GEMM (sglang.kernels.jit, JIT-only).",
+        description="Tiny BF16-activation GEMM (sglang.kernels.jit, JIT-only).",
     )
 )
 register_kernel(
