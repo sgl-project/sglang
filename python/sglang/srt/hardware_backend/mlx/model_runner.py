@@ -839,7 +839,7 @@ class MlxModelRunner:
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
-    def _sync_decode_kv_to_pool(self, req_id: str) -> None:
+    def _sync_decode_kv_to_pool(self, req_id: str, limit: int | None = None) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool."""
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
             return
@@ -847,6 +847,8 @@ class MlxModelRunner:
         if cache is None:
             return
         current_offset = self._first_attention_cache(cache).offset
+        if limit is not None:
+            current_offset = min(current_offset, limit)
         synced_offset = self._req_synced_offset.get(req_id, 0)
         if current_offset <= synced_offset:
             return
@@ -870,6 +872,29 @@ class MlxModelRunner:
             return
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
+
+    def flush_decode_kv_for_request(
+        self, req_id: str, owned_len: int | None = None
+    ) -> None:
+        """Sync one request's un-flushed decode KV to the shared pool.
+
+        ``owned_len`` caps the flush to the scheduler-owned prefix. Chained
+        decode steps never allocate pool slots, so req_to_token entries past
+        that prefix were never written for this request; syncing them would
+        read stale or recycled row content and scatter KV into slots owned
+        by the tree or by the next request on this row. Once the owned
+        prefix is synced the request is sealed as fully flushed, since the
+        tail is never pool-addressable.
+        """
+        if self.disable_radix_cache:
+            return
+        self._sync_decode_kv_to_pool(req_id, limit=owned_len)
+        if owned_len is not None:
+            cache = self._req_caches.get(req_id)
+            if cache is not None:
+                self._req_synced_offset[req_id] = self._first_attention_cache(
+                    cache
+                ).offset
 
     def decode_batch(self, req_ids: list[str]) -> list[int]:
         """Decode one token per request.

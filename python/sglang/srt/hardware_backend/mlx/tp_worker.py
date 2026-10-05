@@ -168,6 +168,11 @@ class MlxTpModelWorker(TpModelWorker):
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
         if self._mlx_runner.has_request(req.rid):
+            # Flush while req still owns its req_to_token row, capped at the
+            # owned prefix: chained decode allocates no pool slots past the
+            # first step, so the row past owned_kv_len holds stale or recycled
+            # content that must never be read as slot ids.
+            self._mlx_runner.flush_decode_kv_for_request(req.rid, req.owned_kv_len())
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
