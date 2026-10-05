@@ -308,6 +308,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -341,7 +342,8 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        start = get_parallel().attn_tp_rank * param.numel()
+                        projection = self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                        start = projection.tp_rank * param.numel()
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(
