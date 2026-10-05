@@ -524,15 +524,13 @@ class Step3VisionMLP(nn.Module):
         # Since this is a dense model,
         # the MLP component likewise adopts a DP-MLP approach modeled after DP Attention.
         # This choice may not represent the optimal solution and remains open to further deliberation.
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.fc1 = ColumnParallelLinear(
             dim,
             intermediate_size,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
@@ -550,8 +548,7 @@ class Step3VisionMLP(nn.Module):
             dim,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("down_proj", prefix),
         )
 
