@@ -664,6 +664,10 @@ class AFDRoleGraphService:
     def _estimate_hbm_bytes(self, *, shape: AFDShapeIdentity) -> int:
         bytes_per_value = self._bytes_per_value(shape=shape)
         rows = sum(self._own_bucket_rows(shape=shape))
+        if self.role == AFDRole.FFN and shape.attention_lanes % shape.ffn_size:
+            # Every F computes merged rows, including ranks with no ingress.
+            # Budget the new layout conservatively; preserve legacy estimates.
+            rows = sum(sum(vector) for vector in shape.lane_bucket_rows)
         # Entry hidden, entry residual, and every layer's two intermediates live
         # in the graph pool for the whole step rather than being reused per op.
         entry_bytes = rows * shape.hidden_size * bytes_per_value * 2

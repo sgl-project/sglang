@@ -82,7 +82,7 @@ def make_shape(
     if (
         len(lane_rows) != config.attention_lane_count
         or lane < 0
-        or lane >= config.attention_lane_count
+        or lane >= max(config.attention_lane_count, config.lanes)
         or any(len(vector) != config.stages for vector in lane_rows)
         or hidden_size < 1
         or not dtype
@@ -145,7 +145,7 @@ class AFDShapeCache:
         if self._sealed or self._closed:
             raise AFDError("AFD_GRAPH_STARTUP_ALREADY_FINISHED")
         if tuple(
-            sorted(bucket.shape.bucket_rows[0] for bucket in self.buckets)
+            sorted(bucket.shape.lane_bucket_rows[0][0] for bucket in self.buckets)
         ) != self._capture_sizes or any(
             bucket.phase != AFDBucketPhase.INSTALLED for bucket in self.buckets
         ):
@@ -178,7 +178,7 @@ class AFDShapeCache:
         if capture and self._sealed:
             raise AFDError("AFD_GRAPH_RUNTIME_CAPTURE_FORBIDDEN")
         if bucket is None:
-            width = shape.bucket_rows[0]
+            width = shape.lane_bucket_rows[0][0]
             if (
                 width not in self._capture_sizes
                 or any(rows != (width, width) for rows in shape.lane_bucket_rows)
@@ -380,6 +380,7 @@ class AFDShapeCache:
                     "shape": {
                         "stage_rows": bucket.shape.stage_rows,
                         "bucket_rows": bucket.shape.bucket_rows,
+                        "capture_width": bucket.shape.lane_bucket_rows[0][0],
                         "hidden_size": bucket.shape.hidden_size,
                         "dtype": bucket.shape.dtype,
                     },

@@ -167,11 +167,11 @@ def test_stating_the_symmetric_lane_count_changes_nothing(lanes):
             )
 
 
-@pytest.mark.parametrize("attention_lanes", [3, 6, 2, 0, -4, True, 4.0, "8"])
-def test_topology_rejects_a_lane_group_ratio_that_is_not_a_whole_multiple(
+@pytest.mark.parametrize("attention_lanes", [0, -4, True, 4.0, "8"])
+def test_topology_rejects_invalid_attention_counts(
     attention_lanes,
 ):
-    """A partial lane group would strand rows, so it must fail at construction."""
+    """Balanced ingress admits nonintegral ratios, never invalid rank counts."""
 
     with pytest.raises(
         contracts.AFDError, match="AFD_TOPOLOGY_LANE_GROUP_RATIO_INVALID"
@@ -383,7 +383,7 @@ def test_startup_parallelism_matches_each_roles_width(role, lanes, attention_lan
 def test_lane_count_outside_admitted_range_fails_config_validation():
     """The config gate bounds lanes; the per-profile lane list stays authoritative."""
 
-    for lanes in (0, 32):
+    for lanes in (0, 33):
         with pytest.raises(contracts.AFDError, match="AFD_GRAPH_LANE_COUNT_INVALID"):
             config.AFDConfig(lanes=lanes).validate()
     # Three lanes clear the cheap bound but no profile admits them.
@@ -393,9 +393,9 @@ def test_lane_count_outside_admitted_range_fails_config_validation():
 
 
 def test_attention_lane_count_outside_admitted_range_fails_config_validation():
-    """The cheap config bound rejects a partial group before any profile lookup."""
+    """Counts are bounded here; model profiles own the admitted combinations."""
 
-    for attention_lanes in (3, 6, 36):
+    for attention_lanes in (0, -1, 36):
         with pytest.raises(
             contracts.AFDError,
             match="AFD_GRAPH_ATTENTION_LANE_COUNT_INVALID",
@@ -404,13 +404,15 @@ def test_attention_lane_count_outside_admitted_range_fails_config_validation():
                 lanes=4,
                 attention_lanes=attention_lanes,
             ).validate()
-    # Narrower than the FFN role is the wrong direction: one FFN rank amortizes
-    # its weight stream over k attention lanes, so k < 1 buys nothing.
+    config.AFDConfig(lanes=4, attention_lanes=2).validate()
+    config.AFDConfig(lanes=4, attention_lanes=3).validate()
+    config.AFDConfig(lanes=4, attention_lanes=6).validate()
     with pytest.raises(
-        contracts.AFDError,
-        match="AFD_GRAPH_ATTENTION_LANE_COUNT_INVALID",
+        contracts.AFDError, match="AFD_TOPOLOGY_ATTENTION_LANE_COUNT_UNSUPPORTED"
     ):
-        config.AFDConfig(lanes=4, attention_lanes=2).validate()
+        profiles.GLM5_PAIRED_C1.validate_shape(
+            config=config.AFDConfig(lanes=4, attention_lanes=6, attention_backend="nsa")
+        )
     # Sixteen clears the cheap bound and the ratio, and GLM-5 admits it.
     config.AFDConfig(
         lanes=4,

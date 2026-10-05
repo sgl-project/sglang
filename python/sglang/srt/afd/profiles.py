@@ -216,10 +216,10 @@ QWEN3_PAIRED_C1 = AFDCapabilityProfile(
     stage_plan="native-tbo-s2-lane-merged-return-v2",
     stages=(2,),
     fa_backends=("fa3", "fa4"),
-    lanes=(1, 2, 4, 8, 16),
+    lanes=(1, 2, 4, 8, 16, 32),
     # Attention constructs a proxy before experts. These are CPU-checked shape
     # bounds; current-run model capacity, graph and transport remain GPU gates.
-    attention_lanes=(1, 2, 4, 8, 12, 16, 24, 32),
+    attention_lanes=(1, 2, 3, 4, 8, 12, 16, 20, 24, 32),
     max_nodes=8,
     cache_policy="native-capture-sizes-no-eviction-hard-hbm-v2",
 )
@@ -248,8 +248,8 @@ GLM5_PAIRED_C1 = AFDCapabilityProfile(
     # no longer inherits unused expert TP divisibility. DP LM head is still
     # required when the vocabulary cannot divide the selected A role width.
     # These are CPU-checked bounds, not a GPU validation or a resource grant.
-    lanes=(1, 2, 4, 8, 16),
-    attention_lanes=(1, 2, 4, 8, 12, 16, 24, 32),
+    lanes=(1, 2, 4, 8, 16, 32),
+    attention_lanes=(1, 2, 3, 4, 8, 12, 16, 20, 24, 32),
     max_nodes=8,
     cache_policy="native-capture-sizes-no-eviction-hard-hbm-v2",
 )

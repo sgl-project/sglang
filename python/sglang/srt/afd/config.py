@@ -111,9 +111,9 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
 
     @property
     def lanes_per_ffn(self) -> int:
-        """Attention lanes feeding one FFN rank; 1 in the symmetric case."""
+        """Maximum A ingress group width; 1 in the symmetric case."""
 
-        return self.attention_lane_count // self.lanes
+        return (self.attention_lane_count + self.lanes - 1) // self.lanes
 
     @classmethod
     def from_json(cls, value: str) -> AFDConfig:
@@ -146,8 +146,8 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
                 f"lanes={self.lanes}",
             )
         if self.attention_lanes is not None and (
-            self.attention_lanes < self.lanes
-            or self.attention_lanes % self.lanes
+            type(self.attention_lanes) is not int
+            or self.attention_lanes < 1
             or self.attention_lanes > _max_admitted_attention_lanes()
         ):
             raise AFDError(

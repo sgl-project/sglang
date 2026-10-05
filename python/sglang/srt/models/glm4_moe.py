@@ -1557,6 +1557,9 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
         )
         return hidden_states, residual, topk_indices
 
+    # TP1 shared weights use one contributor to the outer F reduce-scatter.
+    afd_shared_expert_partial = True
+
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -1567,6 +1570,20 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
         a2a_backend = get_moe_a2a_backend()
         if not a2a_backend.is_none():
             raise RuntimeError("AFD_GLM_DSA_INTERNAL_COLLECTIVE_UNSUPPORTED")
+        if getattr(self.mlp, "_shared_expert_tp1", False):
+            # Native TP1 loading avoids splitting an FP8 scale block at F32.
+            # Reuse native routed-expert math, but compute shared only once.
+            # Shared reads the original input before a native in-place routed
+            # kernel can overwrite it; only F rank 0 contributes it to the sum.
+            shared = (
+                self.mlp.shared_experts(hidden_states)
+                if get_parallel().tp_rank == 0
+                else None
+            )
+            routed = self.mlp.forward_normal(hidden_states, skip_shared_experts=True)
+            if shared is not None:
+                routed = routed + shared
+            return routed
         return self.mlp(hidden_states, forward_batch=forward_batch)
 
 
