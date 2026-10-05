@@ -361,6 +361,7 @@ class TestSm90Block32Linear(_LinearBackendCheck):
             layer, _ = self._build_layer(96, 288)
             original_weight = layer.weight.detach().clone()
             layer.quant_method.process_weights_after_loading(layer)
+            self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
             torch.testing.assert_close(layer.weight.float(), original_weight.float(), rtol=0, atol=0)
             self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
             x = torch.randn(5, 288, device="cuda", dtype=torch.bfloat16) / 10

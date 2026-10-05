@@ -725,6 +725,10 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        use_deepgemm_runner = (
+            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -806,10 +810,6 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
-            use_deepgemm_runner = (
-                self.w8a8_block_fp8_linear
-                is deepgemm_w8a8_block_fp8_linear_with_fallback
-            )
             requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
                 layer.weight_scale_inv,
@@ -829,6 +829,7 @@ class Fp8LinearMethod(LinearMethodBase):
             _is_cuda
             and get_platform().is_sm90
             and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
+            and not use_deepgemm_runner
             and weight.is_cuda
             and weight.dtype == torch.float8_e4m3fn
             and self.weight_block_size == [32, 32]
