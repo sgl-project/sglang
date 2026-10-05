@@ -1,7 +1,9 @@
+import bisect
 import json
 import logging
 import re
-from typing import List
+from collections import defaultdict
+from typing import Callable, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -13,6 +15,29 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
+
+
+def _make_brace_matcher(text: str) -> Callable[[int], Optional[int]]:
+    # match(idx) -> end of the first "}" at or after idx that brings the running
+    # brace count (started at idx) back to 0, else None; O(log n) per query.
+    brace_pos, levels = [], []
+    closes_by_level = defaultdict(list)
+    level = 0
+    for m in re.finditer(r"[{}]", text):
+        level += 1 if m.group() == "{" else -1
+        brace_pos.append(m.start())
+        levels.append(level)
+        if m.group() == "}":
+            closes_by_level[level].append(m.start())
+
+    def match(idx: int) -> Optional[int]:
+        before = bisect.bisect_left(brace_pos, idx)
+        base = levels[before - 1] if before else 0
+        closes = closes_by_level.get(base, [])
+        i = bisect.bisect_left(closes, idx)
+        return closes[i] + 1 if i < len(closes) else None
+
+    return match
 
 
 class Llama32Detector(BaseFormatDetector):
@@ -65,6 +90,9 @@ class Llama32Detector(BaseFormatDetector):
         safe_idx = idx  # the index of the last valid JSON object
         all_actions = []
         action_text_len = len(action_text)
+        # Built on first use; rescanning for the matching brace from every
+        # failed object start is quadratic when braces never balance.
+        match_brace = None
         while idx < action_text_len:
             try:
                 obj, end = decoder.raw_decode(action_text[idx:])
@@ -74,16 +102,9 @@ class Llama32Detector(BaseFormatDetector):
             except json.JSONDecodeError:
                 # Try Python dict conversion as fallback
                 try:
-                    dict_end = idx
-                    brace_count = 0
-                    for i in range(idx, action_text_len):
-                        if action_text[i] == "{":
-                            brace_count += 1
-                        elif action_text[i] == "}":
-                            brace_count -= 1
-                            if brace_count == 0:
-                                dict_end = i + 1
-                                break
+                    if match_brace is None:
+                        match_brace = _make_brace_matcher(action_text)
+                    dict_end = match_brace(idx) or idx
 
                     if dict_end > idx:
                         potential_dict = action_text[idx:dict_end]

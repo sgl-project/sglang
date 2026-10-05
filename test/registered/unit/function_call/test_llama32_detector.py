@@ -1,6 +1,7 @@
 """Unit tests for Llama32Detector — no server, no model loading."""
 
 import json
+import time
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.llama32_detector import Llama32Detector
@@ -184,6 +185,22 @@ class TestLlama32Detector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
         self.assertEqual(params["unit"], "celsius")
+
+    def test_unbalanced_braces_parse_in_linear_time(self):
+        """Many object starts whose braces never balance must not stall the
+        parser (it runs on the event loop); a valid call before them parses."""
+        text = (
+            '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Paris"}};'
+            + '{"name": {' * 7000
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Paris"})
 
 
 if __name__ == "__main__":
