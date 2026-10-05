@@ -3,7 +3,7 @@ its best blocks, a consumer takes its top-k among them."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -26,6 +26,7 @@ from .scoring import (
     write_decode,
     write_prefill,
 )
+from .sm90_decode import CandidateBlocks, try_sm90_decode
 from .types import (
     CandidateMetadata,
     DecodeInputs,
@@ -90,6 +91,15 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published, out)
 
     def publish_decode(self, inputs: DecodeInputs, out: Selection):
+        handled, published = try_sm90_decode(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            is_source=True,
+        )
+        if handled:
+            return published
         d = decode_scores(
             inputs=inputs,
             out=out,
@@ -122,9 +132,19 @@ class DenseBlocksBackend:
     def consume_decode(
         self,
         inputs: DecodeInputs,
-        published: Optional[BlockIds],
+        published: Optional[Union[BlockIds, CandidateBlocks]],
         out: Selection,
     ) -> None:
+        handled, _ = try_sm90_decode(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            is_consumer=True,
+            published=published,
+        )
+        if handled:
+            return
         d = decode_scores(
             inputs=inputs,
             out=out,
