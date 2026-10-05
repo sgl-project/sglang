@@ -462,7 +462,10 @@ class TestNVFP4DSAGather(CustomTestCase):
             NVFP4KVCacheMethod,
         )
         from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.mem_cache.memory_pool import DSANVFP4TokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            DSANVFP4TokenToKVPool,
+            KVWriteLoc,
+        )
         from sglang.srt.runtime_context import get_parallel
 
         method = NVFP4KVCacheMethod(num_layers=1, device="cuda")
@@ -491,7 +494,9 @@ class TestNVFP4DSAGather(CustomTestCase):
         k_nope = torch.randn(2, 1, 512, dtype=torch.bfloat16, device="cuda")
         k_rope = torch.randn(2, 1, 64, dtype=torch.bfloat16, device="cuda")
         with get_parallel().override(dcp_enabled=False):
-            pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+            pool.set_mla_kv_buffer(
+                layer, KVWriteLoc(loc, physical=True), k_nope, k_rope
+            )
 
         data, scales, global_scale = pool.get_nvfp4_mla_buffers(0)
         self.assertEqual(data.shape, (128, 1, 288))

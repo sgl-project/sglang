@@ -413,7 +413,7 @@ class TestRadixCache(CustomTestCase):
         )
         self.assertEqual(cache.total_size(), 5)
 
-    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
+    def test_checkpoint_deferred_free_owns_original_indices(self):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -448,11 +448,13 @@ class TestRadixCache(CustomTestCase):
             priority=0,
             last_node=cache.root_node,
         )
-        req.get_fill_ids.return_value = token_ids
+        req.full_untruncated_fill_ids = token_ids
+        req.origin_input_ids = token_ids
+        req.output_ids = array("q")
 
         available_before_free = allocator.available_size()
         allocator.free_group_begin()
-        cache.cache_unfinished_req(req)
+        cache.checkpoint(req, up_to=len(token_ids))
         allocator.free_group_end()
 
         self.assertEqual(
@@ -468,6 +470,9 @@ class TestRadixCache(CustomTestCase):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
+
+            def write(self, indices, values):
+                self.req_to_token[indices] = values
 
         allocator = TokenToKVPoolAllocator(
             size=16,
@@ -485,6 +490,7 @@ class TestRadixCache(CustomTestCase):
         req = unittest.mock.Mock(
             origin_input_ids=prompt_ids,
             output_ids=output_ids,
+            full_untruncated_fill_ids=prompt_ids + output_ids,
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
@@ -493,7 +499,7 @@ class TestRadixCache(CustomTestCase):
         )
 
         up_to = len(prompt_ids) + len(output_ids)
-        cache.insert_req(req, up_to=up_to)
+        cache.checkpoint(req, up_to=up_to)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
         cache.unpin(req)
 

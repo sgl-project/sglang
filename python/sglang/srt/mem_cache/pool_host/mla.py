@@ -148,6 +148,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.packed_device_kv_buffers = [
                 buffer for pool in device_pools for buffer in pool.kv_buffer
             ]
+        self._init_device_row_stride(
+            buf
+            for pool in (self.device_pool, *self.mtp_draft_device_pools)
+            for buf in getattr(pool, "kv_buffer", None) or ()
+        )
         self._init_write_back_staging_buffers()
 
     def _init_dummy(
@@ -402,7 +407,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        # The staged kernel reads whole device pages, so it needs packed rows.
+        if (
+            self.layout != "page_first"
+            or not self.device_rows_packed
+            or (_is_npu or _is_xpu or _is_mps)
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
@@ -680,6 +690,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=self.kv_buffer[host_layer_id],
                         dst=device_pool.kv_buffer[device_layer_id],
@@ -698,6 +709,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla_pf_lf")
                     transfer_kv_per_layer_mla_pf_lf(
                         src=self.kv_buffer,
                         dst=device_pool.kv_buffer[device_layer_id],
@@ -808,6 +820,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=device_pool.kv_buffer[device_layer_id],
                         dst=self.kv_buffer[host_layer_id],
@@ -907,10 +920,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         ptr_src=device_data_ptrs,
                         indices_src=device_indices,
                         cache_dst_stride_bytes=self.token_stride_size,
-                        cache_src_stride_bytes=self.token_stride_size,
+                        cache_src_stride_bytes=self.device_row_stride_bytes,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer_mla")
                     transfer_kv_all_layer_mla(
                         src_layers=device_data_ptrs,
                         dst_layers=self.data_ptrs,
@@ -929,7 +943,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         dst=self.kv_buffer,
                         page_size=self.page_size,
                     )
+                elif self.can_use_jit and not self.device_rows_packed:
+                    # The per-layer host views of page_first rows sit
+                    # `layout_dim` apart, which the all-layer kernel can step.
+                    jit_transfer_hicache_all_layer_mla(
+                        page_size=self.page_size,
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_data_ptrs,
+                        indices_src=device_indices,
+                        cache_dst_stride_bytes=self.layout_dim,
+                        cache_src_stride_bytes=self.device_row_stride_bytes,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer_mla_lf_pf")
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=device_data_ptrs,
                         dst=self.kv_buffer,

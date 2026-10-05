@@ -120,7 +120,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import (
-    empty_context,
     fast_topk,
     get_available_gpu_memory,
     is_cpu,
@@ -187,15 +186,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
-            get_parallel().enable_dp_attention
-            and self.speculative_algorithm.is_eagle3()
+            get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
-        if self.draft_owns_attention:
-            ctx = draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        else:
-            ctx = empty_context()
         with (
-            ctx,
+            draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -216,9 +210,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -259,10 +250,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -272,10 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -715,7 +700,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if get_spec().speculative_use_rejection_sampling:
+        # Verify commits argmax for an all-greedy batch and never reads the
+        # draft distribution, so skip building it.
+        needs_draft_probs = (
+            get_spec().speculative_use_rejection_sampling
+            and not forward_batch.sampling_info.is_all_greedy
+        )
+        if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         topk1_chain_fits = (
@@ -730,7 +721,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk1_chain_fits
             and _is_cuda
             and self.hot_token_id is None
-            and not get_spec().speculative_use_rejection_sampling
+            and not needs_draft_probs
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -793,7 +784,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -819,7 +810,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info,
-                        get_spec().speculative_use_rejection_sampling,
+                        needs_draft_probs,
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
@@ -836,9 +827,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
-            else None
+            torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
         )
 
         # Organize the results
@@ -1021,6 +1010,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
+            cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -1038,33 +1028,53 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        # Cast to int64 before entering plan stream to avoid cross-stream
+        # synchronization issues with .to() inside the plan stream context.
+        if batch_result.prepared_draft_extend_inputs is not None:
+            num_correct_drafts, select_index, next_token_ids = (
+                batch_result.prepared_draft_extend_inputs
+            )
+        elif batch_result.accept_lens.is_cuda:
+            from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
+
+            num_correct_drafts, select_index, next_token_ids = (
+                prepare_draft_extend_inputs(
+                    batch_result.accept_lens,
+                    batch_result.next_token_ids,
+                    self.speculative_num_draft_tokens,
+                )
+            )
+        else:
+            num_correct_drafts = batch_result.accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
+            )
+
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
+
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
-
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
@@ -1190,6 +1200,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+        next_draft_input.cuda_graph_compatible = not (
+            self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1279,10 +1292,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
-                self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group,
-                    owns_attention=self._draft_worker.draft_owns_attention,
-                ),
+                draft_tp_context(self._draft_worker.draft_owns_attention),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -1365,10 +1375,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group,
-                        owns_attention=self.draft_worker.draft_owns_attention,
-                    ),
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1391,10 +1398,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group,
-                        owns_attention=self.draft_worker.draft_owns_attention,
-                    ),
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
@@ -1424,10 +1428,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group,
-                        owns_attention=self.draft_worker.draft_owns_attention,
-                    ),
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1485,10 +1486,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Draft prefill
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
@@ -1507,7 +1505,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
         target_local_only = len(batch.global_num_tokens) == 1
-        draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
+        # The draft MoE A2A backend may gather differently from the target.
+        draft_local_only = (
+            target_local_only
+            if batch.draft_global_num_tokens is None
+            else len(batch.draft_global_num_tokens) == 1
+        ) or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
         draft_batch = batch
         if is_prefill:
@@ -1538,10 +1541,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft"),
@@ -1565,10 +1565,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
