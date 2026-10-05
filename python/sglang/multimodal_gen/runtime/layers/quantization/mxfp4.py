@@ -150,6 +150,18 @@ class Mxfp4LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: Mxfp4Config):
+        # Only supported on ROCm + GFX950
+        if not is_gfx95_supported():
+            platform = "unknown"
+            if _is_hip:
+                try:
+                    platform = torch.cuda.get_device_properties(0).gcnArchName
+                except Exception:
+                    platform = "ROCm (unknown arch)"
+            raise RuntimeError(
+                f"MXFP4 requires ROCm and MI350+ (gfx95x). "
+                f"Current platform: {platform}."
+            )
         self.quant_config = quant_config
 
     def create_weights(
@@ -196,18 +208,6 @@ class Mxfp4LinearMethod(LinearMethodBase):
         - Packed uint8 (2 FP4 values per byte)
         - E8M0 scales (one per 32-element block)
         """
-        if not is_gfx95_supported():
-            platform = "unknown"
-            if _is_hip:
-                try:
-                    platform = torch.cuda.get_device_properties(0).gcnArchName
-                except:
-                    platform = "ROCm (unknown arch)"
-            raise RuntimeError(
-                f"MXFP4 quantization requires ROCm and MI350+ (gfx95x). "
-                f"Current platform: {platform}."
-            )
-
         # Check if weights are already quantized
         if layer.weight.dtype not in [torch.bfloat16, torch.float16]:
             # Already quantized or unexpected dtype
@@ -246,8 +246,8 @@ class Mxfp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Platform support is validated once in process_weights_after_loading;
-        # the gemm runs through a functional custom op so this stays compilable.
+        # Platform support is validated once in __init__; the gemm runs through
+        # a functional custom op so this stays compilable.
 
         # Handle 3D input tensors [batch, seq, hidden]
         original_shape = x.shape
