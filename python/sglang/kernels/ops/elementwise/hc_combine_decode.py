@@ -30,13 +30,21 @@ def hc_combine_gate(normed: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return partials
 
 
-def hc_combine_apply(block, residual, partials):
+def hc_combine_apply(
+    block: torch.Tensor, residual: torch.Tensor, partials: torch.Tensor
+) -> torch.Tensor:
     combined = torch.empty_like(residual)
     _jit_module().apply(block, residual, partials, combined)
     return combined
 
 
-def hc_combine_apply_norm(block, residual, partials, weight, eps):
+def hc_combine_apply_norm(
+    block: torch.Tensor,
+    residual: torch.Tensor,
+    partials: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual)
     _jit_module().apply_norm(

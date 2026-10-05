@@ -167,6 +167,7 @@ class GatedResidual(HyperConnectionBase):
             )
             self._mix_up_weight_padded = None
 
+        self._gate_stream = None
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -186,11 +187,11 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
-            self._gate_stream = None
             if (
                 self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
+                and config.params_dtype == torch.bfloat16
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] == 10
             ):
@@ -300,14 +301,11 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         residuals = (hyper_input, hyper_input_normed)
-        stream = getattr(self, "_gate_stream", None)
+        stream = self._gate_stream
         if (
             stream is not None
-            and hyper_input.shape == (1, 10240)
-            and hyper_input.is_cuda
+            and hyper_input.shape[0] == 1
             and hyper_input.dtype == torch.bfloat16
-            and hyper_input_normed.dtype == torch.bfloat16
-            and self.block_inject_weight.weight.dtype == torch.bfloat16
             and not torch.compiler.is_compiling()
         ):
             from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
@@ -336,7 +334,6 @@ class GatedResidual(HyperConnectionBase):
             len(residuals) == 3
             and next_norm is not None
             and next_norm.group_size == self.hidden_size
-            and next_norm.weight.shape == (10240,)
             and next_norm.weight.dtype == torch.bfloat16
             and block_output.dtype == torch.bfloat16
         ):

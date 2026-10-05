@@ -1392,8 +1392,13 @@ class Qwen4ExpLayerExtensionMixin:
             use_combine=True,
         )
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
+        from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 
-        self._decode_moe_comm = prepare_qwen4_decode_comm(self.mlp)
+        self._decode_moe_comm = (
+            prepare_qwen4_decode_comm(self.mlp)
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            else None
+        )
 
     def _prepare_qwen4_exp_attn(
         self,
@@ -1466,12 +1471,14 @@ class Qwen4ExpLayerExtensionMixin:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
 
-        from sglang.srt.layers.moe.qwen4_decode import (
-            can_use_qwen4_decode_moe,
-            qwen4_decode_moe,
-        )
+        from sglang.srt.layers.moe.qwen4_decode import qwen4_decode_moe
 
-        if can_use_qwen4_decode_moe(hidden_states, self.mlp, self._decode_moe_comm):
+        if (
+            self._decode_moe_comm is not None
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
             return qwen4_decode_moe(hidden_states, self.mlp, self._decode_moe_comm)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()

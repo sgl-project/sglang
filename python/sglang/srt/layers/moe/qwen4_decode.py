@@ -1,6 +1,9 @@
 """Single-token BF16 Qwen4 MoE finalize, shared gate and TP4 collective."""
 
+from __future__ import annotations
+
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,12 +18,15 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_spec
 
+if TYPE_CHECKING:
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
 
 @lru_cache(None)
-def _fusion_comm(ca):
+def _get_decode_comm(tp_comm: CustomAllReduceV2) -> CustomAllReduceV2 | None:
     comm = CustomAllReduceV2(
-        ca.group,
-        ca.device,
+        tp_comm.group,
+        tp_comm.device,
         max_pull_size=0,
         max_pull_blocks=0,
         max_push_size=4 * 1024 * 1024,
@@ -32,7 +38,9 @@ def _fusion_comm(ca):
     return comm
 
 
-def prepare_qwen4_decode_comm(mlp):
+def prepare_qwen4_decode_comm(
+    mlp: Qwen2MoeSparseMoeBlock,
+) -> CustomAllReduceV2 | None:
     parallel = get_parallel()
     if (
         parallel.tp_size != 4
@@ -41,8 +49,8 @@ def prepare_qwen4_decode_comm(mlp):
         or get_lora().enable_lora
         or get_spec().speculative_algorithm is not None
         or get_exec().overlap.enable_two_batch_overlap
-        or not getattr(mlp, "supports_deferred_finalize", False)
-        or getattr(mlp, "num_experts", None) != 512
+        or not mlp.supports_deferred_finalize
+        or mlp.num_experts != 512
         or mlp.experts.w13_weight.dtype != torch.bfloat16
         or mlp.shared_expert_gate is None
         or mlp.enable_shared_expert_fusion
@@ -50,24 +58,15 @@ def prepare_qwen4_decode_comm(mlp):
         or torch.cuda.get_device_capability()[0] != 10
     ):
         return None
-    ca = parallel.tp_group.ca_comm
-    if not isinstance(ca, CustomAllReduceV2) or ca.disabled:
+    tp_comm = parallel.tp_group.ca_comm
+    if not isinstance(tp_comm, CustomAllReduceV2) or tp_comm.disabled:
         return None
-    return _fusion_comm(ca)
+    return _get_decode_comm(tp_comm)
 
 
-def can_use_qwen4_decode_moe(hidden, mlp, comm):
-    return (
-        comm is not None
-        and not torch.compiler.is_compiling()
-        and hidden.shape == (1, 2560)
-        and hidden.is_cuda
-        and hidden.dtype == torch.bfloat16
-        and mlp.experts.w13_weight.dtype == torch.bfloat16
-    )
-
-
-def qwen4_decode_moe(hidden, mlp, comm):
+def qwen4_decode_moe(
+    hidden: torch.Tensor, mlp: Qwen2MoeSparseMoeBlock, comm: CustomAllReduceV2
+) -> torch.Tensor:
     if mlp.alt_stream is not None and get_is_capture_mode():
         current = torch.cuda.current_stream()
         mlp.alt_stream.wait_stream(current)

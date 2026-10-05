@@ -232,7 +232,13 @@ def moe_finalize_all_reduce(
 
 
 @cache_once
-def _jit_shared_gate_module(world_size, hidden_dim, top_k, cluster_size, weight_dtype):
+def _jit_shared_gate_module(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    weight_dtype: torch.dtype,
+) -> Module:
     require_cluster_launch_arch()
     assert cluster_size in valid_cluster_sizes(hidden_dim)
     args = make_cpp_args(
@@ -256,23 +262,22 @@ def _jit_shared_gate_module(world_size, hidden_dim, top_k, cluster_size, weight_
 
 
 def moe_finalize_shared_gate_all_reduce(
-    gemm2_out,
-    expanded_idx_to_permuted_idx,
-    expert_weights,
-    shared_output,
-    shared_gate,
-    comm,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    shared_output: torch.Tensor,
+    shared_gate: torch.Tensor,
+    comm: Communicator,
     *,
-    cluster_size=None,
-    out=None,
-):
+    cluster_size: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Finalize routed BF16 values, gate the shared branch, then all-reduce.
 
     ``shared_gate`` is FP32 and is applied after the routed BF16 rounding.
     The caller owns the communicator and joins all input-producing streams.
     """
-    tokens, hidden_dim = shared_output.shape
-    assert tokens > 0
+    _, hidden_dim = shared_output.shape
     if out is None:
         out = torch.empty_like(shared_output)
     _jit_shared_gate_module(

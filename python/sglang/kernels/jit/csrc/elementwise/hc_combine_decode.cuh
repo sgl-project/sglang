@@ -45,9 +45,6 @@ struct HcCombineDecode {
         .enable_pdl(true)(hc_combine_apply_kernel<4, 2560, true, bf16_t>, params);
   }
 };
-}  // namespace sglang
-
-namespace sglang {
 struct HcCombineNormDecodeParams {
   const bf16_t* block;
   const bf16_t* residual;
@@ -60,38 +57,38 @@ struct HcCombineNormDecodeParams {
 
 template <int kParts>
 __global__
-__launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDecodeParams __grid_constant__ p) {
+__launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDecodeParams __grid_constant__ params) {
   using namespace device;
-  using Float2 = packed_t<bf16_t>;
-  using Storage = AlignedVector<Float2, 8>;
+  using BFloat16x2 = packed_t<bf16_t>;
+  using Storage = AlignedVector<BFloat16x2, 8>;
   constexpr uint32_t kThreads = 160;
   constexpr uint32_t kWarps = 5;
   static_assert(kThreads % kParts == 0);
   const uint32_t row = blockIdx.x / (4 * kParts);
   const uint32_t branch = (blockIdx.x / kParts) % 4;
   const uint32_t part = blockIdx.x % kParts;
-  const uint32_t tx = threadIdx.x;
+  const uint32_t tid = threadIdx.x;
   const auto gmem = tile::Memory<Storage>::cta(kThreads);
-  const auto r = p.residual + (row * 4 + branch) * 2560;
-  const auto y = p.block + row * 2560;
-  const auto w = p.weight + branch * 2560;
-  __shared__ float smem[kWarpThreads];
+  const auto residual = params.residual + (row * 4 + branch) * 2560;
+  const auto block_output = params.block + row * 2560;
+  const auto norm_weight = params.weight + branch * 2560;
+  __shared__ float warp_sums[kWarpThreads];
   PDLWaitPrimary<true>();
   float total = 0.0f;
 #pragma unroll
   for (uint32_t split = 0; split < 8; ++split)
-    total += p.partials[(row * 8 + split) * 4 + branch];
-  const float a = 2.0f / (1.0f + math::exp(-total / 4));
-  const auto rv = gmem.load(r, 0);
-  const auto yv = gmem.load(y, 0);
-  const auto wv = gmem.load(w, 0);
+    total += params.partials[(row * 8 + split) * 4 + branch];
+  const float gate = 2.0f / (1.0f + math::exp(-total / 4));
+  const auto residual_values = gmem.load(residual, 0);
+  const auto block_values = gmem.load(block_output, 0);
+  const auto weight_values = gmem.load(norm_weight, 0);
   Storage combined;
 #pragma unroll
   for (uint32_t i = 0; i < 8; ++i) {
-    const auto [rx, ry] = cast<fp32x2_t>(rv[i]);
-    const auto [yx, yy] = cast<fp32x2_t>(yv[i]);
+    const auto [rx, ry] = cast<fp32x2_t>(residual_values[i]);
+    const auto [yx, yy] = cast<fp32x2_t>(block_values[i]);
     // Match the stock apply's FMA and its BF16 store before normalization.
-    combined[i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+    combined[i] = cast<BFloat16x2>(fp32x2_t{rx + gate * yx, ry + gate * yy});
   }
   float sum = 0.0f;
 #pragma unroll
@@ -100,26 +97,26 @@ __launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDec
     sum += x * x + y * y;
   }
   sum = warp::reduce_sum(sum);
-  const auto warp_id = tx / kWarpThreads;
-  smem[warp_id] = sum;
+  const auto warp_id = tid / kWarpThreads;
+  warp_sums[warp_id] = sum;
   __syncthreads();
   if (warp_id == 0) {
-    const auto local_sum = tx < kWarps ? smem[tx] : 0.0f;
+    const auto local_sum = tid < kWarps ? warp_sums[tid] : 0.0f;
     sum = warp::reduce_sum(local_sum);
-    smem[tx] = math::rsqrt(sum / 2560 + p.eps);
+    warp_sums[tid] = math::rsqrt(sum / 2560 + params.eps);
   }
   __syncthreads();
-  const float norm = smem[warp_id];
-  if (tx >= part * (kThreads / kParts) && tx < (part + 1) * (kThreads / kParts)) {
+  const float inv_rms = warp_sums[warp_id];
+  if (tid >= part * (kThreads / kParts) && tid < (part + 1) * (kThreads / kParts)) {
     Storage normalized;
 #pragma unroll
     for (uint32_t i = 0; i < 8; ++i) {
       const auto [x, y] = cast<fp32x2_t>(combined[i]);
-      const auto [wx, wy] = cast<fp32x2_t>(wv[i]);
-      normalized[i] = cast<Float2>(fp32x2_t{x * norm * (1.0f + wx), y * norm * (1.0f + wy)});
+      const auto [wx, wy] = cast<fp32x2_t>(weight_values[i]);
+      normalized[i] = cast<BFloat16x2>(fp32x2_t{x * inv_rms * (1.0f + wx), y * inv_rms * (1.0f + wy)});
     }
-    gmem.store(p.combined + (row * 4 + branch) * 2560, combined, 0);
-    gmem.store(p.normalized + (row * 4 + branch) * 2560, normalized, 0);
+    gmem.store(params.combined + (row * 4 + branch) * 2560, combined, 0);
+    gmem.store(params.normalized + (row * 4 + branch) * 2560, normalized, 0);
   }
   PDLTriggerSecondary<true>();
 }

@@ -6,20 +6,29 @@ import triton.language as tl
 
 
 @triton.jit
-def _shared_expert_gate_kernel(X, W, G, H: tl.constexpr, B: tl.constexpr):
+def _shared_expert_gate_kernel(
+    hidden_ptr,
+    weight_ptr,
+    gate_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
     row = tl.program_id(0)
-    h = tl.arange(0, B)
-    w = tl.load(W + h, h < H, 0).to(tl.float32)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    w = tl.load(weight_ptr + offsets, offsets < HIDDEN_SIZE, 0).to(tl.float32)
     tl.extra.cuda.gdc_wait()
-    x = tl.load(X + row * H + h, h < H, 0).to(tl.float32)
+    x = tl.load(hidden_ptr + row * HIDDEN_SIZE + offsets, offsets < HIDDEN_SIZE, 0).to(
+        tl.float32
+    )
     gate = tl.sigmoid(tl.sum(x * w, 0))
     tl.extra.cuda.gdc_launch_dependents()
-    tl.store(G + row, gate)
+    tl.store(gate_ptr + row, gate)
 
 
 def shared_expert_gate(
-    hidden: torch.Tensor, weight: torch.Tensor, out=None
+    hidden: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
+    assert hidden.is_cuda and weight.device == hidden.device
     assert hidden.shape == (1, 2560) and hidden.is_contiguous()
     assert hidden.dtype == weight.dtype == torch.bfloat16
     assert weight.numel() == 2560 and weight.is_contiguous()
