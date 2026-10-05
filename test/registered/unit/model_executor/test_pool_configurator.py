@@ -899,11 +899,11 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_resolved_hicache_override_prices_every_indexer_layer(
+    def test_resolved_hicache_override_prices_producer_layers_only(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        """HiCache sizing must follow the elided layout, not the dense one."""
         num_layers = 6
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
         _configure_dsa_model(mr)
@@ -920,17 +920,22 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
-        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+        # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
+        # producing index-K; the other 3 get a 0-row buffer and cost nothing.
+        producer_layers = 3
+        self.assertEqual(
+            cfg._cell_size, 576 * num_layers + 132 * producer_layers
+        )
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_pd_prices_every_indexer_layer(
+    def test_pd_prices_producer_layers_only(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """PD must retain dense index-K metadata until transports support sparsity."""
+        """PD sizing must follow the elided layout too."""
         num_layers = 6
         mr = _make_model_runner(
             self,
@@ -949,7 +954,12 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
-        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+        # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
+        # producing index-K; the other 3 get a 0-row buffer and cost nothing.
+        producer_layers = 3
+        self.assertEqual(
+            cfg._cell_size, 576 * num_layers + 132 * producer_layers
+        )
 
 
 class TestFactory(CustomTestCase):

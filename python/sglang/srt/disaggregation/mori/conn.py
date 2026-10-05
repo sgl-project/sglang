@@ -1474,6 +1474,13 @@ class MoriKVManager(CommonKVManager):
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
+            if state_item_len == 0:
+                # DSA index-K elision gives every shared-topk layer a 0-row
+                # buffer so the per-layer list stays layer-aligned. There is
+                # nothing to move, and the descriptor describes an empty
+                # allocation. Skipping keeps the index alignment with
+                # state_mem_descs that registration relies on.
+                continue
 
             statuses.extend(
                 self._submit_batch_transfer_plan(

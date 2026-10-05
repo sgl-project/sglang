@@ -105,16 +105,17 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
-def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
-    """Whether non-producer DSA layers can skip their device index-K buffer.
+def _should_elide_dsa_index_k(
+    *, is_draft_worker: bool, supports_sparse_transfer: bool = True
+) -> bool:
+    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries.
 
-    HiCache and PD disaggregation used to block this because both consume the
-    per-layer buffer list, and eliding a layer leaves a zero-sized entry in it.
-    Both now cope: the HiCache host pool covers only the producer layers (its
-    declaration's owned_device_layers is built from skip_topk_layers), and the
-    PD transfer drops the elided entries after aligning the peers' layer spans.
+    ``supports_sparse_transfer`` is False for pools whose PD transfer still
+    slices the per-layer list positionally and so cannot tolerate the gaps.
     """
     memory_config = get_memory()
+    if not supports_sparse_transfer and get_disagg().disaggregation_mode != "null":
+        return False
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
@@ -1572,7 +1573,16 @@ class KVCacheConfigurator:
         use_compact_indexer_layout = (
             is_dsa_model
             and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+            and _should_elide_dsa_index_k(
+                is_draft_worker=self.is_draft_worker,
+                # AscendKVManager.get_mla_kv_ptrs_with_pp slices the buffer list
+                # into equal groups of hidden_kv_layers, and NPU index-K rides in
+                # the KV list rather than StateType.DSA, so the Mooncake filter
+                # never sees it. A compact layout would mis-slice a PP>1 prefill
+                # against a PP=1 decode. Lift this once that slicing reads
+                # indexer_layer_ids.
+                supports_sparse_transfer=False,
+            )
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:

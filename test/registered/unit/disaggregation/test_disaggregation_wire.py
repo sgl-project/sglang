@@ -705,6 +705,47 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(kv_args.state_item_lens[1:], [[], []])
         self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
 
+    def test_elided_dsa_layers_are_not_registered(self):
+        """A 0-row index-K buffer must not reach Mooncake's registration.
+
+        The engine rejects it outright ("Transfer Engine does not support zero
+        length memory region"). Skipping happens in _registerable_regions, not
+        in kv_args, so the per-layer list keeps its dense shape and peers still
+        pair positionally.
+        """
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[],
+            kv_data_lens=[],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            # 6 layers, 3 producers.
+            state_data_ptrs=[[100, 101, 102, 103, 104, 105]],
+            state_data_lens=[[4096, 0, 0, 4096, 0, 4096]],
+        )
+        regions = mgr._registerable_regions()
+        self.assertEqual(regions, [(100, 4096), (103, 4096), (105, 4096)])
+
+    def test_elided_dsa_entries_drop_out_of_transfer_blocks(self):
+        """Entries with item_len 0 carry no bytes and must not be transferred."""
+        layers_params = [(100, 200, 132), (101, 201, 0), (102, 202, 132)]
+        self.assertEqual(
+            [p for p in layers_params if p[2] != 0],
+            [(100, 200, 132), (102, 202, 132)],
+        )
+
+    def test_dense_shape_keeps_positional_pairing_intact(self):
+        """Both peers still publish one entry per layer, so pairing is unchanged.
+
+        This is what keeps the wire compatible with a peer that elides nothing:
+        counts match, and build_transfer_entry_pairs stays on its positional
+        path with no layer ids on either side.
+        """
+        self.assertEqual(
+            build_transfer_entry_pairs([], [], 6, 6),
+            [(i, i) for i in range(6)],
+        )
+
     def test_compact_qsa_entries_map_by_global_layer_id(self):
         self.assertEqual(
             build_transfer_entry_pairs(

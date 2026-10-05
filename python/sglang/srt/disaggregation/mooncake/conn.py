@@ -338,18 +338,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
                 if length == 0:
-                    # DSA index-K elision leaves a zero-row placeholder for
-                    # every non-producer layer so the per-layer buffer list
-                    # stays layer-aligned. Those have nothing to register, and
-                    # Mooncake rejects them outright:
+                    # DSA index-K elision gives every shared-topk layer a 0-row
+                    # buffer so the per-layer list stays layer-aligned. There is
+                    # nothing to register, and Mooncake rejects it outright:
                     #   transfer_engine_impl.cpp: Transfer Engine does not
                     #   support zero length memory region
+                    # kv_args keeps the entry, so peers still pair positionally.
                     continue
-                if ptr == 0 or length < 0:
-                    raise ValueError(
-                        "Invalid non-empty Mooncake registration region: "
-                        f"ptr={ptr}, length={length}"
-                    )
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
@@ -845,6 +840,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 if dst_item_lens is not None:
                     for i, j in pairs:
+                        if item_lens[i] == 0 or dst_item_lens[j] == 0:
+                            # One peer may elide a layer while the other does
+                            # not: HiSparse runs decode-side only, and an older
+                            # build elides nowhere. Neither peer reads index-K
+                            # for a shared-topk layer, so there is nothing to
+                            # move and nothing to disagree about.
+                            continue
                         if item_lens[i] != dst_item_lens[j]:
                             assert bootstrap_room is not None
                             failure_reason = (
@@ -872,6 +874,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         item_lens, dst_item_lens, state_type
                     )
                     for layer_id in range(layers_current_pp_stage):
+                        if (
+                            item_lens[layer_id] == 0
+                            or mapped_dst_lens[layer_id] == 0
+                        ):
+                            continue
                         if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                             assert bootstrap_room is not None
                             failure_reason = (
@@ -922,20 +929,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         assert layers_params is not None
 
+        # Elided layers carry no bytes. Dropping them here covers every path
+        # that consumes layers_params, including process_index_batch, which
+        # builds its blocks without set_transfer_blocks.
+        layers_params = [p for p in layers_params if p[2] != 0]
+
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
-            if item_len == 0:
-                # An elided layer has no bytes to move. Falling through would
-                # queue a zero-length block pointing at the empty allocation
-                # for every transfer, silently.
-                return transfer_blocks
-            if src_ptr == 0 or dst_ptr == 0 or item_len < 0:
-                raise ValueError(
-                    "Invalid non-empty Mooncake KV transfer region: "
-                    f"src_ptr={src_ptr}, dst_ptr={dst_ptr}, item_len={item_len}"
-                )
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
                     device_prefill_kv_blocks is not None
@@ -1356,15 +1358,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> List[Tuple[int, int, int]]:
-            if token_item_len == 0:
-                # See the sibling helper: elided layers carry no bytes.
-                return []
-            if src_ptr == 0 or dst_ptr == 0 or token_item_len < 0:
-                raise ValueError(
-                    "Invalid non-empty Mooncake KV transfer region: "
-                    f"src_ptr={src_ptr}, dst_ptr={dst_ptr}, "
-                    f"token_item_len={token_item_len}"
-                )
             src_groups, dst_groups = groups
             return [
                 (
@@ -1815,46 +1808,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif self._is_generic_kvcache_state_type(st):
-                if st == StateType.DSA and (
-                    any(n == 0 for n in src_item_lens)
-                    or any(n == 0 for n in dst_item_lens)
-                ):
-                    # Non-producer layers carry no index-K. A PP prefill stage
-                    # registers only its own layers while decode may register
-                    # the whole model, so align the spans the same way
-                    # get_mla_kv_ptrs_with_pp does before comparing anything --
-                    # otherwise the two elision patterns are simply offset.
-                    if len(dst_data_ptrs) != len(src_data_ptrs):
-                        span_start, span_end = self._mla_kv_entry_span_with_pp(
-                            len(src_data_ptrs)
-                        )
-                        dst_data_ptrs = dst_data_ptrs[span_start:span_end]
-                        dst_item_lens = dst_item_lens[span_start:span_end]
-                    if len(dst_data_ptrs) != len(src_data_ptrs):
-                        raise RuntimeError(
-                            "DSA indexer entry count still differs after PP "
-                            f"span alignment: prefill={len(src_data_ptrs)}, "
-                            f"decode={len(dst_data_ptrs)}"
-                        )
-                    mismatched = [
-                        (k, src_item_lens[k], dst_item_lens[k])
-                        for k in range(len(src_item_lens))
-                        if (src_item_lens[k] == 0) != (dst_item_lens[k] == 0)
-                    ]
-                    if mismatched:
-                        # One-sided elision means the peers disagree on which
-                        # layers produce index-K; transferring blind would drop
-                        # or mis-place indexer state.
-                        raise RuntimeError(
-                            "DSA index-K elided on only one PD peer for "
-                            f"entries {mismatched}: prefill and decode must "
-                            "agree on the producer-layer set"
-                        )
-                    keep = [k for k, n in enumerate(src_item_lens) if n != 0]
-                    src_data_ptrs = [src_data_ptrs[k] for k in keep]
-                    src_item_lens = [src_item_lens[k] for k in keep]
-                    dst_data_ptrs = [dst_data_ptrs[k] for k in keep]
-                    dst_item_lens = [dst_item_lens[k] for k in keep]
                 is_qwen4_qsa_state = st in (
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
