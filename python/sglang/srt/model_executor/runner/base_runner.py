@@ -474,7 +474,7 @@ class BaseRunner(ABC):
         """Run a dummy forward pass for warmup/profiling.
 
         forward_mode_override forces EXTEND/DECODE regardless of
-        is_generation (used by the PP-parallel DeepGEMM warmup).
+        is_generation.
 
         buffers: a prepared static buffer set (or lightweight adapter exposing
         the same fields), sized >= this dummy shape, which _dummy_run slices to
@@ -482,11 +482,11 @@ class BaseRunner(ABC):
         the flashinfer autotune reuses an existing runner's buffers via
         _autotune_buffers (the eager input registry, or the decode cuda-graph
         runner's captured buffers); the PP-DeepGEMM warmup builds one via
-        _alloc_dummy_decode_buffers. _dummy_run never allocates and never re-pads
-        (autotune must run at the reused shape; the PP warmup pre-pads and sizes
-        its buffer to match). next_token_logits_buffer is optional -- a live
-        autotune forward returns logits fresh, so the eager-reuse path passes
-        None (only the PP warmup set still carries one).
+        _alloc_dummy_decode_buffers. _dummy_run never allocates static buffers
+        and never re-pads (autotune must run at the reused shape; the PP warmup
+        pre-pads and sizes its buffer to match). next_token_logits_buffer is
+        optional -- a live autotune forward returns logits fresh, so the
+        eager-reuse path passes None (only the PP warmup set still carries one).
         """
         mr = self.model_runner
         if forward_mode_override is not None:
@@ -812,18 +812,4 @@ def _create_dummy_spec_info(
         )
     if not mr.is_draft_worker:
         return None
-    from sglang.srt.speculative.eagle_utils import (
-        get_draft_input_from_target_hidden_dim,
-    )
-
-    return create_dummy_draft_extend_input(
-        mr.spec_algorithm,
-        num_tokens=num_tokens,
-        hidden_size=(
-            None
-            if mr.spec_algorithm.is_standalone()
-            else get_draft_input_from_target_hidden_dim(mr)
-        ),
-        dtype=mr.model_config.dtype,
-        device=mr.device,
-    )
+    return create_dummy_draft_extend_input(mr, num_tokens=num_tokens)

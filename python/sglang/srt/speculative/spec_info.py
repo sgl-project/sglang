@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -541,27 +542,27 @@ def supports_dummy_draft_extend(spec_algorithm: SpeculativeAlgorithm) -> bool:
 
 
 def create_dummy_draft_extend_input(
-    spec_algorithm: SpeculativeAlgorithm,
-    *,
-    num_tokens: int,
-    hidden_size: Optional[int],
-    dtype: torch.dtype,
-    device: torch.device,
+    model_runner: ModelRunner, *, num_tokens: int
 ) -> SpecInput:
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from sglang.srt.speculative.eagle_utils import (
+        get_draft_input_from_target_hidden_dim,
+    )
 
+    if model_runner.spec_algorithm.is_standalone():
+        return EagleDraftExtendInput(
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
     return EagleDraftExtendInput(
-        hidden_states=(
-            None
-            if hidden_size is None
-            else torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+        hidden_states=torch.zeros(
+            (num_tokens, get_draft_input_from_target_hidden_dim(model_runner)),
+            dtype=model_runner.dtype,
+            device=model_runner.device,
         ),
         num_tokens_per_req=1,
         num_tokens_for_logprob_per_req=1,
-        capture_hidden_mode=(
-            CaptureHiddenMode.NULL
-            if spec_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
-        ),
+        capture_hidden_mode=CaptureHiddenMode.LAST,
     )

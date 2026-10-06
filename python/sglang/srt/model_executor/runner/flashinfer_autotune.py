@@ -27,6 +27,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -358,7 +359,7 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    if not mr.is_generation:
+    if not mr.is_generation or get_disagg().disaggregation_mode == "decode":
         return
     if mr.is_draft_worker and not supports_dummy_draft_extend(mr.spec_algorithm):
         return
