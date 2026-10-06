@@ -29,6 +29,9 @@ layout = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = layout
 _spec.loader.exec_module(layout)
 
+from sglang.srt.weight_sync.gpu_delta import bindings as byte_layout
+from sglang.srt.weight_sync.gpu_delta import models
+
 
 def _bytes(tensor):
     return tensor.detach().contiguous().reshape(-1).view(torch.uint8)
@@ -201,11 +204,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 new_up = torch.randint(256, gate.shape, dtype=torch.uint8)
 
                 def full(gate, up):
-                    fused = layout.interleave_gate_up_bytes(
+                    fused = byte_layout.interleave_gate_up_bytes(
                         gate, up, group_rows=group, up_first=up_first
                     )
                     return (
-                        layout.swizzle_scale_bytes(fused) if kind == "scale" else fused
+                        byte_layout.swizzle_scale_bytes(fused)
+                        if kind == "scale"
+                        else fused
                     )
 
                 current = full(gate, up)
@@ -214,7 +219,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     ("gate", gate, new_gate),
                     ("up", up, new_up),
                 ):
-                    mask = layout.flashinfer_delta_layout(
+                    mask = byte_layout.flashinfer_delta_layout(
                         before ^ after,
                         dtype="nvfp4",
                         backend=backend,
@@ -230,7 +235,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
     def test_scale_swizzle_matches_physical_offsets_and_zero_padding(self):
         for rows, cols in ((17, 3), (128, 64), (256, 19)):
             source = torch.randint(256, (2, rows, cols), dtype=torch.uint8)
-            swizzled = layout.swizzle_scale_bytes(source)
+            swizzled = byte_layout.swizzle_scale_bytes(source)
             row = torch.arange(rows)[:, None]
             col = torch.arange(cols)[None, :]
             # Physical order: row tile, column tile, row within 32,
@@ -255,7 +260,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 size = 12 * 20 * torch.empty((), dtype=dtype).element_size()
                 canonical = torch.randint(256, (size,), dtype=torch.uint8)
                 target = canonical.view(dtype).reshape(12, 20)[2:10, 5:13].clone()
-                binding = layout._direct_binding(
+                binding = byte_layout._direct_binding(
                     "weight",
                     {"dtype": name, "shape": [12, 20]},
                     target,
@@ -316,7 +321,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     projection=projection, rows=rows, cols=cols, mma=independent_mma
                 ):
                     mask = torch.randint(256, (rows, cols), dtype=torch.uint8)
-                    transformed = layout.flashinfer_delta_layout(
+                    transformed = byte_layout.flashinfer_delta_layout(
                         mask,
                         dtype="nvfp4",
                         backend="cutedsl",
@@ -344,7 +349,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             stem + "_blockscale_mma": mma,
                         },
                     )
-                    binding = layout._moe_binding(
+                    binding = byte_layout._moe_binding(
                         "scale",
                         {"dtype": "F8_E4M3", "shape": [rows, cols]},
                         layer,
@@ -380,7 +385,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         }
         after = {key: torch.randn_like(value) for key, value in before.items()}
         root = torch.nn.Module()
-        root.config = SimpleNamespace(num_hidden_layers=1)
+        root.config = SimpleNamespace(
+            num_hidden_layers=1, architectures=["GlmMoeDsaForCausalLM"]
+        )
         root.mutate_weight_preload = lambda name: name
         root.stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -460,8 +467,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     prepared.matrix_tensor_count = 0
                     prepared.raw_tensor_count = 0
                     prepared.derived = [
-                        layout.DerivedImage("consumer", target, source),
-                        layout.DerivedImage("other", other_target, other_source),
+                        byte_layout.DerivedImage("consumer", target, source),
+                        byte_layout.DerivedImage("other", other_target, other_source),
                     ]
                     # Match the native BF16 MLA cache layout, then change the
                     # canonical bytes after admission to catch stale copies.
@@ -481,9 +488,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
                         w_vc=value.contiguous().transpose(1, 2),
                     )
-                    plan = layout.GpuDeltaLayout.__new__(layout.GpuDeltaLayout)
+                    plan = models.DeepSeekMlaMapping.__new__(models.DeepSeekMlaMapping)
                     plan.derived = []
-                    plan._add_mla_derived("attention", attn)
+                    plan._add_derived("attention", attn)
                     prepared.derived.extend(plan.derived)
                     mla_identity = [
                         (image.destination.data_ptr(), image.destination.stride())
@@ -547,10 +554,80 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             identity,
                         )
 
+    def test_independent_mapping_uses_shared_apply_and_identity_contract(self):
+        root = torch.nn.Module()
+        root.config = SimpleNamespace(architectures=["IndependentTestModel"])
+        root.runtime = torch.nn.Module()
+        root.runtime.weight = torch.nn.Parameter(torch.zeros(6), requires_grad=False)
+        root.cache = torch.zeros(3, 2)
+
+        class IndependentMapping:
+            def __init__(self, model):
+                self.model = model
+                self.parameters = byte_layout.ParameterBindings(model)
+                self.derived = [
+                    byte_layout.DerivedImage(
+                        "cache", model.cache, model.runtime.weight.view(2, 3).t()
+                    )
+                ]
+                self.consumers = [byte_layout.ConsumerSnapshot(lambda: (model.cache,))]
+
+            def bind(self, name, meta):
+                return self.parameters.bind(name, meta, "runtime.weight")
+
+            def finish(self):
+                pass
+
+            @staticmethod
+            def aliases(a, b):
+                return False
+
+        with patch.dict(
+            models._MODEL_MAPPINGS, IndependentTestModel=IndependentMapping
+        ):
+            plan = layout.GpuDeltaLayout(
+                root, {"canonical.vector": {"dtype": "F32", "shape": [6]}}
+            )
+        prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
+        prepared.backend = SimpleNamespace(layout=plan)
+        prepared.device, prepared.stream = torch.device("cpu"), object()
+        prepared.timing_enabled = False
+        prepared.batches, prepared.status_checks = [], []
+        prepared.matrix_tensor_count, prepared.raw_tensor_count = 0, 1
+        prepared.derived = plan.derived
+        prepared.timings, prepared.h2d_bytes, prepared.target_version = {}, 0, 1
+        pointer = root.cache.data_ptr()
+        with (
+            patch.object(prepared, "_allocate_paused"),
+            patch.object(torch.cuda, "device", return_value=nullcontext()),
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(
+                torch.cuda,
+                "Event",
+                return_value=SimpleNamespace(
+                    record=lambda _: None, synchronize=lambda: None
+                ),
+            ),
+        ):
+            for offset in (1, 7):
+                prepared.error = torch.tensor([0])
+                target = torch.arange(6, dtype=torch.float32) + offset
+                prepared.raw_copies = {
+                    torch.float32: ([plan.bindings[0].storage[0]], [target])
+                }
+                self.assertTrue(prepared.apply()["applied"])
+                torch.testing.assert_close(
+                    root.cache, target.view(2, 3).t(), rtol=0, atol=0
+                )
+                self.assertEqual(root.cache.data_ptr(), pointer)
+        root.cache = root.cache.clone()
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
+
     def test_derived_geometry_rejected_at_admission(self):
         for source in (torch.zeros(3), torch.zeros(2, dtype=torch.bfloat16)):
             with self.assertRaisesRegex(ValueError, "derived delta buffer geometry"):
-                layout.DerivedImage("consumer", torch.zeros(2), source)
+                byte_layout.DerivedImage("consumer", torch.zeros(2), source)
 
     def test_w4a16_calibration_is_static_but_weight_scales_remain_mutable(self):
         prefix = "model.layers.0.mlp.experts"
@@ -567,22 +644,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             w13_weight_scale_2=torch.ones(2, 2),
             w2_weight_scale_2=torch.ones(2),
         )
-        plan = layout.GpuDeltaLayout.__new__(layout.GpuDeltaLayout)
-        plan.model = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=1),
-            mutate_weight_preload=lambda name: name,
-        )
-        plan._modules, plan._moe_layers, plan.excluded = {prefix: layer}, {}, {}
+        plan = byte_layout.ParameterBindings.__new__(byte_layout.ParameterBindings)
+        plan.modules, plan.moe_layers, plan.excluded = {prefix: layer}, {}, {}
         meta = {"dtype": "F32", "shape": []}
         for projection in ("gate", "up", "down"):
             for expert in (0, 3):
                 name = f"{prefix}.{expert}.{projection}_proj.input_scale"
-                self.assertIsNone(plan._bind(name, meta))
+                self.assertIsNone(plan.bind(name, meta, name))
                 self.assertEqual(
                     plan.excluded[name], "static W4A16 activation calibration"
                 )
             name = f"{prefix}.0.{projection}_proj.weight_scale_2"
-            binding = plan._bind(name, meta)
+            binding = plan.bind(name, meta, name)
             after = torch.tensor(0.5)
             self.assertEqual(binding.encoding, "raw_bytes")
             torch._foreach_copy_([binding.storage[0]], [after])
@@ -613,10 +686,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             "lm_head.weight",
         ]
         local = [
-            layout._direct_binding(names[i], {"dtype": "U8", "shape": list(t.shape)}, t)
+            byte_layout._direct_binding(
+                names[i], {"dtype": "U8", "shape": list(t.shape)}, t
+            )
             for i, t in enumerate(targets)
         ]
-        foreign = layout._direct_binding(
+        foreign = byte_layout._direct_binding(
             "foreign",
             {"dtype": "U8", "shape": [3, 4]},
             torch.zeros(3, 4, dtype=torch.uint8),
@@ -1085,11 +1160,20 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             prepared.close()
         self.assertEqual(drains, ["decode", "compute"])
 
-    def test_indexer_norm_replacement_matches_fp32_loader_and_preserves_pointer(self):
+    def test_glm_mapping_matches_loader_views_and_preserves_consumers(self):
         root = torch.nn.Module()
-        root.config = SimpleNamespace(num_hidden_layers=1)
+        root.config = SimpleNamespace(
+            num_hidden_layers=1,
+            architectures=["GlmMoeDsaForCausalLM"],
+            q_lora_rank=3,
+            kv_lora_rank=2,
+            qk_rope_head_dim=2,
+        )
         root.mutate_weight_preload = lambda name: name
-        root.stacked_params_mapping = []
+        root.stacked_params_mapping = [
+            ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+            ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+        ]
         root.model = torch.nn.Module()
         root.model.layers = torch.nn.ModuleList([torch.nn.Module()])
         layer = root.model.layers[0]
@@ -1103,13 +1187,76 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             }
             for key in ("weight", "bias")
         }
+        attn = layer.self_attn
+        attn.fused_qkv_a_proj_with_mqa = torch.nn.Linear(8, 7, bias=False).bfloat16()
+        attn.indexer.wk_weights_proj = torch.nn.Linear(8, 9, bias=False).bfloat16()
+        attn.kv_b_proj = torch.nn.Linear(8, 20, bias=False).bfloat16()
+        attn.qk_nope_head_dim, attn.v_head_dim = 4, 6
+        key, value = attn.kv_b_proj.weight.unflatten(0, (2, 10)).split([4, 6], dim=1)
+        attn.w_kc = key.transpose(1, 2).contiguous().transpose(1, 2).detach()
+        attn.w_vc = value.contiguous().transpose(1, 2).detach()
+        expected_views = {
+            "q_a_proj.weight": attn.fused_qkv_a_proj_with_mqa.weight[:3],
+            "kv_a_proj_with_mqa.weight": attn.fused_qkv_a_proj_with_mqa.weight[3:],
+            "indexer.wk.weight": attn.indexer.wk_weights_proj.weight[:5],
+            "indexer.weights_proj.weight": attn.indexer.wk_weights_proj.weight[5:],
+            "kv_b_proj.weight": attn.kv_b_proj.weight,
+        }
+        prefix = "model.layers.0.self_attn."
+        inventory.update(
+            {
+                prefix + name: {"dtype": "BF16", "shape": list(target.shape)}
+                for name, target in expected_views.items()
+            }
+        )
+        inventory.update(
+            {
+                "model.layers.1.weight": {"dtype": "BF16", "shape": [2, 2]},
+                prefix + "rotary_emb.inv_freq": {"dtype": "F32", "shape": [2]},
+            }
+        )
+        layer.mlp = torch.nn.Module()
+        experts = layer.mlp.experts = torch.nn.Module()
+        experts.moe_tp_size, experts.use_presharded_weights = 1, False
+        experts.quant_method = SimpleNamespace(_is_cutedsl_v2_standard=True)
+        experts.moe_runner_config = SimpleNamespace(is_gated=True)
+        experts._map_global_expert_id_to_local_expert_id = lambda expert: expert
+        experts.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(1, 2), requires_grad=False
+        )
+        experts.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(1), requires_grad=False
+        )
+        experts.g1_alphas, experts.g1_alphas_up, experts.g2_alphas = [
+            torch.ones(1) for _ in range(3)
+        ]
+        experts._cutedsl_wrapper = SimpleNamespace(quant_mode="w4a16")
+        experts._cutedsl_scales = [torch.ones(1), None, torch.ones(1)]
+        inventory["model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"] = {
+            "dtype": "F32",
+            "shape": [],
+        }
         plan = layout.GpuDeltaLayout(root, inventory)
+        self.assertEqual(len(plan.excluded), 2)
+        for binding in plan.bindings:
+            relative = binding.name.removeprefix(prefix)
+            if relative in expected_views:
+                target = expected_views[relative]
+                self.assertEqual(binding.shape, tuple(target.shape))
+                self.assertEqual(binding.slices, [[0, n] for n in target.shape])
+                self.assertEqual(binding.storage[0].data_ptr(), target.data_ptr())
+                self.assertEqual(binding.storage[0].stride(), target.stride())
+        for image, source in zip(plan.derived[-2:], (key, value.transpose(1, 2))):
+            self.assertEqual(image.source.data_ptr(), source.data_ptr())
+            self.assertEqual(image.source.stride(), source.stride())
         values = torch.tensor(
             [0.0, -0.0, float("inf"), float("nan"), 1.25, -3.5, 0.125, -16],
             dtype=torch.bfloat16,
         ).repeat(16)
         with torch.no_grad():
             for binding in plan.bindings:
+                if ".k_norm." not in binding.name:
+                    continue
                 self.assertEqual(binding.encoding, "raw_bytes")
                 target = getattr(norm, binding.name.rsplit(".", 1)[1])
                 # An all-zero target is a replacement, not an omitted XOR.
@@ -1128,6 +1275,14 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 self.assertEqual(target.data_ptr(), pointer)
         plan.check_identity()
+        original_key = attn.w_kc
+        attn.w_kc = attn.w_kc.clone()
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
+        attn.w_kc = original_key
+        experts._cutedsl_scales = list(experts._cutedsl_scales)
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
 
     def test_raw_vectors_scalars_prepare_once_and_copy_in_place(self):
         vector = torch.full((4,), 7, dtype=torch.bfloat16)
@@ -1136,13 +1291,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         unchanged = torch.ones(3)
         odd = torch.zeros(3, dtype=torch.uint8)
         bindings = [
-            layout._direct_binding("0", {"dtype": "U8", "shape": [3]}, odd),
-            layout._direct_binding(
+            byte_layout._direct_binding("0", {"dtype": "U8", "shape": [3]}, odd),
+            byte_layout._direct_binding(
                 "a", {"dtype": "BF16", "shape": [8]}, vector, [[2, 6]]
             ),
-            layout._direct_binding("b", {"dtype": "F32", "shape": []}, scalar),
-            layout._indexer_norm_binding("c", {"dtype": "BF16", "shape": [2]}, indexer),
-            layout._direct_binding("d", {"dtype": "F32", "shape": [3]}, unchanged),
+            byte_layout._direct_binding("b", {"dtype": "F32", "shape": []}, scalar),
+            models._indexer_norm_binding("c", {"dtype": "BF16", "shape": [2]}, indexer),
+            byte_layout._direct_binding("d", {"dtype": "F32", "shape": [3]}, unchanged),
         ]
         values = [
             torch.arange(3, dtype=torch.uint8),
@@ -1306,7 +1461,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
 
     def test_invalid_layout_geometry_rejected(self):
         with self.assertRaises(ValueError):
-            layout.flashinfer_delta_layout(
+            byte_layout.flashinfer_delta_layout(
                 torch.zeros(16, 4, dtype=torch.uint8),
                 dtype="nvfp4",
                 backend="cutedsl",

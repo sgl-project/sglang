@@ -248,7 +248,10 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
         refresh_cutedsl_standard_scales_for_weight_update,
     )
-    from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaLayout, _moe_binding
+    from sglang.srt.weight_sync.gpu_delta.bindings import (
+        _moe_binding,
+        moe_derived_images,
+    )
 
     monkeypatch.setenv("SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16", "1")
     old, new = _canonical(13), _canonical(29)
@@ -292,7 +295,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
                 bindings.append(binding)
                 masks.append(mask)
     _apply_prepared_masks(bindings, masks)
-    from sglang.srt.weight_sync.gpu_delta.layout import _direct_binding
+    from sglang.srt.weight_sync.gpu_delta.bindings import _direct_binding
 
     for dtype in (torch.uint8, torch.bfloat16, torch.float32):
         width = torch.empty((), dtype=dtype).element_size()
@@ -387,10 +390,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             storage[0].item() == storage[-1].item() == 0x5A for storage in guards
         )
 
-    plan = GpuDeltaLayout.__new__(GpuDeltaLayout)
-    plan.derived = []
-    plan._add_moe_derived("model.layers.3.mlp.experts", live)
-    for image in plan.derived:
+    for image in moe_derived_images("model.layers.3.mlp.experts", live):
         torch.where(
             torch.tensor(True, device="cuda"),
             image.source,
@@ -414,7 +414,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
 
 def test_feature_scale_permutation_matches_loader_padding():
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
-    from sglang.srt.weight_sync.gpu_delta.layout import swizzle_scale_bytes
+    from sglang.srt.weight_sync.gpu_delta.bindings import swizzle_scale_bytes
 
     for shape in ((17, 3), (128, 64), (2, 256, 19)):
         values = torch.randint(1, 120, shape, dtype=torch.uint8, device="cuda")
@@ -425,7 +425,7 @@ def test_feature_scale_permutation_matches_loader_padding():
             swizzle_scale_bytes(values), expected, rtol=0, atol=0
         )
         if len(shape) == 2:
-            from sglang.srt.weight_sync.gpu_delta.layout import _moe_binding
+            from sglang.srt.weight_sync.gpu_delta.bindings import _moe_binding
 
             live = expected.clone().view(torch.float8_e4m3fn).unsqueeze(0)
             layer = SimpleNamespace(
@@ -456,7 +456,7 @@ def test_feature_scale_permutation_matches_loader_padding():
 
 
 def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():
-    from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaLayout
+    from sglang.srt.weight_sync.gpu_delta.models import DeepSeekMlaMapping
 
     weight = torch.zeros((2 * (4 + 6), 8), dtype=torch.bfloat16, device="cuda")
     key, value = weight.unflatten(0, (2, 10)).split([4, 6], dim=1)
@@ -467,9 +467,9 @@ def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():
         w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
         w_vc=value.contiguous().transpose(1, 2),
     )
-    plan = GpuDeltaLayout.__new__(GpuDeltaLayout)
+    plan = DeepSeekMlaMapping.__new__(DeepSeekMlaMapping)
     plan.derived = []
-    plan._add_mla_derived("attention", attn)
+    plan._add_derived("attention", attn)
     identity = [
         (d.destination.data_ptr(), d.destination.stride()) for d in plan.derived
     ]

@@ -15,6 +15,22 @@ secondary or transformed sources are outside this contract. It does not wrap
 model methods or change ordinary checkpoint loading. Packed live parameters alone
 cannot recover the canonical source inventory.
 
+Model mapping is selected once during admission in `gpu_delta/models.py`. The
+implemented DeepSeek MLA/DSA family covers GLM's shared runtime implementation:
+canonical name mutation, unequal Q/KV-A fusion, indexer fusion and numeric norm
+replacement, static draft exclusions, and MLA derived views. `bindings.py` owns
+ordinary dense TP/vocabulary slicing, FlashInfer CuTe DSL NVFP4 W4A16 physical
+layouts, alpha/scale refresh views, and generic consumer identity snapshots.
+`layout.py` owns canonical plans and the unchanged DE/apply pipeline. A new model
+family supplies startup bindings and derived views through the same small mapping
+interface; no GDN/KDA mapping or additional serving backend is implemented here.
+
+Descriptions identify the admitted dense and MoE storage contracts in `layouts`,
+rather than a model-named adapter. Canonical tensor/view metadata and publication
+wire fields are unchanged. The rank layout digest changes with this description,
+so existing streams require fresh admission. The artificial independent mapping
+in the CPU suite tests the extension boundary, not a newly qualified model.
+
 One Miles coordinator exclusively owns these engines' model updates, pause/resume,
 memory residency and topology for the stream's lifetime. Mixing another weight
 updater or administrative mutation into the same engine is unsupported. Ordinary
