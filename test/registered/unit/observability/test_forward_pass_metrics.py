@@ -29,11 +29,9 @@ class _FakeReq:
         self,
         prompt_len: int,
         output_len: int = 0,
-        prefix_len: int = 0,
     ):
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = list(range(output_len))
-        self.prefix_indices = list(range(prefix_len))
         self.seqlen = prompt_len + output_len
 
 
@@ -153,6 +151,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_mode=_FakeForwardMode(),
             reqs=[],
             decoding_reqs=[],
+            prefix_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
             fpm_start_time=100.0,
@@ -164,13 +163,14 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler._fpm_dp_rank = 3
         self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
 
-        prefill_a = _FakeReq(10, prefix_len=2)
-        prefill_b = _FakeReq(14, prefix_len=3)
+        prefill_a = _FakeReq(10)
+        prefill_b = _FakeReq(14)
         decode_req = _FakeReq(8, output_len=3)
         batch = self._make_batch(
             forward_mode=_FakeForwardMode(is_mixed=True, is_extend=True),
             reqs=[prefill_a, prefill_b, decode_req],
             decoding_reqs=[decode_req],
+            prefix_lens=[2, 3, decode_req.seqlen - 1],
             prefill_stats=PrefillStats(
                 log_input_tokens=12,
                 log_hit_tokens=5,
