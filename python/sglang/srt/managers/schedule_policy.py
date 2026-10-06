@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -159,74 +158,6 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
-def match_prefix_for_req(
-    tree_cache: BasePrefixCache,
-    req: Req,
-    token_ids: Optional[array[int]] = None,
-    *,
-    cow_mamba: bool = False,
-    include_req: bool = False,
-    max_prefix_len: Optional[int] = None,
-):
-    if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
-
-    # unified_kv SWA lives in a per-request ring that's not content-stable and is
-    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
-    # the match by the trailing sliding window so it gets re-prefilled, rewriting
-    # this request's SWA ring. No-op for other layouts.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-    if max_prefix_len is not None:
-        key_limit = (
-            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
-        )
-
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
-            cow_mamba=cow_mamba,
-            req=req if include_req else None,
-        )
-    )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(
-            tree_cache, match_result, extra_key=req.extra_key
-        )
-    (
-        req.prefix_indices,
-        req.last_node,
-        req.last_host_node,
-        req.best_match_node,
-        req.host_hit_length,
-        req.swa_host_hit_length,
-        req.mamba_host_hit_length,
-    ) = (
-        match_result.device_indices,
-        match_result.last_device_node,
-        match_result.last_host_node,
-        match_result.best_match_node,
-        match_result.host_hit_length,
-        match_result.swa_host_hit_length,
-        match_result.mamba_host_hit_length,
-    )
-    max_len = req._compute_max_prefix_len(len(token_ids))
-    req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
-    )
-    req.swa_branching_seqlen = match_result.swa_branching_seqlen
-    if match_result.mamba_branching_seqlen is not None:
-        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
-    if match_result.cache_protected_len is not None:
-        req.kv.cache_protected_len = match_result.cache_protected_len
-    return match_result
-
-
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -285,7 +216,7 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r, include_req=True)
+                r.match_prefix(self.tree_cache, include_req=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -394,9 +325,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_prefix_for_req(
-                self.tree_cache, r, prefix_ids, include_req=True
-            )
+            match_result = r.match_prefix(self.tree_cache, prefix_ids, include_req=True)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
