@@ -154,6 +154,8 @@ class _CacheEntry:
     owner: int
     preferred: bool
     device_resident: bool = False
+    # stored by warmup and not yet hit by a served request
+    provisional: bool = False
 
     @classmethod
     def snapshot(cls, output, size, owner, preferred, device_resident):
@@ -295,6 +297,19 @@ class ConditioningCache:
             entry.wait()
         self._entries.clear()
         self.bytes = 0
+
+    def _recycle_provisional_entries(self):
+        """Free warmup-only entries so served snapshots reuse their pinned blocks
+        instead of pinning fresh pages (~0.3 ms/MB). Seeded negatives stay."""
+        for key in [
+            key
+            for key, entry in self._entries.items()
+            if entry.provisional and not entry.preferred
+        ]:
+            removed = self._entries.pop(key)
+            removed.wait()
+            self.bytes -= removed.size
+            self.evictions += 1
 
     def invalidate(self, parameters):
         if parameters is None:
@@ -453,6 +468,8 @@ class ConditioningCache:
             self.hits += 1
             if entry is not None:
                 entry.preferred |= _prefer_cache.get()
+                if not _refresh_cache.get():
+                    entry.provisional = False
                 self._entries.move_to_end(key)
             if group_entry is not None:
                 self.group_hits += 1
@@ -511,6 +528,9 @@ class ConditioningCache:
         if old is not None:
             old.wait()
             self.bytes -= old.size
+        refresh = _refresh_cache.get()
+        if not refresh:
+            self._recycle_provisional_entries()
         preferred = _prefer_cache.get()
         evictable = [
             key
@@ -535,6 +555,7 @@ class ConditioningCache:
         self._entries[key] = _CacheEntry.snapshot(
             output, size, self._identity(model), preferred, keep_on_device
         )
+        self._entries[key].provisional = refresh
         self.bytes += size
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",

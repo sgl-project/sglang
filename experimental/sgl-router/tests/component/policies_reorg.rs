@@ -114,6 +114,7 @@ fn registry() -> Arc<WorkerRegistry> {
 
 fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
     }
@@ -259,6 +260,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         prefix: None,
         model: &model,
         input_tokens: 10,
+        total_input_tokens: 10,
         expected_peak_tokens: Some(20),
         token_ids: None,
         session_key: None,
@@ -427,6 +429,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         prefix: None,
         model: &model,
         input_tokens: 2,
+        total_input_tokens: 2,
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
         session_key: Some("session"),
