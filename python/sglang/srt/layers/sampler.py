@@ -20,7 +20,12 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -110,6 +115,7 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
+        self._resolve_tp_sync_group_per_call = get_disagg().enable_pdmux
         self.tp_sync_group = get_parallel().tp_group.device_group
         self.cp_sync_group = None
         if is_dp_attention_enabled():
@@ -129,6 +135,19 @@ class Sampler(nn.Module):
         self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
 
         self.output_logprob_processor = OutputLogprobProcessor()
+
+    def _get_tp_sync_group(self):
+        # A final prefill sample can overlap decode sampling. Resolve the
+        # lane's communicator instead of retaining the construction-time group.
+        if self._resolve_tp_sync_group_per_call:
+            parallel = get_parallel()
+            group = (
+                parallel.attn_tp_group
+                if is_dp_attention_enabled()
+                else parallel.tp_group
+            )
+            return group.device_group
+        return self.tp_sync_group
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -558,10 +577,9 @@ class Sampler(nn.Module):
 
         # All replicas must make the same request-abort decision.
         if dist.is_initialized():
-            if dist.get_world_size(self.tp_sync_group) > 1:
-                dist.all_reduce(
-                    statuses, op=dist.ReduceOp.MAX, group=self.tp_sync_group
-                )
+            tp_sync_group = self._get_tp_sync_group()
+            if dist.get_world_size(tp_sync_group) > 1:
+                dist.all_reduce(statuses, op=dist.ReduceOp.MAX, group=tp_sync_group)
             if (
                 self.cp_sync_group is not None
                 and dist.get_world_size(self.cp_sync_group) > 1
@@ -692,7 +710,7 @@ class Sampler(nn.Module):
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
+                group=self._get_tp_sync_group(),
             )
 
     def compute_logprobs_only(

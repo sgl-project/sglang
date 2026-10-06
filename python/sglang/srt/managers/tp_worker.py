@@ -718,6 +718,9 @@ class TpModelWorker(BaseTpWorker):
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        # Decode resets the consumer between slices; restore load-back fences.
+        self.set_hicache_consumer(batch.hicache_consumer_index)
+
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(
                 batch,

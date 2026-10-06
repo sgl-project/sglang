@@ -2212,6 +2212,11 @@ def pdmux_prefill_tp_group():
         yield
 
 
+def is_pdmux_enabled() -> bool:
+    """Whether the duplicate PDMux prefill communicator has been initialized."""
+    return _PDMUX_PREFILL_TP_GROUP is not None
+
+
 def get_tp_group() -> GroupCoordinator:
     return get_parallel().tp_group
 

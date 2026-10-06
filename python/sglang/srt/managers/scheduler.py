@@ -634,6 +634,7 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
+        self.init_pdmux_prefill_plan_limit(self.tp_worker.model_runner.attn_backend)
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -3177,11 +3178,12 @@ class Scheduler(
                     storage_hit_end=storage_hit_end,
                 )
 
-    def _process_storage_prefetch_retries(self):
+    def _process_storage_prefetch_retries(self) -> bool:
         """Issue due L3 attempts in the current waiting-queue order."""
         retries = self.tree_cache.storage_prefetch_retries
         if retries is None:
-            return
+            return False
+        retried = False
         memory = get_memory()
         for req, storage_hit_end in retries.pop_ready(
             self.waiting_queue,
@@ -3189,6 +3191,8 @@ class Scheduler(
             memory.hicache_storage_prefetch_retry_max_attempts,
         ):
             self._retry_storage_prefetch(req, storage_hit_end)
+            retried = True
+        return retried
 
     def _retry_storage_prefetch(
         self, req: Req, storage_hit_end: Optional[int] = None
@@ -3630,7 +3634,7 @@ class Scheduler(
 
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
-    ) -> None:
+    ) -> bool:
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
@@ -3639,9 +3643,18 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            device_work = self.tree_cache.check_hicache_events()
+            # Legacy external cache implementations return None and may free
+            # failed-load pages. Conservatively publish their dependency.
+            device_work = device_work is None or bool(device_work)
             if self.enable_hicache_storage and should_retry_storage_prefetch:
-                self._process_storage_prefetch_retries()
+                device_work = self._process_storage_prefetch_retries() or device_work
+            return device_work
+        return False
+
+    def check_hicache_events_if_enabled(self) -> bool:
+        """Drain events and report allocator/mapping work for stream ordering."""
+        return self._process_hicache_events()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
@@ -3910,19 +3923,25 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # One DSV compressor plan has a hard token bound, including the first request.
+        max_prefill_tokens, enforce_max_prefill_tokens = (
+            self._get_prefill_admission_config(self.max_prefill_tokens)
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
+            enforce_max_prefill_tokens=enforce_max_prefill_tokens,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -4479,10 +4498,14 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
+            elif self.enable_pdmux and batch is self.split_prefill_batch:
+                if batch.split_index == 0:
+                    resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+                if batch_result.has_sampled_token_ids:
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
@@ -5026,6 +5049,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            and (not self.enable_pdmux or self.split_prefill_batch is None)
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -5296,6 +5320,8 @@ class Scheduler(
         if self.enable_continuous_input_polling and self.result_queue:
             # Polling can run intake before the newest queued batch becomes last_batch.
             inflight_batches.extend(batch for batch, _ in self.result_queue)
+        if self.enable_pdmux and self.split_prefill_batch is not None:
+            inflight_batches.append(self.split_prefill_batch)
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):

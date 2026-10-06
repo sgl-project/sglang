@@ -3435,8 +3435,8 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
-    def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+    def check_hicache_events(self) -> bool:
+        """Poll async HiCache events and report possible device-side work."""
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -3456,13 +3456,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
-            return
+            return False
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
+
+        write_back_policy = (
+            self.cache_controller is not None
+            and getattr(self.cache_controller, "write_policy", None) == "write_back"
+        )
 
         (
             write_finish_count,
@@ -3496,6 +3501,14 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        # Buffer-mode load acks can release auxiliary device slots after H2D.
+        # Ordinary write-through acks only release host/device locks and do not
+        # need a new prefill-to-decode dependency.
+        return (
+            (write_back_policy and write_finish_count > 0)
+            or (self.buffer_pipeline is not None and load_finish_count > 0)
+            or (self.enable_storage and any(storage_queue_sizes))
+        )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

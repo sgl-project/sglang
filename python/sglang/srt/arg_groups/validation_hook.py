@@ -169,9 +169,24 @@ def check_server_args(server_args: Any):
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
         )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
+        assert cfg.speculative_algorithm is None, (
+            "PD-Multiplexing speculative decoding requires the split-prefill worker adapter."
         )
+        assert not cfg.enable_dp_attention, (
+            "PD-Multiplexing attention DP requires rank-aligned split-prefill support."
+        )
+        if cfg.chunked_prefill_size > 0:
+            assert not cfg.enable_mixed_chunk, (
+                "PD-Multiplexing does not support mixed prefill/decode chunks."
+            )
+        if cfg.pdmux_config_path:
+            from sglang.srt.multiplex.pdmux_context import load_pdmux_config
+
+            yaml_groups = load_pdmux_config(cfg.pdmux_config_path).sm_group_num
+            assert yaml_groups == cfg.sm_group_num, (
+                "--sm-group-num must match the PDMux YAML sm_group_num "
+                f"(CLI={cfg.sm_group_num}, YAML={yaml_groups})."
+            )
         assert cfg.disaggregation_mode == "null", (
             "PD-Multiplexing is not compatible with disaggregation mode."
         )
