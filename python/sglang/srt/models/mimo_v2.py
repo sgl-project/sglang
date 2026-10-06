@@ -24,6 +24,7 @@ from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -105,8 +106,7 @@ def load_mimo_v2_qkv_proj_weight(
     *,
     qkv_proj: QKVParallelLinear,
 ):
-    tp_size = qkv_proj.tp_size
-    tp_rank = qkv_proj.tp_rank
+    tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
     ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
 
     if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
@@ -211,8 +211,7 @@ def _resolve_deferred_qkv_scale_inv(
             )
 
         qkv_proj = model.get_submodule(weight_name.rsplit(".", 1)[0])
-        tp_size = qkv_proj.tp_size
-        tp_rank = qkv_proj.tp_rank
+        tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
         shards_per_rank = ckpt_tp // tp_size
         weight_param = params_dict[weight_name]
         scale_param = params_dict[scale_name]
@@ -1608,7 +1607,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             projection = self.get_submodule(
                                 name.rsplit(".", 1)[0]
                             ).qkv_proj
-                            start = projection.tp_rank * param.numel()
+                            start = (
+                                get_group_rank_size(projection.tp_group)[0]
+                                * param.numel()
+                            )
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

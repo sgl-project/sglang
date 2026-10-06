@@ -1945,8 +1945,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             *,
             q_b_proj: ColumnParallelLinear,
         ):
-            attn_tp_rank = q_b_proj.tp_rank
-            attn_tp_size = q_b_proj.tp_size
+            group = q_b_proj.tp_group
+            attn_tp_rank = group.rank_in_group if group is not None else 0
+            attn_tp_size = group.world_size if group is not None else 1
             assert weight.ndim > cat_dim, (
                 f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
             )

@@ -14,7 +14,7 @@ from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -113,7 +113,7 @@ def load_sinks(
     source = (
         torch.arange(source_heads, device=param.device, dtype=torch.float32) + offset
     ) / 16
-    start = attention.qkv_proj.tp_rank * param.numel()
+    start = rank_size(attention.qkv_proj)[0] * param.numel()
     expected = source[start : start + param.numel()].to(param.dtype)
     if cpu_padding and expected.numel() < param.numel():
         expected = torch.cat(

@@ -27,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -1277,8 +1278,11 @@ class GptOssForCausalLM(nn.Module):
                             projection = self.get_submodule(
                                 name.rsplit(".", 1)[0]
                             ).qkv_proj
-                            start = projection.tp_rank * param.numel()
-                            tp_size = projection.tp_size
+                            start = (
+                                get_group_rank_size(projection.tp_group)[0]
+                                * param.numel()
+                            )
+                            tp_size = get_group_rank_size(projection.tp_group)[1]
                             full_shard_size = param.numel() * tp_size
                             # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
                             # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.

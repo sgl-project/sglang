@@ -15,7 +15,7 @@ from sglang.srt.models.dots3_common.modeling import (
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -157,7 +157,7 @@ def load_fused(
         model.load_weights(weights, is_nextn=nextn)
         post.assert_called_once()
     owner = attention.q_b_proj
-    gate = parts["g_proj.weight"].chunk(owner.tp_size, 0)[owner.tp_rank]
+    gate = parts["g_proj.weight"].chunk(rank_size(owner)[1], 0)[rank_size(owner)[0]]
 
     def pad(t, target):
         return torch.cat((t, t.new_zeros(target - t.shape[0], t.shape[1])), 0)
@@ -177,8 +177,8 @@ def load_fused(
         torch.testing.assert_close(
             module.weight.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
         )
-        start = owner.tp_rank * gate.shape[0] // 128
-        end = ((owner.tp_rank + 1) * gate.shape[0] + 127) // 128
+        start = rank_size(owner)[0] * gate.shape[0] // 128
+        end = ((rank_size(owner)[0] + 1) * gate.shape[0] + 127) // 128
         expected_scale = torch.cat(
             (
                 parts["q_a_proj.weight_scale_inv"],

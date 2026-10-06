@@ -20,6 +20,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -343,7 +344,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
                         projection = self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
-                        start = projection.tp_rank * param.numel()
+                        start = (
+                            get_group_rank_size(projection.tp_group)[0] * param.numel()
+                        )
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(

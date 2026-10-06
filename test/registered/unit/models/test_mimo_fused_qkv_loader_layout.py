@@ -17,7 +17,7 @@ from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -92,21 +92,23 @@ def values(shape, dtype, offset=0):
 def load_fused(projection, *, changed=False, ckpt_tp=None, sharded=False, offset=0):
     weight = projection.weight
     full = values(
-        (weight.shape[0] * projection.tp_size, weight.shape[1]), weight.dtype, offset
+        (weight.shape[0] * rank_size(projection)[1], weight.shape[1]),
+        weight.dtype,
+        offset,
     )
-    shards = full.chunk(projection.tp_size, dim=0)
-    data = shards[projection.tp_rank] if sharded else full
+    shards = full.chunk(rank_size(projection)[1], dim=0)
+    data = shards[rank_size(projection)[0]] if sharded else full
     with loading_scope(changed):
         load_mimo_v2_qkv_proj_weight(
             WEIGHT_NAME, weight, data, ckpt_tp, qkv_proj=projection
         )
-    torch.testing.assert_close(weight, shards[projection.tp_rank], rtol=0, atol=0)
+    torch.testing.assert_close(weight, shards[rank_size(projection)[0]], rtol=0, atol=0)
     return weight
 
 
 def load_deferred(model, projection, *, changed=False, offset=0):
     ckpt_tp = 8
-    rows = projection.weight.shape[0] * projection.tp_size
+    rows = projection.weight.shape[0] * rank_size(projection)[1]
     full = values((rows, 128), torch.float8_e4m3fn, offset)
     # Each checkpoint shard has 448 rows, requiring four 128-row scales.
     scale = ((torch.arange(32, device="cuda") + offset) % 3 + 1).float().reshape(
@@ -136,8 +138,8 @@ def load_deferred(model, projection, *, changed=False, offset=0):
         _resolve_deferred_qkv_scale_inv(
             params, deferred, ckpt_tp, config=config, model=model
         )
-    first = projection.tp_rank * (ckpt_tp // projection.tp_size)
-    last = first + ckpt_tp // projection.tp_size
+    first = rank_size(projection)[0] * (ckpt_tp // rank_size(projection)[1])
+    last = first + ckpt_tp // rank_size(projection)[1]
     dequant = []
     for index in range(first, last):
         shard = full.chunk(ckpt_tp, dim=0)[index].float()
@@ -202,8 +204,8 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                     for ckpt_tp, sharded in (
                         (None, True),
                         (None, False),
-                        (projection.tp_size, True),
-                        (projection.tp_size, False),
+                        (rank_size(projection)[1], True),
+                        (rank_size(projection)[1], False),
                         (8, False),
                     ):
                         for offset in (0, 11):
@@ -253,7 +255,9 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                         del model.model.layers
                         name = "model.mtp.layers.0.self_attn.qkv_proj.weight"
                     full = values((3584, 128), projection.weight.dtype)
-                    expected = full.chunk(projection.tp_size, dim=0)[projection.tp_rank]
+                    expected = full.chunk(rank_size(projection)[1], dim=0)[
+                        rank_size(projection)[0]
+                    ]
                     for changed in (False, True):
                         with loading_scope(changed):
                             model.load_weights([(name, full)])

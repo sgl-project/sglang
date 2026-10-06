@@ -13,7 +13,7 @@ from sglang.srt.models.interns1pro import (
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -101,7 +101,11 @@ def load_coefficients(model, attention, *, changed=False, offset=0, top_level=Fa
             - 18
         ).float().reshape(shape) / 64
         owner = attention.qkv_proj
-        first = owner.tp_rank // max(1, owner.tp_size // shape[0]) * param.shape[0]
+        first = (
+            rank_size(owner)[0]
+            // max(1, rank_size(owner)[1] // shape[0])
+            * param.shape[0]
+        )
         expected = full[first : first + param.shape[0]]
         name = "model.rotary_emb." + coefficient
         if top_level:
