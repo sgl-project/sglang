@@ -35,6 +35,7 @@ if not is_npu():
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
+    ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )

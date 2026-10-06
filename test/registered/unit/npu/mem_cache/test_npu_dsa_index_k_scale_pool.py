@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -33,18 +34,22 @@ LAYER_NUM = 2
 class TestNPUIndexKScaleBuffer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.pool = NPUMLATokenToKVPool(
-            size=SIZE,
-            page_size=PAGE_SIZE,
-            dtype=torch.float8_e4m3fn,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            layer_num=LAYER_NUM,
-            device="npu",
-            enable_memory_saver=False,
-            index_head_dim=INDEX_HEAD_DIM,
-            kv_cache_dim=KV_CACHE_DIM,
-        )
+        # The pool reads the DCP topology from the runtime parallel context,
+        # which nothing publishes in a unit test; state the single-rank
+        # widths explicitly.
+        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+            cls.pool = NPUMLATokenToKVPool(
+                size=SIZE,
+                page_size=PAGE_SIZE,
+                dtype=torch.float8_e4m3fn,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                layer_num=LAYER_NUM,
+                device="npu",
+                enable_memory_saver=False,
+                index_head_dim=INDEX_HEAD_DIM,
+                kv_cache_dim=KV_CACHE_DIM,
+            )
 
     def test_scale_buffer_layout(self):
         # One E8M0 byte per 32-element block: per-token tail (k_n, d/64, 2)
@@ -133,18 +138,19 @@ class TestNPUIndexKScaleBuffer(unittest.TestCase):
 @unittest.skipUnless(HAVE_NPU, "Ascend NPU device required")
 class TestHostIndexKScaleMirror(unittest.TestCase):
     def test_mirror_matches_device_pool(self):
-        device_pool = NPUMLATokenToKVPool(
-            size=SIZE,
-            page_size=PAGE_SIZE,
-            dtype=torch.float8_e4m3fn,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            layer_num=LAYER_NUM,
-            device="npu",
-            enable_memory_saver=False,
-            index_head_dim=INDEX_HEAD_DIM,
-            kv_cache_dim=KV_CACHE_DIM,
-        )
+        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+            device_pool = NPUMLATokenToKVPool(
+                size=SIZE,
+                page_size=PAGE_SIZE,
+                dtype=torch.float8_e4m3fn,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                layer_num=LAYER_NUM,
+                device="npu",
+                enable_memory_saver=False,
+                index_head_dim=INDEX_HEAD_DIM,
+                kv_cache_dim=KV_CACHE_DIM,
+            )
         host = MLATokenToKVPoolHost(
             device_pool=device_pool,
             host_to_device_ratio=1.0,

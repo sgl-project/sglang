@@ -25,6 +25,7 @@ if HAVE_NPU:
     # Importing dsa_npu_indexer on NPU also registers the CANN
     # ops-transformer kernels under torch.ops.cann_ops_transformer.
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
         _check_quant_lightning_indexer_constraints,
         _quantize_npu_indexer_activation,
@@ -48,18 +49,22 @@ KV_CACHE_DIM = KV_LORA_RANK + KV_LORA_RANK // 128 * 4 + QK_ROPE_HEAD_DIM * 2
 
 
 def _make_pool() -> NPUMLATokenToKVPool:
-    return NPUMLATokenToKVPool(
-        size=SIZE,
-        page_size=PAGE_SIZE,
-        dtype=torch.float8_e4m3fn,
-        kv_lora_rank=KV_LORA_RANK,
-        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-        layer_num=1,
-        device="npu",
-        enable_memory_saver=False,
-        index_head_dim=HEAD_DIM,
-        kv_cache_dim=KV_CACHE_DIM,
-    )
+    # The pool reads the DCP topology from the runtime parallel context,
+    # which nothing publishes in a unit test; state the single-rank
+    # widths explicitly.
+    with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+        return NPUMLATokenToKVPool(
+            size=SIZE,
+            page_size=PAGE_SIZE,
+            dtype=torch.float8_e4m3fn,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            layer_num=1,
+            device="npu",
+            enable_memory_saver=False,
+            index_head_dim=HEAD_DIM,
+            kv_cache_dim=KV_CACHE_DIM,
+        )
 
 
 @unittest.skipUnless(HAVE_NPU, "Ascend NPU device required")
@@ -129,6 +134,9 @@ class TestQuantizeNPUIndexerActivation(unittest.TestCase):
         # scale[..., b // 2, b % 2]) must reproduce the hadamard-rotated
         # input within e4m3 precision. The e8m0/e4m3 -> float32 casts are
         # unsupported on the NPU, so the dequant math runs on CPU.
+        # The draw is pinned and rtol covers e4m3's worst-case ~12.5%
+        # rounding plus the bf16 rotation error.
+        torch.manual_seed(0)
         x = torch.randn(64, HEAD_DIM, dtype=torch.bfloat16, device="npu")
         quantized, scale = _quantize_npu_indexer_activation(
             x, self.hadamard, torch.float8_e4m3fn
@@ -142,7 +150,7 @@ class TestQuantizeNPUIndexerActivation(unittest.TestCase):
             dequantized[:, block] = (
                 quantized_cpu[:, block] * scales[:, b // 2, b % 2].unsqueeze(-1)
             )
-        torch.testing.assert_close(dequantized, rotated, rtol=0.10, atol=0.05)
+        torch.testing.assert_close(dequantized, rotated, rtol=0.16, atol=0.05)
 
 
 @unittest.skipUnless(HAVE_NPU, "Ascend NPU device required")
