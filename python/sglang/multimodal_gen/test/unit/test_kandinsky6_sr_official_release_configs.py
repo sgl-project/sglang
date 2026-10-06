@@ -357,9 +357,13 @@ def test_legacy_bundle_requires_official_diffusers_layout(tmp_path):
             }
         )
     )
+    for name in ("dit", "vae"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "diffusion_pytorch_model.safetensors").touch()
     pipeline = object.__new__(Kandinsky6SRPipeline)
+    pipeline.server_args = SimpleNamespace(model_subfolder=None, revision=None)
     pipeline.model_path = str(tmp_path)
     with pytest.raises(
         ValueError, match="k6_video SR bundle.*kandinskylab/Kandinsky-6.0-VSR"
     ):
-        pipeline.load_modules(SimpleNamespace())
+        pipeline.load_modules(pipeline.server_args)

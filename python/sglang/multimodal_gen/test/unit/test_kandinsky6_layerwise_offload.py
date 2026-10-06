@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the declared offload groups, not just component selection."""
 
-import os
 import sys
 from types import SimpleNamespace
 
@@ -25,7 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    global_force_attn_backend,
+    global_force_attn_backend_context_manager,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -42,37 +41,39 @@ from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_audio import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsky6SRVAE
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import set_global_server_args
-from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils import precision
 from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import TINY_LU_MODEL
 from sglang.srt.utils.network import get_free_port_below_ephemeral
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def single_gpu():
+@pytest.fixture(autouse=True)
+def single_gpu(monkeypatch, default_global_server_args):
     if not model_parallel_is_initialized():
         port = get_free_port_below_ephemeral()
-        os.environ.update(
+        for key, value in dict(
             MASTER_ADDR="127.0.0.1",
             MASTER_PORT=str(port),
             RANK="0",
             LOCAL_RANK="0",
             WORLD_SIZE="1",
-        )
+        ).items():
+            monkeypatch.setenv(key, value)
         maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-    global_force_attn_backend(AttentionBackendEnum.FA)
-    set_mixed_precision_policy(torch.bfloat16, torch.float32)
-    set_global_server_args(
-        SimpleNamespace(
-            attention_backend="fa",
-            attention_backend_config=None,
-            kv_gather_degree=1,
-            sp_split_auto=False,
-            pipeline_config=Kandinsky6TI2VAPipelineConfig(),
-        )
+    monkeypatch.setattr(
+        precision._mixed_precision_state,
+        "state",
+        precision.MixedPrecisionState(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        ),
     )
+    args = get_global_server_args()
+    args.attention_backend = "fa"
+    args.pipeline_config = Kandinsky6TI2VAPipelineConfig()
+    with global_force_attn_backend_context_manager(AttentionBackendEnum.FA):
+        yield
 
 
 def _dit(multimodal):
