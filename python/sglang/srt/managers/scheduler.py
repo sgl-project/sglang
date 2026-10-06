@@ -3668,12 +3668,9 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
-            # Stash (cache) the previous chunk only when it produced new KV
-            # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves extend_range.end ==
-            # prefix_len, so there is nothing new to cache and
-            # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > self.chunked_req.prefix_len:
+            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
+            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -4115,7 +4112,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4124,9 +4121,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
+                    self.chunked_req.extend_len if self.chunked_req is not None else 0
                 ),
             ),
         )
@@ -4608,10 +4603,9 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob or batch.return_hidden_states:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                batch_result.extend_input_len_per_req = (
+                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+                )
             else:
                 batch_result.extend_input_len_per_req = None
 
@@ -5464,7 +5458,7 @@ class Scheduler(
                 and (req := self.chunked_req) is not None
             ):
                 # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 

@@ -427,8 +427,7 @@ class C_SchedulerHook(BaseHook):
                     for req in batch.reqs:
                         extend_length = getattr(req, "extend_input_len", None)
                         if extend_length is None:
-                            # The range API represents extend tokens as a half-open interval.
-                            extend_length = req.extend_range.length
+                            extend_length = req.extend_len
                         simulation_batch.reqs.append(
                             ScheduleRequest(
                                 extend_length=extend_length,

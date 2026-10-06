@@ -170,9 +170,9 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
-        tree_cache.checkpoint(req, up_to=req.extend_range.end)
+        tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
-    req.prefix_len = req.extend_range.end
+    req.prefix_len = req.extend_end
 
 
 def evict_from_tree_cache(

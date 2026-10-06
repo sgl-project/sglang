@@ -69,7 +69,6 @@ from typing import (
     Generic,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -1325,15 +1324,6 @@ def get_current_device_stream_fast():
 # ==============================================================================
 # END: Multi-Device & CUDA Version Utilities
 # ==============================================================================
-
-
-class Range(NamedTuple):
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
 
 
 def assert_int64_array(values: array, name: str) -> None:

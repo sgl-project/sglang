@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.common import Range
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -91,7 +90,7 @@ class MockReq:
         self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None, lock=None
     ):
         self.full_untruncated_fill_ids = array("q", fill_ids)
-        self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
+        self.extend_end = len(self.full_untruncated_fill_ids)
         self.origin_input_ids = array(
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
@@ -111,7 +110,7 @@ class MockReq:
         self.kv_rotation_base = None
 
     def get_fill_ids(self):
-        return self.full_untruncated_fill_ids[: self.extend_range.end]
+        return self.full_untruncated_fill_ids[: self.extend_end]
 
     rid = "mock-req"
     skip_radix_cache_insert = False
@@ -264,7 +263,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Step 2: checkpoint (dec old lock, inc new lock)
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         # Step 3: release_kv_cache (insert, free the rest, dec lock)
         req.finished_reason = "finished"
@@ -315,7 +314,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Step 2: checkpoint (dec root=no-op, inc new leaf)
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         # Step 3: cache_finished_req (dec leaf)
         req.finished_reason = "finished"
@@ -661,7 +660,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
                 scheduler, SimpleNamespace(batch_size=lambda: 0)
             )
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
@@ -698,7 +697,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 lock=lock,
             )
 
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
             req.finished_reason = "finished"
             release_kv_cache(req, cache, checkpoint=True)
 

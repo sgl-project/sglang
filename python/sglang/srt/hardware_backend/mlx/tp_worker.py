@@ -205,9 +205,9 @@ class MlxTpModelWorker(TpModelWorker):
         discarded (the runner pops it as the stale intermediate token), so
         the runner may skip the logit head for it.
         """
-        if req.extend_range is None:
+        if req.extend_end is None:
             return True
-        return req.extend_range.end >= len(req.full_untruncated_fill_ids)
+        return req.extend_end >= len(req.full_untruncated_fill_ids)
 
     @staticmethod
     def _sampling_active(batch: ScheduleBatch) -> bool:

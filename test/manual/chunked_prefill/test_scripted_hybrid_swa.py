@@ -97,7 +97,7 @@ class TestSWABasic(ScriptedTestCase):
         for _ in range(400):
             if r.is_chunking:
                 assert r.req.prefix_len <= r.req.kv.kv_committed_len, (
-                    f"prefix_indices must be bounded by kv_committed_len, "
+                    f"prefix_len must be bounded by kv_committed_len, "
                     f"got prefix_indices_len={r.req.prefix_len}, "
                     f"kv_committed_len={r.req.kv.kv_committed_len}"
                 )

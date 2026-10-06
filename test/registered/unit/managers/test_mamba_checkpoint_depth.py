@@ -54,7 +54,7 @@ def _track_seqlen(
         vocab_size=128,
     )
     req.prefix_len = prefix_len
-    req.set_extend_range(prefix_len, prefix_len + extend_len)
+    req.extend_end = prefix_len + extend_len
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0
     req.mamba_branching_seqlen = None

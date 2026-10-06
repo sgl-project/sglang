@@ -209,7 +209,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
 
                 self.assertIsNone(adder.add_chunked_req(req))
                 self.assertEqual(adder.can_run_list, [req])
-                self.assertEqual(req.extend_range.length, 1)
+                self.assertEqual(req.extend_len, 1)
 
     def test_unaligned_ignore_eos_enters_empty_pool(self):
         for page_size in (4, 64):

@@ -33,7 +33,6 @@ from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -350,7 +349,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req = SimpleNamespace(
             pending_bootstrap=True,
             kv=SimpleNamespace(req_pool_idx=0),
-            extend_range=Range(0, 5),
+            extend_end=5,
         )
 
         SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)

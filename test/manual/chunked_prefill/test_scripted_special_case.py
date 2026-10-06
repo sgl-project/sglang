@@ -332,7 +332,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 expected = chunked.seqlen - chunked.prefix_len
                 assert pending == expected, (
                     f"load_inquirer chunked contribution must equal the prefix-"
-                    f"subtracting formula seqlen - len(prefix_indices) = {expected}; "
+                    f"subtracting formula seqlen - prefix_len = {expected}; "
                     f"got {pending}"
                 )
                 assert pending <= chunked.seqlen, (
@@ -377,7 +377,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 observed = s.load_inquirer._get_num_pending_tokens()
                 assert observed == expected, (
                     f"chunked contribution must equal remainder "
-                    f"seqlen - len(prefix_indices) = {expected}, got {observed}; "
+                    f"seqlen - prefix_len = {expected}, got {observed}; "
                     f"a value of {chunked.seqlen} would mean the committed prefix "
                     "is being double-counted"
                 )
@@ -407,9 +407,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and chunked is not None
                 and chunked.rid == r.rid
-                and chunked.extend_range.length > 0
+                and chunked.extend_len > 0
             ):
-                deduct = chunked.extend_range.length
+                deduct = chunked.extend_len
                 base = s.load_inquirer._get_num_pending_tokens()
                 deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
                 assert deducted == base - deduct, (
@@ -474,17 +474,15 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and r.chunks_done >= 1
                 and req is not None
-                and req.extend_range is not None
+                and req.extend_end is not None
             ):
                 saw_mid_chunk = True
-                assert (
-                    req.extend_range.end == req.prefix_len + req.extend_range.length
-                ), (
+                assert req.extend_end == req.prefix_len + req.extend_len, (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
-                    f"fill_ids_len={req.extend_range.end}, "
+                    f"fill_ids_len={req.extend_end}, "
                     f"prefix_indices_len={req.prefix_len}, "
-                    f"extend_input_len={req.extend_range.length}, "
+                    f"extend_input_len={req.extend_len}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
@@ -779,11 +777,11 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         page_size = 16
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.req.extend_range is not None:
+            if r.is_chunking and r.req.extend_end is not None:
                 saw_chunking = True
-                assert r.req.extend_range.length % page_size == 0, (
+                assert r.req.extend_len % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
-                    f"got extend_input_len={r.req.extend_range.length}, page_size={page_size}"
+                    f"got extend_input_len={r.req.extend_len}, page_size={page_size}"
                 )
             if r.finished:
                 break

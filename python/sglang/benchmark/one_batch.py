@@ -424,7 +424,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(req.prefix_len, len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return input_ids, reqs
@@ -441,7 +441,7 @@ def prepare_extend_inputs_for_correctness_test(
             # The cut prefix is already in the request's row from the first extend.
             req.prefix_len = bench_args.cut_len
             req.logprob_start_len = -1
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
     return reqs
 
 
@@ -468,7 +468,7 @@ def prepare_synthetic_inputs_for_latency_test(
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(req.prefix_len, len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return reqs
