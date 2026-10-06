@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import math
 import os
+import weakref
 from collections import defaultdict
 from functools import lru_cache
 
@@ -233,6 +236,97 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
 
 
+@lru_cache(maxsize=1)
+def _hip_runtime() -> ctypes.CDLL:
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        find_loaded_library,
+    )
+
+    # Bind the copy torch loaded; dlopen by soname could load a second HIP runtime.
+    path = find_loaded_library("libamdhip64")
+    if path is None:
+        raise RuntimeError("libamdhip64 is not loaded in this process")
+    lib = ctypes.CDLL(path)
+    lib.hipHostMalloc.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    lib.hipHostMalloc.restype = ctypes.c_int
+    lib.hipHostFree.argtypes = [ctypes.c_void_p]
+    lib.hipHostFree.restype = ctypes.c_int
+    lib.hipGetErrorString.argtypes = [ctypes.c_int]
+    lib.hipGetErrorString.restype = ctypes.c_char_p
+    return lib
+
+
+def _hip_host_malloc(nbytes: int) -> int:
+    lib = _hip_runtime()
+    ptr = ctypes.c_void_p()
+    # hipHostMallocDefault, the flags torch's pinned allocator uses.
+    rc = lib.hipHostMalloc(ctypes.byref(ptr), nbytes, 0)
+    if rc != 0:
+        raise RuntimeError(
+            f"hipHostMalloc of {nbytes / 1e9:.2f} GB for a HiCache host pool failed "
+            f"(rc={rc}, {lib.hipGetErrorString(rc).decode()}). With "
+            "HSA_USERPTR_FOR_PAGED_MEM=0 host pools are GTT memory, which all ranks "
+            "on a node share up to /sys/class/drm/card*/device/mem_info_gtt_total. "
+            "Reduce --hicache-size or unset HSA_USERPTR_FOR_PAGED_MEM."
+        )
+    return ptr.value
+
+
+def _hip_host_free(ptr: int) -> None:
+    rc = _hip_runtime().hipHostFree(ptr)
+    if rc != 0:
+        logger.warning("hipHostFree failed (rc=%d) for ptr=%#x", rc, ptr)
+
+
+@lru_cache(maxsize=1)
+def _log_hip_owned_host_pool() -> None:
+    logger.info(
+        "HSA_USERPTR_FOR_PAGED_MEM=0: allocating HiCache host pools with "
+        "hipHostMalloc (GTT) instead of hipHostRegister (USERPTR)."
+    )
+    if envs.SGLANG_HUGEPAGE_SIZE.get():
+        logger.warning(
+            "SGLANG_HUGEPAGE_SIZE is ignored for hipHostMalloc HiCache host pools."
+        )
+
+
+def _uses_hip_owned_host_memory(
+    pin_memory: bool, allocator: HostTensorAllocator
+) -> bool:
+    # hipHostRegister memory is USERPTR even with HSA_USERPTR_FOR_PAGED_MEM=0; any page
+    # migration in it stalls every GPU queue while KFD revalidates. GTT never migrates.
+    return (
+        _is_hip
+        and pin_memory
+        # Storage allocators own their backing (shm fds, registered transfer buffers).
+        and type(allocator) is HostTensorAllocator
+        and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
+    )
+
+
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: its host allocator rounds each block up to a power of
+    # two, so a 180 GB pool would pin 256 GiB of GTT.
+    numel = math.prod(dims)
+    nbytes = numel * dtype.itemsize
+    ptr = _hip_host_malloc(nbytes)
+    try:
+        array = (ctypes.c_uint8 * nbytes).from_address(ptr)
+        buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
+    except BaseException:
+        _hip_host_free(ptr)
+        raise
+    # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
+    weakref.finalize(array, _hip_host_free, ptr).atexit = False
+    # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+    return buffer
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -243,23 +337,13 @@ def alloc_with_host_register(
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
-    CudaHostRegister only applies when pin_memory=True.
+    CudaHostRegister only applies when pin_memory=True. On ROCm with
+    HSA_USERPTR_FOR_PAGED_MEM=0, default-allocator pools come from hipHostMalloc.
     """
-    if (
-        _is_hip
-        and pin_memory
-        and type(allocator) is HostTensorAllocator
-        and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
-    ):
-        # hipHostRegister always uses USERPTR, even when the runtime is asked
-        # to allocate non-USERPTR host memory. Use the HIP-owned allocation in
-        # that mode so CPU page migration cannot invalidate this entire pool.
-        # Storage-specific allocators must retain their own backing/lifetime.
-        buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
-        # PyTorch owns hipHostFree. Do not cudaHostUnregister this allocation
-        # from HostKVCache.destroy(), including during partial startup failure.
-        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
-        return buffer
+    if _uses_hip_owned_host_memory(pin_memory=pin_memory, allocator=allocator):
+        assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
+        _log_hip_owned_host_pool()
+        return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
