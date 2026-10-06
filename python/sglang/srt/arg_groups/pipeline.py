@@ -72,9 +72,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
-    from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
+    from sglang.srt.arg_groups.memory_hook import (
+        handle_disk_offload,
+        handle_offload_compatibility,
+    )
 
     run_hook(handle_offload_compatibility, server_args)
+    run_hook(handle_disk_offload, server_args)
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,

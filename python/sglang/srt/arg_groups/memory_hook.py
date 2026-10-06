@@ -44,6 +44,23 @@ def handle_offload_compatibility(server_args: Any) -> None:
         )
 
 
+def handle_disk_offload(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.offload_mode != "disk" or cfg.offload_group_size <= 0:
+        return
+    if not cfg.disable_cuda_graph:
+        declare_resolution(server_args, "handle_disk_offload", disable_cuda_graph=True)
+        logger.info("--offload-mode disk: disabling CUDA graphs.")
+    if not cfg.disable_overlap_schedule:
+        declare_resolution(
+            server_args, "handle_disk_offload", disable_overlap_schedule=True
+        )
+        logger.info(
+            "--offload-mode disk: disabling the overlap schedule, whose lookahead "
+            "batch costs a full weight-streaming pass per request."
+        )
+
+
 def handle_gpu_memory_settings(server_args: Any):
     """
     Configure GPU memory-dependent settings including

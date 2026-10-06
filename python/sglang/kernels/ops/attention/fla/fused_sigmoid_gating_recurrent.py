@@ -20,11 +20,13 @@ def _select_recurrent_launch_config(
     v: int,
     is_kda: bool,
     target_verify: bool = False,
+    packed_decode: bool = False,
 ) -> tuple[int, int]:
     """Select the value tile and warp count for recurrent GDN."""
     if (
         _is_hip
         and _is_gfx95
+        and not packed_decode
         and not is_kda
         and 0 < n <= 32
         and h == 4
@@ -34,7 +36,7 @@ def _select_recurrent_launch_config(
     ):
         return (8, 4) if n == 1 else (16, 2)
     if (
-        target_verify
+        (target_verify or packed_decode)
         and not _is_hip
         and not is_kda
         and 0 < n <= 64

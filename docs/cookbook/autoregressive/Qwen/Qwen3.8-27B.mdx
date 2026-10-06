@@ -316,6 +316,35 @@ row back to Auto.
   accept length of 4.29, the best result on this card.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
+- **GPUs smaller than the weights (disk offload)**: `--offload-mode disk`
+  streams every decoder layer through two GPU slots, keeping as many layers as
+  `--offload-host-cache-gb` allows in pinned RAM and reading the rest from
+  `--offload-disk-dir` (a local NVMe directory) with O_DIRECT. The input
+  embedding moves to an mmap on the same disk, and CUDA graphs and the overlap
+  schedule are disabled automatically. Decode speed is bound by SSD read
+  bandwidth, so MTP is the multiplier: one weight pass verifies all draft
+  tokens. Measured on an RTX 4050 Laptop (6 GB) with 11 GB of RAM under WSL2
+  and a ~2.5 GB/s NVMe, FP8 checkpoint, greedy:
+  8.5 s/token without speculation, 2.7 s/token with MTP at
+  `--speculative-num-steps 5 --speculative-num-draft-tokens 6` (accept length
+  3.0), 8.8 s to first token. Startup takes ~15 minutes because the processed
+  weights are written to the offload directory.
+
+  ```bash
+  sglang serve --model-path Qwen/Qwen3.8-27B-FP8 --language-model-only \
+    --offload-mode disk --offload-group-size 1 --offload-num-in-group 1 \
+    --offload-prefetch-step 1 --offload-host-cache-gb 5.5 \
+    --offload-disk-dir /path/on/nvme \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+    --enable-linear-replayssm-spec \
+    --attention-backend triton --kv-cache-dtype fp8_e4m3 \
+    --disable-radix-cache --context-length 8192 --max-total-tokens 8192 \
+    --max-running-requests 2 --mem-fraction-static 0.88
+  ```
+
+  Each pinned GiB of `--offload-host-cache-gb` removes that GiB from every
+  pass's SSD reads; leave ~1.5 GB of RAM free for the server processes.
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
   request from 5 slots to 4 at no accuracy cost. On small-VRAM cards (RTX 5090
   32GB) the state pool bounds concurrency long before KV does — prefer lowering

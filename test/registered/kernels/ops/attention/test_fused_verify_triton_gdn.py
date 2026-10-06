@@ -15,11 +15,13 @@ from sglang.srt.utils import is_gfx95_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
+    from sglang.kernels.ops.attention.fla import fused_recurrent as packed_decode_module
     from sglang.kernels.ops.attention.fla import (
         fused_sigmoid_gating_recurrent as recurrent_module,
     )
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
         fused_recurrent_gated_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -302,6 +304,62 @@ def test_sm90_verify_launch_is_bit_exact(
     assert _select_recurrent_launch_config(N, H, HV, K, V, False, True) == (4, 1)
     assert torch.equal(out_tuned, out_default)
     assert torch.equal(states_tuned, states_default)
+
+
+@_requires_sm90
+def test_sm90_packed_decode_launch_config_is_narrow():
+    def select(n: int, h: int, hv: int) -> tuple[int, int]:
+        return _select_recurrent_launch_config(
+            n, h, hv, 128, 128, False, packed_decode=True
+        )
+
+    assert select(1, 16, 48) == (4, 1)
+    assert select(64, 4, 12) == (4, 1)
+    assert select(65, 16, 48) == (32, 1)
+
+
+@_requires_sm90
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+@pytest.mark.parametrize("N", [1, 3, 16, 64])
+@pytest.mark.parametrize("H,HV", [(16, 48), (4, 12)])
+def test_sm90_packed_decode_launch_is_bit_exact(N: int, H: int, HV: int, monkeypatch):
+    """The tuned SM90 packed decode launch matches the BV=32 launch bit for bit."""
+    K = V = 128
+    num_slots = N + 2
+    torch.manual_seed(2025)
+    mixed_qkv = torch.randn(N, 2 * H * K + HV * V, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.randn(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(HV, dtype=torch.float32, device="cuda")
+    initial_state = torch.randn(num_slots, HV, V, K, dtype=torch.float32, device="cuda")
+    state_indices = torch.randperm(num_slots, device="cuda")[:N].to(torch.int32)
+
+    def run(launch_config):
+        monkeypatch.setattr(
+            packed_decode_module, "_select_recurrent_launch_config", launch_config
+        )
+        state = initial_state.clone()
+        out = mixed_qkv.new_empty(N, 1, HV, V)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            initial_state=state,
+            out=out,
+            ssm_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out, state
+
+    out_tuned, state_tuned = run(_select_recurrent_launch_config)
+    out_default, state_default = run(lambda *args, **kwargs: (32, 1))
+
+    assert torch.equal(out_tuned, out_default)
+    assert torch.equal(state_tuned, state_default)
 
 
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
