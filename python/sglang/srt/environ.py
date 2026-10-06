@@ -1126,10 +1126,6 @@ class Envs:
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-    # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
-    # warmup. Opt-in: the extra forward needs transient activation headroom
-    # that small-VRAM or tightly-packed configs may not have.
-    SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
 
     # ===================================================================
     # Triton and Torch compilation
@@ -1963,6 +1959,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
+    ),
+    "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": _DeprecatedEnv(
+        note="The prefill-sized FlashInfer autotune pass always runs; "
+        "pass --disable-flashinfer-autotune to skip autotuning."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),

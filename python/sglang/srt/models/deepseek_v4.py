@@ -109,7 +109,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
@@ -5071,63 +5071,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
-
-    @torch.inference_mode()
-    def wants_prefill_autotune(self) -> bool:
-        return getattr(self.config, "model_type", None) == "deepseek_v41"
-
-    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
-        The quant method is called directly, so no TP collectives run and no
-        request/KV/draft state is touched; the runner owns the autotune context."""
-        if getattr(self.config, "model_type", None) != "deepseek_v41":
-            return 0
-        seen = set()
-        # The backbone excludes vision and lm_head, whose prefill shapes differ.
-        for layer in self.model.modules():
-            method = getattr(layer, "quant_method", None)
-            if not isinstance(method, Fp8LinearMethod):
-                continue
-            if not (method.use_mxfp8 or method.block_fp8_as_mxfp8):
-                continue
-            if method.block_fp8_as_mxfp8 and not getattr(
-                layer, "block_fp8_mxfp8_ready", False
-            ):
-                # No swizzled MXFP8 scale buffer: these kept the block-FP8 fallback.
-                continue
-            backend = method.mxfp8_dense_backend
-            if backend is None or not backend.is_flashinfer_cutedsl():
-                continue
-            if method.block_fp8_as_mxfp8:
-                # Small shapes and deterministic execution keep their pinned tactic.
-                method.mxfp8_prefill_autotune_min_tokens = 4096
-            weight = layer.weight
-            scale = layer.weight_scale_inv_swizzled
-            key = (
-                weight.shape,
-                weight.stride(),
-                weight.dtype,
-                scale.shape,
-                scale.stride(),
-                scale.dtype,
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            x = torch.zeros(
-                (num_tokens, weight.shape[1]),
-                dtype=dtype,
-                device=weight.device,
-            )
-            method.apply(layer, x)
-            del x
-        if seen:
-            logger.info(
-                "FlashInfer prefill autotune: %d MXFP8 weight layouts at M=%d.",
-                len(seen),
-                num_tokens,
-            )
-        return len(seen)
 
     @property
     def routed_experts_weights_of_layer(self):

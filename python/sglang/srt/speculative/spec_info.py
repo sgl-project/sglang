@@ -528,3 +528,40 @@ def create_dummy_verify_input(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
     return spec_info
+
+
+def supports_dummy_draft_extend(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    if spec_algorithm.is_standalone():
+        return True
+    return (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_frozen_kv_mtp()
+        and not get_spec_config().enable_multi_layer_eagle
+    )
+
+
+def create_dummy_draft_extend_input(
+    spec_algorithm: SpeculativeAlgorithm,
+    *,
+    num_tokens: int,
+    hidden_size: Optional[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> SpecInput:
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    return EagleDraftExtendInput(
+        hidden_states=(
+            None
+            if hidden_size is None
+            else torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+        ),
+        num_tokens_per_req=1,
+        num_tokens_for_logprob_per_req=1,
+        capture_hidden_mode=(
+            CaptureHiddenMode.NULL
+            if spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        ),
+    )

@@ -27,7 +27,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -35,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_prefill_buffer_tokens,
 )
+from sglang.srt.speculative.spec_info import supports_dummy_draft_extend
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -358,32 +358,10 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
-    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
-    wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
-    if wants_prefill_autotune is not None and not wants_prefill_autotune():
-        # Entering the autotune context loads / saves the tactic cache and syncs
-        # ranks, so a model that has nothing to tune must decline before it.
-        prefill_autotune = None
-    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
-        with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
-        if tuned:
-            return
-
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+    if not mr.is_generation:
         return
-    is_pd_prefill_target = (
-        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
-    )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
+    if mr.is_draft_worker and not supports_dummy_draft_extend(mr.spec_algorithm):
         return
-    # Multimodal generation wrappers can still run this text-only EXTEND dummy;
-    # an incompatible model should fail the explicit opt-in visibly.
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size

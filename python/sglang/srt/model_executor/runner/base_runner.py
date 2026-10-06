@@ -53,7 +53,11 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
 )
-from sglang.srt.speculative.spec_info import create_dummy_verify_input
+from sglang.srt.speculative.spec_info import (
+    create_dummy_draft_extend_input,
+    create_dummy_verify_input,
+    supports_dummy_draft_extend,
+)
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -270,6 +274,10 @@ class BaseRunner(ABC):
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
             maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+        elif should_run_flashinfer_autotune(
+            self.model_runner, for_speculative_draft=True
+        ):
+            maybe_flashinfer_autotune_extend(self, decode_num_tokens=0)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -490,21 +498,21 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        is_extend_dummy = forward_mode_override == ForwardMode.EXTEND
+        if extend_num_tokens_per_req is not None:
+            assert is_extend_dummy, "extend_num_tokens_per_req requires an EXTEND dummy"
+            num_tokens_per_req = extend_num_tokens_per_req
+        if is_extend_dummy:
+            assert not mr.is_draft_worker or supports_dummy_draft_extend(
+                mr.spec_algorithm
+            ), "this draft has no EXTEND-shaped prefill pass"
+        elif mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
                 )
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
-        if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
-            )
-            num_tokens_per_req = extend_num_tokens_per_req
 
         num_tokens = batch_size * num_tokens_per_req
 
@@ -633,14 +641,17 @@ class BaseRunner(ABC):
             global_num_tokens_cpu = None
 
         # Speculative metadata and hidden-state capture mode.
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            buffers.custom_mask,
-            num_tokens_per_req,
-            mr.is_draft_worker,
+        spec_info = _create_dummy_spec_info(
+            mr,
+            is_extend_dummy=is_extend_dummy,
+            custom_mask=buffers.custom_mask,
+            num_tokens=num_tokens,
+            num_tokens_per_req=num_tokens_per_req,
         )
-        if spec_info is not None and (
-            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        if (
+            spec_info is not None
+            and not is_extend_dummy
+            and (mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone())
         ):
             # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
             # during forward; provide a dummy so warmup doesn't crash.
@@ -707,7 +718,8 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
-        mr.attn_backend.init_forward_metadata(forward_batch)
+        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+            mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
             mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
@@ -770,3 +782,34 @@ class BaseRunner(ABC):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
+
+
+def _create_dummy_spec_info(
+    mr: ModelRunner,
+    *,
+    is_extend_dummy: bool,
+    custom_mask: Optional[torch.Tensor],
+    num_tokens: int,
+    num_tokens_per_req: int,
+):
+    if not is_extend_dummy:
+        return create_dummy_verify_input(
+            mr.spec_algorithm, custom_mask, num_tokens_per_req, mr.is_draft_worker
+        )
+    if not mr.is_draft_worker:
+        return None
+    from sglang.srt.speculative.eagle_utils import (
+        get_draft_input_from_target_hidden_dim,
+    )
+
+    return create_dummy_draft_extend_input(
+        mr.spec_algorithm,
+        num_tokens=num_tokens,
+        hidden_size=(
+            None
+            if mr.spec_algorithm.is_standalone()
+            else get_draft_input_from_target_hidden_dim(mr)
+        ),
+        dtype=mr.model_config.dtype,
+        device=mr.device,
+    )
