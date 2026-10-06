@@ -4,12 +4,14 @@
 import copy
 import os
 from functools import partial
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from kandinsky6_sr_tiny_components import (
+    TINY_DIT,
     TINY_LU_MODEL,
+    TINY_PIFLOW,
     build_components,
     make_request,
     make_stage,
@@ -24,6 +26,12 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.kandinsky6_piflow import (
+    PiflowScheduler,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.upsampler.kandinsky6_sr_latent_upscaler import (
     Kandinsky6SRLatentUpscalerBank,
@@ -60,7 +68,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     SR_VIDEO_KEY,
     build_dit_spec,
     build_sampling_spec,
-    effective_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     module_dtype,
@@ -93,22 +100,25 @@ def tiny_resolutions(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "bank_scales",
-    [("2x", "4x"), (), ("4x",)],
+    "bank_scales,nfe,num_steps",
+    [(("2x", "4x"), 2, 5), ((), None, 3), (("4x",), 3, 9)],
     ids=["lu_path", "pixel_path", "pixel_fallback"],
 )
-def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
-    """encode -> latent-prep -> denoise -> decode -> output must give what
-    ``super_resolve`` gives on the same clip, for the LU path, the pixel path, and a bank
-    that has no entry for the requested scale (which must fall back to the pixel path, not
-    fail). The 64x128 clip holds 12 overlapping 32x48 tiles, denoised in chunks of 5, 5 and
-    2."""
-    vae, dit, bank, server_args = build_components(bank_scales)
+def test_stage_chain_reproduces_the_pure_orchestration(bank_scales, nfe, num_steps):
+    """Cover LU/pixel fallback and scheduler reuse across chunks and requests."""
+    scheduler = (
+        PiflowScheduler(**dict(TINY_PIFLOW, nfe=nfe))
+        if nfe is not None
+        else FlowMatchEulerDiscreteScheduler(shift=5.0)
+    )
+    vae, dit, bank, server_args = build_components(
+        bank_scales, dict(TINY_DIT, out_visual_dim=12 if nfe is not None else 4)
+    )
     video = random_video(9, 64, 128)
-    batch = make_request(video, tiles_batch_size=5)
+    batch = make_request(video, tiles_batch_size=5, num_steps=num_steps)
 
     pipeline = object.__new__(Kandinsky6SRPipeline)
-    pipeline.modules = dict(vae=vae, transformer=dit, scheduler=None)
+    pipeline.modules = dict(vae=vae, transformer=dit, scheduler=scheduler)
     if bank is not None:
         pipeline.modules["latent_upscaler"] = bank
     pipeline._stages, pipeline._stage_name_mapping = [], {}
@@ -148,7 +158,14 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
     assert SR_LR_LATENT_KEY not in batch.extra and SR_VIDEO_KEY not in batch.extra
     assert len(batch.extra["kandinsky6_sr_chunks"]) == 3  # 12 tiles / 5 per chunk
     assert isinstance(batch.extra[SR_PLAN_KEY], TilePlan)
-    batch = denoise.forward(batch, server_args)
+    dit_calls = []
+    hook = dit.register_forward_hook(lambda *args: dit_calls.append(1))
+    with patch.object(denoise, "progress_bar", wraps=denoise.progress_bar) as progress:
+        batch = denoise.forward(batch, server_args)
+    hook.remove()
+    assert len(dit_calls) == 3 * (nfe or num_steps)
+    assert progress.call_args.kwargs["total"] == len(dit_calls)
+    assert denoise.scheduler is scheduler
     batch = decode.forward(batch, server_args)
     assert len(batch.extra[SR_TILES_KEY]) == 12
     result = output.forward(batch, server_args)
@@ -159,9 +176,10 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
         arch=arch,
         tiling_scale=2,
         seed=42,
-        num_steps=5,
+        num_steps=num_steps,
         tiles_batch_size=5,
         tile_min_overlap=0.2,
+        scheduler=scheduler,
     )
     expected = super_resolve(
         video,
@@ -170,7 +188,7 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
         dit=dit,
         dit_spec=build_dit_spec(dit),
         spec=spec,
-        scheduler=effective_scheduler(spec, None),
+        scheduler=scheduler,
         device=next(dit.parameters()).device,
         upscale_fn=partial(bank.upscale, scale=2) if use_lu else None,
         lu_dtype=module_dtype(bank) if use_lu else None,
@@ -182,6 +200,24 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
     assert torch.equal(restored, expected)
     assert (batch.height, batch.width) == (128, 256)
     assert SR_TILES_KEY not in batch.extra and SR_PLAN_KEY not in batch.extra
+
+
+def test_mismatched_sampler_fails_before_encoding_tiles():
+    vae, dit, _, server_args = build_components(())
+    stage = make_stage(
+        Kandinsky6SRLatentPrepStage,
+        server_args,
+        vae,
+        dit,
+        None,
+        FlowMatchEulerDiscreteScheduler(shift=5.0),
+    )
+    batch = make_request(random_video(9, 64, 96))
+    with patch.object(vae, "encode", wraps=vae.encode) as encode:
+        with pytest.raises(ValueError, match="head.*same checkpoint"):
+            stage.forward(batch, server_args)
+        encode.assert_not_called()
+    assert SR_VIDEO_KEY in batch.extra
 
 
 @pytest.mark.parametrize(

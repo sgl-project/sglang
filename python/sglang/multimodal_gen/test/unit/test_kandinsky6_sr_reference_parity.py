@@ -23,7 +23,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from kandinsky6_sr_tiny_components import TINY_KVAE, TINY_LU_MODEL, super_resolve
+from kandinsky6_sr_tiny_components import (
+    TINY_KVAE,
+    TINY_LU_MODEL,
+    TINY_PIFLOW,
+    super_resolve,
+)
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
     Kandinsky6SRDitConfig,
@@ -58,7 +63,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
     build_dit_spec,
     build_sampling_spec,
-    effective_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     denoise_with_scheduler,
@@ -104,14 +108,6 @@ TINY_DIT_CFG = dict(
     instruct_type="noise",
     attention_params={"512": {"type": "flash"}},
     use_text=False,
-)
-TINY_PIFLOW = dict(
-    nfe=2,
-    num_policy_substeps=8,
-    final_step_size_scale=0.5,
-    shift=5.0,
-    n_grid=3,
-    eps=1e-6,
 )
 TINY_SR_PARAMS = dict(
     scale_factor={512: [1.0, 1.0, 1.0]},
@@ -240,40 +236,16 @@ def build_reference_dit(*, piflow: dict | None, seed: int = 2, cfg: dict | None 
     return dit
 
 
-def flat_transformer_config(*, cfg: dict, piflow: dict | None, overrides: dict) -> dict:
-    """The flat legacy dict form of a transformer config (n_grid / piflow_* / sr_* fields)."""
-    flat = dict(cfg)
-    flat["patch_size"] = list(flat["patch_size"])
-    flat["axes_dims"] = list(flat["axes_dims"])
-    flat["n_grid"] = piflow["n_grid"] if piflow is not None else 1
-    if piflow is not None:
-        flat.update(
-            piflow_nfe=piflow["nfe"],
-            piflow_num_policy_substeps=piflow["num_policy_substeps"],
-            piflow_final_step_size_scale=piflow["final_step_size_scale"],
-            piflow_shift=piflow["shift"],
-            piflow_eps=piflow["eps"],
-        )
-    flat["attribute_overrides"] = dict(overrides)
-    flat.update(
-        sr_visual_size=[512],
-        sr_scale_factor={"512": [1.0, 1.0, 1.0]},
-        sr_scheduler_scale=TINY_SR_PARAMS["scheduler_scale"],
-        sr_lq_noise_scale=TINY_SR_PARAMS["lq_noise_scale"],
-        sr_lq_noise_type=TINY_SR_PARAMS["lq_noise_type"],
-        sr_lq_channel_noise_scale=TINY_SR_PARAMS["lq_channel_noise_scale"],
-        sr_cap_noise_timestep=TINY_SR_PARAMS["cap_noise_timestep"],
-        sr_fps=TINY_SR_PARAMS["fps"],
-    )
-    return flat
-
-
 def build_port_dit(
     reference_dit, *, cfg: dict | None = None, piflow: dict | None, overrides: dict
 ) -> Kandinsky6SRTransformer3DModel:
     """Port DiT loaded with the reference weights (``model.`` prefix), strictly."""
-    flat = flat_transformer_config(
-        cfg=dict(cfg or TINY_DIT_CFG), piflow=piflow, overrides=overrides
+    cfg = dict(cfg or TINY_DIT_CFG)
+    flat = dict(
+        cfg,
+        out_visual_dim=cfg["out_visual_dim"] * (piflow["n_grid"] if piflow else 1),
+        attribute_overrides=dict(overrides),
+        sr_params=dict(TINY_SR_PARAMS),
     )
     dit_config = Kandinsky6SRDitConfig()
     dit_config.update_model_arch(flat)
@@ -663,6 +635,9 @@ def build_stacks(*, piflow, use_lu):
     vae.load_state_dict(dict(ref_vae.state_dict()), strict=True)
     port = {
         "vae": vae.eval(),
+        "scheduler": PiflowScheduler(**piflow)
+        if piflow
+        else FlowMatchEulerDiscreteScheduler(shift=TINY_SR_PARAMS["scheduler_scale"]),
         "dit": build_port_dit(
             ref_dit, piflow=piflow, overrides={"instruct_type": "noise"}
         ),
@@ -728,7 +703,10 @@ def run_port(video, port, *, scale, seed, tiles_batch_size, num_steps):
     if pre != 1.0:
         video = tiling.pre_upscale_video(video, pre, 16)
     arch = port["dit"].config
-    port_num_steps = num_steps if arch.is_piflow else num_steps - 1
+    scheduler = port["scheduler"]
+    port_num_steps = (
+        num_steps if isinstance(scheduler, PiflowScheduler) else num_steps - 1
+    )
     spec = build_sampling_spec(
         arch=arch,
         tiling_scale=tiling_scale,
@@ -736,6 +714,7 @@ def run_port(video, port, *, scale, seed, tiles_batch_size, num_steps):
         num_steps=port_num_steps,
         tiles_batch_size=tiles_batch_size,
         tile_min_overlap=0.2,
+        scheduler=scheduler,
     )
     bank = port["bank"]
     use_lu = bank is not None and bank.for_scale(tiling_scale) is not None
@@ -746,7 +725,7 @@ def run_port(video, port, *, scale, seed, tiles_batch_size, num_steps):
         dit=port["dit"],
         dit_spec=build_dit_spec(port["dit"]),
         spec=spec,
-        scheduler=effective_scheduler(spec, None),
+        scheduler=scheduler,
         device="cpu",
         upscale_fn=partial(bank.upscale, scale=tiling_scale) if use_lu else None,
         lu_dtype=module_dtype(bank) if use_lu else None,

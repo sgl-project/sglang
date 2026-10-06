@@ -232,8 +232,6 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.in_visual_dim = arch.in_visual_dim
-        self.base_out_visual_dim = arch.base_out_visual_dim
-        self.n_grid = arch.n_grid
         self.model_dim = arch.model_dim
         self.patch_size = arch.patch_size
         self.use_motion_score = arch.use_motion_score
@@ -298,7 +296,7 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.out_layer = Kandinsky6SROutLayer(
             arch.model_dim,
             arch.time_dim,
-            arch.head_width,
+            arch.out_visual_dim,
             arch.patch_size,
         )
 

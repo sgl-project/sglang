@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     SR_DENOISED_KEY,
     SR_DIT_SPEC_KEY,
     SR_SAMPLING_SPEC_KEY,
-    effective_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     denoise_chunks,
@@ -104,26 +103,21 @@ class Kandinsky6SRDenoisingStage(DenoisingStage):
         chunks = batch.extra.pop(SR_CHUNKS_KEY)
         device = get_local_torch_device()
 
-        # Reuse the shared cache-dit / torch.compile wiring (both are no-ops unless the
-        # corresponding server arg actually requests them): ``spec.steps_per_chunk`` is this
-        # request's DiT-call count, the closest analogue of the global ``num_inference_steps``
-        # those hooks expect.
-        self._maybe_enable_cache_dit_and_torch_compile(spec.steps_per_chunk, batch)
+        self._maybe_enable_cache_dit_and_torch_compile(spec.num_steps, batch)
 
-        scheduler = effective_scheduler(spec, self.scheduler)
         with self.use_declared_component(
             component_name="transformer", module=self.transformer, phase="denoise_tiles"
         ) as transformer:
             assert transformer is not None
             self.transformer = transformer
-            total = spec.steps_per_chunk * len(chunks)
+            total = spec.num_steps * len(chunks)
             with self.progress_bar(
                 total=total, batch=batch, desc="Kandinsky6 SR denoising"
             ) as progress:
                 denoised = denoise_chunks(
                     chunks,
                     transformer,
-                    scheduler,
+                    self.scheduler,
                     dit_spec=dit_spec,
                     spec=spec,
                     device=device,

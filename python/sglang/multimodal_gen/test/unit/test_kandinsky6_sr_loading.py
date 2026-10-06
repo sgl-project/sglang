@@ -7,7 +7,7 @@ import os
 
 import pytest
 import torch
-from kandinsky6_sr_tiny_components import TINY_KVAE, TINY_LU_MODEL
+from kandinsky6_sr_tiny_components import TINY_DIT, TINY_KVAE, TINY_LU_MODEL
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
@@ -41,25 +41,6 @@ from sglang.multimodal_gen.runtime.models.upsampler.kandinsky6_sr_latent_upscale
     Kandinsky6SRLatentUpscalerBank,
 )
 from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsky6SRVAE
-
-TINY_DIT = dict(
-    in_visual_dim=4,
-    in_text_dim=8,
-    in_text_dim2=8,
-    time_dim=16,
-    out_visual_dim=4,
-    patch_size=[1, 2, 2],
-    model_dim=32,
-    ff_dim=64,
-    num_text_blocks=0,
-    num_visual_blocks=2,
-    axes_dims=[8, 4, 4],
-    visual_cond=False,
-    instruct_type="noise",
-    use_text=False,
-    n_grid=3,
-    attribute_overrides={"instruct_type": "noise"},
-)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -152,6 +133,7 @@ def test_complete_checkpoint_loads_and_meta_buffers_are_rebuilt():
     assert not any(t.is_meta for t in [*model.parameters(), *model.buffers()])
     assert not model.time_embeddings.freqs.is_meta
     torch.testing.assert_close(model.pooled_bias, reference.pooled_bias)
+    assert model.out_layer.out_layer.weight.shape[0] == 4 * TINY_DIT["out_visual_dim"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -183,53 +165,6 @@ def test_unexpected_checkpoint_tensor_fails_the_load():
     checkpoint["text_embeddings.in_layer.weight"] = torch.zeros(2, 2)
     with pytest.raises(ValueError, match="unexpected keys"):
         _load_through_the_real_loader(checkpoint)
-
-
-def test_official_config_builds_the_head_from_the_total_width_and_loads_official_keys():
-    """An official config stores the TOTAL DX head width in ``out_visual_dim`` (n_grid lives
-    in the scheduler config) plus nested ``sr_params`` and ``attribute_overrides: null``.
-    """
-    official = {
-        key: value
-        for key, value in TINY_DIT.items()
-        if key not in ("n_grid", "attribute_overrides")
-    }
-    official.update(
-        out_visual_dim=12,
-        attribute_overrides=None,
-        sr_params=dict(
-            scale_factor={"512": [1.0, 1.0, 1.0]},
-            visual_size=[512],
-            scheduler_scale=5.0,
-            lq_noise_scale=0.7,
-            lq_noise_type="ddpm",
-            lq_channel_noise_scale=0.0,
-            cap_noise_timestep=False,
-            fps=24,
-        ),
-    )
-    config = Kandinsky6SRDitConfig()
-    config.update_model_arch(official)
-    with torch.device("meta"):
-        model = Kandinsky6SRTransformer3DModel(config, official)
-    # head width = prod(patch_size) * the TOTAL out_visual_dim
-    assert model.state_dict()["out_layer.out_layer.weight"].shape[0] == 4 * 12
-    assert model.base_out_visual_dim == 4 and model.n_grid == 1
-
-    load_model_from_full_model_state_dict(
-        model,
-        model.preprocess_loaded_state_dict(
-            iter(
-                _official_state_dict(_dit()).items()
-            )  # same shapes as the legacy DX head
-        ),
-        torch.device("cpu"),
-        torch.float32,
-        strict=False,
-        param_names_mapping=get_param_names_mapping(model.param_names_mapping),
-    )
-    model.post_load_weights()
-    assert not any(t.is_meta for t in [*model.parameters(), *model.buffers()])
 
 
 def test_wide_input_checkpoint_needs_visual_cond_to_run_under_noise():

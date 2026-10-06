@@ -16,13 +16,6 @@ ATTRIBUTE_OVERRIDE_WHITELIST = ("instruct_type", "visual_cond", "attention_param
 # Bookkeeping keys the loader leaves in the component config.
 _TOLERATED_EXTRA_KEYS = frozenset({"_class_name", "_diffusers_version"})
 _SPARSE_ATTENTION_TYPES = ("nabla", "nabla_framewise_causal")
-_PIFLOW_FIELDS = (
-    "piflow_nfe",
-    "piflow_num_policy_substeps",
-    "piflow_final_step_size_scale",
-    "piflow_shift",
-    "piflow_eps",
-)
 _LQ_NOISE_TYPES = ("ddpm", "linear")
 
 
@@ -66,17 +59,6 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
     use_text: bool = False
     use_lq_noise_cond: bool = False
 
-    # --- optional legacy / test-only DX head / pi-Flow fields ---
-    # An official checkpoint stores the TOTAL head width in ``out_visual_dim`` and the
-    # pi-Flow values in its scheduler config; with ``n_grid > 1`` here the head is
-    # ``out_visual_dim * n_grid`` wide instead (``out_visual_dim`` being the base dim).
-    n_grid: int = 1
-    piflow_nfe: int | None = None
-    piflow_num_policy_substeps: int | None = None
-    piflow_final_step_size_scale: float | None = None
-    piflow_shift: float | None = None
-    piflow_eps: float | None = None
-
     # Post-load attribute overrides (whitelist: instruct_type, visual_cond,
     # attention_params); the architecture above stays as trained.  The official
     # config writes ``null`` when there are none.
@@ -109,26 +91,16 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         self._reject_unsupported_flags()
         self._normalize_and_validate_shapes()
         self._validate_overrides()
-        self._validate_sampler_fields()
+        if self.sr_lq_noise_type not in _LQ_NOISE_TYPES:
+            raise ValueError(
+                f"sr_lq_noise_type must be one of {list(_LQ_NOISE_TYPES)}, "
+                f"got {self.sr_lq_noise_type!r}"
+            )
         self.hidden_size = self.model_dim
         self.num_attention_heads = self.model_dim // sum(self.axes_dims)
         self.in_channels = self.in_visual_dim
         self.out_channels = self.out_visual_dim
         self.num_channels_latents = self.in_visual_dim
-
-    @property
-    def is_piflow(self) -> bool:
-        return self.piflow_nfe is not None
-
-    @property
-    def head_width(self) -> int:
-        """Channels the DiT head emits per latent position (all grids of a DX head)."""
-        return self.out_visual_dim * self.n_grid
-
-    @property
-    def base_out_visual_dim(self) -> int:
-        """Channels per latent grid; legacy n_grid configs store the base output width."""
-        return self.out_visual_dim if self.n_grid > 1 else self.in_visual_dim
 
     @property
     def trained_wide_input(self) -> bool:
@@ -139,7 +111,7 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         """Post-load value of ``name``: the override if present, else as trained."""
         if name in self.attribute_overrides:
             return self.attribute_overrides[name]
-        return getattr(self, name)
+        return self.__dict__[name]
 
     def requested_sparse_attention(self) -> str | None:
         """Sparse attention type asked for by ``attention_params``, if any."""
@@ -218,8 +190,6 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
             )
         if self.model_dim % 2 != 0:
             raise ValueError(f"model_dim must be even, got {self.model_dim}")
-        if self.n_grid < 1:
-            raise ValueError(f"n_grid must be >= 1, got {self.n_grid}")
 
     def _validate_overrides(self) -> None:
         unknown = sorted(
@@ -239,19 +209,6 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         visual_cond = self.effective_override("visual_cond")
         if not isinstance(visual_cond, bool):
             raise ValueError(f"visual_cond must be a bool, got {visual_cond!r}")
-
-    def _validate_sampler_fields(self) -> None:
-        present = [name for name in _PIFLOW_FIELDS if getattr(self, name) is not None]
-        if present and len(present) != len(_PIFLOW_FIELDS):
-            missing = sorted(set(_PIFLOW_FIELDS) - set(present))
-            raise ValueError(
-                f"pi-Flow config is incomplete: {missing} missing next to {present}"
-            )
-        if self.sr_lq_noise_type not in _LQ_NOISE_TYPES:
-            raise ValueError(
-                f"sr_lq_noise_type must be one of {list(_LQ_NOISE_TYPES)}, "
-                f"got {self.sr_lq_noise_type!r}"
-            )
 
 
 @dataclass

@@ -14,17 +14,6 @@ StepCallback = Callable[[], None]
 StepContext = Callable[[int], AbstractContextManager]
 
 
-class PiflowParams(msgspec.Struct, frozen=True, kw_only=True):
-    """pi-Flow parameters from the scheduler or legacy flat DiT config."""
-
-    nfe: int
-    num_policy_substeps: int
-    final_step_size_scale: float
-    shift: float
-    n_grid: int
-    eps: float
-
-
 class DitSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Post-override behaviour of the DiT that the sampling code needs."""
 
@@ -46,21 +35,15 @@ class SamplingSpec(msgspec.Struct, frozen=True, kw_only=True):
     tiling_scale: int
     tiles_batch_size: int
     seed: int
-    num_steps: int
+    num_steps: int  # actual DiT calls per tile chunk
+    is_piflow: bool
     tile_min_overlap: float
     visual_size: int
     scale_factor: tuple[float, float, float]
-    scheduler_scale: float
     lq_noise_scale: float
     lq_noise_type: str
     lq_channel_noise_scale: float
     cap_noise_timestep: bool
-    piflow: PiflowParams | None
-
-    @property
-    def steps_per_chunk(self) -> int:
-        """DiT calls per chunk of tiles: ``nfe`` (pi-Flow), else ``num_steps``."""
-        return self.piflow.nfe if self.piflow is not None else self.num_steps
 
 
 def bf16_autocast(device: torch.device | str) -> AbstractContextManager:
@@ -93,21 +76,6 @@ def euler_start_timestep(
         "hybrid_anchor",
     )
     return lq_noise_scale if capped else 1.0
-
-
-def check_sampler_options(
-    *, piflow: PiflowParams | None, cap_noise_timestep: bool, instruct_type: str | None
-) -> None:
-    """Reject option combinations the reference sampler rejects."""
-    if (
-        piflow is not None
-        and cap_noise_timestep
-        and instruct_type in ("noise", "hybrid")
-    ):
-        raise NotImplementedError(
-            "piflow sampler does not support cap_noise_timestep for noise/hybrid "
-            "instruct"
-        )
 
 
 def make_dit_fn(
@@ -177,13 +145,11 @@ def denoise_with_scheduler(
 __all__ = [
     "DitFn",
     "DitSpec",
-    "PiflowParams",
     "SamplingSpec",
     "StepCallback",
     "StepContext",
     "bf16_autocast",
     "cast_to_module_dtype",
-    "check_sampler_options",
     "denoise_with_scheduler",
     "euler_start_timestep",
     "make_dit_fn",

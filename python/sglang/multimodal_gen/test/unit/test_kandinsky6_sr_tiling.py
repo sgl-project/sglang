@@ -63,15 +63,14 @@ def test_initial_latent_uses_dit_dtype_or_preserves_input(dit_dtype):
         tiles_batch_size=1,
         seed=1,
         num_steps=5,
+        is_piflow=False,
         tile_min_overlap=0.2,
         visual_size=512,
         scale_factor=(1.0, 1.0, 1.0),
-        scheduler_scale=5.0,
         lq_noise_scale=0.7,
         lq_noise_type="linear",
         lq_channel_noise_scale=0.0,
         cap_noise_timestep=False,
-        piflow=None,
     )
     tile = torch.randn(4, 4, 4, 4, dtype=torch.float64)
     result = build_chunk_latent(

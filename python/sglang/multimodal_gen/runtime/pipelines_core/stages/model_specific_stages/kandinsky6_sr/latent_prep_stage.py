@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     SR_VIDEO_KEY,
     build_dit_spec,
     build_sampling_spec,
-    check_denoising_request,
     uses_latent_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
@@ -96,7 +95,6 @@ class Kandinsky6SRLatentPrepStage(PipelineStage):
             tile_min_overlap=batch.sr_tile_min_overlap,
             scheduler=self.scheduler,
         )
-        check_denoising_request(spec, batch.num_inference_steps)
         dit_spec = build_dit_spec(self.transformer)
         device = get_local_torch_device()
 

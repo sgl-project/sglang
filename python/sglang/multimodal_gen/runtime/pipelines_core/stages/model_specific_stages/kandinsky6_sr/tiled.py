@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     StepContext,
     bf16_autocast,
     cast_to_module_dtype,
-    check_sampler_options,
     denoise_with_scheduler,
     euler_start_timestep,
     make_dit_fn,
@@ -267,12 +266,7 @@ def denoise_chunk(
     on_step: StepCallback | None = None,
 ) -> torch.Tensor:
     """Denoise one [B, T, H, W, C] chunk, resetting the configured scheduler."""
-    is_piflow = spec.piflow is not None
-    check_sampler_options(
-        piflow=spec.piflow,
-        cap_noise_timestep=spec.cap_noise_timestep,
-        instruct_type=dit_spec.instruct_type,
-    )
+    is_piflow = spec.is_piflow
     if not is_piflow:
         # The Euler start timestep is only meaningful for the scheduler this chunk is about to
         # run: re-derive it instead of baking a stale one into ``set_timesteps`` up front.
@@ -315,8 +309,8 @@ def denoise_chunks(
     on_step: StepCallback | None = None,
 ) -> list[torch.Tensor]:
     """Denoise chunks sequentially on device and return CPU latents."""
-    if spec.piflow is not None:
-        scheduler.set_timesteps(spec.piflow.nfe, device=device)
+    if spec.is_piflow:
+        scheduler.set_timesteps(spec.num_steps, device=device)
     return [
         denoise_chunk(
             chunk.to(device),
