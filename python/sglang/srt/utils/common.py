@@ -1005,7 +1005,7 @@ def fi_a2a_platform_blocker(
 ) -> Optional[str]:
     """Why this host cannot run the fused fi_a2a DCP reduce, or None if it can.
 
-    Runs at argument resolution: no CUDA context and no flashinfer import.
+    Runs at argument resolution, so it finds FlashInfer's op without importing it.
     """
     if not get_platform().is_sm100:
         return "requires a Blackwell (SM100-family) GPU"
@@ -1018,13 +1018,6 @@ def fi_a2a_platform_blocker(
                 f"{tp_size_per_node} TP ranks per node (tp_size={tp_size}, "
                 f"pp_size={pp_size}, nnodes={nnodes})"
             )
-    # torch 2.14 is the first release whose symmetric memory exposes the NCCL
-    # device communicator and window offsets the fused kernel is built on.
-    if torch_release < (2, 14):
-        return (
-            "requires torch>=2.14 (NCCL device communicator in torch symmetric "
-            f"memory); found torch {torch.__version__}"
-        )
     if not _flashinfer_has_fused_dcp_reduce():
         return (
             "requires a FlashInfer build that provides "

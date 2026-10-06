@@ -356,21 +356,12 @@ def dispatch_custom_allreduce(
     can_use_custom_all_reduce_v2); other cross-node groups fall back to NCCL.
     """
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-        import torch.distributed._symmetric_memory as torch_symm_mem
-
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,
             can_use_custom_all_reduce_v2,
         )
 
-        if torch_symm_mem.get_backend(device) == "NCCL":
-            # CustomAllReduceV2 allocates torch symmetric memory with a group name
-            # and rendezvouses on the gloo group; the NCCL allocator rejects both.
-            logger.info(
-                "[AR] torch symmetric memory uses the NCCL backend (DCP fi_a2a); "
-                "CustomAllReduceV2 cannot allocate from it, using CustomAllreduce"
-            )
-        elif can_use_custom_all_reduce_v2(group=group, device=device):
+        if can_use_custom_all_reduce_v2(group=group, device=device):
             logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
             return CustomAllReduceV2
 

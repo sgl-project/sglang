@@ -248,9 +248,6 @@ def handle_decode_context_parallelism(server_args: Any):
                 f"--dcp-comm-backend fi_a2a {blocker}. Use --dcp-comm-backend a2a, "
                 "or leave the flag unset to resolve a supported backend."
             )
-        # The fused reduce's workspace is an NCCL symmetric window, which needs
-        # cuMem-backed NCCL memory; set before any communicator exists.
-        os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")

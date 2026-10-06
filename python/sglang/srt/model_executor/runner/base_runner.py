@@ -325,8 +325,7 @@ class BaseRunner(ABC):
 
     def _pre_initialize_fi_a2a_workspace(self):
         """Create the fused fi_a2a DCP reduce workspaces; must run before CG
-        capture (workspace rendezvous and the group's first reduce are
-        collective and not capturable).
+        capture, since creation is collective and synchronizes the stream.
         """
         parallel = get_parallel()
         if not parallel.dcp_enabled or parallel.dcp_comm_backend != "fi_a2a":
@@ -339,13 +338,13 @@ class BaseRunner(ABC):
 
         mr = self.model_runner
         init_fi_a2a_workspace(
-            parallel.dcp_group,
+            cp_group=parallel.dcp_group,
             # Batches wider than the captured graphs run as several fused calls.
             max_tokens=self._widest_decode_rows() or _FI_A2A_EAGER_ONLY_MAX_TOKENS,
             local_heads=mr.model_config.num_attention_heads // parallel.attn_tp_size,
             head_dim=mr.model_config.kv_lora_rank,
             dtype=mr.dtype,
-            probe_stream=get_or_create_global_graph_capture_stream(),
+            capture_stream=get_or_create_global_graph_capture_stream(),
         )
 
     def _pre_initialize_pcie_ipc_workspace(self):

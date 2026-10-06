@@ -142,12 +142,6 @@ def init_parallel_runtime(
             local_omp_cpuid=local_omp_cpuid,
             dist_init_method=dist_init_method,
         )
-    if (
-        device == "cuda"
-        and parallel.dcp_enabled
-        and parallel.dcp_comm_backend == "fi_a2a"
-    ):
-        _select_nccl_symm_mem_backend()
 
     _init_parallel_groups(
         backend=backend,
@@ -299,21 +293,6 @@ def _init_cpu_threads_env(
         logger.warning(
             "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
         )
-
-
-def _select_nccl_symm_mem_backend() -> None:
-    # DCP fi_a2a's fused reduce allocates torch symmetric memory on the NCCL
-    # backend. The choice is process-global and frozen by the first symmetric
-    # allocation, which custom all-reduce makes while the groups are built.
-    import torch.distributed._symmetric_memory as symm_mem
-
-    try:
-        symm_mem.set_backend("NCCL")
-    except RuntimeError as e:
-        raise RuntimeError(
-            "--dcp-comm-backend fi_a2a needs torch's NCCL symmetric-memory "
-            f"backend, which could not be selected before process-group init: {e}"
-        ) from e
 
 
 def _init_parallel_groups(

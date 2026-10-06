@@ -25,7 +25,6 @@ from typing import Optional
 
 import msgspec
 import torch
-import torch.distributed as dist
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
@@ -37,13 +36,9 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
-    NCCLLibrary,
-    find_nccl_library,
-)
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, log_info_on_rank0
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -396,28 +391,24 @@ def all_gather_kv_cache_for_dcp(
 # A2A communication backend for DCP decode (alternative to AG+RS above): exchange
 # per-head partial outputs + LSEs across DCP ranks and merge them. a2a sends one
 # NCCL all-to-all and merges with the Triton LSE kernel; fi_a2a hands exchange and
-# merge to FlashInfer's fused decode_cp_a2a_lse_reduce (one cooperative kernel over
-# NCCL LSA symmetric memory).
+# merge to FlashInfer's fused decode_cp_a2a_lse_reduce, one kernel that writes into
+# its peers' torch symmetric memory.
 # ---------------------------------------------------------------------------
 
 
-class _FiA2aState(msgspec.Struct, kw_only=True):
+class _FiA2aState(msgspec.Struct, frozen=True, kw_only=True):
     cp_rank: int
-    cp_size: int
-    # One fused call carries at most this many rows (product of the leading dims).
+    # Rows (tokens x local heads) one fused call carries.
     capacity_rows: int
-    # Created before graph capture; each binds to the first stream that uses it.
-    unbound: list
-    by_stream: dict
+    # A workspace serves one ordered CUDA stream: graphs captured on capture_stream
+    # use capture_workspace, also when replayed; eager calls use serving_workspace.
+    capture_stream: int
+    capture_workspace: torch.Tensor
+    serving_workspace: torch.Tensor
 
 
-# Per-process singleton, populated once before CUDA graph capture by
-# init_fi_a2a_workspace(); holds strong references to the workspaces.
+# Set once per process, before CUDA graph capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[_FiA2aState] = None
-
-# A workspace may serve only one ordered CUDA stream: the graph-capture stream
-# (bound by the startup probe) and the serving stream (bound on first use).
-_FI_A2A_NUM_WORKSPACES = 2
 
 
 def init_fi_a2a_workspace(
@@ -427,263 +418,131 @@ def init_fi_a2a_workspace(
     local_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    probe_stream: torch.cuda.Stream,
+    capture_stream: torch.cuda.Stream,
 ) -> None:
-    """Create the fused fi_a2a workspaces on every DCP rank; collective, run
-    before graph capture (rendezvous and the first reduce are not capturable)."""
+    """Create the fused reduce's workspaces on every DCP rank. Collective, and it
+    synchronizes the current stream, so it runs before graph capture."""
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None or cp_group.world_size == 1:
         return
-    # The kernel's receive spin-wait has no timeout, so every rank must agree to
-    # proceed before the NCCL collectives below; the verdict travels over gloo.
-    _fi_a2a_require_all_ranks(
-        cp_group=cp_group,
-        stage="eligibility check",
-        error=_fi_a2a_local_blocker(cp_group=cp_group, head_dim=head_dim, dtype=dtype),
-    )
+    import torch.distributed._symmetric_memory as symm_mem
     from flashinfer.comm import (
         decode_cp_a2a_lse_reduce_create_workspace,
         decode_cp_a2a_lse_reduce_workspace_size,
     )
 
-    # Rendezvous finds the group's NCCL communicator by name, and ProcessGroupNCCL
-    # creates it lazily: one collective on the device group makes it exist.
-    dist.barrier(group=cp_group.device_group)
-    workspaces = [
-        decode_cp_a2a_lse_reduce_create_workspace(
-            max_tokens=max_tokens,
-            local_heads=local_heads,
-            cp_size=cp_group.world_size,
-            head_dim=head_dim,
-            dtype=dtype,
-            group=cp_group.device_group,
-        )
-        for _ in range(_FI_A2A_NUM_WORKSPACES)
-    ]
-    dist.barrier(group=cp_group.device_group)
-    state = _FiA2aState(
-        cp_rank=cp_group.rank_in_group,
+    geometry = dict(
+        max_tokens=max_tokens,
+        local_heads=local_heads,
         cp_size=cp_group.world_size,
-        capacity_rows=max_tokens * local_heads,
-        unbound=workspaces[1:],
-        by_stream={probe_stream.cuda_stream: workspaces[0]},
+        head_dim=head_dim,
+        dtype=dtype,
     )
-    with torch.cuda.stream(probe_stream):
-        error = _fi_a2a_probe(
-            state=state,
-            cp_group=cp_group,
-            local_heads=local_heads,
-            head_dim=head_dim,
-            dtype=dtype,
-        )
-    _fi_a2a_require_all_ranks(cp_group=cp_group, stage="startup probe", error=error)
-    _FI_A2A_STATE = state
-    workspace_mib = (
-        decode_cp_a2a_lse_reduce_workspace_size(
-            max_tokens=max_tokens,
-            local_heads=local_heads,
-            cp_size=cp_group.world_size,
-            head_dim=head_dim,
-            dtype=dtype,
-        )
-        / 2**20
-    )
-    logger.info(
-        "DCP fi_a2a: fused all-to-all + LSE reduce ready (rank %d/%d, %d heads/rank, "
-        "head_dim %d, %s, capacity %d rows, %d workspaces x %.1f MiB)",
-        state.cp_rank,
-        state.cp_size,
-        local_heads,
-        head_dim,
-        dtype,
-        state.capacity_rows,
-        _FI_A2A_NUM_WORKSPACES,
-        workspace_mib,
-    )
+    device = torch.device("cuda", torch.cuda.current_device())
 
+    def create_workspace() -> torch.Tensor:
+        return decode_cp_a2a_lse_reduce_create_workspace(
+            **geometry, group=cp_group.device_group
+        )
 
-def _fi_a2a_local_blocker(
-    *, cp_group: GroupCoordinator, head_dim: int, dtype: torch.dtype
-) -> Optional[str]:
     try:
-        import flashinfer.comm.dcp_lse_reduce  # noqa: F401
-    except ImportError as e:
-        return f"FlashInfer lacks flashinfer.comm.decode_cp_a2a_lse_reduce ({e})"
-    import torch.distributed._symmetric_memory as symm_mem
-
-    backend = symm_mem.get_backend(torch.device("cuda", torch.cuda.current_device()))
-    if backend != "NCCL":
-        return (
-            f"torch symmetric memory uses the {backend} backend; the fused reduce "
-            "needs NCCL, which bootstrap selects before process-group init"
-        )
-    # The op is built against the pip NCCL headers; an older loaded libnccl would
-    # abort at the first call instead of raising.
-    nccl_version = NCCLLibrary(find_nccl_library()).ncclGetRawVersion()
-    if nccl_version < 22900:
-        return f"the loaded NCCL is {nccl_version}; the fused reduce needs >= 2.29"
-    if dtype not in (torch.float16, torch.bfloat16):
-        return f"attention partials are {dtype}; the fused reduce supports float16 and bfloat16"
-    if head_dim * dtype.itemsize % 16 != 0:
-        return f"head_dim {head_dim} rows of {dtype} are not 16-byte aligned"
-    if cp_group.world_size > 64:
-        return f"dcp_size {cp_group.world_size} exceeds the fused reduce's 64 ranks"
-    if dist.get_rank(cp_group.device_group) != cp_group.rank_in_group:
-        return "the DCP device-group rank differs from rank_in_group"
-    return None
-
-
-def _fi_a2a_require_all_ranks(
-    *, cp_group: GroupCoordinator, stage: str, error: Optional[str]
-) -> None:
-    errors: list = [None] * cp_group.world_size
-    dist.all_gather_object(errors, error, group=cp_group.cpu_group)
-    failed = [(rank, e) for rank, e in enumerate(errors) if e is not None]
-    if failed:
-        detail = "; ".join(f"rank {rank}: {e}" for rank, e in failed[:4])
+        capture_workspace = create_workspace()
+        serving_workspace = create_workspace()
+    except RuntimeError as e:
         raise RuntimeError(
-            f"--dcp-comm-backend fi_a2a {stage} failed on {len(failed)}/"
-            f"{cp_group.world_size} DCP ranks: {detail}. "
-            "Use --dcp-comm-backend a2a."
-        )
+            "--dcp-comm-backend fi_a2a: FlashInfer could not create its fused-reduce "
+            "workspace on this process's torch symmetric-memory backend "
+            f"({symm_mem.get_backend(device)}): {str(e).rstrip('.')}. Use a "
+            "flashinfer-python release whose decode_cp_a2a_lse_reduce does not "
+            "select a backend, or pass --dcp-comm-backend a2a."
+        ) from e
+    _FI_A2A_STATE = _FiA2aState(
+        cp_rank=cp_group.rank_in_group,
+        capacity_rows=max_tokens * local_heads,
+        capture_stream=capture_stream.cuda_stream,
+        capture_workspace=capture_workspace,
+        serving_workspace=serving_workspace,
+    )
+    workspace_mib = decode_cp_a2a_lse_reduce_workspace_size(**geometry) / 2**20
+    log_info_on_rank0(
+        logger,
+        "DCP fi_a2a: fused all-to-all + LSE reduce ready "
+        f"(backend={symm_mem.get_backend(device)}, capacity "
+        f"{max_tokens * local_heads} rows ({max_tokens} tokens x {local_heads} "
+        f"heads), 2 workspaces x {workspace_mib:.2f} MiB)",
+    )
 
 
-def _fi_a2a_probe(
-    *,
-    state: _FiA2aState,
-    cp_group: GroupCoordinator,
-    local_heads: int,
-    head_dim: int,
-    dtype: torch.dtype,
-) -> Optional[str]:
-    """Check the fused reduce against all-gather + Triton merge for both LSE bases.
-
-    Its first call also builds the group's NCCL device communicator (collective),
-    which must happen eagerly, before any graph capture.
-    """
-    rank, n = cp_group.rank_in_group, cp_group.world_size
-    gen = torch.Generator(device="cuda").manual_seed(4929 + rank)
-    error = None
-    for is_lse_base_on_e in (False, True):
-        partial_o = torch.randn(
-            2, local_heads, n, head_dim, dtype=dtype, device="cuda", generator=gen
-        )
-        partial_lse = torch.randn(
-            2, local_heads, n, dtype=torch.float32, device="cuda", generator=gen
-        )
-        # The reference collectives run on every rank and every iteration, even
-        # after a local failure, so no rank waits in a collective the others skip.
-        gathered_o = cp_group.all_gather(partial_o.unsqueeze(0), dim=0)
-        gathered_lse = cp_group.all_gather(partial_lse.unsqueeze(0), dim=0)
-        expected, _ = dcp_lse_combine_triton(
-            gathered_o[:, :, :, rank].contiguous(),
-            gathered_lse[:, :, :, rank].contiguous(),
-            is_lse_base_on_e=is_lse_base_on_e,
-        )
-        if error is not None:
-            continue
-        try:
-            got = _fi_a2a_fused_reduce_impl(
-                state=state,
-                partial_o=partial_o,
-                partial_lse=partial_lse,
-                is_lse_base_on_e=is_lse_base_on_e,
-            )
-            torch.cuda.current_stream().synchronize()
-        except RuntimeError as e:
-            error = str(e).splitlines()[0]
-            continue
-        if not torch.allclose(got.float(), expected.float(), rtol=1e-2, atol=1e-2):
-            max_diff = (got.float() - expected.float()).abs().max().item()
-            base = "e" if is_lse_base_on_e else "2"
-            error = (
-                f"fused reduce disagrees with the all-gather reference "
-                f"(LSE base {base}, max abs diff {max_diff:.3g})"
-            )
-    return error
+def _fi_a2a_peer_partials(
+    cp_attn_out: torch.Tensor, cp_attn_lse: torch.Tensor, cp_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[B, H, D] partials and [B, H] LSE as the fused reduce's [B, H/cp, cp, D]
+    and [B, H/cp, cp]; head h goes to peer h // (H/cp)."""
+    batch, heads, head_dim = cp_attn_out.shape
+    local_heads = heads // cp_size
+    partial_o = cp_attn_out.new_empty(batch, local_heads, cp_size, head_dim)
+    partial_lse = cp_attn_lse.new_empty(batch, local_heads, cp_size)
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        partial_lse.permute(2, 0, 1),
+    )
+    return partial_o, partial_lse
 
 
-def _fi_a2a_workspace_for_current_stream(state: _FiA2aState) -> torch.Tensor:
-    stream = torch.cuda.current_stream().cuda_stream
-    workspace = state.by_stream.get(stream)
-    if workspace is not None:
-        return workspace
-    if not state.unbound:
-        bound = ", ".join(hex(s) for s in state.by_stream)
-        raise RuntimeError(
-            f"DCP fi_a2a: CUDA stream {stream:#x} is a third stream calling the "
-            f"fused reduce; its workspaces are bound to streams {bound}. Each "
-            "ordered stream needs its own workspace, created before graph capture."
-        )
-    workspace = state.unbound.pop(0)
-    state.by_stream[stream] = workspace
-    return workspace
+def _fi_a2a_lse_reduce_fake(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_size: int,
+    is_lse_base_on_e: bool,
+) -> torch.Tensor:
+    batch, heads, head_dim = cp_attn_out.shape
+    return cp_attn_out.new_empty(batch, heads // cp_size, head_dim)
 
 
-def _fi_a2a_fused_reduce_impl(
-    *,
-    state: _FiA2aState,
-    partial_o: torch.Tensor,
-    partial_lse: torch.Tensor,
+# A custom op, so torch.compile sees one opaque collective rather than tracing the
+# workspace choice.
+@register_custom_op(fake_impl=_fi_a2a_lse_reduce_fake)
+def fi_a2a_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_size: int,
     is_lse_base_on_e: bool,
 ) -> torch.Tensor:
     from flashinfer.comm import decode_cp_a2a_lse_reduce
 
-    workspace = _fi_a2a_workspace_for_current_stream(state)
-    lse_mode = "basee" if is_lse_base_on_e else "base2"
-    batch, heads, n, head_dim = partial_o.shape
-    rows = batch * heads
-    if rows <= state.capacity_rows:
-        return decode_cp_a2a_lse_reduce(
-            partial_o=partial_o,
-            partial_lse=partial_lse,
-            workspace=workspace,
-            cp_rank=state.cp_rank,
-            cp_size=state.cp_size,
-            lse_mode=lse_mode,
-        )
-    # An eager batch wider than the graph capture size: the op flattens leading
-    # dims into rows, so reduce capacity-sized row chunks in order on this stream.
-    # Every DCP rank has the same batch, hence the same chunk plan.
-    o_rows = partial_o.view(rows, n, head_dim)
-    lse_rows = partial_lse.view(rows, n)
-    out = partial_o.new_empty(rows, head_dim)
-    for start in range(0, rows, state.capacity_rows):
-        end = min(start + state.capacity_rows, rows)
-        out[start:end] = decode_cp_a2a_lse_reduce(
-            partial_o=o_rows[start:end],
-            partial_lse=lse_rows[start:end],
-            workspace=workspace,
-            cp_rank=state.cp_rank,
-            cp_size=state.cp_size,
-            lse_mode=lse_mode,
-        )
-    return out.view(batch, heads, head_dim)
-
-
-def _fi_a2a_fused_reduce_fake(
-    partial_o: torch.Tensor, partial_lse: torch.Tensor, is_lse_base_on_e: bool
-) -> torch.Tensor:
-    return partial_o.new_empty(partial_o.shape[:-2] + partial_o.shape[-1:])
-
-
-# A custom op so Dynamo (decode tc-piecewise graphs, torch.compile) sees one opaque
-# collective instead of tracing the Python stream-to-workspace lookup.
-@register_custom_op(fake_impl=_fi_a2a_fused_reduce_fake)
-def fi_a2a_fused_reduce(
-    partial_o: torch.Tensor, partial_lse: torch.Tensor, is_lse_base_on_e: bool
-) -> torch.Tensor:
     state = _FI_A2A_STATE
     assert state is not None, (
-        "fi_a2a workspace not initialized; BaseRunner.warmup() creates it "
-        "before CUDA graph capture."
+        "BaseRunner.warmup() creates the fi_a2a workspaces before graph capture"
     )
-    return _fi_a2a_fused_reduce_impl(
-        state=state,
-        partial_o=partial_o,
-        partial_lse=partial_lse,
-        is_lse_base_on_e=is_lse_base_on_e,
+    batch, heads, head_dim = cp_attn_out.shape
+    local_heads = heads // cp_size
+    # The kernel rejects an empty batch; every DCP rank sees the same batch.
+    if batch == 0:
+        return cp_attn_out.new_empty(0, local_heads, head_dim)
+    partial_o, partial_lse = _fi_a2a_peer_partials(
+        cp_attn_out=cp_attn_out, cp_attn_lse=cp_attn_lse, cp_size=cp_size
     )
+    if torch.cuda.current_stream().cuda_stream == state.capture_stream:
+        workspace = state.capture_workspace
+    else:
+        workspace = state.serving_workspace
+    # Eager batches wider than the widest captured graph run as several calls,
+    # in the same order on every DCP rank.
+    tokens_per_call = state.capacity_rows // local_heads
+    outputs = [
+        decode_cp_a2a_lse_reduce(
+            partial_o=partial_o[start : start + tokens_per_call],
+            partial_lse=partial_lse[start : start + tokens_per_call],
+            workspace=workspace,
+            cp_rank=state.cp_rank,
+            cp_size=cp_size,
+            lse_mode="basee" if is_lse_base_on_e else "base2",
+        )
+        for start in range(0, batch, tokens_per_call)
+    ]
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
 def dcp_a2a_lse_reduce(
@@ -703,8 +562,11 @@ def dcp_a2a_lse_reduce(
         return cp_attn_out
 
     if comm_backend == "fi_a2a":
-        return _dcp_fi_a2a_lse_reduce(
-            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        return fi_a2a_lse_reduce(
+            cp_attn_out=cp_attn_out,
+            cp_attn_lse=cp_attn_lse,
+            cp_size=cp_group.world_size,
+            is_lse_base_on_e=is_lse_base_on_e,
         )
 
     N = cp_group.world_size
@@ -750,42 +612,3 @@ def dcp_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
     return combined
-
-
-def _dcp_fi_a2a_lse_reduce(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: "GroupCoordinator",
-    is_lse_base_on_e: bool = True,
-) -> torch.Tensor:
-    """fi_a2a: one FlashInfer kernel exchanges the head partials and merges them.
-    Its layout is partial_o [B, H_per_rank, cp_size, D] (peer axis second-to-last)
-    plus a contiguous fp32 partial_lse [B, H_per_rank, cp_size].
-    """
-    N = cp_group.world_size
-    B, H, D = cp_attn_out.shape
-    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
-    H_per_rank = H // N
-    if cp_attn_out.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError(
-            f"DCP fi_a2a: attention partials are {cp_attn_out.dtype}; the fused "
-            "reduce supports float16 and bfloat16."
-        )
-    # The op rejects an empty input; B is equal on every DCP rank, so all ranks
-    # skip this collective together.
-    if B == 0:
-        return cp_attn_out.new_empty(0, H_per_rank, D)
-
-    partial_o = torch.empty(
-        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
-    )
-    partial_lse = torch.empty(
-        B, H_per_rank, N, dtype=torch.float32, device=cp_attn_out.device
-    )
-    dcp_pack_a2a_send(
-        cp_attn_out,
-        cp_attn_lse,
-        partial_o.permute(2, 0, 1, 3),
-        partial_lse.permute(2, 0, 1),
-    )
-    return fi_a2a_fused_reduce(partial_o, partial_lse, is_lse_base_on_e)

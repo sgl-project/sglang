@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups import model_override_base
@@ -1329,19 +1328,11 @@ def fi_a2a_blocker(view: Any) -> Optional[str]:
             "does not support --enable-pdmux (every captured stream group would "
             "need its own fused-reduce workspace)"
         )
-    if view.enable_torch_symm_mem:
-        return (
-            "cannot be combined with --enable-torch-symm-mem (fi_a2a moves torch "
-            "symmetric memory to the NCCL backend, which that all-reduce cannot use)"
-        )
     if envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get() and view.pp_size > 1:
         return (
             "cannot be combined with SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP at "
             "--pp-size > 1 (its decode warmup runs on a third CUDA stream)"
         )
-    # The fused workspace is an NCCL symmetric window, which needs cuMem memory.
-    if os.environ.get("NCCL_CUMEM_ENABLE") == "0":
-        return "needs cuMem-backed NCCL memory, but NCCL_CUMEM_ENABLE=0 is exported"
     return None
 
 

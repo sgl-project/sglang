@@ -4004,11 +4004,13 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
-    def _args(self, **fields):
-        return ServerArgs(model_path="dummy", tp_size=8, **fields)
+    _NO_FUSED_OP = (
+        "requires a FlashInfer build that provides "
+        "flashinfer.comm.decode_cp_a2a_lse_reduce"
+    )
 
     def _resolved(self, **fields):
-        args = self._args(**fields)
+        args = ServerArgs(model_path="dummy", tp_size=8, **fields)
         parallel_hook.handle_decode_context_parallelism(args)
         return resolution_result(args, "dcp_comm_backend")
 
@@ -4039,42 +4041,34 @@ class TestDcpCommBackendDefault(CustomTestCase):
     def test_a2a_when_the_fused_reduce_cannot_run(self):
         """fi_a2a has no fallback kernel, so resolving to it on a host that
         cannot run the fused reduce would fail every default DCP start."""
-        host, mla = self._fused_reduce(platform_blocker="requires torch>=2.14")
+        host, mla = self._fused_reduce(platform_blocker=self._NO_FUSED_OP)
         with host, mla:
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_configs_the_fused_reduce_cannot_serve_resolve_to_a2a(self):
         cases = {
-            "non-MLA model": ({}, {}, False),
-            "--enable-pdmux": ({"enable_pdmux": True}, {}, True),
-            "--enable-torch-symm-mem": ({"enable_torch_symm_mem": True}, {}, True),
-            "exported NCCL_CUMEM_ENABLE=0": ({}, {"NCCL_CUMEM_ENABLE": "0"}, True),
+            "non-MLA model": ({}, False, False),
+            "--enable-pdmux": ({"enable_pdmux": True}, False, True),
+            "PP DeepGEMM warmup at pp_size 2": ({"pp_size": 2}, True, True),
         }
-        for name, (fields, env, is_mla) in cases.items():
+        for name, (fields, pp_warmup, is_mla) in cases.items():
             with self.subTest(name):
                 host, mla = self._fused_reduce(mla=is_mla)
-                with host, mla, patch.dict(os.environ, env):
+                warmup = envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.override(pp_warmup)
+                with host, mla, warmup:
                     self.assertEqual(self._resolved(dcp_size=4, **fields), "a2a")
                     with self.assertRaisesRegex(ValueError, "--dcp-comm-backend a2a"):
                         self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a", **fields)
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_fi_a2a_names_the_blocker(self):
-        host, mla = self._fused_reduce(platform_blocker="requires torch>=2.14")
+        host, mla = self._fused_reduce(platform_blocker=self._NO_FUSED_OP)
         with host, mla:
-            with self.assertRaisesRegex(ValueError, "fi_a2a requires torch>=2.14"):
+            with self.assertRaisesRegex(
+                ValueError, "fi_a2a requires a FlashInfer build that provides"
+            ):
                 self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a")
-
-    @override_platform(is_cuda=True, is_hip=False)
-    def test_explicit_fi_a2a_defaults_nccl_cumem_on(self):
-        """The fused workspace is an NCCL symmetric window; engine startup would
-        otherwise force NCCL_CUMEM_ENABLE=0 for a non-symm-mem server."""
-        host, mla = self._fused_reduce()
-        with host, mla, patch.dict(os.environ):
-            os.environ.pop("NCCL_CUMEM_ENABLE", None)
-            self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a")
-            self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "1")
 
     @override_platform(is_cuda=False, is_hip=False)
     def test_ag_rs_off_cuda(self):
