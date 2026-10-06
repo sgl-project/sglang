@@ -5033,14 +5033,20 @@ class InklingTokenOutputTest(CustomTestCase):
             for chunk in chunks
         ]
 
-    def _reasoning_and_content(self, request, output_ids, finish_reason) -> dict:
+    def _reasoning_and_content(
+        self, request, output_ids, finish_reason, *, split=2
+    ) -> dict:
         reasoning, content, _, _ = self.serving._parse_inkling_response(
             request, output_ids, finish_reason
         )
         results = {"non-stream": (reasoning or "", content)}
         for incremental in (False, True):
             deltas = self._stream_deltas(
-                request, output_ids, finish_reason, incremental=incremental, split=2
+                request,
+                output_ids,
+                finish_reason,
+                incremental=incremental,
+                split=split,
             )
             results[f"stream incremental={incremental}"] = (
                 "".join(d.get("reasoning_content") or "" for d in deltas),
@@ -5139,6 +5145,84 @@ class InklingTokenOutputTest(CustomTestCase):
             for mode, result in results.items():
                 with self.subTest(case=name, mode=mode):
                     self.assertEqual(result, expected)
+
+    def test_stop_string_is_cut_where_the_sampler_matched(self):
+        """Bug regression: the stop string was searched in the merged content,
+        where two text blocks can spell it although framing separated them in
+        the sampled stream; the answer was truncated at that false match."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        first_block = [
+            special("message_model"),
+            special("content_text"),
+            *encode("EN"),
+            special("end_message"),
+        ]
+        output_ids = [
+            *first_block,
+            special("message_model"),
+            special("content_text"),
+            *encode("D and actual END"),
+        ]
+        for no_stop_trim, expected in (
+            (False, ("", "END and actual ")),
+            (True, ("", "END and actual END")),
+        ):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                no_stop_trim=no_stop_trim,
+            )
+            results = self._reasoning_and_content(
+                request,
+                output_ids,
+                {"type": "stop", "matched": "END"},
+                split=len(first_block),
+            )
+            for mode, result in results.items():
+                with self.subTest(no_stop_trim=no_stop_trim, mode=mode):
+                    self.assertEqual(result, expected)
+
+    def test_special_stop_inside_open_text_block_is_not_visible(self):
+        """Bug regression: inside an open text block TML renders a special token
+        as text, so a custom special stop id leaked unless trimmed by id."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        stop_id = tokenizer.encode_special("content_text")
+        text_block = [tokenizer.encode_special("message_model"), stop_id]
+        continued = [
+            {"role": "user", "content": "First five primes?"},
+            {"role": "assistant", "content": "2, 3,"},
+        ]
+        cases = [
+            ("explicit block", [{"role": "user", "content": "hi"}], text_block),
+            ("continued block", continued, []),
+        ]
+        for name, messages, header in cases:
+            for no_stop_trim, expected in (
+                (False, ("", " 5, 7")),
+                (True, ("", " 5, 7<|content_text|>")),
+            ):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    continue_final_message=name == "continued block",
+                    no_stop_trim=no_stop_trim,
+                )
+                results = self._reasoning_and_content(
+                    request,
+                    [*header, *encode(" 5, 7"), stop_id],
+                    {"type": "stop", "matched": stop_id},
+                    split=len(header) + 1,
+                )
+                for mode, result in results.items():
+                    with self.subTest(case=name, no_stop_trim=no_stop_trim, mode=mode):
+                        self.assertEqual(result, expected)
 
     def test_constrained_output_without_header_is_content(self):
         """Bug regression: response_format grammars sample bare JSON where a

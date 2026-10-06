@@ -98,19 +98,52 @@ class InklingOutputParser:
         matched_stop: int | str | None = None,
         keep_matched_stop: bool = False,
     ) -> InklingOutputDelta:
-        tokenizer = self._tml.tokenizer
-        if (
-            isinstance(matched_stop, int)
-            and not keep_matched_stop
+        if isinstance(matched_stop, str):
+            token_ids = self._cut_at_stop_string(
+                token_ids, matched_stop, keep_stop=keep_matched_stop
+            )
+        elif (
+            not keep_matched_stop
             and token_ids
             and token_ids[-1] == matched_stop
-            and not tokenizer.is_special_token(matched_stop)
+            and matched_stop != self._end_message_id
         ):
+            # Inside an open block TML renders even a special stop as text;
+            # only end_message closes a block without rendering.
             token_ids = token_ids[:-1]
-        delta = self.feed(token_ids).merge(self._flush())
-        if isinstance(matched_stop, str):
-            delta = _trim_stop_string(delta, matched_stop, keep_stop=keep_matched_stop)
-        return delta
+        return self.feed(token_ids).merge(self._flush())
+
+    def _cut_at_stop_string(
+        self, token_ids: Sequence[int], stop: str, *, keep_stop: bool
+    ) -> list[int]:
+        # The scheduler matched ``stop`` on the decoded ids, framing included,
+        # and ended on the token completing it; cut the raw stream there.
+        tokenizer = self._tml.tokenizer
+        stop_bytes = stop.encode()
+        pieces: list[bytes] = []
+        region = b""
+        start = len(token_ids)
+        while start > 0 and stop_bytes not in region:
+            if pieces and len(region) >= len(stop_bytes) + len(pieces[-1]):
+                return list(token_ids)
+            start -= 1
+            pieces.insert(0, tokenizer.decode_bytes([token_ids[start]]))
+            region = pieces[0] + region
+        cut = region.find(stop_bytes)
+        if cut == -1:
+            return list(token_ids)
+        if keep_stop:
+            cut += len(stop_bytes)
+        kept = list(token_ids[:start])
+        offset = 0
+        for token_id, piece in zip(token_ids[start:], pieces):
+            if offset + len(piece) <= cut:
+                kept.append(token_id)
+            elif offset < cut and not tokenizer.is_special_token(token_id):
+                partial = piece[: cut - offset].decode(errors="ignore")
+                kept += tokenizer.encode_ordinary(partial)
+            offset += len(piece)
+        return kept
 
     def _flush(self) -> InklingOutputDelta:
         delta = _DeltaBuilder()
@@ -237,20 +270,6 @@ class InklingOutputParser:
         return tokenizer.decode(
             [t for t in ids[kind_index + 1 :] if not tokenizer.is_special_token(t)]
         )
-
-
-def _trim_stop_string(
-    delta: InklingOutputDelta, stop: str, *, keep_stop: bool
-) -> InklingOutputDelta:
-    # The scheduler stops at the first occurrence; like the detokenizer's text
-    # trim, drop it (unless kept) and whatever followed it in the last token.
-    for field in ("reasoning", "content"):
-        text = getattr(delta, field)
-        pos = text.find(stop)
-        if pos != -1:
-            end = pos + len(stop) if keep_stop else pos
-            return msgspec.structs.replace(delta, **{field: text[:end]})
-    return delta
 
 
 class _DeltaBuilder:
