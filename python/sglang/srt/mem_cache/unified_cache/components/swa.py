@@ -82,6 +82,15 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        margin = envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.get()
+        if margin < 0:
+            raise ValueError(
+                f"SGLANG_SWA_CACHE_WINDOW_MARGIN must be >= 0, got {margin}"
+            )
+        # Live SWA a tree insert keeps behind its end. A chat template that
+        # re-renders the previous assistant turn can end the next turn's match a
+        # few tokens early, which one exact window does not cover.
+        self.cached_window_size = self.sliding_window_size + margin
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -561,10 +570,10 @@ class SWAComponent(TreeComponent):
     def _maybe_split_leaf_for_swa_lock(
         self, leaf: UnifiedTreeNode
     ) -> Optional[UnifiedTreeNode]:
-        """Cap a fresh in-window SWA leaf at one page-aligned window so locking it pins
-        only one window of SWA pool, not the whole (long chunked-prefill) leaf; return
-        the split-off parent (older window) or None. The SWA value is stamped later, so
-        this runs on the tombstone leaf.
+        """Cap a fresh in-window SWA leaf at the page-aligned cached window so locking
+        it pins only that much SWA pool, not the whole (long chunked-prefill) leaf;
+        return the split-off parent (older window) or None. The SWA value is stamped
+        later, so this runs on the tombstone leaf.
         """
         ct = self.component_type
         cd = leaf.component_data[ct]
@@ -572,8 +581,10 @@ class SWAComponent(TreeComponent):
             return None
 
         page_size = self.tree_core.page_size
-        # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        # Smallest page-aligned size that still covers the cached window. A margin
+        # split into the parent would sit outside the window the lock refreshes
+        # and be evicted first.
+        tail_size = (self.cached_window_size + page_size - 1) // page_size * page_size
         leaf_len = len(leaf.key)
         if leaf_len <= tail_size:
             return None
@@ -985,7 +996,7 @@ class SWAComponent(TreeComponent):
         free_swa_out_of_window_slots(
             req,
             pre_len,
-            sliding_window_size=self.sliding_window_size,
+            sliding_window_size=self.cached_window_size,
             page_size=self.cache.page_size,
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,

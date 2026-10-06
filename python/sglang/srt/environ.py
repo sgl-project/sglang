@@ -680,6 +680,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # SWA tokens a cached prompt keeps live beyond its sliding window, so a later
+    # request whose match ends this many tokens before its end can reuse it.
+    SGLANG_SWA_CACHE_WINDOW_MARGIN = EnvInt(0)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
