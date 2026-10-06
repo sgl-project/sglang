@@ -810,7 +810,7 @@ class TestPrefillResultPolling(CustomTestCase):
         ):
             _run_loop(scheduler)
 
-        release_kv.assert_called_once_with(prior, scheduler.tree_cache)
+        release_kv.assert_called_once_with(prior, scheduler.tree_cache, checkpoint=True)
         self.assertEqual(prior.metadata_buffer_index, -1)
         self.assertEqual(second.reqs[0].metadata_buffer_index, 0)
         self.assertIn((6, "launch", 2), scheduler.actions)
@@ -1367,7 +1367,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
 
-                def release(req, tree_cache, is_insert):
+                def release(req, tree_cache, checkpoint):
                     self.assertEqual(req.inflight_middle_chunks, 0)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
@@ -1383,7 +1383,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     _run_loop(scheduler, optimistic_prefill_attempts=2)
 
                 release_kv.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
+                    req, scheduler.tree_cache, checkpoint=False
                 )
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
