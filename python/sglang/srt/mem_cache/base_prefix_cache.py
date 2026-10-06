@@ -241,6 +241,16 @@ class DecLockRefParams:
 
 
 @dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
 class DecLockRefResult:
     """Result of an dec_lock_ref operation."""
 
@@ -521,11 +531,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
-    def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``; a cache
-        whose acquire returned a receipt releases with it here."""
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+    def lock(self, node: Any) -> Optional[TreeLock]:
+        """Take a tree lock on ``node`` for one holder; ``unlock`` releases it."""
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
 
     def maybe_hand_to_session(self, req: Req) -> None:
         """A cache that keeps records across requests (a streaming session) takes

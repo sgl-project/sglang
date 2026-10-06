@@ -3144,16 +3144,26 @@ class ServerArgs(DisaggServerArgsMixin):
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
-        Normalizes localhost and IPv6 hosts to IPv4 loopback for internal ZMQ.
+        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
         """
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
-        """Ingress endpoint of one DP replica's driver rank."""
+        """Ingress endpoint of one DP replica's driver rank.
+
+        The scheduler ingress is an unauthenticated pickle-RPC endpoint
+        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
+        with ``pickle.loads``), so it must never be derived from the public
+        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
+        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
+        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
+        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
+        (used for intentional cross-machine deployments) are honored.
+        """
         scheduler_host = self.host
         if (
             scheduler_host is None
-            or scheduler_host == "localhost"
+            or scheduler_host in ("localhost", "0.0.0.0")
             or is_valid_ipv6_address(scheduler_host)
         ):
             scheduler_host = "127.0.0.1"
