@@ -99,11 +99,7 @@ class _LastRowTrunk:
 
 
 class _LastRowModel:
-    """``self`` for ``Model.__call__`` whose ``.model`` yields its last row only.
-
-    The model's own forward then applies the head (and any op after it) to one
-    position. Every other attribute resolves to the real model.
-    """
+    """Model proxy whose trunk returns only its last position."""
 
     __slots__ = ("_model", "model")
 
@@ -1195,8 +1191,7 @@ class MlxModelRunner:
             logits = self._extract_logits(model_output)
             return mx.argmax(logits[:, -1, :], axis=-1), None
         if input_ids.shape[1] > 1 and self._trunk is not None:
-            # Head on the last position only; a [chunk, vocab] logits array is
-            # otherwise the largest transient in the process.
+            # Avoid materializing logits for unused positions.
             model_output = type(self.model).__call__(
                 _LastRowModel(self.model, self._trunk), input_ids, cache=cache
             )

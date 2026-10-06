@@ -64,11 +64,10 @@ class TestLastRowLogits(CustomTestCase):
             self.assertTrue(mx.array_equal(c_full.values, c_last.values).item())
         return last
 
-    def test_untied_head(self):
-        self._assert_matches_full_forward(_tiny_qwen2(tie=False))
-
-    def test_tied_head(self):
-        self._assert_matches_full_forward(_tiny_qwen2(tie=True))
+    def test_tied_and_untied_heads(self):
+        for tie in (False, True):
+            with self.subTest(tie=tie):
+                self._assert_matches_full_forward(_tiny_qwen2(tie=tie))
 
     def test_post_head_op_still_applies(self):
         last = self._assert_matches_full_forward(
