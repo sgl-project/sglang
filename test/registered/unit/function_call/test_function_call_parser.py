@@ -3270,11 +3270,68 @@ class TestGlm4MoeDetector(unittest.TestCase):
 
         self.assertEqual(len(result.calls), 1)
         params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], r"\C|\.")
+        self.assertEqual(params["city"], r'"\C|\."')
         self.assertFalse(
             any(isinstance(w.message, SyntaxWarning) for w in caught),
             [str(w.message) for w in caught],
         )
+
+    def test_string_arg_values_kept_verbatim(self):
+        """The chat template writes string values raw, so the raw text is the
+        value in non-streaming and streaming parsing alike."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="edit_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "new_str": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "options": {"type": "object"},
+                            "tags": {"type": "array"},
+                        },
+                    },
+                ),
+            )
+        ]
+        for value in (
+            '"hello"',
+            "'hello'",
+            '"a\\nb"',
+            '""',
+            "true",
+            "null",
+            "1e2",
+            '{"k":1}',
+        ):
+            text = (
+                "<tool_call>edit_file\n"
+                f"<arg_key>new_str</arg_key>\n<arg_value>{value}</arg_value>\n"
+                "<arg_key>count</arg_key>\n<arg_value>7</arg_value>\n"
+                '<arg_key>options</arg_key>\n<arg_value>{"ok": false}</arg_value>\n'
+                '<arg_key>tags</arg_key>\n<arg_value>["a"]</arg_value>\n'
+                "</tool_call>"
+            )
+            expected = {
+                "new_str": value,
+                "count": 7,
+                "options": {"ok": False},
+                "tags": ["a"],
+            }
+            with self.subTest(value=value):
+                result = Glm4MoeDetector().detect_and_parse(text, tools)
+                self.assertEqual(json.loads(result.calls[0].parameters), expected)
+
+                detector = Glm4MoeDetector()
+                streamed = ""
+                for offset in range(0, len(text), 5):
+                    chunk = text[offset : offset + 5]
+                    for call in detector.parse_streaming_increment(chunk, tools).calls:
+                        streamed += call.parameters or ""
+                self.assertEqual(json.loads(streamed), expected)
+                self.assertEqual(detector.prev_tool_call_arr[0]["arguments"], expected)
 
     def test_parse_arguments_preserves_underscore_in_string_args(self):
         """PEP 515 makes ast.literal_eval strip underscores ("123_456"->123456);
