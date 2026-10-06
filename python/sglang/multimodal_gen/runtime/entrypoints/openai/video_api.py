@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -309,6 +310,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "output_path": request.output_path,
         "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
+        "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
         "profile": request.profile,
@@ -370,9 +372,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
@@ -503,6 +509,7 @@ async def create_video(
     upscaling_scale: Optional[int] = Form(None),
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    x264_preset: Optional[str] = Form(None),
     output_path: Optional[str] = Form(None),
     perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
@@ -519,14 +526,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.prompt_optional:
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -606,7 +614,11 @@ async def create_video(
         num_frames_val = form_value("num_frames", num_frames)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # ``prompt`` is a required str field on VideoGenerationsRequest; it is only
+            # ``None`` here for a prompt-optional pipeline (the gate above already
+            # rejected a missing prompt for every other one), so an empty string is the
+            # correct substitute, not a real (ignored) prompt value.
+            prompt=prompt or "",
             enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
@@ -649,6 +661,7 @@ async def create_video(
             ),
             upscaling_scale=form_value("upscaling_scale", upscaling_scale),
             output_compression=form_value("output_compression", output_compression),
+            x264_preset=form_value("x264_preset", x264_preset),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             perf_dump_path=form_value("perf_dump_path", perf_dump_path),
@@ -702,6 +715,8 @@ async def create_video(
                         detail=f"Failed to process image source: {str(e)}",
                     )
                 payload["input_reference"] = input_path
+            if resolve_sampling_params_cls(server_args).prompt_optional:
+                payload.setdefault("prompt", "")
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")

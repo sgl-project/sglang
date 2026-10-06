@@ -15,6 +15,9 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    FORWARD_OVERLAP_CATEGORIES,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -85,7 +88,7 @@ class TestEnableMetrics(CustomTestCase):
             self.assertIn("1", num_prefill_ranks_values)
 
         self._execute_core(
-            other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+            other_args=["--tp", "2", "--attn-dp-size", "2"],
             verify_metrics_extra=_verify_metrics_extra,
             expect_mfu_metrics=True,
             enable_mfu_metrics=True,
@@ -233,7 +236,6 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:forward_execution_seconds_total", {"category": "extend"}),
             ("sglang:forward_execution_seconds_total", {"category": "decode"}),
             ("sglang:scheduler_process_cpu_seconds_total", {}),
-            ("sglang:scheduler_stage_seconds_total", {"category": "other"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
             ("sglang:weight_memory_usage_gb", {"model_name": _MODEL_NAME}),
             ("sglang:kv_cache_memory_usage_gb", {"model_name": _MODEL_NAME}),
@@ -253,6 +255,22 @@ class TestEnableMetrics(CustomTestCase):
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
+        # Reuse this serving fixture; the overlap mix depends on the workload.
+        stage_samples = metrics["sglang:scheduler_stage_seconds_total"]
+        self.assertTrue(
+            all(
+                sample.labels.get("forward_overlap") in FORWARD_OVERLAP_CATEGORIES
+                for sample in stage_samples
+            )
+        )
+        self.assertGreater(
+            sum(
+                sample.value
+                for sample in stage_samples
+                if sample.labels["category"] == "other"
+            ),
+            0,
+        )
         for metric_name in (
             "sglang:graph_memory_usage_gb",
             "sglang:startup_cuda_graph_time_seconds",

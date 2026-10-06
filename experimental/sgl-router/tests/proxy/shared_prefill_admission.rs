@@ -148,12 +148,15 @@ fn config(policy: PolicyKind) -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -195,7 +198,7 @@ async fn fixture(
                 url: backend.url.clone(),
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId("tiny".into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -412,7 +415,7 @@ async fn chat_records_prefill_admission_exhausted_for_out_of_range_primary() {
         url: "http://outsider:30000".into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     let fixture = fixture(PolicyKind::SessionAware, |_| {
         Arc::new(InvalidPairPolicy {
