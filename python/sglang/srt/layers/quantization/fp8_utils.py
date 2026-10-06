@@ -617,10 +617,20 @@ def dispatch_w8a8_block_fp8_linear(
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
+        linear = _dispatch_explicit_backend(backend)
+    else:
+        # Auto mode: Select based purely on hardware/backend availability
+        linear = _dispatch_auto_backend()
 
-    # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+    # CUTLASS quantizes activations inside the backend, so preserve the
+    # checkpoint-requested activation scale format through dispatch.
+    if linear is cutlass_w8a8_block_fp8_linear_with_fallback and act_scale_ue8m0:
+        return partial(
+            linear,
+            act_scale_ue8m0=True,
+        )
+
+    return linear
 
 
 def torch_w8a8_block_fp8_linear(
@@ -1179,6 +1189,7 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
 ) -> torch.Tensor:
     # TODO: add more robust shape check here
     shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
@@ -1205,7 +1216,13 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     if not shape_supported:
         # fallback to triton
         return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale,
+            bias,
+            act_scale_ue8m0=act_scale_ue8m0,
         )
 
     input_2d = input.view(-1, input.shape[-1])
@@ -1216,7 +1233,9 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     # kernels per GEMM). weight_scale.T is left as a K-major view because the
     # kernel requires scales_b.stride(0) == 1 and materializes it internally.
     q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
-        input_2d, block_size[1]
+        input_2d,
+        block_size[1],
+        scale_ue8m0=act_scale_ue8m0,
     )
     output = fp8_blockwise_scaled_mm(
         q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
