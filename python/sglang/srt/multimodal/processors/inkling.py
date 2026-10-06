@@ -79,7 +79,7 @@ def _resolve_media_item(item):
     if not isinstance(url, str):
         return item
     if not url.strip():
-        raise ValueError("empty image_url")
+        raise ValueError("empty media URL")
     try:
         if url.startswith("data:"):
             header, _, payload = url.partition(",")
@@ -89,7 +89,10 @@ def _resolve_media_item(item):
         if url.startswith(("http://", "https://")):
             return download_remote_media(url, timeout=30)
     except CLIENT_MEDIA_EXCEPTIONS as e:
-        raise ValueError(f"Error while resolving media {url!r}: {e}") from e
+        url_str = url
+        if len(url_str) > 100:
+            url_str = url_str[:100] + "..."
+        raise ValueError(f"Error while resolving media {url_str}: {e}") from e
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 
