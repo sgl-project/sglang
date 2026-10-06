@@ -24,6 +24,148 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
+class MarkovSamplingTest(TestCase):
+    def _heads(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.models.deepseek_v4_dspark import DSparkV4MarkovHead
+        from sglang.srt.models.dspark import GatedMarkovHead, RNNHead, VanillaMarkov
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4_dspark.VocabParallelEmbedding",
+                side_effect=lambda vocab, rank, **kwargs: torch.nn.Embedding(
+                    vocab, rank
+                ),
+            ),
+            envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.override(False),
+            envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.override(False),
+        ):
+            deepseek = DSparkV4MarkovHead(vocab_size=32, markov_rank=8)
+        return [
+            VanillaMarkov(vocab_size=32, markov_rank=8),
+            GatedMarkovHead(vocab_size=32, markov_rank=8, hidden_size=16),
+            RNNHead(vocab_size=32, markov_rank=8, hidden_size=16),
+            deepseek,
+        ]
+
+    def test_shared_markov_sampling_matches_teacher_forced_logits(self):
+        from sglang.srt.sampling.markov import run_markov_block
+
+        torch.manual_seed(41)
+        base = torch.randn(2, 4, 32)
+        hidden = torch.randn(2, 4, 16)
+        anchor = torch.tensor([3, 7])
+        for head in self._heads():
+            with self.subTest(head=type(head).__name__):
+                # A fixed draw exercises the recurrence independently of argmax.
+                draws = torch.tensor([[1, 4, 9, 2], [6, 2, 3, 8]])
+                tokens, logits = run_markov_block(
+                    head,
+                    base,
+                    first_prev_tokens=anchor,
+                    hidden_states=hidden,
+                    sampler=lambda logits, step: draws[:, step],
+                )
+                previous = torch.cat((anchor[:, None], draws[:, :-1]), dim=1)
+                if hasattr(head, "apply_block_logits"):
+                    expected = head.apply_block_logits(
+                        base,
+                        token_ids=previous,
+                        hidden_states=hidden,
+                    )
+                else:
+                    expected = base + head.compute_step_bias(previous, hidden)
+                torch.testing.assert_close(tokens, draws)
+                torch.testing.assert_close(logits, expected)
+                greedy, no_logits = run_markov_block(
+                    head,
+                    base,
+                    first_prev_tokens=anchor,
+                    hidden_states=hidden,
+                    sampler=lambda logits, step: logits.argmax(-1),
+                    collect_corrected=False,
+                )
+                self.assertIsNone(no_logits)
+                again, _ = run_markov_block(
+                    head,
+                    base,
+                    first_prev_tokens=anchor,
+                    hidden_states=hidden,
+                    sampler=lambda logits, step: logits.argmax(-1),
+                )
+                torch.testing.assert_close(greedy, again)
+                empty, empty_logits = run_markov_block(
+                    head,
+                    base[:, :0],
+                    first_prev_tokens=anchor,
+                    hidden_states=hidden[:, :0],
+                    sampler=Mock(side_effect=AssertionError),
+                )
+                self.assertEqual(empty.shape, (2, 0))
+                self.assertEqual(empty_logits.shape, (2, 0, 32))
+
+    @skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_shared_markov_greedy_and_graph_replay(self):
+        from sglang.srt.models.deepseek_v4_dspark import MarkovW2ShardGeometry
+        from sglang.srt.sampling.markov import (
+            run_markov_block,
+            sample_markov_block_greedy,
+        )
+
+        torch.manual_seed(42)
+        base = torch.randn(2, 4, 32, device="cuda")
+        hidden = torch.randn(2, 4, 16, device="cuda")
+        anchor = torch.tensor([3, 7], device="cuda")
+        for head in self._heads():
+            head = head.cuda()
+            is_deepseek = hasattr(head, "supports_sharded_greedy")
+            if is_deepseek:
+                head._is_dsv41 = True
+                head._opt_markov_w2_bf16 = True
+                head.markov_w2 = head.markov_w2.to(torch.bfloat16)
+                head._tp_shard = MarkovW2ShardGeometry(1, 0, 32, 32, 32)
+                head._shard_group = NS(world_size=1)
+                head._vocab_gather = Mock(
+                    side_effect=lambda tensor: tensor,
+                    gather_stacked=lambda tensor: tensor,
+                )
+            with self.subTest(head=type(head).__name__):
+
+                def run():
+                    return run_markov_block(
+                        head,
+                        base,
+                        first_prev_tokens=anchor,
+                        hidden_states=hidden,
+                        sampler=lambda logits, step: logits.argmax(-1),
+                    )
+
+                # Warm kernels on a side stream before capture.
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    run()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    tokens, logits = run()
+                base.add_(torch.randn_like(base))
+                anchor.copy_(torch.tensor([5, 1], device="cuda"))
+                graph.replay()
+                expected_tokens, expected_logits = run()
+                torch.testing.assert_close(tokens, expected_tokens)
+                torch.testing.assert_close(logits, expected_logits)
+                fused = sample_markov_block_greedy(
+                    head,
+                    base,
+                    first_prev_tokens=anchor,
+                )
+                if head.markov_head_type == "vanilla":
+                    torch.testing.assert_close(fused, expected_tokens)
+                else:
+                    self.assertIsNone(fused)
+
+
 class VerifySamplingTest(TestCase):
     def test_moe_keeps_native_epilogue_and_single_capture(self):
         from sglang.srt.speculative.dspark_components import (

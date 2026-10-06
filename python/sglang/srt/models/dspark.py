@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -29,8 +29,6 @@ from sglang.srt.speculative.ragged_verify import (
 
 logger = logging.getLogger(__name__)
 
-StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
-
 
 def gather_and_crop_vocab(
     local_logits: torch.Tensor, lm_head: nn.Module
@@ -47,41 +45,6 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
     return torch.matmul(hidden.to(weight.dtype), weight.T)
-
-
-def run_markov_block(
-    head: nn.Module,
-    base_logits: torch.Tensor,
-    *,
-    first_prev_tokens: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    sampler: StepSampler,
-    collect_corrected: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    batch_size, proposal_len = base_logits.shape[:2]
-    if proposal_len == 0:
-        empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-        return empty, base_logits
-
-    sampled_tokens = []
-    corrected_logits = []
-    prev_tokens = first_prev_tokens.long()
-    for step_idx in range(proposal_len):
-        step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
-        )
-        next_tokens = sampler(step_logits, step_idx)
-        sampled_tokens.append(next_tokens)
-        if collect_corrected:
-            corrected_logits.append(step_logits.unsqueeze(1))
-        prev_tokens = next_tokens
-    return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-    )
 
 
 class VanillaMarkov(nn.Module):
@@ -118,8 +81,9 @@ class VanillaMarkov(nn.Module):
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return logits + self.compute_step_bias(token_ids, hidden_states), state
 
     def apply_block_logits(
         self,
@@ -132,57 +96,12 @@ class VanillaMarkov(nn.Module):
             return base_logits
         return base_logits + self.compute_step_bias(token_ids, hidden_states)
 
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
+    def compute_greedy_step(self, logits, *, token_ids):
+        return MarkovGreedyStep.execute(
+            base_logits=logits,
+            prev_embeds=self.get_prev_embeddings(token_ids),
+            w2_weight=self.markov_w2.weight,
         )
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Greedy-only draft-block sampling via the fused per-step
-        [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
-        markov_w2 per step instead of GEMV + add + two-pass argmax, and no
-        full-vocab bias/step-logits materialization.
-
-        Only valid for the vanilla step bias (bias = w2 @ w1[prev]); subclasses
-        whose step bias depends on hidden state override this to return None so
-        the caller falls back to sample_block.
-        """
-        if not base_logits.is_cuda:
-            return None
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            return torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-        sampled_tokens = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_embeds = self.get_prev_embeddings(prev_tokens)
-            prev_tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits[:, step_idx, :],
-                prev_embeds=prev_embeds,
-                w2_weight=self.markov_w2.weight,
-            )
-            sampled_tokens.append(prev_tokens)
-        return torch.stack(sampled_tokens, dim=1)
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -247,14 +166,8 @@ class GatedMarkovHead(VanillaMarkov):
         )
         return self.project_bias(gate * prev_embeddings)
 
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        # The gated step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
+    def compute_greedy_step(self, logits, *, token_ids):
+        # Hidden-state-dependent bias is not supported by the fused kernel.
         return None
 
 
@@ -319,55 +232,29 @@ class RNNHead(VanillaMarkov):
             output_logits.append(base_logits[..., k, :] + bias)
         return torch.stack(output_logits, dim=-2)
 
-    def sample_block(
+    def apply_step_logits(
         self,
-        base_logits: torch.Tensor,
+        logits: torch.Tensor,
         *,
-        first_prev_tokens: torch.Tensor,
+        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
+        state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            empty = torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
+        prev_embeddings = self.get_prev_embeddings(token_ids)
+        if state is None:
+            state = torch.zeros(
+                *token_ids.shape,
+                self.markov_rank,
+                device=logits.device,
+                dtype=hidden_states.dtype,
             )
-            return empty, base_logits
+        state, bias = self._rnn_step(state, prev_embeddings, hidden_states)
+        return logits + bias, state
 
-        state = torch.zeros(
-            batch_size,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        sampled_tokens = []
-        corrected_logits = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_emb = self.get_prev_embeddings(prev_tokens)
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
-            step_logits = base_logits[:, step_idx, :] + bias
-            next_tokens = sampler(step_logits, step_idx)
-            sampled_tokens.append(next_tokens)
-            if collect_corrected:
-                corrected_logits.append(step_logits.unsqueeze(1))
-            prev_tokens = next_tokens
-        return (
-            torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-        )
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        # The recurrent step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
+    def compute_greedy_step(self, logits, *, token_ids):
+        # Hidden-state-dependent bias is not supported by the fused kernel.
         return None
 
 
