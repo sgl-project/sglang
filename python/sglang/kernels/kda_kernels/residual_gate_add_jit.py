@@ -271,6 +271,8 @@ def _residual_gate_add_rocm_triton(residual, update, gate):
     is_16 = residual.dtype in (torch.float16, torch.bfloat16)
     if _is_transposed_dense_residual(residual, update, gate):
         _, tokens, hidden = residual.shape
+        # Tile/warp sizes reused from the CUDA transposed kernel; not
+        # independently tuned or profiled on AMD GPUs.
         tile = (
             16
             if residual.numel() <= 65536
