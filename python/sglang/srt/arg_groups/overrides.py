@@ -1446,11 +1446,11 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and get_platform().is_sm120
+        and (get_platform().is_sm120 or get_platform().is_sm110)
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
             "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
         )
     if moe_runner_backend != view.moe_runner_backend:
