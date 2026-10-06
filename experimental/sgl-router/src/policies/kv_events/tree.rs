@@ -545,6 +545,8 @@ struct Node {
     /// block on. A carrier is dropped the moment its last tier bit clears;
     /// an entry with empty tiers never exists (see [`TreeState::insert`]).
     workers: HashMap<KvWorkerId, Tiers>,
+    /// Exact shard-local worker bits used only for continuity diagnostics.
+    owner_bits: u64,
     /// Children keyed by next-block hash.
     children: FxHashMap<i64, NodeId>,
     last_used: AtomicU64,
@@ -557,6 +559,7 @@ impl Node {
             parent_block_hash,
             parent: Some(parent),
             workers: HashMap::new(),
+            owner_bits: 0,
             children: FxHashMap::default(),
             last_used: AtomicU64::new(now_millis()),
         }
@@ -585,6 +588,10 @@ struct TreeState {
     /// `account_remove`), so a scrape reads it without walking the tree. A
     /// carrier holding nothing in the shard has no row.
     occupancy: HashMap<KvWorkerId, TierCounts>,
+    // At most 64 identities, never recycled. Overflow falls back to exact
+    // worker comparisons; bit collisions must never hide a gap.
+    worker_bits: HashMap<KvWorkerId, u64>,
+    worker_bits_overflow: bool,
 }
 
 const ROOT_ID: NodeId = 0;
@@ -603,6 +610,7 @@ impl TreeState {
                 parent_block_hash: None,
                 parent: None,
                 workers: HashMap::new(),
+                owner_bits: 0,
                 children: FxHashMap::default(),
                 last_used: AtomicU64::new(now_millis()),
             },
@@ -612,7 +620,22 @@ impl TreeState {
             by_hash: FxHashMap::default(),
             next_id: 1,
             occupancy: HashMap::new(),
+            worker_bits: HashMap::new(),
+            worker_bits_overflow: false,
         }
+    }
+
+    fn worker_bit(&mut self, worker: &KvWorkerId) -> u64 {
+        if let Some(&bit) = self.worker_bits.get(worker) {
+            return bit;
+        }
+        if self.worker_bits.len() == 64 {
+            self.worker_bits_overflow = true;
+            return 0;
+        }
+        let bit = 1u64 << self.worker_bits.len();
+        self.worker_bits.insert(worker.clone(), bit);
+        bit
     }
 
     fn alloc_id(&mut self) -> NodeId {
@@ -764,6 +787,7 @@ impl TreeState {
         if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
+        let worker_bit = self.worker_bit(worker);
         let mut current = self.resolve_parent(worker, parent_hash);
         let mut prev_hash = parent_hash;
         let now = now_millis();
@@ -790,6 +814,7 @@ impl TreeState {
                 return;
             };
             let added = add_tiers(&mut child.workers, worker, tiers);
+            child.owner_bits |= worker_bit;
             child.last_used.store(now, Ordering::Relaxed);
             tally_tiers(&mut delta, added);
             current = child_id;
@@ -802,6 +827,7 @@ impl TreeState {
     /// any hash in `block_hashes`. The worker leaves a node once no tier bit
     /// remains, and a node that becomes empty + childless is pruned.
     fn remove(&mut self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
+        let worker_bit = self.worker_bits.get(worker).copied().unwrap_or(0);
         // Collect all node ids to touch (fixed snapshot — avoids iterator
         // invalidation when pruning mutates `by_hash`).
         let mut targets: Vec<NodeId> = Vec::new();
@@ -821,6 +847,7 @@ impl TreeState {
                         held.remove(tiers);
                         if held.is_empty() {
                             node.workers.remove(worker);
+                            node.owner_bits &= !worker_bit;
                         }
                     }
                     (
@@ -839,6 +866,7 @@ impl TreeState {
 
     /// Drop `worker` from every node in THIS shard, pruning emptied nodes.
     fn clear_worker(&mut self, worker: &KvWorkerId) {
+        let worker_bit = self.worker_bits.get(worker).copied().unwrap_or(0);
         // Snapshot ids before mutation.
         let ids: Vec<NodeId> = self
             .nodes
@@ -849,6 +877,7 @@ impl TreeState {
         let mut prune_candidates: Vec<NodeId> = Vec::new();
         for id in ids {
             let removed = self.nodes.get_mut(&id).and_then(|node| {
+                node.owner_bits &= !worker_bit;
                 node.workers
                     .remove(worker)
                     .map(|held| (held, node.workers.is_empty() && node.children.is_empty()))
@@ -961,6 +990,33 @@ impl TreeState {
             },
         };
 
+        // Sampled lookups intersect exact worker bits during normal descent.
+        // After identity overflow, retain borrowed worker IDs instead; this
+        // preserves exact semantics without bit collisions or URL cloning.
+        let fast_diagnostic = diagnose && !self.worker_bits_overflow;
+        let slow_diagnostic = diagnose && self.worker_bits_overflow;
+        let mut continuous_bits = u64::MAX;
+        let mut continuous: Option<Vec<&KvWorkerId>> = None;
+        if diagnose && start != ROOT_ID {
+            let mut ancestor = Some(start);
+            while let Some(id) = ancestor {
+                if id == ROOT_ID {
+                    break;
+                }
+                let node = &self.nodes[&id];
+                continuous_bits &= node.owner_bits;
+                if slow_diagnostic {
+                    match &mut continuous {
+                        None => continuous = Some(node.workers.keys().collect()),
+                        Some(owners) => {
+                            owners.retain(|worker| node.workers.keys().any(|w| w == *worker))
+                        }
+                    }
+                }
+                ancestor = node.parent;
+            }
+        }
+        let mut has_owner_path_gap = false;
         let mut current = start;
         let mut matched = 0usize;
         let mut last_owned_node: Option<NodeId> = None;
@@ -979,9 +1035,25 @@ impl TreeState {
                     matched += 1;
                     if let Some(child) = self.nodes.get(&child_id) {
                         child.last_used.store(now, Ordering::Relaxed);
+                        if fast_diagnostic {
+                            continuous_bits &= child.owner_bits;
+                        }
+                        if slow_diagnostic {
+                            match &mut continuous {
+                                None => continuous = Some(child.workers.keys().collect()),
+                                Some(owners) => owners
+                                    .retain(|worker| child.workers.keys().any(|w| w == *worker)),
+                            }
+                        }
                         if !child.workers.is_empty() {
                             last_owned_node = Some(child_id);
                             owned_matched_blocks = matched;
+                            if fast_diagnostic {
+                                has_owner_path_gap = child.owner_bits & !continuous_bits != 0;
+                            }
+                            if let Some(owners) = &continuous {
+                                has_owner_path_gap = owners.len() < child.workers.len();
+                            }
                         }
                     }
                 }
@@ -999,28 +1071,8 @@ impl TreeState {
             .and_then(|id| self.nodes.get(&id))
             .map(|n| n.workers.clone())
             .unwrap_or_default();
-        // Check the same worker (including DP rank) across ANY tier. A host
-        // ancestor followed by a device block is not a gap. Parent links avoid
-        // allocating a second path; stop at the first inconsistent owner.
-        let has_owner_path_gap = diagnose
-            && tiers.keys().any(|worker| {
-                let mut ancestor = owner_node
-                    .and_then(|id| self.nodes.get(&id))
-                    .and_then(|node| node.parent);
-                while let Some(id) = ancestor {
-                    if id == ROOT_ID {
-                        break;
-                    }
-                    let Some(node) = self.nodes.get(&id) else {
-                        return true;
-                    };
-                    if !node.workers.contains_key(worker) {
-                        return true;
-                    }
-                    ancestor = node.parent;
-                }
-                false
-            });
+        // An unowned result has no returned owner to diagnose.
+        has_owner_path_gap &= !tiers.is_empty();
         MatchResult {
             has_owner_path_gap,
             matched_blocks: matched,
@@ -1749,7 +1801,11 @@ impl HashTree {
             // (worker-table index, bits newly held) per carrier, booked into
             // the shard's occupancy once the node borrow ends.
             let mut added: Vec<(usize, Tiers)> = Vec::with_capacity(rec.workers.len());
+            let owner_bits = rec.workers.iter().fold(0, |bits, &w| {
+                bits | st.worker_bit(&worker_table[w as usize])
+            });
             if let Some(node) = st.nodes.get_mut(&id) {
+                node.owner_bits |= owner_bits;
                 for (k, &w) in rec.workers.iter().enumerate() {
                     // Absent tiers (pre-tiering producer) read as device;
                     // `from_bits` also folds a zero entry to device so no
@@ -1917,6 +1973,122 @@ mod tests {
                 .match_prefix_with_options(None, &[99], true, true)
                 .has_owner_path_gap
         );
+    }
+
+    #[test]
+    fn diagnostic_bits_follow_tier_removal_clear_and_restore() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let query = [10, 20, 30];
+        tree.insert(&a, None, &query);
+        tree.insert_tiered(&a, None, &query, Tiers::HOST);
+        tree.insert(&b, None, &query);
+        tree.remove_tiered(&a, &[20], Tiers::DEVICE);
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        tree.remove_tiered(&a, &[20], Tiers::HOST);
+        assert!(
+            tree.match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        let (workers, nodes) = tree.export_snapshot();
+        let restored = HashTree::new();
+        // Assign B the first local bit; snapshot IDs must not be reused as bits.
+        restored.insert(&b, None, &query);
+        restored.restore_snapshot(&workers, &nodes).unwrap();
+        assert!(
+            restored
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        restored.clear_worker(&a);
+        assert!(
+            !restored
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        restored.insert_tiered(&a, None, &query, Tiers::HOST);
+        assert!(
+            !restored
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+    }
+
+    #[test]
+    fn diagnostic_bits_overflow_remains_exact() {
+        let tree = HashTree::new();
+        let query = [10, 20, 30];
+        for rank in 0..65 {
+            let w = worker("http://same-url", rank);
+            tree.insert(&w, None, &query);
+            // Include churn: cleared identities must not be recycled.
+            if rank < 64 {
+                tree.clear_worker(&w);
+            }
+        }
+        let w = worker("http://same-url", 64);
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        tree.remove(&w, &[20]);
+        assert!(
+            tree.match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+        assert!(
+            tree.match_prefix_with_options(Some(20), &[30], true, true)
+                .has_owner_path_gap
+        );
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &[10, 20], true, true)
+                .has_owner_path_gap
+        );
+        tree.insert(&w, None, &query);
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &query, true, true)
+                .has_owner_path_gap
+        );
+    }
+
+    #[test]
+    fn diagnostic_bits_agree_with_exact_scan_during_mutations() {
+        let mut tree = TreeState::new();
+        let query = [10, 20, 30, 40];
+        let workers: Vec<_> = (0..6).map(|rank| worker("http://worker", rank)).collect();
+        for w in &workers {
+            tree.insert(w, None, &query, Tiers::DEVICE);
+        }
+        for step in 0..180 {
+            let w = &workers[step % workers.len()];
+            let hash = query[(step / workers.len()) % query.len()];
+            match step % 4 {
+                0 => tree.remove(w, &[hash], Tiers::DEVICE),
+                1 => tree.insert(w, None, &query, Tiers::HOST),
+                2 => tree.remove(w, &[hash], Tiers::HOST),
+                _ => tree.insert(w, None, &query, Tiers::DEVICE),
+            }
+            for depth in 1..=query.len() {
+                for fallback in [false, true] {
+                    let fast = tree.match_prefix(None, &query[..depth], fallback, true);
+                    tree.worker_bits_overflow = true;
+                    let slow = tree.match_prefix(None, &query[..depth], fallback, true);
+                    tree.worker_bits_overflow = false;
+                    assert_eq!(
+                        fast.has_owner_path_gap, slow.has_owner_path_gap,
+                        "step {step}, depth {depth}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -57,9 +57,20 @@ Checks run only with a metrics sink, once per 128 eligible lookups.
 gap counter rate by this counter rate to estimate their fraction. Counts are
 unweighted samples, not an exact total. Both counters count `select` calls,
 like decision counters: retries may count the same request more than once.
-Each sampled check walks parent links and stops at the first gap; sampled
-lookups still have extra read-lock time. Unsampled lookups do not scan
-ancestors. Continuous-owner filtering is deferred; a positive counter means
+Each node maintains an exact shard-local worker bitmap on insert, final-tier
+removal, worker clear, and snapshot restore. A sampled root lookup intersects
+these bits during its normal descent, without another ancestor walk or URL
+hashing. Partial-tier removal preserves the bit. Bits are never recycled and
+include DP rank; snapshot restore assigns destination-local bits.
+
+This adds one `u64` field per node and a bounded map of up to 64 identities
+per shard. If a shard encounters a 65th distinct identity (including historical
+workers), sampled lookups fall back to exact worker-set comparisons, without
+collisions or lost gap detection. That slower path remains subject to 1/128
+sampling. Unsampled lookups never perform continuity checks. Lookups starting
+from a non-root parent additionally check its ancestors.
+
+Continuous-owner filtering is deferred; a positive counter means
 the reported owned/selected depth may overstate the usable prefix.
 
 Use `sgl_router_selected_overlap_blocks_total` for the selected destination's
@@ -78,25 +89,30 @@ changes stabilize so their effects can be distinguished.
 ## Local lookup benchmark
 
 Release build with Rust 1.90, 2,500 blocks, 200 warmups and 2,000 timed
-lookups per case. Five interleaved runs; table entries are medians of the
-per-run mean latency in microseconds:
+lookups per case. Five interleaved runs; entries are medians of per-run mean
+latency in microseconds:
 
-| Owners | Base d4637ea | Fallback on, no diagnostic | Fallback on, 1/128 sampled | Fallback off, no diagnostic |
-|---|---:|---:|---:|---:|
-| 1 | 43.6 | 43.6 | 44.1 | 43.6 |
-| 3 | 43.4 | 44.6 | 44.8 | 43.9 |
-| 6 | 43.8 | 44.2 | 46.0 | 43.9 |
+| Owners | Base d4637ea | Previous full diagnostic | Bitmap full diagnostic | Bitmap ordinary lookup | Bitmap 1/128 sampled |
+|---|---:|---:|---:|---:|---:|
+| 1 | 42.6 | 85.7 | 44.5 | 44.1 | 44.2 |
+| 3 | 43.0 | 174.5 | 44.4 | 44.0 | 44.0 |
+| 6 | 42.9 | 309.9 | 44.8 | 44.0 | 44.0 |
 
-The sampled column invokes the diagnostic every 128 lookups. It measures tree
-lookup cost, excluding the policy's sampling counter, token hashing, metric
-emission, concurrent KV-event writers, and engine work. It does not establish
-router throughput, writer tail latency, or Step5 cache-hit gains. Sampled
-lookups still perform the full continuity scan.
+The previous full diagnostic uses the owner-by-owner parent scan from
+211455f99b. Full diagnostic columns check every lookup, not just sampled ones.
+The sampled column checks one in 128 lookups. All current columns enable
+ancestor fallback and stay within the 64-identity fast path.
+
+This measures tree lookup cost, excluding the policy's sampling counter,
+token hashing, metric emission, concurrent KV-event writers, and engine work.
+It does not establish router throughput, writer tail latency, event-update
+overhead, heap memory overhead, or Step5 cache-hit gains.
 
 Reproduce the current modes with:
 
 ```sh
 cargo run --release --example long_chain_match
+cargo run --release --example long_chain_match -- diagnostic
 cargo run --release --example long_chain_match -- sampled
 cargo run --release --example long_chain_match -- disabled
 ```

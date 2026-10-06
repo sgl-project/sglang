@@ -19,12 +19,12 @@ fn main() {
         let iters = 2000;
         let t = Instant::now();
         for i in 0..iters {
-            let result = if mode == "sampled" {
+            let result = if mode == "sampled" || mode == "diagnostic" {
                 tree.match_prefix_with_options(
                     None,
                     std::hint::black_box(&chain),
                     true,
-                    i % 128 == 0,
+                    mode == "diagnostic" || i % 128 == 0,
                 )
             } else if mode == "disabled" {
                 tree.match_prefix_with_options(None, std::hint::black_box(&chain), false, false)
