@@ -775,12 +775,8 @@ def eagle_sample(
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
+        next_token_logits.unflatten(0, (bs, verify_input.draft_token_num)).add_(
+            sampling_info.acc_additive_penalties.unsqueeze(1)
         )
     if sampling_info.acc_scaling_penalties is not None:
         apply_scaling_penalties(
