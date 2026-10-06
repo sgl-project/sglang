@@ -326,7 +326,8 @@ def _quantize_nvfp4_k_cache_into_kernel(
     ROPE_DIM: tl.constexpr,
     BLOCKS_PER_PROGRAM: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # Widen before multiplying by tensor strides to avoid int32 overflow.
+    token = tl.program_id(0).to(tl.int64)
     part = tl.program_id(1)
     dst = tl.load(loc_ptr + token).to(tl.int64)
     valid_dst = (dst >= 0) & (dst < num_rows)
@@ -496,7 +497,8 @@ def _dequantize_nvfp4_k_cache_paged_kernel(
     output_stride: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # Widen before multiplying by tensor strides to avoid int32 overflow.
+    token = tl.program_id(0).to(tl.int64)
     dimension = tl.arange(0, BLOCK)
     physical = tl.load(indices_ptr + token).to(tl.int64)
     valid_row = (physical >= 0) & (physical < num_rows)
