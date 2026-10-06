@@ -416,7 +416,12 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
+    # Inkling has no no_buffer path (inkling.py asserts enable_mamba_extra_buffer),
+    # so rejecting it on XPU makes the model unlaunchable there.
+    if get_platform().is_xpu and hf_config.architectures[0] not in (
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    ):
         return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
