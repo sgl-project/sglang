@@ -19,27 +19,18 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 
-def configured_codec():
-    """Freeze the launch constraint when the scheduler admits a delta backend."""
-    codec = os.environ.get("GPU_DELTA_CODEC", "snappy-zstd")
-    if codec not in {"snappy-zstd", "lz4-zstd"}:
-        raise ValueError("GPU_DELTA_CODEC must be snappy-zstd or lz4-zstd")
-    return codec
-
-
-def validate_codec(manifest, expected):
-    """Authenticate the negotiated wire codec before examining any tensor payload."""
+def validate_codec(manifest):
+    """Admit the authenticated publication codec before examining any tensor payload."""
     if (
         type(manifest.get("protocol_version")) is not int
         or manifest["protocol_version"] != 4
-        or manifest.get("codec") != expected
-        or expected not in {"snappy-zstd", "lz4-zstd"}
+        or manifest.get("codec") not in {"snappy-zstd", "lz4-zstd"}
         or "codec_profile" in manifest
         or type(manifest.get("frame_bytes")) is not int
         or manifest["frame_bytes"] not in {1 << 16, 1 << 20, 4 << 20}
     ):
         raise ValueError(
-            "GPU delta requires protocol 4 with the negotiated snappy-zstd or lz4-zstd codec"
+            "GPU delta requires protocol 4 with a snappy-zstd or lz4-zstd codec"
         )
 
 

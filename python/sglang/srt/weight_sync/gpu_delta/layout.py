@@ -735,11 +735,9 @@ class GpuDeltaBackend:
         )
         from sglang.srt.weight_sync.gpu_delta.payload import (
             OuterZstdPool,
-            configured_codec,
             configured_cpu_workers,
         )
 
-        self.codec = configured_codec()
         self.decode_stages = int(os.environ.get("GPU_DELTA_DECODE_STAGES", "2"))
         if self.decode_stages not in (2, 3, 4):
             raise ValueError("GPU_DELTA_DECODE_STAGES must be 2, 3 or 4")
@@ -756,14 +754,13 @@ class GpuDeltaBackend:
 
         self.outer_pool = OuterZstdPool(configured_cpu_workers())
         self.host_arena = HostArena(identity["engine_id"], self.device.index)
-        self.decoder = None
+        self.decoders = {}
         self.apply_stream = self.de_stream = None
 
     def describe(self):
         self.layout.check_identity()
         return {
             "adapter": "deepseek-nvfp4-cutedsl-w4a16-v1",
-            "codec": self.codec,
             "rank_plan_digest": self.layout.rank_plan_digest,
             "tensors": [binding.describe() for binding in self.layout.bindings],
             "excluded": self.layout.excluded,
@@ -987,7 +984,8 @@ class PreparedDelta:
             time.perf_counter() - manifest_started
         )
         plan_started = time.perf_counter()
-        validate_codec(manifest, backend.codec)
+        validate_codec(manifest)
+        self.codec = manifest["codec"]
         if (
             type(manifest["base_version"]) is not int
             or manifest["target_version"] != manifest["base_version"] + 1
@@ -1124,13 +1122,14 @@ class PreparedDelta:
             )
         self.workspace = self.decode_plan = None
         if self.static_plans:
-            if backend.decoder is None:
-                backend.decoder = NvcompDecoder(self.device, backend.codec)
+            if self.codec not in backend.decoders:
+                backend.decoders[self.codec] = NvcompDecoder(self.device, self.codec)
+            decoder = backend.decoders[self.codec]
             with torch.cuda.stream(self.de_stream):
-                self.workspace = backend.decoder.allocate_workspace(
+                self.workspace = decoder.allocate_workspace(
                     frame_plans, slot_count=self.decode_stages
                 )
-                self.decode_plan = backend.decoder.prepare_batches(
+                self.decode_plan = decoder.prepare_batches(
                     frame_plans,
                     backend.host_arena.tensor,
                     self.workspace,

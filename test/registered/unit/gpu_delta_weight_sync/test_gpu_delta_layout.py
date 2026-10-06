@@ -46,7 +46,8 @@ def cpu_host_snapshot(backend, metadata, directory):
     }
     backend.outer_pool = OuterZstdPool(2)
     backend.host_arena = host.HostArena("cpu-engine", 0)
-    backend.apply_stream = backend.de_stream = backend.decoder = None
+    backend.apply_stream = backend.de_stream = None
+    backend.decoders = {}
     backend.decode_stages = getattr(backend, "decode_stages", 2)
     metadata.update(session_id="cpu-1", participants=[backend.identity])
     cache = Path(directory) / "cache"
@@ -621,12 +622,23 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             torch.zeros(3, 4, dtype=torch.uint8),
         )
         definitions = [b.describe() for b in (*local, foreign)]
+
+        def literal(size, codec):
+            data = bytes(range(size))
+            if codec == "snappy-zstd":
+                return bytes([size, (size - 1) << 2]) + data
+            # Valid raw LZ4 block containing only literals.
+            return (
+                bytes([min(size, 15) << 4])
+                + (bytes([size - 15]) if size >= 15 else b"")
+                + data
+            )
+
         blobs, entries, records = {}, [], []
         for binding in (*local, foreign):
             name, size = binding.name, binding.storage[0].numel()
-            # A valid Snappy literal block expands these tiny matrix frames.
-            # Only the CUDA decoder is mocked below; CPU Zstd and file checks run.
-            inner = bytes([size, (size - 1) << 2]) + bytes(range(size))
+            # Only the CUDA decoder is mocked; CPU Zstd and file checks run.
+            inner = literal(size, "lz4-zstd")
             blob = zstd.ZstdCompressor().compress(inner)
             if name == "foreign":
                 blob = b"not-a-zstd-frame"  # Foreign EP data is never unwrapped.
@@ -678,7 +690,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         manifest = dict(
             protocol_version=4,
-            codec="snappy-zstd",
+            codec="lz4-zstd",
             frame_bytes=1 << 20,
             tensors=entries,
             files=records,
@@ -687,7 +699,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan=None,
             batch_plan=None,
-            codec="snappy-zstd",
             decode_stages=stages,
             device=torch.device("cpu"),
             layout=SimpleNamespace(
@@ -726,8 +737,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         class CpuLiteralDecoder:
             # CPU oracle only. The native suite qualifies real DE and CUDA races.
             def __init__(self, device, codec):
-                assert codec == backend.codec
-                self.device = device
+                self.device, self.codec = device, codec
+                operations.append(("decoder_created", codec))
 
             def allocate_workspace(self, batches, slot_count):
                 assert slot_count == stages
@@ -762,12 +773,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             frame.input_offset : frame.input_offset
                             + frame.encoded_bytes
                         ]
-                        assert data[0] == frame.decoded_bytes
-                        assert data[1] == (frame.decoded_bytes - 1) << 2
+                        if self.codec == "snappy-zstd":
+                            assert data[0] == frame.decoded_bytes
+                            assert data[1] == (frame.decoded_bytes - 1) << 2
+                            payload = data[2:]
+                        else:
+                            assert data[0] == min(frame.decoded_bytes, 15) << 4
+                            payload = data[2 if frame.decoded_bytes >= 15 else 1 :]
                         decoded[
                             frame.output_offset : frame.output_offset
                             + frame.decoded_bytes
-                        ].copy_(data[2:])
+                        ].copy_(payload)
 
                 return SimpleNamespace(enqueue=enqueue, index=index)
 
@@ -817,7 +833,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
                 self.assertEqual(streams.call_count, 2)
                 self.assertEqual(events.call_count, 2 * stages + 2)
-                self.assertIsNotNone(backend.decoder)
+                self.assertEqual(list(backend.decoders), ["lz4-zstd"])
                 self.assertEqual(slots, [])
                 self.assertFalse(any(row[0] == "wait_stream" for row in operations))
                 self.assertFalse(any(row[0] == "bind_outputs" for row in operations))
@@ -828,7 +844,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 before_apply = len(operations)
                 self.assertEqual(prepared.timings["compressed_batches"], 7)
-                self.assertEqual(prepared.timings["de_host_input_bytes"], 120)
+                self.assertEqual(prepared.timings["de_host_input_bytes"], 115)
                 self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
                 self.assertEqual(prepared.timings["decoded_zero_ranges"], 0)
                 self.assertFalse(decoded_batches)
@@ -926,11 +942,84 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         ),
                         grouped,
                     )
+                # Alternate codecs on the same plan and version stream. These
+                # identical masks XOR away, then back; the LZ4 decoder is reused.
+                canonical_plan = backend._canonical_plan
+                for version, codec in ((2, "snappy-zstd"), (3, "lz4-zstd")):
+                    prepared.release_and_close()
+                    metadata.update(
+                        session_id=f"cpu-{version}",
+                        base_version=version - 1,
+                        target_version=version,
+                    )
+                    manifest.update(
+                        base_version=version - 1, target_version=version, codec=codec
+                    )
+                    for record, entry in zip(records, entries):
+                        size = entry["nbytes"]
+                        inner = literal(size, codec)
+                        blob = zstd.ZstdCompressor().compress(inner)
+                        if entry["name"] == "foreign":
+                            blob = b"not-a-zstd-frame"
+                        blobs[entry["name"]] = blob
+                        path.with_name(record["name"]).write_bytes(blob)
+                        record.update(
+                            nbytes=len(blob),
+                            sha256=layout.hashlib.sha256(blob).hexdigest(),
+                        )
+                        entry["frames"][0]["encoded_bytes"] = len(inner)
+                        entry["outer"].update(
+                            encoded_bytes=len(blob), decoded_bytes=len(inner)
+                        )
+                        entry["outer"]["frames"][0].update(
+                            encoded_bytes=len(blob), decoded_bytes=len(inner)
+                        )
+                    content = json.dumps(manifest).encode()
+                    path.write_bytes(content)
+                    if version == 2:
+                        with self.assertRaisesRegex(ValueError, "codec"):
+                            invalid = json.dumps(
+                                manifest | {"codec": "unsupported"}
+                            ).encode()
+                            path.write_bytes(invalid)
+                            layout.PreparedDelta(
+                                backend,
+                                path,
+                                layout.hashlib.sha256(invalid).hexdigest(),
+                                metadata,
+                            )
+                        path.write_bytes(content)
+                        self.assertEqual(list(backend.decoders), ["lz4-zstd"])
+                    prepared = layout.PreparedDelta(
+                        backend,
+                        path,
+                        layout.hashlib.sha256(content).hexdigest(),
+                        metadata,
+                    )
+                    self.assertIs(backend._canonical_plan, canonical_plan)
+                    self.assertEqual(prepared.codec, codec)
+                    prepared.apply()
+                    for target in targets:
+                        expected = torch.arange(
+                            target.numel(), dtype=torch.uint8
+                        ).reshape(target.shape)
+                        torch.testing.assert_close(
+                            target,
+                            expected if version == 3 else torch.zeros_like(target),
+                        )
+                self.assertEqual(
+                    [row for row in operations if row[0] == "decoder_created"],
+                    [
+                        ("decoder_created", "lz4-zstd"),
+                        ("decoder_created", "snappy-zstd"),
+                    ],
+                )
+                self.assertEqual(streams.call_count, 2)
                 # An engine-proof release permits the next immutable publication;
                 # its corrupt payload must still fail before model writes.
                 prepared.host_snapshot.mark_reusable()
                 prepared.host_snapshot.close()
-                metadata["session_id"] = "cpu-2"
+                metadata["session_id"] = "cpu-4"
                 metadata["base_version"] = metadata["target_version"]
                 metadata["target_version"] += 1
                 manifest.update(
@@ -976,7 +1065,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             backend = layout.GpuDeltaBackend(
                 SimpleNamespace(model=fake_model), {"engine_id": "test-engine"}
             )
-            self.assertIsNone(backend.decoder)
+            self.assertEqual(backend.decoders, {})
             self.assertIsNone(backend.apply_stream)
             self.assertIsNone(backend.de_stream)
             backend.describe()
@@ -1102,7 +1191,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan=None,
             batch_plan=None,
-            codec="snappy-zstd",
             device=torch.device("cpu"),
             layout=SimpleNamespace(
                 bindings=bindings,
@@ -1133,7 +1221,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     torch.cuda,
                     "Stream",
                     return_value=SimpleNamespace(
-                        wait_stream=lambda _: None, wait_event=lambda _: None
+                        wait_stream=lambda _: None,
+                        wait_event=lambda _: None,
+                        synchronize=lambda: None,
                     ),
                 ) as streams,
                 patch.object(torch.cuda, "device", return_value=nullcontext()),
@@ -1152,7 +1242,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 self.assertEqual(streams.call_count, 2)
                 self.assertFalse(prepared.batches)
-                self.assertIsNone(backend.decoder)
+                self.assertEqual(backend.decoders, {})
                 self.assertEqual(prepared.timings["raw_tensors"], 4)
                 self.assertEqual(prepared.timings["raw_bytes"], len(blob))
                 self.assertEqual(prepared.timings["raw_h2d_bytes"], 36)
@@ -1161,13 +1251,32 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 result = prepared.apply()
                 self.assertEqual(result["h2d_bytes"], 36)
                 self.assertEqual(result["timings"]["decoded_buffers"], 0)
-                self.assertIsNone(backend.decoder)
+                self.assertEqual(backend.decoders, {})
                 torch.testing.assert_close(odd, values[0])
                 torch.testing.assert_close(vector, values[1][2:6])
                 torch.testing.assert_close(scalar, values[2])
                 torch.testing.assert_close(indexer, values[3].float())
                 torch.testing.assert_close(unchanged, torch.ones(3))
                 self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
+                prepared.release_and_close()
+                metadata.update(session_id="cpu-2", base_version=1, target_version=2)
+                manifest.update(codec="lz4-zstd", base_version=1, target_version=2)
+                content = json.dumps(manifest).encode()
+                path.write_bytes(content)
+                prepared = layout.PreparedDelta(
+                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
+                )
+                prepared.apply()
+                # Raw values overwrite even after a codec change; no decoder is
+                # constructed and applying the same target does not XOR it away.
+                self.assertEqual(backend.decoders, {})
+                torch.testing.assert_close(odd, values[0])
+                torch.testing.assert_close(vector, values[1][2:6])
+                torch.testing.assert_close(scalar, values[2])
+                torch.testing.assert_close(indexer, values[3].float())
+                torch.testing.assert_close(unchanged, torch.ones(3))
+                self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
+                prepared.release_and_close()
 
     def test_movable_or_reordered_experts_rejected_before_plan(self):
         defaults = dict(

@@ -163,11 +163,14 @@ has no distributed collectives, and shared IPC weight storage is excluded.
 The `GPU_DELTA_*` environment variables below are development/debug knobs,
 not a stable user-facing configuration API.
 
-`GPU_DELTA_CODEC` accepts `snappy-zstd` (default) and `lz4-zstd`. The
-receiver freezes it at backend admission, advertises it in its participant plan,
-and rejects any unsupported value. The sender and receiver must agree before a
-publication; manifest fields cannot override the launch constraint. Legacy codec
-values and removed encoder/outer selectors have no migration layer.
+Each immutable publication manifest selects its `codec` (`snappy-zstd` or
+`lz4-zstd`). The receiver authenticates the manifest and chooses the decoder during
+preparation; it does not select or freeze a codec from its environment. A stream can start with LZ4 and continue
+with Snappy without changing its canonical plan or committed version sequence.
+The backend caches native decoders by codec during preparation; capability,
+alignment and temporary-size admission stays outside the serving pause. Raw
+scalar/vector targets bypass inner decompression and retain overwrite semantics;
+compressed matrix masks retain XOR semantics.
 
 Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 1 MiB or
 4 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without

@@ -1,15 +1,12 @@
 """Outer CPU Zstd transport tests; no CUDA allocation or model imports."""
 
 import copy
-import os
 import unittest
-from unittest.mock import patch
 
 import zstandard as zstd
 
 from sglang.srt.weight_sync.gpu_delta.payload import (
     OuterZstdPool,
-    configured_codec,
     validate_codec,
     validate_outer_entries,
     validate_zstd_frame,
@@ -58,28 +55,14 @@ def entry(payload, name="weight", size=36):
 class TestOuterZstd(unittest.TestCase):
     def test_manifest_codec_and_frame_geometry_admission(self):
         admitted = dict(protocol_version=4, codec="snappy-zstd", frame_bytes=1 << 20)
-        with patch.dict(os.environ):
-            os.environ.pop("GPU_DELTA_CODEC", None)
-            self.assertEqual(configured_codec(), "snappy-zstd")
-            for codec in ("snappy-zstd", "lz4-zstd"):
-                os.environ["GPU_DELTA_CODEC"] = codec
-                frozen = configured_codec()
-                for size in (1 << 16, 1 << 20, 4 << 20):
-                    validate_codec(
-                        admitted | {"codec": codec, "frame_bytes": size}, frozen
-                    )
-                    record = entry(bytes(50))
-                    record["nbytes"] = size + 16
-                    record["frames"][0]["decoded_bytes"] = size
-                    record["frames"][1]["decoded_offset"] = size
-                    validate_outer_entries([record], {"owner.bin": 50}, size)
-                other = "lz4-zstd" if codec == "snappy-zstd" else "snappy-zstd"
-                os.environ["GPU_DELTA_CODEC"] = other
-                with self.assertRaisesRegex(ValueError, "codec"):
-                    validate_codec(admitted | {"codec": other}, frozen)
-            os.environ["GPU_DELTA_CODEC"] = "lz4"
-            with self.assertRaisesRegex(ValueError, "GPU_DELTA_CODEC"):
-                configured_codec()
+        for codec in ("snappy-zstd", "lz4-zstd"):
+            for size in (1 << 16, 1 << 20, 4 << 20):
+                validate_codec(admitted | {"codec": codec, "frame_bytes": size})
+                record = entry(bytes(50))
+                record["nbytes"] = size + 16
+                record["frames"][0]["decoded_bytes"] = size
+                record["frames"][1]["decoded_offset"] = size
+                validate_outer_entries([record], {"owner.bin": 50}, size)
         for patch_value in (
             {"protocol_version": 2},
             {"protocol_version": 3},
@@ -94,7 +77,7 @@ class TestOuterZstd(unittest.TestCase):
                 self.subTest(patch=patch_value),
                 self.assertRaisesRegex(ValueError, "codec"),
             ):
-                validate_codec(admitted | patch_value, "snappy-zstd")
+                validate_codec(admitted | patch_value)
 
     def test_gpu_outer_chunks_decode_directly_to_one_destination(self):
         values = [bytes(range(256)) * 4096, bytes(range(19))]
