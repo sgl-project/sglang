@@ -421,15 +421,18 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
+                decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+                    batch, server_args=server_args, vae=vae
+                )
                 try:
                     if stream is None:
                         # Model-specific decode overrides need not support streaming.
                         frames = self.decode(
-                            batch.latents, server_args, vae_dtype=vae_dtype
+                            decode_latents, server_args, vae_dtype=vae_dtype
                         )
                     else:
                         frames = self.decode(
-                            batch.latents,
+                            decode_latents,
                             server_args,
                             vae_dtype=vae_dtype,
                             on_frames=stream,
@@ -469,6 +472,9 @@ class DecodingStage(PipelineStage):
 
         if output_file_paths is None:
             frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            frames = server_args.pipeline_config.postprocess_decoded_batch(
+                frames, batch, server_args
+            )
         else:
             frames = None
 
@@ -476,6 +482,8 @@ class DecodingStage(PipelineStage):
         output_batch = OutputBatch(
             output=frames,
             output_file_paths=output_file_paths,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,
