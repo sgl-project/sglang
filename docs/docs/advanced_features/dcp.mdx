@@ -132,16 +132,11 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | `ag_rs` | Query AG + LSE AG + FP32 output RS | Fallback for platforms without the a2a path; opt in with `--dcp-comm-backend ag_rs` |
 | `a2a`, gathered Q | Query AG + packed NCCL A2A | Two collectives |
 | `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
-| `fi_a2a`, replicated Q | One FlashInfer kernel: NCCL LSA all-to-all and LSE merge fused | Requires Blackwell, the DCP group inside one NVLink domain (GB200/GB300 fabric, or a single node), an MLA model, torch 2.14 or newer, and a FlashInfer build that provides `decode_cp_a2a_lse_reduce` |
+| `fi_a2a`, replicated Q | One FlashInfer kernel: all-to-all and LSE merge fused | Requires Blackwell, an MLA model, a DCP group inside one NVLink domain (GB200/GB300 fabric, or one node), and a `flashinfer-python` with the fused `decode_cp_a2a_lse_reduce` |
 
-When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the fused reduce can run, otherwise `a2a` on CUDA/ROCm, and `ag_rs` only on platforms without the a2a path. The startup log names the missing requirement when `fi_a2a` is not selected.
+When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the fused reduce can run, otherwise `a2a` on CUDA/ROCm, and `ag_rs` only on platforms without the a2a path. The startup log names the missing requirement when `fi_a2a` is not selected. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
 
-`fi_a2a` exchanges and merges the partials in one cooperative kernel over NCCL symmetric memory, instead of an all-to-all followed by a separate merge kernel. Running it changes a few process-wide settings:
-
-- torch symmetric memory uses the NCCL backend, so custom all-reduce uses its v1 kernel instead of `CustomAllReduceV2`;
-- `NCCL_CUMEM_ENABLE` defaults to `1`, because the fused workspace is an NCCL symmetric window;
-- `--enable-pdmux` and `--enable-torch-symm-mem` are rejected, since they need more CUDA streams or the CUDA symmetric-memory backend;
-- decode batches wider than the captured CUDA graphs run as several fused calls. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
+`fi_a2a` keeps two fused-reduce workspaces, one for CUDA graph replays and one for eager decode, each sized for the widest captured decode batch; the startup log reports their size. Eager batches wider than that run as several fused calls. A workspace serves only one CUDA stream, so `--enable-pdmux`, and `SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP` with `--pp-size` above 1, resolve to `a2a`.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
