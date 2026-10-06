@@ -530,22 +530,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             )
         if cfg.disaggregation_decode_retraction_backup == "host_pool":
             model_config = model_config_of(server_args)
-            assert not cfg.disaggregation_decode_enable_radix_cache, (
-                "--enable-unified-memory host-pool decode retraction does not "
-                "support decode radix-cache H2D/D2H transfers yet."
-            )
             assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-Mamba models."
             )
-            assert not model_config.is_hybrid_swa, (
-                "--enable-unified-memory host-pool decode retraction does not "
-                "support hybrid-SWA H2D/D2H transfers yet."
-            )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "audited for the unified pool's virtual-to-physical loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     if cfg.speculative_algorithm == "DSPARK":
@@ -565,7 +557,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"attention backends {sorted(spec_allowed)} for both prefill "
             f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
             "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
+            "pool's physical ids yet."
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
@@ -578,6 +570,21 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "the LMCache offload path indexes the device buffers with the ids it "
         "is handed, and under the unified pool those are VIRTUAL."
     )
+    assert not cfg.enable_unified_cache_external_linker, (
+        "--enable-unified-memory does not support "
+        "--enable-unified-cache-external-linker: direct L3 transfers do not "
+        "preserve unified page-envelope indices and compaction lifetimes. "
+        "Use --enable-hierarchical-cache for supported L2/L3 transfers."
+    )
+    if cfg.enable_hierarchical_cache:
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "pipeline parallelism (--pp-size > 1)."
+        )
+        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+            "--enable-unified-memory with hierarchical cache requires lazy "
+            "compaction so pending H2D physical reservations remain stable."
+        )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured
@@ -608,6 +615,18 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 sorted(full_cg_backends),
                 sorted(backends),
             )
+    # trtllm_mha refills its graph page table before replay from
+    # `cache_seqlens_int32`, which only the in-graph metadata kernel writes, so
+    # it uses the previous replay's lengths. Refuse until it uses the batch's.
+    _, decode_backend = attention_backends_of(resolved_view(server_args))
+    if decode_backend == "trtllm_mha":
+        assert _cg_cfg is None or _cg_cfg.decode.backend == Backend.DISABLED, (
+            "--enable-unified-memory does not yet support decode cuda graphs "
+            "with the trtllm_mha attention backend: its replay refills the page "
+            "table from the previous replay's sequence lengths. Pass "
+            "--disable-cuda-graph, or pick another decode attention backend "
+            "(fa3 / fa4 / flashinfer / triton)."
+        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:
@@ -656,9 +675,8 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
 
 
 def handle_page_major_kv_layout(server_args: Any):
-    # The unified pool stores state in the page-major envelope-strided layout, so
-    # enabling it implies --enable-page-major-kv-layout — routing it through the
-    # single page-major path + stride-aware Triton asserts (set before the guard).
+    # --enable-unified-memory implies --enable-page-major-kv-layout, so the
+    # unified pool goes through this one gate (declared before the guard).
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
@@ -684,24 +702,24 @@ def handle_page_major_kv_layout(server_args: Any):
     assert unified_memory_supported_for_model(
         model_config, use_mla_backend=use_mla_backend(server_args)
     ), (
-        "--enable-unified-memory requires uniform K/V rows "
-        "(head_dim == v_head_dim); this model has "
+        "--enable-unified-memory does not yet admit asymmetric K/V rows "
+        "(head_dim != v_head_dim); this model has "
         f"head_dim={model_config.head_dim}, "
         f"v_head_dim={model_config.v_head_dim}, "
         f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
-        "pool's per-layer views require a uniform row width; run "
-        "this model without --enable-unified-memory."
+        f"swa_v_head_dim={model_config.swa_v_head_dim}. The token-major "
+        "views can hold them, but the backends' write and read paths are "
+        "not audited for it; run this model without --enable-unified-memory."
     )
     # Allow-list. Every backend below reads through the translator, so what
-    # gates one is only whether its kernels can address the per-layer views:
+    # gates one is only whether its kernels address the per-layer views by
+    # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
-    #   * Without the unified pool, plain page-major stays Triton-only.
     # Names are the RESOLVED ids from attention_backends_of.
-    if cfg.enable_unified_memory and use_mla_backend(server_args):
+    if use_mla_backend(server_args):
         allowed_full = {
             "triton",
             "fa3",
@@ -711,7 +729,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "tokenspeed_mla",
             "flashmla",
         }
-    elif cfg.enable_unified_memory:
+    else:
         allowed_full = {
             "triton",
             "fa3",
@@ -719,17 +737,14 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "trtllm_mha",
         }
-    else:
-        allowed_full = {"triton"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
         f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the per-layer-view families; plain page-major keeps the "
-        "envelope-strided views only Triton reads). Pass a compatible "
-        "--attention-backend."
+        "allows the stride-aware per-layer-view families). Pass a "
+        "compatible --attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

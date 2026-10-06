@@ -302,6 +302,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
+            out_cache_loc_is_physical=True,
             batch_size=expanded_bs,
             input_ids=None,
             req_pool_indices=req_pool_indices,
