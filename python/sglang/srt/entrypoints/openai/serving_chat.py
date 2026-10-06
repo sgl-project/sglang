@@ -1371,16 +1371,22 @@ class OpenAIServingChat(OpenAIServingBase):
             and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
-            enable_thinking = (request.chat_template_kwargs or {}).get(
-                "enable_thinking"
-            )
+            if self.reasoning_parser:
+                # Templates such as GLM-5.3 open <think> regardless of
+                # enable_thinking, so follow the template-aware value.
+                glm_thinking_mode = thinking_mode
+            else:
+                enable_thinking = (request.chat_template_kwargs or {}).get(
+                    "enable_thinking"
+                )
+                glm_thinking_mode = (
+                    True if enable_thinking is None else bool(enable_thinking)
+                )
             parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=glm_thinking_mode,
             )
 
         # Apply chat template and its stop strings
