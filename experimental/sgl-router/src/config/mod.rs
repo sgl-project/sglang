@@ -54,8 +54,16 @@ impl Config {
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
+            self.proxy.request_timeout_secs > 0,
+            "request_timeout_secs must be greater than zero"
+        );
+        ensure!(
             self.proxy.stream_idle_timeout_secs > 0,
             "stream_idle_timeout_secs must be greater than zero"
+        );
+        ensure!(
+            self.proxy.initial_backoff_ms <= self.proxy.max_backoff_ms,
+            "--retry-initial-backoff-ms must not exceed --retry-max-backoff-ms"
         );
         ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
@@ -253,7 +261,10 @@ mod tests {
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
+                dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
@@ -600,6 +611,22 @@ mod tests {
             shutdown_drain_advisory(MAX_SHUTDOWN_DRAIN_SECS, Some(3600)).is_none(),
             "a long drain under a grace period declared to cover it must not warn",
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_request_timeout() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.proxy.request_timeout_secs = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("request_timeout_secs"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_an_initial_backoff_above_the_cap() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.proxy.initial_backoff_ms = config.proxy.max_backoff_ms + 1;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("--retry-initial-backoff-ms"), "{error}");
     }
 
     #[test]

@@ -65,7 +65,10 @@ fn build_app_context(
             tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: Some(bucket_config),
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -220,6 +223,7 @@ fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+        ..Default::default()
     }
 }
 
@@ -991,4 +995,122 @@ async fn cache_no_signal_restarts_normal_prompt_length_bucket_fallback() {
         "without a cache winner the request must restart the normal full-input Bucket path"
     );
     assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+}
+
+/// A version group with no decode bucket that fits falls back to another group,
+/// without a discarded prefill pick.
+#[tokio::test]
+async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
+    use crate::common::mock_worker::MockWorker;
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let mut short = bucket("d-v1", BucketStage::Decode, 20, "d-v1");
+    short.max_sequence_tokens = Some(1_024);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            bucket("p-v1", BucketStage::Prefill, 10, "p-v1"),
+            bucket("p-v2", BucketStage::Prefill, 11, "p-v2"),
+            short,
+            bucket("d-v2", BucketStage::Decode, 30, "d-v2"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let specs = [
+        ("p-v1", WorkerMode::Prefill, "v1"),
+        ("p-v2", WorkerMode::Prefill, "v2"),
+        ("d-v1", WorkerMode::Decode, "v1"),
+        ("d-v2", WorkerMode::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    .map(|((id, mode, group), worker)| WorkerSpec {
+        version_group: Some(group.into()),
+        ..worker_spec(id, worker.url.clone(), mode)
+    })
+    .collect();
+    let ctx = build_ctx(specs, bucket_config, PolicyKind::PowerOfTwo, None);
+    let response = build_router(ctx.clone())
+        .oneshot(chat_request(None, Some(2_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
+    let prefill_picks: u64 = ctx
+        .metrics
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("sgl_router_policy_decisions_total{"))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(prefill_picks, 1);
+}
+
+/// Prefer a group with decode capacity, but retain capacity fallback when all
+/// groups are full, without relaxing their token-length limits.
+#[tokio::test]
+async fn version_group_capacity_fallback_preserves_decode_limits() {
+    use crate::common::mock_worker::MockWorker;
+    for (short_first, second_full) in [(false, false), (false, true), (true, true)] {
+        let workers: Vec<_> =
+            futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+        let specs = [
+            ("p1", WorkerMode::Prefill, "v1"),
+            ("p2", WorkerMode::Prefill, "v2"),
+            ("d1", WorkerMode::Decode, "v1"),
+            ("d2", WorkerMode::Decode, "v2"),
+        ]
+        .into_iter()
+        .zip(&workers)
+        .map(|((id, mode, group), worker)| WorkerSpec {
+            version_group: Some(group.into()),
+            ..worker_spec(id, worker.url.clone(), mode)
+        })
+        .collect();
+        let mut first_decode = bucket("d-first", BucketStage::Decode, 0, "d1");
+        if short_first {
+            first_decode.max_sequence_tokens = Some(10);
+        }
+        let ctx = build_ctx(
+            specs,
+            BucketConfig {
+                buckets: vec![
+                    bucket("p-first", BucketStage::Prefill, 0, "p1"),
+                    bucket("p-second", BucketStage::Prefill, 1, "p2"),
+                    first_decode,
+                    bucket("d-second", BucketStage::Decode, 1, "d2"),
+                ],
+                ttft_slo_policy: SloBucketPolicy::Disabled,
+                tps_slo_policy: SloBucketPolicy::Disabled,
+            },
+            PolicyKind::PowerOfTwo,
+            None,
+        );
+        set_native_load(&ctx, &workers[2].url, 1_000, 1_000);
+        set_native_load(
+            &ctx,
+            &workers[3].url,
+            if second_full { 1_000 } else { 0 },
+            1_000,
+        );
+        let response = build_router(ctx)
+            .oneshot(chat_request(None, Some(100)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let dispatched: Vec<_> = workers
+            .iter()
+            .map(|w| w.captured.lock().unwrap().last_body.is_some())
+            .collect();
+        let use_first = second_full && !short_first;
+        assert_eq!(
+            dispatched,
+            [use_first, !use_first, use_first, !use_first],
+            "short_first={short_first}, second_full={second_full}"
+        );
+    }
 }

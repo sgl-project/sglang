@@ -57,7 +57,10 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -81,7 +84,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             url: worker_url.to_string(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());

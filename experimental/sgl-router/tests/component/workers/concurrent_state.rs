@@ -76,7 +76,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
                     url: format!("http://w{i}:30000"),
                     mode: WorkerMode::Plain,
                     model_ids: vec![model.clone()],
-                    bootstrap_port: None,
+                    ..Default::default()
                 });
                 let snapshot = r.workers_for(&model);
                 for w in &snapshot {
@@ -129,7 +129,7 @@ fn load_guard_decrements_on_panic_unwind() {
         url: "http://x:30000".into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     assert_eq!(w.router_inflight_load(), 0);
 
