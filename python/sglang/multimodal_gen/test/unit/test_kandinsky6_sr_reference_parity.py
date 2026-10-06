@@ -61,9 +61,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     build_sampling_spec,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
-    denoise_with_scheduler,
-    euler_start_timestep,
-    make_dit_fn,
+    SamplingSpec,
+    denoise_chunks,
     module_dtype,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
@@ -382,14 +381,29 @@ def _reference_loop_inputs(x):
     return visual_cu, text, text_cu, rope_pos, torch.zeros(0, dtype=torch.long)
 
 
-def _port_dit_fn(model, x, scale_factor, use_motion_score=False):
-    return make_dit_fn(
-        model,
-        latent_frames_hw=tuple(x.shape[1:4]),
-        patch_size=model.patch_size,
-        scale_factor=scale_factor,
-        use_motion_score=use_motion_score,
+def _port_sample(model, x, scale, scheduler, steps, capped=False):
+    spec = SamplingSpec(
+        tiling_scale=2,
+        tiles_batch_size=1,
+        seed=42,
+        num_steps=steps,
+        is_piflow=isinstance(scheduler, PiflowScheduler),
+        tile_min_overlap=0.2,
+        visual_size=512,
+        scale_factor=scale,
+        lq_noise_scale=0.7,
+        lq_noise_type="ddpm",
+        lq_channel_noise_scale=0.0,
+        cap_noise_timestep=capped,
     )
+    return denoise_chunks(
+        [x.clone()],
+        model,
+        scheduler,
+        dit_spec=build_dit_spec(model),
+        spec=spec,
+        device=x.device,
+    )[0]
 
 
 def test_piflow_loop_matches_reference_piflow_generate():
@@ -405,7 +419,6 @@ def test_piflow_loop_matches_reference_piflow_generate():
     visual_cu, text, text_cu, rope_pos, text_rope = _reference_loop_inputs(x)
     packed = x.reshape(-1, *x.shape[2:]).clone()
     scheduler = PiflowScheduler(**TINY_PIFLOW)
-    scheduler.set_timesteps(TINY_PIFLOW["nfe"], device="cpu")
     with torch.no_grad():
         expected = piflow_generate(
             packed,
@@ -421,13 +434,7 @@ def test_piflow_loop_matches_reference_piflow_generate():
             device="cpu",
             **TINY_PIFLOW,
         )
-        actual = denoise_with_scheduler(
-            x.clone(),
-            _port_dit_fn(model, x, scale),
-            scheduler,
-            channels=4,
-            is_piflow=True,
-        )
+        actual = _port_sample(model, x, scale, scheduler, TINY_PIFLOW["nfe"])
     torch.testing.assert_close(
         actual, expected.reshape(*x.shape[:4], 4), rtol=1e-5, atol=1e-5
     )
@@ -452,16 +459,11 @@ def test_euler_loop_matches_reference_generate(capped):
     reference.instruct_type, reference.visual_cond = "noise", True
     x = _random_latent(2 * 4 + 1, seed=9)
     scale = (1.0, 1.5, 1.5)
-    start = euler_start_timestep(
-        cap_noise_timestep=capped, lq_noise_scale=0.7, instruct_type="noise"
-    )
-    assert start == (0.7 if capped else 1.0)
+    start = 0.7 if capped else 1.0
     visual_cu, text, text_cu, rope_pos, text_rope = _reference_loop_inputs(x)
     packed = x.reshape(-1, *x.shape[2:]).clone()
     num_inference_steps = 4  # the reference's 5 grid points == 4 actual Euler steps
     scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0)
-    sigmas = torch.linspace(start, 0.0, num_inference_steps + 1)[:-1].tolist()
-    scheduler.set_timesteps(sigmas=sigmas, device="cpu")
     with torch.no_grad():
         expected = generate(
             packed,
@@ -481,13 +483,7 @@ def test_euler_loop_matches_reference_generate(capped):
             5.0,
             start_timestep=start,
         )
-        actual = denoise_with_scheduler(
-            x.clone(),
-            _port_dit_fn(model, x, scale, use_motion_score=True),
-            scheduler,
-            channels=4,
-            is_piflow=False,
-        )
+        actual = _port_sample(model, x, scale, scheduler, num_inference_steps, capped)
     torch.testing.assert_close(
         actual, expected.reshape(*x.shape[:4], 4), rtol=1e-5, atol=1e-5
     )

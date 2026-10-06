@@ -30,10 +30,7 @@ SR_TILING_SCALE_KEY = "kandinsky6_sr_tiling_scale"  # int tile scale (2 or 4)
 SR_LR_LATENT_KEY = "kandinsky6_sr_lr_latent"  # [T', C, h, w] fp32 (LU path)
 SR_PLAN_KEY = "kandinsky6_sr_tile_plan"  # tiled.TilePlan
 SR_TILES_KEY = "kandinsky6_sr_tiles"  # list of uint8 [3, T, Hb, Wb]
-# Handoff between the three model-phase stages (latent prep -> denoise -> decode), split out
-# of the single combined stage so the denoising stage can subclass the shared DenoisingStage
-# (see denoising_stage.py): SamplingSpec / DitSpec are immutable msgspec.Struct values (plain
-# data, like TilePlan above), and the chunk lists are CPU tensors throughout.
+# stages exchange immutable specs and CPU chunks, not resident model objects
 SR_SAMPLING_SPEC_KEY = "kandinsky6_sr_sampling_spec"  # sampling.SamplingSpec
 SR_DIT_SPEC_KEY = "kandinsky6_sr_dit_spec"  # sampling.DitSpec
 SR_CHUNKS_KEY = (
@@ -42,11 +39,7 @@ SR_CHUNKS_KEY = (
 SR_DENOISED_KEY = (
     "kandinsky6_sr_denoised"  # list of fp32 [B, T', H', W', C] (post-denoise)
 )
-# (H, W) of the clip actually requested, before any VAE-spatial-factor alignment padding the
-# input stage added so whole-video KVAE encoding survives every supported sr_resolution_scale
-# (not only 2.25, whose pixel pre-upscale happens to already land on an aligned size). The
-# output stage crops the stitched result from (padded_H * scale, padded_W * scale) down to
-# (H * scale, W * scale) so the delivered video matches what was actually asked for.
+# original (H, W), used to crop VAE alignment padding from the stitched output
 SR_REQUESTED_HW_KEY = "kandinsky6_sr_requested_hw"
 
 
@@ -68,22 +61,6 @@ def build_dit_spec(dit: Any) -> DitSpec:
         patch_size=tuple(dit.patch_size),
         dtype=module_dtype(dit),
     )
-
-
-def _rope_scale_factor(arch: Kandinsky6SRArchConfig) -> tuple[float, float, float]:
-    table = arch.sr_scale_factor
-    visual_size = arch.sr_visual_size[0]
-    if table is None:
-        raise ValueError(
-            "transformer/config.json carries no sr_params (visual_size / scale_factor); "
-            "an official Diffusers Kandinsky6SRPipeline repo is required"
-        )
-    values = table.get(str(visual_size), table.get(visual_size))
-    if values is None:
-        raise ValueError(
-            f"sr_scale_factor has no entry for visual size {visual_size}: {table}"
-        )
-    return tuple(float(value) for value in values)
 
 
 def build_sampling_spec(
@@ -136,6 +113,18 @@ def build_sampling_spec(
                 nfe,
             )
         num_steps = nfe
+    table = arch.sr_scale_factor
+    visual_size = arch.sr_visual_size[0]
+    if table is None:
+        raise ValueError(
+            "transformer/config.json carries no sr_params (visual_size / scale_factor); "
+            "an official Diffusers Kandinsky6SRPipeline repo is required"
+        )
+    values = table.get(str(visual_size), table.get(visual_size))
+    if values is None:
+        raise ValueError(
+            f"sr_scale_factor has no entry for visual size {visual_size}: {table}"
+        )
     return SamplingSpec(
         tiling_scale=tiling_scale,
         tiles_batch_size=tiles_batch_size,
@@ -143,8 +132,8 @@ def build_sampling_spec(
         num_steps=num_steps,
         is_piflow=is_piflow,
         tile_min_overlap=tile_min_overlap,
-        visual_size=arch.sr_visual_size[0],
-        scale_factor=_rope_scale_factor(arch),
+        visual_size=visual_size,
+        scale_factor=tuple(float(value) for value in values),
         lq_noise_scale=arch.sr_lq_noise_scale,
         lq_noise_type=arch.sr_lq_noise_type,
         lq_channel_noise_scale=arch.sr_lq_channel_noise_scale,

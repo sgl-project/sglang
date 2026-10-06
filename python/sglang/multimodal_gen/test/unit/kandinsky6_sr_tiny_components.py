@@ -3,6 +3,7 @@
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,16 +38,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     DitSpec,
     SamplingSpec,
+    denoise_chunks,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     LatentUpscaleFn,
     decode_chunks,
-    denoise_chunks,
+    encode_pixel_tile,
     encode_video_to_lr_latent,
     plan_tiles,
-    prepare_lu_tile_latents,
-    prepare_pixel_tile_latents,
+    prepare_tile_latents,
     stitch_tiles,
+    upscale_lr_latent_tile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
     RESOLUTIONS,
@@ -229,28 +231,33 @@ def super_resolve(
             lr_latent.shape[-1] * spatial_factor,
         )
         plan = plan_tiles(frame_hw=frame_hw, **common)
-        chunks = prepare_lu_tile_latents(
-            lr_latent,
-            plan,
+        source = lr_latent
+        tile_encoder = partial(
+            upscale_lr_latent_tile,
             upscale_fn=upscale_fn,
             lu_dtype=lu_dtype,
             scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
             device=device,
-            spatial_factor=spatial_factor,
         )
     else:
         plan = plan_tiles(frame_hw=tuple(video.shape[-2:]), **common)
-        chunks = prepare_pixel_tile_latents(
-            video,
-            plan,
+        source = video
+        tile_encoder = partial(
+            encode_pixel_tile,
             vae=vae,
             scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
             device=device,
         )
+    chunks = prepare_tile_latents(
+        source,
+        plan,
+        tile_encoder=tile_encoder,
+        latent_path=upscale_fn is not None,
+        dit_spec=dit_spec,
+        spec=spec,
+        device=device,
+        spatial_factor=spatial_factor,
+    )
     denoised = denoise_chunks(
         chunks, dit, scheduler, dit_spec=dit_spec, spec=spec, device=device
     )

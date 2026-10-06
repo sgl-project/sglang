@@ -29,46 +29,6 @@ RESAMPLE_FPS_TOLERANCE: float = 1.5
 RESIZE_FRAME_CHUNK: int = 8
 
 
-def select_frame_indices(
-    total_frames: int, src_fps: float, target_fps: float
-) -> list[int]:
-    """Select rounded frame indices to downsample src_fps to target_fps."""
-    step = src_fps / target_fps
-    indices = [round(i * step) for i in range(int(total_frames / step))]
-    return [i for i in indices if i < total_frames]
-
-
-def resample_to_target_fps(
-    video: torch.Tensor,
-    src_fps: float,
-    target_fps: int = TARGET_FPS,
-) -> tuple[torch.Tensor, int]:
-    """Downsample high-fps inputs; retain near-target and lower-fps inputs.
-
-    Return [T, C, H, W] video and its effective playback rate."""
-    if abs(src_fps - target_fps) < RESAMPLE_FPS_TOLERANCE:
-        return video, round(src_fps)
-    if src_fps > target_fps:
-        indices = select_frame_indices(video.shape[0], src_fps, target_fps)
-        logger.warning(
-            "Source fps %.2f > target %sfps: downsampling %s frames -> %s (fixed-stride); "
-            "source temporal detail beyond %sfps is discarded.",
-            src_fps,
-            target_fps,
-            video.shape[0],
-            len(indices),
-            target_fps,
-        )
-        return video[indices], target_fps
-    logger.warning(
-        "Source fps %.2f < target %sfps: keeping native frames (no minterpolate upsample); "
-        "output is mildly out of distribution.",
-        src_fps,
-        target_fps,
-    )
-    return video, round(src_fps)
-
-
 def clip_to_aligned_frames(
     video: torch.Tensor, max_num_frames: int = MAX_NUM_FRAMES
 ) -> torch.Tensor:

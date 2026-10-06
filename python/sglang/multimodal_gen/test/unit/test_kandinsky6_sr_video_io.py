@@ -15,12 +15,12 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import _sample_to_uint8_frames
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.input_stage import (
-    Kandinsky6SRInputStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
     SR_TILING_SCALE_KEY,
     SR_VIDEO_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.stages import (
+    Kandinsky6SRInputStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_io import (
     FrameSelector,
@@ -30,11 +30,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_utils import (
     clip_to_aligned_frames,
-    resample_to_target_fps,
 )
 
 FRAME_COUNTS = [1, 2, 9, 24, 50, 121, 125, 200, 301, 302, 400, 1000]
 SOURCE_FPS = [12, 23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 120]
+
+
+def _reference_resample(video, fps):
+    if abs(fps - 24) < 1.5 or fps < 24:
+        return video, round(fps)
+    step = fps / 24
+    indices = [round(i * step) for i in range(int(len(video) / step))]
+    return video[[i for i in indices if i < len(video)]], 24
 
 
 def _stream_select(total: int, fps: float) -> tuple[list[int], int]:
@@ -54,7 +61,7 @@ def _stream_select(total: int, fps: float) -> tuple[list[int], int]:
 
 def _reference_select(total: int, fps: float) -> tuple[list[int], int] | None:
     ids = torch.arange(total).view(total, 1, 1, 1)
-    resampled, effective_fps = resample_to_target_fps(ids, fps)
+    resampled, effective_fps = _reference_resample(ids, fps)
     try:
         clipped = clip_to_aligned_frames(resampled)
     except ValueError:
@@ -147,7 +154,7 @@ def test_decode_clip_equals_reference_cli_pipeline(tmp_path, fps, frames):
     path = tmp_path / "clip.mp4"
     write_test_video(path, frames=frames, fps=fps)
     full, source_fps = _decode_everything(path)
-    expected, expected_fps = resample_to_target_fps(full, source_fps)
+    expected, expected_fps = _reference_resample(full, source_fps)
     expected = clip_to_aligned_frames(expected)
 
     clip = decode_clip(str(path))

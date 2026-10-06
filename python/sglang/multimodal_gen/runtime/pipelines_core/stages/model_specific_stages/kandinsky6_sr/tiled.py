@@ -6,7 +6,6 @@ Each chunk uses seed + its first tile index, matching the reference.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any
 
 import msgspec
 import torch
@@ -18,13 +17,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     DitSpec,
     SamplingSpec,
-    StepCallback,
-    StepContext,
     bf16_autocast,
     cast_to_module_dtype,
-    denoise_with_scheduler,
-    euler_start_timestep,
-    make_dit_fn,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
     RESOLUTIONS,
@@ -162,167 +156,51 @@ def build_chunk_latent(
         visual_cond=dit_spec.visual_cond,
         in_visual_dim=dit_spec.in_visual_dim,
         lq_latent=lq,
-        batch_size=batch,
-        duration=lq.shape[0] // batch,
-        height=lq.shape[1],
-        width=lq.shape[2],
         device=device,
         seed=seed,
         lq_noise_scale=spec.lq_noise_scale,
         lq_noise_type=spec.lq_noise_type,
         lq_channel_noise_scale=spec.lq_channel_noise_scale,
-        # The DiT's own loaded dtype (reference: cast_to_module_dtype(dit, ...) before
-        # building the initial latent), not a hard-coded fp32 regardless of precision.
+        # conditioning noise must round in the loaded DiT dtype
         dtype=dit_spec.dtype,
     )
     return x.reshape(batch, -1, *x.shape[1:])
 
 
 @torch.no_grad()
-def prepare_lu_tile_latents(
-    lr_latent: torch.Tensor,
+def prepare_tile_latents(
+    source: torch.Tensor,
     plan: TilePlan,
     *,
-    upscale_fn: LatentUpscaleFn,
-    lu_dtype: torch.dtype | None,
-    scaling_factor: float,
+    tile_encoder: Callable[[torch.Tensor], torch.Tensor],
+    latent_path: bool,
     dit_spec: DitSpec,
     spec: SamplingSpec,
     device: torch.device,
     spatial_factor: int = VAE_SPATIAL_FACTOR,
 ) -> list[torch.Tensor]:
-    """LU path: initial latents (CPU) of every chunk from the whole-video latent."""
-    latent_grid = latent_tile_grid_from_pixel_grid(plan.pixel_grid, spatial_factor)
-    tiles = extract_all_tiles(lr_latent, latent_grid)
-    chunks: list[torch.Tensor] = []
-    for start, stop in chunk_ranges(len(tiles), spec.tiles_batch_size):
-        lq_tiles = [
-            upscale_lr_latent_tile(
-                tile,
-                upscale_fn,
-                lu_dtype=lu_dtype,
-                scaling_factor=scaling_factor,
-                device=device,
-            )
-            for tile in tiles[start:stop]
-        ]
-        chunk = build_chunk_latent(
-            lq_tiles,
-            seed=spec.seed + start,
-            dit_spec=dit_spec,
-            spec=spec,
-            device=device,
-        )
-        chunks.append(chunk.cpu())
-    return chunks
-
-
-@torch.no_grad()
-def prepare_pixel_tile_latents(
-    video: torch.Tensor,
-    plan: TilePlan,
-    *,
-    vae: torch.nn.Module,
-    scaling_factor: float,
-    dit_spec: DitSpec,
-    spec: SamplingSpec,
-    device: torch.device,
-) -> list[torch.Tensor]:
-    """Pixel path: bilinear tile -> KVAE encode -> initial latents (CPU) per chunk."""
-    tiles = extract_all_tiles(video, plan.pixel_grid)
-    chunks: list[torch.Tensor] = []
-    for start, stop in chunk_ranges(len(tiles), spec.tiles_batch_size):
-        enlarged = upsample_tiles_to_base(tiles[start:stop], *plan.base_hw)
-        lq_tiles = [
-            encode_pixel_tile(tile, vae, scaling_factor=scaling_factor, device=device)
-            for tile in enlarged
-        ]
-        chunk = build_chunk_latent(
-            lq_tiles,
-            seed=spec.seed + start,
-            dit_spec=dit_spec,
-            spec=spec,
-            device=device,
-        )
-        chunks.append(chunk.cpu())
-    return chunks
-
-
-def reset_scheduler_for_chunk(scheduler: Any) -> None:
-    """Reset step and begin indices so each tile chunk starts at the same timestep."""
-    scheduler._step_index = None
-    scheduler.set_begin_index(0)
-
-
-@torch.no_grad()
-def denoise_chunk(
-    x: torch.Tensor,
-    dit: Callable[..., torch.Tensor],
-    scheduler: Any,
-    *,
-    dit_spec: DitSpec,
-    spec: SamplingSpec,
-    step_context: StepContext | None = None,
-    on_step: StepCallback | None = None,
-) -> torch.Tensor:
-    """Denoise one [B, T, H, W, C] chunk, resetting the configured scheduler."""
-    is_piflow = spec.is_piflow
-    if not is_piflow:
-        # The Euler start timestep is only meaningful for the scheduler this chunk is about to
-        # run: re-derive it instead of baking a stale one into ``set_timesteps`` up front.
-        start = euler_start_timestep(
-            cap_noise_timestep=spec.cap_noise_timestep,
-            lq_noise_scale=spec.lq_noise_scale,
-            instruct_type=dit_spec.instruct_type,
-        )
-        sigmas = torch.linspace(start, 0.0, spec.num_steps + 1)[:-1].tolist()
-        scheduler.set_timesteps(sigmas=sigmas, device=x.device)
-    reset_scheduler_for_chunk(scheduler)
-    dit_fn = make_dit_fn(
-        dit,
-        latent_frames_hw=tuple(x.shape[1:4]),
-        patch_size=dit_spec.patch_size,
-        scale_factor=spec.scale_factor,
-        use_motion_score=dit_spec.use_motion_score and not is_piflow,
-        step_context=step_context,
+    """Encode/upscale one tile batch at a time; keep prepared chunks on CPU."""
+    grid = (
+        latent_tile_grid_from_pixel_grid(plan.pixel_grid, spatial_factor)
+        if latent_path
+        else plan.pixel_grid
     )
-    with bf16_autocast(x.device):
-        return denoise_with_scheduler(
-            x,
-            dit_fn,
-            scheduler,
-            channels=dit_spec.in_visual_dim,
-            is_piflow=is_piflow,
-            on_step=on_step,
-        )
-
-
-def denoise_chunks(
-    chunks: Sequence[torch.Tensor],
-    dit: Callable[..., torch.Tensor],
-    scheduler: Any,
-    *,
-    dit_spec: DitSpec,
-    spec: SamplingSpec,
-    device: torch.device,
-    step_context: StepContext | None = None,
-    on_step: StepCallback | None = None,
-) -> list[torch.Tensor]:
-    """Denoise chunks sequentially on device and return CPU latents."""
-    if spec.is_piflow:
-        scheduler.set_timesteps(spec.num_steps, device=device)
-    return [
-        denoise_chunk(
-            chunk.to(device),
-            dit,
-            scheduler,
+    tiles = extract_all_tiles(source, grid)
+    chunks = []
+    for start, stop in chunk_ranges(len(tiles), spec.tiles_batch_size):
+        inputs = tiles[start:stop]
+        if not latent_path:
+            inputs = upsample_tiles_to_base(inputs, *plan.base_hw)
+        lq_tiles = [tile_encoder(tile) for tile in inputs]
+        chunk = build_chunk_latent(
+            lq_tiles,
+            seed=spec.seed + start,
             dit_spec=dit_spec,
             spec=spec,
-            step_context=step_context,
-            on_step=on_step,
-        ).cpu()
-        for chunk in chunks
-    ]
+            device=device,
+        )
+        chunks.append(chunk.cpu())
+    return chunks
 
 
 @torch.no_grad()

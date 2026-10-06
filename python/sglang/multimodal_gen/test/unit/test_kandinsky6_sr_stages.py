@@ -35,26 +35,6 @@ from sglang.multimodal_gen.runtime.pipelines.kandinsky6_sr_pipeline import (
     Kandinsky6SRPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.decode_stage import (
-    Kandinsky6SRDecodeStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.denoising_stage import (
-    Kandinsky6SRDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.encode_stage import (
-    Kandinsky6SREncodeStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.input_stage import (
-    WARMUP_CLIP_FRAMES,
-    WARMUP_CLIP_HW,
-    Kandinsky6SRInputStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.latent_prep_stage import (
-    Kandinsky6SRLatentPrepStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.output_stage import (
-    Kandinsky6SROutputStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
     SR_LR_LATENT_KEY,
     SR_PLAN_KEY,
@@ -66,6 +46,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     module_dtype,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.stages import (
+    WARMUP_CLIP_FRAMES,
+    WARMUP_CLIP_HW,
+    Kandinsky6SRDecodeStage,
+    Kandinsky6SRDenoisingStage,
+    Kandinsky6SREncodeStage,
+    Kandinsky6SRInputStage,
+    Kandinsky6SRLatentPrepStage,
+    Kandinsky6SROutputStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     TilePlan,
