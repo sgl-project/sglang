@@ -11,10 +11,14 @@ use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
 use kube::{api::Api, runtime::watcher, Client};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
+
+mod peers;
+
+pub use peers::{peer_address_family, spawn_peer_watch, AddressFamily};
 
 /// Decide which [`WorkerMode`] an `EndpointSlice` should be assigned, based
 /// on the configured discovery mode.
@@ -76,6 +80,13 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
     true
 }
 
+/// A slice's PD version group: the configured label's value, inherited from its
+/// Service. A missing or empty label yields `None`, its own group.
+fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
+    let group = es.metadata.labels.as_ref()?.get(label?)?;
+    (!group.is_empty()).then(|| group.clone())
+}
+
 /// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
 /// supplied [`WorkerMode`].
 ///
@@ -112,8 +123,7 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
-        let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
-        if !is_ready {
+        if !endpoint_ready(ep) {
             continue;
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
@@ -142,11 +152,25 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 url,
                 mode,
                 model_ids: Vec::new(),
-                bootstrap_port: None,
+                services: es
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kubernetes.io/service-name"))
+                    .filter(|service| !ns.is_empty() && !service.is_empty())
+                    .map(|service| format!("{ns}/{service}"))
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
             });
         }
     }
     out
+}
+
+/// Per the EndpointSlice API, an absent `conditions.ready` means ready.
+fn endpoint_ready(ep: &Endpoint) -> bool {
+    ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)
 }
 
 /// Spawn the k8s discovery task.
@@ -187,10 +211,15 @@ async fn emit_diff(
     per_slice: &HashMap<String, HashMap<WorkerId, WorkerSpec>>,
     prev_union: &mut HashMap<WorkerId, WorkerSpec>,
 ) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
-    let union: HashMap<WorkerId, WorkerSpec> = per_slice
-        .values()
-        .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .collect();
+    // A pod can be selected by several Services or temporarily appear in
+    // overlapping slices. Keep every membership until its last slice leaves.
+    let mut union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+    for (id, spec) in per_slice.values().flat_map(|slice| slice.iter()) {
+        union
+            .entry(id.clone())
+            .and_modify(|worker| worker.services.extend(spec.services.iter().cloned()))
+            .or_insert_with(|| spec.clone());
+    }
 
     for (id, spec) in &union {
         match prev_union.get(id) {
@@ -202,9 +231,18 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.url != spec.url
+                    || prev.model_ids != spec.model_ids
+                    || prev.version_group != spec.version_group
+                {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                } else if prev.services != spec.services {
+                    tx.send(DiscoveryEvent::ServicesChanged {
+                        id: id.clone(),
+                        services: spec.services.clone(),
+                    })
+                    .await?;
                 }
             }
             None => {
@@ -244,8 +282,12 @@ async fn emit_diff(
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
-async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
-where
+async fn process_events<S>(
+    mut stream: S,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    mode: K8sDiscoveryMode,
+    version_group_label: Option<String>,
+) where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
     let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
@@ -255,14 +297,19 @@ where
     fn workers_for_slice(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
+        version_group_label: Option<&str>,
     ) -> HashMap<WorkerId, WorkerSpec> {
-        match classify_mode(es, mode) {
-            Some(wm) => extract_workers(es, wm)
-                .into_iter()
-                .map(|w| (w.id.clone(), w))
-                .collect(),
-            None => HashMap::new(),
-        }
+        let Some(wm) = classify_mode(es, mode) else {
+            return HashMap::new();
+        };
+        let group = version_group(es, version_group_label);
+        extract_workers(es, wm)
+            .into_iter()
+            .map(|mut w| {
+                w.version_group = group.clone();
+                (w.id.clone(), w)
+            })
+            .collect()
     }
 
     while let Some(event) = stream.next().await {
@@ -273,7 +320,7 @@ where
             }
             Ok(watcher::Event::InitApply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 if let Some(buf) = init_buffer.as_mut() {
                     buf.insert(key, workers);
                     Ok(())
@@ -293,7 +340,7 @@ where
             }
             Ok(watcher::Event::Apply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 per_slice.insert(key, workers);
                 emit_diff(&tx, &per_slice, &mut prev_union).await
             }
@@ -315,10 +362,29 @@ where
     tracing::warn!("k8s watcher stream ended; discovery task exiting");
 }
 
-/// Empty `cfg.namespace` triggers a cluster-wide watch via `Api::all(client)`.
+/// An `EndpointSlice` API handle from the default client config.
+///
+/// An empty `namespace` means a cluster-wide watch via `Api::all(client)`.
 /// `Api::namespaced(client, "")` is namespace-scoped to the empty-named
 /// namespace, which is almost never what callers intend.
-///
+async fn endpoint_slice_api(namespace: &str) -> Result<Api<EndpointSlice>, kube::Error> {
+    let client = Client::try_default().await?;
+    Ok(if namespace.is_empty() {
+        Api::all(client)
+    } else {
+        Api::namespaced(client, namespace)
+    })
+}
+
+/// How a watched namespace appears in startup logs.
+fn namespace_display(namespace: &str) -> &str {
+    if namespace.is_empty() {
+        "<all namespaces>"
+    } else {
+        namespace
+    }
+}
+
 /// State is tracked per-slice as `HashMap<SliceKey, HashMap<WorkerId,
 /// WorkerSpec>>`.  K8s auto-shards Services with >100 endpoints and CNIs
 /// often shard per AZ, so multiple `EndpointSlice` objects can exist per
@@ -340,17 +406,12 @@ pub async fn spawn(
         namespace,
         mode,
         peer_selector: _,
+        version_group_label,
     } = cfg;
 
-    let client = Client::try_default()
+    let api = endpoint_slice_api(&namespace)
         .await
         .context("kube client default config")?;
-
-    let api: Api<EndpointSlice> = if namespace.is_empty() {
-        Api::all(client)
-    } else {
-        Api::namespaced(client, &namespace)
-    };
 
     // Plain mode pushes the single selector to the server side so the LIST
     // is already filtered.  PD mode leaves the server-side selector empty
@@ -371,11 +432,7 @@ pub async fn spawn(
     // an empty namespace. Surfacing the watch target here lets an
     // operator spot the typo in the first log lines instead of only
     // discovering it via later `no workers available` request failures.
-    let namespace_display: &str = if namespace.is_empty() {
-        "<all namespaces>"
-    } else {
-        &namespace
-    };
+    let namespace_display = namespace_display(&namespace);
     match &mode {
         K8sDiscoveryMode::Plain { label_selector } => tracing::info!(
             namespace = %namespace_display,
@@ -389,6 +446,7 @@ pub async fn spawn(
             namespace = %namespace_display,
             prefill_selector = %prefill_selector,
             decode_selector = %decode_selector,
+            version_group_label = version_group_label.as_deref().unwrap_or("<none>"),
             "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
         ),
     }
@@ -396,7 +454,7 @@ pub async fn spawn(
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        process_events(stream, tx, mode).await;
+        process_events(stream, tx, mode, version_group_label).await;
     });
     Ok(handle)
 }
@@ -404,7 +462,8 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
+    use k8s_openapi::api::core::v1::ObjectReference;
+    use k8s_openapi::api::discovery::v1::{EndpointConditions, EndpointPort};
     use kube::core::ObjectMeta;
 
     /// Helper: build a minimal EndpointSlice with predictable metadata.
@@ -642,7 +701,7 @@ mod tests {
         ];
         let (tx, mut rx) = mpsc::channel(16);
         let stream = futures::stream::iter(events);
-        process_events(stream, tx, plain_mode()).await;
+        process_events(stream, tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -670,7 +729,7 @@ mod tests {
             Ok(watcher::Event::InitDone),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -704,7 +763,7 @@ mod tests {
         }));
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let handle = tokio::spawn(process_events(events, tx, plain_mode()));
+        let handle = tokio::spawn(process_events(events, tx, plain_mode(), None));
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("process_events must exit promptly when consumer drops")
@@ -723,7 +782,7 @@ mod tests {
             Ok(watcher::Event::Apply(s)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -769,7 +828,7 @@ mod tests {
             Ok(watcher::Event::Apply(unrelated_slice)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, pd_mode()).await;
+        process_events(futures::stream::iter(events), tx, pd_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -788,6 +847,43 @@ mod tests {
         );
         assert_eq!(added[0].mode, WorkerMode::Prefill);
         assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
+    }
+
+    /// Each slice's label value becomes its workers' version group; a missing
+    /// or empty label yields `None`.
+    #[tokio::test]
+    async fn pd_mode_reads_version_group_from_slice_label() {
+        let events = [
+            ("p-v1", "10.0.0.1", "prefill", "v1"),
+            ("d-v2", "10.0.0.2", "decode", "v2"),
+            ("d-empty", "10.0.0.3", "decode", ""),
+        ]
+        .map(|(name, addr, role, group)| {
+            let labels = [
+                ("app", "sglang"),
+                ("role", role),
+                ("sglang.ai/version-group", group),
+            ];
+            let es = make_slice_full(&[addr], 30000, true, "ns", name, &labels);
+            Ok(watcher::Event::Apply(with_uid(es, &format!("u-{name}"))))
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let label = Some("sglang.ai/version-group".into());
+        process_events(futures::stream::iter(events), tx, pd_mode(), label).await;
+        let mut groups = Vec::new();
+        while let Ok(DiscoveryEvent::Added(spec)) = rx.try_recv() {
+            groups.push((spec.url, spec.version_group));
+        }
+        groups.sort_unstable();
+        let group = |g: &str| Some(g.to_owned());
+        assert_eq!(
+            groups,
+            [
+                ("http://10.0.0.1:30000".into(), group("v1")),
+                ("http://10.0.0.2:30000".into(), group("v2")),
+                ("http://10.0.0.3:30000".into(), None),
+            ]
+        );
     }
 
     /// End-to-end K8s + PD integration: synthesize EndpointSlice events
@@ -944,7 +1040,7 @@ mod tests {
         ];
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(events);
-            process_events(stream, dtx, pd_mode()).await;
+            process_events(stream, dtx, pd_mode(), None).await;
         });
 
         // Poll the registry until all four workers are present with
@@ -1007,7 +1103,6 @@ mod tests {
     /// Helper: build a slice where every endpoint carries a synthetic
     /// `target_ref.uid`. The endpoint at position `i` gets `uids[i]`.
     fn make_slice_with_uids(addrs: &[&str], port: i32, uids: &[&str]) -> EndpointSlice {
-        use k8s_openapi::api::core::v1::ObjectReference;
         assert_eq!(addrs.len(), uids.len());
         let endpoints = addrs
             .iter()
@@ -1063,6 +1158,7 @@ mod tests {
             ]),
             tx,
             plain_mode(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -1103,6 +1199,112 @@ mod tests {
         );
         // Same URL across both, confirming the IP didn't change.
         assert_eq!(added[0].url, added[1].url);
+    }
+
+    /// Service pools must survive pod replacement, and a shared pod must retain
+    /// its other Service when one EndpointSlice disappears.
+    #[tokio::test]
+    async fn service_membership_survives_replacement_and_merges_slices() {
+        use crate::buckets_reorg::{Bucket, BucketGroups, EngineGroup};
+        use crate::discovery::ModelId;
+        use crate::policies_reorg::{power_of_two::PowerOfTwoPolicy, PickRequest, Stage};
+        use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+        use crate::workers::WorkerRegistry;
+        use std::sync::Arc;
+
+        let slice = |uid: &str, pod: &str, namespace: &str, service: &str| {
+            let mut es = with_uid(make_slice_with_uids(&["10.0.0.1"], 30000, &[pod]), uid);
+            es.metadata.namespace = Some(namespace.into());
+            es.metadata.labels = Some(BTreeMap::from([(
+                "kubernetes.io/service-name".into(),
+                service.into(),
+            )]));
+            es
+        };
+        let old = slice("slice", "old", "ns", "short");
+        let new = slice("slice", "new", "ns", "short");
+        let other = slice("other-slice", "new", "ns", "other");
+        let overlapping = slice("overlapping-slice", "new", "ns", "short");
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(vec![
+                Ok(watcher::Event::Apply(old)),
+                Ok(watcher::Event::Apply(new.clone())),
+                Ok(watcher::Event::Apply(other)),
+                Ok(watcher::Event::Apply(overlapping.clone())),
+                Ok(watcher::Event::Delete(new)),
+                Ok(watcher::Event::Delete(overlapping)),
+            ]),
+            tx,
+            plain_mode(),
+            None,
+        )
+        .await;
+        let mut group = EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(
+            EngineReportedLoadTable::new(),
+        )));
+        group.worker_services = Some(["ns/short".into()].into());
+        let bucket = Bucket::new("short", BucketGroups::Plain(group));
+        let BucketGroups::Plain(group) = &bucket.groups else {
+            unreachable!()
+        };
+        let registry = WorkerRegistry::default();
+        let model = ModelId("m".into());
+        let request = PickRequest::new(&model, Stage::Plain, 1);
+        // Same Service name in another namespace must not leak into the pool.
+        let mut foreign = extract_workers(
+            &slice("foreign", "foreign", "elsewhere", "short"),
+            Stage::Plain,
+        )
+        .remove(0);
+        foreign.model_ids = vec![model.clone()];
+        registry.add(foreign).unwrap();
+        assert!(!bucket.has_ready_workers(&registry, &model));
+        let mut selected = Vec::new();
+        let mut membership_updates = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                DiscoveryEvent::Added(mut spec) => {
+                    spec.model_ids = vec![model.clone()];
+                    let spec_id = spec.id.0.clone();
+                    registry.add(spec).unwrap();
+                    selected.push(spec_id.clone());
+                    if spec_id == "ns/old" {
+                        assert_eq!(
+                            group.pick(&registry, &request).await.unwrap().engine.id.0,
+                            "ns/old"
+                        );
+                    }
+                    assert!(bucket.has_ready_workers(&registry, &model));
+                }
+                DiscoveryEvent::Removed { id } => {
+                    registry.remove(&id);
+                    assert_eq!(
+                        group.pick(&registry, &request).await.unwrap().engine.id.0,
+                        "ns/new"
+                    );
+                }
+                DiscoveryEvent::ServicesChanged { id, services } => {
+                    membership_updates.push(services.clone());
+                    let worker = registry.get(&id).unwrap();
+                    worker.set_services(services);
+                }
+                _ => panic!("unexpected discovery event"),
+            }
+        }
+        assert_eq!(selected, ["ns/old", "ns/new"]);
+        assert_eq!(
+            membership_updates,
+            vec![
+                ["ns/short".into(), "ns/other".into()].into(),
+                ["ns/other".into()].into(),
+            ]
+        );
+        assert!(registry.get(&WorkerId("ns/old".into())).is_none());
+        let worker = registry.get(&WorkerId("ns/new".into())).unwrap();
+        assert_eq!(worker.services(), ["ns/other".into()].into());
+        assert!(!bucket.has_ready_workers(&registry, &model));
+        assert!(group.pick(&registry, &request).await.is_err());
     }
 
     /// End-to-end reconcile: an EndpointSlice flips `ready=true` while the
@@ -1183,7 +1385,7 @@ mod tests {
         // Drive the ready=true slice through the real discovery processor.
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(vec![Ok(watcher::Event::Apply(slice))]);
-            process_events(stream, dtx, plain_mode()).await;
+            process_events(stream, dtx, plain_mode(), None).await;
         });
 
         // No target_ref on the endpoint => id falls back to ns/slice/addr:port.

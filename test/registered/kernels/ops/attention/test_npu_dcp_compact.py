@@ -80,6 +80,8 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                 pool = SimpleNamespace(
                     dtype=dtype,
                     store_dtype=dtype,
+                    index_head_dim=None,
+                    is_draft_worker=False,
                     start_layer=0,
                     kv_lora_rank=512,
                     qk_rope_head_dim=64,
@@ -163,6 +165,8 @@ class TestNpuDcpCompactKernels(CustomTestCase):
         pool = SimpleNamespace(
             dtype=torch.bfloat16,
             store_dtype=torch.bfloat16,
+            index_head_dim=None,
+            is_draft_worker=False,
             start_layer=0,
             kv_lora_rank=512,
             qk_rope_head_dim=64,

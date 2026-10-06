@@ -2639,13 +2639,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or is_npu()):
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_npu):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP, CUDA, or Ascend NPU "
-            "platform, but got "
-            f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on an unsupported platform."
+            "currently only supported on the AMD HIP, CUDA, or NPU "
+            "platform, but got decode_context_parallel_size "
+            f"({decode_context_parallel_size}) on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(
@@ -2800,7 +2799,10 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_custom_allreduce=False,
+            # Attention TP can be a derived subgroup of the full TP group.
+            # Inherit the global policy and let per-group capability detection
+            # select a custom communicator or fall back.
+            use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

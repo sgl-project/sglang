@@ -124,6 +124,7 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
 class TestNormalizeMlaKRoPECache(unittest.TestCase):
     def test_non_dcp_prefix_preserves_main_nz_page_reader(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         logical_k = torch.arange(2 * 4 * 32).reshape(2, 4, 1, 32).float()
         logical_rope = logical_k + 1000
         pages = torch.tensor([1, 0], dtype=torch.int64)
@@ -208,6 +209,8 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
             start_layer=0,
             dtype=torch.bfloat16,
             store_dtype=torch.bfloat16,
+            index_head_dim=None,
+            is_draft_worker=False,
             dsa_kv_cache_store_fp8=False,
             use_fia_nz=False,
             k_buffer=[torch.empty(1024, 1, 4, dtype=torch.bfloat16)],
@@ -261,6 +264,25 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
                                     )
                                     torch.testing.assert_close(call.args[2], values)
 
+        # DSA slots have already been localized by ForwardBatch; a draft
+        # worker keeps global slots. Neither may enter the K3 token remapper.
+        for index_dim, draft in ((128, False), (None, True)):
+            pool.index_head_dim = index_dim
+            pool.is_draft_worker = draft
+            with (
+                self.subTest(index_dim=index_dim, draft=draft),
+                rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1),
+                patch.object(memory_pool_npu, "torch_npu", create=True) as npu,
+                patch.object(memory_pool_npu, "set_mla_kv_buffer_kernel") as kernel,
+            ):
+                memory_pool_npu.NPUMLATokenToKVPool.set_kv_buffer(
+                    pool, SimpleNamespace(layer_id=0), loc, cache_k, cache_v
+                )
+                kernel.__getitem__.assert_not_called()
+                self.assertEqual(npu.npu_scatter_nd_update_.call_count, 2)
+                for call in npu.npu_scatter_nd_update_.call_args_list:
+                    torch.testing.assert_close(call.args[1], loc.view(-1, 1))
+
 
 class TestNpuMlaDcpRead(unittest.TestCase):
     def test_read_preserves_index_dtype_and_output_dtype(self):
@@ -280,7 +302,7 @@ class TestNpuMlaDcpRead(unittest.TestCase):
                 torch.empty(0, dtype=index_dtype),
                 torch.tensor([7, 0, 1, 2, 7, 3], dtype=index_dtype)[::2],
             ):
-                for dst_dtype in (None, torch.float32):
+                for dst_dtype in (None, torch.bfloat16):
                     with (
                         self.subTest(
                             index_dtype=index_dtype, loc=loc, dst_dtype=dst_dtype
@@ -302,6 +324,11 @@ class TestNpuMlaDcpRead(unittest.TestCase):
                             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                         pool.get_key_buffer.assert_called_with(3)
                         pool.get_value_buffer.assert_called_with(3)
+
+        with self.assertRaisesRegex(ValueError, "do not support dtype conversion"):
+            memory_pool_npu.NPUMLATokenToKVPool.get_mla_kv_buffer(
+                pool, SimpleNamespace(layer_id=3), torch.tensor([0]), torch.float32
+            )
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
@@ -521,6 +548,13 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
             "dcp_mtp_attn_mask",
+            "dcp_seq_lens_cpu_int",
+            "dcp_seq_lens",
+            "dcp_block_tables",
+            "dcp_origin_out_cache_loc",
+            "dcp_spec_seq_lens_cpu_int",
+            "dcp_spec_seq_lens",
+            "dcp_spec_block_tables",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
@@ -529,6 +563,7 @@ class TestForwardMetadata(unittest.TestCase):
 
     def test_dspark_target_verify_builds_local_dcp_metadata(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.use_mla = True
         backend.is_draft_worker = False
         backend.page_size = 4
@@ -586,8 +621,112 @@ class TestForwardMetadata(unittest.TestCase):
             ],
         )
 
+    def test_dsa_dcp_graph_keeps_page_interleaved_metadata(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_dsa = True
+        backend.is_draft_worker = False
+        backend.page_size = 4
+        backend.device = "cpu"
+        backend.max_context_len = 32
+        backend.speculative_step_id = 0
+        backend.speculative_step_offset_npu = torch.tensor(1)
+        backend.q_head_num_padding = None
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.enable_sparsity_driven_kv_offload = False
+        backend.req_to_token = torch.arange(64, 128).view(1, 64)
+
+        for window, mode in (
+            (None, ForwardMode.DECODE),
+            (3, ForwardMode.TARGET_VERIFY),
+        ):
+            with (
+                self.subTest(window=window),
+                rc.get_parallel().override(
+                    dcp_enabled=True,
+                    dcp_size=2,
+                    dcp_rank=1,
+                    attn_dcp_size=2,
+                    attn_dcp_rank=1,
+                ),
+            ):
+                backend.speculative_num_draft_tokens = window
+                backend.init_cuda_graph_state(max_bs=1, max_num_tokens=3)
+                self.assertNotIn("dcp_mtp_attn_mask", backend.graph_metadata)
+                self.assertIn("dcp_origin_out_cache_loc", backend.graph_metadata)
+                seq_lens = torch.tensor([9], dtype=torch.int32)
+                loc = torch.arange(window or 1)
+                metadata = backend._init_cuda_graph_metadata(
+                    1, mode, seq_lens.clone(), loc
+                )
+                pointer = metadata.dcp_origin_out_cache_loc.data_ptr()
+                backend._apply_cuda_graph_metadata(
+                    bs=1,
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=seq_lens.clone(),
+                    seq_lens_cpu=seq_lens,
+                    forward_mode=mode,
+                    spec_info=None,
+                    out_cache_loc=loc,
+                    origin_out_cache_loc=loc + 64,
+                    in_capture=True,
+                )
+                # Page-interleaved ownership: rank 1 owns positions 4..7,
+                # not every odd token as in K3's dense MLA path.
+                if window:
+                    self.assertEqual(metadata.dcp_spec_seq_lens.tolist(), [4, 4, 4])
+                else:
+                    self.assertEqual(metadata.dcp_seq_lens.tolist(), [4])
+                self.assertEqual(metadata.seq_lens.tolist(), [9 + (window or 0)])
+                self.assertIsNone(metadata.dcp_mtp_attn_mask)
+                self.assertEqual(pointer, metadata.dcp_origin_out_cache_loc.data_ptr())
+                torch.testing.assert_close(metadata.dcp_origin_out_cache_loc, loc + 64)
+
+    def test_forward_batch_localizes_dsa_but_not_k3_or_draft(self):
+        from sglang.srt.model_executor import forward_batch_info
+
+        tree = ast.parse(inspect.getsource(forward_batch_info))
+        condition = next(
+            node.test
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "origin_out_cache_loc"
+                    for target in stmt.targets
+                )
+                for stmt in node.body
+            )
+        )
+        code = compile(ast.Expression(condition), "<DCP write-location guard>", "eval")
+        for npu in (False, True):
+            for enabled in (False, True):
+                for draft in (False, True):
+                    for index_dim in (None, 128):
+                        runner = SimpleNamespace(
+                            is_draft_worker=draft,
+                            model_config=SimpleNamespace(index_head_dim=index_dim),
+                        )
+                        actual = eval(
+                            code,
+                            {
+                                "_is_npu": npu,
+                                "model_runner": runner,
+                                "get_parallel": lambda: SimpleNamespace(
+                                    dcp_enabled=enabled
+                                ),
+                            },
+                        )
+                        self.assertEqual(
+                            actual,
+                            npu and enabled and not draft and index_dim is not None,
+                        )
+
     def test_swa_graph_buffers_preserve_original_capacity(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.use_mla = False
         backend.is_draft_worker = False
         backend.page_size = 128
@@ -620,6 +759,7 @@ class TestForwardMetadata(unittest.TestCase):
 
     def test_dspark_graph_metadata_is_fixed_shape_and_rank_local(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.use_mla = True
         backend.is_draft_worker = False
         backend.page_size = 4
@@ -696,6 +836,7 @@ class TestForwardMetadata(unittest.TestCase):
 class TestEmptyDcpTargetVerify(unittest.TestCase):
     def test_shared_fia_helper_normalizes_heads_lse_and_empty_rows(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.kv_lora_rank = 4
         backend.qk_rope_head_dim = 2
         backend.page_size = 4
@@ -754,6 +895,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
 
     def test_forward_mtp_returns_empty_without_calling_fia(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.use_mla = True
         backend.is_draft_worker = False
         backend.graph_mode = False
@@ -789,6 +931,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
     )
     def test_forward_mtp_preserves_padded_query_shape(self, _fia_nz):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_dsa = False
         backend.use_mla = backend.use_fia = True
         backend.is_draft_worker = False
         backend.kv_lora_rank = 4

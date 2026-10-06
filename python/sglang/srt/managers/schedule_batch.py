@@ -933,6 +933,9 @@ class ReqKvInfo:
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
+    # This request already inserted [0, here) into the tree; later inserts count
+    # a hit only on the nodes past it, so a request counts each node once.
+    cache_inserted_len: int = 0
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
@@ -952,6 +955,9 @@ class ReqKvInfo:
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
     mamba_last_track_seqlen: Optional[int] = None
+    # Seq len of the other ping-pong slot's state. None means what is in
+    # that slot cannot be named (never written, donated, freed).
+    mamba_prev_track_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1059,12 +1065,12 @@ class Req(ReqDllmMixin):
             else self.origin_input_ids
         )  # Before image padding
         # Each decode stage's output ids. Append-only by contract:
-        # _refresh_fill_ids infers how many output tokens are already in
+        # refresh_fill_ids infers how many output tokens are already in
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Kept in sync by _refresh_fill_ids; admission only updates
+        # Kept in sync by refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
@@ -1131,7 +1137,7 @@ class Req(ReqDllmMixin):
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
-        self.mamba_lazy_is_insert: bool = True
+        self.mamba_lazy_checkpoint: bool = True
 
         # Check finish
         self.tokenizer = None
@@ -1214,7 +1220,7 @@ class Req(ReqDllmMixin):
         # Refreshed at every sharded alloc — read through last_node, or drawn
         # least-full for a new chain — and consumed by the radix insert to
         # stamp new tree nodes. Allocation itself must NOT read it back when
-        # a tree node is available (the cache_unfinished_req dedup rebind
+        # a tree node is available (the checkpoint dedup rebind
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
@@ -1475,7 +1481,14 @@ class Req(ReqDllmMixin):
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
-        return self.kv.kv_committed_len
+        if self.finished_len is None:
+            return self.kv.kv_committed_len
+        # A verify step commits a whole accepted chunk, so output_ids can run
+        # past the stop; the client never sees those tokens, so nothing matches.
+        return min(
+            self.kv.kv_committed_len,
+            len(self.origin_input_ids) + len(self.output_ids_through_stop),
+        )
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1558,7 +1571,7 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
-    def _refresh_fill_ids(self) -> None:
+    def refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
         appending only the new output tokens.
 
@@ -1587,7 +1600,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self._refresh_fill_ids()
+            self.refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
@@ -1968,6 +1981,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv.cache_inserted_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
@@ -1988,6 +2002,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
+        self.kv.mamba_prev_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
@@ -2212,7 +2227,8 @@ def set_mamba_track_indices_from_reqs(
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
-        # Default to 0 (first ping-pong slot) to avoid TypeError.
+        # Keep the gather in bounds for those requests. Freed rows are
+        # invalidated below so they cannot scatter into a recycled slot.
         track_positions = [
             (
                 req.kv.mamba_next_track_idx
@@ -2221,6 +2237,9 @@ def set_mamba_track_indices_from_reqs(
             )
             for req in batch.reqs
         ]
+    freed_rows = [
+        i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
+    ]
     batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
@@ -2234,6 +2253,12 @@ def set_mamba_track_indices_from_reqs(
     batch.mamba_track_indices = (
         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
     )
+    if freed_rows:
+        # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
+        # been freed and reused by another request. The downstream scatter
+        # treats a negative destination as a no-op, while the old fallback to
+        # position 0 could overwrite the reused live slot.
+        batch.mamba_track_indices[freed_rows] = -1
 
 
 def release_req(
@@ -2265,7 +2290,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -2364,6 +2389,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+
+    # Tracks process_prefill_chunk() on the original scheduler batch only.
+    prefill_chunk_processed: bool = False
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -3156,7 +3184,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req, prefix_len in zip(
             running_batch.reqs, running_prefix_lens, strict=True
         ):
-            req._refresh_fill_ids()
+            req.refresh_fill_ids()
             req.set_extend_range(prefix_len, prefix_len + 1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
@@ -3234,9 +3262,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # cannot stand in for it. Rows past bs are a beam tail, not requests.
         seq_lens = self.seq_lens_cpu[:bs].tolist()
         for req, seq_len in zip(self.reqs, seq_lens, strict=True):
-            req._refresh_fill_ids()
+            req.refresh_fill_ids()
             # end runs one past full_untruncated_fill_ids while output_ids
-            # trails; safe only while decoding_reqs suppresses cache_unfinished_req.
+            # trails; safe only while decoding_reqs suppresses the checkpoint insert.
             req.set_extend_range(seq_len - 1, seq_len)
 
         self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
@@ -3891,9 +3919,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Auxiliary windows check their own cursors and prefix locks.
             has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
-            release_leaf_lock = (
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
-                and hasattr(self.tree_cache, "dec_swa_lock_only")
+            release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
+                self.tree_cache, "release_swa_prefix_lock"
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -3921,23 +3948,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # Past the window the request no longer reads its prefill's SWA;
+                    # release that part of the tree lock so SWA LRU can reclaim it.
                     if (
                         release_leaf_lock
-                        and not req.swa_prefix_lock_released
-                        and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
-                        is not None
-                        and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
-                        self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.lock_receipt
-                        )
-                        req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                        self.tree_cache.release_swa_prefix_lock(req)
+                elif (
+                    self.forward_mode.is_extend()
+                    and not self.tree_cache.supports_prefix_sharing()
+                ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
