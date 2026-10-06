@@ -1427,7 +1427,8 @@ class PrefillAdder:
                 ):
                     full_load_tokens = req.host_hit_length
                     if (
-                        isinstance(self.tree_cache, UnifiedRadixCache)
+                        self.memory_budget.load_back_needs_full_tokens
+                        and isinstance(self.tree_cache, UnifiedRadixCache)
                         and self.tree_cache.buffer_pipeline is None
                         and not (
                             self.tree_cache.linker is not None
