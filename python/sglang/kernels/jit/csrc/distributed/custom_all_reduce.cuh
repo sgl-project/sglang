@@ -455,7 +455,12 @@ struct AllReduceKernel {
       const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
                                    : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
-      LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
+      auto block_size = choose_block_size(num_vecs);
+      if (two_shot) {
+        // Every peer needs a warp, including when callers use a small grid.
+        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
+      }
+      LaunchKernel(push.num_blocks, block_size, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;
     }
