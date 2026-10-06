@@ -27,6 +27,63 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 
+def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Drop pre-cutover AMD names without changing the shared analyzer."""
+
+    legacy_callers = {
+        "call-nightly-amd-rocm720",
+        "call-pr-test-amd-extra-rocm720",
+        "call-pr-test-amd-rocm720",
+    }
+    filtered = {}
+    for full_name, data in job_data.items():
+        # These callers were renamed by the AMD workflow canonicalization. Keep
+        # recognizing their historical spellings so old rows do not merge into
+        # current streaks.
+        name_parts = full_name.split(" / ")
+        if any(part in legacy_callers for part in name_parts[:-1]):
+            continue
+
+        leaf_name = name_parts[-1]
+        if leaf_name.startswith(("wait-for-stage-a-amd", "wait-for-stage-b-amd")):
+            continue
+        if leaf_name in {
+            "call-gate",
+            "call-pr-test-amd-extra",
+            "check-all-jobs",
+            "check-changes",
+            "pr-gate",
+            "pr-test-amd-extra-finish",
+            "pr-test-amd-finish",
+            "pr-test-amd-rocm720-finish",  # Legacy pre-canonicalization teardown
+        }:
+            continue
+
+        # Old display-name stems ended in -rocm<digits>. Their version was not
+        # reliable enough to map forward: a -rocm720 PR job could run rocm724.
+        stem = leaf_name.split(" (", 1)[0]
+        _, separator, version = stem.rpartition("-rocm")
+        if separator and version.isdigit():
+            continue
+
+        # An intermediate nightly schema showed only the ROCm flavor. Current
+        # names always include both the flavor and runner inside parentheses.
+        if leaf_name.endswith(")") and " (" in leaf_name:
+            details = leaf_name.rsplit(" (", 1)[1][:-1]
+            if details.startswith("rocm") and details[4:].isdigit():
+                continue
+
+            # The canonical workflow paths reuse the history of the retired
+            # ROCm 7.0 workflows. Do not let those rows contribute to current
+            # multi-version streaks during the lookback window.
+            if details.split(",", 1)[0] == "rocm700":
+                continue
+
+        filtered[full_name] = data
+
+    return filtered
+
+
 class SGLangFailuresAnalyzer:
     """Analyzes consecutive failures in GitHub Actions workflows."""
 
@@ -47,6 +104,7 @@ class SGLangFailuresAnalyzer:
             "check-changes",
             "pr-test-finish",  # Nvidia workflow teardown
             "pr-test-amd-finish",  # AMD workflow teardown
+            "pr-test-amd-rocm720-finish",  # Legacy AMD teardown
             "call-gate",
             "pr-gate",
             "check-all-jobs",
@@ -586,6 +644,10 @@ class SGLangFailuresAnalyzer:
         runner_instance_first_failure: Dict[str, Optional[Dict]] = {}
         runner_instance_last_failure: Dict[str, Optional[Dict]] = {}
         runner_instance_recovery: Dict[str, Optional[Dict]] = {}
+        runner_instance_all_failures_in_streak: Dict[str, List[Dict]] = defaultdict(
+            list
+        )
+        runner_instance_all_failures: Dict[str, List[Dict]] = defaultdict(list)
 
         total_runs_processed = len(sorted_runs)
         for i, run in enumerate(sorted_runs, 1):
@@ -659,9 +721,9 @@ class SGLangFailuresAnalyzer:
                     runner_instance_key = f"{runner_labels_str}_{runner_id}"
                     runner_instance_stats[runner_instance_key]["total_jobs"] += 1
                     # Store runner name for reference
-                    runner_instance_stats[runner_instance_key][
-                        "runner_name"
-                    ] = runner_name
+                    runner_instance_stats[runner_instance_key]["runner_name"] = (
+                        runner_name
+                    )
 
                     # Calculate queue time (time from created to started) per instance
                     created_at = job.get("created_at")
@@ -802,6 +864,12 @@ class SGLangFailuresAnalyzer:
                             runner_instance_first_failed_job[runner_instance_key]
                         )
                     runner_instance_last_failure[runner_instance_key] = failure_info
+                    runner_instance_all_failures_in_streak[runner_instance_key].append(
+                        failure_info
+                    )
+                    runner_instance_all_failures[runner_instance_key].append(
+                        failure_info
+                    )
 
                     if (
                         runner_instance_current_streak[runner_instance_key]
@@ -823,6 +891,7 @@ class SGLangFailuresAnalyzer:
 
                     runner_instance_current_streak[runner_instance_key] = 0
                     runner_instance_first_failure[runner_instance_key] = None
+                    runner_instance_all_failures_in_streak[runner_instance_key] = []
                     runner_instance_last_failure[runner_instance_key] = None
 
             time.sleep(0.05)
@@ -903,6 +972,9 @@ class SGLangFailuresAnalyzer:
                 "avg_queue_time_seconds": avg_queue_time,
                 "p90_queue_time_seconds": p90_queue_time,
                 "queue_time_samples": len(queue_times),
+                "all_failures": list(
+                    runner_instance_all_failures.get(instance_key, [])
+                ),
             }
 
         # Build runner streak data
@@ -950,6 +1022,9 @@ class SGLangFailuresAnalyzer:
                 ),
                 "last_failure_in_streak": runner_instance_last_failure.get(
                     instance_key
+                ),
+                "all_failures_in_streak": list(
+                    runner_instance_all_failures_in_streak.get(instance_key, [])
                 ),
                 "recovery_info": runner_instance_recovery.get(instance_key),
             }
@@ -1758,17 +1833,8 @@ class SGLangFailuresAnalyzer:
                             test_data = test_info["test_data"]
                             job_data = test_info["job_data"]
 
-                            # Truncate names
-                            test_display = (
-                                test_file
-                                if len(test_file) <= 30
-                                else test_file[:27] + "..."
-                            )
-                            job_display = (
-                                job_name
-                                if len(job_name) <= 25
-                                else job_name[:22] + "..."
-                            )
+                            test_display = test_file
+                            job_display = job_name
 
                             # Get first and last failure from job level
                             first_failure = job_data.get("first_failure_in_streak")
@@ -1851,16 +1917,8 @@ class SGLangFailuresAnalyzer:
                             failed_runs = test_info["failed_runs"]
                             total_test_runs = test_info["total_test_runs"]
 
-                            test_display = (
-                                test_file
-                                if len(test_file) <= 30
-                                else test_file[:27] + "..."
-                            )
-                            job_display = (
-                                job_name
-                                if len(job_name) <= 25
-                                else job_name[:22] + "..."
-                            )
+                            test_display = test_file
+                            job_display = job_name
 
                             # Build history links
                             recent_runs = test_data.get("recent_runs", [])
@@ -2075,8 +2133,10 @@ class SGLangFailuresAnalyzer:
                             "total_jobs": stats["total_jobs"],
                             "unique_jobs": len(stats.get("jobs_failed", {})),
                             "avg_queue": stats.get("avg_queue_time_seconds", 0),
-                            "first_failure": streak_data.get("first_failure_in_streak"),
-                            "last_failure": streak_data.get("last_failure_in_streak"),
+                            "all_failures_in_streak": streak_data.get(
+                                "all_failures_in_streak", []
+                            ),
+                            "all_failures": stats.get("all_failures", []),
                         }
                     )
 
@@ -2113,10 +2173,10 @@ class SGLangFailuresAnalyzer:
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | Total Jobs | Unique Jobs | First Failure | Last Failure |"
+                        "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | Total Jobs | Failed Jobs | Unique Jobs | Jobs |"
                     )
                     summary_lines.append(
-                        "|--------------|----------------|-----|-----------|-----------|------------|-------------|---------------|--------------|"
+                        "|--------------|----------------|-----|-----------|-----------|------------|-------------|-------------|------|"
                     )
 
                     for runner_data in runners_with_streak[:15]:
@@ -2132,17 +2192,14 @@ class SGLangFailuresAnalyzer:
                             else "N/A"
                         )
 
-                        first_failure = runner_data.get("first_failure")
-                        first_str = (
-                            f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
-                            if first_failure
-                            else "N/A"
-                        )
-
-                        last_failure = runner_data.get("last_failure")
-                        last_str = (
-                            f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
-                            if last_failure
+                        all_failures = runner_data.get("all_failures_in_streak", [])
+                        failed_jobs_count = len(all_failures)
+                        jobs_str = (
+                            " ".join(
+                                f"[#{f.get('run_number', '?')}]({f.get('job_url', f['url'])})"
+                                for f in all_failures
+                            )
+                            if all_failures
                             else "N/A"
                         )
 
@@ -2150,12 +2207,12 @@ class SGLangFailuresAnalyzer:
                         if runner_data["current_streak"] >= 3:
                             summary_lines.append(
                                 f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{runner_data['current_streak']}</span> | <span style='color:red'>{runner_data['max_streak']}</span> | "
-                                f"<span style='color:red'>{runner_data['failure_rate']:.1f}%</span> | <span style='color:red'>{avg_queue_str}</span> | <span style='color:red'>{runner_data['total_jobs']}</span> | <span style='color:red'>{runner_data.get('unique_jobs', 0)}</span> | <span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> |"
+                                f"<span style='color:red'>{runner_data['failure_rate']:.1f}%</span> | <span style='color:red'>{avg_queue_str}</span> | <span style='color:red'>{runner_data['total_jobs']}</span> | <span style='color:red'>{failed_jobs_count}</span> | <span style='color:red'>{runner_data.get('unique_jobs', 0)}</span> | <span style='color:red'>{jobs_str}</span> |"
                             )
                         else:
                             summary_lines.append(
                                 f"| `{display_name}` | {runner_data['current_streak']} | {runner_data['max_streak']} | "
-                                f"{runner_data['failure_rate']:.1f}% | {avg_queue_str} | {runner_data['total_jobs']} | {runner_data.get('unique_jobs', 0)} | {first_str} | {last_str} |"
+                                f"{runner_data['failure_rate']:.1f}% | {avg_queue_str} | {runner_data['total_jobs']} | {failed_jobs_count} | {runner_data.get('unique_jobs', 0)} | {jobs_str} |"
                             )
 
                     summary_lines.append("")
@@ -2167,10 +2224,10 @@ class SGLangFailuresAnalyzer:
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Machine Name | Fail Rate | Avg Queue | Total Jobs | Unique Jobs |"
+                        "| Machine Name | Fail Rate | Avg Queue | Total Jobs | Failed Jobs | Unique Jobs | Jobs |"
                     )
                     summary_lines.append(
-                        "|--------------|-----------|-----------|------------|-------------|"
+                        "|--------------|-----------|-----------|------------|-------------|-------------|------|"
                     )
 
                     for runner_data in runners_high_fail_rate[:15]:
@@ -2186,10 +2243,21 @@ class SGLangFailuresAnalyzer:
                             else "N/A"
                         )
 
+                        all_failures = runner_data.get("all_failures", [])
+                        failed_jobs_count = len(all_failures)
+                        jobs_str = (
+                            " ".join(
+                                f"[#{f.get('run_number', '?')}]({f.get('job_url', f['url'])})"
+                                for f in all_failures
+                            )
+                            if all_failures
+                            else "N/A"
+                        )
+
                         summary_lines.append(
                             f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{runner_data['failure_rate']:.1f}%</span> | "
                             f"<span style='color:orange'>{avg_queue_str}</span> | <span style='color:orange'>{runner_data['total_jobs']}</span> | "
-                            f"<span style='color:orange'>{runner_data.get('unique_jobs', 0)}</span> |"
+                            f"<span style='color:orange'>{failed_jobs_count}</span> | <span style='color:orange'>{runner_data.get('unique_jobs', 0)}</span> | <span style='color:orange'>{jobs_str}</span> |"
                         )
 
                     summary_lines.append("")
@@ -2529,7 +2597,9 @@ def main():
         )
 
         # Choosing nvidia pr test and nightly for runner health analysis
-        runner_runs = pr_test_nvidia_general_runs + nightly_nvidia_general_runs
+        # Use scheduled runs (already limited to 12 PR + 6 nightly) to avoid
+        # pulling months of history from the unfiltered general fetch.
+        runner_runs = pr_test_nvidia_scheduled_runs + nightly_nvidia_scheduled_runs
 
         if not runner_runs and not pr_test_nvidia_scheduled_runs:
             print("No workflow runs found")
@@ -2634,6 +2704,21 @@ def main():
             if nightly_npu_general_runs
             else ({}, {})
         )
+
+        # AMD renamed its display names to carry the actual ROCm flavor. Reset
+        # only AMD history at that boundary so legacy failures cannot remain
+        # "current" under names that no longer exist. Other platforms continue
+        # to use the unmodified shared analyzer results. General AMD reports
+        # intentionally omit old-schema rows from branches that have not moved
+        # to the new names; their ROCm flavor cannot be mapped reliably.
+        pr_test_amd_scheduled_data = _filter_legacy_amd_job_rows(
+            pr_test_amd_scheduled_data
+        )
+        nightly_amd_scheduled_data = _filter_legacy_amd_job_rows(
+            nightly_amd_scheduled_data
+        )
+        pr_test_amd_general_data = _filter_legacy_amd_job_rows(pr_test_amd_general_data)
+        nightly_amd_general_data = _filter_legacy_amd_job_rows(nightly_amd_general_data)
 
         # Analyze runner health and consecutive failures on all runs
         (

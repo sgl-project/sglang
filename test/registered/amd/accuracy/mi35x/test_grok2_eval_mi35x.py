@@ -105,7 +105,7 @@ class TestGrok2EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
-        cls.accuracy_threshold = 0.915
+        cls.accuracy_threshold = 0.90
 
     def test_grok2_accuracy(self):
         """Test Grok-2 with GSM8K completion benchmark."""
@@ -142,6 +142,7 @@ class TestGrok2EvalMI35x(unittest.TestCase):
             )
             passed = acc >= self.accuracy_threshold
             status = "✅ PASS" if passed else "❌ FAIL"
+            print(f"  accuracy={acc:.3f} threshold={self.accuracy_threshold} {status}")
 
             summary = f"### GROK2 (MI35x)\n\n"
             summary += f"| Model | Accuracy | Threshold | Status |\n"

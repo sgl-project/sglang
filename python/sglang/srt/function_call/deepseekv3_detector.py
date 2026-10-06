@@ -162,9 +162,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             )
                         )
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                     if _is_complete_json(func_args_raw):
                         # Update the stored arguments
@@ -203,7 +203,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=">" + name + "\n```json\n",
-            end="\n```<",
-            trigger=">" + name + "\n```json\n",
+            begin="<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            + name
+            + "\n```json\n",
+            end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            trigger="<｜tool▁calls▁begin｜>",
         )

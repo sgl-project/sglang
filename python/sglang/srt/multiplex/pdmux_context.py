@@ -33,7 +33,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         raise ValueError("Missing required field: sm_group_num")
 
     if raw["sm_group_num"] < 3:
-        raise ValueError("sm_group_num must greater than 3")
+        raise ValueError("sm_group_num must be >= 3")
 
     manual_divisions = raw.get("manual_divisions", [])
 
@@ -104,7 +104,12 @@ def divide_sm(total_sms, compute_capability, groups):
 def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     from sgl_kernel import spatial
 
-    global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
+    global \
+        STREAM_GROUPS, \
+        SM_COUNTS, \
+        SM_GROUP_NUM, \
+        CURRENT_STREAM_IDX, \
+        CURRENT_STREAM_GROUP
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)

@@ -72,6 +72,11 @@ class CutlassMoEParams:
     # b_scales_ptrs: [e] dtype: int64
     a_scales_ptrs: torch.Tensor
     b_scales_ptrs: torch.Tensor
+    # Pointers for per-expert alpha values
+    alpha_ptrs: torch.Tensor
+    # CUTLASS blockscale layouts for A and B operands
+    layout_sfa: torch.Tensor
+    layout_sfb: torch.Tensor
 
     # Offsets that mark at which token index each expert begins its computation
     # The number of tokens computed with expert E is expert_offsets[E + 1] - expert_offsets[E]
@@ -139,6 +144,13 @@ class CutlassMoEParams:
         self.b_scales_ptrs = torch.empty(
             (self.e,), dtype=torch.int64, device=self.device
         )
+        self.alpha_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
+        self.layout_sfa = torch.empty(
+            (self.e, 5), dtype=torch.int64, device=self.device
+        )
+        self.layout_sfb = torch.empty(
+            (self.e, 5), dtype=torch.int64, device=self.device
+        )
 
     def to_gemm1_args(self) -> dict:
         return {
@@ -147,11 +159,14 @@ class CutlassMoEParams:
             "problem_sizes": self.problem_sizes1,
             "expert_offsets": self.expert_offsets[:-1],
             "blockscale_offsets": self.blockscale_offsets[:-1],
-            #    "a_ptrs": self.a_ptrs,
-            #    "b_ptrs": self.b_ptrs,
-            #    "out_ptrs": self.out_ptrs,
-            #    "a_scales_ptrs": self.a_scales_ptrs,
-            #    "b_scales_ptrs": self.b_scales_ptrs,
+            "a_ptrs": self.a_ptrs,
+            "b_ptrs": self.b_ptrs,
+            "out_ptrs": self.out_ptrs,
+            "a_scales_ptrs": self.a_scales_ptrs,
+            "b_scales_ptrs": self.b_scales_ptrs,
+            "alpha_ptrs": self.alpha_ptrs,
+            "layout_sfa": self.layout_sfa,
+            "layout_sfb": self.layout_sfb,
         }
 
     def to_gemm2_args(self) -> dict:
@@ -161,9 +176,12 @@ class CutlassMoEParams:
             "problem_sizes": self.problem_sizes2,
             "expert_offsets": self.expert_offsets[:-1],
             "blockscale_offsets": self.blockscale_offsets[:-1],
-            #    "a_ptrs": self.a_ptrs,
-            #    "b_ptrs": self.b_ptrs,
-            #    "out_ptrs": self.out_ptrs,
-            #    "a_scales_ptrs": self.a_scales_ptrs,
-            #    "b_scales_ptrs": self.b_scales_ptrs,
+            "a_ptrs": self.a_ptrs,
+            "b_ptrs": self.b_ptrs,
+            "out_ptrs": self.out_ptrs,
+            "a_scales_ptrs": self.a_scales_ptrs,
+            "b_scales_ptrs": self.b_scales_ptrs,
+            "alpha_ptrs": self.alpha_ptrs,
+            "layout_sfa": self.layout_sfa,
+            "layout_sfb": self.layout_sfb,
         }

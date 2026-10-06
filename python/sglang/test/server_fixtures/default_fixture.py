@@ -2,12 +2,14 @@ import logging
 import time
 from contextlib import contextmanager
 
-from sglang.srt.utils import kill_process_tree
+import requests
+
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,8 @@ class DefaultServerBase(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     other_args: list[str] = []
+    # Extra env vars passed to the launched server subprocess.
+    server_env: dict = None
 
     # For OpenAI API settings
     api_key = "sk-123456"
@@ -53,15 +57,23 @@ class DefaultServerBase(CustomTestCase):
 
         # Set OpenAI API key and base URL environment variables.
         # Needed for lmm-evals to work.
+        kwargs = {}
+        if cls.server_env:
+            kwargs["env"] = cls.server_env
         with openai_api_env(cls.api_key):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=cls.timeout,
                 other_args=cls.other_args,
+                **kwargs,
             )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         time.sleep(2)
+
+    @classmethod
+    def flush_cache(cls):
+        requests.post(cls.base_url + "/flush_cache")

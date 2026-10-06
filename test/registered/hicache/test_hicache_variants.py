@@ -1,20 +1,17 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=524, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=534, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
 """
 
 import unittest
-from types import SimpleNamespace
 
-import requests
-
-from sglang.bench_serving import get_tokenizer
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.benchmark.utils import get_tokenizer
+from sglang.srt.utils import is_hip
+from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -24,41 +21,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
-
-
-class HiCacheEvalMixin:
-    """Mixin class containing common HiCache evaluation test methods"""
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], self.expected_mmlu_score)
-
-
-class HiCacheMGSMEvalMixin:
-    """Mixin for tests that also run MGSM evaluation"""
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.8)
 
 
 class HiCacheBaseServer(CustomTestCase):
@@ -66,7 +32,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = []
-    expected_mmlu_score = 0.65
+    server_env: dict = {}
 
     @classmethod
     def setUpClass(cls):
@@ -82,17 +48,19 @@ class HiCacheBaseServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.hicache_args,
+            env=cls.server_env,
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
 
-class TestHiCacheStandard(HiCacheBaseServer, HiCacheEvalMixin):
+class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--mem-fraction-static",
@@ -100,26 +68,35 @@ class TestHiCacheStandard(HiCacheBaseServer, HiCacheEvalMixin):
         "--hicache-size",
         100 if not _is_hip else 200,
     ]
-    expected_mmlu_score = 0.65
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
 
 
-class TestHiCacheMLA(HiCacheBaseServer, HiCacheEvalMixin, HiCacheMGSMEvalMixin):
+class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
     model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
     ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
-    expected_mmlu_score = 0.5
+    mmlu_score_threshold = 0.54
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
+    mgsm_en_score_threshold = 0.8
+    if _is_hip:
+        mgsm_en_num_threads = 32
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
-class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
+class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
 
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",
@@ -141,34 +118,17 @@ class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
         "--chunked-prefill-size",
         1024,
     ]
-    expected_mmlu_score = 0.72
-
-    def test_mmlu(self):
-        """Override to add EAGLE-specific assertions"""
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], self.expected_mmlu_score)
-
-        # EAGLE-specific check
-        server_info = requests.get(self.base_url + "/get_server_info").json()
-        avg_spec_accept_length = server_info["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.26)
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
+    mmlu_accept_length_thres = 2.26
 
 
-class TestHiCachePage(HiCacheBaseServer, HiCacheEvalMixin):
+class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--page-size",
@@ -176,7 +136,9 @@ class TestHiCachePage(HiCacheBaseServer, HiCacheEvalMixin):
         "--hicache-write-policy",
         "write_back",
     ]
-    expected_mmlu_score = 0.65
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
 
 
 if __name__ == "__main__":

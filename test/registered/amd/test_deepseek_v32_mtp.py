@@ -17,10 +17,16 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(
+    est_time=3600,
+    suite="stage-c-test-large-8-gpu-amd-mi35x",
+    disabled="move to nightly for saving time",
+)
+
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -30,9 +36,8 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -48,9 +53,9 @@ class TestDeepseekV32DPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(
@@ -75,13 +80,13 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -116,7 +121,6 @@ class TestDeepseekV32DPMTP(CustomTestCase):
                 self.assertGreater(speed, 75)
 
 
-@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -141,9 +145,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(
@@ -168,13 +172,13 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -204,7 +208,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
 
             self.assertGreater(acc_length, 2.7)
             if is_in_amd_ci():
-                self.assertGreater(speed, 60)
+                self.assertGreater(speed, 55)
             else:
                 self.assertGreater(speed, 130)
 

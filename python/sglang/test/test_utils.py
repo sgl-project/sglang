@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import doctest
+import importlib.util
 import inspect
 import json
 import logging
@@ -18,31 +20,36 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial, wraps
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
+import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.bench_serving import run_benchmark
-from sglang.global_config import global_config
+from sglang.benchmark.serving import run_benchmark
+from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
-    is_port_available,
+    is_blackwell,
+    is_cuda,
+    is_xpu,
     kill_process_tree,
     retry,
 )
-from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils.network import is_port_available
+from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.utils import normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -54,7 +61,6 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -63,9 +69,13 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # Hybrid Mamba models
 DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+# Small GDN-hybrid (gated delta net) model that fits a single GPU
+DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3.5-4B"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP = "google/gemma-4-E4B-it"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -104,6 +114,10 @@ DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 
+# DFLASH model
+DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
+
 # EAGLE2 with DP-Attention models
 DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
@@ -126,6 +140,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -134,10 +149,13 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
+# Deliberate omission: a model another registered suite already uses as its base
+# model is left out, since a regression there surfaces in that suite instead.
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = (
+    "meta-llama/Llama-3.1-70B-Instruct,Qwen/Qwen2-57B-A14B-Instruct"
+)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -164,6 +182,22 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def build_vlm_image_prompt(processor, question: str) -> str:
+    # Take the image placeholder from the model's own HF chat template: a
+    # hand-written one silently degrades to a text-only prompt on any model
+    # whose placeholder differs.
+    return processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -175,13 +209,23 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
     """Return whether it is running on an H200 system."""
     return envs.IS_H200.get()
+
+
+def is_rust_server_built():
+    """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
+    is importable.
+
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
+    """
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -204,7 +248,7 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
@@ -212,22 +256,8 @@ if is_blackwell_system():
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
-
-def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop_sequences": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    pred = res.json()["generated_text"][0]
-    return pred
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
 def find_available_port(base_port: int):
@@ -239,174 +269,6 @@ def find_available_port(base_port: int):
             port += 42
         else:
             port -= 43
-
-
-def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
-):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "regex": regex,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    obj = res.json()
-    pred = obj["text"]
-    return pred
-
-
-def call_generate_guidance(
-    prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
-):
-    assert model is not None
-    from guidance import gen
-
-    rets = []
-    for _ in range(n):
-        out = (
-            model
-            + prompt
-            + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
-        )
-        rets.append(out["answer"])
-    return rets if n > 1 else rets[0]
-
-
-def call_select_lightllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "inputs": context + choices[i],
-            "parameters": {
-                "max_new_tokens": 1,
-            },
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(0)
-    return np.argmax(scores)
-
-
-def call_select_vllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "prompt": context + choices[i],
-            "max_tokens": 1,
-            "prompt_logprobs": 1,
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(res.json().get("prompt_score", 0))
-    return np.argmax(scores)
-
-    """
-    Modify vllm/entrypoints/api_server.py
-
-    if final_output.prompt_logprobs is not None:
-        score = np.mean([prob[t_id] for t_id, prob in zip(final_output.prompt_token_ids[1:], final_output.prompt_logprobs[1:])])
-        ret["prompt_score"] = score
-    """
-
-
-def call_select_guidance(context, choices, model=None):
-    assert model is not None
-    from guidance import select
-
-    out = model + context + select(choices, name="answer")
-    return choices.index(out["answer"])
-
-
-def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
-    parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--backend",
-        type=str,
-        required=True,
-        choices=[
-            "vllm",
-            "outlines",
-            "lightllm",
-            "gserver",
-            "guidance",
-            "srt-raw",
-            "llama.cpp",
-        ],
-    )
-    parser.add_argument("--n-ctx", type=int, default=4096)
-    parser.add_argument(
-        "--model-path", type=str, default="meta-llama/Llama-2-7b-chat-hf"
-    )
-    parser.add_argument("--result-file", type=str, default="result.jsonl")
-    args = parser.parse_args()
-
-    if args.port is None:
-        default_port = {
-            "vllm": 21000,
-            "outlines": 21000,
-            "lightllm": 22000,
-            "srt-raw": 30000,
-            "gserver": 9988,
-        }
-        args.port = default_port.get(args.backend, None)
-    return args
 
 
 def auto_config_device() -> str:
@@ -423,7 +285,7 @@ def auto_config_device() -> str:
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument(
@@ -447,75 +309,12 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        backend = RuntimeEndpoint(normalize_base_url(args.host, args.port))
     elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
     return backend
-
-
-def _get_call_generate(args: argparse.Namespace):
-    if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_generate = partial(call_generate_guidance, model=model)
-        call_generate("Hello,", 1.0, 8, ".")
-        return call_generate
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def _get_call_select(args: argparse.Namespace):
-    if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_select = partial(call_select_guidance, model=model)
-
-        call_select("Hello,", ["world", "earth"])
-        return call_select
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def get_call_generate(args: argparse.Namespace):
-    call_generate = _get_call_generate(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_generate(*args, **kwargs)
-        except Exception:
-            print("Exception in call_generate:\n" + get_exception_traceback())
-            raise
-
-    return func
-
-
-def get_call_select(args: argparse.Namespace):
-    call_select = _get_call_select(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_select(*args, **kwargs)
-        except Exception:
-            print("Exception in call_select:\n" + get_exception_traceback())
-            raise
-
-    return func
 
 
 def _get_default_models():
@@ -543,46 +342,68 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
-def popen_with_error_check(command: list[str], allow_exit: bool = False):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def popen_with_error_check(command: list[str]):
+    process = subprocess.Popen(command, stdout=None, stderr=None)
 
     def _run_and_check():
-        stdout, stderr = process.communicate()
+        process.wait()
 
-        while process.poll() is None:
-            time.sleep(5)
+        if process.returncode == -9:
+            return
 
-        if not allow_exit or process.returncode != 0:
+        if process.returncode != 0:
             raise Exception(
-                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+                f"{shlex.join(command)} exited with code {process.returncode}"
             )
 
-    t = threading.Thread(target=_run_and_check)
+    t = threading.Thread(target=_run_and_check, daemon=True)
     t.start()
     return process
+
+
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
+    """Abort the test runner the moment any watched subprocess exits non-zero.
+
+    Caller must `.set()` the returned Event before intentional teardown."""
+    stop = threading.Event()
+
+    def watcher():
+        while not stop.is_set():
+            for name, proc in named_procs:
+                rc = proc.poll() if proc else None
+                if rc is None or rc == 0:
+                    continue
+                if stop.is_set():
+                    return
+                sys.stderr.write(
+                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
+                    f"rc={rc}; aborting.\n"
+                )
+                sys.stderr.flush()
+                for _, sib in named_procs:
+                    if sib and sib is not proc:
+                        try:
+                            kill_process_tree(sib.pid, wait_timeout=10)
+                        except Exception:
+                            pass
+                # POSIX: signal N -> 128+N (os._exit masks negatives via & 0xff).
+                os._exit(rc if rc >= 0 else 128 + (-rc))
+            time.sleep(0.1)
+
+    threading.Thread(target=watcher, daemon=True, name="SubprocFailFastWatcher").start()
+    return stop
 
 
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
-    """
-    CI helper: Check if model cache is complete and enable offline mode.
+    """Set HF_HUB_OFFLINE=1 in `env` if the model cache validates; return the
+    per-run marker path, or None if offline mode was not enabled.
 
-    Uses per-run validation markers that are NOT shared across runners.
-    Each runner independently validates its cache using lightweight checks
-    before enabling offline mode.
-
-    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
-    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
-    The marker is only a hint that this snapshot was validated earlier in the run.
-
-    Args:
-        model_name_or_path: Model identifier or path
-        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
-        other_args: Launch command arguments (used to detect quantization requirement)
-
-    Returns:
-        Per-run marker path if offline mode was enabled, None otherwise
+    Markers are per-run and not shared across runners. A marker is only a hint;
+    the current launch's requirements (e.g. hf_quant_config.json) are revalidated.
     """
     from sglang.srt.model_loader.ci_weight_validation import (
         _get_per_run_marker_path,
@@ -619,8 +440,7 @@ def _try_enable_offline_mode_if_cache_complete(
     except Exception:
         return None
 
-    # Detect if quantization requires hf_quant_config.json
-    # Do this BEFORE checking marker to ensure current launch requirements are known
+    # Detect before the marker check so the current launch's requirements are known.
     requires_hf_quant_config = False
     for i, arg in enumerate(other_args):
         if arg == "--quantization" and i + 1 < len(other_args):
@@ -632,9 +452,8 @@ def _try_enable_offline_mode_if_cache_complete(
     # Check per-run marker (fast hint - snapshot validated earlier in this run)
     per_run_marker = _read_per_run_marker(snapshot_dir)
     if per_run_marker is not None:
-        # Marker exists, but STILL validate for current launch requirements
-        # This prevents a test without --quantization from enabling offline
-        # for a later test with --quantization that needs hf_quant_config.json
+        # Still validate: a marker from a launch without --quantization must not
+        # enable offline mode for a later launch that needs hf_quant_config.json.
         is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
 
         if not is_valid:
@@ -688,17 +507,7 @@ def _try_enable_offline_mode_if_cache_complete(
 
 
 def _create_clean_subprocess_env(env: dict) -> dict:
-    """Create a clean subprocess environment without internal CI keys.
-
-    Removes all keys starting with '_CI_OFFLINE_' or 'CI_OFFLINE' to prevent
-    leaking implementation details to the server subprocess.
-
-    Args:
-        env: Source environment dict
-
-    Returns:
-        Clean copy of environment dict
-    """
+    """Create a clean subprocess environment without internal CI keys."""
     child_env = env.copy()
     keys_to_remove = [
         k for k in child_env if k.startswith(("_CI_OFFLINE_", "CI_OFFLINE_"))
@@ -706,6 +515,48 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     for k in keys_to_remove:
         del child_env[k]
     return child_env
+
+
+def _subprocess_popen_with_outputs(
+    command: list,
+    env: Optional[dict],
+    return_stdout_stderr: Optional[tuple],
+) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+    if not return_stdout_stderr:
+        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+        daemon=True,
+    ).start()
+    return process
 
 
 def _launch_server_process(
@@ -716,51 +567,18 @@ def _launch_server_process(
 ) -> subprocess.Popen:
     """Launch server subprocess with clean environment.
 
-    Args:
-        command: Command list for subprocess
-        env: Environment dict (will be cleaned before use)
-        return_stdout_stderr: Optional tuple of (stdout_file, stderr_file) for output capture
-        model: Model name for logging
-
-    Returns:
-        Started subprocess.Popen object
+    `return_stdout_stderr` is an optional (stdout_file, stderr_file) pair.
     """
     child_env = _create_clean_subprocess_env(env)
 
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
-
-    return proc
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=child_env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def _wait_for_server_health(
@@ -769,17 +587,7 @@ def _wait_for_server_health(
     api_key: Optional[str],
     timeout_duration: float,
 ) -> Tuple[bool, Optional[str]]:
-    """Wait for server health check to pass.
-
-    Args:
-        proc: Server subprocess
-        base_url: Base URL for health check
-        api_key: Optional API key for authorization
-        timeout_duration: Maximum wait time in seconds
-
-    Returns:
-        Tuple of (success, error_message)
-    """
+    """Wait for server health check to pass; return (success, error_message)."""
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout_duration:
@@ -811,6 +619,17 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def unified_radix_tree_server_env(
+    tree_core_backend: str, **extra_env: str
+) -> dict[str, str]:
+    return {
+        **os.environ,
+        **extra_env,
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
+    }
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -825,20 +644,8 @@ def popen_launch_server(
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
-    Args:
-        model: Model path or identifier
-        base_url: Base URL for the server
-        timeout: Timeout for server startup
-        api_key: Optional API key for authentication
-        other_args: Additional command line arguments
-        env: Environment dict for subprocess
-        return_stdout_stderr: Optional tuple for output capture
-        device: Device type ("auto", "cuda", "rocm" or "cpu")
-        pd_separated: Whether to use PD separated mode
-        num_replicas: Number of replicas for mixed PD mode
-
-    Returns:
-        Started subprocess.Popen object
+    `device` is one of "auto", "cuda", "rocm", "cpu";
+    `num_replicas` applies to mixed PD mode.
     """
     other_args = other_args or []
 
@@ -852,7 +659,14 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        env = env.copy()
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
+
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -872,18 +686,22 @@ def popen_launch_server(
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
-        command = "sglang.launch_pd_server"
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_pd_server",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+        ]
     else:
-        command = "sglang.launch_server"
-
-    command = [
-        "python3",
-        "-m",
-        command,
-        "--model-path",
-        model,
-        *[str(x) for x in other_args],
-    ]
+        command = [
+            "sglang",
+            "serve",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+        ]
 
     if pd_separated or use_mixed_pd_engine:
         command.extend(["--lb-host", host, "--lb-port", port])
@@ -964,6 +782,30 @@ def popen_launch_server(
     raise TimeoutError(error_msg)
 
 
+def terminate_and_kill_process_tree(
+    process,
+    terminate_timeout: float = 60,
+    **kill_kwargs,
+) -> None:
+    """Shut a launched server down gracefully, then SIGKILL whatever is left.
+
+    A bare ``kill_process_tree`` leaves the kernel to unwind the CUDA context
+    and unpin the host memory during process reclaim, which can hold GPU memory
+    for minutes on a busy host -- long enough to trip the per-class GPU-idle
+    gate in the next ``setUpClass``. SIGTERM first so the server releases those
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
+    """
+    pids = collect_process_tree_pids(process.pid)
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
+
+
 def popen_launch_pd_server(
     model: str,
     base_url: str,
@@ -971,6 +813,7 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -1000,9 +843,15 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    # Merge so caller-supplied env adds to, not replaces, PATH / PYTHONPATH / etc.
+    if env is not None:
+        env = {**os.environ, **env}
 
-    return process
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def get_similarities(vec1, vec2):
@@ -1036,6 +885,7 @@ def get_benchmark_args(
     gsp_output_len=32,
     gsp_num_turns=1,
     header=None,
+    max_concurrency=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -1077,6 +927,8 @@ def get_benchmark_args(
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
         header=header,
+        max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 
@@ -1110,12 +962,25 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
+    # Prefer the local snapshot so the client's AutoTokenizer skips the HF Hub API,
+    # which can stall for minutes in CI.
+    bench_tokenizer = tokenizer
+    if bench_tokenizer is None:
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            local_dir = find_local_repo_dir(model, revision=None)
+            if local_dir and os.path.isdir(local_dir):
+                bench_tokenizer = local_dir
+        except Exception:
+            pass
+
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=tokenizer,
+        tokenizer=bench_tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
@@ -1168,19 +1033,7 @@ async def _run_api_benchmark_requests(
     num_requests: int,
     response_validator: Callable[[dict], bool],
 ):
-    """
-    Helper function to run API benchmark requests and collect metrics.
-
-    Args:
-        base_url: The base URL of the server
-        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
-        test_requests: List of request payloads to send
-        num_requests: Total number of requests expected
-        response_validator: Function to validate if response contains expected data
-
-    Returns:
-        Dictionary with benchmark metrics
-    """
+    """Run API benchmark requests and return a dict of metrics."""
     start_time = time.monotonic()
     successful_requests = 0
     total_latency = 0
@@ -1243,6 +1096,29 @@ def run_score_benchmark(
     device="auto",
 ):
     """Score API benchmark function compatible with run_bench_serving pattern"""
+    return run_score_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_score_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size.
+
+    Batch size is a property of the request, not of the server, so the launch
+    is shared rather than repeated per size.
+    """
     if other_server_args is None:
         other_server_args = []
 
@@ -1258,7 +1134,7 @@ def run_score_benchmark(
         other_args=other_server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1281,7 +1157,7 @@ def run_score_benchmark(
                 )
             return text
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "query": generate_text_with_token_count(score_query_tokens),
                 "items": [
@@ -1299,7 +1175,7 @@ def run_score_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except:
+                except Exception:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1329,12 +1205,16 @@ def run_score_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_embeddings_benchmark(
@@ -1347,6 +1227,27 @@ def run_embeddings_benchmark(
     device="auto",
 ):
     """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    return run_embeddings_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        input_tokens=input_tokens,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_embeddings_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size. See run_score_benchmark_multi."""
     if other_server_args is None:
         other_server_args = []
 
@@ -1365,26 +1266,18 @@ def run_embeddings_benchmark(
         other_args=server_args,
     )
 
-    async def _run_benchmark():
-
-        # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        tokenizer = get_tokenizer(model)
+    async def _run_benchmark(batch_size, warmup):
 
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
-            # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
-            # Verify it's a single token
-            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
             text = special_token * num_tokens
             return text
 
         # Generate input text
         input_text = generate_text_with_token_count(input_tokens)
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "input": input_text,
                 "model": model,
@@ -1397,7 +1290,7 @@ def run_embeddings_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except:
+                except Exception:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1424,12 +1317,16 @@ def run_embeddings_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_bench_serving_multi(
@@ -1467,12 +1364,7 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
-    """Launch a offline process with automatic device detection.
-
-    Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
-                If "auto", will detect available platforms automatically.
-    """
+    """Launch an offline process with automatic device detection."""
     # Auto-detect device if needed
 
     device = auto_config_device()
@@ -1482,7 +1374,7 @@ def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_one_batch",
+        "sglang.benchmark.one_batch",
         "--batch-size",
         "1",
         "--input",
@@ -1494,6 +1386,10 @@ def run_bench_one_batch(model, other_args):
     if model is not None:
         command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    prefill_latency = None
+    decode_throughput = None
+    decode_latency = None
 
     try:
         stdout, stderr = process.communicate()
@@ -1517,6 +1413,12 @@ def run_bench_one_batch(model, other_args):
     finally:
         kill_process_tree(process.pid)
 
+    if prefill_latency is None or decode_throughput is None or decode_latency is None:
+        raise RuntimeError(
+            f"Failed to parse benchmark output. "
+            f"prefill_latency={prefill_latency}, decode_throughput={decode_throughput}, decode_latency={decode_latency}"
+        )
+
     return prefill_latency, decode_throughput, decode_latency
 
 
@@ -1524,7 +1426,7 @@ def run_bench_offline_throughput(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_offline_throughput",
+        "sglang.benchmark.offline_throughput",
         "--num-prompts",
         "1",
         "--dataset-name",
@@ -1652,6 +1554,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1679,6 +1582,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output
@@ -1762,7 +1666,7 @@ def run_mmlu_test(
         )
 
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
@@ -1801,7 +1705,7 @@ def run_mulit_request_test(
                     },
                 },
             )
-            ret = response.json()
+            response.json()
 
         with ThreadPoolExecutor(2) as executor:
             list(executor.map(run_one, list(range(4))))
@@ -1987,7 +1891,431 @@ async def send_concurrent_generate_requests_with_custom_params(
     return await asyncio.gather(*tasks)
 
 
+def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
+    """Spawn ``world_size`` processes, initialise torch.distributed in each,
+    run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
+    """
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    port = find_available_port(29500)
+
+    processes = []
+    for rank in range(world_size):
+        p = ctx.Process(
+            target=_distributed_worker,
+            args=(rank, world_size, backend, port, func, result_queue, kwargs),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    errors = [result_queue.get() for _ in range(world_size)]
+    errors = [e for e in errors if e]
+    if errors:
+        raise AssertionError("\n".join(errors))
+
+
+def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwargs):
+    import traceback
+
+    import torch.distributed as dist
+
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        func(rank, **kwargs)
+        result_queue.put(None)
+    except Exception as e:
+        result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
+    finally:
+        dist.destroy_process_group()
+
+
+def maybe_stub_sgl_kernel():
+    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
+
+    Must be called before any import that transitively depends on sgl_kernel.
+    On machines with a working sgl_kernel this is a no-op.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    import importlib.abc
+    import importlib.machinery
+
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            from unittest.mock import MagicMock
+
+            module.__getattr__ = lambda name: MagicMock()
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
+@contextlib.contextmanager
+def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
+    """Publish a test topology, defaulting to WORLD rank zero.
+
+    ``ranks`` overrides the launcher placement. Reset the context before
+    publication and on exit, including when the test fails.
+    """
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    bundle = dict(world_rank=0, dp_rank=None)
+    bundle.update(ranks or {})
+    server_args = ServerArgs(model_path="dummy", **server_args_fields)
+    reset_context()
+    publish(server_args, role=role, ranks=SpawnRanks(**bundle))
+    try:
+        yield server_args
+    finally:
+        reset_context()
+
+
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """Publish the topology for a subsequent ``initialize_model_parallel`` call.
+
+    Preserve an existing WORLD group across the context reset. The caller is
+    responsible for tearing down groups and resetting the context afterward.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Restore the existing WORLD handle after resetting the context.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
+
+
+_GPU_IDLE_TIMEOUT_SECS = 30.0
+_GPU_IDLE_POLL_INTERVAL_SECS = 2.0
+_GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
+
+
+def _format_gib(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "N/A"
+    return f"{num_bytes / (1 << 30):.2f} GiB"
+
+
+def _visible_gpu_indices(pynvml) -> List[int]:
+    num_gpus = pynvml.nvmlDeviceGetCount()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return list(range(num_gpus))
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if not all(entry.isdigit() for entry in entries):
+        # UUID-style entries; fall back to checking all GPUs.
+        return list(range(num_gpus))
+    return [int(entry) for entry in entries if int(entry) < num_gpus]
+
+
+def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
+            proc_info = ""
+        reports.append(
+            f"GPU {index} uses {_format_gib(used_bytes)}"
+            f" ({proc_info or 'no compute processes found'})"
+        )
+    return reports
+
+
+def _wait_for_gpu_idle_in_ci(
+    timeout: float = _GPU_IDLE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+) -> None:
+    """Wait until visible GPUs release residual memory from earlier tests.
+
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
+    """
+    if not is_in_ci():
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        deadline = time.monotonic() + timeout
+        while True:
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            if not busy_reports:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
+                    f"before setUpClass: {'; '.join(busy_reports)}"
+                )
+            print(
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
+                f"{'; '.join(busy_reports)}",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
+
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__struct_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        msgspec.Struct.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value for name, value in fields.items() if name in cls.__struct_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
+    for name, value in fields.items():
+        msgspec.Struct.__setattr__(variant, name, value)
+    return variant
+
+
+def enter_override(test_case, override):
+    """Install a scoped context override for the length of one test.
+
+    Stands in for `unittest.TestCase.enterContext`, which is 3.11+ while this package
+    supports 3.10; on 3.10 it raises AttributeError, so tests pass locally on newer
+    interpreters but fail in CI.
+    """
+    installed = override.install()
+    test_case.addCleanup(override.restore)
+    return installed
+
+
+def enter_scope(test_case, scope):
+    """Enter a context manager for the length of one test.
+
+    The `with`-statement form of `enter_override` above, and 3.10-safe for the
+    same reason: `enterContext` arrived in 3.11.
+    """
+    entered = scope.__enter__()
+    test_case.addCleanup(scope.__exit__, None, None, None)
+    return entered
+
+
 class CustomTestCase(unittest.TestCase):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # unittest skips tearDownClass when setUpClass raises, leaking ports and
+        # processes; wrap setUpClass so tearDownClass still runs.
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
+            try:
+                _wait_for_gpu_idle_in_ci()
+                orig_func(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
@@ -2004,38 +2332,6 @@ class CustomTestCase(unittest.TestCase):
         )
 
 
-def dump_bench_raw_result(
-    path: str,
-    states,
-    preds,
-    labels,
-):
-    if not path:
-        return
-
-    rows = []
-    for i in range(len(states)):
-        state = states[i]
-        output = state["answer"]
-        prompt = _ensure_remove_suffix(state.text(), output)
-        rows.append(
-            dict(
-                prompt_id=i,
-                prompt=prompt,
-                output=output,
-                correct=bool(preds[i] == labels[i]),
-            )
-        )
-
-    print(f"BenchRawResultDumper save results to {path}")
-    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
-
-
-def _ensure_remove_suffix(text: str, suffix: str):
-    assert text.endswith(suffix)
-    return text.removesuffix(suffix)
-
-
 class ModelLaunchSettings:
     def __init__(
         self,
@@ -2044,12 +2340,14 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
+        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
+        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
@@ -2058,12 +2356,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
@@ -2230,6 +2522,44 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
     return decorator
 
 
+def get_gpu_count():
+    if get_device() == "cpu":
+        gpu_count = 0
+    else:
+        gpu_count = torch.accelerator.device_count()
+    return gpu_count
+
+
+def empty_gpu_cache():
+    """
+    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
+    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    """
+    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
+        return torch.accelerator.empty_cache()
+
+    # CUDA
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+
+    # XPU (Intel)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        return
+
+    return
+
+
+def get_gpu_memory_gb():
+    if is_cuda():
+        return torch.cuda.device_memory_used() / 1024**3
+    elif is_xpu():
+        return torch.xpu.memory_allocated() / 1024**3
+    else:
+        return 0
+
+
 def run_doctests(obj: Callable[..., Any] | ModuleType):
     mod = inspect.getmodule(obj)
     globals = dict(mod.__dict__)
@@ -2262,11 +2592,6 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
       - stdout: [METRIC] metric_name=value [labels=...]
 
     This function never fails tests - all errors are silently caught.
-
-    Args:
-        metric_name: Metric name (e.g., "gsm8k_accuracy", "cache_hit_rate")
-        value: Metric value
-        labels: Optional label dict (e.g., {"backend": "fa3"})
     """
     try:
         # 1. Capture test context
@@ -2343,11 +2668,7 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
 
 
 def _get_test_context() -> tuple[str, str]:
-    """
-    Get current test's filename and test_case.
-
-    Tries PYTEST_CURRENT_TEST first, falls back to inspect.stack().
-    """
+    """Get current test's filename and test_case, via PYTEST_CURRENT_TEST or stack."""
     # 1. Try parsing PYTEST_CURRENT_TEST
     pytest_current = os.getenv("PYTEST_CURRENT_TEST")
     if pytest_current:

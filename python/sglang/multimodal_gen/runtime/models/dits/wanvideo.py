@@ -3,29 +3,42 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from functools import lru_cache
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    fused_temb_table_slices,
+    mark_fused_gelu_site,
+    mark_nvfp4_bias_gelu_site,
+    nvfp4_bias_gelu_active,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
-from sglang.multimodal_gen.runtime.distributed import divide
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_group,
     get_sp_world_size,
-    get_tensor_model_parallel_world_size,
+    get_tp_world_size,
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
@@ -34,6 +47,12 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
@@ -45,20 +64,66 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     TimestepEmbedder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
+
+if USE_AITER:
+    from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+
+class _WanGELUMLP(MLP):
+    """Wan FFN with request-scoped GELU fast paths."""
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        prefix: str,
+        quant_config: QuantizationConfig | None,
+    ):
+        super().__init__(
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=prefix,
+            quant_config=quant_config,
+            fuse_bias_gelu_tanh=False,
+        )
+        mark_fused_gelu_site(self, "fc_in")
+        self.fuse_bias_gelu_tanh = isinstance(
+            self.fc_in.quant_method, ModelOptFp4LinearMethod
+        )
+        if self.fuse_bias_gelu_tanh:
+            mark_nvfp4_bias_gelu_site(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+            x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
+        else:
+            x, bias = self.fc_in(x)
+            x = self._apply_activation(
+                x,
+                bias,
+                use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
+            )
+        x, _ = self.fc_out(x)
+        return x
 
 
 class WanImageEmbedding(torch.nn.Module):
-
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
@@ -75,7 +140,6 @@ class WanImageEmbedding(torch.nn.Module):
 
 
 class WanTimeTextImageEmbedding(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -118,7 +182,6 @@ class WanTimeTextImageEmbedding(nn.Module):
 
 
 class WanSelfAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -127,7 +190,10 @@ class WanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
+        prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        is_cross_attention: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -138,39 +204,66 @@ class WanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_tp_world_size()
 
         # layers
-        self.to_q = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_out = RowParallelLinear(dim, dim, input_is_parallel=True)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
+        )
+        self.to_out = RowParallelLinear(
+            dim,
+            dim,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out", prefix),
+        )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.tp_rmsnorm = self.tp_size > 1 and qk_norm
+        self.tp_rmsnorm = tp_size > 1 and qk_norm
+        self.local_num_heads = divide(num_heads, tp_size)
 
         # Scaled dot product attention
         self.attn = USPAttention(
-            num_heads=num_heads // self.tp_size,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            skip_sequence_parallel=is_cross_attention,
+            is_cross_attention=is_cross_attention,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, is_cross_attention=True)
 
     def forward(self, x, context, context_lens):
         r"""
@@ -179,25 +272,22 @@ class WanT2VCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-        num_heads_per_rank = n // self.tp_size
-
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
             q = tensor_parallel_rms_norm(q, self.norm_q)
         else:
             q = self.norm_q(q)
-        q = q.view(b, -1, num_heads_per_rank, d)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
         k, _ = self.to_k(context)
         if self.tp_rmsnorm:
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
             k = self.norm_k(k)
-        k = k.view(b, -1, num_heads_per_rank, d)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
         v, _ = self.to_v(context)
-        v = v.view(b, -1, num_heads_per_rank, d)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         # compute attention
         x = self.attn(q, k, v)
@@ -209,7 +299,6 @@ class WanT2VCrossAttention(WanSelfAttention):
 
 
 class WanI2VCrossAttention(WanSelfAttention):
-
     def __init__(
         self,
         dim: int,
@@ -217,9 +306,10 @@ class WanI2VCrossAttention(WanSelfAttention):
         window_size=(-1, -1),
         qk_norm=True,
         eps=1e-6,
+        prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
-        # VSA should not be in supported_attention_backends
         super().__init__(
             dim,
             num_heads,
@@ -227,10 +317,24 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            is_cross_attention=True,
+            quant_config=quant_config,
         )
 
-        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=False)
+        self.add_k_proj = ColumnParallelLinear(
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("add_k_proj", prefix),
+        )
+        self.add_v_proj = ColumnParallelLinear(
+            dim,
+            dim,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("add_v_proj", prefix),
+        )
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens):
@@ -242,35 +346,33 @@ class WanI2VCrossAttention(WanSelfAttention):
         """
         context_img = context[:, :257]
         context = context[:, 257:]
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-        num_heads_per_rank = n // self.tp_size
 
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
             q = tensor_parallel_rms_norm(q, self.norm_q)
         else:
             q = self.norm_q(q)
-        q = q.view(b, -1, num_heads_per_rank, d)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
         k, _ = self.to_k(context)
         if self.tp_rmsnorm:
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
             k = self.norm_k(k)
-        k = k.view(b, -1, num_heads_per_rank, d)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
         v, _ = self.to_v(context)
-        v = v.view(b, -1, num_heads_per_rank, d)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         k_img, _ = self.add_k_proj(context_img)
         if self.tp_rmsnorm:
             k_img = tensor_parallel_rms_norm(k_img, self.norm_added_k)
         else:
             k_img = self.norm_added_k(k_img)
-        k_img = k_img.view(b, -1, num_heads_per_rank, d)
+        k_img = k_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
         v_img, _ = self.add_v_proj(context_img)
-        v_img = v_img.view(b, -1, num_heads_per_rank, d)
+        v_img = v_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
         img_x = self.attn(q, k_img, v_img)
         x = self.attn(q, k, v)
@@ -283,8 +385,56 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
-class WanTransformerBlock(nn.Module):
+_WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
 
+
+def _eager_temb_table_slices(
+    table: torch.Tensor, temb: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    parts = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
+    return tuple(part.squeeze(2) for part in parts)
+
+
+def _wan_temb_table_slices(
+    table: torch.Tensor, temb: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Per-token adaLN slices ``(table + temb.float()).chunk(6)`` in one pass.
+
+    The fused kernel writes each ``(B, S, D)`` slice contiguously, so the
+    downstream fused-norm wrappers' ``.contiguous()`` calls stop copying the
+    full activation.  A float32 add of widened values involves no rounding,
+    so the result is bit-identical to the eager chain; the first call still
+    verifies ``torch.equal`` and falls back permanently on mismatch.
+    """
+    verified = _WAN_TEMB_SLICES.verified
+    if (
+        not _WAN_TEMB_SLICES.disabled
+        and _is_cuda
+        and temb.is_cuda
+        and (verified or _WAN_TEMB_SLICES.can_attempt_once())
+    ):
+        try:
+            buf = fused_temb_table_slices(table, temb)
+        except Exception as exc:
+            _WAN_TEMB_SLICES.on_exception(exc, logger=logger)
+        else:
+            out = tuple(buf[j] for j in range(6))
+            if verified:
+                return out
+            return _WAN_TEMB_SLICES.accept_or_fallback(
+                out,
+                _eager_temb_table_slices(table, temb),
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "Wan fused temb-table slices are not bit-exact on this "
+                    "platform; falling back to eager"
+                ),
+            )
+    return _eager_temb_table_slices(table, temb)
+
+
+class WanTransformerBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -298,36 +448,112 @@ class WanTransformerBlock(nn.Module):
         prefix: str = "",
         attention_type: str = "original",
         sla_topk: float = 0.1,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.norm1 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
+        self.to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
+        )
 
-        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
-        if attention_type == "sla":
-            self.attn1 = MinimalA2AAttnOp(
-                num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
-                head_size=dim // num_heads,
-                attention_type=attention_type,
-                topk=sla_topk,
-                supported_attention_backends={AttentionBackendEnum.SLA_ATTN},
-            )
-        else:
-            self.attn1 = USPAttention(
-                num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
-                head_size=dim // num_heads,
-                causal=False,
-                supported_attention_backends=supported_attention_backends,
-                prefix=f"{prefix}.attn1",
-            )
-
+        self.to_out = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out", prefix),
+        )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
         self.dim_head = dim // num_heads
+        self.use_offline_qk_rotation = False
+
+        tp_size = get_tp_world_size()
+        self.local_num_heads = divide(num_heads, tp_size)
+        self_attn_backends = supported_attention_backends
+
+        if attention_type in ("sla", "sagesla"):
+            self.attn1 = MinimalA2AAttnOp(
+                num_heads=self.local_num_heads,
+                head_size=dim // num_heads,
+                attention_type=attention_type,
+                topk=sla_topk,
+                supported_attention_backends={
+                    AttentionBackendEnum.SLA_ATTN,
+                    AttentionBackendEnum.SAGE_SLA_ATTN,
+                },
+                prefix=add_prefix("attn1", prefix),
+            )
+        else:
+            # TODO Need to create mxfp8 attention scheme and port the code below
+            from sglang.multimodal_gen import envs
+
+            quant_description = getattr(quant_config, "quant_description", {})
+            self.use_offline_qk_rotation = (
+                quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
+                and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
+                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+            )
+            if self.use_offline_qk_rotation:
+                self.register_buffer(
+                    "q_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                self.register_buffer(
+                    "k_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                quant_config.use_offline_qk_rotation = True
+
+            self.attn1 = USPAttention(
+                num_heads=self.local_num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=self_attn_backends,
+                prefix=add_prefix("attn1", prefix),
+                quant_config=quant_config,
+                is_cross_attention=False,
+            )
+
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(self.dim_head, eps=eps)
             self.norm_k = RMSNorm(self.dim_head, eps=eps)
@@ -340,16 +566,18 @@ class WanTransformerBlock(nn.Module):
             raise Exception
         assert cross_attn_norm is True
         self.qk_norm = qk_norm
+        self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -357,7 +585,9 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                prefix=add_prefix("attn2", prefix),
+                supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -366,20 +596,25 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                prefix=add_prefix("attn2", prefix),
+                supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.ffn = _WanGELUMLP(
+            dim,
+            ffn_dim,
+            prefix=add_prefix("ffn", prefix),
+            quant_config=quant_config,
+        )
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -389,6 +624,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -396,67 +632,102 @@ class WanTransformerBlock(nn.Module):
         orig_dtype = hidden_states.dtype
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
-            ).chunk(6, dim=2)
-            # batch_size, seq_len, 1, inner_dim
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                c_gate_msa,
+            ) = _wan_temb_table_slices(self.scale_shift_table, temb)
         else:
             # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
             e = self.scale_shift_table + temb.float()
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                e.chunk(6, dim=1)
-            )
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                c_gate_msa,
+            ) = e.chunk(6, dim=1)
 
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm1 = self.norm1(hidden_states.float())
-        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-        tp_rmsnorm = (
-            self.qk_norm == "rms_norm_across_heads"
-            and get_tensor_model_parallel_world_size() > 1
-        )
+
         if self.norm_q is not None:
-            if tp_rmsnorm:
+            if self.tp_rmsnorm:
                 query = tensor_parallel_rms_norm(query, self.norm_q)
             else:
                 query = self.norm_q(query)
         if self.norm_k is not None:
-            if tp_rmsnorm:
+            if self.tp_rmsnorm:
                 key = tensor_parallel_rms_norm(key, self.norm_k)
             else:
                 key = self.norm_k(key)
-
-        query = query.squeeze(1).unflatten(2, (-1, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (-1, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (-1, self.dim_head))
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if _is_cuda and query.shape == key.shape:
+            # The concatenated cache only depends on freqs_cis, which is fixed
+            # for the whole forward; the transformer builds it once per call.
+            cos_sin_cache = rope_cos_sin_cache
+            if cos_sin_cache is None:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif USE_AITER:
+            query_shape = query.shape
+            key_shape = key.shape
+            num_tokens = query.shape[:-2].numel()
+            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+            rope_cached_2c_fwd_inplace(
+                q_sbhd,
+                k_sbhd,
+                cos_sbhd,
+                sin_sbhd,
+                1,  # GPTJ rotate style
+                True,  # reuse_freqs_front_part
+                False,  # nope_first
+            )
+            query = q_sbhd.view(query_shape)
+            key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
+
+        if (
+            self.use_offline_qk_rotation
+            and self.attn1.backend is AttentionBackendEnum.FA
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        ):
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -468,9 +739,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -479,20 +751,20 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
 
 
 class WanTransformerBlock_VSA(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -504,25 +776,67 @@ class WanTransformerBlock_VSA(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.0,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.norm1 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
+        self.to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
+        )
         self.to_gate_compress = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn1.to_gate_compress", prefix),
         )
 
-        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_out = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out", prefix),
+        )
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
+            prefix=add_prefix("attn1", prefix),
+            quant_config=quant_config,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -540,16 +854,15 @@ class WanTransformerBlock_VSA(nn.Module):
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
-        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
-            supported_attention_backends.remove(AttentionBackendEnum.VIDEO_SPARSE_ATTN)
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -557,7 +870,9 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                prefix=add_prefix("attn2", prefix),
+                supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -566,20 +881,25 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                prefix=add_prefix("attn2", prefix),
+                supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.ffn = _WanGELUMLP(
+            dim,
+            ffn_dim,
+            prefix=add_prefix("ffn", prefix),
+            quant_config=quant_config,
+        )
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -589,6 +909,7 @@ class WanTransformerBlock_VSA(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -602,9 +923,7 @@ class WanTransformerBlock_VSA(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = (
-            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
-        ).to(orig_dtype)
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -624,21 +943,45 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if _is_cuda and query.shape == key.shape:
+            # The concatenated cache only depends on freqs_cis, which is fixed
+            # for the whole forward; the transformer builds it once per call.
+            cos_sin_cache = rope_cos_sin_cache
+            if cos_sin_cache is None:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif USE_AITER:
+            query_shape = query.shape
+            key_shape = key.shape
+            num_tokens = query.shape[:-2].numel()
+            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+            rope_cached_2c_fwd_inplace(
+                q_sbhd,
+                k_sbhd,
+                cos_sbhd,
+                sin_sbhd,
+                1,  # GPTJ rotate style
+                True,  # reuse_freqs_front_part
+                False,  # nope_first
+            )
+            query = q_sbhd.view(query_shape)
+            key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
@@ -649,9 +992,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -660,27 +1004,32 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
 
 
-class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: WanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -727,9 +1076,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
-                    prefix=f"{config.prefix}.blocks.{i}",
+                    prefix=f"blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -738,29 +1088,24 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
-        self.proj_out = nn.Linear(
-            inner_dim, config.out_channels * math.prod(config.patch_size)
+        self.proj_out = ColumnParallelLinear(
+            inner_dim,
+            config.out_channels * math.prod(config.patch_size),
+            bias=True,
+            gather_output=True,
+            prefix="proj_out",
+            quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
         )
 
         # For type checking
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = True
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
+
         self.cnt = 0
         self.__post_init__()
 
@@ -775,13 +1120,36 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 
         self.layer_names = ["blocks"]
+
+    @lru_cache(maxsize=1)
+    def _compute_rope_for_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start,
+            token_start + local_len,
+            device=device,
+            dtype=torch.long,
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.rotary_emb.forward_uncached(positions)
 
     def forward(
         self,
@@ -793,7 +1161,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
-        enable_teacache = forward_batch is not None and forward_batch.enable_teacache
+        if forward_batch is not None:
+            sequence_shard_enabled = (
+                forward_batch.enable_sequence_shard and self.sp_size > 1
+            )
+        else:
+            sequence_shard_enabled = False
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
+        enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -813,25 +1190,58 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # The rotary embedding layer correctly handles SP offsets internally.
-        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
-            (
-                post_patch_num_frames * self.sp_size,
-                post_patch_height,
-                post_patch_width,
-            ),
-            shard_dim=0,
-            start_frame=0,
-            device=hidden_states.device,
-        )
-        assert freqs_cos.dtype == torch.float32
-        assert freqs_cos.device == hidden_states.device
-        freqs_cis = (
-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
-        )
+        if not sequence_shard_enabled:
+            # The rotary embedding layer correctly handles SP offsets internally.
+            freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
+                (
+                    post_patch_num_frames * self.sp_size,
+                    post_patch_height,
+                    post_patch_width,
+                ),
+                shard_dim=0,
+                start_frame=0,
+                device=hidden_states.device,
+            )
+            assert freqs_cos.dtype == torch.float32
+            assert freqs_cos.device == hidden_states.device
+            freqs_cis = (
+                (freqs_cos.float(), freqs_sin.float())
+                if freqs_cos is not None
+                else None
+            )
 
         hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+
+        # shape is [B, T' * H' * W', C]
+        seq_len_orig = hidden_states.shape[1]
+        seq_shard_pad = 0
+        if sequence_shard_enabled:
+            if seq_len_orig % self.sp_size != 0:
+                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+                pad = torch.zeros(
+                    (batch_size, seq_shard_pad, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                hidden_states = torch.cat([hidden_states, pad], dim=1)
+            sp_rank = get_sp_group().rank_in_group
+            local_seq_len = hidden_states.shape[1] // self.sp_size
+            hidden_states = hidden_states.view(
+                batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
+            )
+            hidden_states = hidden_states[:, sp_rank, :, :]
+
+            frame_stride = post_patch_height * post_patch_width
+            freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
+                local_seq_len,
+                sp_rank,
+                frame_stride,
+                post_patch_width,
+                hidden_states.device,
+            )
+            freqs_cis = (freqs_cos.float(), freqs_sin.float())
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
@@ -840,13 +1250,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep,
-                encoder_hidden_states,
-                encoder_hidden_states_image,
-                timestep_seq_len=ts_seq_len,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+            timestep_seq_len=ts_seq_len,
         )
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim
@@ -855,6 +1268,28 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # batch_size, 6, inner_dim
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
+        if sequence_shard_enabled and ts_seq_len is not None:
+            if seq_shard_pad > 0:
+                pad = torch.zeros(
+                    (
+                        batch_size,
+                        seq_shard_pad,
+                        timestep_proj.shape[2],
+                        timestep_proj.shape[3],
+                    ),
+                    dtype=timestep_proj.dtype,
+                    device=timestep_proj.device,
+                )
+                timestep_proj = torch.cat([timestep_proj, pad], dim=1)
+            timestep_proj = timestep_proj.view(
+                batch_size,
+                self.sp_size,
+                local_seq_len,
+                timestep_proj.shape[2],
+                timestep_proj.shape[3],
+            )
+            timestep_proj = timestep_proj[:, sp_rank, :, :, :]
+
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
@@ -862,32 +1297,58 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)
-            if current_platform.is_mps()
+            if not current_platform.is_amp_supported()
             else encoder_hidden_states
-        )  # cast to orig_dtype for MPS
+        )  # cast to orig_dtype if amp is not supported
 
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
-        # if caching is enabled, we might be able to skip the forward pass
+        run_transformer_blocks = self.begin_spectrum_step()
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
 
-        if should_skip_forward:
+        if enable_spectrum and not run_transformer_blocks:
+            hidden_states = self.spectrum_predict_features(hidden_states)
+        elif should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # if teacache is enabled, we need to cache the original hidden states
-            if enable_teacache:
+            if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            rope_cos_sin_cache = None
+            if _is_cuda and freqs_cis is not None:
+                cos, sin = freqs_cis
+                rope_cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             for block in self.blocks:
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
+                    rope_cos_sin_cache=rope_cos_sin_cache,
                 )
             # if teacache is enabled, we need to cache the original hidden states
-            if enable_teacache:
+            if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+            if enable_spectrum:
+                self.spectrum_record_features(hidden_states)
+        self.cnt += 1
+
+        if sequence_shard_enabled:
+            hidden_states = hidden_states.contiguous()
+            hidden_states = sequence_model_parallel_all_gather(hidden_states, dim=1)
+            if seq_shard_pad > 0:
+                hidden_states = hidden_states[:, :seq_len_orig, :]
+
         # 5. Output norm, projection & unpatchify
         if temb.dim() == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
@@ -901,7 +1362,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
             batch_size,
@@ -921,114 +1382,52 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
     ) -> None:
-        if self.is_even:
-            self.previous_residual_even = (
-                hidden_states.squeeze(0) - original_hidden_states
-            )
+        """Cache residual with CFG positive/negative separation."""
+        residual = hidden_states.squeeze(0) - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
         else:
-            self.previous_residual_odd = (
-                hidden_states.squeeze(0) - original_hidden_states
-            )
+            self.previous_residual_negative = residual
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None or not forward_batch.enable_teacache:
+        if not self.enable_teacache:
             return False
-        teacache_params = forward_batch.teacache_params
-        assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(
-            teacache_params, WanTeaCacheParams
-        ), "teacache_params is not a WanTeaCacheParams"
-        current_timestep = forward_context.current_timestep
-        num_inference_steps = forward_batch.num_inference_steps
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
 
-        # initialize the coefficients, cutoff_steps, and ret_steps
-        coefficients = teacache_params.coefficients
+        # Initialize Wan-specific parameters
+        teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
-        cutoff_steps = teacache_params.get_cutoff_steps(num_inference_steps)
-        ret_steps = teacache_params.ret_steps
-        teacache_thresh = teacache_params.teacache_thresh
+        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
+        )
 
-        if current_timestep == 0:
-            self.cnt = 0
+        # Determine boundary step
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
-        if self.cnt % 2 == 0:  # even -> condition
-            self.is_even = True
-            if self.cnt < ret_steps or self.cnt >= cutoff_steps:
-                self.should_calc_even = True
-                self.accumulated_rel_l1_distance_even = 0
-            else:
-                assert (
-                    self.previous_e0_even is not None
-                ), "previous_e0_even is not initialized"
-                assert (
-                    self.accumulated_rel_l1_distance_even is not None
-                ), "accumulated_rel_l1_distance_even is not initialized"
-                rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance_even += rescale_func(
-                    (
-                        (modulated_inp - self.previous_e0_even).abs().mean()
-                        / self.previous_e0_even.abs().mean()
-                    )
-                    .cpu()
-                    .item()
-                )
-                if self.accumulated_rel_l1_distance_even < teacache_thresh:
-                    self.should_calc_even = False
-                else:
-                    self.should_calc_even = True
-                    self.accumulated_rel_l1_distance_even = 0
-            self.previous_e0_even = modulated_inp.clone()
+        self.is_cfg_negative = ctx.is_cfg_negative
 
-        else:  # odd -> unconditon
-            self.is_even = False
-            if self.cnt < ret_steps or self.cnt >= cutoff_steps:
-                self.should_calc_odd = True
-                self.accumulated_rel_l1_distance_odd = 0
-            else:
-                assert (
-                    self.previous_e0_odd is not None
-                ), "previous_e0_odd is not initialized"
-                assert (
-                    self.accumulated_rel_l1_distance_odd is not None
-                ), "accumulated_rel_l1_distance_odd is not initialized"
-                rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance_odd += rescale_func(
-                    (
-                        (modulated_inp - self.previous_e0_odd).abs().mean()
-                        / self.previous_e0_odd.abs().mean()
-                    )
-                    .cpu()
-                    .item()
-                )
-                if self.accumulated_rel_l1_distance_odd < teacache_thresh:
-                    self.should_calc_odd = False
-                else:
-                    self.should_calc_odd = True
-                    self.accumulated_rel_l1_distance_odd = 0
-            self.previous_e0_odd = modulated_inp.clone()
-        self.cnt += 1
-        should_skip_forward = False
-        if self.is_even:
-            if not self.should_calc_even:
-                should_skip_forward = True
-        else:
-            if not self.should_calc_odd:
-                should_skip_forward = True
+        # Use shared helper to compute cache decision
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=modulated_inp,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
 
-        return should_skip_forward
+        return not should_calc
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.is_even:
-            return hidden_states + self.previous_residual_even
+        """Retrieve cached residual with CFG positive/negative separation."""
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
         else:
-            return hidden_states + self.previous_residual_odd
+            return hidden_states + self.previous_residual_negative
 
 
 EntryClass = WanTransformer3DModel

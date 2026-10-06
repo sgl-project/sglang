@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=195, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=165, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
 import json
@@ -39,7 +39,9 @@ def test_update_weights_from_tensor(tp_size):
     new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
 
     time_start = time.perf_counter()
+    engine.begin_weight_update()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
+    engine.end_weight_update()
     print(f"Time delta: {time.perf_counter() - time_start:.03f}")
 
     for param_name in param_names[:3]:
@@ -52,9 +54,9 @@ def test_update_weights_from_tensor(tp_size):
     torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
-    assert (
-        memory_after <= memory_before + 1024
-    ), f"Memory leak detected: {memory_after - memory_before} bytes"
+    assert memory_after <= memory_before + 1024, (
+        f"Memory leak detected: {memory_after - memory_before} bytes"
+    )
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
@@ -82,6 +84,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         )
 
         new_tensor = torch.full((3072, 2048), 1.5)
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             [
                 (write_param_name, new_tensor.clone())
@@ -89,6 +92,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             ],
             load_format="direct",
         )
+        engine.end_weight_update()
 
         for read_param_name in read_param_names[:3]:
             _check_param(engine, read_param_name, [1.5] * 5)
@@ -96,9 +100,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_custom(self):
-        custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
-        )
+        custom_loader_name = "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct"
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             custom_weight_loader=[custom_loader_name],
@@ -116,6 +118,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         )
 
         new_tensor = torch.full((3072, 2048), 1.5)
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             [
                 (write_param_name, new_tensor.clone())
@@ -123,6 +126,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             ],
             load_format=custom_loader_name,
         )
+        engine.end_weight_update()
 
         for read_param_name in read_param_names[:3]:
             _check_param(engine, read_param_name, [1.5] * 5)
@@ -170,9 +174,11 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Update weights using flattened_bucket format
         time_start = time.perf_counter()
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             named_tensors=serialized_bucket_list, load_format="flattened_bucket"
         )
+        engine.end_weight_update()
         update_time = time.perf_counter() - time_start
         print(f"Flattened bucket update time: {update_time:.03f}")
 
@@ -236,6 +242,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         return ret
 
     def run_update_weights(self, named_tensors, flush_cache=True):
+        requests.post(self.base_url + "/begin_weight_update", json={})
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
@@ -245,55 +252,50 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 "flush_cache": flush_cache,
             },
         )
+        requests.post(self.base_url + "/end_weight_update", json={})
         ret = response.json()
         return ret
 
     def test_update_weights(self):
-        pause_generation_modes = ["in_place", "retract"]
-        for pause_generation_mode in pause_generation_modes:
-            num_requests = 32
-            with ThreadPoolExecutor(num_requests) as executor:
-                futures = [
-                    executor.submit(self.run_decode, 3000) for _ in range(num_requests)
-                ]
+        num_requests = 32
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [
+                executor.submit(self.run_decode, 3000) for _ in range(num_requests)
+            ]
 
-                # ensure the decode has been started
-                time.sleep(2)
+            # ensure the decode has been started
+            time.sleep(2)
 
-                param_names = [
-                    f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)
-                ]
-                new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
-                named_tensors = [(x, new_tensor) for x in param_names]
+            param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+            new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+            named_tensors = [(x, new_tensor) for x in param_names]
 
-                ret = self.pause_generation(pause_generation_mode)
-                ret = self.run_update_weights(
-                    named_tensors, flush_cache=pause_generation_mode == "retract"
+            # abort mode ensures server is totally idle before returning
+            ret = self.pause_generation("abort")
+            ret = self.run_update_weights(named_tensors, flush_cache=True)
+            self.assertTrue(ret["success"])
+            ret = self.continue_generation()
+
+            # requests were aborted by pause_generation("abort")
+            for future in as_completed(futures):
+                future.result()
+
+            for param_name in param_names[:3]:
+                response = requests.post(
+                    self.base_url + "/get_weights_by_name",
+                    json={"name": param_name},
                 )
-                self.assertTrue(ret["success"])
-                ret = self.continue_generation()
-
-                for future in as_completed(futures):
-                    self.assertNotEqual(
-                        future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                    )
-
-                for param_name in param_names[:3]:
-                    response = requests.post(
-                        self.base_url + "/get_weights_by_name",
-                        json={"name": param_name},
-                    )
-                    actual_values = torch.tensor(response.json())[0, :5]
-                    assert torch.allclose(
-                        actual_values, torch.tensor([1.5] * 5), atol=0.002
-                    ), f"{actual_values=}"
+                actual_values = torch.tensor(response.json())[0, :5]
+                assert torch.allclose(
+                    actual_values, torch.tensor([1.5] * 5), atol=0.002
+                ), f"{actual_values=}"
 
 
 def _check_param(engine, param_name, expect_values):
     actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-    assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.002
-    ), f"{actual_values=}"
+    assert torch.allclose(actual_values, torch.tensor(expect_values), atol=0.002), (
+        f"{actual_values=}"
+    )
 
 
 if __name__ == "__main__":

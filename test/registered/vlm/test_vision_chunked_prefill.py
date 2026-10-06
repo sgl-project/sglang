@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=150, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=270, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:
 python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_chunked_prefill
@@ -38,21 +38,16 @@ logger = logging.getLogger(__name__)
 
 
 class TestVisionChunkedPrefill(CustomTestCase):
-
     def prepare_video_messages(self, video_path, max_frames_num=8):
-        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-        # The following import order will cause Segmentation fault.
-        # import decord
-        # from transformers import AutoTokenizer
-        from decord import VideoReader, cpu
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
-        vr = VideoReader(video_path, ctx=cpu(0))
-        total_frame_num = len(vr)
+        decoder = VideoDecoderWrapper(video_path)
+        total_frame_num = len(decoder)
         uniform_sampled_frames = np.linspace(
             0, total_frame_num - 1, max_frames_num, dtype=int
         )
         frame_idx = uniform_sampled_frames.tolist()
-        frames = vr.get_batch(frame_idx).asnumpy()
+        frames = decoder.get_frames_at(frame_idx)
 
         base64_frames = []
         for frame in frames:
@@ -193,12 +188,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
         try:
             outputs_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Chunked test iteration {i + 1}/{len(batches)}")
                 output_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_chunked += [output_chunked]
-                logger.info(f"Chunked test iteration {i+1} completed")
+                logger.info(f"Chunked test iteration {i + 1} completed")
         finally:
             logger.info(f"Killing chunked server pid={chunked_server_pid}")
             kill_process_tree(chunked_server_pid)
@@ -212,12 +207,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
             logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
             outputs_no_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Non-chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Non-chunked test iteration {i + 1}/{len(batches)}")
                 output_no_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_no_chunked += [output_no_chunked]
-                logger.info(f"Non-chunked test iteration {i+1} completed")
+                logger.info(f"Non-chunked test iteration {i + 1} completed")
 
         finally:
             logger.info(f"Killing non-chunked server pid={no_chunked_server_pid}")

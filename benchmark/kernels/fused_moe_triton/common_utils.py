@@ -1,13 +1,14 @@
 import json
+from types import SimpleNamespace
 from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_config
 
 
@@ -37,7 +38,7 @@ def get_model_config(
     topk_ids_dir: str = None,
 ) -> Dict:
     config = get_config(model_name, trust_remote_code=True)
-
+    architecture = config.architectures[0]
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -46,11 +47,26 @@ def get_model_config(
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
 
-    architecture = config.architectures[0]
-
+    if (
+        hasattr(config, "quantization_config")
+        and "config_groups" in config.quantization_config
+    ):
+        config_groups = config.quantization_config["config_groups"]
+        # Get group_size from the first group's weights config
+        first_group = next(iter(config_groups.values()), {})
+        weights_config = first_group.get("weights", {})
+        group_size = weights_config.get("group_size")
+        block_shape = [0, group_size]
+        assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
-        config = config.get_text_config()
+        text_config = config.get_text_config()
+        # Some models (e.g. MiniMax-M3) carry text_config as a plain dict; wrap
+        # it so downstream attribute access works uniformly.
+        if isinstance(text_config, dict):
+            config = SimpleNamespace(**text_config)
+        else:
+            config = text_config
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
@@ -66,6 +82,18 @@ def get_model_config(
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "MellumForCausalLM",
+    ]:
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+    elif architecture in [
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -73,7 +101,14 @@ def get_model_config(
     elif architecture in [
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepseekOCRForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -82,7 +117,10 @@ def get_model_config(
             or architecture
             not in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
             else 1
@@ -111,15 +149,43 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "HYV3ForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.expert_hidden_dim
     elif architecture == "NemotronHForCausalLM":
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
+    elif architecture == "Gemma4ForConditionalGeneration":
+        E = config.num_experts // ep_size
+        topk = config.top_k_experts
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "Lfm2MoeForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "MiniMaxM3SparseForConditionalGeneration":
+        # Serving fuses the shared expert into the routed-expert tensor by
+        # default (E = num_local_experts + 1), so tune for that shape unless
+        # fusion is explicitly disabled.
+        E = config.num_local_experts // ep_size + (
+            0 if disable_shared_experts_fusion else 1
+        )
+        topk = config.num_experts_per_tok + (
+            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        )
+        intermediate_size = config.intermediate_size
+    elif architecture == "UnlimitedOCRForCausalLM":
+        E = config.n_routed_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
@@ -130,14 +196,32 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
+    # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
+    # sm100/gfx95 run native [1,32] and must not remap (mirrors fp8.py).
+    if (
+        architecture == "MiniMaxM3SparseForConditionalGeneration"
+        and is_hip()
+        and not is_gfx95_supported()
+        and block_shape == [1, 32]
+    ):
+        block_shape = [128, 128]
+
+    # text_config may not carry torch_dtype; fall back to bf16.
+    torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    # Only the DeepSeek family replaces leading MoE layers with dense ones.
+    dense_layers = getattr(config, "first_k_dense_replace", 0)
+
     return {
         "num_experts": E,
         "topk": topk,
         "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": torch_dtype,
         "block_shape": block_shape,
         "architecture": architecture,
+        "num_layers": num_layers,
+        "dense_layers": dense_layers,
     }
 
 
@@ -222,6 +306,7 @@ def get_config_filename(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
 ) -> str:
@@ -230,13 +315,16 @@ def get_config_filename(
         use_int8_w8a16=use_int8_w8a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
+        use_int4_w4a16=use_int4_w4a16,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
+    N = shard_intermediate_size // 2
+
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        N,
         dtype_str,
         block_shape,
         per_channel_quant,

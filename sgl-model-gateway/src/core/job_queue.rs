@@ -10,8 +10,10 @@ use std::{
 };
 
 use dashmap::DashMap;
+use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
+use wfaas::WorkflowId;
 
 use crate::{
     app_context::AppContext,
@@ -24,9 +26,7 @@ use crate::{
         McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
         WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
-    mcp::McpConfig,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
-    workflow::WorkflowId,
 };
 
 /// Job types for control plane operations
@@ -99,47 +99,6 @@ impl Job {
     }
 }
 
-impl JobStatus {
-    fn pending(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-}
-
 /// Job queue configuration
 #[derive(Clone, Debug)]
 pub struct JobQueueConfig {
@@ -153,7 +112,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            max_concurrent_jobs: 10,
+            max_concurrent_jobs: 200,
         }
     }
 }

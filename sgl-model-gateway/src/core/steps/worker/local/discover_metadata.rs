@@ -8,12 +8,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::strip_protocol;
 use crate::{
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 // HTTP client for metadata fetching
@@ -33,6 +33,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub attn_dp_size: Option<usize>,
     pub load_balance_method: Option<String>,
     pub disaggregation_mode: Option<String>,
     pub version: Option<String>,
@@ -43,10 +44,24 @@ pub struct ServerInfo {
     pub max_num_reqs: Option<usize>,
 }
 
+impl ServerInfo {
+    /// How many DP ranks the server runs, one scheduler each: its replicas
+    /// times its attention-DP groups. A server that predates `attn_dp_size`
+    /// counts attention-DP groups in `dp_size` and reports no `attn_dp_size`.
+    pub fn num_dp_ranks(&self) -> Option<usize> {
+        self.dp_size
+            .map(|dp_size| dp_size * self.attn_dp_size.unwrap_or(1))
+    }
+}
+
 /// Model information returned from /model_info endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub model_path: Option<String>,
+    /// The identity the worker currently serves under. A weight update moves
+    /// this (and `model_path`) on the worker's manager, so it is answered here
+    /// rather than by `/server_info`, which reports the launch record.
+    pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
     pub is_generation: Option<bool>,
     pub model_type: Option<String>,
@@ -169,6 +184,45 @@ pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInf
         .map_err(|e| format!("Failed to parse response from {}: {}", model_info_url, e))
 }
 
+/// Get model name from /v1/models endpoint (OpenAI-compatible fallback).
+async fn get_model_name_from_v1_models(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let base_url = url.trim_end_matches('/');
+    let models_url = format!("{}/v1/models", base_url);
+
+    let mut req = HTTP_CLIENT.get(&models_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", models_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            models_url
+        ));
+    }
+
+    let json: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", models_url, e))?;
+
+    json["data"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|entry| entry["object"].as_str() == Some("model"))
+        })
+        .and_then(|entry| entry["id"].as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("No model found in response from {}", models_url))
+}
+
 /// Fetch gRPC metadata (returns labels and detected runtime type).
 async fn fetch_grpc_metadata(
     url: &str,
@@ -238,23 +292,55 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
 
-                // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
-                    get_server_info(&config.url, config.api_key.as_deref()).await
-                {
-                    if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
-                        labels.insert("model_path".to_string(), model_path);
+                // /server_info reports the launch configuration; /model_info
+                // reports the model the worker is serving now. Both are read
+                // here, and a failure of one does not lose the other.
+                let server_info = get_server_info(&config.url, config.api_key.as_deref())
+                    .await
+                    .ok();
+                let model_info = get_model_info(&config.url, config.api_key.as_deref())
+                    .await
+                    .ok();
+
+                // Identity comes from /model_info, which a weight update moves;
+                // /server_info answers the launch record and is the fallback for
+                // workers that predate the fields there.
+                let present = |value: Option<&String>| value.filter(|s| !s.is_empty()).cloned();
+                let identity = [
+                    (
+                        "model_path",
+                        present(model_info.as_ref().and_then(|m| m.model_path.as_ref())).or_else(
+                            || present(server_info.as_ref().and_then(|s| s.model_path.as_ref())),
+                        ),
+                    ),
+                    (
+                        "served_model_name",
+                        present(
+                            model_info
+                                .as_ref()
+                                .and_then(|m| m.served_model_name.as_ref()),
+                        )
+                        .or_else(|| {
+                            present(
+                                server_info
+                                    .as_ref()
+                                    .and_then(|s| s.served_model_name.as_ref()),
+                            )
+                        }),
+                    ),
+                ];
+                for (key, value) in identity {
+                    if let Some(value) = value {
+                        labels.insert(key.to_string(), value);
                     }
-                    if let Some(served_model_name) =
-                        server_info.served_model_name.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("served_model_name".to_string(), served_model_name);
-                    }
+                }
+
+                if let Some(server_info) = server_info {
                     if let Some(tp_size) = server_info.tp_size {
                         labels.insert("tp_size".to_string(), tp_size.to_string());
                     }
-                    if let Some(dp_size) = server_info.dp_size {
-                        labels.insert("dp_size".to_string(), dp_size.to_string());
+                    if let Some(num_dp_ranks) = server_info.num_dp_ranks() {
+                        labels.insert("dp_size".to_string(), num_dp_ranks.to_string());
                     }
                     if let Some(load_balance_method) = server_info.load_balance_method {
                         labels.insert("load_balance_method".to_string(), load_balance_method);
@@ -264,9 +350,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     }
                 }
 
-                // Fetch from /model_info for model-related metadata
-                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
-                {
+                if let Some(model_info) = model_info {
+                    if let Some(tokenizer_path) =
+                        model_info.tokenizer_path.filter(|s| !s.is_empty())
+                    {
+                        labels.insert("tokenizer_path".to_string(), tokenizer_path);
+                    }
                     if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
                         labels.insert("model_type".to_string(), model_type);
                     }
@@ -275,6 +364,15 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                         if let Ok(json_str) = serde_json::to_string(&architectures) {
                             labels.insert("architectures".to_string(), json_str);
                         }
+                    }
+                }
+
+                // If no model name discovered yet, try /v1/models as fallback
+                if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
+                    if let Ok(model_name) =
+                        get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
+                    {
+                        labels.insert("served_model_name".to_string(), model_name);
                     }
                 }
 
@@ -311,5 +409,32 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::ServerInfo;
+
+    fn parse(json: &str) -> ServerInfo {
+        serde_json::from_str(json).expect("valid server info")
+    }
+
+    #[test]
+    fn dp_ranks_multiply_replicas_by_attention_dp_groups() {
+        let info = parse(r#"{"dp_size": 1, "attn_dp_size": 8}"#);
+        assert_eq!(info.num_dp_ranks(), Some(8));
+    }
+
+    #[test]
+    fn a_server_without_attention_dp_size_counts_dp_size() {
+        let info = parse(r#"{"dp_size": 4}"#);
+        assert_eq!(info.num_dp_ranks(), Some(4));
+    }
+
+    #[test]
+    fn no_dp_size_means_no_rank_count() {
+        let info = parse(r#"{"attn_dp_size": 2}"#);
+        assert_eq!(info.num_dp_ranks(), None);
     }
 }

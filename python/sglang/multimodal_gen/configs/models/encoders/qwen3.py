@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3 text encoder configuration for SGLang diffusion models."""
+
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
-
-
-def _is_embeddings(n: str, m) -> bool:
-    return n.endswith("embed_tokens")
-
-
-def _is_final_norm(n: str, m) -> bool:
-    return n.endswith("norm")
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_embed_tokens,
+    is_final_norm,
+    is_layer,
+)
 
 
 @dataclass
@@ -65,7 +59,7 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
 
     # FSDP sharding conditions for CPU offload
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
+        default_factory=lambda: [is_layer, is_embed_tokens, is_final_norm]
     )
 
     def __post_init__(self) -> None:

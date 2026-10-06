@@ -3,7 +3,7 @@ import re
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.midashenglm import MiDashengLMModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -48,7 +48,13 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             self.FEATURE_NAMES.append("input_values")
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        **kwargs,
     ):
         """Override to use correct audio parameter name for MiDashengLM processor."""
         if images:
@@ -57,10 +63,14 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             kwargs["videos"] = videos
         if audios:
             kwargs["audio"] = audios
-            kwargs["audio_kwargs"] = {}
+            kwargs.setdefault("audio_kwargs", {})
             kwargs["audio_kwargs"].setdefault("truncation", False)
+            if self.audio_config:
+                kwargs["audio_kwargs"].update(self.audio_config)
 
-        processor = self._processor
+        # Take the worker pool's per-thread clone when it hands one over; falling
+        # back to self._processor would put every worker on one shared object.
+        processor, _ = self._resolve_processor(processor)
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -68,7 +78,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not getattr(self.server_args, "keep_mm_feature_on_device", False):
+        if not self.use_cuda_ipc:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
@@ -101,7 +111,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
             logger.info("Auto-prepended audio token")
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
@@ -110,7 +120,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             logger.info("base_output is None")
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         logger.info(f"mm_items count: {len(mm_items)}")
@@ -154,12 +164,12 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             mm_items[0].audio_length = audio_length
             logger.info(f"Set audio_length={audio_length} (fallback, waveform length)")
 
-        result = {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
-        logger.info(f"Returning {len(result['mm_items'])} mm_items")
+        result = MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+        )
+        logger.info(f"Returning {len(result.mm_items)} mm_items")
         return result

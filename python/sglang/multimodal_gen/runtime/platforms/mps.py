@@ -27,16 +27,34 @@ class MpsPlatform(Platform):
     device_control_env_var: str = "MPS_VISIBLE_DEVICES"
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        return False
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("mps")
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        pass
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
+        return None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
+        return "Apple Silicon MPS"
 
     @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
+        return "mps"
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -64,7 +82,7 @@ class MpsPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -102,6 +120,13 @@ class MpsPlatform(Platform):
     def get_device_communicator_cls(cls) -> str:
         # Use base communicator for MPS
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+
+    @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:

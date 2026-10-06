@@ -10,8 +10,8 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=104, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LORA_REPO = "charent/self_cognition_Alice"
@@ -29,15 +29,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
             model_path=MODEL_PATH,
             enable_lora=True,
             max_lora_rank=64,
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             mem_fraction_static=0.6,
             log_level="error",
         )
@@ -61,15 +53,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
             model_path=MODEL_PATH,
             enable_lora=True,
             max_lora_rank=64,
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             mem_fraction_static=0.6,
             log_level="error",
             max_loaded_loras=MAX_LOADED_LORAS,
@@ -79,7 +63,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
         # This should trigger LRU eviction when we exceed the limit
         TEST_LORA_COUNT = 10
         for i in range(TEST_LORA_COUNT):
-            print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
+            print(f"[Test]Loading LoRA adapter {i + 1}/10: self_cognition_Alice_{i}")
             result = test_engine.load_lora_adapter_from_tensors(
                 lora_name=f"self_cognition_Alice_{i}",
                 tensors=self.lora_tensors,
@@ -90,7 +74,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 f"Failed to load LoRA adapter {i}: {result.error_message}",
             )
             print(
-                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
+                f"[Test]Successfully loaded LoRA {i + 1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
             )
 
         EXPECTED_LORA_ADAPTERS = [
@@ -344,6 +328,40 @@ class TestLoRALoadFromTensor(CustomTestCase):
         )
 
         print("\n[Test]LoRA logprob comparison test passed!")
+
+    def test_lora_e2e_load_from_flattened_bucket(self):
+        """Test loading LoRA via FlattenedTensorBucket format (RL weight sync path)."""
+        from sglang.srt.utils import MultiprocessingSerializer
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+        named_tensors = list(self.lora_tensors.items())
+        bucket = FlattenedTensorBucket(named_tensors=[(n, t) for n, t in named_tensors])
+        bucket_dict = {
+            "flattened_tensor": bucket.get_flattened_tensor(),
+            "metadata": bucket.get_metadata(),
+        }
+        serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
+
+        # flattened_bucket callers pass one serialized copy per TP rank, same
+        # as Engine.update_weights_from_tensor.
+        result = self.engine.load_lora_adapter_from_tensors(
+            lora_name="self_cognition_Alice_flattened",
+            tensors=[serialized],
+            config_dict=self.lora_config_dict,
+            load_format="flattened_bucket",
+        )
+        self.assertTrue(result.success, f"Failed: {result.error_message}")
+
+        output = self.engine.generate(
+            prompt=[TEST_PROMPT],
+            sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
+            lora_path=["self_cognition_Alice_flattened"],
+        )
+        self.assertEqual(
+            output[0]["text"][: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output after applying LoRA via flattened bucket does not match expected",
+        )
 
     @classmethod
     def tearDownClass(cls):

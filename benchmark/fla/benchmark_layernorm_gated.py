@@ -4,10 +4,12 @@ import numpy as np
 import torch
 
 # Import the function to benchmark
-from sglang.srt.layers.attention.fla.layernorm_gated import (
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_ref
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    rms_norm_ref,
+)
 
 
 def benchmark_layer_norm_fwd(

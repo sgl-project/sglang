@@ -17,10 +17,10 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     find_available_port,
-    is_in_ci,
+    get_gpu_count,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=391, stage="base-b", runner_config="2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -210,37 +210,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         return server_args, env_vars
 
 
-'''
-# Same as #10131, layer first layout test TODO(mateng): will make it work
-class TestMooncakeBackendLayerFirstLayout(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
-    """Layer first layout tests for HiCache-Mooncake backend"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "layer_first"
-        server_args["--hicache-io-backend"] = "direct"
-        return server_args, env_vars
-'''
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestMooncakeBackendPageFirstLayout(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
-    """Page first layout tests for HiCache-Mooncake backend"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "page_first"
-        return server_args, env_vars
-
-
 class TestMooncakeBackendMLAModel(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -257,6 +226,40 @@ class TestMooncakeBackendMLAModel(
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-mem-layout"] = "page_first"
         server_args["--tp-size"] = 2
+        return server_args, env_vars
+
+
+@unittest.skipUnless(get_gpu_count() >= 2, "Requires at least 2 CUDA GPUs for TP2+CP2")
+class TestMooncakeBackendQwen330BCP2(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Qwen3-30B with Mooncake HiCache storage, CP2, and TP2."""
+
+    @classmethod
+    def _get_model_name(cls):
+        return "Qwen/Qwen3-30B-A3B-FP8"
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args.update(
+            {
+                "--tp-size": 2,
+                "--moe-dp-size": 2,
+                "--attn-cp-size": 2,
+                "--enable-prefill-cp": True,
+                "--cp-strategy": "zigzag",
+                "--trust-remote-code": True,
+                "--cuda-graph-max-bs-decode": 32,
+                "--max-running-requests": 32,
+                "--max-total-tokens": 8192,
+                "--model-loader-extra-config": (
+                    '{"enable_multithread_load": true, "num_threads": 64}'
+                ),
+                "--hicache-mem-layout": "page_first_direct",
+                "--hicache-io-backend": "direct",
+            }
+        )
         return server_args, env_vars
 
 

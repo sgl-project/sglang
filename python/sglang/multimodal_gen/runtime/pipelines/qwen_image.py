@@ -3,46 +3,31 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
-from sglang.multimodal_gen.runtime.models.model_stages.qwen_image_layered import (
-    QwenImageLayeredBeforeDenoisingStage,
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
+    QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DecodingStage,
-    DenoisingStage,
-    ImageEncodingStage,
-    ImageVAEEncodingStage,
-    InputValidationStage,
-    LatentPreparationStage,
-    TextEncodingStage,
-    TimestepPreparationStage,
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    calculate_linear_shift,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
-    ConditioningStage,
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
+    QwenImageLayeredBeforeDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-# TODO(will): move PRECISION_TO_TYPE to better place
-
-logger = init_logger(__name__)
-
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -52,19 +37,20 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     image_seq_len = (int(height) // vae_scale_factor // 2) * (
         int(width) // vae_scale_factor // 2
     )
-    mu = calculate_shift(
+    return "mu", calculate_linear_shift(
         image_seq_len,
-        # hard code, since scheduler_config is not in PipelineConfig now
-        256,
-        8192,
-        0.5,
-        0.9,
+        max_seq_len=8192,
+        max_shift=0.9,
     )
-    return "mu", mu
 
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImagePipelineConfig
+    sampling_params_cls = QwenImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",
@@ -75,52 +61,9 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
-        )
-
-        self.add_stage(
-            stage_name="prompt_encoding_stage_primary",
-            stage=TextEncodingStage(
-                text_encoders=[
-                    self.get_module("text_encoder"),
-                ],
-                tokenizers=[
-                    self.get_module("tokenizer"),
-                ],
-            ),
-        )
-
-        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
-
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
-            ),
-        )
-
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=LatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        self.add_standard_t2i_stages(
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=QwenImageProgressiveDenoisingStage,
         )
 
 
@@ -137,66 +80,27 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        self.add_stage(
-            stage_name="input_validation_stage",
-            stage=InputValidationStage(
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                )
-            ),
+        vae_image_processor = VaeImageProcessor(
+            vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+            * 2
         )
 
-        self.add_stage(
-            stage_name="prompt_encoding_stage_primary",
-            stage=ImageEncodingStage(
-                image_processor=self.get_module("processor"),
-                text_encoder=self.get_module("text_encoder"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="image_encoding_stage_primary",
-            stage=ImageVAEEncodingStage(
-                vae=self.get_module("vae"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
-            ),
-        )
-
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=LatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
-        )
-
-        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
-
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        self.add_standard_ti2i_stages(
+            vae_image_processor=vae_image_processor,
+            prompt_encoding="image_encoding",
+            image_processor_key="processor",
+            prompt_text_encoder_key="text_encoder",
+            prepare_extra_timestep_kwargs=[prepare_mu],
         )
 
 
 class QwenImageEditPlusPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageEditPlusPipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImageEditPlusPipelineConfig
+    sampling_params_cls = QwenImageEditPlusSamplingParams
 
 
 def prepare_mu_layered(batch: Req, server_args: ServerArgs):
@@ -209,6 +113,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
     _required_config_modules = [
+        "text_encoder",
         "vae",
         "tokenizer",
         "processor",
@@ -217,39 +122,32 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        self.add_stage(
-            stage_name="QwenImageLayeredBeforeDenoisingStage",
-            stage=QwenImageLayeredBeforeDenoisingStage(
+        def create_before_denoising_stage():
+            stage = QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
+                text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                model_path=self.model_path,
-            ),
+                vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
+                text_encoder_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.text_encoder_precisions[0]
+                ],
+            )
+            return stage
+
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            create_before_denoising_stage,
+            "QwenImageLayeredBeforeDenoisingStage",
         )
 
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu_layered],
-            ),
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=[prepare_mu_layered]
         )
-
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
-        )
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
 
 
 EntryClass = [

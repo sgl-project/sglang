@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional
 import requests
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -40,8 +40,9 @@ class BaseTestGptOss(CustomTestCase):
         }[(model_variant, quantization)]
 
         if model_variant == "20b":
-            other_args += ["--cuda-graph-max-bs", "600"]
-        if _is_hip:
+            other_args += ["--cuda-graph-max-bs-decode", "600"]
+        # Respect SGLANG_USE_AITER if already set, otherwise default to "0" for HIP
+        if _is_hip and "SGLANG_USE_AITER" not in os.environ:
             os.environ["SGLANG_USE_AITER"] = "0"
         self._run_test_raw(
             model=model,
@@ -65,8 +66,7 @@ class BaseTestGptOss(CustomTestCase):
         try:
             self._check_streaming_responses_api_request(model)
 
-            # run multiple tests in parallel since we are mostly bound by the longest generate sequence
-            # instead of the number of questions
+            # Parallel: bound by the longest generation, not the question count.
             with ThreadPoolExecutor(max_workers=4) as executor:
                 list(
                     executor.map(
@@ -128,11 +128,11 @@ class BaseTestGptOss(CustomTestCase):
             num_examples=198,
             # use enough threads to allow parallelism
             num_threads=198,
-            # TODO 4k is still not enough, we need e.g. 64k token, but that is super slow
-            # otherwise a lot of questions are not answered
+            # sgl-eval's gpqa defaults to n_repeats=8.
+            repeat=1,
+            # Too small (many answers truncate); ~64k would fit but is too slow.
             max_tokens=4096,
-            # simple-evals by default use 0.5 and is better than 0.0 temperature
-            # but here for reproducibility, we use 0.1
+            # Arbitrary; non-zero so a tier is not scored on one greedy path.
             temperature=0.1,
             reasoning_effort=reasoning_effort,
         )
@@ -140,7 +140,7 @@ class BaseTestGptOss(CustomTestCase):
         setup = f"model={model} reasoning_effort={reasoning_effort} expected_score={expected_score}"
 
         print(f"Evaluation start: {setup}")
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation end: {setup} {metrics=}")
         self.assertGreaterEqual(metrics["score"], expected_score)
 

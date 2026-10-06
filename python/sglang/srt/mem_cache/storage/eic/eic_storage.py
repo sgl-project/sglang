@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import eic
 import torch
@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +146,6 @@ class FlexibleKVCacheMemoryPool:
             return
         self.free_data_addr.add(self.data_ptr_to_index[data_ptr])
 
-    def check_data_ptr_allocated(self, data_ptr):
-        return data_ptr in self.data_ptr_to_index
-
-    def left_count(self):
-        return len(self.free_data_addr)
-
 
 class EICStorage(HiCacheStorage):
     def __init__(
@@ -267,6 +261,7 @@ class EICStorage(HiCacheStorage):
         self.world_size = hicache_config.tp_size
         self.page_size = self.memory_pool_host.page_size
         self.use_zero_copy = self.memory_pool_host.layout == "page_first"
+        self.mha_zero_copy = self.use_zero_copy and not self.is_mla_model
         if not self.use_zero_copy:
             self.kv_cache_shape = self.memory_pool_host.get_data_page(
                 0, flat=True
@@ -410,7 +405,7 @@ class EICStorage(HiCacheStorage):
     ) -> int:
         if len(keys) == 0:
             return 0
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
         exist_mask = self._batch_exists_impl(keys)
         prefix_success = 0
@@ -419,7 +414,7 @@ class EICStorage(HiCacheStorage):
                 prefix_success += 1
             else:
                 break
-        if not self.is_mla_model and self.use_zero_copy:
+        if self.mha_zero_copy:
             prefix_success = prefix_success // 2
         return prefix_success
 
@@ -433,16 +428,6 @@ class EICStorage(HiCacheStorage):
 
     def clear(self) -> None:
         return
-
-    # Not used for now
-    def _filter_kv_cache(self, total_len) -> Tuple[int, int]:
-        mean_len = total_len // self.world_size
-        remainder = total_len % self.world_size
-        tp_keys_len = mean_len + (1 if self.rank < remainder else 0)
-        start = self.rank * mean_len + min(self.rank, remainder)
-        end = start + tp_keys_len
-        logger.debug(f"start: {start}, end: {end}, tp_keys_len: {tp_keys_len}")
-        return start, end
 
     def zero_copy_batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
         logger.debug(f"eic zero copy set {len(keys)} keys")
@@ -713,7 +698,7 @@ class EICStorage(HiCacheStorage):
             ]
         )
 
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 
@@ -760,7 +745,7 @@ class EICStorage(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 

@@ -1,7 +1,5 @@
 import argparse
 
-from sglang.cli.generate import generate
-from sglang.cli.serve import serve
 from sglang.cli.utils import get_git_commit_hash
 from sglang.version import __version__
 
@@ -11,25 +9,32 @@ def version(args, extra_argv):
     print(f"git revision: {get_git_commit_hash()[:7]}")
 
 
+COOKBOOK_URL = "https://docs.sglang.io/cookbook"
+COOKBOOK_EPILOG = (
+    f"Deploying a specific model? Its cookbook page at {COOKBOOK_URL} carries the "
+    "recommended command for it: GPU count, parallelism, quantization and the "
+    "flags that matter for that model."
+)
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        epilog=COOKBOOK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
     # complex sub commands
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
-
-    serve_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "serve",
-        help="Launch the SGLang server.",
-        add_help=False,  # Defer help to the specific parser
+        help="Launch an SGLang server.",
+        add_help=False,
     )
-    serve_parser.set_defaults(func=serve)
-
-    generate_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "generate",
         help="Run inference on a multimodal model.",
-        add_help=False,  # Defer help to the specific parser
+        add_help=False,
     )
-    generate_parser.set_defaults(func=generate)
 
     # simple commands
     version_parser = subparsers.add_parser(
@@ -39,4 +44,14 @@ def main():
     version_parser.set_defaults(func=version)
 
     args, extra_argv = parser.parse_known_args()
-    args.func(args, extra_argv)
+
+    if args.subcommand == "serve":
+        from sglang.cli.serve import serve
+
+        serve(args, extra_argv)
+    elif args.subcommand == "generate":
+        from sglang.cli.generate import generate
+
+        generate(args, extra_argv)
+    elif args.subcommand == "version":
+        version(args, extra_argv)

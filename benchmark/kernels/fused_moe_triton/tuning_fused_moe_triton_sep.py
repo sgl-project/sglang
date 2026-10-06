@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
 import dataclasses
@@ -22,19 +24,29 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
     invoke_fused_moe_kernel,
     moe_align_block_size,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.utils import is_hip
+from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import (
+    get_device,
+    get_device_module,
+    is_hip,
+    is_xpu,
+)
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
+device_module = get_device_module()
 
 
 @dataclasses.dataclass
@@ -66,11 +78,12 @@ class KernelWrapper:
             expert_ids=moe_input.expert_ids,
             num_tokens_post_padded=moe_input.num_tokens_post_padded,
         )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
-        # Capture 10 invocations with CUDA graph
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # Capture inner_iter invocations into one replayable graph.
+        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph = graph_cls()
+        with device_module.graph(graph):
             for k in range(self.inner_iter):
                 moe_input = self.moe_inputs[k]
                 self.func(
@@ -80,19 +93,19 @@ class KernelWrapper:
                     expert_ids=moe_input.expert_ids,
                     num_tokens_post_padded=moe_input.num_tokens_post_padded,
                 )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
         # Warmup
         for _ in range(5):
             graph.replay()
-        torch.cuda.synchronize()
+        device_module.synchronize()
         return graph
 
     def forward_cost(self, try_cnt=2):
         time_cost = float("inf")
         for _ in range(try_cnt):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            start_event = device_module.Event(enable_timing=True)
+            end_event = device_module.Event(enable_timing=True)
             start_event.record()
             if self.use_cuda_graph:
                 self.graph.replay()
@@ -107,14 +120,19 @@ class KernelWrapper:
                         num_tokens_post_padded=moe_input.num_tokens_post_padded,
                     )
             end_event.record()
-            torch.cuda.synchronize()
+            device_module.synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
+    model_config = get_model_config(
+        get_model().model_path,
+        tp_size=get_parallel().tp_size,
+        ep_size=get_parallel().ep_size,
+    )
+    num_layers = model_config["num_layers"]
+    dense_layers = model_config["dense_layers"]
     moe_layers = num_layers - dense_layers
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
@@ -132,13 +150,20 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     topk_ids_list,
     block_shape: List[int] = None,
+    ep_size: int = 1,
     num_iters: int = 100,
+    enable_up_tma: bool = False,
+    tune_round: str = "both",
+    down_use_tma_map: dict = None,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
+    # Weights here are per-call, so a cached descriptor only pins a dead w1/w2.
+    clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
@@ -162,6 +187,27 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
+    elif use_int4_w4a16:
+        w1 = torch.randint(
+            0,
+            255,
+            (
+                num_experts,
+                shard_intermediate_size,
+                hidden_size // 2,
+            ),
+            dtype=torch.uint8,
+        )
+        w2 = torch.randint(
+            0,
+            255,
+            (
+                num_experts,
+                hidden_size,
+                shard_intermediate_size // 4,
+            ),
+            dtype=torch.uint8,
+        )
     else:
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
@@ -179,6 +225,19 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+    if use_int4_w4a16:
+        block_n = 1 if (block_shape[0] == 0) else block_shape[0]
+        block_k = block_shape[1]
+        n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
+        n_tiles_w2 = (hidden_size + block_n - 1) // block_n
+        k_tiles_w1 = (hidden_size + block_k - 1) // block_k
+        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+        w1_scale = torch.randn(
+            (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
+        )
+        w2_scale = torch.randn(
+            (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.bfloat16
+        )
     if use_fp8_w8a8 or use_int8_w8a8:
         if use_int8_w8a8 and block_shape is None:
             w1_scale = torch.randn(
@@ -253,6 +312,12 @@ def benchmark_config(
     def prepare(i: int, inner_iter):  # update inputs according to topk_ids
         for k in range(inner_iter):
             topk_ids = topk_ids_list[i * inner_iter + k]
+            # With EP, saved topk_ids are global expert indices; remap to local.
+            if ep_size > 1:
+                topk_ids = (topk_ids // ep_size).to(
+                    device=moe_inputs[k].topk_ids.device,
+                    dtype=moe_inputs[k].topk_ids.dtype,
+                )
             tokens, _topk = moe_inputs[k].topk_ids.shape
             moe_inputs[k].topk_ids.copy_(topk_ids[:tokens, :_topk])
             sorted_token_ids_, expert_ids_, num_tokens_post_padded_ = (
@@ -264,20 +329,35 @@ def benchmark_config(
             moe_inputs[k].expert_ids.copy_(expert_ids_)
             moe_inputs[k].num_tokens_post_padded.copy_(num_tokens_post_padded_)
 
-    def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
-        )
-        apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    moe_runner_config = MoeRunnerConfig(
+        inplace=True,
+    )
+    apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+
+    use_cuda_graph = True if not ncu_enable else False
+
+    # Determine which kernels to build based on tune_round:
+    #   "both"  — up (c_sorted=False, no TMA) + down (no-tma + tma)  [default, enable_up_tma=False]
+    #   "down"  — down (no-tma + tma) only                            [round 1 of two-round tune]
+    #   "up"    — up (no-tma + tma) only, c_sorted from down_use_tma_map [round 2 of two-round tune]
+    build_up = tune_round in ("both", "up")
+    build_down = tune_round in ("both", "down")
+
+    # For "up" round, c_sorted must match what down TMA decided at runtime
+    if tune_round == "up":
+        c_sorted = down_use_tma_map.get(config["BLOCK_SIZE_M"], False)
+    else:
+        c_sorted = False
+
+    up_kernels = []
+    if build_up:
         kernel0 = KernelWrapper(
             A=hidden_states,
             B=w1,
             bias=None,
             C=intermediate_cache1,
-            A_scale=None,
+            A_scale=a1_scale,
             B_scale=w1_scale,
             B_zp=None,
             topk_weights=topk_output_.topk_weights,
@@ -287,17 +367,49 @@ def benchmark_config(
             config=config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=False,
-            use_int8_w8a16=False,
-            use_int4_w4a16=False,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=False,
             block_shape=block_shape,
-            b_use_tma=moe_use_tma,
-            c_sorted=moe_use_tma,
+            b_use_tma=False,
+            c_sorted=c_sorted,
             filter_expert=False,
             use_cuda_graph=use_cuda_graph,
             inner_iter=inner_iter,
         )
+        up_kernels.append(kernel0)
+        if enable_up_tma or tune_round == "up":
+            kernel0_tma = KernelWrapper(
+                A=hidden_states,
+                B=w1,
+                bias=None,
+                C=intermediate_cache1,
+                A_scale=a1_scale,
+                B_scale=w1_scale,
+                B_zp=None,
+                topk_weights=topk_output_.topk_weights,
+                moe_inputs=moe_inputs,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=topk,
+                config=config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=False,
+                block_shape=block_shape,
+                b_use_tma=True,
+                c_sorted=c_sorted,
+                filter_expert=False,
+                use_cuda_graph=use_cuda_graph,
+                inner_iter=inner_iter,
+            )
+            up_kernels.append(kernel0_tma)
+
+    down_kernels = []
+    if build_down:
         kernel1 = KernelWrapper(
             A=intermediate_cache2,
             B=w2,
@@ -313,30 +425,50 @@ def benchmark_config(
             config=config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=False,
-            use_int8_w8a16=False,
-            use_int4_w4a16=False,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=False,
             block_shape=block_shape,
-            a_use_tma=moe_use_tma,
-            b_use_tma=moe_use_tma,
+            a_use_tma=False,
+            b_use_tma=False,
             filter_expert=False,
             use_cuda_graph=use_cuda_graph,
             inner_iter=inner_iter,
         )
-        return kernel0, kernel1
-
-    use_cuda_graph = True if not ncu_enable else False
-
-    kernel0, kernel1 = get_kernel_wrapper(False, inner_iter, use_cuda_graph)
-    kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
+        down_kernels.append(kernel1)
+        kernel1_tma = KernelWrapper(
+            A=intermediate_cache2,
+            B=w2,
+            bias=None,
+            C=intermediate_cache3,
+            A_scale=a2_scale,
+            B_scale=w2_scale,
+            B_zp=None,
+            topk_weights=topk_output_.topk_weights,
+            moe_inputs=moe_inputs,
+            mul_routed_weight=not apply_router_weight_on_input,
+            top_k=1,
+            config=config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=False,
+            block_shape=block_shape,
+            a_use_tma=True,
+            b_use_tma=True,
+            filter_expert=False,
+            use_cuda_graph=use_cuda_graph,
+            inner_iter=inner_iter,
+        )
+        down_kernels.append(kernel1_tma)
 
     # JIT compilation & warmup
     if not ncu_enable:
-        kernel0.forward_cost()
-        kernel1.forward_cost()
-        kernel_tma0.forward_cost()
-        kernel_tma1.forward_cost()
+        for k in up_kernels + down_kernels:
+            k.forward_cost()
 
     ts0 = []
     ts1 = []
@@ -345,31 +477,42 @@ def benchmark_config(
 
     for i in range(num_iters // inner_iter):
         prepare(i, inner_iter)
-        ts0.append(kernel0.forward_cost())
-        ts1.append(kernel1.forward_cost())
-        ts_tma0.append(kernel_tma0.forward_cost())
-        ts_tma1.append(kernel_tma1.forward_cost())
-    torch.cuda.synchronize()
+        if build_up:
+            ts0.append(kernel0.forward_cost())  # up no-tma
+            if len(up_kernels) > 1:
+                ts_tma0.append(kernel0_tma.forward_cost())  # up tma
+        if build_down:
+            ts1.append(kernel1.forward_cost())  # down no-tma
+            ts_tma1.append(kernel1_tma.forward_cost())  # down tma
+    device_module.synchronize()
 
-    avg = sum(ts0) / (num_iters) * 1000  # us
-    avg1 = sum(ts1) / (num_iters) * 1000  # us
-    avg_tma = sum(ts_tma0) / (num_iters) * 1000  # us
-    avg1_tma = sum(ts_tma1) / (num_iters) * 1000  # us
+    avg = sum(ts0) / (num_iters) * 1000 if ts0 else float("inf")
+    avg1 = sum(ts1) / (num_iters) * 1000 if ts1 else float("inf")
+    avg_tma = sum(ts_tma0) / (num_iters) * 1000 if ts_tma0 else float("inf")
+    avg1_tma = sum(ts_tma1) / (num_iters) * 1000 if ts_tma1 else float("inf")
 
     return avg, avg_tma, avg1, avg1_tma
 
 
 class BestConfigTrace:
-    def __init__(self, name, down_moe=False):
+    def __init__(self, name, down_moe=False, enable_up_tma=False):
         self.name = name
         self.down_moe = down_moe
+        self.enable_up_tma = enable_up_tma
         self.best_costs_m = {}  # block_m: best_cost
 
     def update(self, config, time_cost_all):
         block_m = config["BLOCK_SIZE_M"]
         if not self.down_moe:
-            time_cost = time_cost_all[0]
+            # time_cost_all = (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma)
+            if self.enable_up_tma:
+                # For up_proj, pick the faster of TMA vs no-TMA.
+                time_cost = min(time_cost_all[0], time_cost_all[1])
+            else:
+                # Up TMA not enabled — always use no-TMA cost.
+                time_cost = time_cost_all[0]
         else:
+            # For down_proj, pick the faster of TMA vs no-TMA.
             time_cost = min(time_cost_all[2], time_cost_all[3])
         if (
             block_m not in self.best_costs_m
@@ -388,7 +531,16 @@ class BestConfigTrace:
             return {}
         config, _, time_cost_all = self.best_costs_m[block_m]
         if not self.down_moe:
-            return config
+            if self.enable_up_tma:
+                # up_proj: use TMA when the TMA variant is faster.
+                return {
+                    **config,
+                    "USE_TMA": time_cost_all[0] > time_cost_all[1],
+                }
+            else:
+                # Up TMA not enabled — do not add USE_TMA key so the runtime
+                # defaults to no-TMA for up-projection.
+                return config
         else:
             return {
                 **config,
@@ -397,14 +549,14 @@ class BestConfigTrace:
 
 
 class BenchmarkWorker:
-
-    def __init__(self, seed: int) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
+    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+        torch.set_default_device(get_device())
+        device_module.manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = 0  # int(ray.get_gpu_ids()[0])
+        self.device_id = 0 if not ray.is_initialized() else int(ray.get_gpu_ids()[0])
+        set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
         self,
@@ -417,27 +569,81 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
+        ep_size: int = 1,
+        enable_up_tma: bool = False,
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        device_module.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
-            kernel_time = benchmark_config(
-                cfg,
-                num_tokens,
-                num_experts,
-                shard_intermediate_size,
-                hidden_size,
-                topk,
-                dtype,
-                use_fp8_w8a8,
-                use_int8_w8a8,
-                use_int8_w8a16,
-                topk_ids_list,
-                block_shape,
-            )
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
+            if enable_up_tma:
+                # Two-step: first measure down to determine c_sorted,
+                # then measure up with the correct c_sorted.
+                _, _, kt1_no_tma, kt1_tma = benchmark_config(
+                    cfg,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    topk_ids_list,
+                    block_shape,
+                    ep_size=ep_size,
+                    enable_up_tma=True,
+                    tune_round="down",
+                )
+                down_use_tma = kt1_no_tma > kt1_tma
+                kt0_no_tma, kt0_tma, _, _ = benchmark_config(
+                    cfg,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    topk_ids_list,
+                    block_shape,
+                    ep_size=ep_size,
+                    enable_up_tma=True,
+                    tune_round="up",
+                    down_use_tma_map={cfg["BLOCK_SIZE_M"]: down_use_tma},
+                )
+                kernel_time = (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma)
+            else:
+                kernel_time = benchmark_config(
+                    cfg,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    topk_ids_list,
+                    block_shape,
+                    ep_size=ep_size,
+                    enable_up_tma=False,
+                    tune_round="both",
+                )
         return cfg, kernel_time
 
     def tune(
@@ -451,43 +657,140 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
+        ep_size: int = 1,
+        enable_up_tma: bool = False,
     ) -> Dict[str, int]:
-        trace0 = BestConfigTrace("kernel0", down_moe=False)
-        trace1 = BestConfigTrace("kernel1", down_moe=True)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
 
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
-            for config in tqdm(search_space):
-                try:
-                    kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
+        if not enable_up_tma:
+            # Default path: single round, up c_sorted=False, no up TMA.
+            # Down TMA is still tuned.
+            trace0 = BestConfigTrace("kernel0", down_moe=False, enable_up_tma=False)
+            trace1 = BestConfigTrace("kernel1", down_moe=True)
+
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
+                for config in tqdm(search_space):
+                    try:
+                        kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
+                            config,
+                            num_tokens,
+                            num_experts,
+                            shard_intermediate_size,
+                            hidden_size,
+                            topk,
+                            dtype,
+                            use_fp8_w8a8,
+                            use_int8_w8a8,
+                            use_int8_w8a16,
+                            use_int4_w4a16,
+                            topk_ids_list,
+                            block_shape,
+                            ep_size=ep_size,
+                            num_iters=100,
+                            enable_up_tma=False,
+                            tune_round="both",
+                        )
+                    except triton.runtime.autotuner.OutOfResources:
+                        continue
+                    trace0.update(
                         config,
-                        num_tokens,
-                        num_experts,
-                        shard_intermediate_size,
-                        hidden_size,
-                        topk,
-                        dtype,
-                        use_fp8_w8a8,
-                        use_int8_w8a8,
-                        use_int8_w8a16,
-                        topk_ids_list,
-                        block_shape,
-                        num_iters=100,
+                        (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                     )
-                except triton.runtime.autotuner.OutOfResources:
-                    # Some configurations may be invalid and fail to compile.
-                    continue
-                trace0.update(
-                    config,
-                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
-                )
-                trace1.update(
-                    config,
-                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
-                )
+                    trace1.update(
+                        config,
+                        (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
+                    )
+        else:
+            # Two-round coupled tuning: first tune down to determine c_sorted,
+            # then tune up with the correct c_sorted that matches runtime.
+            trace0 = BestConfigTrace("kernel0", down_moe=False, enable_up_tma=True)
+            trace1 = BestConfigTrace("kernel1", down_moe=True)
+
+            # === Round 1: Down-only ===
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
+                for config in tqdm(search_space, desc="Round 1 (down)"):
+                    try:
+                        _, _, kt1_no_tma, kt1_tma = benchmark_config(
+                            config,
+                            num_tokens,
+                            num_experts,
+                            shard_intermediate_size,
+                            hidden_size,
+                            topk,
+                            dtype,
+                            use_fp8_w8a8,
+                            use_int8_w8a8,
+                            use_int8_w8a16,
+                            use_int4_w4a16,
+                            topk_ids_list,
+                            block_shape,
+                            ep_size=ep_size,
+                            num_iters=100,
+                            enable_up_tma=True,
+                            tune_round="down",
+                        )
+                    except triton.runtime.autotuner.OutOfResources:
+                        continue
+                    trace1.update(
+                        config,
+                        (float("inf"), float("inf"), kt1_no_tma, kt1_tma),
+                    )
+
+            # Extract down TMA decision per BLOCK_SIZE_M from round 1 results
+            down_use_tma_map = {}
+            for block_m, (_, _, time_cost_all) in trace1.best_costs_m.items():
+                down_use_tma_map[block_m] = time_cost_all[2] > time_cost_all[3]
+
+            print(
+                f"Round 1 done. Down TMA decisions per BLOCK_SIZE_M: {down_use_tma_map}"
+            )
+
+            # === Round 2: Up with c_sorted from round 1 ===
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
+                for config in tqdm(search_space, desc="Round 2 (up)"):
+                    try:
+                        kt0_no_tma, kt0_tma, _, _ = benchmark_config(
+                            config,
+                            num_tokens,
+                            num_experts,
+                            shard_intermediate_size,
+                            hidden_size,
+                            topk,
+                            dtype,
+                            use_fp8_w8a8,
+                            use_int8_w8a8,
+                            use_int8_w8a16,
+                            use_int4_w4a16,
+                            topk_ids_list,
+                            block_shape,
+                            ep_size=ep_size,
+                            num_iters=100,
+                            enable_up_tma=True,
+                            tune_round="up",
+                            down_use_tma_map=down_use_tma_map,
+                        )
+                    except triton.runtime.autotuner.OutOfResources:
+                        continue
+                    trace0.update(
+                        config,
+                        (kt0_no_tma, kt0_tma, float("inf"), float("inf")),
+                    )
 
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
@@ -516,9 +819,11 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         block_shape: List[int],
         cmp_config_files: List[str],
         topk_ids_dir: str,
+        ep_size: int = 1,
     ):
         # compare performance of different configs
         cmp_configs = []
@@ -529,8 +834,12 @@ class BenchmarkWorker:
             print(f"config {i}: {file}")
 
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        torch.cuda.manual_seed_all(0)
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        device_module.manual_seed_all(0)
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             for bs in num_tokens:
                 kernel_times = []
                 cfgs = []
@@ -550,8 +859,10 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
+                        use_int4_w4a16,
                         topk_ids_list,
                         block_shape,
+                        ep_size=ep_size,
                     )
                     kernel_times.append(kernel_time)
                 print(f"batch_size={bs=}:")
@@ -569,6 +880,7 @@ def save_configs_sep(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     block_shape: List[int],
     down_moe: bool = False,
 ) -> None:
@@ -577,6 +889,7 @@ def save_configs_sep(
         use_int8_w8a16=use_int8_w8a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
+        use_int4_w4a16=use_int4_w4a16,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
@@ -598,6 +911,10 @@ def save_configs_sep(
 def main(args: argparse.Namespace):
     print(args)
 
+    server_args = ServerArgs(
+        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
+    )
+
     model_config = get_model_config(
         args.model,
         args.tp_size,
@@ -616,6 +933,7 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    use_int4_w4a16 = args.dtype == "int4_w4a16"
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -625,7 +943,7 @@ def main(args: argparse.Namespace):
         batch_sizes = [args.batch_size]
 
     if args.cmp_configs is not None:
-        worker = BenchmarkWorker(args.seed)
+        worker = BenchmarkWorker(args.seed, server_args)
         worker.cmp_configs(
             batch_sizes,
             E,
@@ -636,14 +954,16 @@ def main(args: argparse.Namespace):
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a16,
             block_shape,
             args.cmp_configs,
             topk_ids_dir,
+            args.ep_size,
         )
         return
 
     if len(batch_sizes) == 1:
-        worker = BenchmarkWorker(args.seed)
+        worker = BenchmarkWorker(args.seed, server_args)
         if args.tune:
             search_space = get_configs_compute_bound()
             worker.tune(
@@ -656,9 +976,12 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
+                use_int4_w4a16,
                 block_shape,
                 search_space,
                 topk_ids_dir,
+                args.ep_size,
+                enable_up_tma=args.enable_tune_up_tma,
             )
         else:
             cfg = {
@@ -680,9 +1003,12 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
+                use_int4_w4a16,
                 block_shape,
                 cfg,
                 topk_ids_dir,
+                args.ep_size,
+                enable_up_tma=args.enable_tune_up_tma,
             )
             print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
@@ -692,7 +1018,7 @@ def main(args: argparse.Namespace):
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [
-        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed)
+        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
         for _ in range(num_gpus)
     ]
 
@@ -722,6 +1048,7 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        use_int4_w4a16,
         False,
         block_shape,
     )
@@ -743,9 +1070,12 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
+                use_int4_w4a16,
                 block_shape,
                 search_space,
                 topk_ids_dir,
+                args.ep_size,
+                args.enable_tune_up_tma,
             )
             for batch_size in batch_sizes
         ],
@@ -770,6 +1100,7 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        use_int4_w4a16,
         block_shape,
     )
 
@@ -784,6 +1115,7 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        use_int4_w4a16,
         block_shape,
         down_moe=True,
     )
@@ -801,7 +1133,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -811,6 +1143,14 @@ if __name__ == "__main__":
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
     parser.add_argument("--cmp-configs", type=str, nargs="+", required=False)
+    parser.add_argument(
+        "--enable-tune-up-tma",
+        action="store_true",
+        help="Enable up-projection TMA tuning in addition to down-projection TMA. "
+        "When set, the up config file will contain a USE_TMA flag. "
+        "When not set (default), only down-projection TMA is tuned and the up "
+        "config will not contain a USE_TMA key.",
+    )
     args = parser.parse_args()
 
     main(args)

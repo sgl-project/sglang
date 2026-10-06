@@ -4,11 +4,9 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::debug;
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::steps::workflow_data::WorkerUpdateWorkflowData,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
-};
+use crate::core::steps::workflow_data::WorkerUpdateWorkflowData;
 
 /// Step to update policies for updated workers.
 ///

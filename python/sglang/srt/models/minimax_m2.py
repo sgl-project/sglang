@@ -16,7 +16,9 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
-from typing import Iterable, Optional, Set, Tuple, Union
+from contextlib import nullcontext
+from functools import lru_cache
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import triton
@@ -24,21 +26,24 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
 )
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -46,33 +51,73 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    BumpAllocator,
-    add_prefix,
-    get_compiler_backend,
-    is_non_idle_and_non_empty,
-    make_layers,
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    process_model_config,
 )
 
+# get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
+# Importing from the wrong module causes this file to fail import, which prevents the
+# native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
+# transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
+# Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_bool_env_var,
+    get_compiler_backend,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    make_pp_layers,
+)
+from sglang.srt.utils.common import is_building_neighbour_layer
+from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
 logger = logging.getLogger(__name__)
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+
+if not _is_xpu:
+    from sglang.kernels.ops.communication.all_reduce import (
+        fused_parallel_qknorm,
+        get_fused_parallel_qknorm_max_occupancy,
+    )
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 
 @triton.jit
@@ -157,6 +202,7 @@ def rmsnorm_apply_kernel_serial(
     tl.store(out2_row + offsets2, out2, mask=mask2)
 
 
+@debug_kernel_api
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
@@ -166,7 +212,14 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     stride_x1 = x1.stride(0)
     stride_x2 = x2.stride(0)
 
-    sum_sq = torch.empty(B + B2, device=x1.device, dtype=torch.float32)
+    # We found that custom all-reduce `sglang::cross_device_reduce_1stage`
+    # is much faster than the nccl all-reduce in torch.
+    # However, `should_custom_ar` checks if the reduced buffer is 16-byte aligned.
+    # RMSNormTP reduces a [B, 2] fp32 tensor, so we pad the total element count to
+    # satisfy the alignment requirement.
+    B_padded = (B + B2 + 3) // 4 * 4
+
+    sum_sq = torch.empty(B_padded, device=x1.device, dtype=torch.float32)
 
     BLOCK_SIZE1 = triton.next_power_of_2(D1)
     BLOCK_SIZE2 = triton.next_power_of_2(D2)
@@ -188,6 +241,7 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return sum_sq
 
 
+@debug_kernel_api
 def rms_apply_serial(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -236,27 +290,61 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.tp_world = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+
+        # Align with QKVParallelLinear pattern
+        if self.attn_tp_size >= num_heads:
+            assert self.attn_tp_size % num_heads == 0, (
+                f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            )
+            self.num_heads = 1
+            self.num_head_replicas = self.attn_tp_size // num_heads
+        else:
+            assert num_heads % self.attn_tp_size == 0, (
+                f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            )
+            self.num_heads = num_heads // self.attn_tp_size
+            self.num_head_replicas = 1
+
+        self.head_dim = hidden_size // num_heads
 
         # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+        self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        shard_id = self.attn_tp_rank // self.num_head_replicas
+        shard_size = param.data.shape[0]
 
-        shard_size = loaded_weight.shape[0] // tp_world
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        if _is_cpu and _is_amx_available:
+            # Handle uneven TP sharding on CPU
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_id * shard_size,  # weight_start
+                0,  # shard_axis
+                shard_size,
+            )
+            param_data.copy_(loaded_weight)
+            return
+
+        shard_end = (shard_id + 1) * shard_size
+        assert shard_end <= loaded_weight.shape[0], (
+            f"Weight shard out of bounds: shard [{shard_id * shard_size}:{shard_end}] "
+            f"exceeds loaded_weight size {loaded_weight.shape[0]} "
+            f"(attn_tp_rank={self.attn_tp_rank}, num_head_replicas={self.num_head_replicas})"
+        )
+        shard = slice(shard_id * shard_size, shard_end)
         param.data.copy_(loaded_weight[shard])
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -274,9 +362,9 @@ class MiniMaxM2RMSNormTP(nn.Module):
         # Compute variance across the full dimension (not just local shard)
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
 
-        if self.tp_world > 1:
+        if self.attn_tp_size > 1:
             # All-reduce variance across TP ranks to get global variance
-            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+            variance = attn_tp_all_reduce(variance) / self.attn_tp_size
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -284,29 +372,144 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         return x
 
-    @staticmethod
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def forward_qk(
-        q_norm: "MiniMaxM2RMSNormTP",
-        k_norm: "MiniMaxM2RMSNormTP",
-        q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> torch.Tensor:
-        sum_sq = rms_sumsq_serial(q, k)
-        if q_norm.tp_world > 1:
-            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
 
-        q, k = rms_apply_serial(
-            q,
-            k,
-            q_norm.weight,
-            k_norm.weight,
-            sum_sq,
-            q_norm.tp_world,
-            q_norm.variance_epsilon,
+@register_custom_op(mutates_args=["q", "k"])
+def fused_tp_qknorm(
+    counter: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    return fused_parallel_qknorm(
+        MiniMaxM2QKRMSNorm.COMM_MAP[counter].obj,
+        q,
+        k,
+        q_weight,
+        k_weight,
+        eps=eps,
+    )
+
+
+class MiniMaxM2QKRMSNorm:
+    COUNTER = 0
+    COMM_MAP: Dict[int, Any] = {}
+
+    def __init__(
+        self,
+        q_norm: MiniMaxM2RMSNormTP,
+        k_norm: MiniMaxM2RMSNormTP,
+    ) -> None:
+        assert q_norm.variance_epsilon == k_norm.variance_epsilon
+        self._q_norm = q_norm
+        self._k_norm = k_norm
+        self._world_size = self._q_norm.attn_tp_size
+        self._eps = q_norm.variance_epsilon
+        use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
+
+        self._forward_impl = self._forward_naive
+        if (
+            self._world_size > 1
+            and _is_cuda
+            and use_fused_norm
+            and not is_building_neighbour_layer()
+        ):
+            occupancy = get_fused_parallel_qknorm_max_occupancy(
+                q_norm.weight.dtype,
+                self._world_size,
+                # NOTE: we need full dimension
+                q_dim=q_norm.weight.shape[0] * self._world_size,
+                k_dim=k_norm.weight.shape[0] * self._world_size,
+            )
+            counter = MiniMaxM2QKRMSNorm._get_comm(q_norm.weight.device, occupancy)
+            if counter is not None:
+                self._counter = counter
+                self._forward_impl = self._forward_fused
+        elif _is_cpu and _is_amx_available:
+            self._forward_impl = self._forward_cpu
+
+    @lru_cache
+    @staticmethod
+    def _get_comm(device: torch.device, occupancy: int):
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
         )
 
+        props = torch.cuda.get_device_properties(device)
+        # probe the maximum tokens for one prefill
+        max_tokens = get_schedule().chunked_prefill_size
+        if max_tokens is None:
+            max_tokens = process_model_config().context_len
+        max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
+        logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
+        ALIGN = 512
+        # typically, this should not exceed 1M, since max_tokens is usually less than 16384
+        max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
+        comm = CustomAllReduceV2(
+            group=get_parallel().attn_tp_group.cpu_group,
+            device=device,
+            # push-only: no barrier plane and no staging buffer
+            max_pull_size=0,
+            max_pull_blocks=0,
+            max_push_size=max_size,
+            max_push_blocks=props.multi_processor_count * occupancy,
+        )
+        counter = MiniMaxM2QKRMSNorm.COUNTER
+        MiniMaxM2QKRMSNorm.COUNTER += 1
+        MiniMaxM2QKRMSNorm.COMM_MAP[counter] = comm
+        return counter if not comm.disabled else None
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor):
+        return self._forward_impl(q, k)
+
+    def _forward_naive(self, q: torch.Tensor, k: torch.Tensor):
+        q, k = q.contiguous(), k.contiguous()
+        sum_sq = rms_sumsq_serial(q, k)
+        if self._world_size > 1:
+            sum_sq = attn_tp_all_reduce(sum_sq)
+        return rms_apply_serial(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            sum_sq,
+            self._world_size,
+            self._eps,
+        )
+
+    def _forward_fused(self, q: torch.Tensor, k: torch.Tensor):
+        fused_tp_qknorm(
+            self._counter,
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
         return q, k
+
+    def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
+        if self._world_size > 1:
+            sum_sq = torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q, k)
+            sum_sq = attn_tp_all_reduce(sum_sq)
+            return torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q,
+                k,
+                self._q_norm.weight,
+                self._k_norm.weight,
+                sum_sq,
+                self._world_size,
+                self._eps,
+            )
+
+        return torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -320,7 +523,7 @@ class MiniMaxM2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if self.tp_size > config.num_local_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -339,7 +542,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -349,6 +552,7 @@ class MiniMaxM2MoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             renormalize=True,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
@@ -367,7 +571,7 @@ class MiniMaxM2MoE(nn.Module):
         self.layer_id = layer_id
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -376,24 +580,33 @@ class MiniMaxM2MoE(nn.Module):
         param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
-            return self.forward_deepep(hidden_states, forward_batch)
-        else:
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             return self.forward_normal(hidden_states)
+        else:
+            return self.forward_deepep(hidden_states, forward_batch)
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -406,7 +619,7 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -421,93 +634,6 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
     # TBO Operations for MiniMax MoE
-    def op_gate(self, state):
-        """Gate operation for TBO - compute router logits"""
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):  # router_logits: (num_tokens, num_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_select_experts(self, state):
-        """Expert selection operation for TBO"""
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-    def op_dispatch_a(self, state):
-        """Dispatch A operation for TBO - start async dispatch"""
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        """Dispatch B operation for TBO - complete async dispatch"""
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        """Expert computation for TBO"""
-        state.hidden_states_experts_output = self.experts.moe_impl(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        """Combine A operation for TBO - start async combine"""
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        """Combine B operation for TBO - complete async combine"""
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-            )
-
-    def op_output(self, state):
-        """Output operation for TBO - final MLP output"""
-        final_hidden_states = state.pop("hidden_states_after_combine")
-        # MiniMax doesn't have shared experts like DeepSeek, so no need to add them
-        state.hidden_states_mlp_output = final_hidden_states
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -522,23 +648,26 @@ class MiniMaxM2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+
+        # Use attention TP rank/size for dp-attention support
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
 
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
 
         # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
@@ -549,7 +678,8 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        # FIXME: minimax_m2 config use external config that not compatible with transformers v5
+        self.rope_theta, self.rope_scaling = get_rope_config(config)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
@@ -566,6 +696,8 @@ class MiniMaxM2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -575,17 +707,18 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
         # Setup RoPE with partial rotary dimension
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,  # Use partial rotary dimension
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
-            rope_scaling=rope_scaling,
+            rope_scaling=self.rope_scaling,
         )
 
         # QK Normalization layers
@@ -594,11 +727,16 @@ class MiniMaxM2Attention(nn.Module):
                 # Use RMSNormTP for proper tensor parallel support
                 # Use total dimensions (before TP sharding) for correct normalization
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    num_heads=self.total_num_heads,
+                    eps=config.rms_norm_eps,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_kv_heads * self.head_dim,
+                    num_heads=self.total_num_kv_heads,
+                    eps=config.rms_norm_eps,
                 )
+                self.qk_norm_impl = MiniMaxM2QKRMSNorm(self.q_norm, self.k_norm)
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
 
@@ -618,22 +756,60 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if hidden_states.shape[0] == 0:
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            # q = self.q_norm(q.contiguous())
-            # k = self.k_norm(k.contiguous())
-            q, k = MiniMaxM2RMSNormTP.forward_qk(
-                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
-            )
-        else:
-            q, k = q.contiguous(), k.contiguous()
+            q, k = self.qk_norm_impl.forward(q, k)
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
+            return hidden_states, forward_batch, None
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.use_qk_norm:
+            cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            q, k, v = split_qkv_tp_rmsnorm_rope(
+                input=qkv,
+                cos=cos,
+                sin=sin,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                rotary_dim=self.rotary_dim,
+                eps=self.q_norm.variance_epsilon,
+                tp_world=self.q_norm.attn_tp_size,
+                tp_group=get_parallel().attn_tp_group.device_group,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = q.contiguous(), k.contiguous()
+            q, k = self.rotary_emb(positions, q, k)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
     def forward_core(self, intermediate_state):
-        _, _, inner_state = intermediate_state
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
         return output
@@ -644,24 +820,19 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if not _is_npu:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
-
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
 
 
 class MiniMaxM2DecoderLayer(nn.Module):
@@ -692,7 +863,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
 
         self.input_layernorm = RMSNorm(
@@ -702,21 +873,17 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -724,90 +891,32 @@ class MiniMaxM2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         # Fully Connected (MLP or MoE)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-
-        return hidden_states, residual
+        return hidden_states
 
     # TBO Operations for MiniMax Decoder Layer
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        zero_allocator: BumpAllocator,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        """Communication prepare for attention - TBO operation"""
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        """Communication prepare for MLP - TBO operation"""
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
-        )
-
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.block_sparse_moe(
-            hidden_states, state.forward_batch
-        )
-
-    def op_comm_postprocess_layer(self, state):
-        """Communication postprocess for layer - TBO operation"""
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        return output
 
 
 class MiniMaxM2Model(nn.Module):
@@ -825,11 +934,12 @@ class MiniMaxM2Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         def layer_fn(idx, prefix: str) -> nn.Module:
@@ -840,11 +950,9 @@ class MiniMaxM2Model(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -871,45 +979,45 @@ class MiniMaxM2Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         if forward_batch.can_run_tbo:
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states = model_forward_stages(
                 layers=self.layers,
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                with get_global_expert_distribution_recorder().with_current_layer(i):
-                    if i in self.layers_to_capture:
-                        aux_hidden_states.append(hidden_states + residual)
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
+                    hidden_states = layer(
                         positions=positions,
                         forward_batch=forward_batch,
                         hidden_states=hidden_states,
-                        residual=residual,
+                        captured_last_layer_outputs=aux_hidden_states
+                        if i in self.layers_to_capture
+                        else None,
                     )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
-
-        if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
-        else:
-            hidden_states = self.norm(hidden_states)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -918,6 +1026,18 @@ class MiniMaxM2Model(nn.Module):
 
 class MiniMaxM2ForCausalLM(nn.Module):
     """MiniMax M2 model for causal language modeling."""
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
 
     def __init__(
         self,
@@ -934,7 +1054,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -945,6 +1065,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+        self.pp_group = get_parallel().pp_group
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -953,7 +1074,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         return self.model.get_input_embeddings(input_ids)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        if not get_pp_group().is_last_rank:
+        if not get_parallel().pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
@@ -977,17 +1098,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # _print_tensor_info(input_ids, "input_ids")
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
@@ -1016,13 +1146,32 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            _is_kv_scale = name.endswith(".k_scale") or name.endswith(".v_scale")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+                # Skip kv cache scales - maybe_remap_kv_scale_name expects the
+                # original checkpoint name (e.g. self_attn.k_proj.k_scale) to
+                # remap it to self_attn.attn.k_scale. Renaming k_proj -> qkv_proj
+                # here would break that pattern match.
+                if _is_kv_scale:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -1034,7 +1183,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name not in params_dict:
+                    continue
+
+                if name.endswith(".bias"):
                     continue
 
                 param = params_dict[name]
@@ -1048,6 +1200,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1068,6 +1222,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if name is None:
                         continue
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

@@ -1,7 +1,11 @@
 //! Unified gRPC client wrapper for SGLang and vLLM backends
 
+use std::sync::Arc;
+
+use smg_grpc_client::{SglangSchedulerClient, VllmEngineClient};
+
 use crate::{
-    grpc_client::{SglangSchedulerClient, VllmEngineClient},
+    observability::otel_trace::OtelTraceInjector,
     routers::grpc::proto_wrapper::{
         ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
     },
@@ -69,9 +73,14 @@ impl GrpcClient {
         url: &str,
         runtime_type: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let trace_injector = Arc::new(OtelTraceInjector);
         match runtime_type {
-            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
-            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
+            "sglang" => Ok(Self::Sglang(
+                SglangSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "vllm" => Ok(Self::Vllm(
+                VllmEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
             _ => Err(format!("Unknown runtime type: {}", runtime_type).into()),
         }
     }
@@ -151,8 +160,8 @@ impl GrpcClient {
 
 /// Unified ModelInfo wrapper
 pub enum ModelInfo {
-    Sglang(Box<crate::grpc_client::sglang_proto::GetModelInfoResponse>),
-    Vllm(crate::grpc_client::vllm_proto::GetModelInfoResponse),
+    Sglang(Box<smg_grpc_client::sglang_proto::GetModelInfoResponse>),
+    Vllm(smg_grpc_client::vllm_proto::GetModelInfoResponse),
 }
 
 impl ModelInfo {

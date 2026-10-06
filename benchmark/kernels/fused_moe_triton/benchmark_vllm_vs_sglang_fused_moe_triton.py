@@ -5,15 +5,17 @@ import torch
 import triton
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
+from sglang.test.test_utils import publish_build_topology
 
 from .common_utils import get_model_config
 
@@ -190,8 +192,8 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         )
     torch.cuda.synchronize()
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(
         lambda: api_func(
             x,
             w1,
@@ -242,10 +244,8 @@ def main():
             backend="nccl" if torch.cuda.is_available() else "gloo",
         )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
+        publish_build_topology()
+        initialize_model_parallel()
 
         shape_configs = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(

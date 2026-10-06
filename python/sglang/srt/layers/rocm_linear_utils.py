@@ -1,37 +1,59 @@
+from typing import Optional, Tuple
+
 import torch
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
-from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.tuned_gemm import tgemm
 
-from sglang.srt.utils import BumpAllocator
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_gfx95_supported
 
-__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
+__all__ = [
+    "fused_fp8_bmm_rope_cat_and_cache_mla",
+    "fused_qk_rope_cat",
+    "fused_qk_rope_cat_and_cache_mla",
+]
+
+# This module is imported wherever AITER is on, gfx942 included, but the fused
+# bmm+rope+cache op is gfx95-only. Import it behind the same predicate its one
+# caller gates on, so an aiter build without the op cannot take down every
+# DeepSeek import on another card. The name stays bound either way.
+if is_gfx95_supported():
+    from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+        fused_fp8_bmm_rope_cat_and_cache_mla,
+    )
+else:
+    fused_fp8_bmm_rope_cat_and_cache_mla = None
 
 
 def aiter_dsv3_router_gemm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
-    gemm_output_zero_allocator: BumpAllocator = None,
 ):
-    M = hidden_states.shape[0]
-    N = weight.shape[0]
-    y = None
+    """Use aiter tuned GEMM dispatcher (tgemm.mm) to automatically select the GEMM kernel."""
+    return tgemm.mm(hidden_states, weight.detach(), otype=hidden_states.dtype)
 
-    if M <= 256:
-        # TODO (cagri): convert to bfloat16 as part of another kernel to save time
-        # for now it is also coupled with zero allocator.
-        if gemm_output_zero_allocator != None:
-            y = gemm_output_zero_allocator.allocate(M * N).view(M, N)
-        else:
-            y = torch.zeros((M, N), dtype=torch.float32, device=hidden_states.device)
 
-    if y is not None:
-        logits = gemm_a16w16_atomic(hidden_states, weight, y=y).to(hidden_states.dtype)
-    else:
-        logits = gemm_a16w16(hidden_states, weight)
-
-    return logits
+def rocm_dsv3_router_split_k(
+    gate, hidden_states: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The ROCm decode router for gate (a MoEGate): an fp32 logits buffer plus
+    the split-K partials whose fixed-order sum fills it, or None when gate.forward
+    applies. Only TopK.forward_cuda(..., router_logits_partials=partials) may read
+    the buffer: it sums the partials into it inside the fused gate launch."""
+    num_tokens = hidden_states.shape[0]
+    if not 0 < num_tokens <= gate.rocm_router_max_tokens:
+        return None
+    if get_exec().deterministic.enable_deterministic_inference:
+        return None
+    partials = rocm_router_gemv_split_k(hidden_states, gate.weight)
+    logits = torch.empty(
+        (num_tokens, gate.weight.shape[0]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    return logits, partials
 
 
 def get_dsv3_gemm_output_zero_allocator_size(

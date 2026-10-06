@@ -1,5 +1,6 @@
 import argparse
 
+from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.utils import get_is_diffusion_model, get_model_path
 
 
@@ -10,7 +11,11 @@ def generate(args, extra_argv):
             add_multimodal_gen_generate_args,
         )
 
-        parser = argparse.ArgumentParser(description="SGLang Multimodal Generation")
+        parser = argparse.ArgumentParser(
+            description="SGLang Multimodal Generation",
+            epilog=COOKBOOK_EPILOG,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
         add_multimodal_gen_generate_args(parser)
         parser.parse_args(extra_argv)
         return
@@ -25,8 +30,8 @@ def generate(args, extra_argv):
 
         parser = argparse.ArgumentParser(description="SGLang Multimodal Generation")
         add_multimodal_gen_generate_args(parser)
-        parsed_args = parser.parse_args(extra_argv)
-        generate_cmd(parsed_args)
+        parsed_args, unknown_args = parser.parse_known_args(extra_argv)
+        generate_cmd(parsed_args, unknown_args)
     else:
         raise Exception(
             f"Generate subcommand is not yet supported for model: {model_path}"

@@ -18,13 +18,13 @@ SGLang Diffusion now includes an integrated WebUI. Simply add the `--webui` para
 ### Launch Text-to-Image Service
 
 ```bash
-sglang serve black-forest-labs/FLUX.1-dev --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path black-forest-labs/FLUX.1-dev --num-gpus 1 --webui --webui-port 2333
 ```
 
 ### Launch Text-to-Video Service
 
 ```bash
-sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --webui --webui-port 2333
 ```
 
 ### Launch Image-to-Image Service
@@ -34,8 +34,29 @@ sglang serve --model-path Qwen/Qwen-Image-Edit-2511 --num-gpus 1 --webui --webui
 
 ### Launch Image-to-Video Service
 ```bash
-sglang serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers --num-gpus 1 --webui --webui-port 2333
 ```
+
+### Launch MiniMax H3
+
+MiniMax H3 uses a native joint video/audio request contract. Select the weight
+partition at server startup:
+
+```bash
+# Serves text-to-video-with-audio (t2va) and first/last-frame-to-video-with-audio (fl2va).
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --num-gpus 4 --ulysses-degree 4 --webui --webui-port 2333
+
+# Serves reference-to-video-with-audio (ref2va).
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant ref2va \
+  --num-gpus 4 --ulysses-degree 4 --webui --webui-port 2333
+```
+
+The WebUI exposes H3's `task`, conditioning media, target short edge/aspect
+ratio/duration, joint denoising steps, video/audio flow shifts, and seed. H3 is CFG-distilled, so the generic negative prompt,
+guidance scales, manual FPS/frame count, width/height, and TeaCache controls do
+not apply. H3 output is fixed at 24 FPS, with its frame count and canvas derived
+from the target.
 
 ## Port Forwarding
 

@@ -4,8 +4,7 @@
 //! allowing the router to work with either backend transparently.
 
 use futures_util::StreamExt;
-
-use crate::grpc_client::{
+use smg_grpc_client::{
     sglang_proto::{self as sglang, generate_complete::MatchedStop},
     sglang_scheduler::AbortOnDropStream as SglangStream,
     vllm_engine::AbortOnDropStream as VllmStream,

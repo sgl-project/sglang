@@ -2,12 +2,10 @@
 
 use async_trait::async_trait;
 use tracing::debug;
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::get_server_info;
-use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID},
-    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
-};
+use crate::core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID};
 
 /// DP (Data Parallel) information for a worker.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -21,7 +19,7 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
     let info = get_server_info(url, api_key).await?;
 
     let dp_size = info
-        .dp_size
+        .num_dp_ranks()
         .ok_or_else(|| format!("No dp_size in response from {}", url))?;
 
     let model_id = info

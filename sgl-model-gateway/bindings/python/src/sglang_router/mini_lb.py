@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import random
 import urllib
+import warnings
 from http import HTTPStatus
 from itertools import chain
 from typing import Optional
@@ -17,21 +18,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
-
-try:
-    from sglang.srt.tracing.trace import (
-        process_tracing_init,
-        trace_get_remote_propagate_context,
-        trace_req_finish,
-        trace_req_start,
-        trace_set_thread_info,
-        trace_slice_end,
-        trace_slice_start,
-    )
-
-    trace_package_imported = True
-except ImportError:
-    trace_package_imported = False
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +47,9 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
-        self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
-        self.enable_trace = router_args.enable_trace
-        if self.enable_trace and not trace_package_imported:
-            logger.warning(
-                "Tracing is not supported in this environment. Please install sglang."
-            )
-            self.enable_trace = False
+        self.test_external_dp_routing = router_args.test_external_dp_routing
+        self.prefill_dp_size = None
+        self.decode_dp_size = None
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -90,10 +72,33 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
-        if self.enable_trace:
-            process_tracing_init(self.otlp_traces_endpoint, "sglang")
-            trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
+
+    async def _ensure_dp_sizes(self):
+        if self.prefill_dp_size is not None:
+            return
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
+                info = await resp.json()
+                self.prefill_dp_size = len(info.get("internal_states", [1]))
+            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
+                info = await resp.json()
+                self.decode_dp_size = len(info.get("internal_states", [1]))
+        logger.info(
+            f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
+        )
+
+    def _fork_dp_requests(self, request):
+        p_rank = random.randint(0, self.prefill_dp_size - 1)
+        d_rank = random.randint(0, self.decode_dp_size - 1)
+
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["routed_dp_rank"] = p_rank
+        decode_req["routed_dp_rank"] = d_rank
+        decode_req["disagg_prefill_dp_rank"] = p_rank
+
+        return prefill_req, decode_req, d_rank
 
     def select_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
@@ -106,48 +111,71 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def current_role_and_port(self, worker_url):
+        """Return (role, bootstrap_port) of a registered server, or (None, None)
+        if it is not in either routing list."""
+        if worker_url in self.prefill_urls:
+            return (
+                "prefill",
+                self.prefill_bootstrap_ports[self.prefill_urls.index(worker_url)],
+            )
+        if worker_url in self.decode_urls:
+            return "decode", None
+        return None, None
+
+    def remove_worker(self, worker_url):
+        """Drop a server from both routing lists so no new requests are sent to
+        it (used to quiesce it before a role switch)."""
+        if worker_url in self.decode_urls:
+            self.decode_urls.remove(worker_url)
+        if worker_url in self.prefill_urls:
+            idx = self.prefill_urls.index(worker_url)
+            self.prefill_urls.pop(idx)
+            self.prefill_bootstrap_ports.pop(idx)
+
+    def add_worker(self, worker_url, role, bootstrap_port=None):
+        """Register a server under a role in the routing lists."""
+        if role == "prefill":
+            self.prefill_urls.append(worker_url)
+            self.prefill_bootstrap_ports.append(bootstrap_port or 8998)
+        elif role == "decode":
+            self.decode_urls.append(worker_url)
+
+    def apply_role_switch(self, worker_url, new_role, bootstrap_port=None):
+        """Move a server between the prefill and decode routing lists after its
+        role has been switched on the backend. Idempotent."""
+        self.remove_worker(worker_url)
+        self.add_worker(worker_url, new_role, bootstrap_port)
+
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        expected_decode_dp_rank = None
+        if self.test_external_dp_routing:
+            await self._ensure_dp_sizes()
+            prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
+                modified_request
+            )
+        else:
+            prefill_req = modified_request
+            decode_req = modified_request
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-            headers = {}
-            bootstrap_room_list = []
-            if self.enable_trace:
-                bootstrap_room_list = (
-                    modified_request["bootstrap_room"]
-                    if isinstance(modified_request["bootstrap_room"], list)
-                    else [modified_request["bootstrap_room"]]
-                )
-                trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
-                headers = {"trace_context": trace_context}
-
             tasks = [
-                session.post(
-                    f"{prefill_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
-                session.post(
-                    f"{decode_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
+                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                session.post(f"{decode_server}/{endpoint}", json=decode_req),
             ]
-
-            for bootstrap_room in bootstrap_room_list:
-                trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
 
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
             if "return_logprob" in modified_request:
-
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
 
@@ -161,13 +189,15 @@ class MiniLoadBalancer:
             else:
                 ret_json = await decode_response.json()
 
-            for bootstrap_room in bootstrap_room_list:
-                trace_slice_end(
-                    "wait_PD_finish",
-                    bootstrap_room,
-                    thread_finish_flag=True,
-                )
-                trace_req_finish(bootstrap_room)
+            if expected_decode_dp_rank is not None:
+                actual = ret_json.get("meta_info", {}).get("dp_rank")
+                if actual != expected_decode_dp_rank:
+                    return ORJSONResponse(
+                        content={
+                            "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
+                        },
+                        status_code=500,
+                    )
 
             return ORJSONResponse(
                 content=ret_json,
@@ -177,6 +207,10 @@ class MiniLoadBalancer:
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
+
+        if self.test_external_dp_routing:
+            warnings.warn("--test-external-dp-routing is not supported with streaming")
+
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -186,36 +220,11 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
-                headers = {}
-                bootstrap_room_list = []
-                if self.enable_trace:
-                    bootstrap_room_list = (
-                        modified_request["bootstrap_room"]
-                        if isinstance(modified_request["bootstrap_room"], list)
-                        else [modified_request["bootstrap_room"]]
-                    )
-                    trace_context = trace_get_remote_propagate_context(
-                        bootstrap_room_list
-                    )
-                    headers = {"trace_context": trace_context}
-
                 tasks = [
-                    session.post(
-                        f"{prefill_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
-                    session.post(
-                        f"{decode_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
 
-                for bootstrap_room in bootstrap_room_list:
-                    trace_slice_end(
-                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
-                    )
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
@@ -255,14 +264,6 @@ class MiniLoadBalancer:
                     ):
                         yield chunk
 
-            for bootstrap_room in bootstrap_room_list:
-                trace_slice_end(
-                    "wait_PD_finish",
-                    bootstrap_room,
-                    thread_finish_flag=True,
-                )
-                trace_req_finish(bootstrap_room)
-
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -290,18 +291,89 @@ async def health_generate():
     return Response(status_code=200)
 
 
+async def _post_role_switch(worker_url, body):
+    """POST the role switch to a backend server; return (status, json)."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=lb.timeout)
+        ) as session:
+            async with session.post(f"{worker_url}/pd_role_switch", json=body) as resp:
+                return resp.status, await resp.json()
+    except Exception as e:  # transport error -> report as a failure
+        return 502, {"success": False, "message": str(e)}
+
+
+@app.post("/pd_role_switch")
+async def pd_role_switch(request_data: dict):
+    """Switch a running server's PD role (prefill<->decode) at runtime and
+    update the LB's routing lists. Body: {"worker_url", "new_role":
+    "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?,
+    "decode_cuda_graph_memory_gb"?, "drain"?, "drain_timeout_secs"?}.
+
+    The backend rejects a switch unless the instance is idle. To make this
+    safe while serving, by default the LB first removes the server from its
+    routing lists (so no new requests arrive), then retries the switch while
+    the server drains its in-flight requests, and only then registers it
+    under the new role. A failed server is restored only when the backend
+    confirms that no role state changed."""
+    worker_url = request_data.get("worker_url")
+    new_role = request_data.get("new_role")
+    if worker_url is None:
+        raise HTTPException(status_code=400, detail="worker_url is required")
+    if new_role not in ("prefill", "decode"):
+        raise HTTPException(status_code=400, detail=f"invalid new_role={new_role!r}")
+
+    drain = request_data.get("drain", True)
+    drain_timeout = request_data.get("drain_timeout_secs", 300)
+    old_role, old_port = lb.current_role_and_port(worker_url)
+
+    body = {"new_role": new_role}
+    for field in ("decode_cuda_graph_bs", "decode_cuda_graph_memory_gb"):
+        if request_data.get(field) is not None:
+            body[field] = request_data[field]
+
+    # Stop routing new requests to this server so it can drain to idle.
+    if drain and old_role is not None:
+        lb.remove_worker(worker_url)
+
+    deadline = asyncio.get_event_loop().time() + drain_timeout
+    while True:
+        status, result = await _post_role_switch(worker_url, body)
+        if status == 200 and result.get("success", False):
+            break
+        # The backend rejects while not idle; keep retrying as it drains.
+        not_idle = "not idle" in (result.get("message", "") or "").lower()
+        if drain and not_idle and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(1.0)
+            continue
+        if drain and old_role is not None and result.get("safe_to_restore", False):
+            lb.add_worker(worker_url, old_role, old_port)
+        return ORJSONResponse(content=result, status_code=status)
+
+    lb.apply_role_switch(worker_url, new_role, request_data.get("bootstrap_port"))
+    return ORJSONResponse(content=result, status_code=200)
+
+
 @app.post("/flush_cache")
-async def flush_cache():
+async def flush_cache(timeout: Optional[float] = None):
+    # `timeout` must reach the workers. The scheduler treats a missing or
+    # non-positive timeout as "flush now, skip the idle check", so dropping it
+    # here frees KV buffers while a PD KV transfer is still reading them: the
+    # transfer then fails for real and the peer session gets blacklisted.
+    # Forwarding it keeps the scheduler on its deferred, drain-first path.
+    params = None if timeout is None else {"timeout": timeout}
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
         for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.post(f"{server}/flush_cache"))
+            tasks.append(session.post(f"{server}/flush_cache", params=params))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)
 
 
+# TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
+@app.get("/server_info")
 @app.get("/get_server_info")
 async def get_server_info():
     prefill_infos = []
@@ -310,10 +382,10 @@ async def get_server_info():
 
     async with aiohttp.ClientSession() as session:
         for server in lb.prefill_urls:
-            server_info = await session.get(f"{server}/get_server_info")
+            server_info = await session.get(f"{server}/server_info")
             prefill_infos.append(await server_info.json())
         for server in lb.decode_urls:
-            server_info = await session.get(f"{server}/get_server_info")
+            server_info = await session.get(f"{server}/server_info")
             info_json = await server_info.json()
             decode_infos.append(info_json)
             # Extract internal_states from decode servers
@@ -367,7 +439,7 @@ async def _get_model_info_impl():
                 model_info_json = await response.json()
                 return ORJSONResponse(content=model_info_json)
 
-        except aiohttp.ClientError as e:
+        except aiohttp.ClientError:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 detail=f"Failed to get model info from backend",
@@ -465,11 +537,7 @@ async def handle_completion_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    bootstrap_room = random.randint(0, 2**63 - 1)
-    if lb.enable_trace:
-        trace_req_start(bootstrap_room, bootstrap_room, role="router")
-        trace_slice_start("mini_lb_launch", bootstrap_room)
-    return bootstrap_room
+    return random.randint(0, 2**63 - 1)
 
 
 # We may utilize `GenerateReqInput`'s logic later

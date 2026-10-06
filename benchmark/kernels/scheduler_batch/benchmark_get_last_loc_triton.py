@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.benchmark.bench_utils import run_bench
+
 
 @torch.compile(dynamic=True)
 def get_last_loc_torch(
@@ -124,14 +126,14 @@ def get_benchmark():
         quantiles = [0.5, 0.2, 0.8]
 
         if provider == "reference":
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: get_last_loc_torch(req_to_token, req_pool_indices, pre_lens),
-                quantiles=quantiles,
+                quantiles=tuple(quantiles),
             )
         elif provider == "triton":
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: get_last_loc_triton(req_to_token, req_pool_indices, pre_lens),
-                quantiles=quantiles,
+                quantiles=tuple(quantiles),
             )
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms

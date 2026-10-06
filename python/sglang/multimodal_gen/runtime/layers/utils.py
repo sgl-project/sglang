@@ -3,30 +3,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/utils.py
 """Utility methods for model layers."""
+
 import inspect
 from typing import Any, Callable, List, Optional
 
 import torch
 from torch.library import Library
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
+import sglang.multimodal_gen.runtime.platforms as platforms
+from sglang.kernels.kernel_api_logging import debug_torch_op
 
 
-def get_token_bin_counts_and_mask(
-    tokens: torch.Tensor,
-    vocab_size: int,
-    num_seqs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Compute the bin counts for the tokens.
-    # vocab_size + 1 for padding.
-    bin_counts = torch.zeros(
-        (num_seqs, vocab_size + 1), dtype=torch.long, device=tokens.device
-    )
-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
-    bin_counts = bin_counts[:, :vocab_size]
-    mask = bin_counts > 0
+def get_group_size(group) -> int:
+    if hasattr(group, "world_size"):
+        return group.world_size  # GroupCoordinator
+    elif hasattr(group, "size") and callable(getattr(group, "size", None)):
+        return group.size()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
 
-    return bin_counts, mask
+
+def get_group_rank(group) -> int:
+    if hasattr(group, "rank_in_group"):
+        return group.rank_in_group  # GroupCoordinator
+    elif hasattr(group, "rank") and callable(getattr(group, "rank", None)):
+        return group.rank()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
@@ -42,7 +45,7 @@ def direct_register_custom_op(
     """
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
-    directly registers a custom op and dispatches it to the CUDA backend.
+    directly registers a custom op for the active platform's dispatch key.
     See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
     for more details.
 
@@ -87,7 +90,9 @@ def direct_register_custom_op(
     try:
         my_lib.define(op_name + schema_str)
         my_lib.impl(
-            op_name, op_func, "CUDA" if not current_platform.is_npu() else "PrivateUse1"
+            op_name,
+            op_func,
+            platforms.current_platform.get_torch_library_dispatch_key(),
         )
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
@@ -127,7 +132,6 @@ class CustomOpWrapper:
     def real_impl(self) -> Callable:
         if self._impl is None:
             if not hasattr(torch.ops.sglang, self.op_name):
-
                 # NOTE(dark): if torch compile fail here, mark the decorator as eager
                 # lazy registration does not work with torch compile
                 direct_register_custom_op(
@@ -136,7 +140,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = getattr(torch.ops.sglang, self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 
@@ -220,15 +224,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None

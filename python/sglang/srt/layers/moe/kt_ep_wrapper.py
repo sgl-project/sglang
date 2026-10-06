@@ -12,9 +12,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils.common import is_building_neighbour_layer
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -70,27 +76,22 @@ def create_kt_config_from_server_args(
     Returns:
         KTConfig if KT is configured, None otherwise
     """
-    if server_args.kt_weight_path is None:
+    if get_exec().moe.kt_weight_path is None:
         return None
 
-    # Try to get num_layers from model config
-    num_layers = None
-    try:
-        hf_config = server_args.get_hf_config()
-        num_layers = getattr(hf_config, "num_hidden_layers", None)
-    except Exception:
-        # If we can't get the config, num_layers will be None
-        pass
+    num_layers = getattr(
+        model_config_of(server_args).hf_config, "num_hidden_layers", None
+    )
 
     return KTConfig(
         layer_idx=layer_idx,
-        num_gpu_experts=server_args.kt_num_gpu_experts,
-        cpuinfer_threads=server_args.kt_cpuinfer,
-        threadpool_count=server_args.kt_threadpool_count,
-        weight_path=server_args.kt_weight_path,
-        chunked_prefill_size=server_args.chunked_prefill_size,
-        method=server_args.kt_method,
-        max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+        num_gpu_experts=get_exec().moe.kt_num_gpu_experts,
+        cpuinfer_threads=get_exec().moe.kt_cpuinfer,
+        threadpool_count=get_exec().moe.kt_threadpool_count,
+        weight_path=get_exec().moe.kt_weight_path,
+        chunked_prefill_size=get_schedule().chunked_prefill_size,
+        method=get_exec().moe.kt_method,
+        max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
     )
 
@@ -128,7 +129,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     Example:
         # Wrap any GPU method with AMX/AVX CPU expert support
-        gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
+        gpu_method = CompressedTensorsWNA16MoE(quant_config, prefix)
         kt_config = KTConfig(layer_idx=0, num_gpu_experts=4, ...)
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
@@ -154,7 +155,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
@@ -215,7 +216,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and not is_building_neighbour_layer():
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -286,9 +287,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return

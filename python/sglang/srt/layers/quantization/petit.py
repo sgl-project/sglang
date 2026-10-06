@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
 
@@ -8,7 +10,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
@@ -20,6 +22,7 @@ from sglang.srt.layers.quantization.petit_utils import (
     prepare_nvfp4_layer_for_petit,
     verify_petit_nvfp4_supported,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_hip
 
@@ -42,10 +45,7 @@ class PetitNvFp4Config(QuantizationConfig):
     ) -> None:
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            logger.info("Detected nvfp4 checkpoint.")
         self.group_size = group_size
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.exclude_modules = exclude_modules
@@ -175,7 +175,7 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         if input_size_per_partition % 16 != 0:
             raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
+                "Unsupported model when in features size is not multiple of 16"
             )
 
         weight_dtype = (

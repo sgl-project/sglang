@@ -4,11 +4,22 @@ Provides nodes for connecting to SGLang Diffusion server and generating images/v
 """
 
 import os
+import uuid
 
 import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+
+
+def _enable_gguf_in_diffusion_models() -> None:
+    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
+    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
+    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
+        entry[1].add(".gguf")
+
+
+_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -23,6 +34,17 @@ class SGLDOptions:
         return {
             "required": {},
             "optional": {
+                "model_type": (
+                    [
+                        "auto-detect",
+                        "qwen_image",
+                        "qwen_image_edit",
+                        "flux",
+                        "lumina2",
+                        "minimax_h3",
+                    ],
+                    {"default": "auto-detect"},
+                ),
                 "enable_torch_compile": (
                     "BOOLEAN",
                     {"default": False},
@@ -56,9 +78,24 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
-                "cache_strategy": (
+                "dit_layerwise_offload": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "enable_cache_dit": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "quantization": (
                     "STRING",
-                    {"default": "none"},
+                    {"default": ""},
+                ),
+                "transformer_weights_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                    },
                 ),
             },
         }
@@ -70,6 +107,7 @@ class SGLDOptions:
 
     def create_options(
         self,
+        model_type: str = "auto-detect",
         enable_torch_compile: bool = False,
         num_gpus: int = 1,
         tp_size: int = -1,
@@ -80,7 +118,10 @@ class SGLDOptions:
         dp_degree: int = 1,
         enable_cfg_parallel: bool = False,
         attention_backend: str = "",
-        cache_strategy: str = "none",
+        dit_layerwise_offload: bool = False,
+        enable_cache_dit: bool = False,
+        quantization: str = "",
+        transformer_weights_path: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -88,9 +129,15 @@ class SGLDOptions:
         # Convert -1 to None for optional parameters (matching ServerArgs defaults)
         ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
         ring_degree = None if ring_degree == -1 else ring_degree
+        tp_size = None if tp_size == -1 else tp_size
+        sp_degree = None if sp_degree == -1 else sp_degree
         attention_backend = None if attention_backend == "" else attention_backend
+        # dp_degree is a leftover alias; ServerArgs only has dp_size.
+        if dp_degree not in (None, 1) and dp_size in (None, 1):
+            dp_size = dp_degree
 
         options = {
+            "model_type": model_type,
             "enable_torch_compile": enable_torch_compile,
             "num_gpus": num_gpus,
             "tp_size": tp_size,
@@ -98,20 +145,82 @@ class SGLDOptions:
             "ulysses_degree": ulysses_degree,
             "ring_degree": ring_degree,
             "dp_size": dp_size,
-            "dp_degree": dp_degree,
             "enable_cfg_parallel": enable_cfg_parallel,
             "attention_backend": attention_backend,
-            "cache_strategy": cache_strategy,
+            "dit_layerwise_offload": dit_layerwise_offload,
         }
+        if enable_cache_dit:
+            options["enable_cache_dit"] = True
+        quantization = (quantization or "").strip()
+        if quantization:
+            options["quantization"] = quantization
+        transformer_weights_path = (transformer_weights_path or "").strip()
+        if transformer_weights_path:
+            # Same selector as `sglang serve --transformer-weights-path`:
+            # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
+            options["transformer_weights_path"] = transformer_weights_path
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}
         return (options,)
 
 
+class SGLDLoraLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength_model": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0, "max": 10, "step": 0.01},
+                ),
+                "nickname": ("STRING", {"default": ""}),
+                "target": (
+                    ["all", "transformer", "transformer_2", "critic"],
+                    {"default": "all"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_lora"
+
+    CATEGORY = "SGLDiffusion"
+
+    def load_lora(
+        self, model, lora_name, strength_model=1.0, nickname="", target="all"
+    ):
+        """Load LoRA adapter using SGLang Diffusion API."""
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        assert model is not None
+        bi = model.clone()
+        nickname = nickname if nickname != "" else str("lora" + str(uuid.uuid4()))
+        # set lora in the model
+        bi.patches[nickname] = (lora_path, strength_model, target)
+
+        # prepare input for the SGLang Diffusion API
+        lora_input = {
+            "lora_nickname": [],
+            "lora_path": [],
+            "strength": [],
+            "target": [],
+        }
+        for nickname, lora_info in bi.patches.items():
+            lora_input["lora_nickname"].append(nickname)
+            lora_input["lora_path"].append(lora_info[0])
+            lora_input["strength"].append(lora_info[1])
+            lora_input["target"].append(lora_info[2])
+
+        # call the SGLang Diffusion API
+        model.model.diffusion_model.set_lora(**lora_input)
+        return (model,)
+
+
 class SGLDUNETLoader:
     def __init__(self):
-        self.generator = SGLDiffusionGenerator()
+        self.generator = SGLDiffusionGenerator.shared()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -522,6 +631,222 @@ class SGLDiffusionGenerateVideo:
         return (video, video_path)
 
 
+class SGLDiffusionGenerateH3:
+    """Node to generate joint video and audio with MiniMax-H3.
+
+    H3 denoises a packed video+audio sequence in one pass and routes its
+    conditioning by task rather than by a single reference slot, so it needs
+    its own request shape (`task` / `conditions` / `target`) that the generic
+    video node does not model. The returned MP4 carries both streams.
+    """
+
+    TASKS = ["t2va", "fl2va", "ref2va"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sgld_client": ("SGLD_CLIENT",),
+                "positive_prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Text prompt. Reference material is addressed "
+                        "positionally as <Picture 1>, <Video 1>, <Audio 1>",
+                    },
+                ),
+                "task": (
+                    cls.TASKS,
+                    {
+                        "default": "t2va",
+                        "tooltip": "t2va: text only. fl2va: first/last keyframes. "
+                        "ref2va: image, video, and audio references",
+                    },
+                ),
+            },
+            "optional": {
+                "first_frame": (
+                    "IMAGE",
+                    {"tooltip": "fl2va: becomes the clip's first frame"},
+                ),
+                "last_frame": (
+                    "IMAGE",
+                    {"tooltip": "fl2va: becomes the clip's last frame"},
+                ),
+                "reference_image": (
+                    "IMAGE",
+                    {
+                        "tooltip": "ref2va: guides identity and style; not "
+                        "preserved as an endpoint frame"
+                    },
+                ),
+                "reference_video": (
+                    "STRING",
+                    {"default": "", "tooltip": "ref2va: path or URL to a video"},
+                ),
+                "reference_audio": (
+                    "STRING",
+                    {"default": "", "tooltip": "ref2va: path or URL to audio"},
+                ),
+                "negative_prompt": ("STRING", {"default": ""}),
+                "seed": ("INT", {"default": 1101, "min": -1, "max": 2**32 - 1}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
+                "short_edge": ("INT", {"default": 768, "min": 256, "max": 1536}),
+                "aspect_ratio": (
+                    ["16:9", "9:16", "1:1", "auto"],
+                    {"default": "16:9"},
+                ),
+                "duration_seconds": (
+                    "FLOAT",
+                    {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.5},
+                ),
+                "flow_shift": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 30.0}),
+                "audio_flow_shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 30.0},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "video_path")
+    FUNCTION = "generate"
+    CATEGORY = "SGLDiffusion"
+    OUTPUT_NODE = False
+
+    @staticmethod
+    def _material_uri(value: str) -> str:
+        """Local paths become file:// URIs; remote URLs are passed through."""
+        if value.startswith(("http://", "https://", "file://")):
+            return value
+        return f"file://{os.path.abspath(value)}"
+
+    def generate(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        positive_prompt: str,
+        task: str,
+        first_frame: torch.Tensor = None,
+        last_frame: torch.Tensor = None,
+        reference_image: torch.Tensor = None,
+        reference_video: str = "",
+        reference_audio: str = "",
+        negative_prompt: str = "",
+        seed: int = 1101,
+        steps: int = 50,
+        short_edge: int = 768,
+        aspect_ratio: str = "16:9",
+        duration_seconds: float = 5.0,
+        flow_shift: float = 12.0,
+        audio_flow_shift: float = 3.0,
+    ):
+        """Build H3's task-shaped request and submit it through the server API."""
+        if not positive_prompt:
+            raise ValueError("Prompt cannot be empty")
+
+        # 1. keyframes carry a frame_index and are preserved as endpoints;
+        #    references are semantic material and keep request order, because
+        #    the prompt addresses them positionally per modality
+        conditions = []
+        if first_frame is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(first_frame)),
+                    "role": "keyframe",
+                    "frame_index": 0,
+                }
+            )
+        if last_frame is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(last_frame)),
+                    "role": "keyframe",
+                    "frame_index": -1,
+                }
+            )
+        if reference_image is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(reference_image)),
+                    "role": "reference",
+                }
+            )
+        if reference_video:
+            conditions.append(
+                {
+                    "type": "video",
+                    "uri": self._material_uri(reference_video),
+                    "role": "reference",
+                }
+            )
+        if reference_audio:
+            conditions.append(
+                {
+                    "type": "audio",
+                    "uri": self._material_uri(reference_audio),
+                    "role": "reference",
+                }
+            )
+
+        # 2. reject wiring the server would reject anyway, but name the input
+        #    the user has to change
+        if task == "fl2va" and not (first_frame is not None or last_frame is not None):
+            raise ValueError("fl2va requires first_frame, last_frame, or both")
+        if task == "ref2va" and not conditions:
+            raise ValueError(
+                "ref2va requires at least one of reference_image, "
+                "reference_video, or reference_audio"
+            )
+        if task == "t2va" and conditions:
+            raise ValueError("t2va takes no conditioning inputs; pick another task")
+
+        # 3. `target` resolves the aligned canvas and frame count; the `size`
+        #    the server API always sends is unused by H3
+        extra_fields = {
+            "task": task,
+            "conditions": conditions,
+            "target": {
+                "short_edge": short_edge,
+                "aspect_ratio": aspect_ratio,
+                "duration_seconds": duration_seconds,
+            },
+            "flow_shift": flow_shift,
+            "audio_flow_shift": audio_flow_shift,
+        }
+
+        request_params = {
+            "prompt": positive_prompt,
+            "seconds": int(duration_seconds),
+            "num_inference_steps": steps,
+            "output_path": folder_paths.get_temp_directory(),
+            "extra_fields": extra_fields,
+        }
+        if negative_prompt:
+            request_params["negative_prompt"] = negative_prompt
+        if seed >= 0:
+            request_params["seed"] = seed
+
+        try:
+            response = sgld_client.generate_video(**request_params)
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
+
+        video_path = response.get("file_path", "")
+        # H3 aligns the canvas server-side, so the resolved size is only known
+        # from the response; short_edge and aspect_ratio cannot reconstruct it
+        resolved_size = response.get("size", "")
+        if resolved_size:
+            width, height = (int(v) for v in resolved_size.split("x"))
+        else:
+            width = height = short_edge
+        video = convert_video_to_comfy_video(video_path, height, width)
+
+        return (video, video_path)
+
+
 class SGLDiffusionServerSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
 
@@ -587,7 +912,7 @@ class SGLDiffusionServerSetLora:
 
         # Call API
         try:
-            response = sgld_client.set_lora(**request_params)
+            sgld_client.set_lora(**request_params)
             return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
@@ -631,7 +956,7 @@ class SGLDiffusionServerUnsetLora:
     ):
         """Unset LoRA adapter using SGLang Diffusion API."""
         try:
-            response = sgld_client.unset_lora(target=target)
+            sgld_client.unset_lora(target=target)
             return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
@@ -642,18 +967,22 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
+    "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
     "SGLDOptions": SGLDOptions,
+    "SGLDLoraLoader": SGLDLoraLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
+    "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
     "SGLDOptions": "SGLDiffusion Options",
+    "SGLDLoraLoader": "SGLDiffusion LoRA Loader",
 }

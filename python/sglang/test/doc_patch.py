@@ -3,6 +3,7 @@ Do some monkey patch to make the documentation compilation faster and more relia
 
 - Avoid port conflicts
 - Reduce the server launch time
+- Limit GPU memory usage to allow multiple servers on the same machine
 """
 
 import weakref
@@ -26,7 +27,10 @@ def patched_post_init(self):
         self.max_running_requests = DEFAULT_MAX_RUNNING_REQUESTS
     if self.max_total_tokens is None:
         self.max_total_tokens = DEFAULT_MAX_TOTAL_TOKENS
-    self.cuda_graph_max_bs = 4
+    # Disable CUDA graphs to avoid memory spikes during capture.
+    # Notebooks only run a few sample requests, so perf is not critical.
+    self.disable_cuda_graph = True
+    self.cuda_graph_max_bs_decode = 4
 
 
 server_args_mod.ServerArgs.__post_init__ = patched_post_init
@@ -47,7 +51,8 @@ def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
     extra_flags = (
         f"--max-running-requests {DEFAULT_MAX_RUNNING_REQUESTS} "
         f"--max-total-tokens {DEFAULT_MAX_TOTAL_TOKENS} "
-        f"--cuda-graph-max-bs 4"
+        f"--disable-cuda-graph "
+        f"--cuda-graph-max-bs-decode 4"
     )
 
     full_command = f"{command} --port {port} {extra_flags}"

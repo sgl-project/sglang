@@ -1,19 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=13, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
-from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
+from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_hip
 from sglang.utils import is_in_ci
+
+if is_hip():
+    os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
 # Added by the IBM Team, 2024
 
@@ -33,7 +41,15 @@ def segsum(x):
     return x_segsum
 
 
-def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+def ssd_minimal_discrete(
+    X,
+    A,
+    B,
+    C,
+    block_len,
+    initial_states=None,
+    return_intermediate_states=False,
+):
     """
     Arguments:
         X: (batch, length, n_heads, d_head)
@@ -81,13 +97,17 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     # Add output of intra-chunk and inter-chunk terms
     # (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    if return_intermediate_states:
+        return Y, final_state, states
     return Y, final_state
 
 
-def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device="cuda"):
+def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=None):
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    if device is None:
+        device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     torch.manual_seed(0)
     A = -torch.exp(torch.rand(n_heads, dtype=itype, device=device))
@@ -110,7 +130,7 @@ def generate_continuous_batched_examples(
     n_heads,
     d_head,
     itype,
-    device="cuda",
+    device=None,
     return_naive_ref=True,
 ):
 
@@ -123,8 +143,10 @@ def generate_continuous_batched_examples(
 
     # generate the full-length example
     A, dt, X, B, C = generate_random_inputs(
-        num_examples, full_length, n_heads, d_head, itype
+        num_examples, full_length, n_heads, d_head, itype, device
     )
+    # Capture the resolved device from the tensors
+    device = X.device
 
     if return_naive_ref:
         Y_min, final_state_min = ssd_minimal_discrete(
@@ -159,7 +181,6 @@ def generate_continuous_batched_examples(
 
     IND_E = None
     for spec in example_lens_by_batch:
-
         # get the (maybe partial) example seen in this cont batch
         dt2, X2, B2, C2 = get_continuous_batch(spec)
 
@@ -212,8 +233,9 @@ if is_in_ci():
 @pytest.mark.parametrize("d_head", SINGLE_DHEAD)
 @pytest.mark.parametrize("seq_len_chunk_size", SINGLE_SEQ_LEN_CHUNK_SIZE)
 def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this tests the kernels on a single example (no batching)
 
@@ -304,8 +326,9 @@ if is_in_ci():
     ],
 )
 def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this test with multiple examples in a continuous batch
     # (i.e. chunked prefill)
@@ -332,7 +355,6 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ) in generate_continuous_batched_examples(
         cases, num_examples, seqlen, last_taken, exhausted, n_heads, d_head, itype
     ):
-
         chunk_indices, chunk_offsets = (
             Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size, cu_seqlens[-1]
@@ -359,7 +381,6 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
 
         # just test the last in sequence
         for i in range(num_examples):
-
             # just test one dim and dstate
             Y_eg = Y[0, cu_seqlens[i] : cu_seqlens[i + 1], 0, 0]
             Y_min_eg = Y_min[i][:, 0, 0]
@@ -383,8 +404,9 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ],
 )
 def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # This test verifies the correctness of the chunked prefill implementation
     # in the mamba2 ssd kernels, by comparing concatenation (in the sequence
@@ -605,6 +627,157 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x: f"seq{i} state " + x,
         )  # noqa: B023
+
+
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("n_heads", [4, 16])
+@pytest.mark.parametrize("d_head", [32, 64])
+@pytest.mark.parametrize("seq_len_chunk_size", [(128, 32), (256, 64)])
+def test_mamba_chunk_scan_intermediate_states(
+    d_head,
+    n_heads,
+    seq_len_chunk_size,
+    itype,
+):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    if itype == torch.bfloat16:
+        atol, rtol = 5e-2, 5e-2
+    else:
+        atol, rtol = 8e-3, 5e-3
+
+    batch_size = 1
+    seqlen, chunk_size = seq_len_chunk_size
+
+    A, dt, X, B, C = generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype)
+
+    _, ref_final_state, ref_states = ssd_minimal_discrete(
+        X * dt.unsqueeze(-1), A * dt, B, C, chunk_size, return_intermediate_states=True
+    )
+
+    Y = torch.empty_like(X)
+    states, final_state = mamba_chunk_scan_combined(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        return_intermediate_states=True,
+        return_final_states=True,
+        out=Y,
+    )
+
+    num_chunks = seqlen // chunk_size
+    assert states.shape == (batch_size, num_chunks, n_heads, d_head, d_head)
+    assert ref_states.shape == states.shape
+
+    torch.testing.assert_close(
+        final_state[:, -1],
+        ref_final_state[:, -1].to(torch.float32),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    for chunk_idx in range(num_chunks):
+        torch.testing.assert_close(
+            states[:, chunk_idx, -1],
+            ref_states[:, chunk_idx, -1].to(states.dtype),
+            atol=atol,
+            rtol=rtol,
+            msg=lambda x: f"chunk {chunk_idx} " + x,
+        )
+
+
+@pytest.mark.parametrize("chunk_size", [64, 128])
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        (500, 700, 900),
+        (256, 300, 400),
+        (130, 200, 300),
+    ],
+)
+def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, itype = 8, 64, torch.float32
+    A, dt, X, B, C = generate_random_inputs(
+        1, sum(seqlens), n_heads, d_head, itype, device
+    )
+    starts = [sum(seqlens[:i]) for i in range(len(seqlens) + 1)]
+
+    def run(x, d, b, c, lens, **kwargs):
+        cu_seqlens = torch.tensor(
+            [sum(lens[:i]) for i in range(len(lens) + 1)],
+            dtype=torch.int32,
+            device=device,
+        )
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lens), dtype=torch.int32, device=device),
+            torch.tensor(lens, dtype=torch.int32, device=device),
+        ).unsqueeze(0)
+        return mamba_chunk_scan_combined(
+            x,
+            d,
+            A,
+            b,
+            c,
+            chunk_size,
+            D=None,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            initial_states=None,
+            out=torch.empty_like(x),
+            return_varlen_states=True,
+            **kwargs,
+        )
+
+    tracked = [
+        (i, (ln // chunk_size) * chunk_size)
+        for i, ln in enumerate(seqlens)
+        if ln >= chunk_size and ln % chunk_size != 0
+    ]
+    assert tracked, "case must exercise the unaligned path"
+
+    _, _, track_states = run(
+        X,
+        dt,
+        B,
+        C,
+        list(seqlens),
+        return_track_states=True,
+        track_seq_idx=torch.tensor(
+            [i for i, _ in tracked], dtype=torch.int64, device=device
+        ),
+        track_end_locs=torch.tensor(
+            [starts[i] + n for i, n in tracked], dtype=torch.int32, device=device
+        ),
+    )
+    assert track_states.shape == (1, len(tracked), n_heads, d_head, d_head)
+    track_states = track_states.squeeze(0)
+
+    for j, (i, n) in enumerate(tracked):
+        sl = slice(starts[i], starts[i] + n)
+        expected = run(
+            X[:, sl].contiguous(),
+            dt[:, sl].contiguous(),
+            B[:, sl].contiguous(),
+            C[:, sl].contiguous(),
+            [n],
+        )
+        torch.testing.assert_close(
+            track_states[j],
+            expected[0],
+            atol=1e-2,
+            rtol=5e-3,
+            msg=lambda m, i=i, n=n: f"request {i} snapshot at {n} tokens: " + m,
+        )
 
 
 if __name__ == "__main__":

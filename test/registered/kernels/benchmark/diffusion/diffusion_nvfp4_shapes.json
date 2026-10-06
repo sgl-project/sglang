@@ -1,0 +1,2676 @@
+{
+  "flux": [
+    {
+      "shape": [
+        4608,
+        3072,
+        15360
+      ],
+      "count": 38,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4608,
+        12288,
+        3072
+      ],
+      "count": 38,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4608,
+        3072,
+        3072
+      ],
+      "count": 114,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        3072,
+        3072
+      ],
+      "count": 57,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        10240,
+        4096
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        3072,
+        3072
+      ],
+      "count": 19,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_out.*"
+    },
+    {
+      "shape": [
+        512,
+        12288,
+        4096
+      ],
+      "count": 24,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        10240
+      ],
+      "count": 24,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        3072
+      ],
+      "count": 57,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        4096
+      ],
+      "count": 24,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        3072
+      ],
+      "count": 19,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        4096
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        77,
+        3072,
+        768
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.mlp.fc1"
+    },
+    {
+      "shape": [
+        77,
+        768,
+        3072
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.mlp.fc2"
+    },
+    {
+      "shape": [
+        77,
+        2304,
+        768
+      ],
+      "count": 12,
+      "kind": "runtime_fused_qkv",
+      "prefix": "clip.layers.*.self_attn.qkv_proj"
+    },
+    {
+      "shape": [
+        4096,
+        64,
+        3072
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        3072,
+        64
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        77,
+        768,
+        768
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.self_attn.out_proj"
+    }
+  ],
+  "flux2": [
+    {
+      "shape": [
+        4608,
+        55296,
+        6144
+      ],
+      "count": 48,
+      "kind": "runtime_fused_qkv_mlp",
+      "prefix": "single_transformer_blocks.*.attn.to_qkv_mlp_proj"
+    },
+    {
+      "shape": [
+        4608,
+        6144,
+        24576
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": "single_transformer_blocks.*.attn.to_out"
+    },
+    {
+      "shape": [
+        4096,
+        36864,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.ff.linear_in"
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        18432
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.ff.linear_out"
+    },
+    {
+      "shape": [
+        4096,
+        18432,
+        6144
+      ],
+      "count": 8,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "transformer_blocks.*.attn.packed_qkv"
+    },
+    {
+      "shape": [
+        4096,
+        12288,
+        6144
+      ],
+      "count": 8,
+      "kind": "synthetic_packed_kv",
+      "prefix": "transformer_blocks.*.attn.packed_kv"
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_k"
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_out.*"
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_q"
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_v"
+    },
+    {
+      "shape": [
+        512,
+        36864,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.ff_context.linear_in"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        18432
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.ff_context.linear_out"
+    },
+    {
+      "shape": [
+        512,
+        18432,
+        6144
+      ],
+      "count": 8,
+      "kind": "synthetic_packed_added_qkv",
+      "prefix": "transformer_blocks.*.attn.packed_qkv"
+    },
+    {
+      "shape": [
+        512,
+        12288,
+        6144
+      ],
+      "count": 8,
+      "kind": "synthetic_packed_kv",
+      "prefix": "transformer_blocks.*.attn.packed_kv"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.add_k_proj"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.add_q_proj"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.add_v_proj"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        6144
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        15360
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        6144,
+        128
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        128,
+        6144
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "proj_out"
+    },
+    {
+      "shape": [
+        1,
+        36864,
+        6144
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        18432,
+        6144
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    }
+  ],
+  "helios": [
+    {
+      "shape": [
+        11040,
+        5120,
+        5120
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        11040,
+        13824,
+        5120
+      ],
+      "count": 80,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        11040,
+        5120,
+        13824
+      ],
+      "count": 80,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        11040,
+        5120,
+        5120
+      ],
+      "count": 80,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        8640,
+        5120,
+        5120
+      ],
+      "count": 80,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        8640,
+        5120,
+        5120
+      ],
+      "count": 80,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        10240,
+        4096
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        12288,
+        4096
+      ],
+      "count": 48,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        10240
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        4096
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        8640,
+        64,
+        5120
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        30720,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        256
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    }
+  ],
+  "hunyuanvideo": [
+    {
+      "shape": [
+        27085,
+        21504,
+        3072
+      ],
+      "count": 40,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.single_blocks.*.linear1"
+    },
+    {
+      "shape": [
+        27085,
+        3072,
+        15360
+      ],
+      "count": 40,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.single_blocks.*.linear2"
+    },
+    {
+      "shape": [
+        27030,
+        3072,
+        12288
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.double_blocks.*.img_mlp.*"
+    },
+    {
+      "shape": [
+        27030,
+        12288,
+        3072
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.double_blocks.*.img_mlp.*.proj"
+    },
+    {
+      "shape": [
+        27030,
+        9216,
+        3072
+      ],
+      "count": 20,
+      "kind": "runtime_fused_qkv",
+      "prefix": "Hunyuan.double_blocks.*.img_attn_qkv"
+    },
+    {
+      "shape": [
+        27030,
+        3072,
+        3072
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.double_blocks.*.img_attn_proj"
+    },
+    {
+      "shape": [
+        150,
+        28672,
+        4096
+      ],
+      "count": 32,
+      "kind": "actual_runtime_linear",
+      "prefix": "llama.layers.*.mlp.gate_up_proj"
+    },
+    {
+      "shape": [
+        150,
+        4096,
+        14336
+      ],
+      "count": 32,
+      "kind": "actual_runtime_linear",
+      "prefix": "llama.layers.*.mlp.down_proj"
+    },
+    {
+      "shape": [
+        150,
+        6144,
+        4096
+      ],
+      "count": 32,
+      "kind": "runtime_fused_qkv",
+      "prefix": "llama.layers.*.self_attn.qkv_proj"
+    },
+    {
+      "shape": [
+        150,
+        4096,
+        4096
+      ],
+      "count": 32,
+      "kind": "actual_runtime_linear",
+      "prefix": "llama.layers.*.self_attn.o_proj"
+    },
+    {
+      "shape": [
+        55,
+        12288,
+        3072
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        55,
+        3072,
+        12288
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        55,
+        9216,
+        3072
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        55,
+        3072,
+        3072
+      ],
+      "count": 20,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        27030,
+        64,
+        3072
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.final_layer.linear"
+    },
+    {
+      "shape": [
+        55,
+        3072,
+        12288
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.refiner_blocks.*.mlp.*"
+    },
+    {
+      "shape": [
+        55,
+        12288,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.refiner_blocks.*.mlp.*.proj"
+    },
+    {
+      "shape": [
+        55,
+        9216,
+        3072
+      ],
+      "count": 2,
+      "kind": "runtime_fused_qkv",
+      "prefix": "Hunyuan.txt_in.refiner_blocks.*.self_attn_qkv"
+    },
+    {
+      "shape": [
+        1,
+        18432,
+        3072
+      ],
+      "count": 40,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        46,
+        3072,
+        768
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.mlp.fc1"
+    },
+    {
+      "shape": [
+        46,
+        768,
+        3072
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.mlp.fc2"
+    },
+    {
+      "shape": [
+        1,
+        9216,
+        3072
+      ],
+      "count": 40,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        55,
+        3072,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.refiner_blocks.*.self_attn_proj"
+    },
+    {
+      "shape": [
+        46,
+        2304,
+        768
+      ],
+      "count": 12,
+      "kind": "runtime_fused_qkv",
+      "prefix": "clip.layers.*.self_attn.qkv_proj"
+    },
+    {
+      "shape": [
+        55,
+        3072,
+        4096
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.input_embedder"
+    },
+    {
+      "shape": [
+        46,
+        768,
+        768
+      ],
+      "count": 12,
+      "kind": "actual_runtime_linear",
+      "prefix": "clip.layers.*.self_attn.out_proj"
+    },
+    {
+      "shape": [
+        1,
+        6144,
+        3072
+      ],
+      "count": 3,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        3072
+      ],
+      "count": 3,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        4096
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.c_embedder.*.proj"
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        3072
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.txt_in.c_embedder.*"
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        3072
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.vector_in.*"
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        256
+      ],
+      "count": 3,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        1,
+        3072,
+        768
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": "Hunyuan.vector_in.*.proj"
+    }
+  ],
+  "ltx": [
+    {
+      "shape": [
+        6144,
+        4096,
+        4096
+      ],
+      "count": 384,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        4096,
+        16384
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        16384,
+        4096
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        4096,
+        4096
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        2048,
+        4096
+      ],
+      "count": 288,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        4096,
+        2048
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1024,
+        4096,
+        4096
+      ],
+      "count": 194,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1024,
+        2048,
+        2048
+      ],
+      "count": 194,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        2048,
+        2048
+      ],
+      "count": 672,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        2048,
+        8192
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        8192,
+        2048
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        2048,
+        2048
+      ],
+      "count": 288,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1024,
+        4096,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1024,
+        2048,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        128,
+        4096
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        6144,
+        4096,
+        128
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        24576,
+        4096
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        4096,
+        4096
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        16384,
+        4096
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        128,
+        2048
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        126,
+        2048,
+        128
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        12288,
+        2048
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        2048,
+        2048
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        8192,
+        2048
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        4096,
+        256
+      ],
+      "count": 6,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        2048,
+        256
+      ],
+      "count": 6,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    }
+  ],
+  "mova-720p": [
+    {
+      "shape": [
+        44100,
+        5120,
+        5120
+      ],
+      "count": 3040,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        44100,
+        5120,
+        5120
+      ],
+      "count": 1760,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        44100,
+        13824,
+        5120
+      ],
+      "count": 640,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        44100,
+        5120,
+        13824
+      ],
+      "count": 640,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        44100,
+        1536,
+        5120
+      ],
+      "count": 960,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 1280,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        2560,
+        4096
+      ],
+      "count": 384,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        4096
+      ],
+      "count": 192,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        1536,
+        1536
+      ],
+      "count": 960,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        2560
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        176400,
+        64,
+        5120
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        101,
+        5120,
+        1536
+      ],
+      "count": 960,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        101,
+        8960,
+        1536
+      ],
+      "count": 480,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        101,
+        1536,
+        8960
+      ],
+      "count": 480,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        101,
+        1536,
+        1536
+      ],
+      "count": 2400,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        1024
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        101,
+        1536,
+        1536
+      ],
+      "count": 1440,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        512,
+        1536,
+        4096
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        512,
+        1536,
+        1536
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        30720,
+        5120
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        403,
+        128,
+        1536
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        5120
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        9216,
+        1536
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        1536,
+        1536
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        256
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        1,
+        1536,
+        256
+      ],
+      "count": 16,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    }
+  ],
+  "qwen": [
+    {
+      "shape": [
+        4096,
+        3072,
+        3072
+      ],
+      "count": 720,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        3072,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_out.*"
+    },
+    {
+      "shape": [
+        47,
+        3072,
+        3072
+      ],
+      "count": 360,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        19,
+        3072,
+        3072
+      ],
+      "count": 360,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        47,
+        3072,
+        3072
+      ],
+      "count": 120,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        19,
+        3072,
+        3072
+      ],
+      "count": 120,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        1,
+        18432,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.img_mod"
+    },
+    {
+      "shape": [
+        1,
+        18432,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.txt_mod"
+    }
+  ],
+  "qwen-edit": [
+    {
+      "shape": [
+        8308,
+        3072,
+        3072
+      ],
+      "count": 720,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        8308,
+        3072,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_out.*"
+    },
+    {
+      "shape": [
+        195,
+        3072,
+        3072
+      ],
+      "count": 360,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        189,
+        3072,
+        3072
+      ],
+      "count": 360,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        195,
+        3072,
+        3072
+      ],
+      "count": 120,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        189,
+        3072,
+        3072
+      ],
+      "count": 120,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.attn.to_add_out"
+    },
+    {
+      "shape": [
+        2,
+        18432,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.img_mod"
+    },
+    {
+      "shape": [
+        1,
+        18432,
+        3072
+      ],
+      "count": 240,
+      "kind": "actual_runtime_linear",
+      "prefix": "transformer_blocks.*.txt_mod"
+    }
+  ],
+  "wan-i2v": [
+    {
+      "shape": [
+        15792,
+        15360,
+        5120
+      ],
+      "count": 320,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "blocks.*.attn1.packed_qkv"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        13824
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*"
+    },
+    {
+      "shape": [
+        15792,
+        13824,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*.proj"
+    },
+    {
+      "shape": [
+        15792,
+        10240,
+        5120
+      ],
+      "count": 320,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn1.packed_kv"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_k"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_out.*"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_q"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_v"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_out.*"
+    },
+    {
+      "shape": [
+        15792,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_q"
+    },
+    {
+      "shape": [
+        512,
+        10240,
+        5120
+      ],
+      "count": 320,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn2.packed_kv"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_k"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 320,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_v"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 384,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        4096
+      ],
+      "count": 192,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        5120
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        2048
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        31584,
+        64,
+        5120
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "proj_out"
+    },
+    {
+      "shape": [
+        1,
+        30720,
+        5120
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        5120
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        256
+      ],
+      "count": 8,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    }
+  ],
+  "wan-t2v": [
+    {
+      "shape": [
+        37800,
+        15360,
+        5120
+      ],
+      "count": 160,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "blocks.*.attn1.packed_qkv"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        13824
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*"
+    },
+    {
+      "shape": [
+        37800,
+        13824,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*.proj"
+    },
+    {
+      "shape": [
+        37800,
+        10240,
+        5120
+      ],
+      "count": 160,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn1.packed_kv"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_k"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_out.*"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_q"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_v"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_out.*"
+    },
+    {
+      "shape": [
+        37800,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_q"
+    },
+    {
+      "shape": [
+        512,
+        10240,
+        5120
+      ],
+      "count": 160,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn2.packed_kv"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 384,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        4096
+      ],
+      "count": 192,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_k"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 160,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_v"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        5120
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        2048
+      ],
+      "count": 192,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        75600,
+        64,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "proj_out"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        512,
+        5120,
+        4096
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        1,
+        30720,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        5120
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        1,
+        5120,
+        256
+      ],
+      "count": 4,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    }
+  ],
+  "wan-ti2v": [
+    {
+      "shape": [
+        18144,
+        3072,
+        14336
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*"
+    },
+    {
+      "shape": [
+        18144,
+        14336,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.ffn.net.*.proj"
+    },
+    {
+      "shape": [
+        18144,
+        9216,
+        3072
+      ],
+      "count": 60,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "blocks.*.attn1.packed_qkv"
+    },
+    {
+      "shape": [
+        18144,
+        6144,
+        3072
+      ],
+      "count": 60,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn1.packed_kv"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_k"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_out.*"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_q"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn1.to_v"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_out.*"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_q"
+    },
+    {
+      "shape": [
+        512,
+        10240,
+        4096
+      ],
+      "count": 96,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        18144,
+        18432,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        12288,
+        4096
+      ],
+      "count": 48,
+      "kind": "runtime_fused_qkv",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        10240
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        3072
+      ],
+      "count": 60,
+      "kind": "synthetic_packed_kv",
+      "prefix": "blocks.*.attn2.packed_kv"
+    },
+    {
+      "shape": [
+        512,
+        4096,
+        4096
+      ],
+      "count": 48,
+      "kind": "actual_runtime_linear",
+      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_k"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        3072
+      ],
+      "count": 60,
+      "kind": "actual_runtime_linear",
+      "prefix": "blocks.*.attn2.to_v"
+    },
+    {
+      "shape": [
+        18144,
+        3072,
+        256
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        18144,
+        192,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "proj_out"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        4096
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "0.proj"
+    },
+    {
+      "shape": [
+        512,
+        3072,
+        3072
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "2"
+    }
+  ],
+  "zimage": [
+    {
+      "shape": [
+        4128,
+        20480,
+        3840
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4128,
+        11520,
+        3840
+      ],
+      "count": 30,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "layers.*.attention.packed_qkv"
+    },
+    {
+      "shape": [
+        4128,
+        3840,
+        10240
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4128,
+        7680,
+        3840
+      ],
+      "count": 30,
+      "kind": "synthetic_packed_kv",
+      "prefix": "layers.*.attention.packed_kv"
+    },
+    {
+      "shape": [
+        4128,
+        3840,
+        3840
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": "layers.*.attention.to_k"
+    },
+    {
+      "shape": [
+        4128,
+        3840,
+        3840
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": "layers.*.attention.to_out.*"
+    },
+    {
+      "shape": [
+        4128,
+        3840,
+        3840
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": "layers.*.attention.to_q"
+    },
+    {
+      "shape": [
+        4128,
+        3840,
+        3840
+      ],
+      "count": 30,
+      "kind": "actual_runtime_linear",
+      "prefix": "layers.*.attention.to_v"
+    },
+    {
+      "shape": [
+        512,
+        19456,
+        2560
+      ],
+      "count": 36,
+      "kind": "actual_runtime_linear",
+      "prefix": "qwen3.layers.*.mlp.gate_up_proj"
+    },
+    {
+      "shape": [
+        4096,
+        20480,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        2560,
+        9728
+      ],
+      "count": 36,
+      "kind": "actual_runtime_linear",
+      "prefix": "qwen3.layers.*.mlp.down_proj"
+    },
+    {
+      "shape": [
+        4096,
+        11520,
+        3840
+      ],
+      "count": 2,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "noise_refiner.*.attention.packed_qkv"
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        10240
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        512,
+        6144,
+        2560
+      ],
+      "count": 36,
+      "kind": "runtime_fused_qkv",
+      "prefix": "qwen3.layers.*.self_attn.qkv_proj"
+    },
+    {
+      "shape": [
+        4096,
+        7680,
+        3840
+      ],
+      "count": 2,
+      "kind": "synthetic_packed_kv",
+      "prefix": "noise_refiner.*.attention.packed_kv"
+    },
+    {
+      "shape": [
+        512,
+        2560,
+        4096
+      ],
+      "count": 36,
+      "kind": "actual_runtime_linear",
+      "prefix": "qwen3.layers.*.self_attn.o_proj"
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "noise_refiner.*.attention.to_k"
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "noise_refiner.*.attention.to_out.*"
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "noise_refiner.*.attention.to_q"
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "noise_refiner.*.attention.to_v"
+    },
+    {
+      "shape": [
+        32,
+        20480,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        32,
+        11520,
+        3840
+      ],
+      "count": 2,
+      "kind": "synthetic_packed_qkv",
+      "prefix": "context_refiner.*.attention.packed_qkv"
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        10240
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        32,
+        7680,
+        3840
+      ],
+      "count": 2,
+      "kind": "synthetic_packed_kv",
+      "prefix": "context_refiner.*.attention.packed_kv"
+    },
+    {
+      "shape": [
+        4128,
+        64,
+        3840
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        4096,
+        3840,
+        64
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "context_refiner.*.attention.to_k"
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "context_refiner.*.attention.to_out.*"
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "context_refiner.*.attention.to_q"
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        3840
+      ],
+      "count": 2,
+      "kind": "actual_runtime_linear",
+      "prefix": "context_refiner.*.attention.to_v"
+    },
+    {
+      "shape": [
+        32,
+        3840,
+        2560
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        15360,
+        256
+      ],
+      "count": 32,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        3840,
+        256
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        256
+      ],
+      "count": 1,
+      "kind": "actual_runtime_linear",
+      "prefix": ""
+    }
+  ]
+}

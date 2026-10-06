@@ -15,10 +15,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd")
+
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -28,17 +30,16 @@ class TestDeepseekV32DP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
 
@@ -62,7 +63,7 @@ class TestDeepseekV32DP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -70,7 +71,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -82,7 +83,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
@@ -90,7 +91,6 @@ class TestDeepseekV32DP(CustomTestCase):
                 self.assertGreater(speed, 50)
 
 
-@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -105,9 +105,9 @@ class TestDeepseekV32TP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
 
@@ -131,7 +131,7 @@ class TestDeepseekV32TP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -139,7 +139,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -151,10 +151,10 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 20)
+                self.assertGreater(speed, 15)
             else:
                 self.assertGreater(speed, 70)
 

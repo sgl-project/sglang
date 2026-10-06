@@ -148,12 +148,20 @@ class MMMUVLMEval(Eval):
                     options = None
 
             # Build final textual prompt; include choices if MC
-            prompt_text = f"Question: {question}\n\n"
+            prompt_text = f"{question}\n"
             if options:
                 letters = [chr(ord("A") + i) for i in range(len(options))]
                 for letter, opt in zip(letters, options):
-                    prompt_text += f"{letter}) {opt}\n"
-            prompt_text += "\nAnswer: "
+                    prompt_text += f"{letter}. {opt}\n"
+                prompt_text += (
+                    "\nAnswer the following multiple-choice question. "
+                    "The last line of your response should be of the "
+                    "following format: 'Answer: $LETTER' (without quotes) "
+                    "where LETTER is one of the options. "
+                    "Think step by step before answering."
+                )
+            else:
+                prompt_text += "\nAnswer: "
 
             samples.append(
                 {
@@ -330,6 +338,14 @@ def _parse_multi_choice_response(
     response: str, all_choices: List[str], index2ans: dict
 ) -> str:
     # loosely adapted from benchmark mmmu eval
+
+    # First, look for explicit "Answer: X" pattern (last occurrence)
+    answer_matches = re.findall(r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?", response)
+    if answer_matches:
+        candidate = answer_matches[-1]
+        if candidate in all_choices:
+            return candidate
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "
