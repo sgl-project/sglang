@@ -223,7 +223,7 @@ def test_target_only_sampling_cdf_boundaries(
 CHAIN_VOCAB, CHAIN_GAMMA, CHAIN_DRAFT = 64, 3, 7
 
 
-def _chain_verify(target_probs, draft_probs, candidates, coin, final_coin):
+def _chain_verify(target_probs, draft_probs, candidates, coin, final_coin, block):
     batch, slots = candidates.shape
     predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device="cuda")
     accept_token_num = torch.empty((batch,), dtype=torch.int32, device="cuda")
@@ -244,11 +244,12 @@ def _chain_verify(target_probs, draft_probs, candidates, coin, final_coin):
         threshold_single=1.0,
         threshold_acc=1.0,
         deterministic=True,
+        block_verification=block,
     )
     return accept_token_num, predicts
 
 
-def _chain_verify_constant_draft(draft_q, target_p, coin, final_coin=0.5):
+def _chain_verify_constant_draft(draft_q, target_p, coin, block, final_coin=0.5):
     target_probs = torch.zeros((1, CHAIN_GAMMA + 1, CHAIN_VOCAB), device="cuda")
     target_probs[:, :, CHAIN_DRAFT] = target_p
     target_probs[:, :, CHAIN_DRAFT + 1] = 1.0 - target_p
@@ -258,39 +259,45 @@ def _chain_verify_constant_draft(draft_q, target_p, coin, final_coin=0.5):
         (1, CHAIN_GAMMA + 1), CHAIN_DRAFT, dtype=torch.int64, device="cuda"
     )
     accept_token_num, predicts = _chain_verify(
-        target_probs, draft_probs, candidates, coin, final_coin
+        target_probs, draft_probs, candidates, coin, final_coin, block
     )
     return accept_token_num.item(), predicts[0].item()
 
 
+@pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize("overshoot", [2**-23, 5e-4])
-def test_chain_verify_accepts_q_rounded_above_one(overshoot):
+def test_chain_verify_accepts_q_rounded_above_one(overshoot, block):
     """A draft q that rounds slightly above 1 must be read as 1, not rejected."""
     num_accept, _ = _chain_verify_constant_draft(
-        1.0 + overshoot, target_p=1.0, coin=1.0 - 2**-24
+        1.0 + overshoot, target_p=1.0, coin=1.0 - 2**-24, block=block
     )
     assert num_accept == CHAIN_GAMMA
 
 
+@pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize(
     "draft_q", [0.0, float("nan"), float("-inf"), float("inf"), 2.0]
 )
-def test_chain_verify_rejects_non_probability_q(draft_q):
+def test_chain_verify_rejects_non_probability_q(draft_q, block):
     """A draft q that is not a probability must never be accepted."""
-    num_accept, _ = _chain_verify_constant_draft(draft_q, target_p=1.0, coin=0.5)
+    num_accept, _ = _chain_verify_constant_draft(
+        draft_q, target_p=1.0, coin=0.5, block=block
+    )
     assert num_accept == 0
 
 
-def test_chain_verify_residual_excludes_rounded_draft_token():
+@pytest.mark.parametrize("block", [False, True])
+def test_chain_verify_residual_excludes_rounded_draft_token(block):
     """After rejecting a draft whose q rounds above 1, (p - q)+ has no mass on it."""
     num_accept, bonus = _chain_verify_constant_draft(
-        1.0 + 8e-6, target_p=0.5, coin=0.99, final_coin=0.25
+        1.0 + 8e-6, target_p=0.5, coin=0.99, block=block, final_coin=0.25
     )
     assert num_accept == 0
     assert bonus == CHAIN_DRAFT + 1
 
 
-def test_chain_verify_accepts_flashinfer_softmax_draft_equal_to_target():
+@pytest.mark.parametrize("block", [False, True])
+def test_chain_verify_accepts_flashinfer_softmax_draft_equal_to_target(block):
     """DSpark's FlashInfer softmax probabilities, used as both p and q, accept every draft."""
     softmax = pytest.importorskip("flashinfer.sampling").softmax
     batch, vocab = 16, 32000
@@ -309,6 +316,7 @@ def test_chain_verify_accepts_flashinfer_softmax_draft_equal_to_target():
         candidates,
         coin=0.999,
         final_coin=0.5,
+        block=block,
     )
     assert (accept_token_num == CHAIN_GAMMA).all(), accept_token_num.tolist()
 
