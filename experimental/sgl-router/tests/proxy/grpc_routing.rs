@@ -599,19 +599,20 @@ async fn router_stream_failures_keep_their_error_code() {
         })
         .start()
         .await;
-    let proxy = Proxy::new(Duration::from_secs(5))
+    // Both the request timeout and the stream idle timeout.
+    let proxy = Proxy::new(Duration::from_millis(100))
         .unwrap()
         .with_stream_idle_timeout(Duration::from_millis(100));
     let workers = [(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))];
     let mut client = serve_grpc(router_ctx_with(&workers, false, proxy)).await;
 
-    let result = collect(client.chat_complete(openai(chat(true))).await).await;
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), Code::DeadlineExceeded);
-    assert_eq!(
-        status.metadata().get("x-router-error-code").unwrap(),
-        "upstream_timeout"
-    );
+    for stream in [true, false] {
+        let result = collect(client.chat_complete(openai(chat(stream))).await).await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded, "stream={stream}");
+        let code = status.metadata().get("x-router-error-code");
+        assert_eq!(code.unwrap(), "upstream_timeout", "stream={stream}");
+    }
 }
 
 #[tokio::test]
