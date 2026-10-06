@@ -25,6 +25,7 @@ Mirrors `test_paged_free_segment.py`, which pins the same properties for
 """
 
 import ast
+import importlib.util
 import inspect
 import textwrap
 import unittest
@@ -32,7 +33,9 @@ from unittest import mock
 
 import torch
 from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
+from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -49,6 +52,39 @@ def _paged_allocator(lazy: bool):
     _pool, full, _swa, _fkv, _skv = inst._build()
     full.lazy_compaction = lazy
     return full
+
+
+_aten = torch.ops.aten
+
+# Output shape depends on tensor values: on CUDA each one copies a count to the
+# host and blocks it until the stream drains.
+_SHAPE_SYNC_OPS = {
+    _aten.nonzero.default,
+    _aten.masked_select.default,
+    _aten._local_scalar_dense.default,
+    _aten._unique2.default,
+    _aten.unique_dim.default,
+    _aten.unique_consecutive.default,
+}
+_INDEX_OPS = {_aten.index.Tensor, _aten.index_put.default, _aten.index_put_.default}
+
+
+class _ShapeSyncRecorder(TorchDispatchMode):
+    """Records every host-syncing op a call dispatches. A boolean-mask index is
+    one: its `nonzero` runs inside the index kernel, below this mode."""
+
+    def __init__(self):
+        super().__init__()
+        self.hits = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in _SHAPE_SYNC_OPS or (
+            func in _INDEX_OPS
+            and any(i is not None and i.dtype == torch.bool for i in args[1])
+        ):
+            self.hits.append(str(func))
+        return func(*args, **kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -387,7 +423,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
 
     PS = 4
 
-    def _swa_composite(self, lazy=True):
+    def _swa_composite(self, lazy=True, ps=None):
         from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
@@ -400,7 +436,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             sub_pool_specs=[full, swa],
             device="cpu",
             enable_memory_saver=False,
-            page_size=self.PS,
+            page_size=ps or self.PS,
         )
 
         class _KV:
@@ -417,7 +453,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             device="cpu",
             full_max_total_num_tokens=64,
             swa_max_total_num_tokens=64,
-            page_size=self.PS,
+            page_size=ps or self.PS,
             need_sort=False,
             forward_stream=None,
             lazy_compaction=lazy,
@@ -489,13 +525,58 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                     a2.swa_attn_allocator.schedulable_available_size(),
                 )
 
-    def test_double_ratchet_is_filtered_not_crashed(self):
-        """Freeing an already-tombstoned range again must no-op through the
-        liveness filter (radix eviction and the ratchet can overlap)."""
+    def test_segment_frees_dispatch_no_data_dependent_shape(self):
+        """Bug regression: the ratchet, a request's release and a tree eviction
+        must not filter by liveness on the device; a boolean-mask index blocks
+        the scheduler on the in-flight forward at every prefill."""
+        recorder = _ShapeSyncRecorder()
+        with recorder:
+            torch.arange(4)[torch.arange(4) > 1]
+        self.assertEqual(len(recorder.hits), 1, "the recorder went blind")
+        for ps in (1, self.PS):
+            with self.subTest(page_size=ps):
+                alloc = self._swa_composite(lazy=True, ps=ps)
+                full_before = alloc.full_available_size()
+                swa_before = alloc.swa_available_size()
+                v = alloc.alloc(8 * ps)
+                recorder = _ShapeSyncRecorder()
+                with recorder:
+                    alloc.free_swa_segment(v[: 2 * ps], start_pos=0)
+                    alloc.free_group_begin()
+                    alloc.free_full_segment(v[: 2 * ps], start_pos=0)
+                    alloc.free_segment(v[2 * ps : 5 * ps], start_pos=2 * ps)
+                    alloc.free_group_end()
+                    alloc.free_segment(v[5 * ps :], start_pos=5 * ps)
+                self.assertEqual(recorder.hits, [])
+                self.assertEqual(alloc.full_available_size(), full_before)
+                self.assertEqual(alloc.swa_available_size(), swa_before)
+
+    def test_a_double_ratchet_is_reported(self):
+        """A segment free trusts its caller that the swa pages are bound (the
+        ratchet's cursor only moves up); a second free must be loud under
+        strict checks, not corrupt the swa hole list."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(4 * self.PS)
         alloc.free_swa_segment(v, start_pos=0)
-        alloc.free_swa_segment(v, start_pos=0)  # all tombstoned -> filtered to empty
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            with self.assertRaises(RuntimeError):
+                alloc.free_swa_segment(v, start_pos=0)
+
+    def test_a_full_only_free_of_a_bound_swa_page_is_reported(self):
+        """`free_full_segment` releases the full side only; a swa page still
+        bound under it would leak, so the caller wanted `free_segment`."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(4 * self.PS)
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            with self.assertRaises(RuntimeError):
+                alloc.free_full_segment(v, start_pos=0)
+
+    def test_importing_the_module_again_registers_nothing_twice(self):
+        """A fixture that patches `sys.modules` drops the modules first imported
+        under the patch, so the next test imports them again; the invariant
+        registry refuses a name it already holds."""
+        spec = importlib.util.find_spec(unified_hybrid_swa.__name__)
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 
 @unittest.skipUnless(
