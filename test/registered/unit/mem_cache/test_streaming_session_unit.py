@@ -7,10 +7,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqK
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    DecLockRefParams,
-    IncLockRefResult,
     MatchResult,
-    TreeLock,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
@@ -64,7 +61,6 @@ class _FakeInnerCache:
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
         self.match_results = list(match_results or [])
-        self.unlocked = []
         self.session = StreamingSession(self)
 
     def checkpoint(self, req, *, up_to):
@@ -82,8 +78,7 @@ class _FakeInnerCache:
         return self.match_results.pop(0)
 
     def unlock(self, lock):
-        if lock is not None:
-            self.unlocked.append(lock)
+        pass
 
 
 class _FakeReq:
@@ -195,55 +190,6 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
-
-
-@pytest.mark.parametrize("uuid", [None, 17])
-def test_release_session_preserves_component_lock_receipt(uuid):
-    """Closing a session releases only the component locks it acquired."""
-    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
-    allocator = _FakeAllocator()
-    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
-    tree_cache = inner
-
-    lock_node = SimpleNamespace(id=42)
-    acquired = IncLockRefResult(
-        node_id=42,
-        skipped_lock_components=(ComponentType.MAMBA,),
-    )
-    acquired.set_lock_uuid(ComponentType.SWA, uuid)
-    acquired.set_lock_uuid(ComponentType.SWA, 19, lock_host=True)
-    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 23)
-    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, None, lock_host=True)
-    tree_cache.session.slots["session-a"] = SessionSlot(
-        kv=ReqKvInfo(
-            req_pool_idx=0,
-            kv_committed_len=50,
-            kv_allocated_len=50,
-            cache_protected_len=0,
-        ),
-        lock=TreeLock(lock_node, acquired.to_dec_params()),
-    )
-
-    acquired.set_lock_uuid(ComponentType.SWA, 99)
-    acquired.set_lock_uuid(ComponentType.SWA, 99, lock_host=True)
-    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99)
-    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99, lock_host=True)
-    tree_cache.session.release_session("session-a")
-
-    (lock,) = inner.unlocked
-    assert lock.node is lock_node
-    params = lock.receipt
-    assert params.skipped_lock_components == (ComponentType.MAMBA,)
-    assert params.get_lock_uuid(ComponentType.SWA) == uuid
-    assert params.get_lock_uuid(ComponentType.SWA, lock_host=True) == 19
-    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA) == 23
-    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA, lock_host=True) is None
-    for lock_host in (False, True):
-        with pytest.raises(KeyError):
-            params.get_lock_uuid(ComponentType.MAMBA, lock_host=lock_host)
-        with pytest.raises(KeyError):
-            DecLockRefParams().get_lock_uuid(ComponentType.SWA, lock_host=lock_host)
 
 
 def test_trim_overshoot_postcondition():

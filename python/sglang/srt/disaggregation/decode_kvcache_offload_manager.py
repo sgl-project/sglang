@@ -337,7 +337,7 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (double free, double unpin).
+        # non-idempotent side effects (double free, double unlock).
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 

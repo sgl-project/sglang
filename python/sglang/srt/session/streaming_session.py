@@ -278,8 +278,6 @@ class StreamingSession:
     # -- Internal helpers (streaming body bits) --
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
-        """Move the request's tree lock to the slot; the request is left on the
-        slot's virtual node and holds no lock of its own."""
         slot.lock, req.lock = req.lock, None
         req.last_node = slot.virtual_node
 

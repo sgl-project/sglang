@@ -228,7 +228,7 @@ class DecodeHiCacheTransferMixin:
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device
-        # boundary; the req's lock is still on pm.last_device_node.
+        # boundary; point it back at the prefix the prealloc matched and locked.
         dr.req.last_node = pm.last_device_node
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
@@ -308,7 +308,6 @@ class DecodeHiCacheTransferMixin:
         req = decode_req.req
         restore_lock = decode_req.hicache_restore_lock
         assert restore_lock is not None
-        # Release the preallocation's lock before installing the restored one.
         self.tree_cache.unlock(req.lock)
 
         self.tree_cache.req_to_token_pool.write(

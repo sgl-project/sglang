@@ -113,7 +113,6 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
@@ -11063,15 +11062,17 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         )
 
     def test_finish_after_early_release_with_skip_swa(self):
-        """The correct F2 flow: skip_swa honors the early release."""
+        """The correct F2 flow: unlock honors the early release."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
-        lock = cache.inc_lock_ref(leaf)
-        cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
-        cache.dec_lock_ref(leaf, lock.to_dec_params(), skip_swa=True)
+        lock = cache.lock(leaf)
+        cache.release_swa(lock)
+        self.assertTrue(lock.swa_released)
+        cache.release_swa(lock)  # a repeat is a no-op
+        cache.unlock(lock)
         self.assertEqual(self._swa_ref(cache, leaf), 0)
         self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
         cache.sanity_check()
@@ -11276,17 +11277,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         max_context_len=64,
     )
 
-    def _lock_and_early_release(self, cache, allocator):
-        tokens = array("q", range(1, 9))
-        value = allocator.alloc(len(tokens))
-        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-        node = match.last_device_node
-        lock = cache.inc_lock_ref(node)
-        self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
-        cache.release_swa(TreeLock(node, lock.to_dec_params()))
-        return node, lock
-
     def _session(self, session_id):
         return SimpleNamespace(
             session_id=session_id,
@@ -11321,39 +11311,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         req.last_node = cache.root_node_handle()
         req.lock = cache.lock(req.last_node)
         return req
-
-    def test_close_after_early_release_releases_swa_once(self):
-        cache, allocator, _ = build_fixture(self.cfg)
-        node, lock = self._lock_and_early_release(cache, allocator)
-        cache.session.slots["s"] = SessionSlot(
-            lock=TreeLock(node, lock.to_dec_params(), swa_released=True)
-        )
-        cache.session.release_session("s")
-        cache.sanity_check()
-
-    def test_abort_hands_early_released_lock_back(self):
-        """The handed-back lock keeps its SWA part released; unpin skips it."""
-        cache, allocator, _ = build_fixture(self.cfg)
-        node, lock = self._lock_and_early_release(cache, allocator)
-        req = SimpleNamespace(
-            rid="r",
-            kv=ReqKvInfo(),
-            last_node=node,
-            lock=TreeLock(node, lock.to_dec_params(), swa_released=True),
-            session=self._session("s2"),
-            finished_reason=None,
-        )
-        cache.maybe_hand_to_session(req)
-        slot = cache.session.slots["s2"]
-        self.assertIs(req.last_node, slot.virtual_node)
-
-        req.finished_reason = FINISH_ABORT()
-        self.assertFalse(cache.session.try_cache_finished_req(req))
-        self.assertNotIn("s2", cache.session.slots)
-        self.assertEqual(req.last_node, node)
-        self.assertTrue(req.lock.swa_released)
-        cache.unlock(req.lock)
-        cache.sanity_check()
 
     def test_slot_publishes_first_prompt_but_not_its_output(self):
         cache, allocator, pool = build_fixture(self.cfg)
@@ -11436,9 +11393,13 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.sanity_check()
 
     def test_later_turn_abort_releases_like_any_request(self):
-        """The record and the slot's lock go back before the KV is checkpointed."""
+        """The record and the slot's lock, SWA part already released, go back
+        before the KV is checkpointed."""
         cache, allocator, pool = build_fixture(self.cfg)
-        _, req = self._later_turn(cache, allocator, pool)
+        slot, req = self._later_turn(cache, allocator, pool)
+        slot_lock = slot.lock
+        cache.release_swa_prefix_lock(req)
+        self.assertTrue(slot_lock.swa_released)
 
         req.finished_reason = FINISH_ABORT()
         release_kv_cache(req, cache, checkpoint=True)

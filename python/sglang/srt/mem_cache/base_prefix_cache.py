@@ -242,9 +242,8 @@ class DecLockRefParams:
 
 @dataclasses.dataclass
 class TreeLock:
-    """A tree lock one holder (a request, a session slot) took on ``node``.
-    ``receipt`` replays the acquire on release; ``swa_released`` marks its SWA
-    part released early, so neither release takes it twice."""
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
 
     node: Any
     receipt: DecLockRefParams

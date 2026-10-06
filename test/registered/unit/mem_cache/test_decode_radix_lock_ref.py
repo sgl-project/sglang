@@ -11,7 +11,7 @@ transfer scenarios identified in PR #19746:
    inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
-   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache checkpoint=False)
+   lock(pop_preallocated) -> unlock(release_kv_cache checkpoint=False)
 
 4. Full transfer & failure (prefix match == 0, transfer fails)
    no inc_lock_ref -> dec(root_node) is no-op since root lock_ref starts at 1
@@ -246,7 +246,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         prefix_len = len(result.device_indices)
         self.assertEqual(prefix_len, 3)
 
-        # Step 1: inc_lock_ref (pop_preallocated locks the matched node)
+        # Step 1: lock (pop_preallocated locks the matched node)
         lock = cache.lock(matched_node)
         self.assertGreater(matched_node.lock_ref, 0)
 
@@ -296,7 +296,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # matched_node is root
 
         root_lock_before = cache.root_node.lock_ref
-        # Step 1: inc_lock_ref on root (simulates get_new_prebuilt_batch)
+        # Step 1: lock root (simulates get_new_prebuilt_batch)
         # Note: inc/dec_lock_ref skip the root node (while node != root_node),
         # so this is a no-op. Root always keeps lock_ref=1.
         lock = cache.lock(matched_node)
@@ -332,8 +332,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         The final committed KV slot has no corresponding output token. Cleanup
         must preserve the matched prefix and release the full request-owned suffix.
 
-        Flow: inc_lock_ref(pop_preallocated)
-              -> dec_lock_ref(unpin via release_kv_cache checkpoint=False)
+        Flow: lock(pop_preallocated)
+              -> unlock(release_kv_cache checkpoint=False)
         """
         cache, req_to_token = _make_cache_with_pools()
 
@@ -448,7 +448,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         matched_node = result.last_device_node
         self.assertIs(matched_node, cache.root_node)
 
-        # inc_lock_ref(root) is a no-op
+        # lock(root) is a no-op
         lock = cache.lock(matched_node)
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
 
@@ -523,7 +523,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
         queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
         queue.tree_cache = MagicMock()
-        queue.tree_cache.dec_lock_ref = MagicMock()
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
         # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
@@ -568,6 +567,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.release_swa.assert_called_once_with(lock)
         queue.tree_cache.unlock.assert_called_once_with(lock)
+        lock_calls = [
+            name
+            for name, _, _ in queue.tree_cache.method_calls
+            if name in ("release_swa", "unlock")
+        ]
+        self.assertEqual(lock_calls, ["release_swa", "unlock"])
         self.assertIsNone(req.lock)
         queue._swa_tail_len.assert_called_with(8)
         queue._allocatable_token_budgets.assert_called_once()
@@ -586,7 +591,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         prealloc_lock = TreeLock(
             prealloc_node,
             DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
-            swa_released=True,
         )
         req.lock = prealloc_lock
         decode_req = MagicMock()
