@@ -209,10 +209,7 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
             "no EPLB": not get_exec().moe.enable_eplb,
             "MoE DP size 1": get_parallel().moe_dp_size == 1,
             "supported shared expert layout": layer.num_fused_shared_experts in (0, 1)
-            and not (
-                layer.num_fused_shared_experts == 1
-                and layer.is_nextn
-            ),
+            and not (layer.num_fused_shared_experts == 1 and layer.is_nextn),
             "no replicated shared expert": not layer._shared_expert_tp1,
             "no SBO shared-expert fusion": not layer._fuse_shared_experts_inside_sbo,
             "positive routed scaling": isinstance(
