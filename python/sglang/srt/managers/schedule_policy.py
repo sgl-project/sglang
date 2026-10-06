@@ -1127,7 +1127,10 @@ class PrefillAdder:
         )
 
     def _align_prefill_chunk(
-        self, prefix_len: int, extend_len: int, truncation_align_size: Optional[int] = None
+        self,
+        prefix_len: int,
+        extend_len: int,
+        truncation_align_size: Optional[int] = None,
     ) -> int:
         """Align an unfinished chunk's absolute end to the cache requirement.
 
