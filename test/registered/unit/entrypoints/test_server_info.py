@@ -106,6 +106,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    scheduler_info: dict | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -128,7 +129,7 @@ def _call_server_info_with(
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
-        scheduler_info={"max_req_input_len": 1024},
+        scheduler_info=scheduler_info or {"max_req_input_len": 1024},
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
@@ -631,6 +632,40 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
                     load_publish_endpoint=endpoint,
                 )
                 check_load_publish_args(args)  # must not raise
+
+
+class TestServerInfoHicacheLayoutField(CustomTestCase):
+    """The scheduler-reported L3 layout surfaces in `/server_info`."""
+
+    def test_layout_from_scheduler_info_is_surfaced(self):
+        args = ServerArgs(model_path="dummy")
+        layout = {
+            "enabled": True,
+            "backend": "mooncake",
+            "page_size": 256,
+            "hicache_object_layout": {
+                "pools": [],
+                "key_prefix": "deepseek-ai-DeepSeek-V4",
+            },
+        }
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "hicache_object_layout": layout,
+            },
+        )
+
+        self.assertEqual(info["hicache_object_layout"], layout)
+        json.dumps(info)
+
+    def test_layout_absent_without_hierarchical_cache(self):
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        self.assertNotIn("hicache_object_layout", info)
 
 
 if __name__ == "__main__":

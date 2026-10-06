@@ -146,6 +146,8 @@ from sglang.srt.managers.io_struct import (
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -1788,6 +1790,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1825,6 +1828,9 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+
+        if self.enable_hierarchical_cache:
+            result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
         return result_dict
 
@@ -5222,6 +5228,46 @@ class Scheduler(
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)
+
+    def _hicache_l3_layout(self) -> dict:
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        layout = {
+            "enabled": False,
+            "backend": None,
+            "hicache_object_layout": {"pools": []},
+        }
+        tree_cache = getattr(self, "tree_cache", None)
+        controller = getattr(tree_cache, "cache_controller", None)
+        storage_backend = getattr(controller, "storage_backend", None)
+        if (
+            self.enable_hierarchical_cache
+            and get_memory().hicache_storage_backend == "mooncake"
+            and storage_backend is not None
+            and hasattr(storage_backend, "describe_l3_object_layout")
+        ):
+            swa = getattr(tree_cache, "components", {}).get(ComponentType.SWA)
+            layout = storage_backend.describe_l3_object_layout(
+                sidecar_pool_specs=getattr(tree_cache, "sidecar_pool_specs", []),
+                swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+                page_size=self.page_size,
+            )
+            layout["enabled"] = True
+        else:
+            # A silently empty layout looks identical to a key mismatch on the
+            # router side, so name the reason the L3 view is unavailable.
+            logger.debug(
+                "No HiCache L3 layout to report: hierarchical=%s storage_backend=%s store=%s",
+                self.enable_hierarchical_cache,
+                get_memory().hicache_storage_backend,
+                type(storage_backend).__name__ if storage_backend else None,
+            )
+        return layout
+
+    def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+        return GetHiCacheL3LayoutReqOutput(
+            layout=msgspec_to_builtins(self._hicache_l3_layout())
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
