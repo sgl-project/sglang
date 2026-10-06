@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -31,6 +31,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
         # full->SWA translated out_cache_loc, computed once per forward
         self.swa_out_cache_loc = None
+        self._fresh_prefill_shape: Optional[tuple[int, int]] = None
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -49,6 +50,29 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._fresh_prefill_shape = None
+        if (
+            torch.device(self.device).type == "mps"
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.batch_size > 1
+            and forward_batch.encoder_lens is None
+            and forward_batch.spec_info is None
+        ):
+            # Use scheduler-owned host metadata once per batch. Reading these
+            # lengths from MPS inside every layer would synchronize the GPU.
+            lengths = forward_batch.extend_seq_lens_cpu
+            prefixes = forward_batch.extend_prefix_lens_cpu
+            batch_size = forward_batch.batch_size
+            if (
+                lengths is not None
+                and prefixes is not None
+                and len(lengths) == len(prefixes) == batch_size
+                and lengths[0] > 0
+                and all(length == lengths[0] for length in lengths)
+                and not any(prefixes)
+                and forward_batch.input_ids.shape[0] == batch_size * lengths[0]
+            ):
+                self._fresh_prefill_shape = (batch_size, lengths[0])
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.swa_out_cache_loc = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -304,6 +328,45 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        if (
+            self._fresh_prefill_shape is not None
+            and save_kv_cache
+            and k is not None
+            and v is not None
+            and layer.attn_type == AttentionType.DECODER
+            and not layer.is_cross_attention
+            and not self.use_sliding_window_kv_pool
+            and not self.token_to_kv_pool.is_quantized_kv_cache
+            and layer.sliding_window_size in (None, -1)
+            and layer.qk_head_dim == layer.v_head_dim
+            and q_.device.type == "mps"
+            and q_.shape[0]
+            == self._fresh_prefill_shape[0] * self._fresh_prefill_shape[1]
+            and q.dtype == k.dtype == v.dtype == self.token_to_kv_pool.dtype
+        ):
+            # Each prompt attends only to its own freshly computed K/V. Cache
+            # writes above still preserve the ordinary decode/prefix-hit path.
+            batch_size, seq_len = self._fresh_prefill_shape
+            batched_q = q_.reshape(
+                batch_size, seq_len, layer.tp_q_head_num, layer.qk_head_dim
+            ).transpose(1, 2)
+            batched_k = k.reshape(
+                batch_size, seq_len, layer.tp_k_head_num, layer.qk_head_dim
+            ).transpose(1, 2)
+            batched_v = v.reshape(
+                batch_size, seq_len, layer.tp_v_head_num, layer.v_head_dim
+            ).transpose(1, 2)
+            result = scaled_dot_product_attention(
+                batched_q,
+                batched_k,
+                batched_v,
+                enable_gqa=use_gqa,
+                scale=layer.scaling,
+                is_causal=True,
+            )
+            o_.copy_(result.transpose(1, 2).reshape_as(o_))
+            return o
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
