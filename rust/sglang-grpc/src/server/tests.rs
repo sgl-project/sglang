@@ -73,3 +73,83 @@ fn resolve_max_message_size_honors_env_var() {
         std::env::remove_var(VAR);
     }
 }
+
+#[tokio::test]
+async fn start_profile_preserves_optional_steps_and_rejects_nonpositive_limits() {
+    use crate::proto::sglang_service_server::SglangService;
+    use prost::Message;
+    use pyo3::prelude::*;
+    use pyo3::types::PyModule;
+    use std::sync::Arc;
+    use tonic::Request;
+
+    Python::initialize();
+    let handle = Python::attach(|py| {
+        PyModule::from_code(
+            py,
+            c"
+class Runtime:
+    def __init__(self):
+        self.calls = []
+
+    def start_profile(self, output_dir, callback, num_steps):
+        self.calls.append((output_dir, num_steps))
+        callback(b'{\"message\": \"Profiling started.\"}', finished=True)
+",
+            c"profile_test.py",
+            c"profile_test",
+        )
+        .unwrap()
+        .getattr("Runtime")
+        .unwrap()
+        .call0()
+        .unwrap()
+        .unbind()
+    });
+    let service = super::SglangServiceImpl {
+        bridge: Arc::new(crate::bridge::PyBridge::new(
+            Python::attach(|py| handle.clone_ref(py)),
+            None,
+            1024,
+            16,
+            tokio::runtime::Handle::current(),
+        )),
+        response_timeout: std::time::Duration::from_secs(5),
+    };
+    // Empty bytes are a valid legacy request with no optional fields.
+    let legacy = crate::proto::StartProfileRequest::decode(&[][..]).unwrap();
+    assert_eq!(legacy.num_steps, None);
+    service.start_profile(Request::new(legacy)).await.unwrap();
+    for steps in [1, 10, i32::MAX] {
+        let request = crate::proto::StartProfileRequest {
+            output_dir: Some("/tmp/profile".into()),
+            num_steps: Some(steps),
+        };
+        let decoded =
+            crate::proto::StartProfileRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        service.start_profile(Request::new(decoded)).await.unwrap();
+    }
+    for steps in [0, -1, i32::MIN] {
+        let error = service
+            .start_profile(Request::new(crate::proto::StartProfileRequest {
+                output_dir: None,
+                num_steps: Some(steps),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+    Python::attach(|py| {
+        let calls: Vec<(Option<String>, Option<i32>)> =
+            handle.getattr(py, "calls").unwrap().extract(py).unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                (None, None),
+                (Some("/tmp/profile".into()), Some(1)),
+                (Some("/tmp/profile".into()), Some(10)),
+                (Some("/tmp/profile".into()), Some(i32::MAX)),
+            ]
+        );
+    });
+}
