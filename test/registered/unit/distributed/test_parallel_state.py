@@ -172,6 +172,95 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def test_quick_allreduce_precedes_custom_allreduce_and_symmetric_memory():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.unique_name = "test"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.pymscclpp_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator._fi_workspace_hint = None
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.qr_comm.should_quick_allreduce.return_value = True
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
+    coordinator.debug_check_symmetric_mempool = Mock()
+    input_ = Mock(is_cpu=False)
+    quick_output = object()
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(
+            parallel_state, "outplace_all_reduce", return_value=quick_output
+        ) as outplace_all_reduce,
+    ):
+        output = coordinator.all_reduce(input_)
+
+    assert output is quick_output
+    outplace_all_reduce.assert_called_once_with(
+        input_,
+        group_name="test",
+        outplace_all_reduce_method="qr",
+    )
+    coordinator.ca_comm.should_custom_ar.assert_called_once_with(input_)
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
+
+
+def test_auto_outplace_resolution_prefers_quick_allreduce():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.qr_comm.should_quick_allreduce.return_value = True
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.pynccl_comm = None
+    input_ = Mock()
+
+    with patch.object(parallel_state, "is_hip", return_value=True):
+        method = coordinator._resolve_outplace_all_reduce_method(input_)
+
+    assert method == "qr"
+
+
+def test_destroy_closes_quick_allreduce_before_process_groups():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    events = []
+    coordinator.pcie_ipc_comm = None
+    coordinator.qr_comm = Mock()
+    coordinator.qr_comm.close.side_effect = lambda: events.append("qr")
+    coordinator.device_group = "device"
+    coordinator.cpu_group = "cpu"
+    coordinator.pynccl_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.ca_comm = None
+    coordinator.mq_broadcaster = None
+
+    with patch.object(
+        parallel_state.torch.distributed,
+        "destroy_process_group",
+        side_effect=lambda group: events.append(group),
+    ):
+        coordinator.destroy()
+
+    assert events == ["qr", "device", "cpu"]
+    assert coordinator.qr_comm is None
+
+
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
 def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """

@@ -59,6 +59,16 @@ QUICK_REDUCE_IMPLEMENTATIONS = (
     "qr-int4",
     "qr-int3",
 )
+QUICK_REDUCE_RELATIVE_L2_LIMITS = {
+    "qr-fp8": 0.15,
+    "qr-int6": 0.20,
+    "qr-int4": 0.35,
+    "qr-int3": 0.50,
+}
+
+
+def is_aiter_implementation(name: str) -> bool:
+    return name == "aiter" or name.startswith("qr-")
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,6 +336,28 @@ def correctness_tolerances(
     return 1e-2, 1e-2
 
 
+def assert_correct_output(
+    name: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    dtype: torch.dtype,
+    world_size: int,
+) -> None:
+    rtol, atol = correctness_tolerances(name, dtype, world_size)
+    torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
+    relative_l2_limit = QUICK_REDUCE_RELATIVE_L2_LIMITS.get(name)
+    if relative_l2_limit is None:
+        return
+    error = torch.linalg.vector_norm(actual.float() - reference.float())
+    reference_norm = torch.linalg.vector_norm(reference.float())
+    relative_l2 = error / reference_norm.clamp_min(torch.finfo(torch.float32).tiny)
+    if not torch.isfinite(relative_l2) or relative_l2.item() > relative_l2_limit:
+        raise AssertionError(
+            f"{name} relative L2 error {relative_l2.item():.6f} exceeds "
+            f"{relative_l2_limit:.6f}"
+        )
+
+
 def align_ranks(
     reference_pg: Optional[dist.ProcessGroup],
     control_pg: dist.ProcessGroup,
@@ -358,11 +390,12 @@ def check_correctness(
     torch.cuda.synchronize()
     local_ok = torch.ones(1, dtype=torch.int32)
     try:
-        torch.testing.assert_close(
+        assert_correct_output(
+            name,
             out,
             reference,
-            rtol=correctness_tolerances(name, inp.dtype, dist.get_world_size())[0],
-            atol=correctness_tolerances(name, inp.dtype, dist.get_world_size())[1],
+            inp.dtype,
+            dist.get_world_size(),
         )
     except AssertionError as exc:
         local_ok.zero_()
@@ -505,8 +538,13 @@ def bench_graph(
             torch.cuda.synchronize()
             local_ok = torch.ones(1, dtype=torch.int32)
             try:
-                rtol, atol = correctness_tolerances(name, dtype, dist.get_world_size())
-                torch.testing.assert_close(graph_out, reference, rtol=rtol, atol=atol)
+                assert_correct_output(
+                    name,
+                    graph_out,
+                    reference,
+                    dtype,
+                    dist.get_world_size(),
+                )
             except AssertionError:
                 local_ok.zero_()
             dist.all_reduce(local_ok, op=dist.ReduceOp.MIN, group=pg)
@@ -971,10 +1009,11 @@ def build_sweep_jobs(
     jobs = []
     for tp in tp_values:
         for mode in modes:
-            if mode != "graph" or "aiter" not in impls:
+            aiter_impls = [name for name in impls if is_aiter_implementation(name)]
+            if mode != "graph" or not aiter_impls:
                 jobs.append((tp, mode, impls, f"tp{tp}_{mode}_{args.dtype}", None))
                 continue
-            non_aiter = [name for name in impls if name != "aiter"]
+            non_aiter = [name for name in impls if not is_aiter_implementation(name)]
             if non_aiter:
                 jobs.append(
                     (
@@ -985,16 +1024,17 @@ def build_sweep_jobs(
                         None,
                     )
                 )
-            for size_bytes in get_message_sizes(args.min_size_kb, args.max_size_mb):
-                jobs.append(
-                    (
-                        tp,
-                        mode,
-                        ["aiter"],
-                        f"tp{tp}_{mode}_{args.dtype}_aiter_{size_bytes}b",
-                        size_bytes,
+            for name in aiter_impls:
+                for size_bytes in get_message_sizes(args.min_size_kb, args.max_size_mb):
+                    jobs.append(
+                        (
+                            tp,
+                            mode,
+                            [name],
+                            (f"tp{tp}_{mode}_{args.dtype}_{name}_{size_bytes}b"),
+                            size_bytes,
+                        )
                     )
-                )
     return jobs
 
 
@@ -1105,7 +1145,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     max_size = max(max(sizes), args.comm_buffer_mb * 1024 * 1024)
     results: Dict[str, List[Tuple[int, Optional[float]]]] = {}
     for name in impls:
-        if args.mode == "graph" and name == "aiter":
+        if args.mode == "graph" and is_aiter_implementation(name):
             isolated = []
             for size in sizes:
                 comm = construct_impl(name, pg, reference_pg, device, max_size, args)
