@@ -267,6 +267,12 @@ request's `--stale-request-timeout-secs` deadline, and none starts after it. Whe
 every eligible worker has failed, the client gets the last failure.
 `sgl_router_retries_total` counts the retried attempts.
 
+Each retry first waits out a jittered exponential backoff: a random delay in
+`[d/2, d]`, where `d` starts at `--retry-initial-backoff-ms` (default 50),
+doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
+Set the initial backoff to 0 to retry immediately. A backoff never waits past
+the request's stale deadline.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its

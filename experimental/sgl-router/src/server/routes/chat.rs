@@ -159,8 +159,8 @@ impl<'a> ModelRouting<'a> {
     }
 
     /// Select workers for `request` and forward it to them. An attempt that
-    /// fails before any response reaches the client is retried on workers it
-    /// has not tried, up to `--retry-max-attempts`.
+    /// fails before any response reaches the client is retried, after a
+    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
     async fn dispatch(
         &self,
         ctx: &AppContext,
@@ -171,12 +171,19 @@ impl<'a> ModelRouting<'a> {
         let mut excluded = Vec::new();
         let mut failed = None;
         let mut duration = None;
-        for _ in 0..ctx.config.proxy.max_attempts.get() {
-            // A retry never starts past the request's stale deadline.
-            if failed.is_some()
-                && start.elapsed() >= ctx.router_inflight_load.stale_request_timeout()
-            {
-                break;
+        for attempt in 0..ctx.config.proxy.max_attempts.get() {
+            if attempt > 0 {
+                // A retry never starts past the request's stale deadline, so the
+                // backoff is capped by what remains of it. Backing off before
+                // selecting lets the pick see fresh breaker and load state.
+                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    break;
+                };
+                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+                if start.elapsed() >= deadline {
+                    break;
+                }
             }
             let workers = match self
                 .select_workers(ctx, &request, &headers, &excluded)
