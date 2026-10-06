@@ -409,6 +409,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_sliding_window_size=params.sliding_window_size,
                 swa_req_ring=is_swa_req_ring(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
+                dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
                 ),

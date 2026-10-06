@@ -19,6 +19,7 @@ KV caching events
 
 import atexit
 import enum
+import hashlib
 import logging
 import queue
 import threading
@@ -297,6 +298,42 @@ class BlockRemoved(KVCacheEvent):
 
 class AllBlocksCleared(KVCacheEvent):
     pass
+
+
+# The dynamo format publishes namespaced hashes as block hashes. If you change
+# this tag, all of these hashes change. unified_tree_core.rs has a Rust copy.
+_NAMESPACE_SEED_TAG = b"sglang-kv-event-namespace-v1"
+
+
+def kv_event_namespace_seed(
+    *, extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[bytes]:
+    """Return the seed for namespaced_block_hash, or None for no namespace."""
+    if extra_key is None and cache_salt is None:
+        return None
+    digest = hashlib.sha256(_NAMESPACE_SEED_TAG)
+    # The presence byte and the length prefix make ("a", "bc") and ("ab", "c") differ.
+    for part in (extra_key, cache_salt):
+        if part is None:
+            digest.update(b"\x00")
+            continue
+        encoded = part.encode("utf-8")
+        digest.update(b"\x01" + len(encoded).to_bytes(8, "little") + encoded)
+    return digest.digest()
+
+
+def namespaced_block_hash(block_hash: int, *, namespace_seed: Optional[bytes]) -> int:
+    """Return the namespaced hash of a published block hash.
+
+    If namespace_seed is None, the result is ``block_hash``. If not, the result is
+    the first 8 bytes of SHA-256(seed, block_hash as 8 big-endian bytes), as int64.
+    """
+    if namespace_seed is None:
+        return block_hash
+    digest = hashlib.sha256(
+        namespace_seed + block_hash.to_bytes(8, "big", signed=True)
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class KVEventBatch(EventBatch):

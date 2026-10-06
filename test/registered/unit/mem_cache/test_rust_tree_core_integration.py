@@ -20,6 +20,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1649,6 +1651,50 @@ def test_salted_events_match_python_hash_and_metadata_contract():
     core.evict_device_end(ComponentType.FULL)
     assert core.take_events() == [
         BlockRemoved(block_hashes=hashes, medium=StorageMedium.GPU)
+    ]
+
+
+def test_dynamo_format_events_match_python_hashes():
+    """In the dynamo format, the Rust tree publishes the Python namespaced hashes."""
+    lora_id = "a" * 32
+    core = _tree_core(
+        enable_kv_cache_events=True,
+        page_size=2,
+        dynamo_kv_event_format=True,
+    )
+    key = RadixKey(array("q", [1, 2, 7, 8]), extra_key="user-" + lora_id)
+    _pump_insert(
+        core,
+        InsertParams(key=key, value=torch.tensor([10, 11, 12, 13], dtype=torch.int64)),
+    )
+    token_only = [
+        hash_str_to_int64(value)
+        for value in mem_cache.get_hash_str(array("q", [1, 2, 7, 8]), None, 2)
+    ]
+    seed = kv_event_namespace_seed(extra_key=key.extra_key, cache_salt=None)
+    namespaced = [namespaced_block_hash(h, namespace_seed=seed) for h in token_only]
+    assert namespaced != token_only
+    assert core.take_events() == [
+        BlockStored(
+            block_hashes=namespaced,
+            parent_block_hash=None,
+            token_ids=[1, 2, 7, 8],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+        )
+    ]
+
+    tracker = {ComponentType.FULL: 0}
+    core.evict_device_start(ComponentType.FULL, 4)
+    candidate = core.evict_device_next_node(ComponentType.FULL, tracker).node_id
+    assert candidate is not None
+    evicted = core.evict_device_leaf(candidate, is_write_back=False)
+    evicted.device_frees.clear()
+    evicted.host_frees.clear()
+    core.evict_device_end(ComponentType.FULL)
+    assert core.take_events() == [
+        BlockRemoved(block_hashes=namespaced, medium=StorageMedium.GPU)
     ]
 
 

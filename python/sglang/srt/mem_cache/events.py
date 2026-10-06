@@ -25,6 +25,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
@@ -40,9 +42,16 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        dynamo_format: bool = False,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        self.dynamo_format = dynamo_format
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -103,6 +112,14 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
+    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+        # The default format publishes the hashes unchanged.
+        if not self.dynamo_format:
+            return None
+        return kv_event_namespace_seed(
+            extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
+        )
+
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None
     ) -> None:
@@ -115,7 +132,12 @@ class KVCacheEventRecorder:
             medium = StorageMedium.GPU
 
         event_hash_values = self._node_event_hash_values(node)
+        namespace_seed = self._namespace_seed(node)
         parent_block_hash = self._parent_block_hash(node)
+        if parent_block_hash is not None:
+            parent_block_hash = namespaced_block_hash(
+                parent_block_hash, namespace_seed=namespace_seed
+            )
 
         page_index = 0
         logical_len = len(node.key)
@@ -131,7 +153,10 @@ class KVCacheEventRecorder:
             else:
                 page_tokens = list(raw[start:end])
 
-            block_hash = hash_str_to_int64(event_hash_values[page_index])
+            block_hash = namespaced_block_hash(
+                hash_str_to_int64(event_hash_values[page_index]),
+                namespace_seed=namespace_seed,
+            )
 
             self.enqueue(
                 BlockStored(
@@ -160,6 +185,7 @@ class KVCacheEventRecorder:
 
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
+        namespace_seed = self._namespace_seed(node)
 
         block_hashes = []
         logical_len = len(node.key)
@@ -169,7 +195,12 @@ class KVCacheEventRecorder:
             if end <= start:
                 continue
 
-            block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
+            block_hashes.append(
+                namespaced_block_hash(
+                    hash_str_to_int64(event_hash_values[page_index]),
+                    namespace_seed=namespace_seed,
+                )
+            )
             page_index += 1
 
         if block_hashes:

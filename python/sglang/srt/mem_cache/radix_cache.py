@@ -288,7 +288,9 @@ class RadixCache(BasePrefixCache):
         self.eviction_policy = params.eviction_policy.lower()
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
         )
 
         if params.enable_metrics:
@@ -317,6 +319,7 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        dynamo_kv_event_format: bool = False,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -325,6 +328,7 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            dynamo_kv_event_format=dynamo_kv_event_format,
         )
         return RadixCache(params)
 

@@ -750,6 +750,53 @@ class TestRadixCache(CustomTestCase):
             self.assertEqual(published[0], published[1])
             self.assertIsNotNone(published[1][-1][0])
 
+    def test_dynamo_format_separates_lora_blocks_from_base_blocks(self):
+        """Adapter blocks and base blocks with the same tokens share block hashes in
+        the default format. The dynamo format gives them different hashes."""
+        lora_id = "0123456789abcdef0123456789abcdef"
+        tokens = [1, 2, 3, 4]
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
+            dynamo_kv_event_format=True,
+        )
+        for extra_key in (None, lora_id):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens), extra_key=extra_key),
+                    value=torch.tensor(tokens, dtype=torch.int64),
+                )
+            )
+
+        base, lora = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertNotEqual(lora.block_hashes, base.block_hashes)
+
+        cache.evict(EvictParams(num_tokens=2 * len(tokens)))
+        removed = [
+            block_hash
+            for event in cache.take_events()
+            if isinstance(event, BlockRemoved)
+            for block_hash in event.block_hashes
+        ]
+        self.assertCountEqual(removed, base.block_hashes + lora.block_hashes)
+
+    def test_dynamo_format_parent_link_survives_node_split(self):
+        cache = RadixCache.create_simulated(
+            page_size=2, enable_kv_cache_events=True, dynamo_kv_event_format=True
+        )
+        for tokens in ([1, 2, 3, 4], [1, 2, 9, 10]):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens), extra_key="lora-a"),
+                    value=torch.tensor(tokens, dtype=torch.int64),
+                )
+            )
+        first, branch = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(branch.parent_block_hash, first.block_hashes[0])
+
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")
