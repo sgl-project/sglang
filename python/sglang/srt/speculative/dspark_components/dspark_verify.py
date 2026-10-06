@@ -670,13 +670,20 @@ class DsparkVerifyEpilogue:
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        # These buffers are rewritten by the next target-verify graph replay.
+        # Under the overlap scheduler the result D2H (accept lens / next token
+        # ids) runs on copy_stream, which forward_stream never waits on, so a
+        # copy that runs late would read step N+1's values -- per rank, so TP
+        # ranks could commit different token counts. Return allocator-owned
+        # copies made here, right after the replay; async_d2h's record_stream
+        # keeps them alive until the copy has run.
         return AcceptOuts(
-            correct_len=self.correct_len_buf[:bs],
-            bonus=self.bonus_buf[:bs],
-            cap_trim_lens=self.cap_trim_lens_buf[:bs],
-            commit_lens=self.commit_lens_buf[:bs],
-            new_seq_lens=self.new_seq_lens_buf[:bs],
-            out_tokens=self.out_tokens_buf[:bs],
+            correct_len=self.correct_len_buf[:bs].clone(),
+            bonus=self.bonus_buf[:bs].clone(),
+            cap_trim_lens=self.cap_trim_lens_buf[:bs].clone(),
+            commit_lens=self.commit_lens_buf[:bs].clone(),
+            new_seq_lens=self.new_seq_lens_buf[:bs].clone(),
+            out_tokens=self.out_tokens_buf[:bs].clone(),
         )
 
     @property
