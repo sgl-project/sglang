@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Loading contracts of the Kandinsky 6 SR components: strict, loud, and dtype-safe.
-
-A silently partial load of a checkpoint would give plausible-looking garbage, so
-missing / unexpected tensors, unsupported configs and unusable motion-attention backends
-must fail (or be rewritten) explicitly.  Tiny random models, CPU only.
-"""
+"""Strict loading, dtype and config contracts for tiny Kandinsky 6 SR components."""
 
 import copy
 import json
@@ -12,6 +7,7 @@ import os
 
 import pytest
 import torch
+from kandinsky6_sr_tiny_components import TINY_KVAE, TINY_LU_MODEL
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
@@ -64,45 +60,6 @@ TINY_DIT = dict(
     n_grid=3,
     attribute_overrides={"instruct_type": "noise"},
 )
-TINY_KVAE_ENC = dict(
-    ch=8,
-    ch_mult=(1, 1, 2, 2, 2),
-    num_res_blocks=2,
-    in_channels=3,
-    z_channels=4,
-    temporal_compress_times=4,
-    norm_type="rms_norm",
-)
-TINY_KVAE_DEC = dict(
-    ch=8,
-    out_ch=3,
-    ch_mult=(1, 1, 2, 2, 2),
-    num_res_blocks=2,
-    z_channels=4,
-    temporal_compress_times=4,
-    norm_type="rms_norm",
-)
-TINY_LU_MODEL = {
-    "architecture": "multi_scale",
-    "in_channels": 4,
-    "hidden_channels": 8,
-    "num_pre_blocks": 1,
-    "num_mid_blocks": 2,
-    "num_post_blocks": 2,
-    "expand_ratio": 2,
-    "dims": 3,
-    "bare_stem": True,
-    "input_skip": False,
-    "modulated_norm": True,
-    "modulated_output_proj": True,
-    "temporal_padding": "replicate",
-    "upsample_mode": "pxs_v2",
-    "upsample_padding_mode": "zeros",
-    "enable_x2_entry": True,
-    "x2_adapter_blocks": 1,
-    "x2_tail_mode": "private_full",
-    "x2_finisher": "pxs_residual",
-}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -122,22 +79,7 @@ def single_process_model_parallel():
 
 @pytest.fixture(autouse=True)
 def cpu_only(monkeypatch):
-    """Loaders place components with ``get_local_torch_device`` (MPS/CUDA on some hosts).
-
-    KNOWN GAP (not fixed here, confirmed pre-existing and model-agnostic): on a host
-    where ``torch.cuda`` is available, ``LayerNormScaleShift``/``RMSNormScaleShift``
-    (``runtime/layers/layernorm.py``) dispatch to a Triton kernel
-    (``fuse_scale_shift_kernel``) that hard-asserts its input is a real CUDA/XPU
-    tensor -- true for *every* dispatch branch of that op (cuda, native, hip, musa
-    all funnel into the same Triton call; only npu has a real elementwise fallback).
-    These CPU tensors therefore crash that assert the first time this fixture's
-    real-DiT-forward tests run on a CUDA-capable box, regardless of Kandinsky6's own
-    code. Fixing it would mean adding a genuine CPU fallback to that shared kernel
-    (out of scope for this PR) or rewriting this fixture to place everything on a real
-    CUDA device (a design change beyond what any Kandinsky6 review comment asked for).
-    Left as a known, reported limitation; unaffected on CPU-only hosts where
-    ``torch.cuda.is_available()`` is False from the start.
-    """
+    """Load on CPU; the forward test moves its DiT to CUDA for fused kernels."""
     monkeypatch.setattr(
         component_loader_module.ComponentLoader,
         "target_device",
@@ -357,54 +299,25 @@ def _write_component(directory, config, tensors):
 
 
 def _tiny_vae_bundle(tmp_path):
-    config = Kandinsky6SRVAEConfig()
-    config.update_model_arch(
-        dict(
-            vae_type="video-kvae",
-            encoder_config=TINY_KVAE_ENC,
-            decoder_config=TINY_KVAE_DEC,
-            scaling_factor=0.5,
-        )
+    raw_config = dict(
+        _class_name="Kandinsky6SRVAE",
+        vae_type="video-kvae",
+        encoder_config=dict(TINY_KVAE, in_channels=3),
+        decoder_config=dict(TINY_KVAE, out_ch=3),
+        scaling_factor=0.5,
+        spatial_factor=16,
+        temporal_factor=4,
     )
+    config = Kandinsky6SRVAEConfig()
+    config.update_model_arch(raw_config)
     wrapper = Kandinsky6SRVAE(config)
     directory = tmp_path / "vae"
     _write_component(
         directory,
-        {
-            "_class_name": "Kandinsky6SRVAE",
-            "vae_type": "video-kvae",
-            "encoder_config": {
-                **TINY_KVAE_ENC,
-                "ch_mult": list(TINY_KVAE_ENC["ch_mult"]),
-            },
-            "decoder_config": {
-                **TINY_KVAE_DEC,
-                "ch_mult": list(TINY_KVAE_DEC["ch_mult"]),
-            },
-            "scaling_factor": 0.5,
-            "spatial_factor": 16,
-            "temporal_factor": 4,
-        },
-        # the official checkpoint stores encoder.* / decoder.*, which are the wrapper's own
-        # top-level attribute names too (no intermediate ``model.*`` nesting), so its
-        # state_dict keys already are the official keys -- no remapping needed
+        raw_config,
         {k: v.contiguous() for k, v in wrapper.state_dict().items()},
     )
     return directory
-
-
-def test_vae_wrapper_round_trips_its_own_state_dict():
-    config = Kandinsky6SRVAEConfig()
-    config.update_model_arch(
-        dict(
-            vae_type="video-kvae",
-            encoder_config=TINY_KVAE_ENC,
-            decoder_config=TINY_KVAE_DEC,
-            scaling_factor=0.5,
-        )
-    )
-    wrapper = Kandinsky6SRVAE(config)
-    Kandinsky6SRVAE(config).load_state_dict(wrapper.state_dict(), strict=True)
 
 
 def test_vae_loader_loads_the_wrapper_strictly(tmp_path):
@@ -418,6 +331,12 @@ def test_vae_loader_loads_the_wrapper_strictly(tmp_path):
     # one missing tensor must fail: non-strict VAE loading would only log a warning
     weights_path = directory / "diffusion_pytorch_model.safetensors"
     weights = load_file(str(weights_path))
+    torch.testing.assert_close(
+        vae.state_dict(),
+        {name: value.bfloat16() for name, value in weights.items()},
+        rtol=0,
+        atol=0,
+    )
     weights.pop(next(iter(weights)))
     save_file(weights, str(weights_path))
     with pytest.raises(RuntimeError, match="Missing key"):

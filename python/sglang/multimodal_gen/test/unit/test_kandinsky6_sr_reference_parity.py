@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from kandinsky6_sr_tiny_components import super_resolve
+from kandinsky6_sr_tiny_components import TINY_KVAE, TINY_LU_MODEL, super_resolve
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
     Kandinsky6SRDitConfig,
@@ -85,24 +85,8 @@ if not _reference_dir or not os.path.isdir(
 # Reference harness (test-only): stubs, tiny resolutions, tiny random components
 # --------------------------------------------------------------------------- #
 TINY_RESOLUTIONS = {512: [(64, 64), (64, 96), (96, 64)]}
-TINY_KVAE_ENC = dict(
-    ch=8,
-    ch_mult=(1, 1, 2, 2, 2),
-    num_res_blocks=2,
-    in_channels=3,
-    z_channels=4,
-    temporal_compress_times=4,
-    norm_type="rms_norm",
-)
-TINY_KVAE_DEC = dict(
-    ch=8,
-    out_ch=3,
-    ch_mult=(1, 1, 2, 2, 2),
-    num_res_blocks=2,
-    z_channels=4,
-    temporal_compress_times=4,
-    norm_type="rms_norm",
-)
+TINY_KVAE_ENC = dict(TINY_KVAE, in_channels=3)
+TINY_KVAE_DEC = dict(TINY_KVAE, out_ch=3)
 TINY_SCALING_FACTOR = 0.5
 TINY_DIT_CFG = dict(
     in_visual_dim=4,
@@ -618,29 +602,6 @@ def test_tile_plan_and_stitch_match_reference(frame_hw, scale):
 # --------------------------------------------------------------------------- #
 # End to end: pure orchestration vs kandinsky_sr.pipeline.stages.run_tiled_sr*
 # --------------------------------------------------------------------------- #
-TINY_LU_MODEL = {
-    "architecture": "multi_scale",
-    "in_channels": 4,
-    "hidden_channels": 8,
-    "num_pre_blocks": 1,
-    "num_mid_blocks": 2,
-    "num_post_blocks": 2,
-    "expand_ratio": 2,
-    "dims": 3,
-    "bare_stem": True,
-    "input_skip": False,
-    "modulated_norm": True,
-    "modulated_output_proj": True,
-    "temporal_padding": "replicate",
-    "upsample_mode": "pxs_v2",
-    "upsample_padding_mode": "zeros",
-    "enable_x2_entry": True,
-    "x2_adapter_blocks": 1,
-    "x2_tail_mode": "private_full",
-    "x2_finisher": "pxs_residual",
-}
-
-
 def build_reference_lu_bank(target_scales=("2x", "4x"), seed=0):
     """Reference LU bank with random weights and its bundle-style ``models`` config."""
     import pydantic

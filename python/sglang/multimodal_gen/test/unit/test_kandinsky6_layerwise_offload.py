@@ -43,7 +43,10 @@ from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsk
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
-from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import TINY_LU_MODEL
+from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import (
+    TINY_KVAE,
+    TINY_LU_MODEL,
+)
 from sglang.srt.utils.network import get_free_port_below_ephemeral
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -162,19 +165,11 @@ def _audio_vae():
 
 def _sr_vae():
     config = Kandinsky6SRVAEConfig()
-    common = dict(
-        ch=8,
-        ch_mult=(1, 1, 2, 2, 2),
-        num_res_blocks=2,
-        z_channels=4,
-        temporal_compress_times=4,
-        norm_type="rms_norm",
-    )
     config.update_model_arch(
         dict(
             vae_type="video-kvae",
-            encoder_config=dict(common, in_channels=3),
-            decoder_config=dict(common, out_ch=3),
+            encoder_config=dict(TINY_KVAE, in_channels=3),
+            decoder_config=dict(TINY_KVAE, out_ch=3),
         )
     )
     model = Kandinsky6SRVAE(config).to("cuda").eval()
