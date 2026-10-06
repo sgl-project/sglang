@@ -15,7 +15,10 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    prepare_kv_for_attention,
+)
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -94,7 +97,10 @@ def is_dcp_mla_enabled() -> bool:
         return False
     if _is_cuda:
         backend = get_attn_backend()
-        if getattr(backend, "use_dsa", False) and backend.qk_rope_head_dim > 0:
+        if (
+            isinstance(backend, DeepseekSparseAttnBackend)
+            and backend.qk_rope_head_dim > 0
+        ):
             # The RoPE DSA draft worker keeps a replicated KV cache.
             return backend.dcp_enabled
     return True

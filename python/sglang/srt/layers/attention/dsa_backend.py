@@ -12,6 +12,7 @@ from typing import (
     TypeAlias,
 )
 
+import msgspec
 import torch
 
 from sglang.srt.configs.model_config import (
@@ -308,8 +309,7 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
-@dataclass
-class DSADcpPageTableCache:
+class DSADcpPageTableCache(msgspec.Struct):
     """Rank-local page table of the latest top-k, for layers that share it."""
 
     layer_id: int = -1
