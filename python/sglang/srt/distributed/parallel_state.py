@@ -84,6 +84,11 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
+# through the pre-registered IPC pool instead of registering graph-pool tensors:
+# the registered path makes peers read stale data over IPC on replay (garbage
+# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
+_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "1") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -1190,7 +1195,7 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1309,7 +1314,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or _AITER_CAPTURE_COPY_IN
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)

@@ -3456,6 +3456,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+            # The gather ships the whole padded chunk and the MoE runs on it, but
+            # graph replay never refreshes pad rows, so they hold stale pool
+            # memory (bf16-max scale) that overflows the MoE and the combine.
+            _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -3794,6 +3798,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             n = hidden.shape[0]
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
+
+
+def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
+    n_real = forward_batch.num_token_non_padded
+    num_rows = local_hidden_states.shape[0]
+    if n_real is None or num_rows == 0:
+        return
+    pad = torch.arange(num_rows, device=local_hidden_states.device) >= n_real
+    local_hidden_states.masked_fill_(
+        pad.view(-1, *([1] * (local_hidden_states.dim() - 1))), 0
+    )
 
 
 def _scatter_tail_rows(
