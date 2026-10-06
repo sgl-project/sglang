@@ -358,13 +358,12 @@ impl Transport for Grpc {
         _path: &'static str,
         headers: &HeaderMap,
         body: Bytes,
-        _engine_rid: Option<&str>,
+        engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
     ) -> Result<GrpcResponse, ApiError> {
-        // A dropped call aborts the engine request, so the rid needs no abort hook.
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
@@ -380,6 +379,7 @@ impl Transport for Grpc {
                 worker,
                 headers,
                 body,
+                engine_rid,
                 metrics.streaming,
                 Some(guards),
                 on_first_byte,
@@ -399,7 +399,9 @@ impl Transport for Grpc {
         body: Bytes,
     ) -> PrefillFailure<GrpcResponse> {
         let result = proxy
-            .chat_complete_grpc(&worker, &headers, body, false, None, None, None, None, None)
+            .chat_complete_grpc(
+                &worker, &headers, body, None, false, None, None, None, None, None,
+            )
             .await;
         let status = match result {
             Ok(response) if response.status.is_success() => {

@@ -3302,6 +3302,7 @@ dependencies = [
  "kube",
  "minijinja",
  "parking_lot",
+ "prost",
  "rand 0.8.8",
  "reqwest",
  "rmp",

@@ -58,6 +58,9 @@ jobs:
           filters: |
             sgl_router:
               - 'experimental/sgl-router/**'
+              # The router builds the shared gRPC types crate, which inherits rust/'s manifest.
+              - 'proto/**'
+              - 'rust/Cargo.toml'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs

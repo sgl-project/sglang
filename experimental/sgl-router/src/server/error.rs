@@ -343,12 +343,7 @@ impl ApiError {
             ErrorClass::Timeout => Code::DeadlineExceeded,
             ErrorClass::Internal => Code::Internal,
         };
-        let mut status = tonic::Status::new(code, self.client_message());
-        status.metadata_mut().insert(
-            "x-router-error-code",
-            tonic::metadata::MetadataValue::from_static(self.error_code()),
-        );
-        status
+        router_grpc_status(code, self.error_code(), self.client_message())
     }
 
     /// The client-facing message; never leaks worker URLs or source chains,
@@ -431,6 +426,21 @@ impl ApiError {
             ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
     }
+}
+
+/// A status the router raises itself; `error_code` travels as `x-router-error-code`,
+/// as it does in the HTTP header.
+pub fn router_grpc_status(
+    code: tonic::Code,
+    error_code: &'static str,
+    message: impl Into<String>,
+) -> tonic::Status {
+    let mut status = tonic::Status::new(code, message);
+    status.metadata_mut().insert(
+        "x-router-error-code",
+        tonic::metadata::MetadataValue::from_static(error_code),
+    );
+    status
 }
 
 #[cfg(test)]

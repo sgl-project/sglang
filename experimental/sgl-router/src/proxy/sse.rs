@@ -27,6 +27,29 @@ pub enum StreamEndReason {
     PumpPanicked,
 }
 
+/// A stream the router ended itself; it reads as before, and a gRPC caller
+/// maps `reason` to the router's error contract.
+#[derive(Debug)]
+pub struct RouterStreamError {
+    pub reason: StreamEndReason,
+    message: String,
+}
+
+impl RouterStreamError {
+    fn io(reason: StreamEndReason, message: impl Into<String>) -> std::io::Error {
+        let message = message.into();
+        std::io::Error::other(Self { reason, message })
+    }
+}
+
+impl std::fmt::Display for RouterStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RouterStreamError {}
+
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
@@ -208,11 +231,11 @@ where
                 }
                 _ = expired => {
                     end.reason = StreamEndReason::Expired;
-                    Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
+                    Err(RouterStreamError::io(end.reason, "SSE stream exceeded stale_request_timeout"))
                 }
                 _ = aborted => {
                     end.reason = StreamEndReason::Aborted;
-                    Err(std::io::Error::other("SSE stream aborted by the router"))
+                    Err(RouterStreamError::io(end.reason, "SSE stream aborted by the router"))
                 }
                 result = async {
                     loop {
@@ -225,7 +248,7 @@ where
                             ),
                             Err(_) => return (
                                 StreamEndReason::IdleTimeout,
-                                Err(std::io::Error::other("SSE upstream idle timeout")),
+                                Err(RouterStreamError::io(StreamEndReason::IdleTimeout, "SSE upstream idle timeout")),
                             ),
                         };
                         started.store(true, Ordering::Relaxed);
@@ -255,9 +278,10 @@ where
                     .copied()
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic payload>");
-                Err(std::io::Error::other(format!(
-                    "SSE pump panicked: {message}"
-                )))
+                Err(RouterStreamError::io(
+                    end.reason,
+                    format!("SSE pump panicked: {message}"),
+                ))
             }
         };
         if let Some(hook) = on_complete {
@@ -270,7 +294,10 @@ where
         futures::future::ready(match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(Err(error)),
-            Err(_) => Some(Err(std::io::Error::other("SSE pump cancelled"))),
+            Err(_) => Some(Err(RouterStreamError::io(
+                StreamEndReason::PumpPanicked,
+                "SSE pump cancelled",
+            ))),
         })
     });
     ReceiverStream::new(rx).map(Ok).chain(terminal)

@@ -18,8 +18,11 @@ RUN apt-get update \
 
 WORKDIR /build
 
-# Copy just the sgl-router crate (context is the repo root)
+# Copy the sgl-router crate (context is the repo root), plus the shared gRPC
+# types crate it depends on and the rust/ workspace manifest that crate inherits.
 COPY experimental/sgl-router /build/experimental/sgl-router
+COPY proto /build/proto
+COPY rust/Cargo.toml /build/rust/Cargo.toml
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
