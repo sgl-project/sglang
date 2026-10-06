@@ -606,6 +606,8 @@ pub struct MetricsRegistry {
     // CatchPanicLayer-synthesized 500).
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    owned_overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    ancestor_fallback_blocks: Mutex<HashMap<String, Histogram>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     /// The three block counters that decompose cache-aware locality, kept in
     /// one map value so a selection books all of them against one key and they
@@ -707,6 +709,8 @@ impl Default for MetricsRegistry {
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
+            owned_overlap_blocks: Default::default(),
+            ancestor_fallback_blocks: Default::default(),
             diverted_overlap_blocks: Default::default(),
             cache_aware_blocks: Default::default(),
             cache_aware_decisions_total: Default::default(),
@@ -924,6 +928,24 @@ impl MetricsRegistry {
     /// Observe an overlap-blocks count for `sgl_router_overlap_blocks`.
     pub fn observe_overlap_blocks(&self, model_id: &str, blocks: u64) {
         let mut guard = self.overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
+    /// Deepest owned prefix, before threshold and load filtering.
+    pub fn observe_owned_overlap_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.owned_overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
+    /// Structural suffix skipped when selecting an eligible ancestor owner.
+    pub fn observe_ancestor_fallback_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.ancestor_fallback_blocks.lock();
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
@@ -1682,6 +1704,38 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_owned_overlap_blocks Deepest owned prefix across hash modes before threshold and load filtering; excludes unowned structural suffixes.\n");
+        out.push_str("# TYPE sgl_router_owned_overlap_blocks histogram\n");
+        let guard = self.owned_overlap_blocks.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, histogram) in entries {
+            let labels = format!("model_id=\"{}\"", escape_label(model));
+            render_histogram(
+                &mut out,
+                "sgl_router_owned_overlap_blocks",
+                &labels,
+                histogram,
+            );
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_ancestor_fallback_blocks Structural suffix skipped for selected ancestor owners; count is ancestor selections, sum is skipped blocks, not recovered engine cache hits.\n");
+        out.push_str("# TYPE sgl_router_ancestor_fallback_blocks histogram\n");
+        let guard = self.ancestor_fallback_blocks.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, histogram) in entries {
+            let labels = format!("model_id=\"{}\"", escape_label(model));
+            render_histogram(
+                &mut out,
+                "sgl_router_ancestor_fallback_blocks",
+                &labels,
+                histogram,
+            );
         }
         drop(guard);
 

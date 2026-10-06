@@ -372,10 +372,12 @@ pub struct MatchResult {
     /// Number of leading block hashes from the input slice that matched a
     /// path from the root.
     pub matched_blocks: usize,
-    /// Workers holding the deepest matched node on ANY tier. Empty when
-    /// `matched_blocks == 0`.
+    /// Depth of the deepest matched node with owners, or zero if none exists.
+    /// May be shorter than the structural `matched_blocks` path.
+    pub owned_matched_blocks: usize,
+    /// Workers holding the deepest OWNED matched node on ANY tier.
     pub workers: HashSet<KvWorkerId>,
-    /// The tiers each of `workers` holds the deepest matched node on. A worker
+    /// The tiers each of `workers` holds the deepest owned matched node on. A worker
     /// without the device bit serves the prefix by loading it back from a
     /// lower tier — cheaper than a cold prefill, dearer than serving in place
     /// — which is the ordering the policy prefers on ([`Tiers::best_slot`]).
@@ -951,7 +953,8 @@ impl TreeState {
 
         let mut current = start;
         let mut matched = 0usize;
-        let mut last_match_node: Option<NodeId> = None;
+        let mut last_owned_node: Option<NodeId> = None;
+        let mut owned_matched_blocks = 0;
         let now = now_millis();
         for &h in block_hashes {
             let next = self
@@ -962,22 +965,26 @@ impl TreeState {
                 Some(child_id) => {
                     // Touch as we descend. Atomic store under a shared
                     // borrow — no &mut needed.
-                    if let Some(child) = self.nodes.get(&child_id) {
-                        child.last_used.store(now, Ordering::Relaxed);
-                    }
                     current = child_id;
                     matched += 1;
-                    last_match_node = Some(child_id);
+                    if let Some(child) = self.nodes.get(&child_id) {
+                        child.last_used.store(now, Ordering::Relaxed);
+                        if !child.workers.is_empty() {
+                            last_owned_node = Some(child_id);
+                            owned_matched_blocks = matched;
+                        }
+                    }
                 }
                 None => break,
             }
         }
-        let tiers: HashMap<KvWorkerId, Tiers> = last_match_node
+        let tiers: HashMap<KvWorkerId, Tiers> = last_owned_node
             .and_then(|id| self.nodes.get(&id))
             .map(|n| n.workers.clone())
             .unwrap_or_default();
         MatchResult {
             matched_blocks: matched,
+            owned_matched_blocks,
             workers: tiers.keys().cloned().collect(),
             tiers,
         }
@@ -1318,8 +1325,8 @@ impl HashTree {
     /// `block_hashes`, optionally starting from the node carrying
     /// `parent_hash`.
     ///
-    /// Returns the deepest matched node's worker set and how many blocks
-    /// matched.
+    /// Returns the deepest owned matched node's worker set, its depth, and
+    /// the structural match depth (which can extend through unowned nodes).
     ///
     /// As a side-effect, touches `last_used` on every node visited along
     /// the match — so frequently-matched paths are kept hot for
@@ -1804,6 +1811,28 @@ mod tests {
     }
 
     #[test]
+    fn owned_ancestor_survives_unowned_suffix_and_interior_gap() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert_tiered(&a, None, &[10, 20], Tiers::HOST);
+        tree.insert(&b, None, &[10, 20, 30, 40]);
+        tree.remove(&b, &[10, 20, 30]);
+        let m = tree.match_prefix(None, &[10, 20, 30]);
+        assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 2));
+        assert_eq!(m.workers, HashSet::from([a.clone()]));
+        assert_eq!(m.tiers[&a], Tiers::HOST);
+        // An interior hole must not hide a deeper owner.
+        let m = tree.match_prefix(None, &[10, 20, 30, 40]);
+        assert_eq!((m.matched_blocks, m.owned_matched_blocks), (4, 4));
+        assert_eq!(m.workers, HashSet::from([b]));
+        tree.clear_worker(&a);
+        let m = tree.match_prefix(None, &[10, 20, 30]);
+        assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 0));
+        assert!(m.workers.is_empty());
+    }
+
+    #[test]
     fn empty_match_returns_zero_no_workers() {
         let tree = HashTree::new();
         let m = tree.match_prefix(None, &[]);
@@ -2187,16 +2216,16 @@ mod tests {
         assert_eq!(tree.node_count(), 3);
 
         // Remove A from the node carrying hash=2. Per spec: that node loses
-        // A; descendants are NOT recursively touched, but `match_prefix`
-        // returns the deepest matched *node*'s worker set. Node 2 still
-        // exists (it has child 3), but its worker set is now empty.
+        // A; descendants are NOT recursively touched. Node 2 still exists
+        // (it has child 3), but its worker set is now empty.
         tree.remove(&a, &[2]);
 
         // Node 2 still in tree (has child 3).
-        // Match length 2 lands on node 2 (workers empty), so workers={}.
+        // The structural match reaches 2, but ownership falls back to 1.
         let m = tree.match_prefix(None, &[1, 2]);
         assert_eq!(m.matched_blocks, 2);
-        assert!(m.workers.is_empty());
+        assert_eq!(m.owned_matched_blocks, 1);
+        assert_eq!(m.workers, workers(&[&a]));
 
         // Match length 3 lands on node 3 (workers still has A).
         let m = tree.match_prefix(None, &[1, 2, 3]);
@@ -2696,7 +2725,7 @@ mod tests {
         src.insert(&a, None, &[10, 20, 30]);
         // Drop the middle block only. Node 20 survives because it has a child.
         src.remove(&a, &[20]);
-        assert!(!src.match_prefix(None, &[10, 20]).workers.contains(&a));
+        assert_eq!(src.match_prefix(None, &[10, 20]).owned_matched_blocks, 1);
 
         let (worker_table, nodes) = src.export_snapshot();
         let dst = HashTree::new();

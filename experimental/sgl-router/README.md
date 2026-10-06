@@ -8,6 +8,27 @@ Serves a single model and routes across its workers. Exposes
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery.
 
+## Cache-aware ancestor fallback
+
+With `--policy cache_aware_zmq`, a matched node without owners falls back to
+its deepest matched ancestor that still has owners. `--cache-threshold` is
+applied to that owned prefix, not the longer structural path. Existing
+worker eligibility, queue gates, and storage-tier preferences still apply.
+No additional flag is required.
+
+The existing structural-overlap metrics keep their meaning. Two histograms
+with the `model_id` label distinguish usable ownership from empty paths:
+
+- `sgl_router_owned_overlap_blocks`: deepest owned prefix before threshold
+  and load filtering.
+- `sgl_router_ancestor_fallback_blocks`: structural suffix skipped when an
+  ancestor owner is selected. Its `_count` counts those selections; `_sum`
+  counts skipped blocks, **not** recovered engine cache hits.
+
+Use `sgl_router_selected_overlap_blocks_total` for the selected destination's
+prefix depth. Actual cache-hit and TTFT gains require an engine replay A/B;
+router ownership does not guarantee that an SWA window is still available.
+
 ## Building
 
 ```bash
