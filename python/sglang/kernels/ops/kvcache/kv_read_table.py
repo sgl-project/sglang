@@ -112,7 +112,10 @@ def _gather_translate_items(
             tl.store(row_out + item, value.to(tl.int32), mask=store_mask)
 
 
-@triton.jit
+# The per-call widths and lengths stay unspecialized: Triton would otherwise
+# compile a new variant (`== 1`, `% 16`) mid-serving each time a batch's shape
+# hits a combination it has not seen.
+@triton.jit(do_not_specialize=["out_stride", "seq_len_delta", "max_row_items"])
 def build_kv_read_indices_kernel(
     req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
     req_pool_indices_ptr,  # in: [bs] -- req_to_token row per batch lane
@@ -172,7 +175,16 @@ def build_kv_read_indices_kernel(
     )
 
 
-@triton.jit
+# As above, and the row counts too, which follow the batch size.
+@triton.jit(
+    do_not_specialize=[
+        "live_rows",
+        "stream_rows",
+        "table_stride",
+        "seq_len_delta",
+        "max_pages",
+    ]
+)
 def build_kv_read_table_and_stream_kernel(
     req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
     req_pool_indices_ptr,  # in: [live_rows] -- req_to_token row per batch lane
