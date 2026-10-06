@@ -1,15 +1,22 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+# No request-slot limit on the interleaving selection.
+ADMIT_ALL = 1 << 20
 
 
 def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **kwargs):
@@ -127,12 +134,16 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
-        self.policy = SchedulePolicy(
-            policy="shortest-prefill-first",
+        self.policy = self.make_policy("shortest-prefill-first")
+
+    def make_policy(self, name, **kwargs):
+        return SchedulePolicy(
+            policy=name,
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            **kwargs,
         )
 
     def make_req(self, rid, uncached, *, cached=0, arrived=0):
@@ -181,21 +192,31 @@ class TestShortestPrefillFirst(CustomTestCase):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            self.policy.prefill_interleaving_chunk_limit(
+                continuation, waiting, 4096, 256, max_reqs=ADMIT_ALL
+            ),
             2560,
         )
 
     def test_reservation_rounds_to_pages_and_keeps_continuation_progress(self):
         continuation = self.make_req("continuation", 16384)
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 257)], 4096, 256
+            self.policy.prefill_interleaving_chunk_limit(
+                continuation,
+                [self.make_req("short", 257)],
+                4096,
+                256,
+                max_reqs=ADMIT_ALL,
             ),
             3584,
         )
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 3840)], 4096, 256
+            self.policy.prefill_interleaving_chunk_limit(
+                continuation,
+                [self.make_req("short", 3840)],
+                4096,
+                256,
+                max_reqs=ADMIT_ALL,
             ),
             256,
         )
@@ -210,20 +231,236 @@ class TestShortestPrefillFirst(CustomTestCase):
         ]:
             with self.subTest(budget=budget, waiting=[req.rid for req in waiting]):
                 self.assertIsNone(
-                    self.policy.shortest_prefill_chunk_limit(
-                        continuation, waiting, budget, 256
+                    self.policy.prefill_interleaving_chunk_limit(
+                        continuation, waiting, budget, 256, max_reqs=ADMIT_ALL
                     )
                 )
 
     def test_other_policy_keeps_normal_chunk_limit(self):
-        self.policy.policy = CacheAwarePolicy.HRRN
+        self.policy = self.make_policy("hrrn")
         self.assertIsNone(
-            self.policy.shortest_prefill_chunk_limit(
+            self.policy.prefill_interleaving_chunk_limit(
                 self.make_req("continuation", 8192),
                 [self.make_req("short", 512)],
                 4096,
                 256,
+                max_reqs=ADMIT_ALL,
             )
+        )
+
+    def test_interleaving_disable_preserves_queue_and_full_chunk(self):
+        for name in ("hrrn", "shortest-prefill-first"):
+            with self.subTest(policy=name):
+                policy = self.make_policy(name, prefill_interleaving=False)
+                waiting = [self.make_req("short", 512)]
+                original = waiting[:]
+                self.assertIsNone(
+                    policy.prefill_interleaving_chunk_limit(
+                        self.make_req("continuation", 8192),
+                        waiting,
+                        4096,
+                        256,
+                        max_reqs=ADMIT_ALL,
+                    )
+                )
+                self.assertEqual(waiting, original)
+
+    def test_policy_selection_and_minimum_allocation(self):
+        # HRRN must scan beyond a large head and retain priority among fitting waiters.
+        for name, expected_limit, expected_order in (
+            ("hrrn", 1024, ["first-fit", "last-fit", "large", "middle"]),
+            (
+                "shortest-prefill-first",
+                None,
+                ["large", "first-fit", "middle", "last-fit"],
+            ),
+        ):
+            with self.subTest(policy=name):
+                policy = self.make_policy(
+                    name,
+                    prefill_interleaving=True,
+                    prefill_interleaving_min_continuation_tokens=1024,
+                )
+                waiting = [
+                    self.make_req(rid, n)
+                    for rid, n in (
+                        ("large", 8192),
+                        ("first-fit", 257),
+                        ("middle", 3072),
+                        ("last-fit", 2560),
+                    )
+                ]
+                limit = policy.prefill_interleaving_chunk_limit(
+                    self.make_req("continuation", 16384),
+                    waiting,
+                    4096,
+                    256,
+                    max_reqs=ADMIT_ALL,
+                )
+                self.assertEqual(limit, expected_limit)
+                self.assertEqual([r.rid for r in waiting], expected_order)
+
+    def test_interleaving_scan_cap_preserves_unscanned_requests(self):
+        continuation = self.make_req("continuation", 8192)
+        for large_count, selected_count, expected_limit in (
+            (126, 2, 3584),
+            (127, 1, 3840),
+            (128, 0, None),
+        ):
+            with self.subTest(large_count=large_count):
+                policy = self.make_policy("hrrn", prefill_interleaving=True)
+                large = [self.make_req(str(i), 4096) for i in range(large_count)]
+                small = [self.make_req("first", 256), self.make_req("second", 256)]
+                waiting = large + small
+                limit = policy.prefill_interleaving_chunk_limit(
+                    continuation, waiting, 4096, 256, max_reqs=ADMIT_ALL
+                )
+                self.assertEqual(limit, expected_limit)
+                self.assertEqual(
+                    waiting, small[:selected_count] + large + small[selected_count:]
+                )
+
+        waiting = [self.make_req(str(i), 1) for i in range(130)]
+        original = waiting[:]
+        self.assertEqual(
+            self.policy.prefill_interleaving_chunk_limit(
+                continuation, waiting, 4096, 1, max_reqs=ADMIT_ALL
+            ),
+            4096 - 128,
+        )
+        self.assertEqual(waiting, original)
+
+    def test_hrrn_aging_orders_fitting_requests_before_reservation(self):
+        policy = self.make_policy(
+            "hrrn",
+            prefill_interleaving=True,
+            prefill_interleaving_min_continuation_tokens=1024,
+        )
+        old = self.make_req("old", 3072)
+        old.arrival_processed_tokens = 0
+        new = self.make_req("new", 1024)
+        new.origin_input_ids = array("q", range(20000, 21024))
+        new.full_untruncated_fill_ids = new.origin_input_ids[:]
+        new.arrival_processed_tokens = 100000
+        waiting = [new, old]
+        policy.calc_priority(waiting, processed_tokens=100000)
+        self.assertEqual(waiting, [old, new])
+        self.assertEqual(
+            policy.prefill_interleaving_chunk_limit(
+                self.make_req("continuation", 16384),
+                waiting,
+                4096,
+                256,
+                max_reqs=ADMIT_ALL,
+            ),
+            1024,
+        )
+        self.assertEqual(waiting, [old, new])
+
+    def test_continuation_allocation(self):
+        for name, minimum, budget, remaining, waiter, expected in (
+            ("hrrn", None, 16384, 32768, 8192, 8192),
+            ("hrrn", None, 4096, 32768, 3072, None),
+            ("hrrn", None, 1280, 32768, 512, 768),
+            ("hrrn", None, 256, 32768, 1, None),
+            ("hrrn", 256, 4096, 32768, 3840, 256),
+            ("shortest-prefill-first", None, 4096, 32768, 3840, 256),
+            ("shortest-prefill-first", 2048, 4096, 32768, 3072, None),
+            ("hrrn", 1024, 1024, 8192, 3072, None),
+            ("shortest-prefill-first", 1024, 1024, 8192, 3072, None),
+            ("hrrn", 1024, 4096, 2048, 3072, 1024),
+            ("shortest-prefill-first", 1024, 4096, 2048, 3072, None),
+        ):
+            with self.subTest(policy=name, minimum=minimum, budget=budget):
+                policy = self.make_policy(
+                    name,
+                    prefill_interleaving=True,
+                    prefill_interleaving_min_continuation_tokens=minimum,
+                )
+                self.assertEqual(
+                    policy.prefill_interleaving_chunk_limit(
+                        self.make_req("continuation", remaining),
+                        [self.make_req("waiter", waiter)],
+                        budget,
+                        256,
+                        max_reqs=ADMIT_ALL,
+                    ),
+                    expected,
+                )
+
+    def test_selection_stops_at_admissible_waiters(self):
+        """Budget reserved for a waiter the pass cannot admit is lost to the
+        continuation, so the reservation stops at the admissible count."""
+        continuation = self.make_req("continuation", 16384)
+        for max_reqs, expected in ((ADMIT_ALL, 2560), (1, 3584), (0, None)):
+            with self.subTest(max_reqs=max_reqs):
+                waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+                self.assertEqual(
+                    self.policy.prefill_interleaving_chunk_limit(
+                        continuation, waiting, 4096, 256, max_reqs=max_reqs
+                    ),
+                    expected,
+                )
+
+    def test_hrrn_fallback_to_fcfs_disables_interleaving(self):
+        """Without a tree cache HRRN runs as FCFS; interleaving must not
+        reorder the FCFS queue."""
+        policy = SchedulePolicy(
+            policy="hrrn",
+            tree_cache=RadixCache.create_simulated(disable=True),
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            prefill_interleaving=True,
+            prefill_interleaving_min_continuation_tokens=1024,
+        )
+        waiting = [self.make_req("large", 8192), self.make_req("small", 512)]
+        original = waiting[:]
+        self.assertIsNone(
+            policy.prefill_interleaving_chunk_limit(
+                self.make_req("continuation", 16384),
+                waiting,
+                4096,
+                256,
+                max_reqs=ADMIT_ALL,
+            )
+        )
+        self.assertEqual(waiting, original)
+
+
+class TestInterleavedWaitingRequestCap(CustomTestCase):
+    """The chunk reservation must follow what admission can take this pass."""
+
+    def make_scheduler(self, *, available, mode=DisaggregationMode.NULL):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = mode
+        scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: available)
+        scheduler.beam_coordinator = SimpleNamespace(pending_member_rows=lambda b: 0)
+        return scheduler
+
+    def test_cap_counts_the_chunked_request_slot(self):
+        batch = SimpleNamespace(reqs=[], batch_is_full=False)
+        for kwargs, prefill_max_requests, expected in (
+            (dict(available=8), None, 7),
+            (dict(available=8), 3, 2),
+            # PD prefill counts every request against the free request slots.
+            (dict(available=8, mode=DisaggregationMode.PREFILL), None, 7),
+            (dict(available=1), None, 0),
+        ):
+            with self.subTest(**kwargs, prefill_max_requests=prefill_max_requests):
+                scheduler = self.make_scheduler(**kwargs)
+                with (
+                    get_context().override_server_args(
+                        prefill_max_requests=prefill_max_requests
+                    ),
+                    get_parallel().override(pp_max_micro_batch_size=64),
+                ):
+                    self.assertEqual(
+                        scheduler._max_interleaved_waiting_reqs(batch), expected
+                    )
+        batch.batch_is_full = True
+        self.assertEqual(
+            self.make_scheduler(available=8)._max_interleaved_waiting_reqs(batch), 0
         )
 
 
