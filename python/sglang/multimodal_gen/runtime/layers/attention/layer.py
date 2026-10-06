@@ -18,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
@@ -89,6 +90,10 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+
+# Set ``SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK=1`` to drop the SP tail-pad mask
+# and run dense attention on the padded layout.
+_SP_PAD_MASK_DISABLED = envs.SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK
 
 
 def _resolve_sp_attention_mode(
@@ -988,6 +993,15 @@ class USPAttention(nn.Module):
             if isinstance(attn_mask_meta, DynamicVarlenMaskMeta)
             else attn_mask
         )
+
+        if (
+            _SP_PAD_MASK_DISABLED
+            and attn_mask is None
+            and not effective_skip_sp
+            and get_sequence_parallel_world_size() > 1
+        ):
+            attn_mask_meta = None
+
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -1196,6 +1210,17 @@ class USPAttention(nn.Module):
                     q = torch.cat([q_prefix, q], dim=1)
                     k = torch.cat([k_prefix, k], dim=1)
                     v = torch.cat([v_prefix, v], dim=1)
+
+                # an all-valid key mask masks nothing; the dense SDPA mask below
+                # would pin a slow kernel (cutlassF on sm100)
+                if (
+                    attn_mask_meta is not None
+                    and "indices" in attn_mask_meta
+                    and attn_mask.dim() == 2
+                    and not torch.is_floating_point(attn_mask)
+                    and attn_mask_meta["indices"].shape[0] == attn_mask.numel()
+                ):
+                    return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)

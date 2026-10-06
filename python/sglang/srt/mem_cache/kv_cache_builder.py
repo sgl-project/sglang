@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -58,10 +59,7 @@ from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -177,6 +175,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     fields = {}
 
     backend = disagg.disaggregation_decode_retraction_backup
+    unified_hybrid_swa = memory.enable_unified_memory and tp_worker.is_hybrid_swa
     if backend is None:
         kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
         full_tokens_per_layer = (
@@ -184,10 +183,17 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Host-pool retraction does not address unified page envelopes or
-        # recurrent state, so those configurations stay on cpu_tensor.
-        supports_host_pool = (
+        draft_pools = tp_worker.model_runner.mtp_draft_device_pools
+        unified_draft_host_pool_supported = (
             not memory.enable_unified_memory
+            or not draft_pools
+            or tp_worker.model_runner.spec_algorithm.is_dspark()
+        )
+        # Host-pool retraction has no recurrent-state sidecar, so a model with
+        # recurrent state stays on cpu_tensor.
+        supports_host_pool = (
+            unified_draft_host_pool_supported
+            and not unified_hybrid_swa
             and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)
@@ -245,13 +251,8 @@ def build_kv_cache(
     tp_worker: BaseTpWorker,
     page_size: int,
     spec_algorithm: SpeculativeAlgorithm,
-    attn_tp_cpu_group: ProcessGroup,
-    tp_cpu_group: ProcessGroup,
-    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    tp_group: GroupCoordinator,
-    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
@@ -337,12 +338,10 @@ def build_kv_cache(
             else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
-        tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
-        ),
-        attn_cp_cache_group=attn_cp_cpu_group,
-        attn_tp_cache_group=attn_tp_cpu_group,
-        pp_cache_group=pp_group.cpu_group,
+        tp_cache_group=get_dp_tp_group().cpu_group,
+        attn_cp_cache_group=parallel.attn_cp_group.cpu_group,
+        attn_tp_cache_group=parallel.attn_tp_group.cpu_group,
+        pp_cache_group=parallel.pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
@@ -373,7 +372,7 @@ def build_kv_cache(
         model_config=model_config,
         tp_size=parallel.tp_size,
         tp_rank=parallel.tp_rank,
-        tp_group=tp_group,
+        tp_group=parallel.tp_group,
     )
     with auto_size_hicache(
         params,

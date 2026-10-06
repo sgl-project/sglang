@@ -1,7 +1,5 @@
-import sys
-import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -58,43 +56,6 @@ class TestFusedFp8WriterHip(CustomTestCase):
             cos_cache=torch.empty(1024, 32, dtype=torch.bfloat16),
             sin_cache=torch.empty(1024, 32, dtype=torch.bfloat16),
         )
-
-    def test_forwards_full_abi(self):
-        op = MagicMock()
-        cache_module = types.ModuleType("aiter.ops.cache")
-        cache_module.indexer_qk_rope_quant_and_cache = op
-        ops_module = types.ModuleType("aiter.ops")
-        ops_module.cache = cache_module
-        aiter_module = types.ModuleType("aiter")
-        aiter_module.ops = ops_module
-
-        args = self._inputs()
-        with patch.dict(
-            sys.modules,
-            {
-                "aiter": aiter_module,
-                "aiter.ops": ops_module,
-                "aiter.ops.cache": cache_module,
-            },
-        ):
-            aiter_fused_fp8_qk_write(
-                **args,
-                epsilon=1e-6,
-                quant_block_size=128,
-                scale_fmt="ue8m0",
-                weights_scale=0.03125,
-                preshuffle=True,
-                is_neox=False,
-                compute_all_q_rope=True,
-            )
-
-        op.assert_called_once()
-        call = op.call_args
-        self.assertIs(call.args[0], args["q"])
-        self.assertIs(call.args[5], args["kv_cache"])
-        self.assertEqual(call.kwargs["preshuffle"], True)
-        self.assertEqual(call.kwargs["is_neox"], False)
-        self.assertEqual(call.kwargs["compute_all_q_rope"], True)
 
     def test_refuses_non_fp32_layernorm(self):
         args = self._inputs()

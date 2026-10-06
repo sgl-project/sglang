@@ -315,37 +315,16 @@ impl SamplingParamsInput {
     /// wins even when it explicitly carries the type's default or null.
     pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
         match self {
-            Self::One(params) => apply_preferred_to_one(params, preferred),
+            Self::One(params) => params.apply_preferred(preferred),
             Self::Many(params) => params
                 .iter_mut()
-                .try_for_each(|params| apply_preferred_to_one(params, preferred)),
+                .try_for_each(|params| params.apply_preferred(preferred)),
         }
     }
 
     pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
         sampling_params_from_value(preferred.clone()).map(|params| Self::One(Box::new(params)))
     }
-}
-
-fn apply_preferred_to_one(
-    params: &mut SamplingParams,
-    preferred: &serde_json::Value,
-) -> Result<(), String> {
-    let mut merged = preferred
-        .as_object()
-        .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
-        .clone();
-    let request_value = serde_json::to_value(&*params).map_err(|e| e.to_string())?;
-    let request = request_value
-        .as_object()
-        .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
-    for field in &params.explicit_fields {
-        if let Some(value) = request.get(field) {
-            merged.insert(field.clone(), value.clone());
-        }
-    }
-    *params = sampling_params_from_value(serde_json::Value::Object(merged))?;
-    Ok(())
 }
 
 impl Default for SamplingParams {
@@ -393,6 +372,33 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
+    /// Record a field supplied by a non-Serde adapter. Preferred launch values
+    /// are merged underneath these fields just as they are underneath keys
+    /// present in an HTTP sampling object.
+    pub(crate) fn mark_explicit(&mut self, field: &'static str) {
+        self.explicit_fields.insert(field.to_owned());
+    }
+
+    /// Merge operator-provided sampling defaults beneath explicitly supplied
+    /// request fields. HTTP and gRPC adapters use the same precedence policy.
+    pub(crate) fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
+        let mut merged = preferred
+            .as_object()
+            .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
+            .clone();
+        let request_value = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
+        let request = request_value
+            .as_object()
+            .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
+        for field in &self.explicit_fields {
+            if let Some(value) = request.get(field) {
+                merged.insert(field.clone(), value.clone());
+            }
+        }
+        *self = sampling_params_from_value(serde_json::Value::Object(merged))?;
+        Ok(())
+    }
+
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's

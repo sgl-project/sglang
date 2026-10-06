@@ -3,20 +3,26 @@
 
 //! Grouped CLI options and conversion into a validated [`Config`].
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
+use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
-    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
+    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
+    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
+    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
+use crate::policies_reorg::admission::AdmissionLimits;
+use crate::policies_reorg::factory::AffinitySpec;
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
@@ -65,10 +71,30 @@ pub struct ModelArgs {
     #[arg(long)]
     pub tokenizer_path: Option<String>,
 
+    /// Skip loading a tokenizer; workers tokenize requests. Load-only policies only:
+    /// cache-aware routing, prefix-cache terms or filters, and length buckets require one.
+    #[arg(long, conflicts_with = "tokenizer_path")]
+    pub no_tokenizer: bool,
+
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
-    /// Use for worker-only thinking defaults, parser/template overrides, or template stop strings.
+    /// Use for worker parser/template overrides or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
+
+    /// Encode backend for router tokenization. fast uses fastokens for encoding and HF for
+    /// decoding, falling back to hf when fastokens cannot load the tokenizer.
+    #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
+    pub tokenizer_backend: TokenizerBackend,
+
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables it. Reuses the tokens of a
+    /// previously encoded prompt up to its deepest shared special-token boundary, so a
+    /// multi-turn chat encodes only its new turns.
+    #[arg(long, default_value_t = 0, value_name = "MB")]
+    pub tokenizer_l1_cache_mb: usize,
+
+    /// Same as SGLang's --default-chat-template-kwargs; must match the workers.
+    #[arg(long, value_name = "JSON")]
+    pub default_chat_template_kwargs: Option<String>,
 
     /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
@@ -111,12 +137,23 @@ pub struct ServerArgs {
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
 
+    /// API key the router sends on its own requests to workers (`/server_info`,
+    /// `/model_info`). Set it to the engines' `--api-key`.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
+
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
+
+    /// Dispatch attempts per request, including the first. A request that fails
+    /// before any response reaches the client (transport error, 5xx, 429) is
+    /// retried on a worker it has not tried yet. 1 disables retries; 3 is typical.
+    #[arg(long, default_value_t = ProxyConfig::default().max_attempts)]
+    pub retry_max_attempts: NonZeroU32,
 
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
@@ -160,6 +197,19 @@ pub struct DiscoveryArgs {
     /// Decode equality selector terms (key=value or key==value). Requires --prefill-selector.
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
+
+    /// Label selector matching the EndpointSlices of this router's OWN Service
+    /// (the Service's labels, not the pods'), so a booting replica can find
+    /// siblings to pull a cache-aware tree snapshot from, e.g.
+    /// `kubernetes.io/service-name=sgl-router`. Unset disables peer bootstrap
+    /// and every replica starts cold.
+    #[arg(long)]
+    pub kv_peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -181,7 +231,12 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
 
-    /// Static P/D bucket configuration. Omit to use the global candidate domain.
+    /// Also pick the DP rank inside each selected multi-rank worker.
+    #[arg(long)]
+    pub dp_aware: bool,
+
+    /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
+    /// Omit to use the global candidate domain (default buckets with reorg).
     #[arg(long)]
     pub bucket_config: Option<String>,
 
@@ -198,6 +253,11 @@ pub struct RoutingArgs {
     /// Router-local in-flight limit for `--filter overloaded`.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
+
+    /// Reorg admission: reject an engine whose KV tokens have reached this share
+    /// of its reported capacity, in (0, 1].
+    #[arg(long)]
+    pub max_kv_usage: Option<f64>,
 
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
@@ -219,6 +279,12 @@ pub struct CacheArgs {
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,
 
+    /// Credit a worker with a prompt's prefix for this many milliseconds after
+    /// routing it there, before the engine's KV events confirm it, so a burst
+    /// sharing a cold prefix lands together. Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_pending_prefix_ttl_ms: Option<u64>,
+
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -233,6 +299,24 @@ pub struct CacheArgs {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+
+    /// Peer-bootstrap deadline in milliseconds. Requires --kv-peer-selector.
+    /// Defaults to 600000 (10 minutes).
+    #[arg(long)]
+    pub kv_bootstrap_timeout_ms: Option<u64>,
+
+    /// Cap on one peer-snapshot fetch in milliseconds; raise it when one
+    /// snapshot transfer + decode outgrows it. Requires --kv-peer-selector.
+    /// Defaults to 300000; at least 30000.
+    #[arg(long)]
+    pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
+
+    /// Hold `/readyz` at 503 when siblings were found but their tree could not
+    /// be pulled. The hold is bounded at max(3x --kv-bootstrap-timeout-ms,
+    /// 60s) and nothing re-sweeps during it, so it delays a failed seed's
+    /// replica rather than keeping it out for good. Requires --kv-peer-selector.
+    #[arg(long)]
+    pub kv_bootstrap_seed_required: bool,
 
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
@@ -297,9 +381,22 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub stable_pair: bool,
 
-    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
+    /// Affinity mode: reorg prefer (default) or balanced; legacy session strict or soft.
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
+
+    /// Reorg balanced affinity: load compared against the alternative
+    /// (default prefill-tokens).
+    #[arg(long, value_enum)]
+    pub affinity_balanced_by: Option<BalancedBy>,
+
+    /// Reorg balanced affinity: switch only above this load ratio (>= 1, default 2).
+    #[arg(long)]
+    pub affinity_load_factor: Option<f64>,
+
+    /// Reorg balanced affinity: minimum load difference (default 1024 tokens or 4 requests).
+    #[arg(long)]
+    pub affinity_load_gap: Option<u64>,
 
     /// Session lookup mode (--policy session_aware). Defaults to bucket (search the target bucket).
     #[arg(long, value_enum)]
@@ -341,35 +438,102 @@ pub struct AffinityArgs {
 
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
-    pub fn into_config(self) -> Result<Config> {
-        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+    pub fn into_config(mut self) -> Result<Config> {
+        let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
+        if reorg {
             ensure!(
-                self.affinity.affinity_mode != Some(AffinityMode::Soft),
-                "reorg sessions do not support --affinity-mode soft"
+                self.affinity.affinity_mode.is_none_or(|mode| matches!(
+                    mode,
+                    AffinityMode::Prefer | AffinityMode::Balanced
+                )),
+                "reorg --affinity-mode must be prefer or balanced"
             );
             ensure!(
-                self.routing.policy != PolicyKind::SessionAware
-                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                self.affinity.pressure_abs_threshold_tokens.is_none()
                         && self.affinity.pressure_abs_threshold_ms.is_none()
                         && self.affinity.pressure_rel_threshold.is_none()
-                        && !self.affinity.disable_pressure_guard),
-                "reorg pressure guard options only apply to cache_aware"
+                        && !self.affinity.disable_pressure_guard
+                        && self.cache.worker_queue_limit.is_none()
+                        && self.cache.saturation_queue_floor.is_none()
+                        && self.cache.cache_switch_margin_tokens.is_none(),
+                "reorg uses --affinity-mode and --affinity-load-* instead of pressure guards and cache queue gates"
+            );
+            if matches!(
+                self.routing.policy,
+                PolicyKind::SessionAware | PolicyKind::CacheAware
+            ) {
+                self.affinity
+                    .affinity_mode
+                    .get_or_insert(AffinityMode::Prefer);
+            }
+        } else {
+            ensure!(
+                self.affinity
+                    .affinity_mode
+                    .is_none_or(|mode| matches!(mode, AffinityMode::Strict | AffinityMode::Soft))
+                    && self.affinity.affinity_balanced_by.is_none()
+                    && self.affinity.affinity_load_factor.is_none()
+                    && self.affinity.affinity_load_gap.is_none(),
+                "prefer, balanced, --affinity-balanced-by and --affinity-load-* require --chat-routing reorg"
+            );
+            ensure!(
+                self.routing.max_kv_usage.is_none(),
+                "--max-kv-usage requires --chat-routing reorg"
+            );
+            ensure!(
+                self.affinity.affinity_mode.is_none()
+                    || self.routing.policy == PolicyKind::SessionAware,
+                "legacy --affinity-mode requires --policy session_aware"
             );
         }
+        let balanced = AffinitySpec {
+            mode: None,
+            balanced_by: self.affinity.affinity_balanced_by,
+            load_factor: self.affinity.affinity_load_factor,
+            load_gap: self.affinity.affinity_load_gap,
+        };
+        balanced.validate(self.affinity.affinity_mode.unwrap_or_default())?;
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
         let discovery = self.discovery.into_config()?;
-        let bucket_config = self
-            .routing
-            .bucket_config
-            .as_deref()
-            .map(load_bucket_config)
-            .transpose()?;
+        let path = self.routing.bucket_config.as_deref();
+        let (bucket_config, reorg_buckets) = match path {
+            Some(path) if reorg => (None, Some(load_bucket_config(path)?)),
+            Some(path) => (Some(load_bucket_config(path)?), None),
+            None => (None, None),
+        };
         let circuit_breaker = self.routing.build_circuit_breaker()?;
+        let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
+        let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
+        let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
+        // Peer bootstrap grafts into this router's own radix tree, so it needs
+        // cache-aware over a local tree; checked here because it spans groups.
+        let has_peer_selector = discovery.peer_selector().is_some();
+        ensure!(
+            has_peer_selector
+                || (kv_bootstrap_timeout_ms.is_none()
+                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()
+                    && !kv_bootstrap_seed_required),
+            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms / \
+             --kv-bootstrap-seed-required require --kv-peer-selector, which is \
+             what enables peer bootstrap"
+        );
+        if has_peer_selector {
+            match cache_aware.as_ref().map(|c| c.prefix_provider) {
+                None => bail!("--kv-peer-selector requires --policy cache_aware"),
+                Some(p) if p != CachePrefixProvider::RadixTree => bail!(
+                    "--kv-peer-selector requires --cache-prefix-provider radix_tree \
+                     (there is no local tree to bootstrap when an external Indexer is \
+                     the prefix source)"
+                ),
+                _ => {}
+            }
+        }
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
+        let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
             .model
@@ -383,28 +547,51 @@ impl Cli {
             })
             .transpose()?
             .unwrap_or_default();
+        let default_chat_template_kwargs = self
+            .model
+            .default_chat_template_kwargs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("--default-chat-template-kwargs must be a JSON object")?
+            .unwrap_or_default();
 
+        let worker_auth = self
+            .server
+            .worker_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
+                worker_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                tokenizer: TokenizerConfig {
+                    backend: self.model.tokenizer_backend,
+                    l1_cache_mb: self.model.tokenizer_l1_cache_mb,
+                },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
+                reorg_buckets,
+                reorg_admission,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -412,11 +599,13 @@ impl Cli {
                 fused,
                 eligibility,
                 sampling_overrides,
+                default_chat_template_kwargs,
             },
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                max_attempts: self.server.retry_max_attempts,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -450,9 +639,18 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
+                );
+                // Peer replicas are found through EndpointSlices too, so with
+                // any other backend the flag would be accepted and then
+                // silently ignored.
+                ensure!(
+                    self.kv_peer_selector.is_none(),
+                    "--kv-peer-selector requires --service-discovery (peer replicas are \
+                     found via Kubernetes EndpointSlices)"
                 );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
@@ -464,9 +662,31 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self.pd_version_group_label;
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.trim().is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
+                // An empty selector matches every EndpointSlice in the watched
+                // namespace(s), turning unrelated Services into "siblings".
+                ensure!(
+                    self.kv_peer_selector
+                        .as_deref()
+                        .is_none_or(|s| !is_selector_empty(s)),
+                    "--kv-peer-selector must not be empty: an empty selector matches \
+                     every EndpointSlice in the watched namespace"
+                );
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
+                    peer_selector: self.kv_peer_selector,
+                    version_group_label,
                 })
             }
         };
@@ -556,6 +776,19 @@ impl RoutingArgs {
 
         Ok(eligibility)
     }
+
+    /// Reorg admission for groups without their own limits.
+    fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
+        let limits = AdmissionLimits {
+            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_kv_usage: self.max_kv_usage,
+            ..Default::default()
+        };
+        limits
+            .validate()
+            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+        Ok(limits)
+    }
 }
 
 impl CacheArgs {
@@ -587,6 +820,16 @@ impl CacheArgs {
             self.kv_indexer_query_max_inflight.is_none() || self.kv_indexer_endpoint.is_some(),
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms != Some(0),
+            "--cache-pending-prefix-ttl-ms must be greater than zero"
+        );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms.is_none()
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -617,6 +860,14 @@ impl CacheArgs {
         Ok(Some(CacheAwareConfig {
             prefix_provider: cache_prefix_provider,
             kv_indexer_endpoint,
+            bootstrap_timeout_ms: self
+                .kv_bootstrap_timeout_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
+            bootstrap_fetch_timeout_cap_ms: self
+                .kv_bootstrap_fetch_timeout_cap_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+            bootstrap_seed_required: self.kv_bootstrap_seed_required,
+            pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
         }))
     }
 }
@@ -632,12 +883,15 @@ impl AffinityArgs {
             || self.session_idle_secs.is_some()
             || self.session_eviction_interval_secs.is_some()
             || self.stable_pair
-            || self.affinity_mode.is_some()
             || self.session_affinity_mode.is_some();
         ensure!(
             !tuned_session_affinity || policy == PolicyKind::SessionAware,
-            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+            "--session-id-header, --session-*-secs, --stable-pair, and \
                  --session-affinity-mode require --policy session_aware"
+        );
+        ensure!(
+            self.affinity_mode.is_none() || affinity_policy,
+            "--affinity-mode requires --policy session_aware or cache_aware"
         );
         ensure!(
             !self.disable_pressure_guard || affinity_policy,
@@ -693,6 +947,7 @@ impl AffinityArgs {
             return Ok(None);
         }
         let defaults = AffinityConfig::default();
+        let load_factor = self.affinity_load_factor.unwrap_or(defaults.load_factor);
         let session_id_header = self
             .session_id_header
             .clone()
@@ -760,6 +1015,9 @@ impl AffinityArgs {
             session_eviction_interval_secs,
             stable_pair: self.stable_pair,
             mode: self.affinity_mode.unwrap_or(defaults.mode),
+            balanced_by: self.affinity_balanced_by.unwrap_or(defaults.balanced_by),
+            load_factor,
+            load_gap: self.affinity_load_gap,
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -833,7 +1091,7 @@ impl AffinityArgs {
     }
 }
 
-fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
+fn load_bucket_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     let raw = std::fs::read_to_string(path)
         .map_err(|error| anyhow!("--bucket-config cannot read {path:?}: {error}"))?;
     serde_json::from_str(&raw)
@@ -844,10 +1102,21 @@ fn join_selector(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(","))
 }
 
+/// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
+fn bearer(key: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+        .context("--worker-api-key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+    use crate::config::{
+        DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+    };
 
     #[test]
     fn chat_routing_selects_policy_implementation_without_another_config() {
@@ -874,13 +1143,13 @@ mod tests {
         let cache = parse(&[
             "--policy",
             "cache_aware",
-            "--worker-queue-limit",
-            "3",
+            "--affinity-mode",
+            "balanced",
             "--kv-indexer-endpoint",
             "http://localhost:50051",
         ])
         .unwrap();
-        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert_eq!(cache.model.affinity.unwrap().mode, AffinityMode::Balanced);
         assert!(cache
             .model
             .cache_aware
@@ -898,22 +1167,25 @@ mod tests {
             session.model.affinity.unwrap().session_id_header,
             "x-session"
         );
-        assert_eq!(
-            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
-                .unwrap()
-                .model
-                .eligibility
-                .unwrap()
-                .max_in_flight,
-            Some(2)
-        );
+        let overloaded = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+            .unwrap()
+            .model;
+        assert_eq!(overloaded.eligibility.unwrap().max_in_flight, Some(2));
+        assert_eq!(overloaded.reorg_admission.max_inflight_requests, Some(2));
+        let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
+        assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
+        assert!(kv.eligibility.is_none());
+        let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
+        assert!(legacy_kv.unwrap().into_config().is_err());
         for args in [
+            vec!["--max-kv-usage", "1.5"],
             vec!["--policy", "round_robin"],
             vec!["--decode-policy", "legacy_host_affinity"],
             vec!["--policy", "session_aware", "--stable-pair"],
             vec!["--policy", "session_aware", "--affinity-mode", "soft"],
             vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
             vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec!["--policy", "cache_aware", "--worker-queue-limit", "3"],
             vec![
                 "--filter",
                 "prefix_cache",
@@ -922,6 +1194,48 @@ mod tests {
             ],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn reorg_affinity_modes_share_validated_load_settings() {
+        for policy in ["session_aware", "cache_aware"] {
+            let base = format!("--chat-routing reorg --policy {policy}");
+            assert_eq!(
+                cfg_of(&base).unwrap().model.affinity.unwrap().mode,
+                AffinityMode::Prefer
+            );
+            for factor in ["1", "2", "0.5", "NaN", "inf"] {
+                let result = cfg_of(&format!("{base} --affinity-mode balanced --affinity-load-factor {factor} --affinity-load-gap 10"));
+                assert_eq!(result.is_ok(), matches!(factor, "1" | "2"));
+                if let Ok(config) = result {
+                    let affinity = config.model.affinity.unwrap();
+                    assert_eq!(affinity.load_factor, factor.parse::<f64>().unwrap());
+                    assert_eq!(affinity.load_gap(), 10);
+                }
+            }
+            for (metric, balanced_by, gap) in [
+                ("", BalancedBy::PrefillTokens, 1_024),
+                (
+                    "--affinity-balanced-by running-requests",
+                    BalancedBy::RunningRequests,
+                    4,
+                ),
+            ] {
+                let config = cfg_of(&format!("{base} --affinity-mode balanced {metric}")).unwrap();
+                let affinity = config.model.affinity.unwrap();
+                assert_eq!(
+                    (affinity.balanced_by, affinity.load_gap()),
+                    (balanced_by, gap)
+                );
+            }
+            assert!(cfg_of(&format!("{base} --affinity-load-gap 10")).is_err());
+            assert!(cfg_of(&format!("{base} --affinity-balanced-by running-requests")).is_err());
+            assert!(cfg_of(&format!(
+                "--policy {policy} --affinity-balanced-by running-requests"
+            ))
+            .is_err());
+            assert!(cfg_of(&format!("--policy {policy} --affinity-mode balanced")).is_err());
         }
     }
 
@@ -1085,7 +1399,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1099,7 +1413,25 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn no_tokenizer_disables_loading_and_conflicts_with_a_path() {
+        let base = ["--model-id", "qwen3", "--worker-urls", "http://x:30000"];
+        let c = into_config(&[&base[..], &["--no-tokenizer"]].concat()).unwrap();
+        assert_eq!(c.model.tokenizer_path, None);
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--tokenizer-path", "/t.json"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1151,6 +1483,196 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("require --service-discovery"), "got: {err}");
+    }
+
+    // ---- peer bootstrap ----
+
+    /// k8s discovery + cache-aware, the base every peer-bootstrap config needs.
+    fn peer_cfg(extra: &[&str]) -> Result<Config> {
+        let mut args = vec![
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+        ];
+        args.extend_from_slice(extra);
+        into_config_owned(with_model(&args))
+    }
+
+    /// The resolved cache config of a peer-bootstrap-enabled `peer_cfg`.
+    fn bootstrap_cache_cfg(extra: &[&str]) -> CacheAwareConfig {
+        let mut args = vec!["--kv-peer-selector", "app=sgl-router"];
+        args.extend_from_slice(extra);
+        peer_cfg(&args).unwrap().model.cache_aware.unwrap()
+    }
+
+    #[test]
+    fn peer_selector_rides_on_the_k8s_backend() {
+        let c = peer_cfg(&[
+            "--kv-peer-selector",
+            "app=sgl-router",
+            "--kv-bootstrap-timeout-ms",
+            "12000",
+        ])
+        .unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => {
+                assert_eq!(k.peer_selector.as_deref(), Some("app=sgl-router"))
+            }
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            12_000,
+        );
+    }
+
+    #[test]
+    fn peer_bootstrap_is_off_by_default() {
+        let c = peer_cfg(&[]).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert!(k.peer_selector.is_none()),
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+        );
+    }
+
+    /// Peers are found through EndpointSlices, so without k8s discovery the
+    /// flag would be accepted and then silently ignored.
+    #[test]
+    fn rejects_peer_selector_without_service_discovery() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://w:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --service-discovery"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_peer_selector_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--policy cache_aware"), "got: {err}");
+    }
+
+    /// With an external Indexer there is no local tree to graft into, so the
+    /// flag would be accepted and then do nothing.
+    #[test]
+    fn rejects_peer_selector_with_an_external_indexer() {
+        let err = peer_cfg(&[
+            "--cache-prefix-provider",
+            "indexer",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--cache-prefix-provider radix_tree"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn kv_bootstrap_timeout_bounds() {
+        let parse = |ms: u64| {
+            peer_cfg(&[
+                "--kv-peer-selector",
+                "app=sgl-router",
+                "--kv-bootstrap-timeout-ms",
+                &ms.to_string(),
+            ])
+        };
+        assert!(parse(MAX_KV_BOOTSTRAP_TIMEOUT_MS).is_ok());
+        let err = parse(MAX_KV_BOOTSTRAP_TIMEOUT_MS + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ceiling"), "got: {err}");
+        let err = parse(0).unwrap_err().to_string();
+        assert!(err.contains("greater than zero"), "got: {err}");
+    }
+
+    /// An empty selector matches every EndpointSlice in the namespace.
+    #[test]
+    fn rejects_an_empty_peer_selector() {
+        for selector in ["", " , "] {
+            let err = peer_cfg(&["--kv-peer-selector", selector])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must not be empty"), "{selector:?} got: {err}");
+        }
+    }
+
+    /// Without a selector these tune a bootstrap that never runs.
+    #[test]
+    fn rejects_bootstrap_tuning_without_a_peer_selector() {
+        for flag in [
+            vec!["--kv-bootstrap-seed-required"],
+            vec!["--kv-bootstrap-timeout-ms", "20000"],
+            vec!["--kv-bootstrap-fetch-timeout-cap-ms", "60000"],
+        ] {
+            let err = peer_cfg(&flag).unwrap_err().to_string();
+            assert!(
+                err.contains("require --kv-peer-selector"),
+                "{flag:?} got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_bootstrap_fetch_timeout_cap_bounds() {
+        let parse = |ms: u64| {
+            peer_cfg(&[
+                "--kv-peer-selector",
+                "app=sgl-router",
+                "--kv-bootstrap-fetch-timeout-cap-ms",
+                &ms.to_string(),
+            ])
+        };
+        let plumbed = |ms: u64| {
+            bootstrap_cache_cfg(&["--kv-bootstrap-fetch-timeout-cap-ms", &ms.to_string()])
+                .bootstrap_fetch_timeout_cap_ms
+        };
+        assert_eq!(
+            plumbed(MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+            MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS
+        );
+        assert_eq!(
+            plumbed(MAX_KV_BOOTSTRAP_TIMEOUT_MS),
+            MAX_KV_BOOTSTRAP_TIMEOUT_MS
+        );
+        for ms in [
+            MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS - 1,
+            MAX_KV_BOOTSTRAP_TIMEOUT_MS + 1,
+        ] {
+            let err = parse(ms).unwrap_err().to_string();
+            assert!(err.contains("out of range"), "{ms} got: {err}");
+        }
+    }
+
+    #[test]
+    fn seed_required_is_off_by_default_and_opt_in() {
+        assert!(!bootstrap_cache_cfg(&[]).bootstrap_seed_required);
+        assert!(bootstrap_cache_cfg(&["--kv-bootstrap-seed-required"]).bootstrap_seed_required);
     }
 
     #[test]
@@ -1266,6 +1788,69 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn pd_version_group_label_reaches_k8s_config() {
+        let args: Vec<_> = PD_K8S
+            .iter()
+            .copied()
+            .chain(["--pd-version-group-label", "sglang.ai/version-group"])
+            .collect();
+        let config = into_config_owned(with_model(&args)).unwrap();
+        let DiscoveryBackend::K8s(discovery) = config.discovery else {
+            panic!("expected k8s")
+        };
+        assert_eq!(
+            discovery.version_group_label.as_deref(),
+            Some("sglang.ai/version-group")
+        );
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 
@@ -2276,6 +2861,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_prefix_ttl_needs_the_local_radix_tree() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(cache.pending_prefix_ttl_ms, 500);
+        for args in [
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 0",
+            "--policy power_of_two --cache-pending-prefix-ttl-ms 500",
+            "--policy cache_aware --kv-indexer-endpoint http://i:1 --cache-pending-prefix-ttl-ms 500",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-ttl-ms"), "{args}: {err}");
+        }
+    }
+
+    #[test]
     fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
         let default_config = cfg_of("--policy power_of_two").unwrap();
         assert_eq!(
@@ -2337,6 +2940,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reorg_bucket_config_builds_complete_buckets_and_rejects_invalid_ones() {
+        use crate::buckets_reorg::{BucketResolver, SloPreference};
+        use serde_json::json;
+        fn build(buckets: &serde_json::Value) -> Result<BucketResolver> {
+            let file = tempfile::NamedTempFile::new()?;
+            std::fs::write(file.path(), buckets.to_string())?;
+            let config = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://worker:30000",
+                "--chat-routing",
+                "reorg",
+                "--policy",
+                "session_aware",
+                "--bucket-config",
+                file.path().to_str().unwrap(),
+            ]))?;
+            let state = crate::state::kv_events::KvEventIndex::new();
+            let (resolver, _) =
+                crate::policies_reorg::factory::build_resolver(&config.model, &state, None)?;
+            Ok(resolver)
+        }
+        let resolver = build(&json!({
+            "ttft_slo": "slo_first",
+            "buckets": [
+                {"id": "short", "max_input_tokens": 4096, "plain": {
+                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9},
+                    "affinity": {"mode": "balanced", "balanced_by": "running_requests"}
+                }},
+                {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two", "worker_services": ["ns/decode"]}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resolver.ttft_slo, SloPreference::SloFirst);
+        let shape: Vec<_> = (resolver.buckets.iter())
+            .map(|b| (b.id.as_str(), b.rank, b.limits.max))
+            .collect();
+        assert_eq!(shape, [("short", 0, Some(4096)), ("long", 1, None)]);
+        let crate::buckets_reorg::BucketGroups::Pd { decode, .. } = &resolver.buckets[1].groups
+        else {
+            panic!("expected PD bucket");
+        };
+        assert_eq!(
+            decode.worker_services.as_ref().unwrap(),
+            &["ns/decode".into()].into()
+        );
+        for bad in [
+            json!({"buckets": []}),
+            json!({"buckets": [{"id": "x", "plain": {}, "prefill": {}}]}),
+            json!({"buckets": [{"id": "x", "prefill": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {}}, {"id": "x", "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"policy": "cache_aware"}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_usage": 2.0}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_kv_tokens": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_running_usage": 0}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"admission": {"max_waiting_requests": 0}}}]}),
+            json!({"buckets": [{"id": "", "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_input_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "min_input_tokens": 9, "max_context_tokens": 8, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "max_context_tokens": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "ttft_ms": 0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "tokens_per_second": 0.0, "plain": {}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [""]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": [" \t"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": []}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/short/extra"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/ short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"worker_ids": ["a"], "worker_services": ["ns/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "strict"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"balanced_by": "running_requests"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "balanced", "load_factor": 0.5}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"load_gap": 1, "mode": "balanced", "extra": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"policy": "power_of_two", "affinity": {"mode": "balanced"}}}]}),
+        ] {
+            assert!(build(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
     /// The flag reaches `ModelConfig`, and is opt-in: unset leaves the model
     /// with an empty sampling contract, so no request is ever checked.
     #[test]
@@ -2396,6 +3081,51 @@ mod tests {
         .to_string();
         assert!(err.contains("unknown parameter"), "got: {err}");
     }
+
+    #[test]
+    fn default_chat_template_kwargs_reaches_the_model_config() {
+        let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "high"});
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-chat-template-kwargs",
+            &kwargs.to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config.model.default_chat_template_kwargs).unwrap(),
+            kwargs
+        );
+
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(defaults.model.default_chat_template_kwargs.is_empty());
+    }
+
+    #[test]
+    fn malformed_default_chat_template_kwargs_fails_the_launch() {
+        for kwargs in [
+            r#"{"thinking": true"#,
+            "[]",
+            "null",
+            "true",
+            "42",
+            r#""high""#,
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--default-chat-template-kwargs",
+                kwargs,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("--default-chat-template-kwargs must be a JSON object"),
+                "kwargs={kwargs}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn input_ids_forwarding_can_be_disabled_for_the_model() {
         let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
@@ -2407,6 +3137,29 @@ mod tests {
         ]))
         .unwrap();
         assert!(disabled.model.disable_input_ids_forwarding);
+    }
+
+    #[test]
+    fn tokenizer_backend_and_l1_cache_are_plumbed() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(defaults.model.tokenizer, TokenizerConfig::default());
+        assert_eq!(defaults.model.tokenizer.backend, TokenizerBackend::Hf);
+        let fast = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--tokenizer-backend",
+            "fast",
+            "--tokenizer-l1-cache-mb",
+            "4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            fast.model.tokenizer,
+            TokenizerConfig {
+                backend: TokenizerBackend::Fast,
+                l1_cache_mb: 4096,
+            }
+        );
     }
 
     #[test]

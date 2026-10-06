@@ -115,6 +115,17 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
+def _init_process_global_configs() -> None:
+    """Process-global config both benchmark modes need before the model loads.
+
+    The Mamba SSU backend is not here: `load_model` installs it for the models
+    that have one.
+    """
+    initialize_moe_config()
+    initialize_fp8_gemm_config()
+    initialize_fp4_gemm_config()
+
+
 def start_profile(
     profile_activities,
     profile_record_shapes=False,
@@ -473,13 +484,13 @@ class TreeCacheNamespace(SimpleNamespace):
     def supports_mamba(self) -> bool:
         return False
 
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        return True
 
     def evict(self, params: EvictParams):
+        pass
+
+    def maybe_hand_to_session(self, req):
         pass
 
 
@@ -686,6 +697,7 @@ def correctness_test(
             gpu_id=gpu_id,
         ),
     )
+    _init_process_global_configs()
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -898,9 +910,7 @@ def latency_test(
             gpu_id=gpu_id,
         ),
     )
-    initialize_moe_config()
-    initialize_fp8_gemm_config()
-    initialize_fp4_gemm_config()
+    _init_process_global_configs()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(tp_rank)
