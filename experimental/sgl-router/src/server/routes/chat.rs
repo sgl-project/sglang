@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, SelectedWorkers};
+use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
 };
@@ -60,10 +60,7 @@ pub async fn chat_completions(
         body,
         routing.needs_request_tokens(&ctx),
     )?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -77,10 +74,7 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
@@ -112,10 +106,7 @@ async fn embedding_input(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
@@ -129,10 +120,7 @@ pub async fn rerank(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, "/v1/rerank")?;
     let request = PreparedRequest::rerank(model, body)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// Prefill and decode engines serve generation only.
@@ -168,6 +156,19 @@ impl<'a> ModelRouting<'a> {
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
         }
+    }
+
+    /// Select workers for `request` and forward it to them.
+    async fn dispatch(
+        &self,
+        ctx: &AppContext,
+        mut request: PreparedRequest,
+        headers: HeaderMap,
+        start: Instant,
+    ) -> Result<Response<Body>, ApiError> {
+        let workers = self.select_workers(ctx, &request, &headers, &[]).await?;
+        let duration = RequestDurationGuard::new(ctx, &request.model, start);
+        forward_request(ctx, &mut request, workers, headers, start, &duration).await
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
