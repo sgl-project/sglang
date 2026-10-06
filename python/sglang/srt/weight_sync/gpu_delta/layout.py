@@ -758,7 +758,7 @@ class PreparedDelta:
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         return {
             "applied": True,
-            "verification": "artifact-sha256-and-decoder-status",
+            "verification": "manifest-sha256-and-decoder-status",
             "target_version": self.target_version,
             "tensors": self.matrix_tensor_count + self.raw_tensor_count,
             "timing_enabled": self.timing_enabled,

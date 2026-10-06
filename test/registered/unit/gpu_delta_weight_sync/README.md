@@ -68,8 +68,13 @@ scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
 Preparation reads, validates and hashes encoded publication files once per engine-host.
-`GPU_DELTA_SKIP_PAYLOAD_HASH=1` skips only the payload SHA256 pass; the default is
-`0`. Each rank caches this setting when its HostArena is created. The encoded
+`GPU_DELTA_SKIP_PAYLOAD_HASH=1` skips payload SHA256 on both Miles and SGLang;
+the default is `0`. Set it in the Ray job environment so trainers and rollout
+workers inherit the same policy. Miles publishes `payload_checksum_format="none"`
+and null file checksums when skipping; a receiver with hashing enabled rejects
+that publication before allocating payload storage. The receiver can also skip
+verification of a hashed publication. Each rank caches this setting when its
+HostArena is created. The encoded
 cache index and READY token bind the policy, and all ranks in the original cohort
 must agree. Skipping trusts payload contents without SHA authentication; manifest
 SHA, file identity/size, path, frame-range and decode checks remain in force.

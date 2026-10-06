@@ -31,7 +31,7 @@ class Payload:
         self.applications += 1
         if self.fail:
             raise RuntimeError("device verdict failed after a possible write")
-        return {"applied": True, "verification": "artifact-sha256-and-decoder-status"}
+        return {"applied": True, "verification": "manifest-sha256-and-decoder-status"}
 
     def close(self):
         self.closed.set()

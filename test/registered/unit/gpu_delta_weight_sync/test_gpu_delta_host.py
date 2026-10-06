@@ -361,7 +361,9 @@ class TestHostSnapshot(unittest.TestCase):
         strict_snapshot.close()
 
         # The manifest itself still has an exact digest; only payload SHA is skipped.
-        manifest["files"][0]["sha256"] = "0" * 64
+        manifest["payload_checksum_format"] = "none"
+        for record in manifest["files"]:
+            record["sha256"] = None
         path.write_text(json.dumps(manifest))
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         for arena, created in ((unchecked, 1), (follower, 0)):
@@ -386,7 +388,7 @@ class TestHostSnapshot(unittest.TestCase):
             for field in ("hash_files", "hash_bytes", "sha256_worker_sum_s"):
                 self.assertEqual(metrics["host_encoded_cache_" + field], 0)
             snapshot.close()
-        with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
+        with self.assertRaisesRegex(ValueError, "payload checksum omitted"):
             prepare_snapshot(
                 strict_peer,
                 path,
@@ -396,17 +398,6 @@ class TestHostSnapshot(unittest.TestCase):
                 self.pool,
                 {},
                 metadata(),
-            )
-        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
-            prepare_snapshot(
-                self.arena("strict-bad-sha"),
-                path,
-                digest,
-                manifest,
-                local_entries(manifest, expected),
-                self.pool,
-                {},
-                metadata(engine="strict-bad-sha"),
             )
 
     def test_hash_failure_poison_and_rank_decode_failure_never_release_cache(self):

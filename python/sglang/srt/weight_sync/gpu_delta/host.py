@@ -406,6 +406,11 @@ class HostArena:
                 or size < 0
             ):
                 raise ValueError("invalid or duplicate delta payload path/size")
+            if record["sha256"] is None and not self.skip_payload_hash:
+                raise ValueError(
+                    "payload checksum omitted; set GPU_DELTA_SKIP_PAYLOAD_HASH=1 "
+                    "on both sender and receiver"
+                )
             definitions[name] = {"nbytes": size, "sha256": record["sha256"]}
         expected = {
             "manifest_path": str(publication),
