@@ -310,15 +310,19 @@ class KVIndexTranslator:
                 width = min(max(-(-max_seq // self.page_size), 1), row_pages)
             else:
                 width = row_pages
-            out_full = torch.zeros((rows, width), dtype=torch.int32, device=self.device)
+            # Fresh tables: the build writes every column of the batch's rows,
+            # the sink past each row's live prefix included.
+            out_full = torch.empty((rows, width), dtype=torch.int32, device=self.device)
             out_swa = (
-                torch.zeros_like(out_full) if self._swa_v2p_table is not None else None
+                torch.empty_like(out_full) if self._swa_v2p_table is not None else None
             )
             for v2p, out in (
                 (self._full_v2p_table, out_full),
                 (self._swa_v2p_table, out_swa),
             ):
                 if out is not None:
+                    if rows > bs:
+                        out[bs:].zero_()
                     build_kv_read_table(
                         req_to_token=self.req_to_token,
                         req_pool_indices=plan.req_pool_indices,
@@ -327,6 +331,7 @@ class KVIndexTranslator:
                         page_size=self.page_size,
                         max_pages=width,
                         out=out,
+                        zero_tail=True,
                         seq_len_delta=plan.read_extent,
                     )
         return KVIndexTable(

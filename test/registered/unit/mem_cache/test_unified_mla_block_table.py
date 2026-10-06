@@ -215,6 +215,44 @@ class TestBlockTable(unittest.TestCase):
                 torch.equal(gpu, cpu), f"ps={page_size}:\ngpu={gpu}\ncpu={cpu}"
             )
 
+    def test_zero_tail_fills_a_fresh_table(self):
+        """With ``zero_tail`` a fresh (garbage) table comes back whole in one
+        launch: each row's live prefix, the sink past it up to ``max_pages``,
+        and nothing past ``max_pages``. The CUDA kernel must agree with the
+        CPU path."""
+        from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            bs = rpi.shape[0]
+            max_pages = int((sl.max().item() + page_size - 1) // page_size) + 2
+
+            def fill(device):
+                # One guard column past the table catches a spill off the row.
+                out = torch.full(
+                    (bs, max_pages + 1), 7, dtype=torch.int32, device=device
+                )
+                build_kv_read_table(
+                    req_to_token=rt.to(device),
+                    req_pool_indices=rpi.to(device),
+                    seq_lens=sl.to(device=device, dtype=torch.int64),
+                    v2p=v2p.to(device),
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=out,
+                    zero_tail=True,
+                )
+                return out.cpu()
+
+            gpu, cpu = fill(_DEV), fill("cpu")
+            self.assertTrue(torch.equal(gpu, cpu), f"ps={page_size}")
+            self.assertTrue(bool((gpu[:, max_pages] == 7).all()), "spilled")
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p).cpu().to(torch.int32)
+            for b in range(bs):
+                live = int((int(sl[b]) + page_size - 1) // page_size)
+                self.assertTrue(torch.equal(gpu[b, :live], want[b, :live]))
+                self.assertTrue(bool((gpu[b, live:max_pages] == 0).all()))
+
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the
         plain token//ps reference -- guards the v2p-arg removal itself."""

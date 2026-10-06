@@ -76,6 +76,7 @@ def build_kv_read_indices_kernel(
     PAGE_SIZE: tl.constexpr,
     EMIT_PER_TOKEN: tl.constexpr,
     OUT_INT64: tl.constexpr,
+    ZERO_TAIL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -98,8 +99,10 @@ def build_kv_read_indices_kernel(
         # A widened window can outrun a fixed-width row (a verify near the
         # context limit); writing past it would land in the next row.
         n_items = tl.minimum(n_items, max_row_items)
+    # A fresh (unzeroed) table also takes the sink past the live prefix.
+    n_written = max_row_items if ZERO_TAIL else n_items
 
-    for start in range(tl.program_id(1) * BLOCK, n_items, item_stride):
+    for start in range(tl.program_id(1) * BLOCK, n_written, item_stride):
         item = start + tl.arange(0, BLOCK)
         mask = item < n_items
         pos = kv_start + item
@@ -118,10 +121,14 @@ def build_kv_read_indices_kernel(
             value = entry * PAGE_SIZE + pos % PAGE_SIZE
         else:
             value = entry
+        store_mask = mask
+        if ZERO_TAIL:
+            value = tl.where(mask, value, 0)
+            store_mask = item < n_written
         if OUT_INT64:
-            tl.store(row_out + item, value, mask=mask)
+            tl.store(row_out + item, value, mask=store_mask)
         else:
-            tl.store(row_out + item, value.to(tl.int32), mask=mask)
+            tl.store(row_out + item, value.to(tl.int32), mask=store_mask)
 
 
 def _launch(
@@ -138,6 +145,7 @@ def _launch(
     kv_start_idx: Optional[torch.Tensor],
     emit_per_token: bool,
     seq_len_delta: int = 0,
+    zero_tail: bool = False,
 ) -> None:
     bs = int(req_pool_indices.numel())
     item_programs = min(
@@ -159,6 +167,7 @@ def _launch(
         PAGE_SIZE=page_size,
         EMIT_PER_TOKEN=emit_per_token,
         OUT_INT64=out.dtype == torch.int64,
+        ZERO_TAIL=zero_tail,
         BLOCK=_BLOCK_ITEMS,
         num_warps=_NUM_WARPS,
     )
@@ -188,12 +197,14 @@ def build_kv_read_table(
     max_pages: int,
     out: torch.Tensor,
     seq_len_delta: int = 0,
+    zero_tail: bool = False,
 ) -> torch.Tensor:
     """Fill ``out``'s live prefix with PAGE TABLE entries.
 
-    ``out`` is caller-owned (fresh zeros for the eager path, the module's
-    capture-stable buffer for replay) and only its ``[:bs, :max_pages]``
-    region's live prefix is written -- never rebound, never tail-cleared.
+    ``out`` is caller-owned and only its ``[:bs, :max_pages]`` region is
+    written: each row's live prefix, and with ``zero_tail`` the sink (0) past
+    it up to ``max_pages`` -- what a fresh ``torch.empty`` table needs, in the
+    same launch. Never rebound.
 
     ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
     verify contract (draft KV read back from the pool). Every row stops at
@@ -228,6 +239,8 @@ def build_kv_read_table(
                 v2p=v2p,
                 page_size=page_size,
             ).to(torch.int32)
+            if zero_tail:
+                out[b, live:max_pages] = 0
         return out
 
     _launch(
@@ -243,6 +256,7 @@ def build_kv_read_table(
         kv_start_idx=None,
         emit_per_token=False,
         seq_len_delta=seq_len_delta,
+        zero_tail=zero_tail,
     )
     return out
 
