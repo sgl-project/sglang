@@ -103,9 +103,7 @@ class Gemma4Renoise(DllmAlgorithm):
         unsupported.extend(
             name
             for name, value in (
-                ("return_logprob", req.return_logprob),
                 ("top_logprobs_num", req.logprob.top_logprobs_num),
-                ("token_ids_logprob", req.logprob.token_ids_logprob),
                 (
                     "return_flat_raw_top_logprobs",
                     req.return_flat_raw_top_logprobs,
@@ -115,6 +113,10 @@ class Gemma4Renoise(DllmAlgorithm):
             )
             if value
         )
+        if req.logprob.token_ids_logprob and not req.return_logprob:
+            unsupported.append("token_ids_logprob without return_logprob")
+        if req.return_logprob and sp.max_new_tokens == 0:
+            unsupported.append("logprobs with max_new_tokens=0 (no denoising)")
         if not unsupported:
             return None
         return (
@@ -353,12 +355,46 @@ class Gemma4Renoise(DllmAlgorithm):
         for index in active:
             state = states[index]
             if state["finished"]:
+                if forward_batch.return_logprob:
+                    # Read raw logits at the SAME canvas position. These are
+                    # denoiser scores, not shifted causal next-token likelihoods.
+                    # Save only compact scores: later sync steps / graph replays
+                    # may overwrite the full logits for an already finished row.
+                    row = logits[index].float()
+                    normalizer = torch.logsumexp(row, dim=-1)
+                    state["output_logprobs"] = (
+                        row.gather(-1, state["argmax"][:, None]).squeeze(-1)
+                        - normalizer
+                    )
+                    candidates = forward_batch.token_ids_logprobs
+                    ids = candidates[index] if candidates is not None else None
+                    state["candidate_logprobs"] = (
+                        row[:, ids] - normalizer[:, None] if ids else None
+                    )
                 state["current"] = state["argmax"]
                 state["self_conditioning"] = None
             else:
                 state["self_conditioning"] = soft_embeds[index]
         self._write_input_ids(forward_batch, states)
         return done
+
+    def finalize_output(self, forward_batch, logits_output, states) -> None:
+        if not forward_batch.return_logprob:
+            return
+        # Unfinished FDFO rows do not emit. Use a zero placeholder only for the
+        # rectangular selected-token tensor; the scheduler skips those rows.
+        logits_output.next_token_logprobs = torch.stack(
+            [
+                state["output_logprobs"]
+                if state["finished"]
+                else torch.zeros(self.block_size, device=forward_batch.input_ids.device)
+                for state in states
+            ]
+        )
+        logits_output.next_token_token_ids_logprobs_val = [
+            state.get("candidate_logprobs") if state["finished"] else None
+            for state in states
+        ]
 
 
 Algorithm = Gemma4Renoise

@@ -176,10 +176,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
             )
         if get_exec().features.enable_mis:
             return f"{route} does not support --enable-mis"
-        if get_exec().dllm.dllm_algorithm is not None:
+        if get_exec().dllm.dllm_algorithm not in (None, "Gemma4Renoise"):
             return (
-                f"{route} does not support diffusion language models "
-                "served with --dllm-algorithm"
+                f"{route} does not support diffusion language models served with "
+                f"--dllm-algorithm {get_exec().dllm.dllm_algorithm}; "
+                "use Gemma4Renoise for DiffusionGemma"
             )
         _, adapter = self._parse_model_parameter(model)
         if adapter is not None:
@@ -345,15 +346,30 @@ class OpenAIServingDecisions(OpenAIServingBase):
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         # Refuse here because --allow-auto-truncate would cut off the answer position.
         context_len = self.tokenizer_manager.context_len
-        if len(prompt_ids) + self.tokenizer_manager.num_reserved_tokens >= context_len:
+        output_budget = self.tokenizer_manager.score_output_token_budget()
+        if (
+            len(prompt_ids) + self.tokenizer_manager.num_reserved_tokens + output_budget
+            > context_len
+        ):
             raise ValueError(
-                f"the prompt has {len(prompt_ids)} tokens, which does not fit "
+                f"the prompt has {len(prompt_ids)} tokens and needs "
+                f"{output_budget} output tokens, which does not fit "
                 f"the context length of {context_len} tokens"
+            )
+        label_prompt, label_prompt_ids = prompt, prompt_ids
+        if get_exec().dllm.dllm_algorithm == "Gemma4Renoise":
+            # The decoder emits its empty thought scaffold on the canvas.
+            # Validate labels after it without adding it to the encoder prompt.
+            label_prompt_ids = self.tokenizer_manager.dllm_scoring_prefix_ids
+            label_prompt = tokenizer.decode(
+                label_prompt_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
             )
         label_ids = _encode_labels(
             tokenizer=tokenizer,
-            prompt=prompt,
-            prompt_ids=prompt_ids,
+            prompt=label_prompt,
+            prompt_ids=label_prompt_ids,
             labels=labels,
             added_tokens=self.added_tokens,
         )
