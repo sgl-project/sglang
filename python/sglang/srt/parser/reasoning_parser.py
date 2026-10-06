@@ -36,7 +36,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     has_atem_markers,
     partial_marker_len,
 )
-from sglang.srt.parser.harmony_parser import HarmonyParser
+from sglang.srt.parser.harmony_parser import HarmonyParser, prefix_hold
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
     CONTENT_INVOKE_TOOL_TEXT,
@@ -1054,6 +1054,165 @@ class GptOssDetector(BaseReasoningFormatDetector):
             normal_text=normal_text,
             reasoning_text=reasoning_text,
         )
+
+
+_LLM_JP_HARMONY_TERMINATORS = ("<|end|>", "<|call|>", "<|return|>")
+_LLM_JP_HARMONY_HEADER_STARTS = ("<|channel|>", "to=", "assistant")
+
+
+def _llm_jp_harmony_channel(header: str) -> str:
+    if "to=functions." in header:
+        return "tool"
+    _, found, rest = header.partition("<|channel|>")
+    words = rest.split()
+    return "analysis" if found and words and words[0] == "analysis" else "content"
+
+
+class LlmJpHarmonyDetector(BaseReasoningFormatDetector):
+    """Detector for LLM-jp-4.1, the gpt-oss Harmony format with a space after every
+    special token::
+
+        <|channel|> analysis<|message|> reasoning<|end|><|start|> assistant<|channel|> final<|message|> answer
+
+    Analysis messages are reasoning and final messages are content. Tool-call
+    messages pass through with their header and terminator for the function-call
+    detector. The markers must survive detokenization, which is why
+    ``llm-jp-harmony`` is registered in ``_patch_reasoning_skip_special_tokens``.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<|channel|>analysis<|message|>",
+            "<|end|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        # The generation prompt ends with "<|start|>assistant".
+        self._state = "header"
+        self._channel = "content"
+        self._at_body_start = False
+        self._pending_reasoning = ""
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        self._buffer += text
+        return self._consume(flush=True)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        return self._consume(flush=False)
+
+    def finish(self) -> StreamingParseResult:
+        return self._consume(flush=True)
+
+    def _consume(self, flush: bool) -> StreamingParseResult:
+        reasoning: List[str] = []
+        normal: List[str] = []
+        while self._buffer:
+            if self._state == "content":
+                normal.append(self._buffer)
+                self._buffer = ""
+            elif self._state == "header":
+                if not self._read_header(flush=flush, normal=normal):
+                    break
+            elif self._state == "body":
+                if not self._read_body(flush=flush, reasoning=reasoning, normal=normal):
+                    break
+            elif not self._read_between(flush=flush):
+                break
+        if flush and self._pending_reasoning:
+            reasoning.append(self._pending_reasoning)
+            self._pending_reasoning = ""
+        return StreamingParseResult(
+            normal_text="".join(normal), reasoning_text="".join(reasoning)
+        )
+
+    def _read_header(self, flush: bool, normal: List[str]) -> bool:
+        end = self._buffer.find("<|message|>")
+        if end < 0:
+            head = self._buffer.lstrip()
+            if not any(
+                head.startswith(s) or s.startswith(head)
+                for s in _LLM_JP_HARMONY_HEADER_STARTS
+            ):
+                self._state = "content"
+                return True
+            if flush:
+                # A header cut off by max_tokens carries no text.
+                self._buffer = ""
+            return False
+        header = self._buffer[:end]
+        self._buffer = self._buffer[end + len("<|message|>") :]
+        self._channel = _llm_jp_harmony_channel(header)
+        if self._channel == "tool":
+            normal.append("<|start|>" + header + "<|message|>")
+        # Llmjp4Tokenizer (--trust-remote-code) decodes without the spaces.
+        self._at_body_start = self._channel != "tool" and "<|channel|> " in header
+        self._in_reasoning = self._channel == "analysis"
+        self._state = "body"
+        return True
+
+    def _read_body(self, flush: bool, reasoning: List[str], normal: List[str]) -> bool:
+        hits = [
+            (self._buffer.find(t), t)
+            for t in _LLM_JP_HARMONY_TERMINATORS
+            if t in self._buffer
+        ]
+        if hits:
+            idx, terminator = min(hits)
+            body = self._buffer[:idx]
+            self._buffer = self._buffer[idx + len(terminator) :]
+        else:
+            terminator = None
+            if flush:
+                body, self._buffer = self._buffer, ""
+            else:
+                body, self._buffer = prefix_hold(
+                    self._buffer, list(_LLM_JP_HARMONY_TERMINATORS)
+                )
+        # The tokenizer's space after <|message|>; a leading space the model
+        # wrote comes as a second one.
+        if self._at_body_start and body:
+            self._at_body_start = False
+            body = body[1:] if body.startswith(" ") else body
+        if self._channel == "analysis":
+            self._pending_reasoning += body
+            if terminator is not None or self.stream_reasoning:
+                reasoning.append(self._pending_reasoning)
+                self._pending_reasoning = ""
+        elif self._channel == "tool":
+            normal.append(body + (terminator or ""))
+        else:
+            normal.append(body)
+        if terminator is None:
+            return False
+        self._in_reasoning = False
+        self._state = "between"
+        return True
+
+    def _read_between(self, flush: bool) -> bool:
+        head = self._buffer.lstrip()
+        if head.startswith("<|start|>"):
+            self._buffer = head[len("<|start|>") :]
+            self._state = "header"
+            return True
+        if not head:
+            if flush:
+                self._buffer = ""
+            return False
+        if not flush and "<|start|>".startswith(head):
+            return False
+        self._state = "content"
+        return True
 
 
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
@@ -2265,6 +2424,7 @@ class ReasoningParser:
         "ling3": Ling3Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
+        "llm-jp-harmony": LlmJpHarmonyDetector,
         "k2_horizon": K2V3Detector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,

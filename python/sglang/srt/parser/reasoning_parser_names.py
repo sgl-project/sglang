@@ -14,6 +14,7 @@ REASONING_PARSER_NAMES = [
     "ling3",
     "hunyuan",
     "gpt-oss",
+    "llm-jp-harmony",
     "k2_horizon",
     "kimi",
     "kimi_k2",
