@@ -47,6 +47,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.buffer_mode.pipeline import _StagedPrefetch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _swa_allocation_callbacks,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
@@ -62,6 +68,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_tri_pool
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -183,6 +190,14 @@ def _events(allocator) -> dict:
         side.sub_pool_name: dict(side._hicache_transfer_done_events)
         for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator)
     }
+
+
+def _state_bytes(allocator, slots: torch.Tensor) -> list:
+    """The shared-buffer bytes behind each Mamba state slot (views, not copies)."""
+    end = allocator.mamba_allocator
+    raw, size = end.unified_buffer._raw, end.entry_bytes_per_page
+    pages = end.virtual_to_physical[slots].tolist()
+    return [raw[page * size : (page + 1) * size] for page in pages]
 
 
 class _ConfigCase(unittest.TestCase):
@@ -343,6 +358,158 @@ class TestPhysicalReservation(_ConfigCase):
             torch.equal(rows.read(missing)[1], rows.markers(504, PAGE)),
         )
         self.assertEqual(allocator.verify_byte_accounting(), [])
+
+
+class TestFloatSwaReservation(_ConfigCase):
+    """The tri-pool's SWA middle floats: it relocates its pages to make room for
+    a neighbour. A load's SWA reservation pins it until the load is queued or
+    cancelled, as on an end pool; the transfer gate then holds until the ack."""
+
+    def setUp(self):
+        super().setUp()
+        bundle, self.allocator = build_tri_pool(page_size=PAGE)
+        self.rows = _Rows(bundle)
+        self.swa = self.allocator.swa_attn_allocator
+        self.states = bundle.req_to_token_pool.mamba_allocator
+        mamba = self.allocator.mamba_allocator
+        resident = self.allocator.alloc(4 * PAGE)
+        # The Mamba end is full: its next slot needs the float to move.
+        self.held = mamba.alloc(mamba.available_size())
+        for row in _state_bytes(self.allocator, self.held):
+            row.fill_(90)
+        # A window slides past its oldest page: a hole at the float's low edge.
+        self.allocator.free_swa(resident[:PAGE])
+        self.resident = resident[PAGE:]
+        self.expected = self.rows.seed(self.resident, 100)
+        self.attempts = []
+        self.moves = []
+        _record_moves(self.allocator, self.moves)
+
+    def _controller(self, evict_state=None) -> HybridCacheController:
+        """What `HybridCacheController.load` reads, with the production SWA and
+        Mamba callbacks of the tri-pool."""
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = self.allocator
+        controller.device = "cpu"
+        controller.load_queue, controller.ack_load_queue = [], []
+
+        def alloc_state(need_size):
+            # What guards the float while the state slot is allocated.
+            self.attempts.append(
+                (self.swa._pending_hicache_load_pages, len(controller.load_queue))
+            )
+            return self.states.alloc(need_size)
+
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    device_evict_fn=None, **_swa_allocation_callbacks(self.swa)
+                ),
+                PoolName.MAMBA: SimpleNamespace(
+                    device_alloc_fn=alloc_state,
+                    device_free_fn=self.states.free,
+                    device_evict_fn=evict_state,
+                ),
+            }
+        )
+        self.allocator.set_host_transfer_move_gate(
+            lambda: not (controller.load_queue or controller.ack_load_queue)
+        )
+        return controller
+
+    def _load(self, controller):
+        # The production order: FULL, then SWA, then the Mamba checkpoint.
+        self.transfers = [
+            PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(PAGE)),
+            PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([1])),
+        ]
+        return controller.load(
+            host_indices=torch.arange(PAGE), extra_pools=self.transfers
+        )
+
+    def _assert_kept(self, held: torch.Tensor):
+        got = self.rows.read(self.resident)[1]
+        self.assertTrue(torch.equal(got, self.expected[1]))
+        for row in _state_bytes(self.allocator, held):
+            self.assertTrue(bool((row == 90).all()))
+
+    def test_state_allocation_cannot_move_a_reservation_before_its_load_is_queued(
+        self,
+    ):
+        full, swa = self.allocator.full_attn_allocator, self.swa
+        controller = self._controller()
+        allocated = (full.allocated_count(), swa.allocated_count())
+        span = (swa.low_wm_page, swa.high_wm_page)
+
+        # The state slot needs the float to move, which the SWA reservation
+        # taken just before forbids: the load rolls back instead.
+        self.assertIsNone(self._load(controller))
+
+        self.assertEqual(self.attempts, [(1, 0)])
+        self.assertEqual(self.moves, [])
+        self.assertEqual((swa.low_wm_page, swa.high_wm_page), span)
+        self.assertIsNone(self.transfers[0].device_indices)
+        self.assertEqual(controller.load_queue, [])
+        self.assertEqual(swa._pending_hicache_load_pages, 0)
+        self.assertEqual((full.allocated_count(), swa.allocated_count()), allocated)
+        # No move wrote through the unbound page's -1 owner.
+        self.assertEqual(swa.virtual_to_physical[-1].item(), -1)
+        self._assert_kept(self.held)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+
+        # Cancelled, so the float makes room again.
+        self.assertIsNotNone(self.states.alloc(1))
+        self.assertIn(("move", "swa"), self.moves)
+        self._assert_kept(self.held)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+
+    def test_reservation_stays_put_until_its_load_is_acked(self):
+        swa, rows = self.swa, self.rows
+        evicted, held = self.held[-1:], self.held[:-1]
+        controller = self._controller(
+            evict_state=lambda _num_slots: self.states.free(evicted)
+        )
+
+        loaded = self._load(controller)
+
+        self.assertIsNotNone(loaded)
+        reserved, state = (transfer.device_indices for transfer in self.transfers)
+        for row in _state_bytes(self.allocator, state):
+            row.fill_(91)
+        # The H2D will write the reserved rows, which no state slot may overlap.
+        rows.swa[reserved] = rows.markers(300, PAGE)
+        for row in _state_bytes(self.allocator, state):
+            self.assertTrue(bool((row == 91).all()))
+        self._assert_kept(held)
+        # The first state attempt could not move the float; the retry after the
+        # tree evicted a checkpoint took that slot. Both ran before the load was
+        # queued, so the reservation alone kept the float in place.
+        self.assertEqual(self.attempts, [(1, 0), (1, 0)])
+        self.assertEqual(self.moves, [])
+
+        # Queued and bound into the tree, not yet submitted.
+        self.allocator.set_full_to_swa_mapping(loaded, reserved)
+        self.assertEqual(swa._pending_hicache_load_pages, 1)
+        self.assertIsNone(self.states.alloc(1))
+        self.assertEqual(self.moves, [])
+
+        # Submitted: the reservation count hands over to the transfer gate.
+        controller.ack_load_queue.append(controller.load_queue.pop())
+        self.allocator.set_hicache_transfer_done_event(H2D, object())
+        self.assertEqual(swa._pending_hicache_load_pages, 0)
+        self.assertIsNone(self.states.alloc(1))
+        self.assertEqual(self.moves, [])
+
+        # Acked: the float moves again, and the loaded rows go with it.
+        controller.ack_load_queue.clear()
+        self.assertIsNotNone(self.states.alloc(1))
+        self.assertIn(("move", "swa"), self.moves)
+        self.assertFalse(torch.equal(rows.swa_rows(loaded), reserved))
+        self.assertTrue(torch.equal(rows.read(loaded)[1], rows.markers(300, PAGE)))
+        for row in _state_bytes(self.allocator, state):
+            self.assertTrue(bool((row == 91).all()))
+        self._assert_kept(held)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
 
 
 class TestAllocationAndTransferOrder(_ConfigCase):

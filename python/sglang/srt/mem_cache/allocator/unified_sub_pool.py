@@ -2049,15 +2049,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
             return None
-        if self.lazy_compaction:
+        if self._reservations_block_moves():
             self._pending_hicache_load_pages += int(physical_pages.shape[0])
         return self._expand_pages_to_tokens(physical_pages)
+
+    def _reservations_block_moves(self) -> bool:
+        """Whether a reservation keeps `moves_blocked()` closed until its H2D is
+        submitted or cancelled. Lazy ends relocate in `_flush`; eager ends never
+        serve HiCache (`install_move_gate`)."""
+        return self.lazy_compaction
 
     def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
         """Roll back a HiCache physical allocation before its H2D is submitted."""
         if free_index is None or free_index.numel() == 0:
             return
-        if self.lazy_compaction:
+        if self._reservations_block_moves():
             num_pages = free_index.numel() // self.page_size
             assert num_pages <= self._pending_hicache_load_pages, (
                 f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
@@ -2398,6 +2404,11 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             # DEFERRED -- see `_absorb_span_boundary_holes`.
             self._holes_dirty = True
             self._park_if_empty()
+
+    def _reservations_block_moves(self) -> bool:
+        # `make_room` / `compact_holes` relocate on demand, and the queued transfer
+        # keeps the reserved address whether or not the page is bound yet.
+        return True
 
     def free_physical(self, free_index: torch.Tensor) -> None:
         """Release physical reservations using the float's hole/span bookkeeping."""
