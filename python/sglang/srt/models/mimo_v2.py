@@ -36,10 +36,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -52,10 +52,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -86,7 +86,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     is_non_idle_and_non_empty,
-    make_layers,
+    make_pp_layers,
 )
 
 MiMoV2Config = None
@@ -444,11 +444,10 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        self._enable_a2a_moe = (
+            is_deepep_class_backend() or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -462,12 +461,6 @@ class MiMoV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        )
 
     def get_moe_weights(self):
         return [
@@ -498,8 +491,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states
 
@@ -829,7 +820,6 @@ class MiMoV2DecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self.is_moe_layer(layer_id)
-        is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
         is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
 
         if self.is_layer_sparse:
@@ -852,6 +842,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -859,7 +850,7 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -868,12 +859,6 @@ class MiMoV2DecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -900,9 +885,8 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -945,7 +929,7 @@ class MiMoV2DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
+        hidden_states = self.ffn_boundary.complete_now(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -994,7 +978,7 @@ class MiMoV2Model(nn.Module):
 
         # Use the provided decoder layer type or default to MiMoV2DecoderLayer
         decoder_layer_type = decoder_layer_type or MiMoV2DecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn=lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -1002,8 +986,6 @@ class MiMoV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
