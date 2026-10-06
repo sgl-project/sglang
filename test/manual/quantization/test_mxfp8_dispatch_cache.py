@@ -52,6 +52,16 @@ class DispatchCacheTest(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(self.checks, [False, True])
 
+    def test_runner_factory_is_wrapped_once_and_reuses_matching_arguments(self):
+        module = SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=lambda *args: object())
+        first = _module.Mxfp8DispatchCache(self.cache.raw_mm, module)
+        second = _module.Mxfp8DispatchCache(self.cache.raw_mm, module)
+        self.assertIs(first.runner_factory, second.runner_factory)
+        self.assertIs(module._cute_dsl_gemm_mxfp8_runner, first.runner_factory)
+        runner = first.runner_factory(10, 0, True, "bf16")
+        self.assertIs(runner, second.runner_factory(10, 0, True, "bf16"))
+        self.assertIsNot(runner, second.runner_factory(10, 0, False, "bf16"))
+
     def test_dtype_change_is_revalidated_and_failed_check_not_cached(self):
         self.cache(*self.args, **self.kwargs)
         self.args[0].dtype = "bf16"

@@ -14,6 +14,8 @@ except ImportError:
     flashinfer_version = ""
     gemm_base = None
 
+_cached_runner_factories = set()
+
 
 def maybe_cache_mxfp8_dispatch(raw_mm):
     """Keep unsupported FlashInfer versions and APIs on the original path."""
@@ -22,8 +24,6 @@ def maybe_cache_mxfp8_dispatch(raw_mm):
     try:
         if not callable(gemm_base._cute_dsl_gemm_mxfp8_runner):
             return raw_mm
-        # FlashInfer's backend-requirement decorator consumes skip_check via
-        # **kwargs; following __wrapped__ would hide this supported argument.
         parameters = signature(raw_mm, follow_wrapped=False).parameters
     except (AttributeError, TypeError, ValueError):
         return raw_mm
@@ -46,9 +46,10 @@ class Mxfp8DispatchCache:
         factory = gemm_module._cute_dsl_gemm_mxfp8_runner
         # This process-wide patch only memoizes the stateless
         # runner factory. The factory arguments include SM, PDL and output dtype.
-        if not hasattr(factory, "cache_info"):
+        if factory not in _cached_runner_factories:
             factory = lru_cache(maxsize=16)(factory)
             gemm_module._cute_dsl_gemm_mxfp8_runner = factory
+            _cached_runner_factories.add(factory)
         self.runner_factory = factory
 
     def __call__(self, a, b, a_scale, b_scale, out_dtype, use_8x4_sf_layout, backend):
