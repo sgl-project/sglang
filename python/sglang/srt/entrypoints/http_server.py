@@ -2913,16 +2913,29 @@ def launch_server(
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
-        # Run a warmup /generate before advertising readiness: the Rust /health
-        # and /get_model_info endpoints are static (200 as soon as the server
-        # binds, before any forward pass), so without this the first real request
-        # pays the cold-start cost (observed as a >60s first generation).
-        if not get_serving().skip_server_warmup:
-            _execute_server_warmup(server_args)
-        logger.info("The server is fired up and ready to roll!")
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
+        sidecar = None
+        try:
+            if get_serving().sidecar is not None:
+                from sglang.srt.entrypoints.sidecar import start_sidecar
+
+                sidecar = start_sidecar()
+
+            # Run a warmup /generate before advertising readiness: the Rust /health
+            # and /get_model_info endpoints are static (200 as soon as the server
+            # binds, before any forward pass), so without this the first real request
+            # pays the cold-start cost (observed as a >60s first generation).
+            if not get_serving().skip_server_warmup:
+                _execute_server_warmup(server_args)
+            logger.info("The server is fired up and ready to roll!")
+            if launch_callback is not None:
+                launch_callback()
+            scheduler_init_result.block_until_scheduler_exits()
+        finally:
+            if sidecar is not None:
+                try:
+                    sidecar.stop()
+                except Exception:
+                    logger.exception("Failed to stop sidecar")
     else:
         _setup_and_run_http_server(
             server_args,

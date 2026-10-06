@@ -15,20 +15,16 @@ use axum::{
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai};
 use crate::frontend::FrontendHandle;
-use crate::message::config::ServerArgs;
 
-/// HTTP adapter state: the shared frontend capability, immutable server
-/// configuration needed for HTTP request preparation, and the chat formatter.
+/// HTTP's existing state name now refers to the operation state shared with
+/// gRPC: frontend capability, immutable launch policy, and one chat formatter.
+/// HTTP routing, middleware, and response framing remain in this module tree.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning the
 /// frontend handle and chat formatter. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
-pub(super) struct AppState {
-    pub(super) frontend: FrontendHandle,
-    pub(super) server_args: Arc<ServerArgs>,
-    pub(super) chat_formatter: Option<openai::ChatFormatter>,
-}
+pub(super) use crate::openai::OpenAiState as AppState;
 
 /// Private marker attached by the main process to its startup warmup request.
 /// The middleware flips readiness only after that request returns successfully.
@@ -61,20 +57,14 @@ fn record_startup_warmup_status(
 
 pub async fn serve(
     listener: std::net::TcpListener,
-    frontend: FrontendHandle,
-    server_args: Arc<ServerArgs>,
+    state: Arc<AppState>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
-    let chat_formatter = openai::load_chat_support(&server_args);
-    let state = Arc::new(AppState {
-        frontend,
-        server_args: server_args.clone(),
-        chat_formatter,
-    });
+    let server_args = state.server_args.clone();
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(common::routes())

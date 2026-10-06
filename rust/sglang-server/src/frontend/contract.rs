@@ -292,6 +292,7 @@ pub(crate) struct ModelInfo {
 /// Public server metadata plus scheduler-owned runtime metrics.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ServerInfo {
+    pub(crate) incremental_streaming_output: bool,
     pub(crate) model_path: String,
     pub(crate) served_model_name: String,
     pub(crate) tokenizer_path: String,

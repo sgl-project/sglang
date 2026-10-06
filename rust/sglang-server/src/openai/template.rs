@@ -37,6 +37,11 @@ pub enum ChatFormatter {
 }
 
 impl ChatFormatter {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        load_chat_formatter(None, None, None, Some("chatml")).expect("built-in chatml template")
+    }
+
     /// Render the request's messages to a single prompt string.
     pub(super) fn render(
         &self,

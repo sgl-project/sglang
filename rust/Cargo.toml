@@ -27,6 +27,7 @@ license = "Apache-2.0"
 async-stream = "0.3"
 bytes = "1"
 futures = "0.3"
+http = "1"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 # These versions define the generated public gRPC API. Update them together
 # and deliberately rather than changing bindings during an unrelated build.

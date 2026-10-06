@@ -9,36 +9,16 @@ mod disaggregation;
 mod frame;
 mod log;
 mod native_api;
-mod openai;
+pub(crate) mod openai;
 
-use axum::http::StatusCode;
-
+#[cfg(test)]
 use crate::frontend::{FrontendError, FrontendErrorKind};
+#[cfg(test)]
+use axum::http::StatusCode;
 
 /// Map transport-neutral failures into HTTP status codes. Response bodies and
 /// stream framing remain the responsibility of each HTTP API surface.
-pub(crate) fn frontend_error_status(error: &FrontendError) -> StatusCode {
-    if let FrontendError::RuntimeRejected {
-        legacy_http_status, ..
-    } = error
-    {
-        return StatusCode::from_u16(*legacy_http_status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    match error.kind() {
-        FrontendErrorKind::InvalidArgument => StatusCode::BAD_REQUEST,
-        FrontendErrorKind::NotFound => StatusCode::NOT_FOUND,
-        FrontendErrorKind::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
-        // Existing intake backpressure has historically surfaced as 503.
-        FrontendErrorKind::ResourceExhausted | FrontendErrorKind::Unavailable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-        FrontendErrorKind::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
-        FrontendErrorKind::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        FrontendErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
+pub(crate) use crate::openai::frontend_error_status;
 
 #[cfg(test)]
 mod tests {
