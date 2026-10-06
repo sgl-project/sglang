@@ -14,6 +14,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torch-compile)
   - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
   - [EAGLE-3 Decoding](#eagle-3-decoding)
+- [Block verification](#block-verification)
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
@@ -404,6 +405,23 @@ print(response.choices[0].message.content)
 ```
 
 ---
+
+## Block verification
+
+For stochastic EAGLE, EAGLE3, or NEXTN decoding on NVIDIA CUDA or AMD ROCm, add
+`--speculative-use-block-verification`
+with `--speculative-eagle-topk 1`. The draft model must produce a full target-vocabulary
+proposal distribution, as required by the existing rejection sampler.
+
+[Block verification](https://arxiv.org/abs/2403.10444) checks every draft prefix and
+keeps the longest accepted prefix, including when an earlier prefix was rejected.
+It uses a corresponding correction distribution to preserve target sampling.
+Use `--speculative-use-rejection-sampling` alone for token-wise verification, which
+stops at the first rejected token.
+Greedy requests keep their existing verification behavior.
+
+Block verification adds vocabulary reductions during verification. Benchmark your
+model and workload to measure the effect on latency and throughput.
 
 ## Multi Token Prediction
 
