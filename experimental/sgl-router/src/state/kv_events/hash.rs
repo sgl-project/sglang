@@ -42,6 +42,58 @@
 
 use sha2::{Digest, Sha256};
 
+/// Request fields the engine namespaces published block hashes by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheNamespace {
+    pub cache_salt: Option<String>,
+    pub lora_name: Option<String>,
+    /// The request names several namespaces, so it matches no published block.
+    pub ambiguous: bool,
+}
+
+impl CacheNamespace {
+    /// The base model without a cache salt.
+    pub const NONE: &'static Self = &Self {
+        cache_salt: None,
+        lora_name: None,
+        ambiguous: false,
+    };
+
+    /// The prompt's block hashes as the engine publishes them: a salt-seeded
+    /// chain, then mixed with the LoRA name (`kv_event_lora_seed` and
+    /// `namespace_event_block_hash` in `mem_cache/utils.py`).
+    pub fn block_hashes(&self, token_ids: &[u32], block_size: usize, bigram: bool) -> Vec<i64> {
+        if self.ambiguous {
+            return Vec::new();
+        }
+        let prior = self
+            .cache_salt
+            .as_deref()
+            .map(|salt| sha256_parts(&[b"sglang-cache-salt-v1\0", salt.as_bytes()]));
+        let hashes = if bigram {
+            chain_bigram(token_ids, block_size, prior)
+        } else {
+            chain(token_ids, block_size, prior)
+        };
+        let Some(lora_name) = self.lora_name.as_deref() else {
+            return hashes;
+        };
+        let seed = sha256_parts(&[b"sglang-kv-event-lora-v1\0", lora_name.as_bytes()]);
+        hashes
+            .into_iter()
+            .map(|hash| sha256_to_i64(&sha256_parts(&[&seed, &hash.to_be_bytes()])))
+            .collect()
+    }
+}
+
+fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
 /// Compute per-block i64 hashes for a token sequence, matching SGLang's
 /// worker emission for a chain that starts with no parent block.
 ///
@@ -55,6 +107,10 @@ use sha2::{Digest, Sha256};
 /// up-front against the worker-published `block_size`; an invalid value is
 /// a programmer/config bug, not a runtime input we should swallow.
 pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    chain(token_ids, block_size, None)
+}
+
+fn chain(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     if token_ids.is_empty() {
         return Vec::new();
@@ -63,7 +119,6 @@ pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
     let n = token_ids.len();
     let num_blocks = n.div_ceil(block_size);
     let mut out = Vec::with_capacity(num_blocks);
-    let mut prior: Option<[u8; 32]> = None;
 
     let mut start = 0;
     while start < n {
@@ -127,6 +182,10 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 /// hashes won't match the worker's stored bigram block hashes and cache-aware
 /// routing silently degrades to min-load.
 pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    chain_bigram(token_ids, block_size, None)
+}
+
+fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     // N raw tokens -> N-1 overlapping bigrams; fewer than 2 tokens -> no blocks.
     let logical_len = token_ids.len().saturating_sub(1);
@@ -135,7 +194,6 @@ pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<
     }
     let num_blocks = logical_len.div_ceil(block_size);
     let mut out = Vec::with_capacity(num_blocks);
-    let mut prior: Option<[u8; 32]> = None;
 
     let mut start = 0;
     while start < logical_len {

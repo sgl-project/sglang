@@ -41,6 +41,8 @@ A JSON array of cases. Each case is:
       "name": "<descriptive label>",
       "tokens": [<u32>, ...],
       "block_size": <usize>,
+      "cache_salt": <str>,   # optional
+      "lora_name": <str>,    # optional
       "expected_i64_hashes": [<i64>, ...]
     }
 """
@@ -54,7 +56,32 @@ import pathlib
 import sys
 
 
-def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
+def namespaced_hashes(
+    tokens: list[int], block_size: int, cache_salt=None, lora_name=None
+) -> list[int]:
+    """Hashes as the engine publishes them for a salted and/or LoRA request:
+    the chain starts from the salt seed, then each hash is mixed with the
+    LoRA name (`kv_event_lora_seed` / `namespace_event_block_hash`)."""
+    prior = None
+    if cache_salt is not None:
+        prior = hashlib.sha256(b"sglang-cache-salt-v1\0" + cache_salt.encode()).digest()
+    hashes = hash_page_chain(tokens, block_size, prior)
+    if lora_name is None:
+        return hashes
+    seed = hashlib.sha256(b"sglang-kv-event-lora-v1\0" + lora_name.encode()).digest()
+    return [
+        int.from_bytes(
+            hashlib.sha256(seed + h.to_bytes(8, "big", signed=True)).digest()[:8],
+            "big",
+            signed=True,
+        )
+        for h in hashes
+    ]
+
+
+def hash_page_chain(
+    tokens: list[int], block_size: int, prior_digest: bytes | None = None
+) -> list[int]:
     """Compute the i64-truncated block hashes for `tokens` using SGLang's
     `RadixKey.hash_page` algorithm + `hash_str_to_int64`.
 
@@ -66,7 +93,6 @@ def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
         raise ValueError("block_size must be positive")
 
     out: list[int] = []
-    prior_digest: bytes | None = None
     n = len(tokens)
     if n == 0:
         return out
@@ -133,30 +159,74 @@ CASES: list[dict] = [
         "tokens": list(range(1, 129)),
         "block_size": 16,
     },
+    {
+        "name": "salted",
+        "tokens": [1, 2, 3, 4],
+        "block_size": 2,
+        "cache_salt": "tenant-a",
+    },
+    {"name": "lora", "tokens": [1, 2, 3, 4], "block_size": 2, "lora_name": "adapter-a"},
+    {
+        "name": "salted_lora",
+        "tokens": [1, 2, 3, 4],
+        "block_size": 2,
+        "cache_salt": "tenant-a",
+        "lora_name": "adapter-a",
+    },
 ]
+NAMESPACE_KEYS = ("cache_salt", "lora_name")
 
 
 def _materialize_cases() -> list[dict]:
     return [
         {
-            "name": c["name"],
-            "tokens": c["tokens"],
-            "block_size": c["block_size"],
-            "expected_i64_hashes": hash_page_chain(c["tokens"], c["block_size"]),
+            **c,
+            "expected_i64_hashes": namespaced_hashes(
+                c["tokens"], c["block_size"], *(c.get(k) for k in NAMESPACE_KEYS)
+            ),
         }
         for c in CASES
     ]
 
 
-def _validate_against_sglang() -> int:
-    """Import the real SGLang `RadixKey.hash_page` and compare its output
-    case-by-case against the locally-replicated `hash_page_chain`. Exits
-    non-zero (and prints a diff-friendly summary) on any mismatch.
+def _published_by_sglang(case: dict) -> list[int]:
+    """Block hashes SGLang's KV event recorder publishes for a namespaced case."""
+    from array import array
 
-    Returns 0 on success. This is the parity safety net for nightly CI.
+    from sglang.srt.disaggregation.kv_events import BlockStored
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+    cache = RadixCache.create_simulated(
+        page_size=case["block_size"], enable_kv_cache_events=True
+    )
+
+    class LoraReq:
+        """The request fields the name table reads; kept alive until the take."""
+
+    req = LoraReq()
+    req.extra_key = req.lora_id = "lora-id" if case.get("lora_name") else None
+    cache.kv_events.lora_names.register(req, case.get("lora_name"))
+    key = RadixKey(
+        array("q", case["tokens"]),
+        extra_key=req.extra_key,
+        cache_salt=case.get("cache_salt"),
+    )
+    cache.insert(InsertParams(key=key))
+    return [
+        h
+        for e in cache.take_events()
+        if isinstance(e, BlockStored)
+        for h in e.block_hashes
+    ]
+
+
+def _validate_against_sglang() -> int:
+    """Compare the replica with the block hashes SGLang's KV event recorder
+    publishes. Exits non-zero on any mismatch; the parity net for nightly CI.
     """
     try:
-        from sglang.srt.mem_cache.radix_cache import RadixKey
+        import sglang  # noqa: F401
     except ImportError as e:
         print(
             f"--validate-against-sglang: cannot import sglang ({e}). "
@@ -167,27 +237,15 @@ def _validate_against_sglang() -> int:
 
     failures: list[str] = []
     for c in CASES:
-        local = hash_page_chain(c["tokens"], c["block_size"])
-        if c["block_size"] == 0 or not c["tokens"]:
-            # `RadixKey.hash_page` requires a non-empty page; the local
-            # replica handles edge cases (empty input → empty list)
-            # which the SGLang oracle would refuse. Skip these cases
-            # under validation — the replica owns the boundary semantics.
+        if not c["tokens"]:
             continue
-        sglang_hashes: list[int] = []
-        prior_hex: str | None = None
-        for start in range(0, len(c["tokens"]), c["block_size"]):
-            page = c["tokens"][start : start + c["block_size"]]
-            key = RadixKey(token_ids=page, extra_key=None)
-            hex_digest = key.hash_page(prior_hex)
-            # SGLang's hash_page returns the hex digest; truncate to i64
-            # the same way `hash_str_to_int64` does.
-            uint64_val = int(hex_digest[:16], 16)
-            i64 = uint64_val - (1 << 64) if uint64_val >= (1 << 63) else uint64_val
-            sglang_hashes.append(i64)
-            prior_hex = hex_digest
-        if sglang_hashes != local:
-            failures.append(f"case {c['name']}: local={local} sglang={sglang_hashes}")
+        local = namespaced_hashes(
+            c["tokens"], c["block_size"], *(c.get(k) for k in NAMESPACE_KEYS)
+        )
+        # The engine publishes full pages only, so it must match a prefix.
+        published = _published_by_sglang(c)
+        if not published or published != local[: len(published)]:
+            failures.append(f"case {c['name']}: local={local} sglang={published}")
 
     if failures:
         print(
