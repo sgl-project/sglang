@@ -370,8 +370,8 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
-        # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards (see start_loading).
+        # Set by the scheduler to the forward stream; gates load-back H2D and
+        # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
@@ -837,6 +837,13 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
+
+        if self.load_fence_stream is not None:
+            # Overlap scheduling caches a finished request while the next forward
+            # still writes its last token's KV; later forwards still overlap.
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                self.load_fence_stream
+            )
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
