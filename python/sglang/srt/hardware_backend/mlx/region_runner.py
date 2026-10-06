@@ -441,14 +441,10 @@ class MlxRegionRunner(BaseRunner):
         key = self._executor_key(forward_batch)
         executor = self._executors[key]
         if key[0] == "extend":
-            num_tokens = forward_batch.input_ids.shape[0]
             padded = self._pad_extend_batch(forward_batch, key[1])
             logits = executor.execute(*serving_forward_args(padded))
-            # The wrapper emits logits for every packed token; serving wants
-            # the last real token's row (pad rows carry garbage by design).
-            return LogitsProcessorOutput(
-                next_token_logits=logits[num_tokens - 1 : num_tokens]
-            )
+            # The wrapper projects only the last real token of each request.
+            return LogitsProcessorOutput(next_token_logits=logits)
         batch_size = forward_batch.batch_size
         padded = self._pad_decode_batch(forward_batch, key[1])
         logits = executor.execute(*serving_forward_args(padded))

@@ -25,7 +25,7 @@ from sglang.srt.hardware_backend.mlx.export_validation import (
 )
 from sglang.srt.hardware_backend.mlx.fx_lowering import MlxFxLoweringRegistry
 from sglang.srt.hardware_backend.mlx.region_runner import _PAD_SINK_SLOT
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -215,6 +215,47 @@ class TestServingBoundaryLogitsParity(CustomTestCase):
             if registry.resolve(node) is None
         ]
         self.assertEqual(unresolved, [])
+
+    def test_prefill_matches_real_processor_pruning_with_prefixes_and_padding(self):
+        torch.manual_seed(0)
+        hidden = torch.randn(_NUM_TOKENS, _HIDDEN)
+        weight = torch.randn(_PADDED_VOCAB, _HIDDEN)
+        weight[_VOCAB_SIZE:] = 0
+        for lengths, prefixes in (([1], [0]), ([3], [17]), ([1, 3], [17, 0])):
+            with self.subTest(lengths=lengths, prefixes=prefixes):
+                lens = torch.tensor(lengths, dtype=torch.int32)
+                prefix = torch.tensor(prefixes, dtype=torch.int32)
+                starts = torch.cat((lens.new_zeros(1), lens.cumsum(0)[:-1])).to(
+                    torch.int32
+                )
+                model = _make_model(hidden, weight)
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    seq_lens_sum=sum(lengths) + sum(prefixes),
+                    extend_num_tokens=_NUM_TOKENS,
+                    global_num_token_non_padded_cpu=sum(lengths),
+                )
+                wrapper = ServingForwardExportWrapper(
+                    model, _make_model_runner(model), batch
+                ).eval()
+                args = list(_SERVING_ARGS)
+                args[2] = torch.zeros(len(lengths), dtype=torch.int64)
+                args[3] = (lens + prefix).to(torch.int64)
+                args[5:8] = [lens, prefix, starts]
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.EXTEND,
+                    extend_seq_lens=lens,
+                )
+                with torch.no_grad():
+                    pruned = model.logits_processor._get_pruned_states(
+                        hidden, None, None, metadata
+                    )[0]
+                    expected = _torch_logits(
+                        model.logits_processor, model.lm_head, pruned
+                    )
+                    actual = wrapper(*args)
+                self.assertEqual(actual.shape, (len(lengths), _VOCAB_SIZE))
+                torch.testing.assert_close(actual, expected)
 
 
 class TestPadSinkSlotIsNotAllocatable(CustomTestCase):

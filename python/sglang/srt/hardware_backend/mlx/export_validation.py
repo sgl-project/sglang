@@ -224,6 +224,12 @@ class ServingForwardExportWrapper(torch.nn.Module):
                 for name, role in self._body_call_kwargs.items()
             }
         )
+        if self.forward_mode.is_extend():
+            # Match LogitsProcessor's no-logprob prefill pruning before the
+            # vocabulary projection. These indices come from live metadata:
+            # padded tokens and cached prefix tokens need no sampling logits.
+            last_indices = (extend_start_loc + extend_seq_lens - 1).to(torch.int64)
+            hidden_states = hidden_states.index_select(0, last_indices)
         logits = torch.matmul(
             hidden_states.to(self.model.lm_head.weight.dtype),
             self.model.lm_head.weight.T,
