@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import torch
 
@@ -122,6 +122,13 @@ def prepare_mha_write_back_staging(
     return staging
 
 
+def _iter_device_buffers(pool, side: str) -> Iterable[torch.Tensor]:
+    """Yield per-layer views from either a sequence or multi-layer tensor."""
+    buffers = getattr(pool, side, None)
+    if buffers is not None:
+        yield from buffers
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
@@ -179,8 +186,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             pool_label=pool_label,
         )
         pools = (self.device_pool, *self.mtp_draft_device_pools)
-        self.device_k_buffers = tuple(b for pool in pools for b in pool.k_buffer)
-        self.device_v_buffers = tuple(b for pool in pools for b in pool.v_buffer)
+        self.device_k_buffers = tuple(
+            b for pool in pools for b in _iter_device_buffers(pool, "k_buffer")
+        )
+        self.device_v_buffers = tuple(
+            b for pool in pools for b in _iter_device_buffers(pool, "v_buffer")
+        )
         self._initialize_transfer_views()
 
     def _initialize_transfer_views(self) -> None:
