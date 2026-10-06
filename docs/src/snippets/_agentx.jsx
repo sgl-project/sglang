@@ -178,14 +178,14 @@ export const AgentX = ({ data }) => {
       return parts.join(" ") || `Run on the ${b.role} node.`;
     }
     if (b.kind === "etcd") return "Start once, before everything else, on $ETCD_IP.";
-    if (b.kind === "nats") return "Start once on $NATS_IP with the config from the nats.conf tab.";
+    if (b.kind === "nats") return "Start once on $NATS_IP, with nats.conf (below) in the working directory.";
     if (b.kind === "mooncake-master") return "Start once on $MOONCAKE_MASTER_IP before the workers.";
     if (b.kind === "mooncake-store") {
       const ports = b.ports || [];
       return `Start on each of the ${b.count_nodes || 1} decode node(s)${ports.length > 1 ? `, one instance per port (${ports.join(", ")}; change --port)` : ""}.`;
     }
     if (b.kind === "dynamo-frontend") return b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind the nginx block (port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.";
-    if (b.kind === "nginx") return "Optional scale-out: hashes each session onto one frontend and listens on port 8000. Uses the config from the nginx.conf tab.";
+    if (b.kind === "nginx") return "Optional scale-out: hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
     if (b.kind === "sglang-router") return "Start once after the workers; clients connect to port 8000.";
     return "";
   };
@@ -269,7 +269,9 @@ export const AgentX = ({ data }) => {
   const blocks = blocksFor(cellIdx, pi, router, kv);
   const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
   const workerCount = blocks.filter((b) => b.kind === "worker").reduce((n, b) => n + (b.workers || 1), 0);
-  const allText = blocks.map((b) => `# ${b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind}\n${formatBlock(b)}`).join("\n\n");
+  const blockText = blocks.map(formatBlock);
+  const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind);
+  const allText = blocks.map((b, i) => `# ${blockTitle(b)}\n${blockText[i]}`).join("\n\n");
   const usedPlaceholders = [...new Set((allText + JSON.stringify(routerData.files.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
     .map((p) => p.slice(1))
     .filter((p) => placeholderText(p));
@@ -282,13 +284,17 @@ export const AgentX = ({ data }) => {
     const n = b.kind === "worker" ? b.workers : b.count;
     return n > 1 ? `${base} ×${n}` : base;
   };
+  // Config files sit in the tab of the process that reads them (nats.conf under NATS, ...).
+  const fileList = routerData.files.map((fid) => data.files[fid]);
+  const looseFiles = fileList.filter((f) => !blockText.some((t) => t.includes(f.name)));
   const tabs = [
-    ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || ""}`, label: shortTitle(b), block: b, index: i })),
-    ...routerData.files.map((fid) => ({ id: `file:${data.files[fid].name}`, label: data.files[fid].name, file: data.files[fid] })),
-    ...(usedPlaceholders.length ? [{ id: "exports", label: "Placeholders" }] : []),
+    ...(usedPlaceholders.length ? [{ id: "exports", label: "Env Vars" }] : []),
+    ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || ""}`, label: shortTitle(b), block: b, text: blockText[i], files: fileList.filter((f) => blockText[i].includes(f.name)) })),
+    ...looseFiles.map((f) => ({ id: `file:${f.name}`, label: f.name, file: f })),
   ];
-  const defaultTab = (tabs.find((t) => t.block && t.block.kind === "worker") || tabs[0]).id;
-  const activeTab = tabs.some((t) => t.id === tab) ? tab : defaultTab;
+  const single = blocks.length === 1 && !looseFiles.length; // one process: no tab bar
+  const activeTab = tabs.some((t) => t.id === tab) ? tab : tabs[0].id;
+  const tabText = (t) => (t.block ? t.text : t.file ? t.file.content : exportText);
   const KV_LABEL = { none: "No KV offload", hicache: "HiCache (host DRAM)", mooncake: "Mooncake store (external linker)" };
 
   const copy = (text, id) => {
@@ -300,6 +306,8 @@ export const AgentX = ({ data }) => {
   // ==== 5. Styles ====
   const accent = isDark ? "#E85D4D" : "#D45D44";
   const border = isDark ? "#374151" : "#e5e7eb";
+  const muted = isDark ? "#9ca3af" : "#6b7280";
+  const mono = "'Menlo', 'Monaco', 'Courier New', monospace";
   const S = {
     wrap: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" },
     card: { padding: "6px 10px", border: `1px solid ${border}`, borderLeft: `3px solid ${accent}`, borderRadius: "4px", display: "flex", alignItems: "flex-start", gap: "10px", background: isDark ? "#1f2937" : "#fff" },
@@ -316,20 +324,27 @@ export const AgentX = ({ data }) => {
       return { display: "inline-block", padding: "2px 8px", borderRadius: "10px", fontSize: "12px", fontWeight: 600, color: c[0], background: c[1] };
     },
     meta: { fontSize: "12px", color: isDark ? "#9ca3af" : "#4b5563", lineHeight: 1.6 },
-    blockHead: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", padding: "6px 10px", borderBottom: `1px solid ${border}`, background: isDark ? "#1f2937" : "#fafafa", fontSize: "12px" },
-    blockWrap: { border: `1px solid ${border}`, borderRadius: "6px", overflow: "hidden", background: isDark ? "#111827" : "#f5f5f5" },
-    pre: { padding: "10px 14px", margin: 0, fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: "12px", lineHeight: 1.5, whiteSpace: "pre", overflowX: "auto", color: isDark ? "#e5e7eb" : "#374151" },
-    button: { fontSize: "11px", padding: "2px 8px", border: `1px solid ${border}`, borderRadius: "4px", cursor: "pointer", background: isDark ? "#374151" : "#fff", color: isDark ? "#e5e7eb" : "inherit" },
-    where: { fontSize: "11px", color: isDark ? "#9ca3af" : "#6b7280", padding: "6px 10px 0" },
+    // Command window (modeled on the vLLM recipes' launch-step panel).
+    window: { border: `1px solid ${border}`, borderRadius: "12px", overflow: "hidden", background: isDark ? "#111827" : "#f6f7f9", marginTop: "4px" },
+    winHead: { flex: 1, paddingTop: "4px", fontFamily: mono, fontSize: "11px", lineHeight: 1.5, color: muted },
+    winBar: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "10px", padding: "10px 14px 0" },
+    seg: { display: "flex", flexWrap: "wrap", gap: "2px", margin: "8px 14px 0", padding: "2px", borderRadius: "7px", background: isDark ? "rgba(255,255,255,0.06)" : "rgba(15,23,42,0.05)" },
+    segTab: (on) => ({
+      padding: "4px 10px", fontSize: "12px", fontWeight: on ? 600 : 500, border: "none", borderRadius: "5px", cursor: "pointer", whiteSpace: "nowrap",
+      background: on ? (isDark ? "#374151" : "#fff") : "transparent", boxShadow: on ? "0 1px 2px rgba(15,23,42,0.12)" : "none",
+      color: on ? (isDark ? "#f9fafb" : "#111827") : muted,
+    }),
+    segNum: { fontFamily: mono, opacity: 0.45, marginRight: "4px" },
+    winActions: { display: "flex", gap: "6px", flexShrink: 0 },
+    winButton: { fontSize: "12px", fontWeight: 500, padding: "4px 10px", border: "none", borderRadius: "6px", cursor: "pointer", background: isDark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.07)", color: isDark ? "#e5e7eb" : "#374151" },
+    comment: { padding: "10px 14px 0", fontFamily: mono, fontSize: "11px", lineHeight: 1.5, color: muted },
+    secHead: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", margin: "4px 14px 0", padding: "8px 0 0", borderTop: `1px dashed ${border}`, fontFamily: mono, fontSize: "11px", color: muted },
+    secHeadFirst: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", margin: "0 14px", padding: "10px 0 0", fontFamily: mono, fontSize: "11px", color: muted },
+    miniButton: { fontSize: "11px", padding: "1px 8px", border: "none", borderRadius: "5px", cursor: "pointer", background: isDark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.07)", color: isDark ? "#e5e7eb" : "#374151" },
+    pre: { padding: "8px 14px 12px", margin: 0, background: "transparent", fontFamily: mono, fontSize: "12px", lineHeight: 1.5, whiteSpace: "pre", overflowX: "auto", color: isDark ? "#e5e7eb" : "#1f2937" },
     list: { margin: "4px 0", paddingLeft: "18px", listStyleType: "disc", fontSize: "12px", lineHeight: 1.55, color: isDark ? "#d1d5db" : "#374151" },
     code: { fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: "11px", padding: "0 4px", borderRadius: "3px", background: isDark ? "#374151" : "#f3f4f6", color: isDark ? "#e5e7eb" : "#1f2937" },
     a: { color: accent, textDecoration: "underline" },
-    tabBar: { display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center", borderBottom: `1px solid ${border}`, paddingBottom: "4px" },
-    tab: (on) => ({
-      padding: "4px 10px", fontSize: "12px", fontWeight: on ? 600 : 500, cursor: "pointer", borderRadius: "4px 4px 0 0",
-      border: `1px solid ${on ? accent : border}`, borderBottom: on ? `2px solid ${accent}` : `1px solid ${border}`,
-      background: on ? (isDark ? "#1f2937" : "#fff") : (isDark ? "#111827" : "#f9fafb"), color: isDark ? "#e5e7eb" : "inherit",
-    }),
   };
 
   const statusText = {
@@ -465,40 +480,70 @@ export const AgentX = ({ data }) => {
         </ul>
       </div>
 
-      <div style={S.tabBar} className="sg-agentx-tabs">
-        {tabs.map((t) => (
-          <button key={t.id} value={t.id} style={S.tab(activeTab === t.id)} onClick={() => setTab(t.id)}>{t.label}</button>
-        ))}
-        <span style={{ flex: 1 }} />
-        <button style={S.button} onClick={() => copy(copyAllText, "all")}>{copied === "all" ? "Copied" : "⧉ Copy all"}</button>
-      </div>
-      {tabs.map((t) => {
-        const visible = activeTab === t.id;
-        if (t.block) {
-          const text = formatBlock(t.block);
-          const title = t.block.kind === "worker" ? ROLE_TITLE[t.block.role] : KIND_TITLE[t.block.kind] || t.block.kind;
-          return (
-            <div key={`${cellIdx}-${pi}-${router}-${kv}-${t.id}`} style={{ ...S.blockWrap, display: visible ? "block" : "none" }}>
-              <div style={S.blockHead}>
-                <strong>{title}{t.block.count > 1 ? ` ×${t.block.count}` : ""}</strong>
-                <button style={S.button} onClick={() => copy(text, t.id)}>{copied === t.id ? "Copied" : "⧉ Copy"}</button>
+      <div style={S.window} className="sg-agentx-window">
+        <div style={S.winBar}>
+          <span style={S.winHead}>
+            {data.hardware.find((h) => h.id === hw).label} · {cell.label} · {concLabel(point)} · {KV_LABEL[kv]} · {routerLabel[router]}
+          </span>
+          <div style={S.winActions}>
+            <button style={S.winButton} onClick={() => copy(single ? blockText[0] : tabText(tabs.find((t) => t.id === activeTab)), "tab")}>{copied === "tab" ? "Copied" : "⧉ Copy"}</button>
+            <button style={S.winButton} onClick={() => copy(copyAllText, "all")}>{copied === "all" ? "Copied" : "⧉ Copy all"}</button>
+          </div>
+        </div>
+        {!single && (
+          <div role="tablist" aria-label="Processes" style={S.seg} className="sg-agentx-tabs">
+            {tabs.map((t, i) => (
+              <button key={t.id} value={t.id} role="tab" aria-selected={activeTab === t.id} style={S.segTab(activeTab === t.id)} onClick={() => setTab(t.id)}>
+                <span style={S.segNum}>{i + 1}·</span>{t.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {(single ? tabs.filter((t) => t.block) : tabs).map((t) => {
+          const visible = single || activeTab === t.id;
+          const section = (label, text, className, id, first) => (
+            <>
+              <div style={first ? S.secHeadFirst : S.secHead}>
+                <span>{label}</span>
+                <button style={S.miniButton} onClick={() => copy(text, id)}>{copied === id ? "Copied" : "⧉ Copy"}</button>
               </div>
-              <div style={S.where}>{where(t.block, router, workerCount)}</div>
-              <pre style={S.pre} className="sg-agentx-block">{text}</pre>
+              <pre style={S.pre} className={className}>{text}</pre>
+            </>
+          );
+          let body;
+          if (t.block) {
+            const envFirst = single && exportText;
+            const split = envFirst || t.files.length > 0;
+            body = (
+              <>
+                <div style={S.comment}># {blockTitle(t.block)}{t.block.count > 1 ? ` ×${t.block.count}` : ""}<br /># {where(t.block, router, workerCount)}</div>
+                {envFirst && section("Env Vars — set first", exportText, "sg-agentx-exports", "exports", true)}
+                {split ? section("Command", t.text, "sg-agentx-block", `${t.id}:cmd`, !envFirst) : <pre style={S.pre} className="sg-agentx-block">{t.text}</pre>}
+                {t.files.map((f) => <div key={f.name}>{section(f.name, f.content, "sg-agentx-file", `${t.id}:${f.name}`, false)}</div>)}
+              </>
+            );
+          } else if (t.file) {
+            body = (
+              <>
+                <div style={S.comment}># {t.file.name}</div>
+                <pre style={S.pre} className="sg-agentx-file">{t.file.content}</pre>
+              </>
+            );
+          } else {
+            body = (
+              <>
+                <div style={S.comment}># Env Vars — set these on every node before running the commands in the other tabs.</div>
+                <pre style={S.pre} className="sg-agentx-exports">{exportText}</pre>
+              </>
+            );
+          }
+          return (
+            <div key={`${cellIdx}-${pi}-${router}-${kv}-${t.id}`} style={{ display: visible ? "block" : "none" }} className="sg-agentx-panel">
+              {body}
             </div>
           );
-        }
-        const text = t.file ? t.file.content : exportText;
-        return (
-          <div key={t.id} style={{ ...S.blockWrap, display: visible ? "block" : "none" }}>
-            <div style={S.blockHead}>
-              <strong>{t.file ? t.file.name : "Placeholders — set on each node first"}</strong>
-              <button style={S.button} onClick={() => copy(text, t.id)}>{copied === t.id ? "Copied" : "⧉ Copy"}</button>
-            </div>
-            <pre style={S.pre} className={t.file ? "sg-agentx-file" : "sg-agentx-exports"}>{text}</pre>
-          </div>
-        );
-      })}
+        })}
+      </div>
     </div>
   );
 };
