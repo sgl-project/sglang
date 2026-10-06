@@ -254,24 +254,26 @@ class TestBlockTable(unittest.TestCase):
                 self.assertTrue(bool((gpu[b, live:max_pages] == 0).all()))
 
     def test_table_and_stream_in_one_launch(self):
-        """One launch fills a fresh table -- live rows, the sink past them,
+        """One gather fills a fresh table -- live rows, the sink past them,
         padded rows all sink -- and the token stream of the same rows, each
-        lane from its window start, padded lanes reading the sink. The CUDA
-        kernel agrees with the CPU path and with a table build plus a packed
-        build of the same rows."""
+        lane from its window start (one reading past its row's live pages),
+        padded lanes reading the sink. The CUDA kernel agrees with the CPU
+        path and with a table build plus a packed build of the same rows."""
         from sglang.kernels.ops.kvcache.kv_read_table import (
             build_kv_read_table,
             build_kv_read_table_and_stream,
             build_kv_read_table_packed,
         )
 
-        for page_size in (1, 32):
+        for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
             live = rpi.shape[0]
             rows = live + 2
             max_pages = int((sl.max().item() + page_size - 1) // page_size) + 2
             starts = torch.tensor([0, 1, page_size, 2, 0], dtype=torch.int64)[:live]
             lens = (sl.cpu().to(torch.int64) - starts).clamp(min=0)
+            # The last lane reads a page past its live prefix.
+            lens[-1] += page_size
             stream_lens = torch.cat([lens, torch.tensor([3, 1])])
             stream_starts = torch.cat([starts, torch.zeros(2, dtype=torch.int64)])
             indptr = torch.zeros(rows + 1, dtype=torch.int32)
