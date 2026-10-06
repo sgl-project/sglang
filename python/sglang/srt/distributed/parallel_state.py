@@ -46,7 +46,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+    set_global_tcp_store,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -54,6 +58,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -480,6 +485,28 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+
+        self.pcie_ipc_comm: Optional[Any] = None
+        from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+            PcieIpcCommunicator,
+            eligible_group,
+        )
+
+        if eligible_group(
+            group_name=group_name,
+            world_size=self.world_size,
+            deterministic=self._deterministic_collectives_enabled(),
+        ):
+            try:
+                # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                # Autotuning is the other way round: it rendezvouses on the host.
+                self.pcie_ipc_comm = PcieIpcCommunicator(
+                    group=self.device_group,
+                    device=self.device,
+                    cpu_group=self.cpu_group,
+                )
+            except Exception as e:
+                logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -939,6 +966,16 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
+        # backend applies. They do not probe for NVLink, so on a host that has it
+        # this ordering is what keeps the faster backend in front of them.
+        if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -1020,6 +1057,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ipc":
+            return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -1092,9 +1131,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
-            )
+            reduce_scatter_single(output, input, group=self.device_group)
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -1303,9 +1340,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
-            )
+            all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
@@ -1396,9 +1431,7 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
+                all_gather_single(output_tensor, input_, group=self.device_group)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 
@@ -2060,6 +2093,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Must precede destroy_process_group(): FlashInfer's workspace
+        # teardown collectives on the group it was built with.
+        if self.pcie_ipc_comm is not None:
+            self.pcie_ipc_comm.destroy()
+            self.pcie_ipc_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2601,12 +2639,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_npu):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP platform or CUDA platform, but got "
-            f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on a non-HIP or non-CUDA platform."
+            "currently only supported on the AMD HIP, CUDA, or NPU "
+            "platform, but got decode_context_parallel_size "
+            f"({decode_context_parallel_size}) on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(
@@ -2761,7 +2799,10 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_custom_allreduce=False,
+            # Attention TP can be a derived subgroup of the full TP group.
+            # Inherit the global policy and let per-group capability detection
+            # select a custom communicator or fall back.
+            use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
@@ -3067,6 +3108,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
+
     _TP_STATE_PATCHED = True
     global _TP
     old_tp_group = _TP
@@ -3093,10 +3144,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
