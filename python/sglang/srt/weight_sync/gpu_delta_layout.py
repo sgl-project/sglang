@@ -970,6 +970,7 @@ class PreparedDelta:
         self.host_snapshot = None
         self.batches, self.raw_copies = [], {}
         self.events, self.timings = {}, {}
+        self.status_checks = []
         self.backend, self.device = backend, backend.device
         preparation_started = time.perf_counter()
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
@@ -1010,14 +1011,10 @@ class PreparedDelta:
             path,
             manifest_sha256,
             manifest,
-            local_names,
+            [entries[name] for name in local_names],
             backend.outer_pool,
             self.timings,
             metadata,
-        )
-        self.timings["host_encoded_cache_read_sha256_s"] = (
-            self.timings["host_encoded_cache_read_s"]
-            + self.timings["host_encoded_cache_sha256_s"]
         )
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
@@ -1137,6 +1134,13 @@ class PreparedDelta:
                     self.workspace,
                     self.de_stream,
                 )
+            from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
+
+            with torch.cuda.stream(self.stream):
+                self.status_checks = [
+                    prepare_status_check(decode, self.error)
+                    for decode in self.decode_plan.batches
+                ]
         # PREPARED includes small input transfers, never output-slot allocation,
         # DE execution, cold scratch tuning or synchronization with rollout.
         ready = [torch.cuda.Event(), torch.cuda.Event()]
@@ -1169,9 +1173,6 @@ class PreparedDelta:
             decoders = (
                 self.decode_plan.bind_outputs(self.decoded) if self.decode_plan else []
             )
-            if decoders:
-                from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
-
             pointer_rows = []
             tune_totals = [0, 0, 0.0, 0, 0]
             apply_groups = []
@@ -1217,7 +1218,7 @@ class PreparedDelta:
                             scratch[offset : offset + size]
                             for offset, size in self.gaps[index]
                         ],
-                        prepare_status_check(decode, self.error),
+                        self.status_checks[index],
                     )
                 )
         self.timings.update(
@@ -1356,6 +1357,7 @@ class PreparedDelta:
 
     def _release_gpu(self):
         self.batches.clear()
+        self.status_checks.clear()
         self.raw_copies.clear()
         self.apply_metadata = self.apply_host_metadata = None
         self.decoded = self.raw_device = self.error = self.workspace = (

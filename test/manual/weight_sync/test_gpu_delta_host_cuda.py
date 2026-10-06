@@ -136,7 +136,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 path,
                 digest,
                 manifest,
-                sorted(names),
+                [entry for entry in manifest["tensors"] if entry["name"] in names],
                 pool,
                 metrics,
                 metadata,

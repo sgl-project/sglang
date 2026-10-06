@@ -191,6 +191,15 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name):
         def __init__(self, value):
             self.value = value
             self.device = device
+            self.pointer_queries = self.size_queries = 0
+
+        def data_ptr(self):
+            self.pointer_queries += 1
+            return self.value.data_ptr()
+
+        def numel(self):
+            self.size_queries += 1
+            return self.value.numel()
 
         def __getattr__(self, name):
             return getattr(self.value, name)
@@ -241,8 +250,13 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name):
     # Preparation uploads input/size metadata without any output allocation,
     # output pointer upload or decompression. Paused binding fills just row 3.
     assert uploads == [(3, 4)] and not launches
+    original_batches = tuple(prepared_plan.batches)
+    assert not prepared_plan.decoded_slots
     outputs = tuple(allocate(256, torch.uint8, device) for _ in range(2))
     plans = prepared_plan.bind_outputs(outputs)
+    assert tuple(plans) == original_batches
+    assert all(plan.decoded_slots is prepared_plan.decoded_slots for plan in plans)
+    assert all(output.pointer_queries == output.size_queries == 1 for output in outputs)
     assert uploads == [(3, 4), (4,)] and not launches
     assert workspace.statuses.shape == workspace.actual_sizes.shape == (2, 2)
     assert plans[0].metadata.stride(0) == 4
@@ -255,7 +269,7 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name):
     for index, (plan, frames) in enumerate(zip(plans, batches)):
         slot = index % 2
         assert plan.host_input is host
-        assert plan.decoded is outputs[slot]
+        assert plan.decoded_slots[slot] is outputs[slot]
         assert plan.stream is stream
         assert plan.metadata.value.tolist() == [
             [host.data_ptr() + frame.input_offset for frame in frames],

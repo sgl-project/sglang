@@ -96,9 +96,11 @@ rows. Temporary DE workspace is shared because DE submissions are ordered.
 The two large decoded-mask slots are allocated only after scheduler pause and
 its reader fence. Preparation already allocates the small nvCOMP temporary
 workspace, per-slot status/size rows and descriptor slabs, and uploads immutable
-input metadata and raw targets on feature-owned streams. After pause, one output
-pointer row and the apply pointers are filled/uploaded, then first-use scratch
-tuning runs. Slots are allocated once per update, reused across layers, and
+input metadata and raw targets on feature-owned streams. Relative output offsets,
+slot bounds, metadata views and status-validation callbacks are also prepared here,
+without launching decode or apply. After pause, actual output pointers are checked
+and uploaded; scratch-dependent apply setup and first-use tuning remain paused.
+Slots are allocated once per update, reused across layers, and
 released after completion before resume. The
 PyTorch native caching allocator may reuse their storage; the feature retains no
 large HBM lease during normal rollout. Host arena capacity and static CPU plans
@@ -209,8 +211,9 @@ publication-specific. Private arena index/state records use `orjson`; atomic
 replacement and canonical namespace/publication digests are unchanged.
 
 One creator per engine-host validates all publication frame metadata, including
-foreign experts, copies owner files into retained tmpfs mappings, checks source
-identity/extent across the read, and SHA-256 checks those retained bytes. The
+foreign experts, then reads and SHA-256 checks owner files in parallel using its
+existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
+checks source identity/extent across the read; all tasks drain before READY or failure. The
 namespace and build/release mutex bind the original engine participants and delta
 stream; publication metadata binds the manifest path, digest, session and versions.
 READY certifies the encoded cache only after verification succeeds. Ranks then
@@ -254,9 +257,10 @@ packed path rather than being split into layer batches.
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
 validation (`host_plan_validate_s`), frame validation (`host_encoded_cache_frames_validate_s`),
 local tensor planning (`host_tensor_prepare_s`) and full preparation
-(`host_prepare_s`). `host_metadata_prepare_s` covers small GPU input setup,
-including its own stream waits (`host_metadata_wait_s`). `paused_setup_host_s`
-includes decoded-slot allocation, output-pointer uploads and first-use kernel work; `paused_apply_tune_s` isolates cold tuning.
+(`host_prepare_s`). `host_metadata_prepare_s` covers small GPU input setup and
+status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
+`paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
+uploads, and scratch-dependent apply setup; `paused_apply_tune_s` isolates cold tuning.
 `paused_apply_host_wall_s` includes setup, the decode/apply pipeline, completion
 and scratch release, but the scheduler's full `blocked_s` remains the pause metric.
 
@@ -275,10 +279,12 @@ setup. These spans overlap and must not be summed. nvCOMP can wait inside an Asy
 call, so host enqueue durations can contain GPU backpressure.
 
 `host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
-and followers. Creator-only `host_encoded_cache_read_s`, `sha256_s`, `hash_files`,
-`hash_bytes` and `frames_validations` (with the same prefix) count shared work once.
-`host_encoded_cache_read_sha256_s` is the read-plus-hash duration; verification
-finishes before local decode starts. `host_encoded_cache_wait_s` isolates the
+and followers. Creator-only `host_encoded_cache_read_hash_s` measures parallel
+file verification, including path checks, submission and all joins.
+`host_encoded_cache_read_worker_sum_s` and `host_encoded_cache_sha256_worker_sum_s`
+sum overlapping worker intervals; neither is additive with the wall span.
+`host_encoded_cache_hash_files`, `hash_bytes` and `frames_validations` (with the
+same prefix) count shared work once. Verification finishes before local decode starts. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
 cache access, rank allocation and local outer decode.

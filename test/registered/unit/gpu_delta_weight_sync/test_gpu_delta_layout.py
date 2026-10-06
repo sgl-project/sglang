@@ -454,6 +454,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
                     prepared.timing_enabled = False
                     prepared.raw_copies, prepared.batches = {}, []
+                    prepared.status_checks = []
                     prepared.matrix_tensor_count = 0
                     prepared.raw_tensor_count = 0
                     prepared.derived = [
@@ -727,20 +728,25 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             def prepare_batches(self, batches, host, workspace, stream):
                 operations.append(("prepare_decoder", len(batches)))
 
+                decoded_slots = []
+                plans = [
+                    self._prepare(index, frames, host, decoded_slots)
+                    for index, frames in enumerate(batches)
+                ]
+
                 def bind_outputs(decoded):
                     operations.append(("bind_outputs", len(decoded)))
                     slots.extend(decoded)
+                    decoded_slots[:] = decoded
                     for slot in decoded:
                         slot.fill_(0xA5)
-                    return [
-                        self._prepare(index, frames, host, decoded[index % 2])
-                        for index, frames in enumerate(batches)
-                    ]
+                    return plans
 
-                return SimpleNamespace(bind_outputs=bind_outputs)
+                return SimpleNamespace(bind_outputs=bind_outputs, batches=plans)
 
-            def _prepare(self, index, frames, host, decoded):
+            def _prepare(self, index, frames, host, decoded_slots):
                 def enqueue():
+                    decoded = decoded_slots[index % 2]
                     operations.append(("decode", index))
                     decoded_batches.append((index, decoded.data_ptr(), frames))
                     for frame in frames:
@@ -758,6 +764,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 return SimpleNamespace(enqueue=enqueue, index=index)
 
         def status_check(decoder, error):
+            operations.append(("prepare_check", decoder.index))
             return lambda: operations.append(("check", decoder.index))
 
         empty = torch.empty
@@ -807,6 +814,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertFalse(any(row[0] == "wait_stream" for row in operations))
                 self.assertFalse(any(row[0] == "bind_outputs" for row in operations))
                 self.assertEqual(prepared.batches, [])
+                self.assertEqual(
+                    [row for row in operations if row[0] == "prepare_check"],
+                    [("prepare_check", index) for index in range(7)],
+                )
+                before_apply = len(operations)
                 self.assertEqual(prepared.timings["compressed_batches"], 7)
                 self.assertEqual(prepared.timings["de_host_input_bytes"], 120)
                 self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
@@ -814,6 +826,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertFalse(decoded_batches)
                 self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
                 result = prepared.apply()
+                self.assertFalse(
+                    any(row[0] == "prepare_check" for row in operations[before_apply:])
+                )
                 self.assertEqual(streams.call_count, 2)
                 self.assertEqual(result["timings"]["decoded_buffers"], 2)
                 self.assertEqual(result["timings"]["decoded_scratch_bytes"], 56)
@@ -850,6 +865,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     )
                 self.assertIsNone(prepared.decoded)
                 self.assertIsNone(prepared.workspace)
+                self.assertIsNone(prepared.decode_plan)
+                self.assertEqual(prepared.status_checks, [])
                 self.assertIsNone(prepared.apply_metadata)
                 self.assertEqual(prepared.batches, [])
                 for target in targets:

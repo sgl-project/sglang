@@ -76,8 +76,8 @@ def fixture(directory):
             }
         tensors.append(entry)
     # A foreign EP tensor's compressed contents are intentionally invalid. It is
-    # authenticated with the owner file but must not be decoded on this host.
-    blob.extend(b"foreign-not-zstd")
+    # authenticated in its own owner file but must not be decoded on this host.
+    foreign = b"foreign-not-zstd"
     tensors.append(
         {
             "name": "foreign",
@@ -93,8 +93,8 @@ def fixture(directory):
                 }
             ],
             "outer": {
-                "file": "owner.bin",
-                "encoded_offset": len(blob) - 16,
+                "file": "foreign.bin",
+                "encoded_offset": 0,
                 "encoded_bytes": 16,
                 "decoded_bytes": 10,
                 "frames": [
@@ -109,6 +109,7 @@ def fixture(directory):
         }
     )
     (directory / "owner.bin").write_bytes(blob)
+    (directory / "foreign.bin").write_bytes(foreign)
     manifest = {
         "frame_bytes": 1 << 20,
         "files": [
@@ -116,13 +117,22 @@ def fixture(directory):
                 "name": "owner.bin",
                 "nbytes": len(blob),
                 "sha256": hashlib.sha256(blob).hexdigest(),
-            }
+            },
+            {
+                "name": "foreign.bin",
+                "nbytes": len(foreign),
+                "sha256": hashlib.sha256(foreign).hexdigest(),
+            },
         ],
         "tensors": tensors,
     }
     path = directory / "manifest.json"
     path.write_text(json.dumps(manifest))
     return path, hashlib.sha256(path.read_bytes()).hexdigest(), manifest, expected
+
+
+def local_entries(manifest, names):
+    return [entry for entry in manifest["tensors"] if entry["name"] in names]
 
 
 def fake_fallocate(fd, offset, length):
@@ -161,7 +171,13 @@ def _child(root, path, digest, manifest, names, barrier, output):
             barrier.wait(timeout=10)
             metrics = {}
             snapshot = arena.prepare(
-                path, digest, manifest, names, pool, metrics, metadata()
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, names),
+                pool,
+                metrics,
+                metadata(),
             )
             values = {
                 name: bytes(
@@ -208,12 +224,17 @@ class TestHostSnapshot(unittest.TestCase):
         arena, metrics = self.arena(), {}
         entered, release, finished = [threading.Event() for _ in range(3)]
         snapshots, errors = [], []
-        original_hash = host._hash_payloads
+        peer_finished = threading.Event()
+        original_read = host._read_verify_payload
 
-        def delayed_hash(files, definitions):
-            entered.set()
-            assert release.wait(5)
-            return original_hash(files, definitions)
+        def delayed_read(source, destination, expected):
+            result = original_read(source, destination, expected)
+            if source.name == "owner.bin":
+                entered.set()
+                assert release.wait(5)
+            else:
+                peer_finished.set()
+            return result
 
         def build():
             try:
@@ -222,7 +243,7 @@ class TestHostSnapshot(unittest.TestCase):
                         path,
                         digest,
                         manifest,
-                        sorted(expected),
+                        local_entries(manifest, expected),
                         self.pool,
                         metrics,
                         metadata(),
@@ -234,13 +255,14 @@ class TestHostSnapshot(unittest.TestCase):
                 finished.set()
 
         with (
-            patch.object(host, "_hash_payloads", side_effect=delayed_hash),
+            patch.object(host, "_read_verify_payload", side_effect=delayed_read),
             patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
             try:
                 self.assertTrue(entered.wait(5))
+                self.assertTrue(peer_finished.wait(5))
                 self.assertFalse(finished.is_set())
                 decode.assert_not_called()
                 self.assertIsNone(arena.allocation)
@@ -252,14 +274,20 @@ class TestHostSnapshot(unittest.TestCase):
                 builder.join(5)
         self.assertFalse(builder.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(metrics["host_encoded_cache_hash_files"], 1)
+        self.assertEqual(metrics["host_encoded_cache_hash_files"], 2)
         snapshot = snapshots[0]
         self.assertEqual(
             {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
         )
         follower_metrics = {}
         follower = self.arena().prepare(
-            path, digest, manifest, ["dense"], self.pool, follower_metrics, metadata()
+            path,
+            digest,
+            manifest,
+            local_entries(manifest, ["dense"]),
+            self.pool,
+            follower_metrics,
+            metadata(),
         )
         self.assertEqual(bytes(follower.get("dense").numpy()), expected["dense"])
         self.assertEqual(follower_metrics["host_encoded_cache_hash_files"], 0)
@@ -270,15 +298,61 @@ class TestHostSnapshot(unittest.TestCase):
     def test_hash_failure_poison_and_rank_decode_failure_never_release_cache(self):
         path, digest, manifest, expected = fixture(self.root)
         manifest["files"][0]["sha256"] = "0" * 64
-        with patch.object(self.pool, "decode", wraps=self.pool.decode) as decode:
-            with self.assertRaisesRegex(ValueError, "SHA256"):
+        peer_entered, release, failed = [threading.Event() for _ in range(3)]
+        finished, errors = threading.Event(), []
+        original_read = host._read_verify_payload
+
+        def blocked_peer(source, destination, record):
+            if source.name == "foreign.bin":
+                peer_entered.set()
+                assert release.wait(5)
+            try:
+                return original_read(source, destination, record)
+            except ValueError:
+                failed.set()
+                raise
+
+        def build():
+            try:
                 self.arena().prepare(
-                    path, digest, manifest, sorted(expected), self.pool, {}, metadata()
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, expected),
+                    self.pool,
+                    {},
+                    metadata(),
                 )
-            decode.assert_not_called()
+            except ValueError as error:
+                errors.append(str(error))
+            finally:
+                finished.set()
+
+        with (
+            patch.object(host, "_read_verify_payload", side_effect=blocked_peer),
+            patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
+        ):
+            thread = threading.Thread(target=build)
+            thread.start()
+            try:
+                self.assertTrue(peer_entered.wait(5))
+                self.assertTrue(failed.wait(5))
+                self.assertFalse(finished.is_set())
+                decode.assert_not_called()
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ["delta payload SHA256 mismatch"])
         with self.assertRaisesRegex(ValueError, "failed or already released"):
             self.arena().prepare(
-                path, digest, manifest, sorted(expected), self.pool, {}, metadata()
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(),
             )
         # A different engine's authenticated bytes can still have invalid Zstd.
         # Encoded READY proves hash/metadata only; local failure cannot release it.
@@ -291,7 +365,7 @@ class TestHostSnapshot(unittest.TestCase):
                 path,
                 digest,
                 manifest,
-                ["foreign"],
+                local_entries(manifest, ["foreign"]),
                 self.pool,
                 {},
                 metadata(engine="bad-decode"),
@@ -301,7 +375,7 @@ class TestHostSnapshot(unittest.TestCase):
                 path,
                 digest,
                 manifest,
-                ["foreign"],
+                local_entries(manifest, ["foreign"]),
                 self.pool,
                 {},
                 metadata(2, "bad-decode"),
@@ -337,7 +411,8 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertNotEqual(records[0][3], records[1][3])
         for field in ("created", "hash_files", "frames_validations"):
             self.assertEqual(
-                sum(row[1]["host_encoded_cache_" + field] for row in records), 1
+                sum(row[1]["host_encoded_cache_" + field] for row in records),
+                2 if field == "hash_files" else 1,
             )
         self.assertTrue(
             all(row[1]["host_rank_outer_zstd_tensors"] == 1 for row in records)
@@ -350,7 +425,13 @@ class TestHostSnapshot(unittest.TestCase):
             self.assertEqual(row[2], {name: expected[name] for name in row[2]})
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             self.arena().prepare(
-                path, digest, manifest, sorted(expected), self.pool, {}, metadata(2)
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(2),
             )
 
     def test_invalid_foreign_metadata_fails_before_allocation_read_or_decode(self):
@@ -360,7 +441,9 @@ class TestHostSnapshot(unittest.TestCase):
         path.write_bytes(content)
         with (
             patch.object(host, "_reserve", wraps=host._reserve) as allocate,
-            patch.object(host, "_read_payload", wraps=host._read_payload) as read,
+            patch.object(
+                host, "_read_verify_payload", wraps=host._read_verify_payload
+            ) as read,
             patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
             self.assertRaisesRegex(ValueError, "outer Zstd chunk range"),
         ):
@@ -368,7 +451,7 @@ class TestHostSnapshot(unittest.TestCase):
                 path,
                 hashlib.sha256(content).hexdigest(),
                 manifest,
-                sorted(expected),
+                local_entries(manifest, expected),
                 self.pool,
                 {},
                 metadata(),
@@ -396,7 +479,13 @@ class TestHostSnapshot(unittest.TestCase):
             try:
                 snapshots.append(
                     first.prepare(
-                        path, digest, manifest, ["dense"], slow_pool, {}, metadata()
+                        path,
+                        digest,
+                        manifest,
+                        local_entries(manifest, ["dense"]),
+                        slow_pool,
+                        {},
+                        metadata(),
                     )
                 )
             except BaseException as error:
@@ -409,13 +498,19 @@ class TestHostSnapshot(unittest.TestCase):
                 self.assertTrue(entered.wait(5))
                 metrics = {}
                 second = follower.prepare(
-                    path, digest, manifest, ["expert"], self.pool, metrics, metadata()
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, ["expert"]),
+                    self.pool,
+                    metrics,
+                    metadata(),
                 )
                 third = other.prepare(
                     path,
                     digest,
                     manifest,
-                    ["expert"],
+                    local_entries(manifest, ["expert"]),
                     self.pool,
                     {},
                     metadata(engine="b"),
@@ -439,7 +534,7 @@ class TestHostSnapshot(unittest.TestCase):
             path,
             digest,
             manifest,
-            sorted(expected),
+            local_entries(manifest, expected),
             self.pool,
             first_metrics,
             metadata(),
@@ -450,13 +545,19 @@ class TestHostSnapshot(unittest.TestCase):
         )
         self.assertEqual(
             first.index["encoded"]["capacity"],
-            (manifest["files"][0]["nbytes"] + 1023) // 1024 * 1024,
+            (sum(file["nbytes"] for file in manifest["files"]) + 1023) // 1024 * 1024,
         )
         first.mark_reusable()
         first.close()
         warm = {}
         second = arena.prepare(
-            path, digest, manifest, sorted(expected), self.pool, warm, metadata(2)
+            path,
+            digest,
+            manifest,
+            local_entries(manifest, expected),
+            self.pool,
+            warm,
+            metadata(2),
         )
         self.assertEqual(second.index["rank_arena"], original)
         self.assertEqual(warm["host_rank_allocation_calls"], 0)
@@ -465,10 +566,17 @@ class TestHostSnapshot(unittest.TestCase):
         first.mark_reusable()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             arena.prepare(
-                path, digest, manifest, sorted(expected), self.pool, {}, metadata(3)
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(3),
             )
         second.mark_reusable()
         second.close()
+        manifest = json.loads(path.read_text())
         large = bytes(original["capacity"] * 2 + 1)
         payload = (self.root / "owner.bin").read_bytes() + large
         raw = manifest["tensors"][2]
@@ -486,7 +594,7 @@ class TestHostSnapshot(unittest.TestCase):
             path,
             hashlib.sha256(path.read_bytes()).hexdigest(),
             manifest,
-            sorted(expected),
+            local_entries(manifest, expected),
             self.pool,
             growth,
             metadata(3),
@@ -499,12 +607,21 @@ class TestHostSnapshot(unittest.TestCase):
             (2 * third.index["arena_bytes"] + 1023) // 1024 * 1024,
         )
         self.assertEqual(
-            third.index["encoded"]["capacity"], (2 * len(payload) + 1023) // 1024 * 1024
+            third.index["encoded"]["capacity"],
+            (2 * sum(file["nbytes"] for file in manifest["files"]) + 1023)
+            // 1024
+            * 1024,
         )
         third.close()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             arena.prepare(
-                path, digest, manifest, sorted(expected), self.pool, {}, metadata(4)
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(4),
             )
 
 

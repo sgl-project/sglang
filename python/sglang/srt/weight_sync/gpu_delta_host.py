@@ -129,7 +129,7 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
-def _read_payload(source, destination, expected):
+def _read_verify_payload(source, destination, expected):
     started = time.perf_counter()
     with source.open("rb", buffering=0) as incoming:
         before = os.fstat(incoming.fileno())
@@ -149,16 +149,38 @@ def _read_payload(source, destination, expected):
             before.st_ctime_ns,
         ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("delta payload size mismatch or source changed")
-    return time.perf_counter() - started
-
-
-def _hash_payloads(files, definitions):
-    """Hash the retained immutable copy, never reread publication files."""
+    read_s = time.perf_counter() - started
     started = time.perf_counter()
-    for name, payload in files.items():
-        if hashlib.sha256(payload).hexdigest() != definitions[name]["sha256"]:
-            raise ValueError("delta payload SHA256 mismatch")
-    return time.perf_counter() - started
+    # Authenticate the retained copy, never reread the publication file.
+    if hashlib.sha256(destination).hexdigest() != expected["sha256"]:
+        raise ValueError("delta payload SHA256 mismatch")
+    return read_s, time.perf_counter() - started
+
+
+def _read_verify_payloads(publication, files, definitions, pool, metrics):
+    started = time.perf_counter()
+    futures, error = [], None
+    try:
+        for name, record in definitions.items():
+            source = (publication.parent / name).resolve(strict=True)
+            if source.parent != publication.parent:
+                raise ValueError("delta payload escapes immutable publication")
+            futures.append(
+                pool.executor.submit(_read_verify_payload, source, files[name], record)
+            )
+    except BaseException as exc:  # noqa: BLE001 - drain submitted file tasks
+        error = exc
+    for future in futures:
+        try:
+            read_s, hash_s = future.result()
+            metrics["host_encoded_cache_read_worker_sum_s"] += read_s
+            metrics["host_encoded_cache_sha256_worker_sum_s"] += hash_s
+        except BaseException as exc:  # noqa: BLE001 - retain mappings until peers drain
+            if error is None:
+                error = exc
+    metrics["host_encoded_cache_read_hash_s"] = time.perf_counter() - started
+    if error is not None:
+        raise error
 
 
 def _natural_key(name):
@@ -319,7 +341,14 @@ class HostArena:
         metrics["host_rank_allocation_bytes"] = self.capacity["capacity"]
 
     def prepare(
-        self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
+        self,
+        manifest_path,
+        manifest_sha256,
+        manifest,
+        local_entries,
+        pool,
+        timings,
+        metadata,
     ):
         root = _cache_root(self.engine_id)
         publication = Path(manifest_path).resolve(strict=True)
@@ -360,8 +389,9 @@ class HostArena:
         metrics = {
             name: 0
             for name in (
-                "host_encoded_cache_read_s",
-                "host_encoded_cache_sha256_s",
+                "host_encoded_cache_read_hash_s",
+                "host_encoded_cache_read_worker_sum_s",
+                "host_encoded_cache_sha256_worker_sum_s",
                 "host_encoded_cache_hash_bytes",
                 "host_encoded_cache_hash_files",
                 "host_encoded_cache_created",
@@ -456,16 +486,7 @@ class HostArena:
                     },
                 )
                 files = _map_files(directory, encoded, definitions)
-                for name, record in definitions.items():
-                    source = (publication.parent / name).resolve(strict=True)
-                    if source.parent != publication.parent:
-                        raise ValueError("delta payload escapes immutable publication")
-                    metrics["host_encoded_cache_read_s"] += _read_payload(
-                        source, files[name], record
-                    )
-                metrics["host_encoded_cache_sha256_s"] = _hash_payloads(
-                    files, definitions
-                )
+                _read_verify_payloads(publication, files, definitions, pool, metrics)
                 metrics["host_encoded_cache_hash_bytes"] = encoded_size
                 metrics["host_encoded_cache_hash_files"] = len(definitions)
                 index["build_s"] = time.perf_counter() - build_started
@@ -483,16 +504,16 @@ class HostArena:
                     (directory / previous["encoded"]["file"]).unlink()
                 metrics["host_encoded_cache_created"] = 1
         self.directory = directory
-        entries_by_name = {entry["name"]: entry for entry in manifest["tensors"]}
         if self.tensor_order is None:
+            # Local binding order is immutable; retain indices, not old entries.
             self.tensor_order = sorted(
-                names,
-                key=lambda name: (
-                    entries_by_name[name]["encoding"] == "raw_bytes",
-                    _natural_key(name),
+                range(len(local_entries)),
+                key=lambda i: (
+                    local_entries[i]["encoding"] == "raw_bytes",
+                    _natural_key(local_entries[i]["name"]),
                 ),
             )
-        entries = [entries_by_name[name] for name in self.tensor_order]
+        entries = [local_entries[i] for i in self.tensor_order]
         layout, size = _tensor_layout(entries)
         self._reserve_rank(size, metrics)
         _decode_arena(
