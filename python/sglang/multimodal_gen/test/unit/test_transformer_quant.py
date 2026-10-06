@@ -1435,19 +1435,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
     def test_online_quant_configs_accepting_ignored_layers_receive_them(self):
-        # Every online method whose config constructor takes `ignored_layers`
-        # must be handed the CLI patterns -- the forwarding is driven by the
-        # constructor signature, not by a hardcoded method list.
+        # The online methods that honour `ignored_layers` in their
+        # `get_quant_method` must be handed the CLI patterns.
         ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
-        for method in ("fp8", "mxfp4", "mxfp8", "convrot_int8"):
+        for method in ("fp8", "mxfp4", "convrot_int8"):
             with self.subTest(method=method):
                 quant_config = self._resolve_online_quant_config(method, ignored_layers)
                 self.assertEqual(quant_config.ignored_layers, ignored_layers)
 
     def test_online_quant_config_without_ignored_layers_param_does_not_raise(self):
-        # Configs whose constructor has no `ignored_layers` parameter must be
-        # built without it rather than raising TypeError when the CLI flag is
-        # set.
+        # Methods outside the online-quant set must be built without the
+        # kwarg rather than raising TypeError when the CLI flag is set.
         quant_config = self._resolve_online_quant_config(
             "mxfp4_npu", ["blocks.0.attn.out_proj"]
         )
