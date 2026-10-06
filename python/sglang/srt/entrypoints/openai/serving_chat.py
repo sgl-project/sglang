@@ -1396,7 +1396,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     if item.function.name == request.tool_choice.function.name
                 ] or None
             elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
+                tools = request._template_tools or [
+                    item.model_dump() for item in request.tools
+                ]
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,

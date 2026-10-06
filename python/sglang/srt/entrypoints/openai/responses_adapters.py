@@ -72,6 +72,18 @@ def custom_tool_names(tools: Any) -> Set[str]:
     return {tool.name for tool in tools or [] if tool.type == "custom" and tool.name}
 
 
+def namespace_function_names(tools: Any) -> Dict[str, Tuple[str, str]]:
+    """Map each namespace member's call name ``<namespace>.<function>`` to
+    ``(namespace, function)``."""
+    return {
+        f"{tool.name}.{member['name']}": (tool.name, member["name"])
+        for tool in tools or []
+        if tool.type == "namespace" and tool.name
+        for member in tool.tools or []
+        if member.get("type", "function") == "function" and member.get("name")
+    }
+
+
 def encode_custom_tool_input(payload: str) -> str:
     return json.dumps({CUSTOM_TOOL_INPUT_KEY: payload}, ensure_ascii=False)
 
