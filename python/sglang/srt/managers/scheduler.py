@@ -87,6 +87,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -577,6 +578,9 @@ class Scheduler(
                 and get_parallel().pp_rank == 0
                 and get_parallel().attn_tp_rank == 0
                 and get_parallel().attn_cp_rank == 0
+            ),
+            dynamo_kv_event_format=uses_dynamo_format(
+                get_observability().kv_events_config
             ),
             kv_event_lora_names=self.kv_event_lora_names,
             enable_hierarchical_cache=self.enable_hierarchical_cache,

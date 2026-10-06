@@ -28,7 +28,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import msgspec
 import zmq
@@ -652,10 +652,22 @@ class KVEventsConfig(BaseModel):
     this topic to receive events.
     """
 
+    format: Literal["default", "dynamo"] = "default"
+    """The event format. "default" is the SGLang format. "dynamo" is the format
+    the Dynamo KV router reads: block hashes also depend on extra_key and
+    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
         return KVEventsConfig.model_validate_json(cli_value)
+
+
+def uses_dynamo_format(kv_events_config: Optional[str]) -> bool:
+    if not kv_events_config:
+        return False
+    return KVEventsConfig.from_cli(kv_events_config).format == "dynamo"
 
 
 class EventPublisherFactory:
@@ -677,6 +689,8 @@ class EventPublisherFactory:
             return NullEventPublisher()
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
+        # The cache event recorder uses the format. The publisher does not accept it.
+        config_dict.pop("format")
 
         kind = config_dict.pop("publisher", "null")
         try:
