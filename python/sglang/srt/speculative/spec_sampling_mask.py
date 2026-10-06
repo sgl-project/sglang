@@ -4,12 +4,11 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.speculative.dflash_utils import (
-    build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
 )
 
@@ -26,7 +25,7 @@ def validate_spec_sampling_mask_request(
     if not spec_algorithm.is_dflash_family():
         return "return_sampling_mask is not supported with speculative decoding."
 
-    # build_speculative_verify_target_probs applies top-k/top-p only.
+    # build_verify_target_probs applies top-k/top-p only.
     if req.sampling_params.min_p > 0:
         return "return_sampling_mask with speculative decoding does not support min_p."
 
@@ -79,7 +78,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             return None
         target_probs = None
         if not sampling_info.is_all_greedy:
-            target_probs = build_speculative_verify_target_probs(
+            target_probs = build_verify_target_probs(
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=draft_token_num,

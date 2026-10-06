@@ -35,8 +35,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -126,6 +124,7 @@ from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
 )
+from torch.profiler import ProfilerActivity, profile
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -543,6 +542,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
+        if (
+            self.model_runner.spec_algorithm.is_dspark()
+            and get_exec().mamba.linear_attn_verify_backend == "nv_cutedsl"
+            and not envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+        ):
+            # Subdivide existing batch tiers without capturing every possible token count.
+            buckets = sorted(
+                set(buckets)
+                | {
+                    bs * width
+                    for bs in self.capture_bs
+                    for width in range(1, min(self.captured_req_width, 8) + 1)
+                }
+            )
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
 
@@ -577,6 +590,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             stream_idx=stream_idx,
             variant_label=variant_label,
             attention_variant=attention_variant,
+            spec_sampling_top_k=(
+                self.model_runner.spec_verify_epilogue.sampling_top_k
+                if self.model_runner.spec_verify_epilogue is not None
+                and self.model_runner.spec_verify_epilogue.sampling
+                else 0
+            ),
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -628,6 +647,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
+        # Sampling variants share the layout refreshed for this token bucket.
+        if num_tokens in self._captured_ragged_layouts:
+            return self._captured_ragged_layouts[num_tokens]
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
@@ -670,6 +692,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Padded and ragged admission must also require a captured sampling variant.
+        # Only the epilogue feeds that field, so the size argument is immaterial.
+        if self._make_graph_key(0).spec_sampling_top_k not in getattr(
+            self, "_captured_spec_top_ks", {0}
+        ):
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1155,7 +1184,115 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        epilogue = self.model_runner.spec_verify_epilogue
+        top_ks = (
+            sorted({min(64, epilogue.vocab_size), epilogue.vocab_size}, reverse=True)
+            if epilogue is not None
+            else []
+        )
+        # can_run_graph admits against this, so it must list exactly what the
+        # loop below captures.
+        self._captured_spec_top_ks = getattr(self, "_captured_spec_top_ks", set()) | {
+            *top_ks,
+            0,
+        }
+        try:
+            for top_k in [*top_ks, 0]:
+                if epilogue is not None:
+                    epilogue.sampling = top_k > 0
+                    epilogue.sampling_top_k = top_k
+                if self.ragged_verify_mode:
+                    previous_size = max(
+                        (bs for bs in self.capture_bs if bs < size), default=0
+                    )
+                    for num_tokens in reversed(self.capture_num_tokens):
+                        if (
+                            not previous_size * self.captured_req_width
+                            < num_tokens
+                            <= size * self.captured_req_width
+                        ):
+                            continue
+                        self._capture_one_shape(
+                            size,
+                            forward,
+                            stream_idx,
+                            variant_label,
+                            attention_variant,
+                            num_tokens=num_tokens,
+                        )
+                else:
+                    self._capture_one_shape(
+                        size, forward, stream_idx, variant_label, attention_variant
+                    )
+        finally:
+            if epilogue is not None:
+                epilogue.sampling = False
+
+    def _variant_targets(self, attn_backend):
+        """Every backend that owns captured metadata under this one.
+
+        Resolved once per root and cached: the backend topology is built during
+        initialization and does not change, while this runs on the replay path
+        for every decode step, where walking vars() each time is pure waste.
+        The cache holds the root alive, so an id key cannot be recycled onto a
+        different object.
+        """
+        cache = getattr(self, "_variant_target_cache", None)
+        if cache is None:
+            cache = self._variant_target_cache = {}
+        cached = cache.get(id(attn_backend))
+        if cached is not None:
+            return cached[1]
+
+        # A wrapper such as HybridAttnBackend owns no captured metadata itself
+        # -- it forwards init_forward_metadata_out_graph to whichever child the
+        # forward mode selects, and the child is the one holding
+        # decode_cuda_graph_metadata. Publishing only onto the wrapper leaves
+        # every variant sharing the (bs, 0) key inside that child, which is the
+        # exact collision this patch exists to remove. Children are found by
+        # type rather than by attribute name so a future wrapper needs no
+        # change here; the visited set makes a self-referencing graph terminate.
+        targets, seen, pending = [], set(), [attn_backend]
+        while pending:
+            backend = pending.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            targets.append(backend)
+            for value in vars(backend).values():
+                if isinstance(value, AttentionBackend):
+                    pending.append(value)
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(
+                        item for item in value if isinstance(item, AttentionBackend)
+                    )
+        targets = tuple(targets)
+        cache[id(attn_backend)] = (attn_backend, targets)
+        return targets
+
+    def _publish_graph_variant(self, attn_backend) -> None:
+        """Tell the attention backend which graph its wrappers belong to.
+
+        Must precede every init_forward_metadata_out_graph call, on the capture
+        and the replay-prep path alike, or captures that share a batch size
+        overwrite each other's wrappers.
+        """
+        variant = self._make_graph_key(0).spec_sampling_top_k
+        for backend in self._variant_targets(attn_backend):
+            backend.cuda_graph_variant = variant
+
+    def _capture_one_shape(
+        self,
+        size: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
+        *,
+        num_tokens: Optional[int] = None,
+    ):
+        if num_tokens is None:
+            num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1177,6 +1314,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+            self._publish_graph_variant(attn_backend)
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
@@ -1433,6 +1571,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.lora_manager.prepare_lora_batch(
                 cast(ForwardBatch, fb_view)
             )
+
+        self._publish_graph_variant(attn_backend)
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
@@ -1457,6 +1597,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     bs,
                     str(self.capture_forward_mode),
                     str(fb_view.actual_forward_mode),
+                    self._make_graph_key(0).spec_sampling_top_k,
                 ),
             )
         else:

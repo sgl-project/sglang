@@ -7,8 +7,6 @@ from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
-from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -22,6 +20,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -682,20 +681,23 @@ def _verify_coins(
     coins when sampling_seed is set (see _seeded_verify_coins), torch.rand
     otherwise.
     """
+    seeded = None
+    use_seed = getattr(sampling_info, "use_sampling_seed", None)
     if sampling_info.sampling_seed is not None:
-        return _seeded_verify_coins(
+        seeded = _seeded_verify_coins(
             sampling_seed=sampling_info.sampling_seed,
             seq_lens=seq_lens,
             draft_token_num=draft_token_num,
             device=device,
         )
-    # coins for rejection sampling
+        if use_seed is None:
+            return seeded
     coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-    # coins for final sampling
-    coins_for_final_sampling = torch.rand(
-        (candidates.shape[0],), dtype=torch.float32, device=device
-    )
-    return coins, coins_for_final_sampling
+    final = torch.rand((candidates.shape[0],), dtype=torch.float32, device=device)
+    if seeded is not None:
+        coins = torch.where(use_seed, seeded[0], coins)
+        final = torch.where(use_seed, seeded[1], final)
+    return coins, final
 
 
 def _verify_uses_greedy(
@@ -740,6 +742,8 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    *,
+    target_max_top_k: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -749,9 +753,7 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
+    from sglang.srt.sampling.verify_graph import apply_verify_logits_adjustments
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -772,29 +774,9 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
+    apply_verify_logits_adjustments(
+        next_token_logits, sampling_info, verify_input.draft_token_num
+    )
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
@@ -925,31 +907,18 @@ def eagle_sample(
         elif not _is_npu:
             from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
-
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        target_probs = build_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=verify_input.draft_token_num,
+            bs=bs,
+            max_top_k=target_max_top_k,
+            use_sparse_topk=target_max_top_k is not None,
+            sparse_top_k_mode="threshold",
+            renorm_top_k=top_k_renorm_prob,
+            renorm_top_p=top_p_renorm_prob,
+            probe=maybe_detect_nan,
+        )
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
@@ -957,13 +926,20 @@ def eagle_sample(
         )
         # Defense-in-depth behind the spec_hook startup allowlist: validate
         # the actual kernel inputs before the Triton kernel.
+        expected_draft_shape = (
+            bs,
+            verify_input.draft_token_num - 1,
+            target_probs.shape[-1],
+        )
         if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            draft_probs is None or tuple(draft_probs.shape) != expected_draft_shape
         ):
             raise ValueError(
                 "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
+                f"distribution with shape {expected_draft_shape}; got "
+                f"{None if draft_probs is None else tuple(draft_probs.shape)}. "
+                "The current speculative algorithm/draft worker produced an "
+                "invalid or stale draft_probs buffer."
             )
 
         coins, coins_for_final_sampling = _verify_coins(
@@ -991,7 +967,6 @@ def eagle_sample(
             deterministic=True,
         )
         del (
-            expanded_temperature,
             target_probs,
             draft_probs,
             coins,

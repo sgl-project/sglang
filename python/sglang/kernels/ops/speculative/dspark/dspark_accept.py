@@ -8,10 +8,13 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    retain_full_cuda_graph_owner,
+)
+from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.utils import is_npu
@@ -97,14 +100,18 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+    if (
+        not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not getattr(sampling_info, "need_min_p_sampling", False)
+    ):
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
             rows_per_request=verify_num_draft_tokens,
         ).view(bs, verify_num_draft_tokens, -1)
     else:
-        target_probs = build_speculative_verify_target_probs(
+        target_probs = build_verify_target_probs(
             next_token_logits=target_logits,
             sampling_info=sampling_info,
             draft_token_num=verify_num_draft_tokens,
@@ -123,6 +130,17 @@ def _accept_sampling_core(
         bs=bs,
         draft_token_num=verify_num_draft_tokens,
         device=device,
+    )
+    # A later eager batch can grow the global scratch cache after graph capture.
+    retain_full_cuda_graph_owner(
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        )
     )
     # The NPU implementation uses the candidate width as its row stride.  The
     # last value is intentionally unused because candidate slot 0 is the root.

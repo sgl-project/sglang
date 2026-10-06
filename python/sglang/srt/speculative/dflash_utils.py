@@ -7,20 +7,16 @@ from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import (
-    apply_custom_logit_processor,
-    top_p_normalize_probs_torch,
-)
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -42,9 +38,6 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 
 if is_cuda():
-    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
@@ -52,100 +45,21 @@ if is_cuda():
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 elif is_musa():
     try:
+        from sgl_kernel import top_k_renorm_prob as top_k_renorm_prob
+        from sgl_kernel import top_p_renorm_prob as top_p_renorm_prob
         from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
             tree_speculative_sampling_target_only,
         )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
-
-
-def _dflash_npu_top_k_top_p_renorm_prob(
-    probs: torch.Tensor,
-    *,
-    top_ks: Optional[torch.Tensor] = None,
-    top_ps: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    if not is_npu() or probs.device.type != "npu":
-        return None
-    try:
-        import torch_npu
-    except ImportError:
-        return None
-    if not hasattr(torch_npu, "npu_top_k_top_p"):
-        return None
-
-    logits = probs.log()
-    npu_top_ps = (
-        top_ps.reshape(-1).to(device=probs.device, dtype=probs.dtype)
-        if top_ps is not None
-        else None
-    )
-    npu_top_ks = (
-        top_ks.reshape(-1).to(device=probs.device, dtype=torch.int32)
-        if top_ks is not None
-        else None
-    )
-    if npu_top_ks is not None and not bool(
-        torch.all((npu_top_ks >= 1) & (npu_top_ks <= 1024)).item()
-    ):
-        return None
-    filtered_logits = torch_npu.npu_top_k_top_p(logits, npu_top_ps, npu_top_ks)
-    return filtered_logits.softmax(dim=-1)
-
-
-def _dflash_top_k_renorm_prob(
-    probs: torch.Tensor, top_ks: torch.Tensor
-) -> torch.Tensor:
-    if top_k_renorm_prob is not None:
-        return top_k_renorm_prob(probs, top_ks)
-
-    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
-    if npu_probs is not None:
-        return npu_probs
-
-    vocab_size = probs.shape[-1]
-    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
-    top_ks = top_ks.clamp(min=1, max=vocab_size)
-    max_top_k = int(top_ks.max().item())
-    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
-    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
-    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
-    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
-
-
-def _dflash_top_p_renorm_prob(
-    probs: torch.Tensor, top_ps: torch.Tensor
-) -> torch.Tensor:
-    if top_p_renorm_prob is not None:
-        return top_p_renorm_prob(probs, top_ps)
-    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
-    if npu_probs is not None:
-        return npu_probs
-    return top_p_normalize_probs_torch(probs, top_ps)
 
 
 def dflash_draft_cell_size_per_token(
@@ -1086,7 +1000,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 dtype=torch.float32,
             )
 
-        target_probs = build_speculative_verify_target_probs(
+        target_probs = build_verify_target_probs(
             next_token_logits=next_token_logits,
             sampling_info=sampling_info,
             draft_token_num=draft_token_num,
@@ -1125,76 +1039,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
     return correct_len, bonus
-
-
-def build_speculative_verify_target_probs(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info: Any,
-    draft_token_num: int,
-    bs: int,
-    max_top_k: Optional[int] = None,
-    uniform_top_k_value: Optional[int] = None,
-    use_sparse_topk: bool = True,
-) -> torch.Tensor:
-    device = next_token_logits.device
-    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
-    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
-    )
-    scaled_logits = next_token_logits / expanded_temperature
-    sparse_topk_applied = False
-
-    if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
-        repeated_top_ks.clamp_(min=1, max=vocab_size)
-        if max_top_k is None:
-            max_top_k = int(repeated_top_ks.max().item())
-        else:
-            max_top_k = int(max_top_k)
-        if max_top_k < 1:
-            max_top_k = 1
-        elif max_top_k > vocab_size:
-            max_top_k = vocab_size
-
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
-        if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
-                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
-                    None, :
-                ]
-                valid = ranks < repeated_top_ks.unsqueeze(1)
-                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
-
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
-
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
-            target_probs.scatter_(1, topk_indices, topk_probs)
-            sparse_topk_applied = True
-
-    if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = _dflash_top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
-        if need_top_p:
-            target_probs = _dflash_top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
-            )
-    return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:

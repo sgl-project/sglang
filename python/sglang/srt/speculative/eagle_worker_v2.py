@@ -4,7 +4,6 @@ import time
 from typing import List, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -230,6 +229,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+
+        from sglang.srt.speculative.eagle_verify_graph import (
+            install_eagle_verify_epilogue,
+        )
+
+        install_eagle_verify_epilogue(self.target_worker, self.server_args)
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size

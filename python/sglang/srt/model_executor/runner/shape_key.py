@@ -28,3 +28,4 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    spec_sampling_top_k: int = 0

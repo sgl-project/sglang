@@ -1,12 +1,13 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -29,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.verify_graph import verify_logits_adjustments_are_noop
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -40,6 +42,10 @@ from sglang.srt.speculative.draft_worker_common import (
     build_draft_tp_worker,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
+)
+from sglang.srt.speculative.dspark_components.dspark_commit_graph import (
+    DSparkCompactVerifyEpilogue,
+    DSparkStaticVerifyEpilogue,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
@@ -70,13 +76,13 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
+    GrammarMask,
     GrammarTree,
     build_grammar_vocab_mask,
     draft_pp_context,
@@ -245,7 +251,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
-                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s, draft_window_size=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
@@ -254,6 +260,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
+                get_spec().speculative_draft_window_size,
             )
 
         self._block_pos_offsets = build_block_pos_offsets(
@@ -341,13 +348,41 @@ class DSparkWorkerV2(BaseSpecWorker):
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
         if (
-            (self._verify_planner.is_compact_mode or static_epilogue_supported)
+            (
+                self._verify_planner.is_compact_mode
+                or static_epilogue_supported
+                or (
+                    self._verify_planner.mode_value == "static"
+                    and not self._draft_is_moe
+                )
+            )
             and self._decode_graph_allowed
             and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
-            self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            epilogue_class = DsparkVerifyEpilogue
+            if not self._draft_is_moe:
+                epilogue_class = (
+                    DSparkCompactVerifyEpilogue
+                    if self._verify_planner.is_compact_mode
+                    else DSparkStaticVerifyEpilogue
+                )
+            max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+            self._verify_epilogue = epilogue_class(
+                max_bs=max_bs,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                **(
+                    {"vocab_size": self.model_runner.model_config.vocab_size}
+                    if issubclass(epilogue_class, DSparkStaticVerifyEpilogue)
+                    else {}
+                ),
+                **(
+                    {
+                        "target_worker": self.target_worker,
+                        "commit_mamba": self._commit_target_mamba_states_after_verify,
+                    }
+                    if issubclass(epilogue_class, DSparkStaticVerifyEpilogue)
+                    else {}
+                ),
                 device=self.device,
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
@@ -364,6 +399,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            if isinstance(self._verify_epilogue, DSparkStaticVerifyEpilogue):
+                self.model_runner.spec_verify_epilogue = self._verify_epilogue
+
+        self._host_grammar = None
+        if os.getenv("SGLANG_DSPARK_XGRAMMAR_HOST_CALLBACK") == "1":
+            epilogue = self._verify_epilogue
+            if not isinstance(epilogue, DSparkStaticVerifyEpilogue):
+                raise ValueError(
+                    "DSpark grammar host callbacks require sampling verify graphs"
+                )
+            epilogue.enable_grammar_host_callback(self.model_runner.model)
+            self._host_grammar = epilogue.host_grammar
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         self._simulate_acc_greedy = (
@@ -907,24 +954,73 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        host_grammar = (
+            self._host_grammar
+            if batch.has_grammar
+            and all(
+                req.grammar is None or isinstance(req.grammar, XGrammarGrammar)
+                for req in batch.reqs
+            )
+            else None
+        )
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+            GrammarTree.from_linear_chain(verify_ids_2d)
+            if batch.has_grammar and host_grammar is None
+            else None
         )
 
-        # A live grammar forces the eager path: the folded epilogue accepts inside
-        # the cuda graph off its own buffers, where the mask below never lands.
+        epilogue = self._verify_executor.verify_epilogue
+        sampling_verify = isinstance(epilogue, DSparkStaticVerifyEpilogue)
+        if sampling_verify:
+            epilogue.prepare(verify_window, bs=bs)
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
+            and (
+                run_compact
+                or sampling_verify
+                or self._verify_planner.mode_value == "static"
+            )
+            and (
+                sampling_verify
+                or (
+                    (sampling_info is None or sampling_info.is_all_greedy)
+                    and not batch.has_grammar
+                )
+            )
+            and bs <= epilogue.max_bs
             and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
-            # sampling batches must take the eager accept path even when the
-            # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
-            and verify_logits_adjustments_are_noop(sampling_info)
+            and verify_logits_adjustments_are_noop(
+                sampling_info, allow_grammar=sampling_verify and batch.has_grammar
+            )
             and self._simulate_acc_len <= 0
-            and not batch.has_grammar
         )
+        grammar_mask = None
+        grammar_prepared = host_grammar is not None or (
+            fold_eligible and batch.has_grammar
+        )
+        if grammar_prepared and host_grammar is None:
+            grammar_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=device,
+                barrier=grammar_barrier,
+            )
+            fold_eligible = grammar_mask is None or isinstance(
+                grammar_mask.grammar, XGrammarGrammar
+            )
+        if fold_eligible and sampling_verify:
+            epilogue.stage_sampling(
+                bs=bs,
+                sampling_info=sampling_info,
+                draft_block=draft_block,
+                grammar_mask=grammar_mask,
+                max_top_k=draft_input.max_top_k,
+            )
+        if host_grammar is not None:
+            host_grammar.prepare([req.grammar for req in batch.reqs], grammar_barrier)
+            sampling_info.grammar_mask = None
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -954,7 +1050,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        if batch.has_grammar:
+        folded_accept = fold_eligible and can_run_cuda_graph
+        if host_grammar is not None:
+            host_grammar.finish()
+            grammar_mask = GrammarMask(
+                next(req.grammar for req in batch.reqs if req.grammar is not None),
+                host_grammar.vocab_mask[: bs * self.verify_num_draft_tokens],
+            )
+        if batch.has_grammar and not grammar_prepared:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
             grammar_mask = build_grammar_vocab_mask(
@@ -964,15 +1067,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,
             )
-            if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
-
-        epilogue = self._verify_executor.verify_epilogue
-        folded_accept = (
-            fold_eligible
-            and can_run_cuda_graph
-            and (run_compact or self._verify_planner.mode_value == "static")
-        )
+        if grammar_mask is not None and not folded_accept:
+            grammar_mask.apply(logits_output.next_token_logits)
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -1018,16 +1114,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(accept.new_seq_lens)
 
-        self._commit_target_mamba_states_after_verify(
-            batch=batch,
-            seq_lens_pre_verify=prefix_lens,
-            seq_lens_post_verify=accept.new_seq_lens,
-            commit_lens=accept.commit_lens,
-        )
+        if not (
+            folded_accept
+            and isinstance(epilogue, DSparkStaticVerifyEpilogue)
+            and epilogue.folds_mamba_commit
+        ):
+            self._commit_target_mamba_states_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=prefix_lens,
+                seq_lens_post_verify=accept.new_seq_lens,
+                commit_lens=accept.commit_lens,
+            )
 
-        folded_commit = folded_accept and epilogue.folds_commit
-        # Consume in this step: every decode graph size shares one aux output,
-        # which the next target forward overwrites (resolve_aux_hidden_states_width).
+        folded_commit = (
+            (folded_accept or type(epilogue) is DSparkStaticVerifyEpilogue)
+            and can_run_cuda_graph
+            and epilogue.folds_commit
+        )
+        # Consume shared hidden outputs before the next target forward.
         if not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,

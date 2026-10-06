@@ -4,7 +4,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -58,23 +57,6 @@ _is_npu = is_npu()
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
-
-
-def verify_logits_adjustments_are_noop(sampling_info) -> bool:
-    if sampling_info is None:
-        return True
-    if sampling_info.has_custom_logit_processor:
-        return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    if penalizer is not None and penalizer.is_required:
-        return False
-    if getattr(sampling_info, "grammar_mask", None) is not None:
-        return False
-    if getattr(sampling_info, "logit_bias", None) is not None:
-        return False
-    return True
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -670,13 +652,14 @@ class DsparkVerifyEpilogue:
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        # Result D2H can overlap the next replay's writes to these graph buffers.
         return AcceptOuts(
-            correct_len=self.correct_len_buf[:bs],
-            bonus=self.bonus_buf[:bs],
-            cap_trim_lens=self.cap_trim_lens_buf[:bs],
-            commit_lens=self.commit_lens_buf[:bs],
-            new_seq_lens=self.new_seq_lens_buf[:bs],
-            out_tokens=self.out_tokens_buf[:bs],
+            correct_len=self.correct_len_buf[:bs].clone(),
+            bonus=self.bonus_buf[:bs].clone(),
+            cap_trim_lens=self.cap_trim_lens_buf[:bs].clone(),
+            commit_lens=self.commit_lens_buf[:bs].clone(),
+            new_seq_lens=self.new_seq_lens_buf[:bs].clone(),
+            out_tokens=self.out_tokens_buf[:bs].clone(),
         )
 
     @property

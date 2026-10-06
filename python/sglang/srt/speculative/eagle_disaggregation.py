@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
@@ -97,9 +96,24 @@ def build_eagle_disagg_draft_input(
         spec.speculative_eagle_topk,
     )
 
+    draft_probs = None
+    if spec.speculative_use_rejection_sampling:
+        # PD transfers candidates, not full proposal distributions. Condition on
+        # each transferred candidate as a deterministic proposal for its first verify.
+        draft_probs = torch.zeros(
+            (*topk_index.shape, batch.model_config.vocab_size),
+            dtype=torch.float32,
+            device=batch.device,
+        )
+        draft_probs.scatter_(-1, topk_index.unsqueeze(-1), 1.0)
+        if not spec.enable_multi_layer_eagle:
+            draft_probs = draft_probs.squeeze(1)
+        topk_p = torch.ones_like(topk_p)
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
+        draft_probs=draft_probs,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,

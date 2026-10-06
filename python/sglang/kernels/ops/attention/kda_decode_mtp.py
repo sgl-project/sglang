@@ -269,13 +269,15 @@ def kda_decode_mtp_kernel(
         )
 
     slot = ssm_state_indices[i_n]
+    cute.arch.griddepcontrol_wait()
+    bos = cu_seqlens[i_n]
+    eos = cu_seqlens[i_n + 1]
+    n_tok = eos - bos
     # CUDA-graph padding rows use slot == -1.
-    if slot < 0:
-        cute.arch.griddepcontrol_wait()
-        pad_bos = cu_seqlens[i_n]
+    if slot < 0 or n_tok == 0:
         for i_t in cutlass.range_constexpr(T_LOOP):
-            if tidx < HEAD_DIM:
-                o[0, pad_bos + i_t, i_hv, tidx] = cutlass.BFloat16(0.0)
+            if tidx < HEAD_DIM and i_t < n_tok:
+                o[0, bos + i_t, i_hv, tidx] = cutlass.BFloat16(0.0)
         cute.arch.griddepcontrol_launch_dependents()
         # nvvm.exit, not `return`: the DSL rejects an early return out of a
         # staged if (UNSUP_EARLY_EXIT).
@@ -330,11 +332,6 @@ def kda_decode_mtp_kernel(
             state_g2s_copy, thr_state_copy, gStateTiles, sState, i_v, STATE_STAGES
         )
 
-    cute.arch.griddepcontrol_wait()
-
-    bos = cu_seqlens[i_n]
-    eos = cu_seqlens[i_n + 1]
-    n_tok = eos - bos
     scratch_row = intermediate_state_indices[i_n]
     r_exp_A = cutlass.Float32(0.0)
 
@@ -521,7 +518,7 @@ def kda_decode_mtp_kernel(
             # unread advance stays in bounds at the last request.
             if p1_job == 0:
                 for _a in range(P1_JOB_WARPS - 1):
-                    _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+                    _nx = bos + cutlass.min(i_t + 1 + _a, n_tok - 1)
                     for i in range(VEC_SIZE):
                         _xn = cutlass.Float32(x_q[0, _nx, i_hv, i * 32 + in_warp_tid])
                         r_state[0 * VEC_SIZE + i] = r_state[1 * VEC_SIZE + i]
@@ -529,7 +526,7 @@ def kda_decode_mtp_kernel(
                         r_state[2 * VEC_SIZE + i] = _xn
             elif p1_job == 1:
                 for _a in range(P1_JOB_WARPS - 1):
-                    _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+                    _nx = bos + cutlass.min(i_t + 1 + _a, n_tok - 1)
                     for i in range(VEC_SIZE):
                         _xn = cutlass.Float32(x_k[0, _nx, i_hv, i * 32 + in_warp_tid])
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = (
@@ -973,14 +970,14 @@ def fused_kda_decode_mtp_dspark(
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
+    max_verify_tokens=None,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
     Persistent recurrent/conv states are read-only.  Every post-token state and
     convolution window is written to DSpARK's existing intermediate buffers.
-    The caller is responsible for enforcing the fixed dense token contract:
-    every request contributes exactly 1 + num_spec tokens (num_spec ==
-    --speculative-dspark-block-size), inferred here from T // N - 1.
+    Dense width is inferred from T // N. Packed batches supply max_verify_tokens;
+    cu_seqlens bounds each request, including zero-length graph-padding slots.
 
     ReplaySSM: passing the four replayssm_* rings switches the kernel to
     CACHE_RING mode — per-step raw inputs go to the rings (consumed by the
@@ -1007,12 +1004,14 @@ def fused_kda_decode_mtp_dspark(
     # step. The backend never dispatches here for it (that is the dedicated
     # decode kernel's job), but the layout is legal and benchmarks compare the
     # two at this point, so the wrapper accepts it.
-    if N <= 0 or T % N != 0 or T // N < 1:
+    if N <= 0 or (max_verify_tokens is None and (T % N != 0 or T // N < 1)):
         raise ValueError(
             f"DSpARK KDA MTP requires a fixed 1 + num_spec dense tokens per "
             f"request; got T={T}, N={N}"
         )
-    num_spec = T // N - 1
+    if max_verify_tokens is not None and not 1 <= max_verify_tokens <= 8:
+        raise ValueError("Packed KDA verify requires max_verify_tokens in [1, 8]")
+    num_spec = (T // N if max_verify_tokens is None else max_verify_tokens) - 1
     if recurrent_state.shape[1:] != (H, TILE_K, TILE_K):
         raise ValueError("expected recurrent state layout [pool, H, V=128, K=128]")
     if (
@@ -1079,7 +1078,8 @@ def fused_kda_decode_mtp_dspark(
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
     block_threads = _block_threads(H=H, N=N)
-    out = torch.empty_like(x_v)
+    # Capped packed layouts can leave an uncovered graph-token tail.
+    out = torch.empty_like(x_v) if max_verify_tokens is None else torch.zeros_like(x_v)
     args = (
         recurrent_state,
         x_q,

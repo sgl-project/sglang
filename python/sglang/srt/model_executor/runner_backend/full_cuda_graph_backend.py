@@ -22,13 +22,15 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
-
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    collect_full_cuda_graph_owners,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -89,6 +91,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_owners: Dict[Any, tuple[Any, ...]] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -175,6 +178,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with (
+            collect_full_cuda_graph_owners() as capture_owners,
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
@@ -193,6 +197,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        if capture_inputs is not None:
+            capture_owners.append(capture_inputs)
+        self._capture_owners[shape_key] = tuple(capture_owners)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -217,4 +224,5 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._output_buffer = None
+        self._capture_owners.clear()
         self._pool = None
