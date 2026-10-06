@@ -82,11 +82,11 @@ def page_table_live_mask(
     cols = torch.arange(width, device=seq_lens.device)
     return cols.view(1, -1) < live_pages.view(-1, 1)
 
+
 @unittest.skipIf(
     not (torch.cuda.is_available() or torch.xpu.is_available()),
     "Test requires CUDA or XPU",
 )
-
 class TestNormalDecodeSetMetadata(CustomTestCase):
     """Test fused Triton kernel in normal_decode_set_metadata."""
 
