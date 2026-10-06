@@ -226,6 +226,40 @@ export const AgentX = ({ data }) => {
         ? `node of frontend ${name.split("_")[1]}`
         : "");
 
+  // Shareable links: the selection lives in `ax_*` query parameters (the Deployment panel above owns
+  // the URL hash). Deployments are named by their label, not by SA's search-space index, so links
+  // survive re-syncs; anything that no longer exists falls back to the nearest valid choice.
+  const slugify = (s) => s.toLowerCase()
+    .replace(/\s*\((\d+) nodes?\)/g, "-$1n")
+    .replace(/\s*·\s*prefill\s+/g, "-p-")
+    .replace(/\s*·\s*decode\s+/g, "-d-")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const ckptSlug = (k) => k.split("/").pop().toLowerCase();
+  const cellSlugs = (() => {
+    const out = {};
+    const groups = {};
+    data.cells.forEach((c, i) => { const g = `${c.hw}|${c.ckpt}`; groups[g] = (groups[g] || []).concat([i]); });
+    Object.values(groups).forEach((idx) => {
+      const count = (arr, v) => arr.filter((x) => x === v).length;
+      // Same label: add the spec detail (without the config-key suffix emit adds to tell twins apart),
+      // then the submitted router, then a number.
+      const base = idx.map((i) => slugify(data.cells[i].label));
+      const spec = idx.map((i, j) => (count(base, base[j]) > 1 ? `${base[j]}-${slugify(data.cells[i].detail.replace(` · ${data.cells[i].configKey}`, ""))}` : base[j]));
+      const named = idx.map((i, j) => (count(spec, spec[j]) > 1 ? `${spec[j]}-${data.cells[i].submitted}` : spec[j]));
+      const seen = {};
+      idx.forEach((i, j) => {
+        seen[named[j]] = (seen[named[j]] || 0) + 1;
+        out[i] = count(named, named[j]) > 1 ? `${named[j]}-${seen[named[j]]}` : named[j];
+      });
+    });
+    return out;
+  })();
+  const tabSlug = (t) => (t.id === "exports" ? "env"
+    : t.file ? t.file.name
+    : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
+    : { "dynamo-frontend": "frontend", "sglang-router": "router" }[t.block.kind] || t.block.kind);
+
   // ==== 4. State ====
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -250,14 +284,47 @@ export const AgentX = ({ data }) => {
   const [kvChoice, setKvChoice] = useState(null); // null = the tier the point was measured with
   const [tab, setTab] = useState(null);
   const [copied, setCopied] = useState(null);
+  const [urlRead, setUrlRead] = useState(false);
+  const [linked, setLinked] = useState(false); // write ax_* to the URL only once the reader uses the explorer
 
   const resetCell = (ci) => { setCellIdx(ci); setPointIdx(0); setRouter(data.cells[ci].submitted); setKvChoice(null); };
   const pickHw = (h) => {
     const k = ckptsFor(h)[0];
-    setHw(h); setCkpt(k); resetCell(cellsFor(h, k)[0][1]);
+    setHw(h); setCkpt(k); resetCell(cellsFor(h, k)[0][1]); setLinked(true);
   };
-  const pickCkpt = (k) => { setCkpt(k); resetCell(cellsFor(hw, k)[0][1]); };
-  const pickCell = (ci) => resetCell(ci);
+  const pickCkpt = (k) => { setCkpt(k); resetCell(cellsFor(hw, k)[0][1]); setLinked(true); };
+  const pickCell = (ci) => { resetCell(ci); setLinked(true); };
+  const pick = (set) => (v) => { set(v); setLinked(true); };
+
+  // Open a shared link: restore the selection from ax_* and bring the explorer into view.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    if ([...q.keys()].some((k) => k.startsWith("ax_"))) {
+      const h = hwList.includes(q.get("ax_hw")) ? q.get("ax_hw") : hwList[0];
+      const k = ckptsFor(h).find((x) => ckptSlug(x) === q.get("ax_ckpt")) || ckptsFor(h)[0];
+      const options = cellsFor(h, k);
+      const ci = (options.find(([, i]) => cellSlugs[i] === q.get("ax_cfg")) || options[0])[1];
+      const c = data.cells[ci];
+      const want = q.get("ax_c") || "";
+      let p = c.points.findIndex((x) => x.concs.join("-") === want);
+      if (p < 0) {
+        const n = parseInt(want, 10);
+        const dist = c.points.map((x) => (Number.isNaN(n) ? 0 : Math.min(...x.concs.map((v) => Math.abs(v - n)))));
+        p = dist.indexOf(Math.min(...dist));
+      }
+      setHw(h); setCkpt(k); setCellIdx(ci); setPointIdx(p);
+      setRouter(Object.keys(c.routers).includes(q.get("ax_router")) ? q.get("ax_router") : c.submitted);
+      setKvChoice(c.kv.available.includes(q.get("ax_kv")) ? q.get("ax_kv") : null);
+      setTab(q.get("ax_tab"));
+      setLinked(true);
+      // After the Deployment panel's own hash scroll, if any.
+      setTimeout(() => {
+        const el = document.querySelector(".sg-agentx");
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 700);
+    }
+    setUrlRead(true);
+  }, []);
 
   const cell = data.cells[cellIdx];
   const pi = Math.min(pointIdx, cell.points.length - 1);
@@ -290,8 +357,24 @@ export const AgentX = ({ data }) => {
     ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || ""}`, label: shortTitle(b), block: b, text: blockText[i], files: fileList.filter((f) => blockText[i].includes(f.name)) })),
     ...looseFiles.map((f) => ({ id: `file:${f.name}`, label: f.name, file: f })),
   ];
+  tabs.forEach((t) => { t.slug = tabSlug(t); });
   const single = blocks.length === 1 && !looseFiles.length; // one process: no tab bar
-  const activeTab = tabs.some((t) => t.id === tab) ? tab : tabs[0].id;
+  const active = (!single && tabs.find((t) => t.slug === tab)) || tabs[0];
+  const activeTab = active.id;
+
+  const query = new URLSearchParams([
+    ["ax_hw", hw], ["ax_ckpt", ckptSlug(ckpt)], ["ax_cfg", cellSlugs[cellIdx]], ["ax_c", point.concs.join("-")],
+    ["ax_kv", kv], ["ax_router", router],
+  ].concat(single ? [] : [["ax_tab", active.slug]])).toString();
+  // Keep the address bar in sync (replaceState: no reload, no history entry; the hash is kept).
+  useEffect(() => {
+    if (!urlRead || !linked) return;
+    const others = [...new URLSearchParams(window.location.search)].filter(([k]) => !k.startsWith("ax_"));
+    const search = new URLSearchParams(others.concat([...new URLSearchParams(query)])).toString();
+    if (window.location.search !== `?${search}`) {
+      window.history.replaceState(window.history.state, "", `${window.location.pathname}?${search}${window.location.hash}`);
+    }
+  }, [urlRead, linked, query]);
   const tabText = (t) => (t.block ? t.text : t.file ? t.file.content : exportText);
   const KV_LABEL = { none: "No KV offload", hicache: "HiCache (host DRAM)", mooncake: "Mooncake store (external linker)" };
 
@@ -394,7 +477,7 @@ export const AgentX = ({ data }) => {
         <span style={S.title} className="sg-agentx-row sg-agentx-row-conc">Concurrency</span>
         <div style={S.chips}>
           {cell.points.map((p, i) => (
-            <button key={i} value={p.concs.join(",")} style={S.chip(pointIdx === i)} onClick={() => setPointIdx(i)}>{concLabel(p)}</button>
+            <button key={i} value={p.concs.join(",")} style={S.chip(pointIdx === i)} onClick={() => pick(setPointIdx)(i)}>{concLabel(p)}</button>
           ))}
         </div>
       </div>
@@ -406,7 +489,7 @@ export const AgentX = ({ data }) => {
             return (
               <button key={t} value={t} disabled={!ok} title={ok ? "" : cell.kv.unavailable[t]}
                 style={{ ...S.chip(kv === t), ...(ok ? {} : { opacity: 0.4, cursor: "not-allowed" }) }}
-                onClick={() => ok && setKvChoice(t)}>
+                onClick={() => ok && pick(setKvChoice)(t)}>
                 {KV_LABEL[t]}{t === point.kv ? " ✓" : ""}
                 <span style={S.sub}>{t === point.kv ? "as measured" : ok ? "derived" : "not available for this image"}</span>
               </button>
@@ -418,7 +501,7 @@ export const AgentX = ({ data }) => {
         <span style={S.title} className="sg-agentx-row sg-agentx-row-router">Router</span>
         <div style={S.chips}>
           {Object.keys(cell.routers).sort().map((r) => (
-            <button key={r} value={r} style={S.chip(router === r)} onClick={() => setRouter(r)}>
+            <button key={r} value={r} style={S.chip(router === r)} onClick={() => pick(setRouter)(r)}>
               {routerLabel[r]}{r === cell.submitted ? " ✓" : ""}
               <span style={S.sub}>{r === cell.submitted ? "as submitted to SA" : "derived"}</span>
             </button>
@@ -486,12 +569,16 @@ export const AgentX = ({ data }) => {
           <div style={S.winActions}>
             <button style={S.winButton} onClick={() => copy(single ? blockText[0] : tabText(tabs.find((t) => t.id === activeTab)), "tab")}>{copied === "tab" ? "Copied" : "⧉ Copy"}</button>
             <button style={S.winButton} onClick={() => copy(copyAllText, "all")}>{copied === "all" ? "Copied" : "⧉ Copy all"}</button>
+            <button style={S.winButton} className="sg-agentx-link" title="Copy a link that opens this page with this selection"
+              onClick={() => { setLinked(true); copy(`${window.location.origin}${window.location.pathname}?${query}`, "link"); }}>
+              {copied === "link" ? "Copied" : "🔗 Copy link"}
+            </button>
           </div>
         </div>
         {!single && (
           <div role="tablist" aria-label="Processes" style={S.seg} className="sg-agentx-tabs">
             {tabs.map((t, i) => (
-              <button key={t.id} value={t.id} role="tab" aria-selected={activeTab === t.id} style={S.segTab(activeTab === t.id)} onClick={() => setTab(t.id)}>
+              <button key={t.id} value={t.id} role="tab" aria-selected={activeTab === t.id} style={S.segTab(activeTab === t.id)} onClick={() => pick(setTab)(t.slug)}>
                 <span style={S.segNum}>{i + 1}·</span>{t.label}
               </button>
             ))}
