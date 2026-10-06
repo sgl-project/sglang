@@ -82,7 +82,7 @@ pub(super) fn generate_stream(
                             // Python's incremental stream still reports the
                             // cumulative completion-token count in every frame.
                             delta.completion_tokens = acc.completion_tokens;
-                            yield Ok(frame_item(&delta, &public_ids[i], index(i), None));
+                            yield Ok(frame_item(delta, &public_ids[i], index(i), None));
                         } else {
                             coalesced = true;
                         }
@@ -99,17 +99,21 @@ pub(super) fn generate_stream(
                 yield Ok(error_item(&error, index(i)));
             } else if let Some(mut delta) = terminal {
                 let e2e_latency = Some(options.created_at.elapsed().as_secs_f64());
-                // A unary reply is the cumulative result whatever the stream policy.
+                // A unary reply is the cumulative result whatever the stream
+                // policy. The terminal frame is the accumulated output's last
+                // use, so it moves out instead of cloning.
                 let output = if options.stream && options.incremental {
                     delta.completion_tokens = acc.completion_tokens;
-                    &delta
+                    delta
                 } else {
-                    &*acc
+                    std::mem::take(acc)
                 };
                 yield Ok(frame_item(output, &public_ids[i], index(i), e2e_latency));
             } else {
                 if coalesced {
-                    yield Ok(frame_item(acc, &public_ids[i], index(i), None));
+                    // An intermediate cumulative frame has to clone: the
+                    // accumulated output stays behind for the next one.
+                    yield Ok(frame_item(acc.clone(), &public_ids[i], index(i), None));
                 }
                 pending.push(recv_indexed(i, call));
             }
@@ -122,7 +126,7 @@ pub(super) fn generate_stream(
 }
 
 fn frame_item(
-    output: &CoreOutput,
+    output: CoreOutput,
     public_id: &str,
     index: Option<u32>,
     e2e_latency: Option<f64>,

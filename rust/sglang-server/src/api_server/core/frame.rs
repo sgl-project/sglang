@@ -166,18 +166,24 @@ impl CoreEvent {
 impl CoreOutput {
     /// One `/generate` frame. `index` is the batch position (batch form only);
     /// `e2e_latency` rides the terminal frame only.
+    ///
+    /// Consumes the output so `text` and `output_ids` move onto the wire: a
+    /// delta or terminal frame never copies them. A cumulative intermediate
+    /// frame is the one caller that must clone first, since the accumulated
+    /// output has to stay behind for the next frame.
     pub(crate) fn frame(
-        &self,
+        self,
         id: &str,
         index: Option<u32>,
         e2e_latency: Option<f64>,
     ) -> api::GenerateResponse {
+        let meta_info = Some(self.meta_info(id, e2e_latency));
         api::GenerateResponse {
-            text: self.text.clone(),
-            meta_info: Some(self.meta_info(id, e2e_latency)),
+            text: self.text,
+            meta_info,
             // Omitted while empty (a text-only frame).
-            output_ids: (!self.token_ids.is_empty()).then(|| api::TokenIds {
-                ids: self.token_ids.clone(),
+            output_ids: (!self.token_ids.is_empty()).then_some(api::TokenIds {
+                ids: self.token_ids,
             }),
             index,
         }

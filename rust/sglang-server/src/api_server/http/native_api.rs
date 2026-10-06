@@ -396,7 +396,7 @@ fn generation_event_stream(
                         timings[i].observe_first_output();
                         accumulated[i].append_delta(&out);
                         if incremental {
-                            yield json_string(&stream_frame(out, &accumulated[i], true, &rid_strs[i], idx(i), None));
+                            yield json_string(&delta_frame(out, &accumulated[i], &rid_strs[i], idx(i), None));
                         } else {
                             coalesced = true;
                         }
@@ -420,17 +420,19 @@ fn generation_event_stream(
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
                 let e2e_latency = Some(e2e_latency(&timings[i]));
-                yield json_string(&stream_frame(
-                    out,
-                    &accumulated[i],
-                    incremental,
-                    &rid_strs[i],
-                    idx(i),
-                    e2e_latency,
-                ));
+                // The terminal frame is the accumulated output's last use, so
+                // the cumulative form moves it out instead of cloning.
+                let frame = if incremental {
+                    delta_frame(out, &accumulated[i], &rid_strs[i], idx(i), e2e_latency)
+                } else {
+                    std::mem::take(&mut accumulated[i]).frame(&rid_strs[i], idx(i), e2e_latency)
+                };
+                yield json_string(&frame);
             } else {
                 if coalesced {
-                    yield json_string(&accumulated[i].frame(&rid_strs[i], idx(i), None));
+                    // An intermediate cumulative frame has to clone: the accumulated
+                    // output stays behind for the next one.
+                    yield json_string(&accumulated[i].clone().frame(&rid_strs[i], idx(i), None));
                 }
                 futs.push(recv_indexed(i, call)); // keep this item flowing
             }
@@ -451,24 +453,18 @@ fn e2e_latency(timing: &RequestTiming) -> f64 {
     e2e_latency.as_secs_f64()
 }
 
-/// One streaming frame: the cumulative view (default), or this step's delta
-/// with the cumulative token count in `meta_info` (matching Python). Only the
-/// terminal frame carries `e2e_latency`.
-fn stream_frame(
-    delta: CoreOutput,
+/// One incremental streaming frame: this step's delta with the cumulative
+/// token count in `meta_info` (matching Python). Only the terminal frame
+/// carries `e2e_latency`.
+fn delta_frame(
+    mut delta: CoreOutput,
     accumulated: &CoreOutput,
-    incremental: bool,
     rid_str: &str,
     index: Option<u32>,
     e2e_latency: Option<f64>,
 ) -> api::GenerateResponse {
-    if incremental {
-        let mut d = delta;
-        d.completion_tokens = accumulated.completion_tokens;
-        d.frame(rid_str, index, e2e_latency)
-    } else {
-        accumulated.frame(rid_str, index, e2e_latency)
-    }
+    delta.completion_tokens = accumulated.completion_tokens;
+    delta.frame(rid_str, index, e2e_latency)
 }
 
 /// The SSE `data` text of one `api.v1` item (a frame or an error).
