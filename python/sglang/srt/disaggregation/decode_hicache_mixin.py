@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -63,7 +64,7 @@ class DecodeHiCachePreallocMixin:
     def _build_decode_prefix_match(
         self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
     ) -> DecodePrefixMatch:
-        """Convert a ``Req.match_prefix`` result into ``DecodePrefixMatch``.
+        """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
         HiCache is enabled and the last host node is backed up.
@@ -211,7 +212,8 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
-        rematch = dr.req.match_prefix(
+        rematch = match_kv_cache(
+            dr.req,
             self.tree_cache,
             dr.req.origin_input_ids,
             cow_mamba=False,

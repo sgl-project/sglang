@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
+    match_kv_cache,
     page_align_floor,
     release_kv_cache,
     restore_kv_cache,
@@ -791,7 +792,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
-        result = req.match_prefix(
+        result = match_kv_cache(
+            req,
             self.tree_cache,
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),

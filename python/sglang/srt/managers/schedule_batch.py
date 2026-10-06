@@ -107,19 +107,16 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
-    MatchPrefixParams,
-    MatchResult,
     TreeLock,
-    zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     backup_kv_cache,
     evict_from_tree_cache,
+    match_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1591,72 +1588,6 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-    def match_prefix(
-        self,
-        tree_cache: BasePrefixCache,
-        token_ids: Optional[array] = None,
-        *,
-        cow_mamba: bool = False,
-        max_prefix_len: Optional[int] = None,
-    ) -> MatchResult:
-        """Match token_ids against tree_cache and adopt the hit as this request's prefix."""
-        if token_ids is None:
-            token_ids = self.origin_input_ids + self.output_ids
-
-        # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-        # prefix carries stale SWA; cap the match so the window is re-prefilled.
-        reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-        key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-        if max_prefix_len is not None:
-            key_limit = (
-                max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
-            )
-
-        match_result = tree_cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(
-                    token_ids=token_ids,
-                    extra_key=self.extra_key,
-                    limit=key_limit,
-                    cache_salt=self.cache_salt,
-                ),
-                cow_mamba=cow_mamba,
-                req=self,
-            )
-        )
-        if envs.SGLANG_RADIX_FORCE_MISS.get():
-            match_result = zero_match_result(
-                tree_cache, match_result, extra_key=self.extra_key
-            )
-        (
-            self.prefix_indices,
-            self.last_node,
-            self.last_host_node,
-            self.best_match_node,
-            self.host_hit_length,
-            self.swa_host_hit_length,
-            self.mamba_host_hit_length,
-        ) = (
-            match_result.device_indices,
-            match_result.last_device_node,
-            match_result.last_host_node,
-            match_result.best_match_node,
-            match_result.host_hit_length,
-            match_result.swa_host_hit_length,
-            match_result.mamba_host_hit_length,
-        )
-        max_len = self._compute_max_prefix_len(len(token_ids))
-        self.num_matched_prefix_tokens = min(
-            len(self.prefix_indices) + self.host_hit_length, max_len
-        )
-        self.swa_branching_seqlen = match_result.swa_branching_seqlen
-        # A probe match keeps what it did not report; a new round resets both.
-        if match_result.mamba_branching_seqlen is not None:
-            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
-        if match_result.cache_protected_len is not None:
-            self.kv.cache_protected_len = match_result.cache_protected_len
-        return match_result
-
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1700,7 +1631,8 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            match_result = self.match_prefix(
+            match_result = match_kv_cache(
+                self,
                 tree_cache,
                 token_ids_to_match,
                 cow_mamba=cow_mamba,

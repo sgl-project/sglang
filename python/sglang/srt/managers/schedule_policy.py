@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -216,7 +217,7 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                r.match_prefix(self.tree_cache)
+                match_kv_cache(r, self.tree_cache)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -325,7 +326,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = r.match_prefix(self.tree_cache, prefix_ids)
+            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from

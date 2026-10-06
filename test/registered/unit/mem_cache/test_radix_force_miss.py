@@ -1,7 +1,7 @@
 """Unit tests for SGLANG_RADIX_FORCE_MISS.
 
 The flag is gated at the scheduler boundary, so we test the helper directly
-plus an end-to-end check of `Req.match_prefix` driving a populated
+plus an end-to-end check of `match_kv_cache` driving a populated
 RadixCache.
 """
 
@@ -17,13 +17,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 
@@ -41,8 +41,6 @@ class _StubReq:
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
         self.kv = SimpleNamespace(cache_protected_len=None)
-
-    match_prefix = Req.match_prefix
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -81,7 +79,7 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertIs(zero_match_result(_StubChunkCache(), original), original)
 
 
-class TestReqMatchPrefixForceMiss(unittest.TestCase):
+class TestMatchKvCacheForceMiss(unittest.TestCase):
     def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
         class _StubTreeCache:
             def swa_reprefill_tail_tokens(self):
@@ -100,7 +98,7 @@ class TestReqMatchPrefixForceMiss(unittest.TestCase):
         req = _StubReq([1, 2, 3, 4])
         req.swa_branching_seqlen = 8
 
-        req.match_prefix(_StubTreeCache())
+        match_kv_cache(req, _StubTreeCache())
 
         self.assertIsNone(req.swa_branching_seqlen)
 
@@ -115,14 +113,14 @@ class TestReqMatchPrefixForceMiss(unittest.TestCase):
         # Sanity: without the flag, the same lookup hits.
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
-            baseline_req.match_prefix(tree)
+            match_kv_cache(baseline_req, tree)
         self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
         self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
-            forced_req.match_prefix(tree)
+            match_kv_cache(forced_req, tree)
         self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
