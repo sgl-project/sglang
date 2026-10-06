@@ -29,9 +29,9 @@ from transformers import ApertusConfig
 from sglang.srt.layers.activation import XIELU
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -265,14 +265,12 @@ class ApertusDecoderLayer(nn.Module):
         self.feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.attention_layernorm),
             (
                 declare_ffn(sparse=False, next_layer_sparse=False),
                 self.feedforward_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(

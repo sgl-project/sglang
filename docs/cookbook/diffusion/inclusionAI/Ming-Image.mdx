@@ -91,9 +91,19 @@ or parallel topologies.
 Full-checkpoint validation covers generation, editing, and layer decomposition
 on H200, including repeated HTTP requests before and after warmup. Tested
 resolutions include 2048-square generation and four-layer 1024-square
-decomposition. See the [compatibility notes](/docs/sglang-diffusion/compatibility_matrix#ming-image-integration-status)
-for the tested feature scope. Other GPU families and quantized checkpoints
-have not been validated for this model.
+decomposition, plus repeated 512-square HTTP generation and editing with one or
+two sequential generations per request.
+
+The validated runtime scope is:
+
+- One H200: DiT and encoder layerwise offload, opt-in VAE tiling, Cache-DiT,
+  SageAttention, breakable CUDA graph replay, and dynamic LoRA loading/removal
+  with a synthetic adapter.
+- Two H200s: DiT TP2, Ulysses2, Ring2 with FlashAttention, CFG parallelism for
+  Design-Layer, encoder folding, and spatial VAE decoding.
+
+These are functional checks, not quality-equivalence claims for lossy
+optimizations. Other GPU families and quantized checkpoints remain unverified.
 
 See [performance optimization](/docs/sglang-diffusion/performance-optimization)
 for shared runtime controls and the
