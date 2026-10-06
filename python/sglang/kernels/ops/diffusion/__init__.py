@@ -498,6 +498,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Indexed adaLN modulation + MXFP8 quant for the online mxfp8 qkv/fc1 inputs.",
     ),
     (
+        "diffusion.swiglu_oai_mxfp8",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:swiglu_oai_mxfp8",
+        _CUDA,
+        "Clamped SwiGLU-OAI + MXFP8 quant, byte-exact vs the unfused chain.",
+    ),
+    (
         "diffusion.group_limited_topk",
         KernelBackend.TRITON,
         "routing.group_limited_topk_triton:group_limited_topk",
@@ -740,6 +747,7 @@ _EXPORTS: dict[str, str] = {
     "indexed_scale_shift_mxfp8_": "quantization.mxfp8_swizzled_triton",
     "mxfp8_quantize_swizzled": "quantization.mxfp8_swizzled_triton",
     "silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
+    "swiglu_oai_mxfp8": "quantization.mxfp8_swizzled_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",

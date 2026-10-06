@@ -14,6 +14,10 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_mxfp8_,
     mxfp8_quantize_swizzled,
     silu_mul_mxfp8,
+    swiglu_oai_mxfp8,
+)
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    swiglu_no_interleaved_with_alpha_and_limit,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -48,6 +52,39 @@ def test_silu_mul_mxfp8_is_byte_exact() -> None:
     assert can_use_silu_mul_mxfp8(x)
     ref = torch.nn.functional.silu(x[:, :HIDDEN]) * x[:, HIDDEN:]
     _assert_matches_flashinfer(silu_mul_mxfp8(x), ref)
+
+
+def _dirty_allocator() -> None:
+    torch.full((1 << 19,), 0xFF, dtype=torch.uint8, device="cuda")
+
+
+@pytest.mark.parametrize("rows", [1, 7, 128, 333])
+@pytest.mark.parametrize("n", [768, 1056])
+@pytest.mark.parametrize("scale", [1e-3, 1.0, 30.0])
+def test_swiglu_oai_mxfp8_matches_eager_chain(rows: int, n: int, scale: float) -> None:
+    g = torch.Generator(device="cuda").manual_seed(rows * 31 + n)
+    x = (torch.randn((rows, 2 * n + 64), device="cuda", generator=g) * scale).to(
+        torch.bfloat16
+    )[:, : 2 * n]
+    ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
+    _dirty_allocator()
+    _assert_matches_flashinfer(swiglu_oai_mxfp8(x, 1.702, 7.0), ref)
+
+
+def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
+    rows, n = 40, 768
+    x = torch.randn((rows, 2 * n), device="cuda").to(torch.bfloat16)
+    swiglu_oai_mxfp8(x, 1.702, 7.0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = swiglu_oai_mxfp8(x, 1.702, 7.0)
+    for scale in [0.0, 1e-4, 1.0, 100.0]:
+        x.copy_(torch.randn_like(x, dtype=torch.float32) * scale)
+        snapshot = x.clone()
+        graph.replay()
+        assert torch.equal(x, snapshot)
+        ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
+        _assert_matches_flashinfer(got, ref)
 
 
 @pytest.mark.parametrize("keep_bf16", [True, False])

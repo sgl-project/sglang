@@ -96,6 +96,8 @@ def _silu_mul_mxfp8_kernel(
     n_groups,
     n_col_blocks,
     stride_row,
+    ALPHA: tl.constexpr,
+    LIMIT: tl.constexpr,
     BLOCK_R: tl.constexpr,
     G: tl.constexpr,
 ):
@@ -109,8 +111,16 @@ def _silu_mul_mxfp8_kernel(
     base = x_ptr + r[:, None].to(tl.int64) * stride_row
     gate = tl.load(base + c[None, :], mask=mask, other=0.0).to(tl.float32)
     up = tl.load(base + hidden + c[None, :], mask=mask, other=0.0).to(tl.float32)
-    act = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
-    prod = (act * up).to(tl.bfloat16).to(tl.float32)
+    if ALPHA is None:
+        act = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+        prod = (act * up).to(tl.bfloat16).to(tl.float32)
+    else:
+        # the op order Inductor emits for swiglu_no_interleaved_with_alpha_and_limit
+        gate = tl.minimum(gate, LIMIT, propagate_nan=tl.PropagateNan.ALL)
+        up = tl.maximum(up, -LIMIT, propagate_nan=tl.PropagateNan.ALL)
+        up = tl.minimum(up, LIMIT, propagate_nan=tl.PropagateNan.ALL)
+        prod = gate * tl.sigmoid(gate * ALPHA) * (up + 1.0)
+        prod = prod.to(tl.bfloat16).to(tl.float32)
     p3 = tl.reshape(prod, [BLOCK_R, G, 32])
     amax = tl.max(tl.abs(p3), axis=2)
     sbyte, inv = _mx_e8m0_from_amax(amax)
@@ -120,10 +130,11 @@ def _silu_mul_mxfp8_kernel(
         q.to(tl.float8e4nv),
         mask=mask,
     )
-    smask = rmask[:, None] & (g < n_groups)[None, :]
+    valid = rmask[:, None] & (g < n_groups)[None, :]
+    smask = (r < tl.cdiv(rows, 128) * 128)[:, None] & (g < n_col_blocks * 4)[None, :]
     tl.store(
         s_ptr + _mx_scale_offsets(r[:, None], g[None, :], n_col_blocks),
-        sbyte.to(tl.uint8),
+        tl.where(valid, sbyte, 0).to(tl.uint8),
         mask=smask,
     )
 
@@ -194,10 +205,11 @@ def can_use_mxfp8_swizzled(x: torch.Tensor) -> bool:
 
 
 def _alloc(
-    rows: int, k: int, device: torch.device
+    rows: int, k: int, device: torch.device, zero_scales: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = torch.empty(rows, k, dtype=_E4M3, device=device)
-    s = torch.zeros(_scale_numel(rows, k), dtype=torch.uint8, device=device)
+    alloc = torch.zeros if zero_scales else torch.empty
+    s = alloc(_scale_numel(rows, k), dtype=torch.uint8, device=device)
     return q, s
 
 
@@ -234,21 +246,22 @@ def can_use_silu_mul_mxfp8(hidden: torch.Tensor) -> bool:
     return can_use_mxfp8_swizzled(hidden) and (hidden.shape[-1] // 2) % 32 == 0
 
 
-def silu_mul_mxfp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized ``silu(gate) * up``."""
+def _swiglu_mxfp8(
+    hidden: torch.Tensor, alpha: float | None, limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
     if not can_use_silu_mul_mxfp8(hidden):
         raise ValueError(
             "expected a row-major bf16 CUDA [rows, 2 * n] tensor, n % 32 == 0"
         )
     rows, twice = hidden.shape
     n = twice // 2
-    q, s = _alloc(rows, n, hidden.device)
+    q, s = _alloc(rows, n, hidden.device, zero_scales=False)
     if rows == 0:
         return q, s
     n_groups = n // 32
     n_col_blocks = -(-n_groups // 4)
-    block_r, g = 16, 8
-    grid = (triton.cdiv(rows, block_r), triton.cdiv(n_groups, g))
+    block_r, g = (4 if rows <= 1024 else 16), 8
+    grid = (triton.cdiv(-(-rows // 128) * 128, block_r), triton.cdiv(n_groups, g))
     with torch.get_device_module().device(hidden.device):
         _silu_mul_mxfp8_kernel[grid](
             hidden,
@@ -259,11 +272,26 @@ def silu_mul_mxfp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             n_groups,
             n_col_blocks,
             hidden.stride(0),
+            ALPHA=alpha,
+            LIMIT=limit,
             BLOCK_R=block_r,
             G=g,
             num_warps=4,
         )
     return q, s
+
+
+def silu_mul_mxfp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized ``silu(gate) * up``."""
+    return _swiglu_mxfp8(hidden, None, None)
+
+
+def swiglu_oai_mxfp8(
+    hidden: torch.Tensor, alpha: float, limit: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized SwiGLU-OAI,
+    ``clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``."""
+    return _swiglu_mxfp8(hidden, alpha, limit)
 
 
 def indexed_scale_shift_mxfp8_(
@@ -315,4 +343,5 @@ __all__ = [
     "indexed_scale_shift_mxfp8_",
     "mxfp8_quantize_swizzled",
     "silu_mul_mxfp8",
+    "swiglu_oai_mxfp8",
 ]
