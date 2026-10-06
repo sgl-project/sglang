@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
+    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
@@ -1135,6 +1136,91 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class TestUnifiedPageEnvelopeSelection(CustomTestCase):
+    """Only no backend and Mori store the complete shared page, so only they
+    keep the page-envelope host arena. The host memory mode plays no part."""
+
+    def _publish(self, backend, mode):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                enable_unified_memory=True,
+                hicache_storage_backend=backend,
+                hicache_host_memory_mode=mode,
+                hicache_mem_layout="layer_first",
+            ),
+            role="tokenizer",
+        )
+
+    def test_only_no_backend_and_mori_select_the_envelope(self):
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        for mode in ("cache", "buffer_only"):
+            for backend in (None, "mori", "file", "sim", "shm", "mooncake", "nixl"):
+                with self.subTest(mode=mode, backend=backend):
+                    self._publish(backend, mode)
+                    self.assertEqual(
+                        _uses_unified_page_envelope_host(
+                            pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+                        ),
+                        backend in (None, "mori"),
+                    )
+
+    def test_built_host_pools_follow_the_selection(self):
+        from sglang.srt.mem_cache.pool_host import common as host_memory
+
+        for backend in (None, "file"):
+            with self.subTest(backend=backend):
+                self._publish(backend, "cache")
+                bundle = _build_unified_swa_pool()
+                pool = bundle.token_to_kv_pool
+                swa_allocator = bundle.token_to_kv_pool_allocator.swa_attn_allocator
+                # CPU host tensors need no page-locking.
+                with patch.object(host_memory, "_cuda_host_register"):
+                    group = build_hybrid_swa_group(
+                        page_size=pool.page_size,
+                        full_kv_pool=pool.full_kv_pool,
+                        swa_kv_pool=pool.swa_kv_pool,
+                        full_layer_mapping={0: 0, 1: 1, 2: 2},
+                        swa_layer_mapping={3: 0},
+                        use_mla=False,
+                        swa_attn_allocator=swa_allocator,
+                    )
+                self.addCleanup(group.destroy)
+                kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
+                for entry in (kv, swa):
+                    self.assertEqual(
+                        isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool),
+                        backend is None,
+                    )
+                # Either way SWA loads into physical reservations.
+                self.assertEqual(swa.device_alloc_fn, swa_allocator.alloc_physical)
+                self.assertEqual(
+                    swa.device_free_fn, swa_allocator.cancel_physical_reservation
+                )
+
+    def test_mla_and_mtp_draft_pools_use_separate_pools(self):
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        self._publish(None, "cache")
+        self.assertFalse(
+            _uses_unified_page_envelope_host(
+                pool.full_kv_pool, pool.swa_kv_pool, use_mla=True
+            )
+        )
+        self.assertFalse(
+            _uses_unified_page_envelope_host(
+                pool.full_kv_pool,
+                pool.swa_kv_pool,
+                use_mla=False,
+                mtp_swa_device_pools=(pool.swa_kv_pool,),
+            )
+        )
 
 
 if __name__ == "__main__":
