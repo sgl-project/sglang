@@ -203,6 +203,16 @@ class KVLocPlan:
             )
         return table
 
+    def is_read_by(self, reader: KVIndexTranslator) -> bool:
+        """Whether `reader` reads this plan's table: it indexes the plan's
+        physical ids and gathers the same `req_to_token` rows. A reader with a
+        table of its own (a draft's compact `req_to_token`) plans its own
+        reads."""
+        return (
+            self.is_translated_for(reader)
+            and reader.req_to_token is self._source.req_to_token
+        )
+
     def is_translated_for(self, reader: KVIndexTranslator) -> bool:
         """Whether `reader`'s pool indexes this plan's physical ids: the
         target's, and a fused draft's, which translates through the target's

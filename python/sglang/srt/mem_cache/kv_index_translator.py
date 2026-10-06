@@ -368,14 +368,32 @@ class KVIndexTranslator:
         req_pool_indices: torch.Tensor,
         bs: int,
     ) -> KVIndexTable:
-        """Where lane ``b``'s ids are gathered from: the plan's table on the
-        unified pool (lane ``b`` is the plan's row ``b``, padded lanes reading
-        the sink), ``req_to_token`` at the caller's ``req_pool_indices``
-        otherwise. For a gather kernel that takes a table, its rows and its
-        entry granularity."""
-        table = plan.read_table(rows=bs)
-        if table.is_translated:
-            return table
+        """Where lane ``b``'s ids are gathered from: the plan's table when this
+        runner reads translated ids (lane ``b`` is the plan's row ``b``, padded
+        lanes reading the sink), ``req_to_token`` at the caller's
+        ``req_pool_indices`` otherwise. For a gather kernel that takes a
+        table, its rows and its entry granularity."""
+        if self.reads_are_translated:
+            return self._plan_table(plan, rows=bs)
+        return self._passthrough_table(req_pool_indices)
+
+    def read_table(self, plan: KVLocPlan) -> KVIndexTable:
+        """The page table this runner reads this iteration: the plan's when it
+        reads translated ids, the ``req_to_token`` passthrough otherwise (a
+        static or private pool, or DCP, where the producing kernel selects
+        this rank's share)."""
+        if self.reads_are_translated:
+            return self._plan_table(plan)
+        return self._passthrough_table(plan.req_pool_indices)
+
+    def _plan_table(self, plan: KVLocPlan, *, rows: Optional[int] = None):
+        assert plan.is_read_by(self), (
+            "a translating reader must read through the plan of its own "
+            "req_to_token rows"
+        )
+        return plan.read_table(rows=rows)
+
+    def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
         return KVIndexTable(
             ids=self.req_to_token,
             row_ids=req_pool_indices,
@@ -436,7 +454,7 @@ class KVIndexTranslator:
             "copy_page_table: reads stay virtual here (a non-unified pool, or "
             "DCP, where the caller selects this rank's share itself)"
         )
-        table = plan.read_table(rows=out.shape[0])
+        table = self._plan_table(plan, rows=out.shape[0])
         width = min(out.shape[1], table.ids.shape[1])
         out[:, :width].copy_(table.ids[: out.shape[0], :width])
         if sliding_window_out is not None:

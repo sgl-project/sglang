@@ -25,6 +25,9 @@
 - the read table covers `seq_lens + read_extent`, is built once, and grows
   for a captured graph's padded lanes by copying (sink rows), never by
   building again;
+- only a reader of the plan's own rows reads its table (the target, a fused
+  draft); a pass-through reader gathers `req_to_token`, and a draft with a
+  `req_to_token` of its own plans its own reads;
 - `bind` gives a batch its ids, with the virtual mirror only when they were
   translated;
 - a runner's own write buffer (graph capture, warmup) is used as it is, its
@@ -141,6 +144,7 @@ class TestKVLocPlan(unittest.TestCase):
         )
         # Every runner of one server shares the target's req_to_token.
         self.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
+        self.draft_pool = draft_pool
         self.target = self._translator(kvcache)
         self.fused_draft = self._translator(draft_pool)
         self.private_draft = self._translator(_FakeKVCache(64))
@@ -274,6 +278,29 @@ class TestKVLocPlan(unittest.TestCase):
             max_pages=table.ids.shape[1],
         )
         self.assertTrue(torch.equal(table.ids, reference.ids))
+
+    def test_only_readers_of_its_rows_read_its_table(self):
+        plan = self._plan()
+        self.assertTrue(plan.is_read_by(self.target))
+        self.assertTrue(plan.is_read_by(self.fused_draft))
+        self.assertFalse(plan.is_read_by(self.private_draft))
+        compact = KVIndexTranslator(
+            req_to_token=self.req_to_token.clone(),
+            token_to_kv_pool_allocator=self.allocator,
+            token_to_kv_pool=self.draft_pool,
+            page_size=_PS,
+            device=_DEV,
+        )
+        self.assertFalse(plan.is_read_by(compact))
+        self.assertIs(
+            self.fused_draft.read_source(plan, req_pool_indices=self.rpi, bs=2),
+            plan.read_table(rows=2),
+        )
+        passthrough = self.private_draft.read_source(
+            plan, req_pool_indices=self.rpi, bs=2
+        )
+        self.assertFalse(passthrough.is_translated)
+        self.assertIs(passthrough.ids, self.req_to_token)
 
     def test_a_pass_through_plan_does_no_work(self):
         plan = self._plan(source=self.private_draft)

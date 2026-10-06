@@ -35,6 +35,9 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The iteration's plan when the draft planned the verify window
+    # (`prepared_out_cache_loc`); verify and draft extend take it.
+    kv_loc_plan: Optional[KVLocPlan] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.

@@ -1266,7 +1266,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        kv_view = forward_batch.kv_loc_plan.read_table()
+        kv_view = self.kv_index_translator.read_table(forward_batch.kv_loc_plan)
         if kv_view.is_translated:
             # No fill kernel: the kernels take the tensor's own width/stride
             # and bound their reads by cache_seqlens.
