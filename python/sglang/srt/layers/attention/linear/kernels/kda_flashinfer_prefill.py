@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-from collections.abc import Iterable
 from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
@@ -17,7 +15,6 @@ if TYPE_CHECKING:
     from flashinfer.kda import RecurrentKDAPrefillWrapper
 
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -29,20 +26,10 @@ def build_flashinfer_kda_checkpoint_plan(
 ) -> bool:
     """Plan tracked boundaries; False selects Triton for this batch.
 
-    Setup validates chunk_size. The host track metadata comes from the same
-    producer as build_prefill_track_plan, including its unaligned-row ordering.
+    Host track metadata follows build_prefill_track_plan's unaligned-row order.
     """
-    if any(
-        values is None
-        for values in (
-            forward_batch.extend_seq_lens_cpu,
-            forward_batch.mamba_track_seqlens_cpu,
-            forward_batch.extend_prefix_lens_cpu,
-            forward_batch.mamba_prefill_track_mask_cpu,
-        )
-    ):
+    if chunk_size <= 0 or chunk_size % 32:
         return False
-
     extend_lens = forward_batch.extend_seq_lens_cpu
     track_lens = forward_batch.mamba_track_seqlens_cpu
     prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -80,14 +67,7 @@ def build_flashinfer_kda_checkpoint_plan(
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
-    """Execute planned, packed BF16 safe-gate KDA prefill on SM100/SM103.
-
-    KDAAttnBackend validates model dimensions, dtypes and the safe gate at
-    setup, then plans each supported batch before any layer runs. Q/K/V and
-    raw gate/beta projections share the model's activation dtype; state pools
-    supply compact 128x128 head matrices, including envelope-strided slots.
-    Unsupported batch modes are dispatched to Triton by KDAKernelDispatcher.
-    """
+    """Execute planned KDA prefill; FlashInfer validates the tensor contract."""
 
     uses_state_checkpoints = True
     supports_track_state_snapshot = True
@@ -100,44 +80,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         from flashinfer.kda import RecurrentKDAPrefillWrapper
 
         self._wrapper_cls = RecurrentKDAPrefillWrapper
-
-    def validate_model(
-        self,
-        *,
-        dtype: torch.dtype,
-        state_dtype: torch.dtype,
-        layers: Iterable[RadixLinearAttention],
-        chunk_size: Optional[int] = None,
-    ) -> None:
-        """Establish the fixed contract once, before warmup or graph capture."""
-        if dtype != torch.bfloat16:
-            raise ValueError("FlashInfer KDA prefill requires BF16 activations")
-        if state_dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("FlashInfer KDA prefill requires BF16 or FP32 SSM state")
-        if chunk_size is not None and (chunk_size <= 0 or chunk_size % 32):
-            raise ValueError(
-                "FlashInfer KDA prefill requires a positive checkpoint interval "
-                "divisible by 32"
-            )
-        for layer in layers:
-            if (layer.head_q_dim, layer.head_k_dim, layer.head_v_dim) != (
-                128,
-                128,
-                128,
-            ) or not layer.num_q_heads == layer.num_k_heads == layer.num_v_heads:
-                raise ValueError(
-                    f"FlashInfer KDA prefill requires equal Q/K/V head counts and "
-                    f"128-D heads (layer {layer.layer_id}); use Triton prefill"
-                )
-            if (
-                layer.lower_bound is None
-                or not math.isfinite(float(layer.lower_bound))
-                or float(layer.lower_bound) >= 0
-            ):
-                raise ValueError(
-                    f"FlashInfer KDA prefill requires a finite negative safe-gate "
-                    f"lower bound (layer {layer.layer_id}); use Triton prefill"
-                )
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")

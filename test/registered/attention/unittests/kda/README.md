@@ -33,12 +33,12 @@ Columns are runner modes; rows are the linear-attention kernel backend. Cells us
 
 ## FlashInfer Prefill Contract
 
-Selecting `--linear-attn-prefill-backend flashinfer` requires SM100/SM103,
+FlashInfer prefill execution requires SM100/SM103,
 BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
-128-D heads, and a finite negative safe-gate lower bound on every KDA layer.
-Radix-cache checkpoints additionally require a positive mamba chunk size
-divisible by 32. Unsupported fixed configurations fail during backend setup;
-use Triton prefill for other configurations.
+128-D heads, and a finite negative safe-gate lower bound.
+FlashInfer validates this tensor contract when the wrapper runs, including
+during server warmup. Radix-cache checkpoints require a positive mamba chunk
+size divisible by 32; other checkpoint intervals use Triton.
 
 The backend plans sequence order and radix-cache checkpoints once per batch,
 before layer execution. The adapter consumes raw gate/beta projections and
@@ -46,8 +46,10 @@ normalizes projection strides before calling FlashInfer. Packed batches may
 include single-token sequences and zero-length padding rows; only the total
 packed token count must exceed one.
 
-Capture, speculative extend, TBO, and track points without a supported
-checkpoint plan use Triton. Untracked prefill needs no host sequence lengths.
+Unbounded-gate models (including original Kimi Linear), capture, speculative
+extend, TBO, and track points without a supported checkpoint plan use Triton.
+Both paths receive raw beta logits and apply sigmoid in their kernels.
+Untracked prefill needs no host sequence lengths.
 
 ## Production-Unsupported
 

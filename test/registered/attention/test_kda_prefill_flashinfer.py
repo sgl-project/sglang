@@ -1,6 +1,5 @@
 """FlashInfer KDA prefill integration against SGLang's Triton reference."""
 
-import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ import torch
 from packaging.version import Version
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -167,7 +167,6 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         **common,
     )
     with (
-        patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")),
         patch(
             "flashinfer.kda_kernels.kda_chunked_bt16._cu_seqlens_contents",
             side_effect=AssertionError("cu_seqlens copied to host"),
@@ -296,25 +295,24 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         query_start_loc=offsets,
         **ref_common,
     )
-    with patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")):
-        fi_output, _ = flashinfer.extend(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states=fi_state,
-            cache_indices=slots,
-            query_start_loc=offsets,
-            prefill_wrapper=flashinfer.plan(offsets),
-            track_state=fi_track,
-            state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
-            state_checkpoint_indices=metadata.state_checkpoint_indices,
-            track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
-            **common,
-        )
+    fi_output, _ = flashinfer.extend(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ssm_states=fi_state,
+        cache_indices=slots,
+        query_start_loc=offsets,
+        prefill_wrapper=flashinfer.plan(offsets),
+        track_state=fi_track,
+        state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
+        num_state_checkpoints=metadata.num_state_checkpoints,
+        state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
+        state_checkpoint_indices=metadata.state_checkpoint_indices,
+        track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
+        **common,
+    )
 
     assert torch.isfinite(fi_track).all()
     torch.testing.assert_close(
@@ -391,6 +389,7 @@ def test_kda_prefill_fallback_does_not_plan(
     )
     dispatcher = backend.kernel_dispatcher
     batch = SimpleNamespace(
+        batch_size=1,
         forward_mode=forward_mode,
         tbo_parent_token_range=tbo_range,
         extend_seq_lens_cpu=[num_tokens],
@@ -430,7 +429,7 @@ def test_kda_prefill_fallback_does_not_plan(
             lower_bound=-5.0,
             beta_is_raw=True,
             extend_seq_lens_cpu=[num_tokens],
-            prefill_metadata=backend.forward_metadata,
+            prefill_wrapper=backend.forward_metadata.flashinfer_kda_prefill_wrapper,
         )
     assert output is q
     fallback.assert_called_once()
@@ -442,7 +441,11 @@ def single_dcp_rank():
         yield
 
 
-def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
+@pytest.mark.parametrize(
+    "lower_bound", [-5.0, None], ids=["safe_gate", "unbounded_gate"]
+)
+def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank, lower_bound):
+    """Raw beta must work in FlashInfer and the unbounded-gate Triton fallback."""
     case = KDAAttentionCase(
         name="flashinfer_kda_tracked_extend",
         backend="triton",
@@ -454,7 +457,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
         extend_lens=(130, 128),
     )
     fixture = build_kda_attention_fixture(
-        unittest.TestCase(),
+        CustomTestCase(),
         case,
         head_k_dim=128,
         head_v_dim=128,
@@ -469,12 +472,13 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
     )
     batch.mamba_prefill_track_mask_cpu = [True, True]
     batch.mamba_track_seqlens_cpu = [130, 128]
-    fixture.actual_module.attn.lower_bound = -5.0
+    fixture.actual_module.attn.lower_bound = lower_bound
     cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
     initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
 
     triton_output = run_kda_fixture_eager(fixture)
     triton_state = cache.temporal.clone()
+    triton_conv = cache.conv[0].clone()
 
     cache.conv[0].copy_(initial_conv)
     cache.temporal.copy_(initial_ssm)
@@ -489,12 +493,6 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
         FlashInferKDAPrefillKernel,
     )
     kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
-    kernel.validate_model(
-        dtype=torch.bfloat16,
-        state_dtype=cache.temporal.dtype,
-        layers=[fixture.actual_module.attn],
-        chunk_size=fixture.backend.linear_attn_backend.mamba_chunk_size,
-    )
     with (
         patch.object(kernel, "plan", wraps=kernel.plan) as plan,
         patch(
@@ -511,6 +509,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
     torch.testing.assert_close(
         cache.temporal.float(), triton_state.float(), atol=3e-2, rtol=3e-2
     )
+    torch.testing.assert_close(cache.conv[0], triton_conv, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

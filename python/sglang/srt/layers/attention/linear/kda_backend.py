@@ -341,13 +341,13 @@ class KDAKernelDispatcher:
         )
 
     def effective_extend_kernel(
-        self, lower_bound: Optional[float], prefill_metadata=None
+        self, lower_bound: Optional[float], prefill_wrapper=None
     ):
-        """Resolve the configured kernel against this batch's prepared metadata."""
+        """Resolve the configured kernel against the gate and prepared batch."""
         kernel = self.extend_kernel
         if self.prefill_backend.is_flashinfer() and (
-            prefill_metadata is None
-            or prefill_metadata.flashinfer_kda_prefill_wrapper is None
+            lower_bound is None
+            or prefill_wrapper is None
             # Piecewise graph capture can reuse eager metadata. The adapter's
             # allocation/planning lifecycle currently supports eager prefill.
             or torch.cuda.is_current_stream_capturing()
@@ -371,12 +371,8 @@ class KDAKernelDispatcher:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         kernel = self.effective_extend_kernel(
-            kwargs.get("lower_bound"), kwargs.get("prefill_metadata")
+            kwargs.get("lower_bound"), kwargs.get("prefill_wrapper")
         )
-        if self.prefill_backend.is_flashinfer() and kernel is self.extend_kernel:
-            kwargs["prefill_wrapper"] = kwargs[
-                "prefill_metadata"
-            ].flashinfer_kda_prefill_wrapper
         return kernel.extend(
             q,
             k,
@@ -452,21 +448,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
-        if prefill_backend.is_flashinfer():
-            self.kernel_dispatcher.extend_kernel.validate_model(
-                dtype=model_runner.dtype,
-                state_dtype=self.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype,
-                layers=(
-                    module
-                    for module in model_runner.model.modules()
-                    if isinstance(module, RadixLinearAttention)
-                ),
-                chunk_size=(
-                    self.mamba_chunk_size
-                    if self.req_to_token_pool.enable_mamba_extra_buffer
-                    else None
-                ),
-            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -607,6 +588,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 build_flashinfer_kda_checkpoint_plan,
             )
 
+            if not self._has_cpu_prefill_track_metadata(forward_batch):
+                return
             if not build_flashinfer_kda_checkpoint_plan(
                 forward_batch, metadata, self.device, self.mamba_chunk_size
             ):
@@ -964,7 +947,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, self.forward_metadata
+                layer.lower_bound, self.forward_metadata.flashinfer_kda_prefill_wrapper
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
@@ -1017,7 +1000,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-            prefill_metadata=self.forward_metadata,
+            prefill_wrapper=self.forward_metadata.flashinfer_kda_prefill_wrapper,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
