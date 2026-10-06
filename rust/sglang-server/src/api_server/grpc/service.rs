@@ -91,6 +91,9 @@ impl SglangService for GrpcService {
                 fill_preferred_sampling(request.sampling_params.take(), &preferred.0)
                     .map_err(Status::internal)?;
         }
+        // Protobuf has no null: a field the client left unset takes the
+        // schema default, as an absent JSON key does.
+        request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
         let (payloads, is_batch) =
             into_requests(request).map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -658,6 +661,35 @@ mod tests {
         let intake = harness.next_generation().await;
         assert_eq!(intake.request.sampling_params.temperature, 0.8);
         assert_eq!(intake.request.sampling_params.max_new_tokens, Some(32));
+    }
+
+    /// Protobuf has no null: a sampling field the client left unset takes the
+    /// schema default, as an absent JSON key does. `max_new_tokens` is the one
+    /// field whose Rust `None` means "unbounded", so without the absent-defaults
+    /// pass an unset value would lift the limit instead of applying 128.
+    #[tokio::test]
+    async fn unset_protobuf_sampling_fields_take_schema_defaults() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        let mut request = ids_request(&[1], None);
+        request.sampling_params = Some(api::SamplingParamsOrList {
+            value: Some(api::sampling_params_or_list::Value::One(
+                api::SamplingParams {
+                    temperature: Some(0.8),
+                    ..Default::default()
+                },
+            )),
+        });
+        let _stream = harness
+            .service
+            .generate(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let intake = harness.next_generation().await;
+        assert_eq!(intake.request.sampling_params.temperature, 0.8);
+        assert_eq!(intake.request.sampling_params.max_new_tokens, Some(128));
+        assert_eq!(intake.request.sampling_params.top_p, 1.0);
     }
 
     /// `HealthCheck` is `/health_generate`: not ready and stalled are both

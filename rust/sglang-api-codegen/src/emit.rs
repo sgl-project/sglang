@@ -698,8 +698,14 @@ fn ser_field(f: &FieldModel, receiver: &str, always_emit_null: bool) -> String {
         FieldKind::Scalar { .. } => format!(
             "        ::serde::ser::SerializeMap::serialize_entry(&mut map, {key:?}, &{get})?;\n"
         ),
-        FieldKind::OptScalar { emit_null, .. } => {
-            if *emit_null || always_emit_null {
+        FieldKind::OptScalar {
+            emit_null,
+            null_is_none_default,
+            ..
+        } => {
+            // null_is_none: None means "explicit null", distinct from absent
+            // (the default), so it must serialize as null to round-trip.
+            if *emit_null || always_emit_null || null_is_none_default.is_some() {
                 format!(
                     "        ::serde::ser::SerializeMap::serialize_entry(&mut map, {key:?}, &{get})?;\n"
                 )

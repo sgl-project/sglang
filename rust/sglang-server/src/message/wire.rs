@@ -230,12 +230,23 @@ pub fn merge_preferred_sampling(
 
 /// The same fill for a request that arrived already decoded (gRPC): the
 /// carrier round-trips through its JSON form so protobuf and HTTP share one
-/// precedence rule. Protobuf has no null, so "sent" is simply "set".
+/// precedence rule. Protobuf has no null, so an unset field is an absent key
+/// (the schema's null-emitting fields are stripped before the merge), never
+/// the explicit null a JSON client can send.
 pub fn fill_preferred_sampling(
     params: Option<api::SamplingParamsOrList>,
     preferred: &serde_json::Value,
 ) -> Result<Option<api::SamplingParamsOrList>, String> {
     let mut body = serde_json::json!({ "sampling_params": params });
+    let strip_nulls = |object: &mut serde_json::Value| {
+        if let Some(map) = object.as_object_mut() {
+            map.retain(|_, value| !value.is_null());
+        }
+    };
+    match &mut body["sampling_params"] {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+        one => strip_nulls(one),
+    }
     merge_preferred_sampling(&mut body, preferred)?;
     serde_json::from_value(body["sampling_params"].take()).map_err(|e| e.to_string())
 }

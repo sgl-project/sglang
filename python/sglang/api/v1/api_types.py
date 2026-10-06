@@ -403,7 +403,7 @@ class GetModelInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     served_model_name: str = ""
     tokenizer_path: str = ""
     is_generation: bool = False
-    preferred_sampling_params: Optional[str] = None
+    preferred_sampling_params: Optional[Any] = None
     weight_version: Optional[str] = None
     load_format: Optional[str] = None
     reasoning_parser: Optional[str] = None
@@ -939,8 +939,7 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
 
 def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    if v.max_new_tokens is not None:
-        d["max_new_tokens"] = v.max_new_tokens
+    d["max_new_tokens"] = v.max_new_tokens
     if v.stop is not None:
         d["stop"] = encode_StringOrList(v.stop)
     if v.stop_token_ids is not None:
@@ -1458,7 +1457,7 @@ def decode_GetModelInfoResponse(value: Any) -> GetModelInfoResponse:
         elif key == "is_generation":
             kw["is_generation"] = _expect_bool(x, expected="a boolean")
         elif key == "preferred_sampling_params":
-            kw["preferred_sampling_params"] = None if x is None else _expect_str(x, expected="a string")
+            kw["preferred_sampling_params"] = x
         elif key == "weight_version":
             kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "load_format":

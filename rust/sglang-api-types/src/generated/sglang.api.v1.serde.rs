@@ -1018,9 +1018,11 @@ impl SamplingParams {
 impl ::serde::Serialize for SamplingParams {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.max_new_tokens {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_new_tokens", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_new_tokens",
+            &self.max_new_tokens,
+        )?;
         if let Some(v) = &self.stop {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop", v)?;
         }
@@ -2792,11 +2794,23 @@ impl ::serde::Serialize for GetModelInfoResponse {
             "is_generation",
             &self.is_generation,
         )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "preferred_sampling_params",
-            &self.preferred_sampling_params,
-        )?;
+        match &self.preferred_sampling_params {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "preferred_sampling_params",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "preferred_sampling_params",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
         ::serde::ser::SerializeMap::serialize_entry(
             &mut map,
             "weight_version",
@@ -2875,8 +2889,10 @@ impl<'de> ::serde::Deserialize<'de> for GetModelInfoResponse {
                                     "preferred_sampling_params",
                                 ));
                             }
-                            f_preferred_sampling_params =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_preferred_sampling_params = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
                         }
                         "weight_version" => {
                             if f_weight_version.is_some() {

@@ -42,9 +42,13 @@ message GetModelInfoResponse {
   string served_model_name = 2;
   string tokenizer_path = 3;
   bool is_generation = 4;
-  // Null on this server: RustServer.launch refuses to start when set (no
-  // per-request merge yet); the key keeps its shape.
-  optional string preferred_sampling_params = 5 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  // The launch-time `--preferred-sampling-params` object, or null when unset.
+  // JSON carries the object itself (the HTTP `/get_model_info` shape); the
+  // protobuf field holds it as JSON text.
+  optional string preferred_sampling_params = 5 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
   optional string weight_version = 6 [(sglang.json.v1.field_json).emit_null_when_absent = true];
   optional string load_format = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
   optional string reasoning_parser = 8 [(sglang.json.v1.field_json).emit_null_when_absent = true];

@@ -618,8 +618,9 @@ pub struct GetModelInfoResponse {
     pub tokenizer_path: ::prost::alloc::string::String,
     #[prost(bool, tag = "4")]
     pub is_generation: bool,
-    /// Null on this server: RustServer.launch refuses to start when set (no
-    /// per-request merge yet); the key keeps its shape.
+    /// The launch-time `--preferred-sampling-params` object, or null when unset.
+    /// JSON carries the object itself (the HTTP `/get_model_info` shape); the
+    /// protobuf field holds it as JSON text.
     #[prost(string, optional, tag = "5")]
     pub preferred_sampling_params: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "6")]

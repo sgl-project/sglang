@@ -16,6 +16,10 @@ bytes = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order: raw_json passthrough (custom_params, internal_states, an
+# unknown finish reason) re-serializes through serde_json::Value, and the
+# contract is "verbatim": key order must not depend on what else links the
+# crate.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

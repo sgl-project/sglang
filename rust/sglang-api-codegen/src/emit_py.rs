@@ -454,9 +454,16 @@ fn ser_stmts(f: &FieldModel, receiver: &str, always_emit_null: bool, indent: &st
     };
     match &f.kind {
         FieldKind::Scalar { .. } => format!("{indent}d[{key:?}] = {enc}\n"),
-        FieldKind::OptScalar { emit_null, .. }
-        | FieldKind::Message { emit_null, .. }
-        | FieldKind::RawJson { emit_null } => nullable(*emit_null),
+        // null_is_none: None means "explicit null", distinct from absent
+        // (the default), so it must encode as null to round-trip.
+        FieldKind::OptScalar {
+            emit_null,
+            null_is_none_default,
+            ..
+        } => nullable(*emit_null || null_is_none_default.is_some()),
+        FieldKind::Message { emit_null, .. } | FieldKind::RawJson { emit_null } => {
+            nullable(*emit_null)
+        }
         FieldKind::RepeatedScalar { .. }
         | FieldKind::RepeatedMessage { .. }
         | FieldKind::RepeatedRawJson
