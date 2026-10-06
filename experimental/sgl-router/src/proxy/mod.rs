@@ -109,8 +109,9 @@ pub struct Proxy {
     /// is used only for workers whose `/server_info` reported `--enable-http2`
     /// on a cleartext URL.
     h2c_client: Client,
-    /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
-    /// requests deliberately do not use this (long generations are valid).
+    /// Wall-clock timeout for a non-streaming upstream request, and for a
+    /// streaming one's response headers. A stream's body is not bounded by it
+    /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
@@ -134,7 +135,7 @@ fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
 
 impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
-    /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
+    /// non-streaming forwards and for streaming response headers. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     ///
     /// WHY both clients up front: protocol is a per-worker property resolved
@@ -334,10 +335,18 @@ impl Proxy {
             .header("accept", "text/event-stream");
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
-        let resp = req.send().await.map_err(|e| {
-            breaker.record_failure();
-            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-        })?;
+        // A worker that never answers is a fault, unlike a long stream once it answers.
+        let resp = match tokio::time::timeout(self.request_timeout, req.send()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                breaker.record_failure();
+                return Err(Self::classify_reqwest_error_for(worker_url, e, path));
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: worker_url });
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             abort.disarm();
