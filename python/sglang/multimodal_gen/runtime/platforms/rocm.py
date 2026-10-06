@@ -122,11 +122,13 @@ class RocmPlatform(Platform):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
         elif selected_backend == AttentionBackendEnum.AITER_QUANT:
-            if dtype not in (torch.float16, torch.bfloat16):
+            if dtype is not torch.bfloat16:
+                # mha_v4 quantizes from BF16 operands and rejects every other
+                # input dtype, fp16 included.
                 logger.warning(
-                    "AITER quant backend expects fp16/bf16 inputs (quantized "
-                    "internally to the selected format) but got dtype=%s. "
-                    "Proceeding anyway.",
+                    "AITER quant backend takes BF16 inputs, which it quantizes "
+                    "to the selected format, but got dtype=%s. Proceeding "
+                    "anyway; aiter will reject the call.",
                     dtype,
                 )
             logger.info("Using aiter_quant attention backend on ROCm.")
