@@ -454,6 +454,245 @@ class TestKimiK2Detector(CustomTestCase):
         self.assertTrue(self.detector.stream_reasoning)
 
 
+class TestPlamo3Detector(CustomTestCase):
+    """Test cases for Plamo3 detector with tool interruption support."""
+
+    def setUp(self):
+        self.detector = Plamo3Detector()
+
+    def test_init(self):
+        """Test Plamo3Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<|plamo:begin_think:plamo|>")
+        self.assertEqual(self.detector.think_end_token, "<|plamo:end_think:plamo|>")
+        self.assertEqual(
+            self.detector.tool_start_token, "<|plamo:begin_tool_requests:plamo|>"
+        )
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    # ------------------------------------------------------------------
+    # detect_and_parse (one-time)
+    # ------------------------------------------------------------------
+
+    def test_detect_and_parse_normal_text_only(self):
+        """Test parsing text without reasoning block."""
+        text = "Just the answer without any reasoning."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_complete_reasoning(self):
+        """Test parsing a complete reasoning block followed by an answer."""
+        text = (
+            self.detector.think_start_token
+            + "Let me think about this."
+            + self.detector.think_end_token
+            + "The answer is 42."
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_reasoning_only(self):
+        """Test parsing when output is all reasoning (truncated, no end token)."""
+        text = self.detector.think_start_token + "All reasoning, no answer"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "All reasoning, no answer")
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_reasoning_only_with_end_token(self):
+        """Test parsing reasoning that is closed but has no answer after it."""
+        text = (
+            self.detector.think_start_token
+            + "All reasoning, no answer"
+            + self.detector.think_end_token
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "All reasoning, no answer")
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_tool_interruption(self):
+        """Test tool_start_token interrupts reasoning before think_end."""
+        tool = self.detector.tool_start_token
+        text = self.detector.think_start_token + "I need a tool" + tool + "payload"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I need a tool")
+        self.assertEqual(result.normal_text, tool + "payload")
+
+    def test_detect_and_parse_multiple_tool_calls_find(self):
+        """Tool split happens at the FIRST occurrence of tool_start_token."""
+        tool = self.detector.tool_start_token
+        text = (
+            self.detector.think_start_token
+            + "thinking"
+            + tool
+            + "first"
+            + tool
+            + "second"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.normal_text, tool + "first" + tool + "second")
+
+    def test_detect_and_parse_tool_after_complete_reasoning(self):
+        """Tool calls after a closed reasoning block stay in normal_text."""
+        tool = self.detector.tool_start_token
+        text = (
+            self.detector.think_start_token
+            + "reason"
+            + self.detector.think_end_token
+            + "answer"
+            + tool
+            + "payload"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason")
+        self.assertEqual(result.normal_text, "answer" + tool + "payload")
+
+    # ------------------------------------------------------------------
+    # Streaming (stream_reasoning=True, default)
+    # ------------------------------------------------------------------
+
+    def test_streaming_reasoning_content(self):
+        """Test streaming reasoning content is returned incrementally."""
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        result = self.detector.parse_streaming_increment("reasoning content")
+        self.assertEqual(result.reasoning_text, "reasoning content")
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_end_token(self):
+        """Test streaming parse with end token transitions to normal text."""
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        self.detector.parse_streaming_increment("reasoning")
+        result = self.detector.parse_streaming_increment(
+            self.detector.think_end_token + "normal text"
+        )
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "normal text")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_tool_interruption(self):
+        """Test tool_start_token interrupts streaming reasoning.
+
+        With stream_reasoning=True the reasoning content is already streamed in
+        the previous increment, so the tool increment returns only normal_text.
+        """
+        tool = self.detector.tool_start_token
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        pref = self.detector.parse_streaming_increment("reasoning here")
+        self.assertEqual(pref.reasoning_text, "reasoning here")
+        result = self.detector.parse_streaming_increment(tool + "payload")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, tool + "payload")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_empty_reasoning_with_tool(self):
+        """Test empty reasoning block followed by tool call."""
+        tool = self.detector.tool_start_token
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        result = self.detector.parse_streaming_increment(tool + "tool call")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, tool + "tool call")
+
+    def test_streaming_truncated_reasoning_on_finish(self):
+        """With stream_reasoning=True, reasoning is streamed; finish() is empty."""
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        result = self.detector.parse_streaming_increment("partial reasoning")
+        self.assertEqual(result.reasoning_text, "partial reasoning")
+        end = self.detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_tool_start_noops_finish(self):
+        """After tool interruption, finish() no-ops (_in_reasoning already False)."""
+        tool = self.detector.tool_start_token
+        self.detector.parse_streaming_increment(self.detector.think_start_token)
+        self.detector.parse_streaming_increment("reasoning here")
+        self.detector.parse_streaming_increment(tool + "payload")
+        end = self.detector.finish()
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.reasoning_text, "")
+
+    # ------------------------------------------------------------------
+    # Streaming (stream_reasoning=False)
+    # ------------------------------------------------------------------
+
+    def test_streaming_no_stream_reasoning(self):
+        """Without stream_reasoning, content is buffered until end token or tool."""
+        detector = Plamo3Detector(stream_reasoning=False)
+        detector.parse_streaming_increment(detector.think_start_token)
+        result = detector.parse_streaming_increment("thinking")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+        # Tool interruption flushes buffered reasoning
+        tool = detector.tool_start_token
+        result = detector.parse_streaming_increment(tool + "tool call")
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.normal_text, tool + "tool call")
+
+    def test_streaming_no_stream_reasoning_truncated_on_finish(self):
+        """stream_reasoning=False: truncated reasoning flushed on finish()."""
+        detector = Plamo3Detector(stream_reasoning=False)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("hidden reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "hidden reasoning")
+        self.assertEqual(end.normal_text, "")
+        self.assertNotIn(detector.think_start_token, end.reasoning_text)
+
+    # ------------------------------------------------------------------
+    # force_reasoning / force_nonempty_content
+    # ------------------------------------------------------------------
+
+    def test_forced_reasoning_mode(self):
+        """Test force_reasoning without a start token."""
+        detector = Plamo3Detector(force_reasoning=True)
+        text = "This is reasoning"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "This is reasoning")
+        self.assertEqual(result.normal_text, "")
+
+    def test_forced_reasoning_with_tool_interruption(self):
+        """Tool interruption works with forced reasoning."""
+        detector = Plamo3Detector(force_reasoning=True)
+        tool = detector.tool_start_token
+        text = "More reasoning" + tool + "tool call"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "More reasoning")
+        self.assertEqual(result.normal_text, tool + "tool call")
+
+    def test_force_nonempty_content_swaps_when_no_normal_text(self):
+        """force_nonempty_content swaps reasoning to content when content is empty."""
+        detector = Plamo3Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token
+            + "All reasoning, no answer"
+            + detector.think_end_token
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "All reasoning, no answer")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_swap_when_normal_text_exists(self):
+        """force_nonempty_content does not swap when content already exists."""
+        detector = Plamo3Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token + "reason" + detector.think_end_token + "answer"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason")
+        self.assertEqual(result.normal_text, "answer")
+
+    def test_force_nonempty_content_truncated_reasoning(self):
+        """force_nonempty_content with truncated reasoning (no end token)."""
+        detector = Plamo3Detector(force_nonempty_content=True)
+        text = detector.think_start_token + "Truncated reasoning"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "Truncated reasoning")
+        self.assertEqual(result.reasoning_text, "")
+
+
 class TestGlm45Detector(CustomTestCase):
     """Test cases for GLM45 detector with tool interruption support."""
 
@@ -962,16 +1201,17 @@ class TestReasoningParser(CustomTestCase):
     def test_plamo3_reasoning_and_tool_interruption(self):
         """Test PLaMo3 reasoning tokens and tool interruption."""
         parser = ReasoningParser("plamo3")
+
         reasoning, normal = parser.parse_non_stream(
-            "<|plamo:begin_think:plamo|>thinking<|plamo:end_think:plamo|>answer"
+            "<|plamo:begin_think:plamo|>thinking<|plamo:end_think:plamo|>"
+            "<|plamo:begin_tool_requests:plamo|>{}"
         )
         self.assertEqual(reasoning, "thinking")
-        self.assertEqual(normal, "answer")
+        self.assertEqual(normal, "<|plamo:begin_tool_requests:plamo|>{}")
 
         parser = ReasoningParser("plamo3")
         reasoning, normal = parser.parse_non_stream(
-            "<|plamo:begin_think:plamo|>thinking"
-            "<|plamo:begin_tool_requests:plamo|>{}"
+            "<|plamo:begin_think:plamo|>thinking<|plamo:begin_tool_requests:plamo|>{}"
         )
         self.assertEqual(reasoning, "thinking")
         self.assertEqual(normal, "<|plamo:begin_tool_requests:plamo|>{}")
@@ -981,7 +1221,7 @@ class TestReasoningParser(CustomTestCase):
             "<|plamo:begin_think:plamo|>",
             "reasoning",
             "<|plamo:end_think:plamo|>",
-            "answer",
+            "<|plamo:begin_tool_requests:plamo|>{}",
         ]
         all_reasoning = ""
         all_normal = ""
@@ -991,7 +1231,7 @@ class TestReasoningParser(CustomTestCase):
             all_normal += normal
 
         self.assertEqual(all_reasoning, "reasoning")
-        self.assertEqual(all_normal, "answer")
+        self.assertEqual(all_normal, "<|plamo:begin_tool_requests:plamo|>{}")
 
     def test_plamo3_reasoning_markers_split_across_chunks(self):
         parser = ReasoningParser("plamo3")
@@ -1367,6 +1607,68 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             f"<think>my reasoning {tool_call}",
             (f"my reasoning {tool_call}", ""),
         )
+
+    def test_plamo3_think_end_split_across_chunks(self):
+        """Plamo3 think_end split across chunk boundary must still end the block."""
+        begin = "<|plamo:begin_think:plamo|>"
+        end = "<|plamo:end_think:plamo|>"
+        self._assert_invariant(
+            Plamo3Detector,
+            f"{begin}abc reasoning{end}normal text",
+            ("abc reasoning", "normal text"),
+        )
+
+    def test_plamo3_think_end_split_buffered_mode(self):
+        self._assert_invariant(
+            lambda: Plamo3Detector(stream_reasoning=False),
+            "<|plamo:begin_think:plamo|>abc reasoning<|plamo:end_think:plamo|>normal text",
+            ("abc reasoning", "normal text"),
+        )
+
+    def test_plamo3_tool_interruption_split_across_chunks(self):
+        """Plamo3 tool_start split across chunk boundary must still interrupt reasoning."""
+        begin = "<|plamo:begin_think:plamo|>"
+        tool = "<|plamo:begin_tool_requests:plamo|>"
+        self._assert_invariant(
+            Plamo3Detector,
+            f"{begin}abc reasoning{tool}payload",
+            ("abc reasoning", f"{tool}payload"),
+        )
+
+    def test_plamo3_literal_angle_bracket_in_reasoning_not_swallowed(self):
+        """A literal `<` is a prefix of every Plamo3 token; it must not be swallowed."""
+        begin = "<|plamo:begin_think:plamo|>"
+        end = "<|plamo:end_think:plamo|>"
+        self._assert_invariant(
+            Plamo3Detector,
+            f"{begin}a < b{end}tail",
+            ("a < b", "tail"),
+        )
+
+    def test_plamo3_truncated_reasoning_keeps_token_prefix(self):
+        """Reasoning ending in a think_end prefix must flush those characters."""
+        begin = "<|plamo:begin_think:plamo|>"
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(Plamo3Detector(), f"{begin}compare a <", chunk_size),
+                    ("compare a <", ""),
+                )
+
+    def test_plamo3_normal_text_ending_in_token_prefix_survives(self):
+        """Normal text ending in a token prefix is buffered; finish() flushes it."""
+        begin = "<|plamo:begin_think:plamo|>"
+        end = "<|plamo:end_think:plamo|>"
+        for text in (f"{begin}a{end}b<", f"{begin}a{end}b<|plamo"):
+            expected = (
+                text.split(end, 1)[0][len(begin) :],
+                text.split(end, 1)[1],
+            )
+            for chunk_size in self.CHUNK_SIZES:
+                with self.subTest(text=text, chunk_size=chunk_size):
+                    self.assertEqual(
+                        self._feed(Plamo3Detector(), text, chunk_size), expected
+                    )
 
 
 class TestGptOssDetector(CustomTestCase):
