@@ -167,9 +167,6 @@ class GpuDeltaBackend:
 
         self.outer_pool = OuterZstdPool(configured_cpu_workers())
         self.host_arena = HostArena(identity["engine_id"], self.device.index)
-        self.host_arena.register_rank(
-            identity, [binding.name for binding in self.layout.bindings]
-        )
         self.decoders = {}
         self.apply_stream = self.de_stream = None
 
@@ -386,7 +383,7 @@ class PreparedDelta:
         from sglang.srt.weight_sync.gpu_delta.payload import validate_codec
 
         self.stream = self.de_stream = None
-        self.host_snapshot = self.shared_lease = None
+        self.host_snapshot = None
         self.batches, self.raw_copies = [], {}
         self.events, self.timings = {}, {}
         self.status_checks = []
@@ -428,7 +425,7 @@ class PreparedDelta:
                 "host tensor union does not cover the admitted local tensors"
             )
         payload_started = time.perf_counter()
-        index, files, self.shared_lease = backend.host_arena.prepare_encoded(
+        index, files = backend.host_arena.prepare_encoded(
             path,
             manifest_sha256,
             manifest,
@@ -449,10 +446,7 @@ class PreparedDelta:
             [entries[name] for name in local_names],
             backend.outer_pool,
             self.timings,
-            self.shared_lease,
         )
-        self.shared_lease.close()
-        self.shared_lease = None
         self.timings["host_rank_prepare_body_s"] = time.perf_counter() - payload_started
         del files
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
@@ -818,9 +812,6 @@ class PreparedDelta:
             if self.stream is not None:
                 self.stream.synchronize()
         self._release_gpu()
-        if self.shared_lease is not None:
-            self.shared_lease.close()
-            self.shared_lease = None
         if self.host_snapshot is not None:
             self.host_snapshot.close()
             self.host_snapshot = None

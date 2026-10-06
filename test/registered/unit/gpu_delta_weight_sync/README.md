@@ -77,12 +77,8 @@ After encoded-cache READY admission drains global validation, the caller keeps
 only its rank's entries and releases the global manifest before local arena
 planning and decode. Encoded file views remain owned until all decode jobs drain;
 failed preparation never authorizes cache reuse.
-Ranks register immutable local tensor membership before the existing description
-barrier. Tensors consumed by several original ranks on one host are unwrapped
-once into an engine-owned CPU tmpfs arena. Each consumer copies those bytes into
-its retained, original DE-capable host allocation. Tensors with one consumer are
-unwrapped directly into that rank's allocation; raw targets keep their private
-copy path. The shared arena is never submitted to DE.
+Each rank unwraps only its local tensors directly into its own retained, original
+DE-capable host allocation for CPU and GPU access.
 Preparation packs each publication's frames into one contiguous numeric table of
 input offsets, encoded sizes, decoded sizes and output offsets. Vectorized checks
 also derive workspace geometry and per-slot output bounds. Static layer membership
@@ -212,8 +208,8 @@ Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 1 Mi
 redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
-disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU into private or shared host storage as described
-above, then decodes model-layer batches from each rank's original DE arena
+disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU directly into each rank's original host arena,
+then decodes model-layer batches
 directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
 The decoder caches the device's hardware operation limit and rejects a frame if
@@ -237,28 +233,21 @@ before the host submits DE i+1. More slots can defer a reuse wait but do not rem
 nvCOMP's calling-stream wait or guarantee lower pause latency.
 
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per rank.
-Each rank uses reusable workers with independent Zstd contexts. Private tensors
-are grouped into at most four times as many tasks as workers. The shared producer
-interleaves at most one common task per worker with its private tasks; other ranks
-submit private tasks before waiting for common READY. No pool task waits on work
-submitted to its own pool. Consumers coalesce adjacent common ranges, including
-only matching unused alignment padding, into disjoint numeric copy tasks. Copy
-tasks share the private pool, so queue delay can limit overlap. Every submitted
-decode and copy task drains before its buffer lease is released. Two EP4 engines therefore
+Each rank uses reusable workers with independent Zstd contexts. Local tensors
+are grouped into at most four times as many tasks as workers, preserving strict
+per-frame checks and direct writes into the rank arena. Two EP4 engines therefore
 have up to eight pools of 32 decode workers. Workers touch only CPU buffers;
 CUDA setup remains on each rank's preparation thread.
 
 `GPU_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
 must be a private, user-owned tmpfs directory large enough for encoded publication
-files and shared outer-decoded inner-codec bytes. Private inner-codec/raw arenas
-are CUDA-owned host RAM, outside tmpfs.
+files. The decoded inner-codec/raw arenas are CUDA-owned host RAM, outside tmpfs.
 Ranks of one engine on the same physical host must see the same cache directory;
 across containers, explicitly mount the same host tmpfs there. Engine IDs select
 separate subdirectories and advertised `host_cache_id` values. Independent engines
 share no cache locks or release lifecycle. Container hostname does not infer sharing.
 Miles still sends the negotiated `host_tensor_names` union. Each receiver checks
-that it covers its local bindings. Original participants' registered local names
-determine shared consumption, without model-name rules or a publication wire change.
+that it covers its local bindings, then decodes only those local tensor names.
 
 Each rank qualifies its local views while admitting the canonical tensor/view
 plan and retains only detached static definitions. Later publications compare
@@ -275,20 +264,11 @@ existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
 checks source identity/extent across the read; all tasks drain before READY or failure. The
 namespace and build/release mutex bind the original engine participants and delta
 stream; publication metadata binds the manifest path, digest, session and versions.
-READY certifies the encoded cache only after verification succeeds. A separate
-coarse shared READY token certifies common decode completion and binds the same
-publication and shared capacity generation. The creator owns its lock until common
-workers drain; failed preparation leaves BUILDING and wakes followers to reject.
-Private work proceeds outside both cache locks. There is no second source-file
-read or full decoded-mask temporary. The shared intermediate holds only compressed
-inner-codec bytes consumed by multiple ranks; encoded and shared storage are
-reused only after the existing all-rank apply/resume release.
-
-`host_rank_outer_zstd_*` counters describe private unique decode; shared creator
-work uses `host_shared_outer_zstd_*`. The private decode wall ends when the last
-private task completes, while `host_rank_shared_copy_s` includes copy queue/drain
-time. These spans overlap. Use enclosing `host_rank_decode_call_s` and preparation
-wall time to compare implementations, rather than adding worker/wait/copy spans.
+READY certifies the encoded cache only after verification succeeds. Ranks then
+release the cache lock and independently decode local tensors into their own
+arenas; raw targets are copied beside the inner-codec frames. There is no second
+source-file read, full decoded temporary or intermediate decoded host copy.
+Each rank drains all submitted decode tasks before returning or raising.
 
 Each rank's arena uses CUDA 13 `cuMemCreate` with `HOST_NUMA`, `PINNED` and
 `CU_MEM_CREATE_USAGE_HW_DECOMPRESS`, without export handles. The original mapping
@@ -297,13 +277,11 @@ CUDA memory import, FD broker, compiled extension or software inner-decoder fall
 Ordinary `cudaHostAlloc`/`cudaHostRegister` memory does not establish this contract.
 See [NVIDIA's DE requirements](https://docs.nvidia.com/cuda/nvcomp/decompression_engine_faq.html).
 
-The private rank arena, encoded cache and shared inner-codec cache reserve the
-required extent for the
+Both the rank arena and shared encoded cache reserve the required extent for the
 initial capacity, rounded to their allocation granularity. Later growth reserves
 twice the required extent; fitting updates reuse the allocation. Each rank owns
 its DE allocation and frees it after its streams drain. Encoded tmpfs capacity is
-owned by the engine-host cache. Encoded and shared inner-codec capacity each have
-their own generation.
+owned by the engine-host cache and has its own generation.
 
 Miles sends resume only after all original ranks of that engine have applied.
 Successful resume authorizes encoded-cache reuse. The session queues release and

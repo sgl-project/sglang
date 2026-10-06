@@ -1,4 +1,4 @@
-"""Two engines share common outer decode and retain private rank DE arenas.
+"""Two engines verify encoded files once and decode into private rank DE arenas.
 
 Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy and Zstandard are required.
 The test barriers coordinate the oracle only; production preparation has no
@@ -116,30 +116,24 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     records = []
     try:
         identity = host.host_cache_id(engine)
-        names = {
-            f"tensor-{i}" for i in range(2 + 3 * (rank % 2), 5 + 3 * (rank % 2))
-        } | {
-            "tensor-0",
-            "tensor-1",
-            "raw",
+        names = {f"tensor-{i}" for i in range(4 * (rank % 2), 4 * (rank % 2 + 1))} | {
+            "raw"
         }
-        participants = [
-            {"engine_id": engine, "rank_id": str(i), "host_cache_id": identity}
-            for i in range(2)
-        ]
-        arena.register_rank(participants[rank % 2], sorted(names))
         for version, (path, digest, expected) in enumerate(publications, 1):
             metadata = dict(
                 stream_id="native-shared-stream",
                 session_id=f"update-{version}",
                 base_version=version - 1,
                 target_version=version,
-                participants=participants,
+                participants=[
+                    {"engine_id": engine, "rank": 0},
+                    {"engine_id": engine, "rank": 1},
+                ],
             )
             barrier.wait(timeout=90)
             metrics = {}
             manifest = json.loads(Path(path).read_text())
-            index, files, shared_lease = arena.prepare_encoded(
+            index, files = arena.prepare_encoded(
                 path,
                 digest,
                 manifest,
@@ -147,17 +141,10 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 metrics,
                 metadata,
             )
-            try:
-                entries = [
-                    entry for entry in manifest["tensors"] if entry["name"] in names
-                ]
-                del manifest
-                snapshot = arena.decode_local(
-                    index, files, entries, pool, metrics, shared_lease
-                )
-            finally:
-                shared_lease.close()
-                del files
+            entries = [entry for entry in manifest["tensors"] if entry["name"] in names]
+            del manifest
+            snapshot = arena.decode_local(index, files, entries, pool, metrics)
+            del files
             source = arena.tensor
             frames, offsets, size = [], {}, 0
             for entry in entries:
@@ -226,8 +213,6 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     version=version,
                     host_cache_id=identity,
                     arena_identity=arena.capacity["identity"],
-                    shared_identity=index["shared"]["identity"],
-                    shared_arena_bytes=index["shared"]["arena_bytes"],
                     local_names=sorted(names),
                     mapping_pointer=arena.tensor.data_ptr(),
                     metrics=metrics,
@@ -296,11 +281,8 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
             for version in range(3):
                 rows = [record["updates"][version] for record in engine_records]
                 assert rows[0]["arena_identity"] != rows[1]["arena_identity"]
-                assert rows[0]["shared_identity"] == rows[1]["shared_identity"]
                 assert set(rows[0]["local_names"]) & set(rows[1]["local_names"]) == {
-                    "tensor-0",
-                    "tensor-1",
-                    "raw",
+                    "raw"
                 }
                 assert (
                     sum(row["metrics"]["host_encoded_cache_created"] for row in rows)
@@ -319,26 +301,8 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
                 )
                 assert (
                     sum(row["metrics"]["host_rank_outer_zstd_tensors"] for row in rows)
-                    == 6
+                    == 8
                 )
-                assert (
-                    sum(
-                        row["metrics"]["host_shared_outer_zstd_tensors"] for row in rows
-                    )
-                    == 2
-                )
-                assert sum(
-                    row["metrics"]["host_shared_cache_allocation_calls"] for row in rows
-                ) == int(version != 1)
-                for row in rows:
-                    assert row["metrics"]["host_shared_outer_zstd_tensors"] == (
-                        2 * row["metrics"]["host_shared_cache_created"]
-                    )
-                    assert row["metrics"]["host_rank_shared_copy_ranges"] == 1
-                    assert (
-                        row["metrics"]["host_rank_shared_copy_bytes"]
-                        == row["shared_arena_bytes"]
-                    )
                 assert sum(
                     row["metrics"]["host_rank_allocation_calls"] for row in rows
                 ) == (0 if version == 1 else 2)
@@ -362,14 +326,9 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
                     * alignment
                 )
             assert a["arena_identity"] == b["arena_identity"] != c["arena_identity"]
-            assert a["shared_identity"] == b["shared_identity"] != c["shared_identity"]
             assert a["mapping_pointer"] == b["mapping_pointer"] != c["mapping_pointer"]
             assert [
                 row["metrics"]["host_rank_capacity_generation"]
-                for row in record["updates"]
-            ] == [1, 1, 2]
-            assert [
-                row["metrics"]["host_shared_cache_capacity_generation"]
                 for row in record["updates"]
             ] == [1, 1, 2]
             assert all(
