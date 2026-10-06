@@ -440,3 +440,9 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
     torch.testing.assert_close(
         cache.temporal.float(), triton_state.float(), atol=3e-2, rtol=3e-2
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

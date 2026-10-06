@@ -26,8 +26,6 @@ def build_flashinfer_kda_checkpoint_plan(
     device: torch.device,
     chunk_size: int,
 ) -> None:
-    if metadata.track_ssm_h_src is None or metadata.track_ssm_h_src.numel() == 0:
-        return
     if chunk_size <= 0 or chunk_size % 32:
         return
     if any(
@@ -65,8 +63,7 @@ def build_flashinfer_kda_checkpoint_plan(
         )
         num_tracked_checkpoints += 1
 
-    if num_tracked_checkpoints != metadata.track_ssm_h_batch_src.numel():
-        return
+    # The backend selects these same unaligned rows with build_prefill_track_plan.
     metadata.state_checkpoint_cu_starts = torch.tensor(
         checkpoint_starts, dtype=torch.int64, device=device
     )
@@ -123,10 +120,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
-        num_sequences = query_start_loc.numel() - 1
         needs_checkpoint = (
             return_intermediate_states and kwargs.get("track_state") is not None
         )
+        # KDAAttnBackend supplies packed Q/K/V from one convolution, matching
+        # gate parameters and device metadata. Both static and envelope state
+        # pools keep compact head matrices with 128-D-aligned slot pitches.
+        # Only backend limitations belong here; caller invariants do not.
         eligible = (
             torch.cuda.get_device_capability(q.device) in ((10, 0), (10, 3))
             and not torch.cuda.is_current_stream_capturing()
@@ -135,50 +135,17 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and lower_bound is not None
             and math.isfinite(float(lower_bound))
             and float(lower_bound) < 0
-            and A_log is not None
-            and dt_bias is not None
-            and q.dtype == k.dtype == v.dtype == g.dtype == beta.dtype == torch.bfloat16
-            and q.device
-            == k.device
-            == v.device
-            == g.device
-            == beta.device
-            == ssm_states.device
-            == cache_indices.device
-            == query_start_loc.device
-            == A_log.device
-            == dt_bias.device
-            and ssm_states.dtype in (torch.bfloat16, torch.float32)
-            and q.ndim == k.ndim == v.ndim == g.ndim == 4
-            and beta.ndim == 3
-            and q.shape[0] == k.shape[0] == v.shape[0] == g.shape[0] == 1
-            and q.shape[1] == k.shape[1] == v.shape[1]
-            and q.shape[2:] == k.shape[2:] == v.shape[2:] == g.shape[2:]
+            and q.dtype == g.dtype == beta.dtype == torch.bfloat16
             and q.shape[-1] == 128
-            and ssm_states.ndim == 4
-            and ssm_states.shape[1:] == (q.shape[2], 128, 128)
-            and ssm_states.stride()[1:] == (128 * 128, 128, 1)
-            and ssm_states.stride(0) % 16 == 0
-            and ssm_states.storage_offset() * ssm_states.element_size() % 32 == 0
-            and A_log.numel() == q.shape[2]
-            and dt_bias.numel() == q.shape[2] * 128
-            and beta.shape[0] == 1
-            and beta.shape[1] >= q.shape[1]
-            and beta.shape[2] == q.shape[2]
-            and beta.data_ptr() % 16 == 0
-            and g.shape[1] >= q.shape[1]
-            and g.shape[2:] == q.shape[2:]
+            and v.shape[2:] == q.shape[2:]
+            and ssm_states.dtype in (torch.bfloat16, torch.float32)
+            # Full-rank fused gate projections can have a padded token stride.
             and g[:, : q.shape[1]].is_contiguous()
-            and num_sequences > 0
-            and query_start_loc.is_cuda
-            and query_start_loc.dtype in (torch.int32, torch.int64)
-            and query_start_loc.is_contiguous()
-            and q.shape[1] > num_sequences
-            and cache_indices.ndim == 1
-            and cache_indices.numel() == num_sequences
+            # gpu_only batches lack host lengths; DP padding can add empty rows.
             and seq_lens_cpu is not None
-            and len(seq_lens_cpu) == num_sequences
             and min(seq_lens_cpu) > 0
+            and q.shape[1] > len(seq_lens_cpu)
+            # TBO derives query offsets separately from its host length slices.
             and sum(seq_lens_cpu) == q.shape[1]
         )
         if eligible and needs_checkpoint and state_checkpoint_cu_starts is None:
@@ -196,12 +163,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
                     prefill_metadata.state_checkpoint_every_n_tokens
                 )
         eligible = eligible and (
-            not needs_checkpoint
-            or (
-                state_checkpoint_cu_starts is not None
-                and state_checkpoint_indices is not None
-                and track_ssm_h_batch_src is not None
-            )
+            # A successful plan publishes starts and indices together; the
+            # backend already supplies tracked batch rows with track_state.
+            not needs_checkpoint or state_checkpoint_cu_starts is not None
         )
         if not eligible:
             return self._triton.extend(
