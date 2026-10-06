@@ -16,6 +16,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
     can_use_modulate_scale_shift_cuda,
     can_use_residual_gate_add_cuda,
+    can_use_residual_gate_add_rocm,
     can_use_rmsnorm_scale_shift_per_token,
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
@@ -26,6 +27,7 @@ from sglang.kernels.ops.diffusion import (
     norm_infer,
     residual_gate_add,
     residual_gate_add_cuda,
+    residual_gate_add_rocm,
     rmsnorm_scale_shift_per_token,
     timestep_embedding,
     try_fused_scaled_residual_add_exact,
@@ -44,6 +46,16 @@ CUDA_NATIVE_ONLY = pytest.mark.skipif(
     torch.version.hip is not None,
     reason="the bit-exact fast path is CUDA-only",
 )
+
+# Each backend has its own residual-gate fast path: the CUDA one embeds NVIDIA
+# PTX, so ROCm runs a separate Triton kernel. The cases below cover whichever
+# path the current platform dispatches to.
+if torch.version.hip is None:
+    can_use_residual_gate_add_fast = can_use_residual_gate_add_cuda
+    residual_gate_add_fast = residual_gate_add_cuda
+else:
+    can_use_residual_gate_add_fast = can_use_residual_gate_add_rocm
+    residual_gate_add_fast = residual_gate_add_rocm
 
 
 @pytest.fixture(autouse=True)
@@ -180,12 +192,18 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
 
+<<<<<<< HEAD
     ref = residual + update * gate
     if torch.version.hip is None:
         assert can_use_residual_gate_add_cuda(residual, update, gate)
         _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
     else:
         assert not can_use_residual_gate_add_cuda(residual, update, gate)
+=======
+    assert can_use_residual_gate_add_fast(residual, update, gate)
+    ref = residual + update * gate
+    _assert_gate_add(residual_gate_add_fast(residual, update, gate), ref)
+>>>>>>> 0cd080ec97 ([AMD][Diffusion] Test ROCm residual gate dispatch)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
 
 
@@ -200,7 +218,7 @@ def test_residual_gate_add_dtypes(dtype, shape, gate_shape):
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=dtype)
     _assert_gate_add(
-        residual_gate_add_cuda(residual, update, gate), residual + update * gate
+        residual_gate_add_fast(residual, update, gate), residual + update * gate
     )
 
 
@@ -216,9 +234,9 @@ def test_residual_gate_add_transposed_residual(dtype, shape):
     gate = torch.randn((1, 1, hidden_size), device=DEVICE, dtype=dtype)
 
     assert not residual.is_contiguous()
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    assert can_use_residual_gate_add_fast(residual, update, gate)
     ref = residual + update * gate
-    out = residual_gate_add_cuda(residual, update, gate)
+    out = residual_gate_add_fast(residual, update, gate)
     _assert_gate_add(out, ref)
     assert out.stride() == ref.stride() == residual.stride()
 
@@ -241,8 +259,8 @@ def test_residual_gate_add_transposed_storage_offsets():
     assert residual.storage_offset() > 0
     assert update.storage_offset() > 0
     assert gate.storage_offset() > 0
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
-    out = residual_gate_add_cuda(residual, update, gate)
+    assert can_use_residual_gate_add_fast(residual, update, gate)
+    out = residual_gate_add_fast(residual, update, gate)
     assert torch.equal(out, residual + update * gate)
 
 
@@ -271,11 +289,11 @@ def test_residual_gate_add_transposed_cuda_graph():
 
     # Build the JIT module before capture; graph capture must contain only the
     # allocation and kernel launch used during steady-state replay.
-    residual_gate_add_cuda(residual, update, gate)
+    residual_gate_add_fast(residual, update, gate)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = residual_gate_add_cuda(residual, update, gate)
+        out = residual_gate_add_fast(residual, update, gate)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -287,9 +305,7 @@ def test_residual_gate_add_guards_and_eager_fallback():
     residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn((1, 1, 64), device=DEVICE, dtype=torch.bfloat16)
-    assert can_use_residual_gate_add_cuda(residual, update, gate) == (
-        torch.version.hip is None
-    )
+    assert can_use_residual_gate_add_fast(residual, update, gate)
 
     rejected = [
         (residual.cpu(), update, gate),  # not on device
@@ -299,13 +315,13 @@ def test_residual_gate_add_guards_and_eager_fallback():
         (residual[:, :0], update[:, :0], gate),  # empty token dim
     ]
     for args in rejected:
-        assert not can_use_residual_gate_add_cuda(*args)
+        assert not can_use_residual_gate_add_fast(*args)
 
     # Batched gates support contiguous BTD residuals, but not arbitrary strides.
     batched = torch.randn((2, 16, 64), device=DEVICE, dtype=torch.bfloat16)[:, ::2]
     batched_update = torch.randn_like(batched)
     batched_gate = torch.randn((2, 1, 64), device=DEVICE, dtype=torch.bfloat16)
-    assert not can_use_residual_gate_add_cuda(batched, batched_update, batched_gate)
+    assert not can_use_residual_gate_add_fast(batched, batched_update, batched_gate)
     assert torch.equal(
         residual_gate_add(batched, batched_update, batched_gate),
         batched + batched_update * batched_gate,
@@ -332,25 +348,21 @@ def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
         assert not gate.is_contiguous()
     else:
         gate = torch.randn((batch, 1, hidden), device=DEVICE, dtype=dtype)
+    assert can_use_residual_gate_add_fast(residual, update, gate)
     expected = residual + update * gate
-    if torch.version.hip is None:
-        assert can_use_residual_gate_add_cuda(residual, update, gate)
-        _assert_gate_add(residual_gate_add_cuda(residual, update, gate), expected)
-    else:
-        assert not can_use_residual_gate_add_cuda(residual, update, gate)
+    _assert_gate_add(residual_gate_add_fast(residual, update, gate), expected)
     _assert_gate_add(residual_gate_add(residual, update, gate), expected)
 
 
-@CUDA_NATIVE_ONLY
 def test_residual_gate_add_batched_rows_cuda_graph():
     residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn((4, 1, 6, 128), device=DEVICE, dtype=torch.bfloat16)[:, :, 2]
-    residual_gate_add_cuda(residual, update, gate)
+    residual_gate_add_fast(residual, update, gate)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = residual_gate_add_cuda(residual, update, gate)
+        out = residual_gate_add_fast(residual, update, gate)
     for _ in range(2):
         residual.normal_()
         update.normal_()
@@ -359,7 +371,20 @@ def test_residual_gate_add_batched_rows_cuda_graph():
         assert torch.equal(out, residual + update * gate)
 
 
-@torch.no_grad()
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm dispatch only")
+def test_residual_gate_add_rocm_never_takes_ptx_path():
+    """ROCm's LLVM aborts the process on the CUDA kernels' NVIDIA PTX (#41852).
+
+    The abort is not a Python exception, so no eager fallback can catch it:
+    HIP must reject the CUDA path and dispatch to the ROCm kernel instead.
+    """
+    residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn((1, 1, 64), device=DEVICE, dtype=torch.bfloat16)
+    assert not can_use_residual_gate_add_cuda(residual, update, gate)
+    assert can_use_residual_gate_add_rocm(residual, update, gate)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        residual_gate_add_cuda(residual, update, gate)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @CUDA_NATIVE_ONLY
 def test_scaled_residual_add_is_bit_exact(dtype):
