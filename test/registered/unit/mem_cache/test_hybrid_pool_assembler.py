@@ -1,5 +1,7 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
+import argparse
+import json
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -1142,7 +1144,24 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
     """Only no backend and Mori store the complete shared page, so only they
     keep the page-envelope host arena. The host memory mode plays no part."""
 
-    def _publish(self, backend, mode):
+    # Every --hicache-storage-backend choice, checked against the parser below.
+    BACKENDS = (
+        "file",
+        "sim",
+        "mooncake",
+        "npu_memcache",
+        "hf3fs",
+        "nixl",
+        "aibrix",
+        "dynamic",
+        "eic",
+        "simm",
+        "mori",
+        "shm",
+        "tensorcast",
+    )
+
+    def _publish(self, backend, mode, extra_config=None):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -1153,24 +1172,51 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                 model_path="dummy",
                 enable_unified_memory=True,
                 hicache_storage_backend=backend,
+                hicache_storage_backend_extra_config=extra_config,
                 hicache_host_memory_mode=mode,
                 hicache_mem_layout="layer_first",
             ),
             role="tokenizer",
         )
 
+    def _selects_envelope(self, pool) -> bool:
+        return _uses_unified_page_envelope_host(
+            pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+        )
+
+    def test_the_cases_cover_every_backend_choice(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        (action,) = [a for a in parser._actions if a.dest == "hicache_storage_backend"]
+        self.assertEqual(sorted(action.choices), sorted(self.BACKENDS))
+
     def test_only_no_backend_and_mori_select_the_envelope(self):
         pool = _build_unified_swa_pool().token_to_kv_pool
         for mode in ("cache", "buffer_only"):
-            for backend in (None, "mori", "file", "sim", "shm", "mooncake", "nixl"):
+            for backend in (None, *self.BACKENDS):
                 with self.subTest(mode=mode, backend=backend):
                     self._publish(backend, mode)
                     self.assertEqual(
-                        _uses_unified_page_envelope_host(
-                            pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
-                        ),
-                        backend in (None, "mori"),
+                        self._selects_envelope(pool), backend in (None, "mori")
                     )
+
+    def test_a_dynamic_backend_keeps_separate_pools_whatever_its_name(self):
+        # The class comes from the extra config, so its layout is unknown.
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        for mode in ("cache", "buffer_only"):
+            for name in ("custom", "mori"):
+                config = json.dumps(
+                    {
+                        "backend_name": name,
+                        "module_path": "custom_storage",
+                        "class_name": "CustomStorage",
+                    }
+                )
+                with self.subTest(mode=mode, backend_name=name):
+                    self._publish("dynamic", mode, extra_config=config)
+                    self.assertFalse(self._selects_envelope(pool))
 
     def test_built_host_pools_follow_the_selection(self):
         from sglang.srt.mem_cache.pool_host import common as host_memory
