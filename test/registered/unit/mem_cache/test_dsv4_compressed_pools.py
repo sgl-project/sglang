@@ -27,12 +27,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestDSV4CompressedPools(CustomTestCase):
     def test_fp8_indexer_pool_shared_accessor_gathers_physical_pages(self):
-        """DSv4's non-paged gather must read keys/scales across index pages.
-
-        #42178 made the shared accessor require a DSA-only page-size field,
-        so real DSv4 pools crashed even though mocked indexer dispatch passed.
-        """
-
         def gather_on_cpu(
             *,
             buf,
@@ -43,8 +37,6 @@ class TestDSV4CompressedPools(CustomTestCase):
             page_size,
             index_head_dim,
         ):
-            # Replace only the device kernel; keep pool construction, accessor
-            # dispatch, and page-size selection on their production paths.
             key_bytes = page_size * index_head_dim
             pages = buf[page_indices.flatten()]
             keys = pages[:, :key_bytes].reshape(-1, index_head_dim)
@@ -69,8 +61,6 @@ class TestDSV4CompressedPools(CustomTestCase):
                     torch.arange(seq_len * 128).reshape(seq_len, 128) % 251
                 ).to(torch.uint8)
                 expected_s = torch.arange(seq_len, dtype=torch.float32).reshape(-1, 1)
-                # Non-sequential page ids and a partial final page catch using
-                # the 256-token logical page instead of the index storage page.
                 page_ids = torch.tensor([[3, 1]], dtype=torch.int32)
                 buf = pool.get_index_k_with_scale_buffer(0)
                 for page, start in zip(page_ids.flatten(), (0, page_size)):
