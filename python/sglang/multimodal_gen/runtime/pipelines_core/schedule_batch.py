@@ -155,7 +155,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
@@ -346,7 +346,8 @@ class Req:
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
@@ -502,7 +503,7 @@ class OutputBatch:
     metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
 

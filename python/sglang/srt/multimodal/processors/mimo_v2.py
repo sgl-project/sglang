@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -33,6 +32,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.mimo_audio import (
+    AudioDecoder,
     AudioInput,
     MiMoAudioPipeline,
 )
@@ -460,6 +460,11 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
+        if AudioDecoder is None:
+            raise ValueError(
+                "torchcodec is required to detect audio tracks in video inputs; "
+                "install torchcodec and its FFmpeg dependencies."
+            )
         # Never hand a client-supplied URL to ffprobe: its internal HTTP client
         # would bypass the shared domain and redirect policy. Resolve it through
         # the guarded downloader first, then probe the resulting bytes in-process.

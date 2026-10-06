@@ -64,7 +64,7 @@ def build_pooled_page_table_64(
     idx = torch.arange(
         0, page_table_64.shape[-1], pool_size, device=page_table_64.device
     )
-    return page_table_64[..., idx]
+    return page_table_64[..., idx] // pool_size
 
 
 def gather_index_k_scale_prefix_into(
@@ -79,7 +79,7 @@ def gather_index_k_scale_prefix_into(
     assert page_indices.dtype in (torch.int32, torch.int64)
     assert k_out.dtype == torch.uint8
     assert scale_out.dtype == torch.float32
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.slots_per_page == BLOCK_SIZE_K
     assert k_out.shape[0] >= seq_len
     assert k_out.shape[1] == INDEX_HEAD_DIM
     assert scale_out.shape[0] >= seq_len
@@ -96,11 +96,11 @@ def gather_index_k_scale_prefix_into(
         page_indices,
         k_out,
         scale_out,
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=pool.slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         PRESHUFFLE_TILE=_preshuffle_tile(),
         HEAD_DIM=INDEX_HEAD_DIM,
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
+        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
     )
 
@@ -122,7 +122,7 @@ def _gather_index_k_scale_prefix_into_kernel(
     token_id = tl.program_id(0)
     page_idx = token_id // PAGE_SIZE
     token_offset_in_page = token_id % PAGE_SIZE
-    page = tl.load(page_indices_ptr + page_idx)
+    page = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
@@ -159,8 +159,6 @@ def kpool_build_ragged_layout(
     total_q: int,
     pool_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # One packed-cache page represents 64 pools, so its source is every
-    # pool_size-th real token page.
     device = full_page_table.device
     n_rag = cu_pages_excl.shape[0]
     concat_page_table = torch.empty(
@@ -224,7 +222,11 @@ def _kpool_build_ragged_layout_kernel(
             mask=p_mask,
             other=0,
         )
-        tl.store(concat_page_table_ptr + page_start + p_offs, pages, mask=p_mask)
+        tl.store(
+            concat_page_table_ptr + page_start + p_offs,
+            pages // POOL_SIZE,
+            mask=p_mask,
+        )
 
     for q_off in tl.range(0, BLOCK_Q * tl.cdiv(q_count, BLOCK_Q), BLOCK_Q):
         q_offs = q_off + tl.arange(0, BLOCK_Q)
@@ -377,11 +379,14 @@ def _update_kpool_write_plan_kernel(
         )
         # Promote the row term before multiplication; 1M-context strides
         # overflow int32 around row 2048.
-        packed_page = tl.load(
-            real_page_table_ptr
-            + (b * N).to(tl.int64) * real_page_table_stride_0
-            + token_page_row
-        ).to(tl.int64)
+        packed_page = (
+            tl.load(
+                real_page_table_ptr
+                + (b * N).to(tl.int64) * real_page_table_stride_0
+                + token_page_row
+            ).to(tl.int64)
+            // POOL_SIZE
+        )
         write_loc = packed_page * SLOTS_PER_PAGE + (pool_id % SLOTS_PER_PAGE)
         tl.store(
             write_loc_out_ptr + b * write_loc_out_stride_0 + p,
@@ -398,10 +403,11 @@ def compute_pooled_write_locs(
     pool_ids = pool_ids.to(torch.int64)
     pool_page_group = torch.div(pool_ids, BLOCK_SIZE_K, rounding_mode="floor")
     token_page_row = pool_page_group * pool_size
-    packed_page = page_table_64.index_select(0, token_page_row.to(torch.int64))
-    return packed_page.to(torch.int64) * BLOCK_SIZE_K + torch.remainder(
-        pool_ids, BLOCK_SIZE_K
+    packed_page = (
+        page_table_64.index_select(0, token_page_row.to(torch.int64)).to(torch.int64)
+        // pool_size
     )
+    return packed_page * BLOCK_SIZE_K + torch.remainder(pool_ids, BLOCK_SIZE_K)
 
 
 def history_group_budget_for_topk(topk: int, pool_size: int) -> int:
@@ -621,7 +627,7 @@ def topk_from_pooled_history_logits(
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
-        from sglang.kernels.ops.moe.kpool_topk_transform import (
+        from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
 
@@ -712,7 +718,7 @@ def kpool_softmax_rotate_write_cache(
     assert slot_score.dtype in KPOOL_SCORE_DTYPES
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.slots_per_page == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert loc.dtype == torch.int64
     assert write_cache or return_compressed
@@ -771,12 +777,12 @@ def kpool_softmax_rotate_write_cache(
         slot_score.stride(0),
         slot_score.stride(1),
         ape.stride(0),
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=pool.slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * pool.index_head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
@@ -816,7 +822,7 @@ def kpool_decode_update_and_maybe_write_cache(
     assert slot_score.dtype == tail_score.dtype
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.slots_per_page == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert tail_k.is_contiguous()
     assert tail_score.is_contiguous()
@@ -1165,7 +1171,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + row * block_tables_stride_0
             + token_page_row * block_tables_stride_1,
         )
-        loc_page_index = packed_page.to(tl.int64)
+        loc_page_index = packed_page.to(tl.int64) // POOL_SIZE
         loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
         out_k_offsets = _kpool_cache_k_offsets(
             loc_page_index,
