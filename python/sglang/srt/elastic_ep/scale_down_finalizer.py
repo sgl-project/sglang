@@ -158,8 +158,10 @@ class ScaleDownFinalizer:
             except ExpertLayoutDivergence:
                 # Deliberately not downgraded: a rank whose map disagrees with its
                 # peers keeps serving and routes tokens to the wrong expert, so the
-                # damage is wrong output nobody is told about. Propagates like the
-                # orphan reload above.
+                # damage is wrong output nobody is told about. Both this and the orphan
+                # reload above are ElasticLayoutFatal, which the FSM's tick re-raises
+                # ahead of its generic handler, so the scheduler goes down rather than
+                # reporting a failed scale and carrying on.
                 raise
             except Exception as exc:
                 # Aborted with nothing installed, so the repaired mapping stands as it
