@@ -335,6 +335,32 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
             )
         DefaultModelLoader.postprocess_weights(model, torch.device("cuda"))
 
+    def test_noncanonical_reload_names_are_rejected_before_mutation(self):
+        model = build_model("qwen3", kv_heads=1)
+        sources = dict(checkpoint(13, "qwen3", 1))
+        snapshot = {
+            n: (p.data_ptr(), p.contiguous().view(torch.uint8).clone())
+            for n, p in model.named_parameters()
+        }
+        for canonical in (
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+        ):
+            with self.subTest(name=canonical):
+                update = [
+                    ("model.norm.weight", sources["model.norm.weight"]),
+                    (canonical.removeprefix("model."), sources[canonical]),
+                ]
+                with self.assertRaisesRegex(ValueError, "canonical checkpoint names"):
+                    model.load_weights(update)
+                for name, param in model.named_parameters():
+                    pointer, data = snapshot[name]
+                    self.assertEqual(param.data_ptr(), pointer)
+                    torch.testing.assert_close(
+                        param.contiguous().view(torch.uint8), data, rtol=0, atol=0
+                    )
+
     def test_eager_native_loaders_match_cold_load(self):
         for kind in ("qwen2", "qwen3"):
             native = {"qwen2": Qwen2ForCausalLM, "qwen3": Qwen3ForCausalLM}[kind]

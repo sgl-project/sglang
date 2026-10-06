@@ -1329,6 +1329,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 
         weights_list = list(weights)
+        for name, _ in weights_list:
+            if name.startswith(("layers.", "embed_tokens.", "norm.")):
+                raise ValueError(
+                    f"FlashRL reload requires canonical checkpoint names: {name!r} "
+                    "must include the 'model.' prefix."
+                )
         updated_param_names, is_last_update = (
             QuantizedRLModelLoader._get_updated_params(weights_list, model)
         )
