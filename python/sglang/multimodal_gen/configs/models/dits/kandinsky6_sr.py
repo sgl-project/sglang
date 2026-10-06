@@ -4,7 +4,7 @@
 Official out_visual_dim is the total DX head width; n_grid lives in the scheduler.
 Unsupported architecture options and unknown fields are rejected."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
@@ -33,7 +33,7 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         }
     )
 
-    # --- DiffusionTransformer3D constructor keys (trained architecture) ---
+    # trained architecture, before inference overrides
     in_visual_dim: int = 4
     in_text_dim: int = 3584
     in_text_dim2: int = 768
@@ -54,19 +54,13 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
     zero_lq_in_main_path: bool = False
     use_adapter: bool = False
     adapter_gamma: float = 0.0
-    # The reference default is True; the SR release is text-free and its config says
-    # so explicitly.
     use_text: bool = False
     use_lq_noise_cond: bool = False
 
-    # Post-load attribute overrides (whitelist: instruct_type, visual_cond,
-    # attention_params); the architecture above stays as trained.  The official
-    # config writes ``null`` when there are none.
+    # inference-only overrides must not change the trained layer dimensions
     attribute_overrides: dict[str, Any] | None = field(default_factory=dict)
 
-    # --- SR sampling parameters of the training config ---
-    # As stored in ``transformer/config.json`` (``sr_params``); expanded into the
-    # flat ``sr_*`` fields below in ``__post_init__``.
+    # checkpoint sr_params expands into the flat sr_* fields
     sr_params: dict[str, Any] | None = None
     sr_visual_size: list[int] = field(default_factory=lambda: [512])
     sr_scale_factor: dict[str, list[float]] | None = None
@@ -86,67 +80,18 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         if self.attribute_overrides is None:
             self.attribute_overrides = {}
         if self.sr_params is not None:
-            self._expand_sr_params(self.sr_params)
-        self._reject_unknown_keys()
-        self._reject_unsupported_flags()
-        self._normalize_and_validate_shapes()
-        self._validate_overrides()
-        if self.sr_lq_noise_type not in _LQ_NOISE_TYPES:
-            raise ValueError(
-                f"sr_lq_noise_type must be one of {list(_LQ_NOISE_TYPES)}, "
-                f"got {self.sr_lq_noise_type!r}"
-            )
-        self.hidden_size = self.model_dim
-        self.num_attention_heads = self.model_dim // sum(self.axes_dims)
-        self.in_channels = self.in_visual_dim
-        self.out_channels = self.out_visual_dim
-        self.num_channels_latents = self.in_visual_dim
-
-    @property
-    def trained_wide_input(self) -> bool:
-        """Whether the input layer was trained on ``[x | cond | mask]`` channels."""
-        return bool(self.visual_cond or self.instruct_type in WIDE_INPUT_INSTRUCT_TYPES)
-
-    def effective_override(self, name: str) -> Any:
-        """Post-load value of ``name``: the override if present, else as trained."""
-        if name in self.attribute_overrides:
-            return self.attribute_overrides[name]
-        return self.__dict__[name]
-
-    def requested_sparse_attention(self) -> str | None:
-        """Sparse attention type asked for by ``attention_params``, if any."""
-        params = self.effective_override("attention_params")
-        if not isinstance(params, dict):
-            return None
-        for value in params.values():
-            attention_type = value.get("type") if isinstance(value, dict) else None
-            if attention_type in _SPARSE_ATTENTION_TYPES:
-                return attention_type
-        return None
-
-    _SR_PARAM_FIELDS = {
-        "visual_size": "sr_visual_size",
-        "scale_factor": "sr_scale_factor",
-        "scheduler_scale": "sr_scheduler_scale",
-        "lq_noise_scale": "sr_lq_noise_scale",
-        "lq_noise_type": "sr_lq_noise_type",
-        "lq_channel_noise_scale": "sr_lq_channel_noise_scale",
-        "cap_noise_timestep": "sr_cap_noise_timestep",
-        "fps": "sr_fps",
-    }
-
-    def _expand_sr_params(self, sr_params: dict[str, Any]) -> None:
-        """Nested ``sr_params`` of ``transformer/config.json`` -> the flat ``sr_*`` fields."""
-        unknown = sorted(set(sr_params) - set(self._SR_PARAM_FIELDS))
-        if unknown:
-            raise ValueError(
-                f"Kandinsky6SR sr_params has unsupported keys {unknown}; accepted "
-                f"keys: {sorted(self._SR_PARAM_FIELDS)}"
-            )
-        for key, value in sr_params.items():
-            setattr(self, self._SR_PARAM_FIELDS[key], value)
-
-    def _reject_unknown_keys(self) -> None:
+            known = {
+                item.name.removeprefix("sr_")
+                for item in fields(self)
+                if item.name.startswith("sr_") and item.name != "sr_params"
+            }
+            unknown = sorted(set(self.sr_params) - known)
+            if unknown:
+                raise ValueError(
+                    f"Kandinsky6SR sr_params has unsupported keys {unknown}; accepted keys: {sorted(known)}"
+                )
+            for key, value in self.sr_params.items():
+                setattr(self, f"sr_{key}", value)
         unknown = sorted(set(self.extra_attrs) - _TOLERATED_EXTRA_KEYS)
         if unknown:
             raise ValueError(
@@ -154,23 +99,15 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
                 f"{unknown}; declare them on Kandinsky6SRArchConfig or fix the checkpoint config."
             )
 
-    def _reject_unsupported_flags(self) -> None:
-        if self.use_text:
-            raise NotImplementedError(
-                "Kandinsky6SR: use_text=True (text-conditioned SR DiT) is not "
-                "supported; only the text-free SR DiT (use_text=False) is implemented."
-            )
-        if self.use_adapter:
-            raise NotImplementedError(
-                "Kandinsky6SR: use_adapter=True (VideoAdapter) is not supported."
-            )
-        if self.use_lq_modulation:
-            raise NotImplementedError(
-                "Kandinsky6SR: use_lq_modulation=True (per-block LQ modulation) is "
-                "not supported."
-            )
-
-    def _normalize_and_validate_shapes(self) -> None:
+        for name, enabled in (
+            ("use_text", self.use_text),
+            ("use_adapter", self.use_adapter),
+            ("use_lq_modulation", self.use_lq_modulation),
+        ):
+            if enabled:
+                raise NotImplementedError(
+                    f"Kandinsky6SR: {name}=True is not supported."
+                )
         self.patch_size = tuple(self.patch_size)
         self.axes_dims = tuple(self.axes_dims)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1:
@@ -191,7 +128,6 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         if self.model_dim % 2 != 0:
             raise ValueError(f"model_dim must be even, got {self.model_dim}")
 
-    def _validate_overrides(self) -> None:
         unknown = sorted(
             set(self.attribute_overrides) - set(ATTRIBUTE_OVERRIDE_WHITELIST)
         )
@@ -209,6 +145,37 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
         visual_cond = self.effective_override("visual_cond")
         if not isinstance(visual_cond, bool):
             raise ValueError(f"visual_cond must be a bool, got {visual_cond!r}")
+        if self.sr_lq_noise_type not in _LQ_NOISE_TYPES:
+            raise ValueError(
+                f"sr_lq_noise_type must be one of {list(_LQ_NOISE_TYPES)}, "
+                f"got {self.sr_lq_noise_type!r}"
+            )
+        self.hidden_size = self.model_dim
+        self.num_attention_heads = self.model_dim // head_dim
+        self.in_channels = self.in_visual_dim
+        self.out_channels = self.out_visual_dim
+        self.num_channels_latents = self.in_visual_dim
+
+    @property
+    def trained_wide_input(self) -> bool:
+        """Whether the input layer was trained on ``[x | cond | mask]`` channels."""
+        return bool(self.visual_cond or self.instruct_type in WIDE_INPUT_INSTRUCT_TYPES)
+
+    def effective_override(self, name: str) -> Any:
+        """Post-load value of ``name``: the override if present, else as trained."""
+        return self.attribute_overrides.get(name, self.__dict__[name])
+
+    def requested_sparse_attention(self) -> str | None:
+        """Sparse attention type asked for by ``attention_params``, if any."""
+        params = self.effective_override("attention_params")
+        if isinstance(params, dict):
+            for value in params.values():
+                if (
+                    isinstance(value, dict)
+                    and value.get("type") in _SPARSE_ATTENTION_TYPES
+                ):
+                    return value["type"]
+        return None
 
 
 @dataclass

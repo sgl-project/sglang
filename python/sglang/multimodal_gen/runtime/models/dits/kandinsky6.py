@@ -72,6 +72,28 @@ def _is_kandinsky6_transformer_block(name: str, module: object) -> bool:
     return is_module_list_entry_in(name, _KANDINSKY6_BLOCK_CONTAINERS)
 
 
+def _validate_parallelism(num_heads: int, **tp_dimensions: int) -> None:
+    """TP splits heads/FFNs; Ulysses splits video heads remaining after TP."""
+    tp_size = get_tp_world_size()
+    ulysses_size, _ = get_ulysses_ctx()
+    ring_size, _ = get_ring_ctx()
+    for name, size in (("TP", tp_size), ("Ulysses", ulysses_size), ("ring", ring_size)):
+        if size <= 0:
+            raise ValueError(f"Kandinsky6 {name} size must be positive.")
+    for name, value in dict(num_attention_heads=num_heads, **tp_dimensions).items():
+        if value % tp_size:
+            raise ValueError(
+                f"Kandinsky6 {name}={value} must be divisible by TP size {tp_size}."
+            )
+    # ring rotates complete K/V shards, so it imposes no head divisibility constraint
+    local_heads = num_heads // tp_size
+    if local_heads % ulysses_size:
+        raise ValueError(
+            f"Kandinsky6 TP-local video attention heads {local_heads} must be "
+            f"divisible by Ulysses size {ulysses_size} (total heads={num_heads}, TP={tp_size})."
+        )
+
+
 def _build_rotary_freqs(dim: int, max_period: float) -> torch.Tensor:
     return torch.exp(
         -math.log(max_period)
@@ -943,42 +965,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.TORCH_SDPA,
     }
 
-    @staticmethod
-    def _validate_tp_config(
-        *, arch: Kandinsky6ArchConfig, tp_size: int, num_heads: int, num_heads_a: int
-    ) -> None:
-        if tp_size <= 0:
-            raise ValueError("Kandinsky6 TP size must be positive.")
-        for name, value in (
-            ("num_attention_heads (video)", num_heads),
-            ("num_attention_heads_a (audio)", num_heads_a),
-            ("ff_dim", arch.ff_dim),
-            ("ff_dim_a", arch.ff_dim_a),
-        ):
-            if value % tp_size:
-                raise ValueError(
-                    f"Kandinsky6 {name}={value} must be divisible by TP size {tp_size}."
-                )
-
-    @staticmethod
-    def _validate_sequence_parallel_config(
-        *, tp_size: int, num_heads: int, ulysses_size: int, ring_size: int
-    ) -> None:
-        if ulysses_size <= 0:
-            raise ValueError("Kandinsky6 Ulysses size must be positive.")
-        if ring_size <= 0:
-            raise ValueError("Kandinsky6 ring size must be positive.")
-        if ulysses_size == 1 and ring_size == 1:
-            return
-        # only Ulysses splits heads; ring rotates complete K/V shards
-        local_heads = num_heads // tp_size
-        if local_heads % ulysses_size:
-            raise ValueError(
-                f"Kandinsky6 TP-local video attention heads {local_heads} must be "
-                f"divisible by Ulysses size {ulysses_size} (total video heads="
-                f"{num_heads}, TP={tp_size})."
-            )
-
     def __init__(
         self,
         config: Kandinsky6VideoAudioConfig,
@@ -1000,20 +986,11 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         head_dim = sum(arch.axes_dims)
         head_dim_a = sum(arch.axes_dims_a)
 
-        tp_size = get_tp_world_size()
-        ulysses_size, _ = get_ulysses_ctx()
-        ring_size, _ = get_ring_ctx()
-        self._validate_tp_config(
-            arch=arch,
-            tp_size=tp_size,
-            num_heads=arch.model_dim // head_dim,
-            num_heads_a=arch.model_dim_a // head_dim_a,
-        )
-        self._validate_sequence_parallel_config(
-            tp_size=tp_size,
-            num_heads=arch.model_dim // head_dim,
-            ulysses_size=ulysses_size,
-            ring_size=ring_size,
+        _validate_parallelism(
+            arch.model_dim // head_dim,
+            num_attention_heads_a=arch.model_dim_a // head_dim_a,
+            ff_dim=arch.ff_dim,
+            ff_dim_a=arch.ff_dim_a,
         )
         self.in_visual_dim = arch.in_visual_dim
         self.in_audio_dim = arch.in_audio_dim
@@ -1048,22 +1025,7 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             self._build_text_tower(
                 "", arch.model_dim, arch.time_dim, arch.ff_dim, head_dim
             )
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6TransformerDecoderBlock(
-                        arch.model_dim,
-                        arch.time_dim,
-                        arch.ff_dim,
-                        head_dim,
-                        self._supported_attention_backends,
-                        prefix=add_prefix(
-                            f"visual_transformer_blocks.{i}", self.prefix
-                        ),
-                        quant_config=quant_config,
-                    )
-                    for i in range(arch.num_visual_blocks)
-                ]
-            )
+            block_cls = Kandinsky6TransformerDecoderBlock
         else:
             self.audio_embeddings = Kandinsky6TextEmbeddings(
                 arch.in_audio_dim, arch.model_dim_a
@@ -1084,29 +1046,28 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 "audio_", arch.model_dim_a, arch.time_dim_a, arch.ff_dim_a, head_dim_a
             )
 
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6FusedTransformerDecoderBlock(
-                        arch.model_dim,
-                        arch.time_dim,
-                        arch.ff_dim,
-                        head_dim,
-                        arch.model_dim_a,
-                        arch.time_dim_a,
-                        arch.ff_dim_a,
-                        head_dim_a,
-                        self._supported_attention_backends,
-                        prefix=add_prefix(
-                            f"visual_transformer_blocks.{i}", self.prefix
-                        ),
-                        ca_rope=arch.ca_rope,
-                        cross_gates=arch.cross_gates,
-                        fix_modulation=arch.fix_modulation,
-                        quant_config=quant_config,
-                    )
-                    for i in range(arch.num_visual_blocks)
-                ]
+            block_cls = partial(
+                Kandinsky6FusedTransformerDecoderBlock,
+                model_dim_a=arch.model_dim_a,
+                time_dim_a=arch.time_dim_a,
+                ff_dim_a=arch.ff_dim_a,
+                head_dim_a=head_dim_a,
+                ca_rope=arch.ca_rope,
+                cross_gates=arch.cross_gates,
+                fix_modulation=arch.fix_modulation,
             )
+        self.visual_transformer_blocks = nn.ModuleList(
+            block_cls(
+                arch.model_dim,
+                arch.time_dim,
+                arch.ff_dim,
+                head_dim,
+                supported_attention_backends=self._supported_attention_backends,
+                prefix=add_prefix(f"visual_transformer_blocks.{i}", self.prefix),
+                quant_config=quant_config,
+            )
+            for i in range(arch.num_visual_blocks)
+        )
 
         self.gradient_checkpointing = False
         self.hidden_size = arch.hidden_size
