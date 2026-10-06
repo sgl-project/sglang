@@ -203,6 +203,7 @@ class TestHostSnapshot(unittest.TestCase):
         self.cache = self.root / "cache"
         self.cache.mkdir()
         for replacement in (
+            patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "0"}),
             patch.object(host, "_cache_base", return_value=self.cache),
             patch.object(host, "_CAPACITY_ALIGNMENT", 1024),
             patch.object(host, "HostAllocation", FakeHostAllocation),
@@ -235,8 +236,8 @@ class TestHostSnapshot(unittest.TestCase):
             validating.set()
             assert validated.wait(5)
 
-        def delayed_read(source, destination, expected):
-            result = original_read(source, destination, expected)
+        def delayed_read(source, destination, expected, skip_payload_hash):
+            result = original_read(source, destination, expected, skip_payload_hash)
             if source.name == "owner.bin":
                 entered.set()
                 assert release.wait(5)
@@ -292,6 +293,16 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertFalse(builder.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(metrics["host_encoded_cache_hash_files"], 2)
+        self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 0)
+        self.assertGreaterEqual(
+            metrics["host_rank_decode_call_s"], metrics["host_rank_outer_zstd_decode_s"]
+        )
+        self.assertGreaterEqual(
+            metrics["host_rank_prepare_body_s"],
+            metrics["host_encoded_cache_access_s"]
+            + metrics["host_rank_layout_s"]
+            + metrics["host_rank_decode_call_s"],
+        )
         snapshot = snapshots[0]
         self.assertEqual(
             {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
@@ -312,6 +323,80 @@ class TestHostSnapshot(unittest.TestCase):
         follower.close()
         snapshot.close()
 
+    def test_payload_hash_policy_is_cached_and_shared_cache_requires_agreement(self):
+        path, digest, manifest, expected = fixture(self.root)
+        strict = self.arena("strict")
+        with patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "1"}):
+            unchecked, follower = self.arena(), self.arena()
+            unchecked_strict_peer = self.arena("strict")
+        strict_peer = self.arena()
+        strict_snapshot = strict.prepare(
+            path,
+            digest,
+            manifest,
+            local_entries(manifest, expected),
+            self.pool,
+            {},
+            metadata(engine="strict"),
+        )
+        with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
+            unchecked_strict_peer.prepare(
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(engine="strict"),
+            )
+        strict_snapshot.close()
+
+        # The manifest itself still has an exact digest; only payload SHA is skipped.
+        manifest["files"][0]["sha256"] = "0" * 64
+        path.write_text(json.dumps(manifest))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        for arena, created in ((unchecked, 1), (follower, 0)):
+            metrics = {}
+            snapshot = arena.prepare(
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                metrics,
+                metadata(),
+            )
+            self.assertEqual(
+                {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
+            )
+            self.assertTrue(snapshot.index["publication"]["skip_payload_hash"])
+            self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 1)
+            self.assertEqual(metrics["host_encoded_cache_created"], created)
+            self.assertEqual(metrics["host_encoded_cache_frames_validations"], created)
+            for field in ("hash_files", "hash_bytes", "sha256_worker_sum_s"):
+                self.assertEqual(metrics["host_encoded_cache_" + field], 0)
+            snapshot.close()
+        with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
+            strict_peer.prepare(
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(),
+            )
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            self.arena("strict-bad-sha").prepare(
+                path,
+                digest,
+                manifest,
+                local_entries(manifest, expected),
+                self.pool,
+                {},
+                metadata(engine="strict-bad-sha"),
+            )
+
     def test_hash_failure_poison_and_rank_decode_failure_never_release_cache(self):
         path, digest, manifest, expected = fixture(self.root)
         manifest["files"][0]["sha256"] = "0" * 64
@@ -319,12 +404,12 @@ class TestHostSnapshot(unittest.TestCase):
         finished, errors = threading.Event(), []
         original_read = host._read_verify_payload
 
-        def blocked_peer(source, destination, record):
+        def blocked_peer(source, destination, record, skip_payload_hash):
             if source.name == "foreign.bin":
                 peer_entered.set()
                 assert release.wait(5)
             try:
-                return original_read(source, destination, record)
+                return original_read(source, destination, record, skip_payload_hash)
             except ValueError:
                 failed.set()
                 raise
@@ -459,12 +544,15 @@ class TestHostSnapshot(unittest.TestCase):
         content = json.dumps(manifest).encode()
         path.write_bytes(content)
         digest = hashlib.sha256(content).hexdigest()
-        arena, errors = self.arena(), []
+        with patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "1"}):
+            arena = self.arena()
+            follower = self.arena()
+        errors = []
         entered, release, finished = [threading.Event() for _ in range(3)]
         original_read = host._read_verify_payload
 
-        def delayed_read(source, destination, record):
-            result = original_read(source, destination, record)
+        def delayed_read(source, destination, record, skip_payload_hash):
+            result = original_read(source, destination, record, skip_payload_hash)
             if source.name == "owner.bin":
                 entered.set()
                 assert release.wait(5)
@@ -515,7 +603,7 @@ class TestHostSnapshot(unittest.TestCase):
         decode.assert_not_called()
         self.assertIsNone(arena.allocation)
         with self.assertRaisesRegex(ValueError, "failed or already released"):
-            self.arena().prepare(
+            follower.prepare(
                 path,
                 digest,
                 manifest,
@@ -563,6 +651,7 @@ class TestHostSnapshot(unittest.TestCase):
                             "nbytes": len(data),
                             "sha256": hashlib.sha256(data).hexdigest(),
                         },
+                        False,
                     )
                     self.assertEqual(destination, data)
                     self.assertTrue(all(value >= 0 for value in times))
@@ -571,12 +660,21 @@ class TestHostSnapshot(unittest.TestCase):
         with memoryview(bytearray(100)) as destination:
             with self.assertRaisesRegex(ValueError, "truncated delta payload"):
                 host._read_verify_payload(
-                    path, destination, {"nbytes": 80, "sha256": "0" * 64}
+                    path, destination, {"nbytes": 80, "sha256": "0" * 64}, True
                 )
         with mmap.mmap(-1, 80) as mapping, memoryview(mapping) as destination:
             with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
                 host._read_verify_payload(
-                    path, destination, {"nbytes": 80, "sha256": "0" * 64}
+                    path, destination, {"nbytes": 80, "sha256": "0" * 64}, False
+                )
+            _, hash_s = host._read_verify_payload(
+                path, destination, {"nbytes": 80, "sha256": "0" * 64}, True
+            )
+            self.assertEqual(destination, b"a" * 80)
+            self.assertEqual(hash_s, 0)
+            with self.assertRaisesRegex(ValueError, "payload size mismatch"):
+                host._read_verify_payload(
+                    path, destination, {"nbytes": 79, "sha256": "0" * 64}, True
                 )
 
     def test_local_decode_does_not_hold_engine_encoded_cache_lock(self):

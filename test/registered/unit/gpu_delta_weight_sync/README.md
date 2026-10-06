@@ -68,6 +68,11 @@ scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
 Preparation reads, validates and hashes encoded publication files once per engine-host.
+`GPU_DELTA_SKIP_PAYLOAD_HASH=1` skips only the payload SHA256 pass; the default is
+`0`. Each rank caches this setting when its HostArena is created. The encoded
+cache index and READY token bind the policy, and all ranks in the original cohort
+must agree. Skipping trusts payload contents without SHA authentication; manifest
+SHA, file identity/size, path, frame-range and decode checks remain in force.
 Each rank unwraps only its local tensors directly into its own retained, original
 DE-capable host allocation for CPU and GPU access.
 Preparation packs each publication's frames into one contiguous numeric table of
@@ -326,17 +331,25 @@ through file verification joins, before waiting for global frame validation.
 Frame validation runs in the same pool and can overlap this span; both are nested
 inside cache build and must not be added to obtain elapsed time.
 `host_encoded_cache_read_worker_sum_s` and `host_encoded_cache_sha256_worker_sum_s`
-sum read-loop and hash-update intervals. A private reader fills the next disjoint
-chunk while the file worker hashes the completed chunk, so these intervals can
-overlap within a file as well as across files. Neither is additive with the wall
-span; thread setup, file checks and joins remain in enclosing wall time.
+sum file-read and SHA intervals. Each file is read directly into its final retained
+mapping, then hashed there. Different files can run concurrently; neither worker
+sum is additive with the enclosing wall span, which also includes scheduling and joins.
 `host_encoded_cache_hash_files`, `hash_bytes` and `frames_validations` (with the
-same prefix) count shared work once. All reads and frame validation drain before
+same prefix) count shared work once. `host_encoded_cache_skip_payload_hash` reports
+the cached policy on every rank; skipped SHA worker time, hash bytes and hash files
+are zero, including on the creator. All reads and frame validation drain before
 READY or failure returns; rank allocation and local decode start only after both
 pass. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
-cache access, rank allocation and local outer decode.
+cache access, rank allocation and local outer decode through HostArena return.
+`host_encoded_cache_access_s` covers HostArena entry through cache mutex release,
+including wait/build/attachment. `host_rank_layout_s` covers local tensor ordering
+and arena-offset planning before allocation. `host_rank_decode_call_s` includes
+the outer-decode call and cleanup of its local jobs/results on return.
+`host_rank_prepare_body_s` ends after snapshot construction, before the final timing
+copy and function-return cleanup. These timers are nested within preparation;
+the caller-minus-body residual includes final bookkeeping and return cleanup.
 
 `host_plan_cache_reused` reports whether the canonical plan's static definitions
 were already qualified. Every publication still authenticates its manifest and

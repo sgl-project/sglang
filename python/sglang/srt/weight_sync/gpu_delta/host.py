@@ -129,7 +129,7 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
-def _read_verify_payload(source, destination, expected):
+def _read_verify_payload(source, destination, expected, skip_payload_hash):
     started = time.perf_counter()
     with source.open("rb", buffering=0) as incoming:
         before = os.fstat(incoming.fileno())
@@ -150,6 +150,8 @@ def _read_verify_payload(source, destination, expected):
         ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("delta payload size mismatch or source changed")
     read_s = time.perf_counter() - started
+    if skip_payload_hash:
+        return read_s, 0.0
     started = time.perf_counter()
     # Authenticate the retained copy, never reread the publication file.
     if hashlib.sha256(destination).hexdigest() != expected["sha256"]:
@@ -157,7 +159,9 @@ def _read_verify_payload(source, destination, expected):
     return read_s, time.perf_counter() - started
 
 
-def _read_verify_payloads(publication, files, definitions, manifest, pool, metrics):
+def _read_verify_payloads(
+    publication, files, definitions, manifest, pool, metrics, skip_payload_hash
+):
     def validate_frames():
         started = time.perf_counter()
         validate_outer_entries(
@@ -177,7 +181,13 @@ def _read_verify_payloads(publication, files, definitions, manifest, pool, metri
             if source.parent != publication.parent:
                 raise ValueError("delta payload escapes immutable publication")
             futures.append(
-                pool.executor.submit(_read_verify_payload, source, files[name], record)
+                pool.executor.submit(
+                    _read_verify_payload,
+                    source,
+                    files[name],
+                    record,
+                    skip_payload_hash,
+                )
             )
     except BaseException as exc:  # noqa: BLE001 - drain submitted file tasks
         error = exc
@@ -313,13 +323,16 @@ def _map_files(directory, encoded, definitions):
 class HostArena:
     """Persistent rank-owned DE storage with an engine-host encoded cache.
 
-    The original engine cohort shares only verified encoded files. Successful
+    The original engine cohort shares encoded files under one hash policy. Successful
     all-rank apply/resume permits the next publication to overwrite that cache;
     aborted/failed preparation never grants release.
     """
 
     def __init__(self, engine_id, device):
         self.engine_id, self.device = engine_id, device
+        self.skip_payload_hash = (
+            os.environ.get("GPU_DELTA_SKIP_PAYLOAD_HASH", "0") == "1"
+        )
         self.allocation = self.mapping = self.tensor = None
         self.capacity = None
         self.directory = None
@@ -368,6 +381,7 @@ class HostArena:
         timings,
         metadata,
     ):
+        started = time.perf_counter()
         root = _cache_root(self.engine_id)
         publication = Path(manifest_path).resolve(strict=True)
         namespace = {
@@ -400,6 +414,7 @@ class HostArena:
             "base_version": metadata["base_version"],
             "target_version": metadata["target_version"],
             "files": definitions,
+            "skip_payload_hash": self.skip_payload_hash,
         }
         token = hashlib.sha256(
             json.dumps(expected, sort_keys=True).encode()
@@ -444,6 +459,12 @@ class HostArena:
             )
             if previous and previous["namespace"] != namespace:
                 raise ValueError("encoded cache namespace differs")
+            if (
+                previous
+                and previous["publication"]["skip_payload_hash"]
+                != self.skip_payload_hash
+            ):
+                raise ValueError("encoded cache payload hash policy differs")
             if previous and previous["publication"] == expected:
                 if state != {
                     "token": token,
@@ -493,10 +514,17 @@ class HostArena:
                 )
                 files = _map_files(directory, encoded, definitions)
                 _read_verify_payloads(
-                    publication, files, definitions, manifest, pool, metrics
+                    publication,
+                    files,
+                    definitions,
+                    manifest,
+                    pool,
+                    metrics,
+                    self.skip_payload_hash,
                 )
-                metrics["host_encoded_cache_hash_bytes"] = encoded_size
-                metrics["host_encoded_cache_hash_files"] = len(definitions)
+                if not self.skip_payload_hash:
+                    metrics["host_encoded_cache_hash_bytes"] = encoded_size
+                    metrics["host_encoded_cache_hash_files"] = len(definitions)
                 index["build_s"] = time.perf_counter() - build_started
                 _write_record(directory, "index", index)
                 _write_record(
@@ -511,7 +539,9 @@ class HostArena:
                 if previous and previous["encoded"]["file"] != encoded["file"]:
                     (directory / previous["encoded"]["file"]).unlink()
                 metrics["host_encoded_cache_created"] = 1
+        metrics["host_encoded_cache_access_s"] = time.perf_counter() - started
         self.directory = directory
+        layout_started = time.perf_counter()
         if self.tensor_order is None:
             # Local binding order is immutable; retain indices, not old entries.
             self.tensor_order = sorted(
@@ -523,7 +553,9 @@ class HostArena:
             )
         entries = [local_entries[i] for i in self.tensor_order]
         layout, size = _tensor_layout(entries)
+        metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
         self._reserve_rank_arena(size, metrics)
+        decode_started = time.perf_counter()
         _decode_arena(
             self.mapping if self.mapping is not None else memoryview(b""),
             layout,
@@ -532,6 +564,7 @@ class HostArena:
             pool,
             metrics,
         )
+        metrics["host_rank_decode_call_s"] = time.perf_counter() - decode_started
         metrics.update(
             host_rank_arena_bytes=size,
             host_rank_capacity_bytes=self.capacity["capacity"],
@@ -540,13 +573,16 @@ class HostArena:
             host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
             host_encoded_cache_capacity_generation=index["encoded"]["generation"],
             host_encoded_cache_build_s=index["build_s"],
+            host_encoded_cache_skip_payload_hash=int(self.skip_payload_hash),
         )
-        timings.update(metrics)
-        return HostDecodedSnapshot(
+        snapshot = HostDecodedSnapshot(
             self,
             index
             | {"tensors": layout, "arena_bytes": size, "rank_arena": self.capacity},
         )
+        metrics["host_rank_prepare_body_s"] = time.perf_counter() - started
+        timings.update(metrics)
+        return snapshot
 
     def close(self):
         self.tensor = self.mapping = None
