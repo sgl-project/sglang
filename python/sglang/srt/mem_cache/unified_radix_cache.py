@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
@@ -93,7 +94,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import get_memory, get_model, get_observability
-from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -975,9 +976,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        result = self.session.try_inc_lock_ref(node_id)
-        if result is not None:
-            return result
         if self.disable:
             return IncLockRefResult()
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
@@ -988,45 +986,41 @@ class UnifiedRadixCache(BasePrefixCache):
         params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        result = self.session.try_dec_lock_ref(node_id, params)
-        if result is not None:
-            return result
         if self.disable:
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
-    def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
-        """Release the tree lock a request holds on its last_node with the
-        receipt its acquire returned, so it never drops a lock it never took."""
-        self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
+    def lock(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> Optional[TreeLock]:
+        # A session's virtual node stands for a lock its slot already holds.
+        if is_virtual_node(node_id):
+            return None
+        result = self.inc_lock_ref(node_id, skip_lock_components)
+        return TreeLock(node_id, result.to_dec_params())
 
-    def unpin(self, req: Req) -> None:
-        # Synthetic profiling requests may own KV without locking a tree node.
-        if req.last_node is not None:
-            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
-
-    def dec_swa_lock_only(
-        self,
-        node_id: NodeId,
-        params: DecLockRefParams,
-    ) -> None:
-        if self.disable:
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is None:
             return
-        result = self.tree_core.dec_swa_lock_only(node_id, params)
+        self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
+
+    def release_swa(self, lock: Optional[TreeLock]) -> None:
+        """Release the SWA part of ``lock`` early, once."""
+        if self.disable or lock is None or lock.swa_released:
+            return
+        result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
         self._free_values(result.device_frees, result.host_frees)
+        lock.swa_released = True
 
     def release_swa_prefix_lock(self, req: Req) -> None:
         """The request's window has moved past its prefix: leave the prefix's
         SWA evictable. A session turn releases its slot's lock, once per session."""
-        holder = self.session.borrowed_slot(req) or req
+        lock = (self.session.borrowed_slot(req) or req).lock
         if (
-            holder.swa_prefix_lock_released
-            or holder.last_node is None
-            or holder.lock_receipt.component_lock_uuids.get(ComponentType.SWA) is None
+            lock is not None
+            and lock.receipt.component_lock_uuids.get(ComponentType.SWA) is not None
         ):
-            return
-        self.dec_swa_lock_only(holder.last_node, holder.lock_receipt)
-        holder.swa_prefix_lock_released = True
+            self.release_swa(lock)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
@@ -1208,14 +1202,14 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
         # already COW'd to the request's own slot, never read from this node again).
         # Safe only because any future COW source is the COWing request's own
         # admission-locked last_node (recorded only if still present, locked before
         # the next alloc) -- not this evictable node. A scheduler that matched a
         # whole batch before locking would break that. Off = original full lock.
-        lock_result = self.inc_lock_ref(
+        req.lock = self.lock(
             new_last_node,
             skip_lock_components=(
                 (ComponentType.MAMBA,)
@@ -1233,10 +1227,6 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
-        # Carry the receipt so this node's dec releases only what we locked.
-        req.lock_receipt = lock_result.to_dec_params()
-        # The rematch acquired a new SWA prefix lock.
-        req.swa_prefix_lock_released = False
 
         # cleanup
         for comp in self._components_tuple:
