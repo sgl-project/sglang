@@ -217,10 +217,7 @@ async fn prepare(
             (routing, PreparedRequest::generate(ctx, model, body)?)
         }
         Endpoint::Embeddings | Endpoint::Classify => {
-            let path = match endpoint {
-                Endpoint::Embeddings => EMBEDDINGS_PATH,
-                _ => CLASSIFY_PATH,
-            };
+            let path = endpoint.path();
             let (model, value) = parse_embedding_request(&body)?;
             let routing = ModelRouting::lookup(ctx, &model)?;
             require_plain_workers(ctx, &model, path)?;

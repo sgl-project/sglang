@@ -445,11 +445,20 @@ async fn typed_unary_rpc_returns_the_engine_reply() {
         input_ids: vec![4, 5],
         ..Default::default()
     };
+    let mut request = tonic::Request::new(request);
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    request
+        .metadata_mut()
+        .insert("traceparent", traceparent.parse().unwrap());
     let reply = client.embed(request).await.unwrap().into_inner();
     assert_eq!(reply.embedding, [0.5]);
     let sent = embeds.last().await;
     assert_eq!(sent.input_ids, [4, 5]);
     assert!(sent.rid.is_some(), "the router mints an engine rid");
+    assert_eq!(
+        sent.trace_headers["traceparent"], traceparent,
+        "trace context reaches the engine"
+    );
 }
 
 #[tokio::test]

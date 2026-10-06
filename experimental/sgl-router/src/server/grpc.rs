@@ -258,7 +258,7 @@ macro_rules! sglang_service {
     };
 }
 
-/// A typed RPC: prepared through the JSON its HTTP sibling reads, then sent as typed.
+/// A typed RPC: prepared from its fields like its HTTP route, then sent as typed.
 macro_rules! typed {
     ($self:ident, $request:ident, $endpoint:ident, $rpc:literal, $finish:ident) => {{
         let (headers, request) = request_headers($request, |r| &r.trace_headers);
