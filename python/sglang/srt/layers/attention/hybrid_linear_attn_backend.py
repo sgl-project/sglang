@@ -1156,6 +1156,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    @property
+    def reads_kv_index_table(self) -> bool:
+        # The KV reads are the full-attention backend's; the linear one reads
+        # state slots.
+        return getattr(self.full_attn_backend, "reads_kv_index_table", True)
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

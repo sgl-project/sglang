@@ -196,6 +196,7 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     """TRTLLM MLA attention kernel from flashinfer."""
 
+    reads_kv_index_table = True  # the kernels read a block table
     # trtllm-gen kernels rebuild metadata from preallocated buffers and never
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False

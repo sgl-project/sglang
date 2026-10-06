@@ -163,6 +163,7 @@ class TRTLLMMHAMetadata:
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
+    reads_kv_index_table = True  # the kernels read a page table
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
     # via the full->SWA lookup; see _fill_page_table_device), so we never need the
     # seq_lens_cpu D2H sync; opt out of it, matching trtllm_mla / triton.

@@ -404,6 +404,92 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(own_plan(ForwardMode.EXTEND, spec).read_extent, 0)
         self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
 
+    def test_a_stream_only_iteration_builds_no_table(self):
+        """When nothing else in the iteration would read the plan's table --
+        one runner reads these rows, and through streams only -- the first
+        stream reader gets its stream alone: one gather of its rows, no table.
+        A second runner of the same rows, or one that reads tables, brings the
+        shared build back; a table read after a stream-only one still gets its
+        table."""
+        calls = {"packed": 0, "fused": 0, "table": 0}
+
+        def counting(name, real):
+            def wrapped(**kwargs):
+                calls[name] += 1
+                return real(**kwargs)
+
+            return wrapped
+
+        def stream_only_backend():
+            return SimpleNamespace(kv_index_translator=None, reads_kv_index_table=False)
+
+        # A runner of rows no other translator here reads.
+        self.req_to_token = self.req_to_token.clone()
+        solo = self._translator(self.allocator.get_kvcache())
+        solo.bind_and_verify_backends([stream_only_backend()])
+        bs = int(self.rpi.numel())
+        lens = torch.tensor([3, 2], dtype=torch.int64)
+        indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        def pack(translator, plan, out):
+            return translator.pack_read_stream(
+                plan, req_pool_indices=self.rpi, seq_lens=lens, indptr=indptr, out=out
+            )
+
+        with (
+            patch.object(
+                kv_index_translator,
+                "build_kv_read_table_packed",
+                counting("packed", kv_index_translator.build_kv_read_table_packed),
+            ),
+            patch.object(
+                kv_index_translator,
+                "build_kv_read_table_and_stream",
+                counting("fused", kv_index_translator.build_kv_read_table_and_stream),
+            ),
+            patch.object(
+                kv_index_translator,
+                "build_kv_read_table",
+                counting("table", kv_index_translator.build_kv_read_table),
+            ),
+        ):
+            plan = self._plan(solo, read_extent=1)
+            out = torch.full((6,), -7, dtype=torch.int32)
+            self.assertTrue(pack(solo, plan, out))
+            self.assertEqual(calls, {"packed": 1, "fused": 0, "table": 0})
+            self.assertFalse(plan.has_read_table())
+            for b in range(bs):
+                row = self.req_to_token[int(self.rpi[b]), : int(lens[b])]
+                want = self.allocator.translate_write_loc(row.to(torch.int64))
+                got = out[int(indptr[b]) : int(indptr[b + 1])].to(torch.int64)
+                self.assertTrue(torch.equal(got, want))
+            self.assertEqual(int(out[5]), -7)  # past the stream: untouched
+
+            # A table read after it still gets one.
+            plan.read_table()
+            self.assertEqual(calls["table"], 1)
+
+            # Another runner of the same rows (a draft): the shared build.
+            peer = self._translator(self.draft_pool)
+            peer.bind_and_verify_backends([stream_only_backend()])
+            shared = self._plan(solo, read_extent=1)
+            pack(solo, shared, torch.empty(6, dtype=torch.int32))
+            self.assertEqual(calls["fused"], 1)
+            self.assertTrue(shared.has_read_table())
+            # The draft has no sliding-window sub-pool: that one the target
+            # alone reads, so its stream still comes alone.
+            self.assertFalse(solo.table_is_read_again(_SWA))
+            solo.pack_read_stream(
+                shared,
+                req_pool_indices=self.rpi,
+                seq_lens=lens,
+                indptr=indptr,
+                out=torch.empty(6, dtype=torch.int32),
+                kind=_SWA,
+            )
+            self.assertEqual(calls["packed"], 2)
+            self.assertFalse(shared.has_read_table(_SWA))
+
     def test_a_captured_first_reader_holds_the_table(self):
         """When the plan's first reader is a captured table, the table is built
         in that buffer -- no table of the plan's own, no copy -- and serves the

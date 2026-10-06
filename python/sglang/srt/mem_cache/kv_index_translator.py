@@ -58,6 +58,7 @@ DCP index kernels select them.
 
 from __future__ import annotations
 
+import weakref
 from typing import Dict, Optional
 
 import msgspec
@@ -69,6 +70,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_and_stream,
+    build_kv_read_table_packed,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
@@ -109,6 +111,12 @@ class KVReadStream(msgspec.Struct, frozen=True):
     kv_start_idx: Optional[torch.Tensor]
 
 
+# This process's translators: a plan asks the ones that read its rows whether
+# its table would be read (`table_is_read_again`).
+_TRANSLATORS: weakref.WeakSet[KVIndexTranslator] = weakref.WeakSet()
+_BINDINGS = [0]  # bumped whenever a translator learns its backends
+
+
 class KVIndexTranslator:
     """Built once per ModelRunner."""
 
@@ -124,6 +132,12 @@ class KVIndexTranslator:
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
+        # Whether this runner's backends read a page table (None until they
+        # are bound), and, per sub-pool, the answer for every runner of these
+        # rows (`table_is_read_again`), cached.
+        self._reads_table: Optional[bool] = None
+        self._table_read_again: Dict[IdSpaceKind, tuple] = {}
+        _TRANSLATORS.add(self)
 
         is_unified_target = (
             isinstance(
@@ -463,8 +477,27 @@ class KVIndexTranslator:
         fuse that translation into the gather."""
         bs = int(seq_lens.numel())
         if self._reads_translated(kind) and not plan.has_read_table(kind):
-            # The plan's first reader: the build that makes its table packs
-            # this stream from the same gather.
+            if not self.table_is_read_again(kind):
+                # Nothing else this iteration would read the table: this
+                # stream alone, from one gather of the caller's rows.
+                assert plan.is_read_by(self), (
+                    "a translating reader must read through the plan of its "
+                    "own req_to_token rows"
+                )
+                build_kv_read_table_packed(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    v2p=self.space(kind).read_v2p,
+                    indptr=indptr,
+                    page_size=self.page_size,
+                    max_tokens=out.numel(),
+                    out=out,
+                    kv_start_idx=kv_start_idx,
+                )
+                return True
+            # The plan's first reader, and the table will be read again: the
+            # build that makes it packs this stream from the same gather.
             self._plan_table(
                 plan,
                 kind=kind,
@@ -541,12 +574,39 @@ class KVIndexTranslator:
         """
         return self._full_v2p_table
 
+    def table_is_read_again(self, kind: IdSpaceKind) -> bool:
+        """Whether a plan's page table in the ``kind`` sub-pool, built for its
+        first CSR stream, would serve another read in the iteration: another
+        runner reads that sub-pool of the same `req_to_token` rows through the
+        plan (a speculative iteration's draft and target), or a runner of them
+        reads the table form itself. A runner whose backends are not bound yet
+        counts as one that does."""
+        cached = self._table_read_again.get(kind)
+        if cached is not None and cached[0] == _BINDINGS[0]:
+            return cached[1]
+        readers = [
+            t
+            for t in _TRANSLATORS
+            if t.req_to_token is self.req_to_token and t._reads_translated(kind)
+        ]
+        value = len(readers) > 1 or any(t._reads_table is not False for t in readers)
+        self._table_read_again[kind] = (_BINDINGS[0], value)
+        return value
+
     def bind_and_verify_backends(self, backends) -> None:
-        """Boot: make every reachable backend carry THIS translator.
+        """Boot: make every reachable backend carry THIS translator, and learn
+        whether any of them reads a page table (`reads_kv_index_table`).
 
         Model-layer producers read it off `get_attn_backend()`, so an unset
         attribute is an unreachable hook, not "no translation needed".
         """
+        reads_table = any(
+            getattr(backend, "reads_kv_index_table", True)
+            for backend in backends
+            if backend is not None
+        )
+        self._reads_table = bool(self._reads_table) or reads_table
+        _BINDINGS[0] += 1
         for backend in backends:
             if backend is None:
                 continue
