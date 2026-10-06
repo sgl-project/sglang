@@ -209,6 +209,7 @@ class ResponseTemplateStreamAdapter:
         )
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
+        self._open_region: dict | None = None
         self._grammar_start = grammar_start
         # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
@@ -227,6 +228,7 @@ class ResponseTemplateStreamAdapter:
             constrained=self._constrained,
         )
         self._prefix_end = len(self._parser.input_text)
+        self._track(self._parser.initial_events)
         for event in reversed(self._parser.initial_events):
             if event.get("field") == _TOOL_FIELD and event["type"] != "region_chunk":
                 return [event] if event["type"] == "region_open" else []
@@ -238,7 +240,7 @@ class ResponseTemplateStreamAdapter:
         if self._verbatim:
             return [_passthrough_chunk(text)] if text else []
         events = self._start(tools)
-        return self._end_reasoning(events + self._parser.feed(text))
+        return self._end_reasoning(events + self._track(self._parser.feed(text)))
 
     def finalize(self, tools: Sequence[Any] | None = None) -> list[dict]:
         if self._finalized:
@@ -247,7 +249,32 @@ class ResponseTemplateStreamAdapter:
         self._finalized = True
         if self._verbatim:
             return events
+        events += self._parser.feed(self._closer_rest())
         return self._end_reasoning(events + self._parser.finalize()[1])
+
+    def _track(self, events: list[dict]) -> list[dict]:
+        for event in events:
+            if event["type"] == "region_open":
+                self._open_region = event
+            elif event["type"] in ("region_close", "region_malformed"):
+                self._open_region = None
+        return events
+
+    def _closer_rest(self) -> str:
+        """The rest of a closer the output stopped in after ending its region,
+        when only the next message's start anchor is missing."""
+        if self._open_region is None:
+            return ""
+        field = self._template.fields[self._open_region["field"]]
+        text = self._parser.input_text[self._open_region["end"] :]
+        for closer in field.close_literals or ():
+            for anchor in message_start_anchors(self._template):
+                if not anchor or not closer.endswith(anchor) or closer == anchor:
+                    continue
+                for cut in range(len(closer) - 1, len(closer) - len(anchor) - 1, -1):
+                    if text.endswith(closer[:cut]):
+                        return closer[cut:]
+        return ""
 
     def _end_reasoning(self, events: list[dict]) -> list[dict]:
         # Stop parsing at the reasoning end, where the grammar backend starts

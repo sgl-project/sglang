@@ -121,6 +121,37 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
         self.assertEqual(json.loads(calls[1].parameters), {"hour": 7})
 
+    def test_output_cut_before_the_next_message_start_ends_its_region(self):
+        """Output that stops after `<|end|>`, such as at `max_tokens`, has ended
+        its reasoning or call and lacks only the next message's start."""
+        for end in ("<|end|>", "<|end|><|start|>"):
+            with self.subTest(end=end):
+                reasoning_parser = ReasoningParser(model_type="beam", prefix=PREFIX)
+                parser, streaming = (
+                    FunctionCallParser(
+                        tools=[_tool()], tool_call_parser="beam", prefix=PREFIX
+                    )
+                    for _ in range(2)
+                )
+                generation = _continuation_call(
+                    "get_weather", _parameter("city", "Paris"), terminator=end
+                )
+
+                reasoning, _ = reasoning_parser.parse_non_stream(
+                    "<|channel|>analysis<|message|>plan" + end
+                )
+                _, calls = parser.parse_non_stream(generation)
+                streamed = streaming.parse_stream_chunk(generation)[1]
+                streamed += streaming.parse_stream_end()[1]
+
+                self.assertEqual(reasoning, "plan")
+                self.assertEqual([call.name for call in calls], ["get_weather"])
+                self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
+                self.assertEqual(
+                    json.loads("".join(call.parameters for call in streamed)),
+                    {"city": "Paris"},
+                )
+
     def test_tool_call_requires_constraint_marker(self):
         parser = FunctionCallParser(
             tools=[_tool()],
