@@ -79,6 +79,7 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -409,6 +410,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _create_block_kv_indices(
         self,
+        plan: KVLocPlan,
         batch_size: int,
         max_blocks: int,
         req_pool_indices: torch.Tensor,
@@ -428,11 +430,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Returns:
             Block KV indices tensor
         """
+        dcp_enabled = get_parallel().dcp_enabled
+        translated = self.kv_index_translator.is_translating and not dcp_enabled
+        # A translated table holds the plan's page ids and reads the sink past
+        # them: a draft extend pads every row's key length to its widest row,
+        # and the padded queries (whose outputs are dropped) read that far.
         block_kv_indices = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+            (batch_size, max_blocks),
+            0 if translated else -1,
+            dtype=torch.int32,
+            device=device,
         )
 
-        if get_parallel().dcp_enabled:
+        if dcp_enabled:
             self._fill_dcp_block_kv_indices(
                 block_kv_indices,
                 req_pool_indices,
@@ -440,12 +450,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             return block_kv_indices
 
-        if self.kv_index_translator.is_translating:
-            self.kv_index_translator.fill_read_table(
-                out=block_kv_indices,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-            )
+        if translated:
+            self.kv_index_translator.copy_page_table(plan, out=block_kv_indices)
         else:
             create_flashmla_kv_indices_triton[
                 (
@@ -594,6 +600,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _apply_cuda_graph_metadata(
         self,
+        plan: KVLocPlan,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -633,10 +640,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Update block indices for new sequences.
         if self.kv_index_translator.is_translating:
-            self.kv_index_translator.fill_read_table(
-                out=metadata.block_kv_indices,
-                req_pool_indices=req_pool_indices[:bs],
-                seq_lens=seq_lens,
+            # The plan's table reaches a verify's draft tail.
+            self.kv_index_translator.copy_page_table(
+                plan, out=metadata.block_kv_indices[:bs]
             )
         else:
             create_flashmla_kv_indices_triton[
@@ -746,6 +752,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -753,6 +760,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -858,6 +866,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
+                forward_batch.kv_loc_plan,
                 bs,
                 max_seqlen_pad,
                 forward_batch.req_pool_indices,

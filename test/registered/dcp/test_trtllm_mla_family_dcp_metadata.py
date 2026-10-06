@@ -55,6 +55,7 @@ def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
         patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
     ):
         backend._apply_cuda_graph_metadata(
+            plan=None,  # DCP builds its own block table
             bs=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
             seq_lens=seq_lens,

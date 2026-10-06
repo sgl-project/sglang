@@ -1088,15 +1088,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
             metadata = self.forward_metadata
-            # `cache_seqlens_int32` is what the attention kernels bound their
-            # page-table reads by, and the fused metadata call above wrote it.
-            # A target verify reads `draft_token_num` further than `seq_lens`
-            # goes, so filling to `seq_lens` leaves those columns untranslated.
-            self.kv_index_translator.fill_read_table(
-                out=metadata.page_table,
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=metadata.cache_seqlens_int32,
-                sliding_window_out=metadata.swa_page_table,
+            # The kernels bound their page-table reads by `cache_seqlens_int32`
+            # (the fused metadata call above wrote it); the plan's table
+            # reaches that far, a target verify's draft tail included.
+            self.kv_index_translator.copy_page_table(
+                forward_batch.kv_loc_plan,
+                out=metadata.page_table[:bs],
+                sliding_window_out=(
+                    None
+                    if metadata.swa_page_table is None
+                    else metadata.swa_page_table[:bs]
+                ),
             )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
@@ -1264,7 +1266,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
+        kv_view = forward_batch.kv_loc_plan.read_table()
         if kv_view.is_translated:
             # No fill kernel: the kernels take the tensor's own width/stride
             # and bound their reads by cache_seqlens.
