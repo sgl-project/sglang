@@ -1458,6 +1458,22 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
         self.assertIsNone(lora_names.get("uuid-a"))
 
+    def test_lora_name_survives_until_queued_stores_are_taken(self):
+        """A finished request's blocks still publish under its adapter when
+        other requests register before the events are taken."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        for i in range(200):
+            lora_names.register(_LoraReq(f"other-{i}"), "adapter-b")
+
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
+
     def test_lora_event_parentage_survives_node_split(self):
         lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(

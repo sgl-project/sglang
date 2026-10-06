@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.events import KVCacheEventRecorder, KvEventLoraNames
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -773,20 +773,6 @@ class TestRadixCache(CustomTestCase):
                 ]
             )
         self.assertEqual(published[0], published[1])
-
-    def test_lora_names_stay_bounded_without_taking_events(self):
-        """Ranks that never take events (e.g. attn-TP rank 1) must still forget
-        the namespaces of finished requests."""
-
-        class Req:
-            def __init__(self, i):
-                self.extra_key, self.lora_id = f"user-{i}|lora", "lora"
-
-        names = KvEventLoraNames()
-        for i in range(1000):
-            names.register(Req(i), "adapter-a")
-        self.assertIsNone(names.get("user-0|lora"))
-        self.assertLess(len(names._names), 200)
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)

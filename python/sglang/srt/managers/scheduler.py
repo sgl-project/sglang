@@ -2719,7 +2719,11 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        if get_observability().kv_events_config:
+        # Only a cache whose events are taken prunes the table.
+        if (
+            self.kv_events_publisher.enable_kv_cache_events
+            and self.tree_cache.supports_prefix_sharing()
+        ):
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:

@@ -42,6 +42,8 @@ class KvEventLoraNames:
 
     A name is kept while a request of its namespace is alive or a block
     published under it is not yet removed, so removals hash like their stores.
+    Pruning runs only when events are taken: the Rust tree counts a block when
+    its queued event is taken, not when it is stored.
     """
 
     def __init__(self):
@@ -50,7 +52,6 @@ class KvEventLoraNames:
         self._published_blocks: Counter = Counter()
         # Namespaces that may have lost their last request or block.
         self._prune_candidates: set[str] = set()
-        self._prune_at = 64
 
     def register(self, req: Any, lora_name: Optional[str]) -> None:
         """Name ``req``'s namespace; ``req`` needs ``extra_key`` and ``lora_id``."""
@@ -59,11 +60,6 @@ class KvEventLoraNames:
         self._names[req.extra_key] = lora_name
         self._requests.setdefault(req.extra_key, weakref.WeakSet()).add(req)
         self._prune_candidates.add(req.extra_key)
-        # Caches that never take events (non-publishing ranks, no radix cache)
-        # rely on this amortized prune.
-        if len(self._prune_candidates) >= self._prune_at:
-            self.prune()
-            self._prune_at = 2 * len(self._prune_candidates) + 64
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
         return self._names.get(extra_key)
