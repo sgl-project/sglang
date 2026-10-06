@@ -3,7 +3,6 @@
 
 import copy
 import json
-import os
 from collections import Counter
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -32,10 +31,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     Kandinsky6SRPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -101,19 +96,7 @@ both_repos = pytest.mark.parametrize(
 )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    """The K6 feed-forward uses TP-aware linears, which need a (size-1) TP group."""
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29509",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 def _prefixes(keys, depth=2):

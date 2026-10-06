@@ -2,7 +2,6 @@
 """Native SR stage-chain parity, component residency and video/audio hand-offs."""
 
 import copy
-import os
 from functools import partial
 from unittest.mock import MagicMock, patch
 
@@ -23,10 +22,6 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
     Kandinsky6SRSamplingParams,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.models.schedulers.kandinsky6_piflow import (
     PiflowScheduler,
 )
@@ -79,19 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     RESOLUTIONS,
 )
 
-
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29509",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 @pytest.fixture(autouse=True)

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +22,6 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGBranch, CFGPolicy
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     global_force_attn_backend_context_manager,
 )
@@ -45,22 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
 
-
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    # Kandinsky6's feed-forward uses ColumnParallelLinear/RowParallelLinear, which
-    # need a (size-1) TP group to construct -- matches test_kandinsky6_sr_stages.py's
-    # fixture of the same name.
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29513",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 def _randomize(module: torch.nn.Module, seed: int) -> None:
@@ -70,29 +50,18 @@ def _randomize(module: torch.nn.Module, seed: int) -> None:
             param.copy_(torch.randn(param.shape, generator=generator) * 0.05)
 
 
-def test_time_embeddings_forward_under_bf16_linear_weights():
-    # Minimal, pinpoint reproduction of the review comment: a bf16-weight
-    # Kandinsky6TimeEmbeddings fed the (always-fp32) sinusoidal embedding must not
-    # raise, and must return bf16 (the Linear weights' dtype).
-    module = Kandinsky6TimeEmbeddings(model_dim=16, time_dim=8)
+@pytest.mark.parametrize(
+    "modulation", [False, True], ids=["time-embedding", "modulation"]
+)
+def test_bf16_projection_accepts_fp32_conditioning(modulation):
+    module = (
+        Kandinsky6Modulation(time_dim=8, model_dim=16, num_params=9)
+        if modulation
+        else Kandinsky6TimeEmbeddings(model_dim=16, time_dim=8)
+    )
     _randomize(module, seed=0)
-    module = module.to(torch.bfloat16)
-
-    out = module(torch.tensor([0.0, 500.0, 999.0]))
-
-    assert out.dtype == torch.bfloat16
-    assert torch.isfinite(out.float()).all()
-
-
-def test_modulation_forward_under_bf16_linear_weights():
-    # Kandinsky6Modulation (the AdaLN projection every block/out-layer uses) has the
-    # identical autocast(dtype=float32)-doesn't-cast-weights bug; fed an fp32 time
-    # embedding with bf16 weights, it must not raise either.
-    module = Kandinsky6Modulation(time_dim=8, model_dim=16, num_params=9)
-    module = module.to(torch.bfloat16)
-
-    out = module(torch.randn(2, 8))  # fp32 input, as Kandinsky6TimeEmbeddings used to
-
+    inputs = torch.randn(2, 8) if modulation else torch.tensor([0.0, 500.0, 999.0])
+    out = module.to(torch.bfloat16)(inputs)
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
 
@@ -360,71 +329,10 @@ def test_bcg_joint_cfg_output_lifetime_and_text_shape_fallback(monkeypatch, use_
         runner.reset()
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason=(
-        "the DiT's fused LayerNormScaleShift/RMSNormScaleShift requires a real "
-        "CUDA/XPU tensor on any CUDA-capable host (see module docstring); bf16 "
-        "numerics are only meaningful on real hardware anyway"
-    ),
-)
-def test_kandinsky6_dit_real_bf16_forward_does_not_crash():
-    """Real (non-mocked) forward pass of a tiny Kandinsky6Transformer3DModel whose
-    weights are bf16 -- the exact configuration the SGLang PR review comment flagged
-    as broken (a fp32 sinusoidal embedding feeding a bf16 Linear)."""
-    device = torch.device("cuda")
-    config = Kandinsky6VideoAudioConfig()
-    arch_kwargs = _tiny_multimodal_arch_kwargs()
-    config.update_model_arch(dict(arch_kwargs))
-    dit = Kandinsky6Transformer3DModel(config, dict(arch_kwargs)).eval()
-    _randomize(dit, seed=1)
-    dit = dit.to(device=device, dtype=torch.bfloat16)
-
-    batch, duration, height, width = 1, 2, 2, 2
-    text_len, audio_len = 3, 5
-    hidden_states = torch.randn(
-        batch, duration, height, width, 4, dtype=torch.bfloat16, device=device
-    )
-    hidden_states_audio = torch.randn(
-        batch, audio_len, 4, dtype=torch.bfloat16, device=device
-    )
-    encoder_hidden_states = torch.randn(
-        batch, text_len, 8, dtype=torch.bfloat16, device=device
-    )
-    pooled_projections = torch.randn(batch, 8, dtype=torch.bfloat16, device=device)
-    # Scheduler timesteps are plain fp32 (not cast to the model's weight dtype by the
-    # caller), same as every real sampling loop -- exactly the dtype that used to
-    # mismatch the bf16 Linear.
-    timestep = torch.tensor([500.0], device=device)
-    visual_rope_pos = (
-        torch.arange(duration, device=device),
-        torch.arange(height, device=device),
-        torch.arange(width, device=device),
-    )
-    text_rope_pos = torch.arange(text_len, device=device)
-
-    video_out, audio_out = dit(
-        hidden_states=hidden_states,
-        hidden_states_audio=hidden_states_audio,
-        encoder_hidden_states=encoder_hidden_states,
-        timestep=timestep,
-        pooled_projections=pooled_projections,
-        visual_rope_pos=visual_rope_pos,
-        text_rope_pos=text_rope_pos,
-    )
-
-    assert video_out.shape == (batch, duration, height, width, 4)
-    assert audio_out.shape == (batch, audio_len, 4)
-    assert video_out.dtype == torch.bfloat16
-    assert audio_out.dtype == torch.bfloat16
-    assert torch.isfinite(video_out.float()).all()
-    assert torch.isfinite(audio_out.float()).all()
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("separate_cfg", [False, True])
 @torch.no_grad()
-def test_cache_dit_joint_streams_refresh_and_unmount(separate_cfg):
+def test_bf16_joint_forward_and_cache_dit_lifetime(separate_cfg):
     config = Kandinsky6VideoAudioConfig()
     arch = _tiny_multimodal_arch_kwargs() | {"num_visual_blocks": 4}
     config.update_model_arch(arch)
@@ -465,6 +373,12 @@ def test_cache_dit_joint_streams_refresh_and_unmount(separate_cfg):
                 torch.testing.assert_close(tensor, target, rtol=0, atol=0)
 
     reference = run_steps()
+    for video, audio in reference:
+        assert video.shape == inputs["hidden_states"].shape
+        assert audio.shape == inputs["hidden_states_audio"].shape
+        for tensor in (video, audio):
+            assert tensor.dtype == torch.bfloat16
+            assert torch.isfinite(tensor).all()
     enable_cache_on_transformer(
         dit,
         CacheDitConfig(

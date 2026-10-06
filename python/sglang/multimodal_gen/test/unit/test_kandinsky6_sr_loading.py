@@ -3,7 +3,6 @@
 
 import copy
 import json
-import os
 
 import pytest
 import torch
@@ -18,10 +17,6 @@ from sglang.multimodal_gen.configs.models.vaes.kandinsky6_sr import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     Kandinsky6SRPipelineConfig,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import (
     component_loader as component_loader_module,
@@ -42,20 +37,7 @@ from sglang.multimodal_gen.runtime.models.upsampler.kandinsky6_sr_latent_upscale
 )
 from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsky6SRVAE
 
-
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    """The K6 feed-forward uses TP-aware linears, which need a (size-1) TP group."""
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29508",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 @pytest.fixture(autouse=True)
@@ -119,19 +101,13 @@ def _load_through_the_real_loader(checkpoint, **changes):
     return model
 
 
-# --------------------------------------------------------------------------- #
-# DiT
-# --------------------------------------------------------------------------- #
 def test_complete_checkpoint_loads_and_meta_buffers_are_rebuilt():
-    """Positive control for the failure tests below, and the meta-device path: RoPE
-    tables and time-embedding frequencies are not in the checkpoint and must be rebuilt
-    by ``post_load_weights`` so that a loaded model actually runs."""
+    """Meta-init must rebuild non-checkpoint RoPE and time-embedding buffers."""
     reference = _dit()
     checkpoint = _official_state_dict(reference)
     model = _load_through_the_real_loader(checkpoint)
     model.post_load_weights()
     assert not any(t.is_meta for t in [*model.parameters(), *model.buffers()])
-    assert not model.time_embeddings.freqs.is_meta
     torch.testing.assert_close(model.pooled_bias, reference.pooled_bias)
     assert model.out_layer.out_layer.weight.shape[0] == 4 * TINY_DIT["out_visual_dim"]
 
@@ -144,26 +120,25 @@ def test_complete_checkpoint_loads_and_meta_buffers_are_rebuilt():
 
 
 @pytest.mark.parametrize(
-    "missing",
+    "key,unexpected,message",
     [
-        "pooled_bias",
-        "visual_transformer_blocks.0.visual_modulation.out_layer.bias",
+        ("pooled_bias", False, "was not loaded"),
+        (
+            "visual_transformer_blocks.0.visual_modulation.out_layer.bias",
+            False,
+            "was not loaded",
+        ),
+        ("text_embeddings.in_layer.weight", True, "unexpected keys"),
     ],
 )
-def test_missing_checkpoint_tensor_fails_the_load(missing):
-    """The generic loader zero-fills missing parameters whose names contain ``bias`` (and
-    would only warn about others).  For this model every parameter is required, so a
-    partial checkpoint must raise instead of yielding a silently different network."""
+def test_incomplete_or_unexpected_checkpoint_fails_the_load(key, unexpected, message):
+    # even bias parameters must fail instead of the generic loader's zero-fill fallback
     checkpoint = _official_state_dict(_dit())
-    del checkpoint[missing]
-    with pytest.raises(ValueError, match="was not loaded"):
-        _load_through_the_real_loader(checkpoint)
-
-
-def test_unexpected_checkpoint_tensor_fails_the_load():
-    checkpoint = _official_state_dict(_dit())
-    checkpoint["text_embeddings.in_layer.weight"] = torch.zeros(2, 2)
-    with pytest.raises(ValueError, match="unexpected keys"):
+    if unexpected:
+        checkpoint[key] = torch.zeros(2, 2)
+    else:
+        del checkpoint[key]
+    with pytest.raises(ValueError, match=message):
         _load_through_the_real_loader(checkpoint)
 
 
@@ -195,9 +170,6 @@ def test_rope_angle_tables_stay_fp32_when_the_module_is_cast():
         assert buffer.dtype == torch.float32, name
 
 
-# --------------------------------------------------------------------------- #
-# Fake server args for the component loaders
-# --------------------------------------------------------------------------- #
 class FakeServerArgs:
     def __init__(self):
         self.pipeline_config = Kandinsky6SRPipelineConfig()
@@ -300,12 +272,21 @@ def _tiny_lu_bundle(tmp_path, models=None, scales=(2, 4), include_scales=True):
     return directory
 
 
-def test_latent_upscaler_loader_loads_bank_in_bf16_eval(tmp_path):
-    directory = _tiny_lu_bundle(tmp_path)
-    bank, _ = LatentUpscalerLoader().load(
-        str(directory), FakeServerArgs(), "latent_upscaler", "diffusers"
+@pytest.mark.parametrize("legacy,library", [(False, "diffusers"), (True, "kandinsky6")])
+def test_latent_upscaler_loading_and_default_scale_order(tmp_path, legacy, library):
+    models = [
+        {"target_scale": scale, "model": copy.deepcopy(TINY_LU_MODEL)}
+        for scale in (("4x", "2x") if legacy else ("2x", "4x"))
+    ]
+    directory = _tiny_lu_bundle(tmp_path, models=models, include_scales=not legacy)
+    loader = component_loader_module.ComponentLoader.for_component_type(
+        "latent_upscaler", library
     )
+    assert isinstance(loader, LatentUpscalerLoader)
+    bank, _ = loader.load(str(directory), FakeServerArgs(), "latent_upscaler", library)
     assert bank.scales == (2, 4)
+    assert bank._models[0] is bank.for_scale(2)
+    assert bank._models[1] is bank.for_scale(4)
     assert not bank.training
     assert all(
         p.dtype == torch.bfloat16 and not p.requires_grad for p in bank.parameters()
@@ -317,75 +298,35 @@ def test_latent_upscaler_loader_loads_bank_in_bf16_eval(tmp_path):
         bank.upscale(z, scale=8)
 
 
-def test_latent_upscaler_legacy_config_uses_current_default_scale_order(tmp_path):
-    models = [
-        {"target_scale": scale, "model": copy.deepcopy(TINY_LU_MODEL)}
-        for scale in ("4x", "2x")
-    ]
-    directory = _tiny_lu_bundle(
-        tmp_path,
-        models=models,
-        include_scales=False,
-    )
-    bank, _ = LatentUpscalerLoader().load(
-        str(directory), FakeServerArgs(), "latent_upscaler", "diffusers"
-    )
-    assert bank.scales == (2, 4)
-    assert bank._models[0] is bank.for_scale(2)
-    assert bank._models[1] is bank.for_scale(4)
-
-
-def test_latent_upscaler_may_be_declared_with_the_kandinsky6_library():
-    """The official ``save_pretrained`` writes ["kandinsky6", ...], the Hub repo ["diffusers", ...]."""
-    for library in ("diffusers", "kandinsky6"):
-        loader = component_loader_module.ComponentLoader.for_component_type(
-            "latent_upscaler", library
-        )
-        assert isinstance(loader, LatentUpscalerLoader)
+def test_latent_upscaler_rejects_the_wrong_library():
     with pytest.raises(AssertionError, match="latent_upscaler must be loaded from"):
         component_loader_module.ComponentLoader.for_component_type(
             "latent_upscaler", "transformers"
         )
 
 
-def test_latent_upscaler_load_errors_are_raised_not_swallowed(tmp_path):
-    """``ComponentLoader.load`` falls back to a diffusers ``AutoModel`` when the
-    customized loader raises, which hides real errors.  This component must re-raise,
-    with the offending config key or tensor named."""
+@pytest.mark.parametrize("error_kind", ["Missing key", "bogus_field"])
+def test_latent_upscaler_load_errors_are_raised_not_swallowed(tmp_path, error_kind):
     directory = _tiny_lu_bundle(tmp_path)
-    weights_path = directory / "diffusion_pytorch_model.safetensors"
-    weights = load_file(str(weights_path))
-    weights.pop(next(iter(weights)))
-    save_file(weights, str(weights_path))
+    if error_kind == "Missing key":
+        path = directory / "diffusion_pytorch_model.safetensors"
+        weights = load_file(str(path))
+        weights.pop(next(iter(weights)))
+        save_file(weights, str(path))
+    else:
+        path = directory / "config.json"
+        config = json.loads(path.read_text())
+        config["models"][0]["model"]["bogus_field"] = 1
+        path.write_text(json.dumps(config))
     with pytest.raises(RuntimeError, match="native fallback is disabled") as error:
         LatentUpscalerLoader().load(
             str(directory), FakeServerArgs(), "latent_upscaler", "diffusers"
         )
-    assert "Missing key" in str(error.value.__cause__)
-
-    bad = copy.deepcopy(TINY_LU_MODEL)
-    bad["bogus_field"] = 1
-    directory = _tiny_lu_bundle(
-        tmp_path / "bad",
-        models=[{"target_scale": "2x", "model": TINY_LU_MODEL}],
-        scales=(2,),
-    )
-    config_path = directory / "config.json"
-    config = json.loads(config_path.read_text())
-    config["models"][0]["model"] = bad
-    config_path.write_text(json.dumps(config))
-    with pytest.raises(RuntimeError, match="native fallback is disabled") as error:
-        LatentUpscalerLoader().load(
-            str(directory), FakeServerArgs(), "latent_upscaler", "diffusers"
-        )
-    assert "bogus_field" in str(error.value.__cause__)
+    assert error_kind in str(error.value.__cause__)
 
 
 def test_motion_attention_is_not_a_supported_entry_key():
-    """The consolidated architecture (mirroring FastVideo's ``kandinsky6_sr.py`` /
-    commit 950a5edb) only implements the released checkpoint, which never trains
-    natten/shifted-window motion attention: a config that asks for it must fail loudly
-    at construction instead of silently building an unsupported backend."""
+    """Unsupported motion attention must fail instead of silently using dense attention."""
     with_motion = {
         **copy.deepcopy(TINY_LU_MODEL),
         "enable_x2_entry": False,

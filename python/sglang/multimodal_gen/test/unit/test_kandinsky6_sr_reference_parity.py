@@ -36,10 +36,6 @@ from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
 from sglang.multimodal_gen.configs.models.vaes.kandinsky6_sr import (
     Kandinsky6SRVAEConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
@@ -199,20 +195,7 @@ from kandinsky_sr.core.components.video_kvae.cached_model import (  # noqa: E402
 )
 from omegaconf import OmegaConf  # noqa: E402
 
-
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    """The K6 feed-forward uses TP-aware linears, which need a (size-1) TP group."""
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29507",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 def randomize(module: torch.nn.Module, seed: int, std: float = 0.05) -> None:
@@ -410,17 +393,7 @@ def _port_dit_fn(model, x, scale_factor, use_motion_score=False):
 
 
 def test_piflow_loop_matches_reference_piflow_generate():
-    """Guards the segment schedule, DXPolicy grid layout and rollout on a batch of tiles.
-
-    The reference packs the tiles along time with one per-frame sigma; the port batches
-    ``[B, T, H, W, C]``.  Same weights and same start latent, fp32 on CPU.
-
-    The port no longer re-derives the pi-Flow segment schedule itself (``latents.piflow_schedule``
-    / ``sampling.denoise_piflow`` are gone): it drives a real ``PiflowScheduler`` object through
-    ``denoise_with_scheduler`` instead, which the analysis in commit d8d0e79f's port (and the
-    ``PiflowScheduler._policy_step`` implementation itself) shows reproduces the exact same
-    per-segment ``(raw_src, seg, raw_dst, sigma_src)`` schedule as the removed pure function did.
-    """
+    """Compare the packed reference loop with the batched native PiflowScheduler."""
     from kandinsky_sr.core.algo.piflow_sampler import piflow_generate
 
     reference = build_reference_dit(piflow=TINY_PIFLOW)
@@ -464,18 +437,8 @@ def test_piflow_loop_matches_reference_piflow_generate():
     "capped", [False, True], ids=["full_range", "capped_noise_start"]
 )
 def test_euler_loop_matches_reference_generate(capped):
-    """Guards the warped timesteps, per-step deltas and (for a wide input) the in-place
-    update of the first channels only, incl. the ``cap_noise_timestep`` start time.
-
-    The reference's ``generate(..., 5, ...)`` counts timestep *grid points* (5 points -> 4
-    Euler steps); the port's own convention counts DiT *calls* directly, so the equivalent
-    port call is ``num_inference_steps=4``. Both grids are the same 5-point warped-linspace
-    array (``FlowMatchEulerDiscreteScheduler.set_timesteps`` applies the configured ``shift``
-    warp to the 4 unwarped sigmas this test passes in, then appends the terminal 0 itself --
-    algebraically the same 5th point the reference's own ``warp(0) == 0`` produces), so the 4
-    step-to-step deltas ``denoise_with_scheduler`` consumes via ``scheduler.step`` are bit-for-
-    bit the 4 deltas the old, removed ``denoise_euler`` consumed from that same array.
-    """
+    """Compare noise caps and channel updates with the reference's five-point grid
+    (four DiT calls); both schedulers append the same terminal zero."""
     from kandinsky_sr.core.algo.utils import generate
 
     cfg = dict(TINY_DIT_CFG, use_motion_score=True, instruct_type="hybrid_anchor")
@@ -761,19 +724,10 @@ def _assert_uint8_close(actual, expected, *, max_diff: int = 1):
 def test_tiled_piflow_super_resolution_matches_reference(
     use_lu, scale, hw, tiles_batch_size
 ):
-    """Guards the whole orchestration: scale request + pre-upscale, tile geometry, LU or
-    tile encode, chunk seeding (``seed + first tile index``), pi-Flow loop, decode with
-    truncation to uint8 and Hann stitching, against ``run_tiled_sr`` /
-    ``run_tiled_sr_from_pixels`` with identical random weights.
+    """Compare tiled pixel/LU paths with identical random weights and seeds.
 
-    ``max_diff=2`` (not the default 1): the reference's ``piflow_generate`` is the
-    training-only inline schedule, which clamps the *final* segment's ``raw_dst`` to
-    0.0 (dead code on every real checkpoint - see GAP 2 / ``latents.piflow_schedule``).
-    The port now deliberately matches the real ``PiflowScheduler._policy_step``
-    convention (``raw_dst=eps``) instead, which real checkpoints always run through.
-    That is a ~1e-6 raw-timestep difference in the last segment only, so it shows up
-    here as at most a 1-LSB-wider uint8 rounding tie on top of the pre-existing
-    rounding-boundary noise (still >99.99% exact pixels), not as a structural bug.
+    The reference ends at raw_dst=0, whereas PiflowScheduler ends at eps (1e-6).
+    Allow two uint8 levels of error while requiring more than 99.9% exact pixels.
     """
     reference, port = build_stacks(piflow=TINY_PIFLOW, use_lu=use_lu)
     video = _random_video(9, *hw)
