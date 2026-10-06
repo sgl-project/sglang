@@ -637,6 +637,8 @@ class SanaWMTextEncodingStage(TextEncodingStage):
     model-specific prompt-window contract.
     """
 
+    deduplicated_output_fields = ()
+
     @staticmethod
     def _text_encoder_max_length(server_args: ServerArgs) -> int:
         encoder_cfg = server_args.pipeline_config.text_encoder_configs[0]
