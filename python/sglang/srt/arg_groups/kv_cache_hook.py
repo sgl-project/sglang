@@ -649,9 +649,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
-        "TBO's replay split hands each child a view without the pre-translate "
-        "write loc, so a captured decode replay raises. "
-        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+        "a TBO child's lanes start partway into its batch, while the "
+        "iteration's read tables (KVLocPlan) are indexed by the batch's own "
+        "lanes, and the readers do not offset a child into them yet."
     )
     assert not cfg.enable_lmcache, (
         "--enable-unified-memory is not yet compatible with --enable-lmcache: "
