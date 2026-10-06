@@ -192,7 +192,7 @@ def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> 
     zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
     at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
     emit buys nothing and the materialize path is used. Centralizes the gate shared
-    by the MoE-down and MLA o_proj producer sites.
+    by the gfx95 bpreshuffle producer sites.
     """
     return on_bpreshuffle_gfx95 and m >= 2
 
