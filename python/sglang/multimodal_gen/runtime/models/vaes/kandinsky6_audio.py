@@ -63,9 +63,6 @@ class Kandinsky6AudioVAE(nn.Module, LayerwiseOffloadableModuleMixin):
         # already normalized and must never be renormalized
         self.vae.remove_weight_norm()
         self.vocoder = BigVGANV2(dict(arch.vocoder_config))
-        # strip PyTorch weight_norm before loading plain .weight checkpoint keys;
-        # this differs from MMAudio's RMS renormalization above
-        self.vocoder.remove_weight_norm()
 
         # resolution containers are not called; hooks belong on their blocks
         self.layer_names = (
