@@ -13,7 +13,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
-HIDDEN_SIZE = 8192
 # Qwen3.8 and Qwen3.8-Flash-Next.
 HIDDEN_SIZES = (8192, 2560)
 NUM_EXPERTS = 512
@@ -22,10 +21,10 @@ TOPK = 10
 
 def _envelope(
     gating_output,
+    hidden_size,
     correction_bias=None,
     num_fused_shared_experts=0,
     packed_out=None,
-    hidden_size=HIDDEN_SIZE,
     hidden_dtype=torch.bfloat16,
 ):
     hidden_states = torch.empty(
@@ -123,38 +122,53 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
             patch.object(topk_module, "_use_aiter_topk_gating", True),
             patch.object(topk_module, "_is_gfx95", True),
         ):
-            self.assertTrue(_envelope(logits))
-            self.assertTrue(_envelope(logits, hidden_size=2560))
-            self.assertFalse(
-                _envelope(
-                    torch.empty(
-                        topk_module._AITER_TOPK_GATING_MAX_ROWS + 1,
-                        NUM_EXPERTS,
-                        device="cuda",
-                        dtype=torch.bfloat16,
+            self.assertFalse(_envelope(logits, 4096))
+            for hidden_size in HIDDEN_SIZES:
+                with self.subTest(hidden_size=hidden_size):
+                    self.assertTrue(_envelope(logits, hidden_size))
+                    self.assertFalse(
+                        _envelope(
+                            torch.empty(
+                                topk_module._AITER_TOPK_GATING_MAX_ROWS + 1,
+                                NUM_EXPERTS,
+                                device="cuda",
+                                dtype=torch.bfloat16,
+                            ),
+                            hidden_size,
+                        )
                     )
-                )
-            )
-            self.assertFalse(_envelope(logits, hidden_size=4096))
-            self.assertFalse(_envelope(logits, hidden_dtype=torch.float16))
-            self.assertFalse(
-                _envelope(torch.empty(4, 256, device="cuda", dtype=torch.bfloat16))
-            )
-            self.assertFalse(_envelope(logits.float()))
-            self.assertFalse(
-                _envelope(
-                    torch.empty(NUM_EXPERTS, 8, device="cuda", dtype=torch.bfloat16).t()
-                )
-            )
-            self.assertFalse(
-                _envelope(
-                    logits, correction_bias=torch.empty(NUM_EXPERTS, device="cuda")
-                )
-            )
-            self.assertFalse(_envelope(logits, num_fused_shared_experts=1))
-            self.assertFalse(_envelope(logits, packed_out=packed))
+                    self.assertFalse(
+                        _envelope(logits, hidden_size, hidden_dtype=torch.float16)
+                    )
+                    self.assertFalse(
+                        _envelope(
+                            torch.empty(4, 256, device="cuda", dtype=torch.bfloat16),
+                            hidden_size,
+                        )
+                    )
+                    self.assertFalse(_envelope(logits.float(), hidden_size))
+                    self.assertFalse(
+                        _envelope(
+                            torch.empty(
+                                NUM_EXPERTS, 8, device="cuda", dtype=torch.bfloat16
+                            ).t(),
+                            hidden_size,
+                        )
+                    )
+                    self.assertFalse(
+                        _envelope(
+                            logits,
+                            hidden_size,
+                            correction_bias=torch.empty(NUM_EXPERTS, device="cuda"),
+                        )
+                    )
+                    self.assertFalse(
+                        _envelope(logits, hidden_size, num_fused_shared_experts=1)
+                    )
+                    self.assertFalse(_envelope(logits, hidden_size, packed_out=packed))
         with patch.object(topk_module, "_use_aiter_topk_gating", False):
-            self.assertFalse(_envelope(logits))
+            for hidden_size in HIDDEN_SIZES:
+                self.assertFalse(_envelope(logits, hidden_size))
 
 
 if __name__ == "__main__":
