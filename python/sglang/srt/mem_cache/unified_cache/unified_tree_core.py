@@ -544,6 +544,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def is_write_through_compatible(self) -> bool:
+        for node in self._node_arena.values():
+            if node is self.root_node:
+                continue
+            full_host = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if full_host is None:
+                if any(
+                    node.component_data[ct].host_value is not None
+                    for ct in self.component_types
+                    if ct != BASE_COMPONENT_TYPE
+                ):
+                    return False
+            elif node.parent is not self.root_node and not node.parent.backuped:
+                return False
+        return True
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
@@ -1756,14 +1772,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+        if node.load_back_pending_id is not None or any(
+            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+        ):
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
             descendants.append(cur)
@@ -2275,11 +2297,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         child_key = key.child_key(self.page_size)
         matched_length = 0
+        host_prefix_len = 0
+        refilled_host_node = None
         cache_actions: list[CacheAction | ComponentAction] = []
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
+
+            matched_host_value = host_value[:prefix_len]
+            matched_hash_value = hash_value[: prefix_len // self.page_size]
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -2291,18 +2318,37 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if action is not None:
                     cache_actions.append(action)
 
+            if not self.is_write_back:
+                full_data = node.component_data[BASE_COMPONENT_TYPE]
+                if full_data.host_value is None:
+                    full_data.host_value = matched_host_value.clone()
+                    if node.hash_value is None:
+                        node.hash_value = list(matched_hash_value)
+                    self.kv_events.record_store(node, medium=StorageMedium.CPU)
+                    self._update_evictable_leaf_sets(node)
+                    if node.parent is not None:
+                        self._update_evictable_leaf_sets(node.parent)
+                    self._update_duplicate_tracking(node)
+                    refilled_host_node = node
+                else:
+                    assert refilled_host_node is None, (
+                        "write-through host-prefix invariant broken: encountered "
+                        f"backed node {node.id} below a refilled host tombstone"
+                    )
+                    host_prefix_len += prefix_len
+
             if len(key):
                 child_key = key.child_key(self.page_size)
 
         result = InsertResult(
-            prefix_len=matched_length,
+            prefix_len=(matched_length if self.is_write_back else host_prefix_len),
             total_len=total_len,
             cache_actions=cache_actions,
         )
         if len(key) == 0:
-            if (
-                node is not self.root_node
-                and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+            if node is not self.root_node and (
+                refilled_host_node is not None
+                or node.component_data[BASE_COMPONENT_TYPE].host_value is not None
             ):
                 result.inserted_host_node = node.id
             return result

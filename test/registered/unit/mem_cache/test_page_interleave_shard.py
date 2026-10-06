@@ -64,7 +64,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
@@ -789,8 +788,7 @@ class _GraftReq:
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
-        self.lock_receipt = DecLockRefParams()
-        self.swa_prefix_lock_released = False
+        self.lock = None
         self.finished_reason = None
         self.session = None
         self.session_id = None
