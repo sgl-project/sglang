@@ -198,6 +198,57 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         self.assertIs(r2, r1)
         self.assertTrue(torch.equal(r1, torch.full((5,), 7, dtype=torch.int32)))
 
+    def _fb_for_chunks(self):
+        fb = self._fb_for_one_shot()
+        fb.kv_loc_plan = object()
+        fb.num_prefix_chunks = 2
+        fb.prefix_chunk_starts = [torch.tensor([0, 0]), torch.tensor([2, 1])]
+        fb.prefix_chunk_seq_lens = [torch.tensor([2, 1]), torch.tensor([1, 2])]
+        fb.prefix_chunk_cu_seq_lens = [
+            torch.tensor([0, 2, 3], dtype=torch.int32),
+            torch.tensor([0, 1, 3], dtype=torch.int32),
+        ]
+        fb.prefix_chunk_num_tokens = [3, 3]
+        fb.prefix_chunk_starts_cpu = [[0, 0], [2, 1]]
+        fb.prefix_chunk_seq_lens_cpu = [[2, 1], [1, 2]]
+        return fb
+
+    def test_chunk_indices_gathered_from_the_plan(self):
+        """On a translating pool each prefix chunk's ids come out of the plan's
+        table: one gather per chunk, at the chunk's start, no translate."""
+        from unittest.mock import patch
+
+        from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
+
+        calls = []
+
+        def pack(plan, *, req_pool_indices, seq_lens, indptr, out, kv_start_idx):
+            calls.append((plan, seq_lens, indptr, kv_start_idx))
+            out.fill_(9)
+            return True
+
+        fb = self._fb_for_chunks()
+        fake_translator = create_autospec(KVIndexTranslator, instance=True)
+        fake_translator.reads_are_translated = True
+        fake_translator.pack_read_stream = pack
+        fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        fake_pool = SimpleNamespace(req_to_token=torch.zeros((4, 8), dtype=torch.int32))
+        with (
+            patch.object(mix, "get_attn_backend", return_value=fake_backend),
+            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
+        ):
+            fb.prepare_chunked_kv_indices(torch.device("cpu"))
+
+        self.assertEqual(len(calls), 2)
+        for idx, (plan, seq_lens, indptr, kv_start_idx) in enumerate(calls):
+            self.assertIs(plan, fb.kv_loc_plan)
+            self.assertIs(seq_lens, fb.prefix_chunk_seq_lens[idx])
+            self.assertIs(indptr, fb.prefix_chunk_cu_seq_lens[idx])
+            self.assertIs(kv_start_idx, fb.prefix_chunk_starts[idx])
+        fake_translator.translate_dcp_read_ids.assert_not_called()
+        for chunk in fb.prefix_chunk_kv_indices:
+            self.assertTrue(bool((chunk == 9).all()))
+
     def test_one_shot_indices_noop_on_unmigrated_backend(self):
         from unittest.mock import patch
 

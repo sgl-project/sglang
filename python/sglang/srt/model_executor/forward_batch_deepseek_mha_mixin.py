@@ -83,6 +83,7 @@ class ForwardBatchDeepSeekMHAMixin:
     ):
         self.prefix_chunk_kv_indices = []
         req_to_token = get_req_to_token_pool().req_to_token
+        translator = get_attn_backend().kv_index_translator
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
             chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
@@ -93,6 +94,18 @@ class ForwardBatchDeepSeekMHAMixin:
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
 
+            if translator.reads_are_translated:
+                # The plan's table already holds the chunk's physical ids.
+                translator.pack_read_stream(
+                    self.kv_loc_plan,
+                    req_pool_indices=self.req_pool_indices,
+                    seq_lens=chunk_seq_lens,
+                    indptr=chunk_cu_seq_lens,
+                    out=chunk_kv_indices,
+                    kv_start_idx=chunk_starts,
+                )
+                self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+                continue
             create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
                 req_to_token,
                 self.req_pool_indices,
@@ -107,7 +120,6 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
             )
-            translator = get_attn_backend().kv_index_translator
             chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
