@@ -188,6 +188,7 @@ from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
+    model_json_response,
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -1807,8 +1808,10 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_completion.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -1817,8 +1820,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2141,8 +2146,10 @@ async def sagemaker_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
