@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
+    DSATokenToKVPoolMXFP4,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
@@ -1641,7 +1642,13 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if self.kv_cache_dtype_str == "mxfp4":
+            if get_memory().enable_hisparse or dsa_cp_layer_shard_rank is not None:
+                raise ValueError(
+                    "MXFP4 DSA KV cache does not support HiSparse or CP layer splitting"
+                )
+            PoolCls = DSATokenToKVPoolMXFP4
+        elif get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1705,6 +1712,8 @@ class KVCacheConfigurator:
         layers use MLA storage. The returned ``SWAKVPool`` exposes the common
         MLA and optional DSA-index interfaces independent of model type.
         """
+        if self.kv_cache_dtype_str == "mxfp4":
+            raise ValueError("MXFP4 DSA KV cache does not support hybrid MLA/SWA pools")
         full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
         common = {
             "page_size": get_schedule().page_size,
@@ -2625,6 +2634,13 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    if kv_cache_dtype == torch.uint8:
+        if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+            raise ValueError(
+                "MXFP4 DSA KV cache requires kv_lora_rank=512 and qk_rope_head_dim=64"
+            )
+        return DSATokenToKVPoolMXFP4.bytes_per_token
 
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the

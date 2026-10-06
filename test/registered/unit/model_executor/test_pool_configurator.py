@@ -306,6 +306,28 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    def test_dsa_mxfp4_layout_and_indexer_budget(self):
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        runner = _make_model_runner(self, num_layers=2, use_mla_backend=True)
+        _configure_dsa_model(runner)
+        runner.kv_cache_dtype = torch.uint8
+        runner.kv_cache_dtype_str = "mxfp4"
+        self.assertEqual(
+            calculate_mla_kv_cache_dim(
+                model_config=runner.model_config, kv_cache_dtype=torch.uint8
+            ),
+            400,
+        )
+        with mock_cpu_env(kv_size=1):
+            configurator = DefaultPoolConfigurator(runner)
+        self.assertEqual(configurator._cell_size, (400 + 132) * 2)
+
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""

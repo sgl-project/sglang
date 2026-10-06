@@ -4449,11 +4449,14 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_mxfp4 = (
+            use_dsa and dtype == torch.uint8 and override_kv_cache_dim == 400
+        )
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_mxfp4
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -5264,6 +5267,121 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class DSATokenToKVPoolMXFP4(DSATokenToKVPool):
+    """DSA cache rows stored as packed MXFP4 latent KV plus BF16 RoPE."""
+
+    packed_dim = 256
+    scale_dim = 16
+    rope_dim = 64
+    bytes_per_token = packed_dim + scale_dim + rope_dim * torch.bfloat16.itemsize
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        kv_cache_dim: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
+    ):
+        if (kv_lora_rank, qk_rope_head_dim) != (512, self.rope_dim):
+            raise ValueError("MXFP4 DSA requires 512 latent and 64 RoPE dimensions")
+        if page_size != 64:
+            raise ValueError("MXFP4 DSA requires page size 64")
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            kv_lora_rank=kv_lora_rank,
+            dtype=torch.uint8,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            index_head_dim=index_head_dim,
+            enable_memory_saver=enable_memory_saver,
+            kv_cache_dim=self.bytes_per_token,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            index_buf_size=index_buf_size,
+            skip_topk_layers=skip_topk_layers,
+        )
+
+    @classmethod
+    def _views(cls, buffer: torch.Tensor):
+        packed = buffer[..., : cls.packed_dim]
+        scales = buffer[..., cls.packed_dim : cls.packed_dim + cls.scale_dim]
+        rope = buffer[..., cls.packed_dim + cls.scale_dim :].view(torch.bfloat16)
+        return packed, scales, rope
+
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, layer_id_override=None):
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        if cache_k_nope.ndim != 3 or cache_k_rope.ndim != 3:
+            raise ValueError("MXFP4 MLA KV inputs must be [tokens, heads, dim]")
+        if cache_k_nope.shape[1] != 1 or cache_k_nope.shape[:2] != cache_k_rope.shape[:2] or cache_k_nope.shape[-1] != self.kv_lora_rank or cache_k_rope.shape[-1] != self.qk_rope_head_dim:
+            raise ValueError(
+                f"MXFP4 MLA KV shapes must be [N,1,{self.kv_lora_rank}] and "
+                f"[N,1,{self.qk_rope_head_dim}], got {cache_k_nope.shape} and {cache_k_rope.shape}"
+            )
+        if loc.numel() != cache_k_nope.shape[0]:
+            raise ValueError("MXFP4 locations must contain one entry per token")
+        if loc.ndim != 1 or loc.dtype not in (torch.int32, torch.int64):
+            raise ValueError("MXFP4 write locations must be a 1-D integer tensor")
+        maybe_detect_oob(
+            loc, 0, (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            "set_mla_kv_buffer (DSA-MXFP4)",
+        )
+        if get_parallel().dcp_enabled:
+            raise RuntimeError("MXFP4 DSA pool does not support DCP widened locations")
+        maybe_detect_kernel_facing_loc(
+            loc, self.page_size, self.kernel_page_blocks, "set_mla_kv_buffer (DSA-MXFP4)"
+        )
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+        buffer = self.kv_buffer[layer_id - self.start_layer]
+        packed, scales, rope = self._views(buffer)
+        MXFP4KVQuantizeUtil.quantize_and_store_paged(
+            cache_k_nope.to(torch.bfloat16), cache_k_rope.to(torch.bfloat16),
+            loc, packed, scales, rope
+        )
+
+    def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        layer_idx = layer.layer_id - self.start_layer
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_idx)
+        buffer = self.kv_buffer[layer_idx]
+        if loc.ndim != 1:
+            loc = loc.reshape(-1)
+        packed, scales, rope = self._views(buffer)
+        output = MXFP4KVQuantizeUtil.dequantize_paged(
+            packed, scales, loc, dtype=dst_dtype or torch.bfloat16, bf16_tail=rope
+        )
+        return (
+            output[..., : self.kv_lora_rank].contiguous(),
+            output[..., self.kv_lora_rank :].contiguous(),
+        )
+
+    def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, layer_id_override=None):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if cache_k.ndim != 3 or cache_k.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise ValueError("MXFP4 DSA set_kv_buffer expects combined latent+rope KV")
+        self.set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
+            layer_id_override=layer_id_override,
+        )
 
 
 def move_kv_cache_native(
