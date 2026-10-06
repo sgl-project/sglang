@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.observability.trace import fastapi_telemetry_disabled
 from sglang.srt.runtime_context import (
     get_disagg,
     get_observability,
@@ -100,7 +101,7 @@ async def _lifespan(app: FastAPI):
             await local_runtime.stop()
 
 
-app = FastAPI(lifespan=_lifespan)
+app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled())
 
 
 def _register_encoder_url_with_bootstrap():

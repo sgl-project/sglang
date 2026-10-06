@@ -167,6 +167,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
+    fastapi_telemetry_disabled,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -475,6 +476,7 @@ class ORJSONRoute(APIRoute):
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+    **fastapi_telemetry_disabled(),
 )
 app.router.route_class = ORJSONRoute
 app.add_middleware(
