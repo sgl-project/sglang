@@ -2088,6 +2088,32 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_buffer_only_resolves_write_back_to_write_through(self):
+        """buffer_only has no retained host tier for write_back to defer
+        writes into, so the mode resolves that policy to write_through
+        instead of rejecting the launch. The rewrite is that narrow: an
+        explicit write_through_selective stays as given, and the cache
+        mode keeps write_back.
+        """
+        cases = [
+            ("buffer_only", "write_back", "write_through"),
+            ("buffer_only", "write_through", "write_through"),
+            ("buffer_only", "write_through_selective", "write_through_selective"),
+            ("cache", "write_back", "write_back"),
+        ]
+        for mode, policy, expected in cases:
+            with self.subTest(mode=mode, policy=policy):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_host_memory_mode=mode,
+                    hicache_storage_backend="file",
+                    hicache_write_policy=policy,
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_write_policy"), expected
+                )
+
     def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
         common = {
             "enable_hierarchical_cache": True,
