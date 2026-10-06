@@ -4303,6 +4303,11 @@ class ServingChatTestCase(CustomTestCase):
         kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
 
+    _K2_LOOKUP_TOOL = {
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object"}},
+    }
+
     def _use_preserved_reasoning_template(self):
         tokenizer = Tokenizer(
             models.BPE(
@@ -4324,6 +4329,23 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.force_reasoning = True
         self.chat.reasoning_parser = "k2_horizon"
         self.chat.tool_call_parser = "k2_horizon"
+
+    def _collect_reasoning_message(self, choices):
+        """Collect text deltas without turning an absent reasoning field into ""."""
+        message = {"role": "assistant", "content": ""}
+        for choice in choices:
+            for field in ("content", "reasoning_content"):
+                value = choice["delta"].get(field)
+                if value is not None:
+                    message[field] = message.get(field, "") + value
+        return message
+
+    def _reasoning_stream_choices(self, request):
+        chunks = self._parse_chunks(self._run_chat_stream(None, request))
+        self.assertFalse(any("error" in chunk for chunk in chunks))
+        choices = [choice for chunk in chunks for choice in chunk.get("choices", [])]
+        self.assertTrue(choices, "Stream did not emit any choices")
+        return choices
 
     def _assert_empty_reasoning_replays(self, message):
         self.assertIn("reasoning_content", message)
@@ -4351,10 +4373,6 @@ class ServingChatTestCase(CustomTestCase):
     def test_empty_reasoning_response_replays(self):
         """An assistant reply with empty thinking must remain replayable as history."""
         self._use_preserved_reasoning_template()
-        tool = {
-            "type": "function",
-            "function": {"name": "lookup", "parameters": {"type": "object"}},
-        }
         for effort, terminator in (
             ("high", "</ifm|think>"),
             ("medium", "</ifm|think_fast>"),
@@ -4364,9 +4382,9 @@ class ServingChatTestCase(CustomTestCase):
                 with self.subTest(effort=effort, tool_only=tool_only):
                     request = ChatCompletionRequest(
                         model="x",
-                        messages=[{"role": "user", "content": "Hi?"}],
+                        messages=self.basic_req.messages,
                         reasoning_effort=effort,
-                        tools=[tool] if tool_only else None,
+                        tools=[self._K2_LOOKUP_TOOL] if tool_only else None,
                     )
                     ret = _spec_result(0)
                     ret["text"] = terminator + (
@@ -4377,9 +4395,7 @@ class ServingChatTestCase(CustomTestCase):
                     response = self.chat._build_chat_response(
                         request, [ret], created=123
                     )
-                    message = json.loads(response.model_dump_json())["choices"][0][
-                        "message"
-                    ]
+                    message = response.model_dump(mode="json")["choices"][0]["message"]
                     self.assertEqual(message["content"], "" if tool_only else "Hello")
                     if tool_only:
                         self.assertEqual(
@@ -4402,36 +4418,23 @@ class ServingChatTestCase(CustomTestCase):
                     yield ret
 
         self.tm.generate_request.return_value = generate()
-        chunks = self._parse_chunks(self._run_chat_stream(None, request))
-        self.assertFalse(any("error" in chunk for chunk in chunks))
+        choices = self._reasoning_stream_choices(request)
         for index in range(request.n):
-            deltas = [
-                choice["delta"]
-                for chunk in chunks
-                for choice in chunk.get("choices", [])
-                if choice["index"] == index
-            ]
-            message = {"role": "assistant", "content": ""}
-            for delta in deltas:
-                for field in ("content", "reasoning_content"):
-                    if delta.get(field) is not None:
-                        message[field] = message.get(field, "") + delta[field]
-            self.assertEqual(message["content"], "Hello")
-            self._assert_empty_reasoning_replays(message)
+            with self.subTest(index=index):
+                message = self._collect_reasoning_message(
+                    [choice for choice in choices if choice["index"] == index]
+                )
+                self.assertEqual(message["content"], "Hello")
+                self._assert_empty_reasoning_replays(message)
 
     def test_empty_stream_reasoning_tool_response_replays(self):
         """A streamed tool-only assistant turn must preserve its empty thinking field."""
         self._use_preserved_reasoning_template()
         request = ChatCompletionRequest(
             model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
+            messages=self.stream_req.messages,
             stream=True,
-            tools=[
-                {
-                    "type": "function",
-                    "function": {"name": "lookup", "parameters": {"type": "object"}},
-                }
-            ],
+            tools=[self._K2_LOOKUP_TOOL],
         )
 
         async def generate():
@@ -4443,16 +4446,13 @@ class ServingChatTestCase(CustomTestCase):
             yield ret
 
         self.tm.generate_request.return_value = generate()
-        chunks = self._parse_chunks(self._run_chat_stream(None, request))
-        self.assertFalse(any("error" in chunk for chunk in chunks))
-        choices = [choice for chunk in chunks for choice in chunk.get("choices", [])]
-        deltas = [choice["delta"] for choice in choices]
-        message = {"role": "assistant", "content": ""}
-        for delta in deltas:
-            for field in ("content", "reasoning_content"):
-                if delta.get(field) is not None:
-                    message[field] = message.get(field, "") + delta[field]
-        calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+        choices = self._reasoning_stream_choices(request)
+        message = self._collect_reasoning_message(choices)
+        calls = [
+            call
+            for choice in choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
         self.assertEqual(message["content"], "")
         self.assertEqual(choices[-1]["finish_reason"], "tool_calls")
         message["tool_calls"] = [
@@ -4495,15 +4495,8 @@ class ServingChatTestCase(CustomTestCase):
                     yield _spec_result(0)
 
                 self.tm.generate_request.return_value = generate()
-                chunks = self._parse_chunks(self._run_chat_stream(None, request))
-                self.assertFalse(any("error" in chunk for chunk in chunks))
-                self.assertTrue(
-                    all(
-                        choice["delta"].get("reasoning_content") is None
-                        for chunk in chunks
-                        for choice in chunk.get("choices", [])
-                    )
-                )
+                for choice in self._reasoning_stream_choices(request):
+                    self.assertIsNone(choice["delta"].get("reasoning_content"))
 
     def test_missing_reasoning_history_still_rejected(self):
         """Missing thinking history must not be silently replaced with empty thinking."""
