@@ -523,7 +523,7 @@ class AscendAttnBackend(AttentionBackend):
         """DSA target attention uses page-interleaved KV and a replicated indexer."""
         return self.use_dsa and get_parallel().dcp_enabled and not self.is_draft_worker
 
-    def _get_dsa_dcp_kv_lens_and_block_tables(
+    def _get_kv_lens_and_block_tables(
         self,
         kv_lens_cpu: torch.Tensor,
         req_pool_indices: torch.Tensor,
@@ -556,98 +556,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens, dim=0
             )
         return local_kv_lens, block_tables
-
-    def _init_dsa_dcp_metadata(self, forward_batch: ForwardBatch):
-        """Build page-interleaved sparse-attention metadata for eager execution."""
-        # Draft workers retain allocator-global cache slots and use the non-DCP
-        # attention path, so only target workers need DCP-specific metadata.
-        self.forward_metadata.dcp_origin_out_cache_loc = (
-            forward_batch.origin_out_cache_loc
-        )
-        if forward_batch.forward_mode.is_target_verify():
-            (
-                self.forward_metadata.dcp_spec_seq_lens_cpu_int,
-                self.forward_metadata.dcp_spec_block_tables,
-            ) = self._get_dsa_dcp_kv_lens_and_block_tables(
-                kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                req_pool_indices=forward_batch.req_pool_indices,
-                is_spec=True,
-            )
-            self.forward_metadata.dcp_spec_seq_lens = (
-                self.forward_metadata.dcp_spec_seq_lens_cpu_int.to(
-                    device=self.device, dtype=torch.int32
-                )
-            )
-        else:
-            (
-                self.forward_metadata.dcp_seq_lens_cpu_int,
-                self.forward_metadata.dcp_block_tables,
-            ) = self._get_dsa_dcp_kv_lens_and_block_tables(
-                kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                req_pool_indices=forward_batch.req_pool_indices,
-            )
-            self.forward_metadata.dcp_seq_lens = (
-                self.forward_metadata.dcp_seq_lens_cpu_int.to(
-                    device=self.device, dtype=torch.int32
-                )
-            )
-
-    def _update_dsa_dcp_graph_metadata(
-        self,
-        metadata,
-        bs,
-        req_pool_indices,
-        attention_kv_lens_cpu,
-        forward_mode,
-        origin_out_cache_loc,
-    ):
-        """Refresh the sparse-attention and indexer graph inputs in place."""
-        if "dcp_origin_out_cache_loc" in self.graph_metadata:
-            buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
-            if origin_out_cache_loc is None:
-                buffer.zero_()
-            else:
-                num_tokens = origin_out_cache_loc.shape[0]
-                assert num_tokens <= buffer.shape[0], (
-                    "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
-                    f"{num_tokens} > {buffer.shape[0]}"
-                )
-                buffer[:num_tokens].copy_(origin_out_cache_loc)
-                buffer[num_tokens:].zero_()
-        # DCP decode/speculative paths use rank-local KV lengths and a block
-        # table whose stride is page_size * dcp_world_size. Draft attention
-        # uses the ordinary full-KV metadata above instead.
-        if forward_mode.is_target_verify():
-            (
-                metadata.dcp_spec_seq_lens_cpu_int,
-                dcp_spec_block_tables,
-            ) = self._get_dsa_dcp_kv_lens_and_block_tables(
-                kv_lens_cpu=attention_kv_lens_cpu,
-                req_pool_indices=req_pool_indices[:bs],
-                is_spec=True,
-            )
-            metadata.dcp_spec_seq_lens.copy_(
-                metadata.dcp_spec_seq_lens_cpu_int.to(
-                    device=metadata.dcp_spec_seq_lens.device
-                )
-            )
-            dcp_pages = dcp_spec_block_tables.shape[1]
-            metadata.dcp_spec_block_tables[:, :dcp_pages].copy_(dcp_spec_block_tables)
-            metadata.dcp_spec_block_tables[:, dcp_pages:].fill_(0)
-        else:
-            (
-                metadata.dcp_seq_lens_cpu_int,
-                dcp_block_tables,
-            ) = self._get_dsa_dcp_kv_lens_and_block_tables(
-                kv_lens_cpu=attention_kv_lens_cpu,
-                req_pool_indices=req_pool_indices[:bs],
-            )
-            metadata.dcp_seq_lens.copy_(
-                metadata.dcp_seq_lens_cpu_int.to(device=metadata.dcp_seq_lens.device)
-            )
-            dcp_pages = dcp_block_tables.shape[1]
-            metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
-            metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -820,7 +728,38 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if self._use_dsa_dcp():
-            self._init_dsa_dcp_metadata(forward_batch)
+            # Draft workers retain allocator-global cache slots and use the non-DCP
+            # attention path, so only target workers need DCP-specific metadata.
+            self.forward_metadata.dcp_origin_out_cache_loc = (
+                forward_batch.origin_out_cache_loc
+            )
+            if forward_batch.forward_mode.is_target_verify():
+                (
+                    self.forward_metadata.dcp_spec_seq_lens_cpu_int,
+                    self.forward_metadata.dcp_spec_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    is_spec=True,
+                )
+                self.forward_metadata.dcp_spec_seq_lens = (
+                    self.forward_metadata.dcp_spec_seq_lens_cpu_int.to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
+            else:
+                (
+                    self.forward_metadata.dcp_seq_lens_cpu_int,
+                    self.forward_metadata.dcp_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                )
+                self.forward_metadata.dcp_seq_lens = (
+                    self.forward_metadata.dcp_seq_lens_cpu_int.to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
 
         if (
             self.use_mla
@@ -1179,14 +1118,56 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         if self._use_dsa_dcp():
-            self._update_dsa_dcp_graph_metadata(
-                metadata,
-                bs,
-                req_pool_indices,
-                attention_kv_lens_cpu,
-                forward_mode,
-                origin_out_cache_loc,
-            )
+            if "dcp_origin_out_cache_loc" in self.graph_metadata:
+                buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
+                if origin_out_cache_loc is None:
+                    buffer.zero_()
+                else:
+                    num_tokens = origin_out_cache_loc.shape[0]
+                    assert num_tokens <= buffer.shape[0], (
+                        "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
+                        f"{num_tokens} > {buffer.shape[0]}"
+                    )
+                    buffer[:num_tokens].copy_(origin_out_cache_loc)
+                    buffer[num_tokens:].zero_()
+            # DCP decode/speculative paths use rank-local KV lengths and a block
+            # table whose stride is page_size * dcp_world_size. Draft attention
+            # uses the ordinary full-KV metadata above instead.
+            if forward_mode.is_target_verify():
+                (
+                    metadata.dcp_spec_seq_lens_cpu_int,
+                    dcp_spec_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=attention_kv_lens_cpu,
+                    req_pool_indices=req_pool_indices[:bs],
+                    is_spec=True,
+                )
+                metadata.dcp_spec_seq_lens.copy_(
+                    metadata.dcp_spec_seq_lens_cpu_int.to(
+                        device=metadata.dcp_spec_seq_lens.device
+                    )
+                )
+                dcp_pages = dcp_spec_block_tables.shape[1]
+                metadata.dcp_spec_block_tables[:, :dcp_pages].copy_(
+                    dcp_spec_block_tables
+                )
+                metadata.dcp_spec_block_tables[:, dcp_pages:].fill_(0)
+            else:
+                (
+                    metadata.dcp_seq_lens_cpu_int,
+                    dcp_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=attention_kv_lens_cpu,
+                    req_pool_indices=req_pool_indices[:bs],
+                )
+                metadata.dcp_seq_lens.copy_(
+                    metadata.dcp_seq_lens_cpu_int.to(
+                        device=metadata.dcp_seq_lens.device
+                    )
+                )
+                dcp_pages = dcp_block_tables.shape[1]
+                metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
+                metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
 
         self.forward_metadata = metadata
 
