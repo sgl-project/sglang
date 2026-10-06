@@ -626,10 +626,14 @@ def dispatch_w8a8_block_fp8_linear(
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
-
-    # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+        linear = _dispatch_explicit_backend(backend)
+    else:
+        # Auto mode: Select based purely on hardware/backend availability
+        linear = _dispatch_auto_backend()
+    # Preserve the unwrapped callable when no activation policy needs binding.
+    if act_scale_ue8m0 and linear is deepgemm_w8a8_block_fp8_linear_with_fallback:
+        return partial(linear, act_scale_ue8m0=True)
+    return linear
 
 
 def torch_w8a8_block_fp8_linear(
@@ -1259,7 +1263,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    block32 = list(block_size) == [32, 32] and get_platform().is_sm90
     if input_scale is not None:
         assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
@@ -1305,7 +1308,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if block32 and act_scale_ue8m0:
+    if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
         # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
         q_input, x_scale = sglang_per_token_group_quant_fp8(
