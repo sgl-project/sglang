@@ -5157,14 +5157,22 @@ class InklingTokenOutputTest(CustomTestCase):
             special("end_message"),
         ]
         eos = special("content_model_end_sampling")
-        cases = [
-            ("after thinking", thinking, ("plan", payload)),
-            ("from first token", [], ("", payload)),
+        # Grammars can sample a content-kind token inside the payload; it has
+        # no header, so it must not reopen a block that renders the EOS as text.
+        with_kind_token = [
+            *encode('{"a": "'),
+            special("content_text"),
+            *encode('x"}'),
         ]
-        for name, prefix, expected in cases:
+        cases = [
+            ("after thinking", thinking, encode(payload), ("plan", payload)),
+            ("from first token", [], encode(payload), ("", payload)),
+            ("content kind in payload", [], with_kind_token, ("", '{"a": "x"}')),
+        ]
+        for name, prefix, sampled, expected in cases:
             results = self._reasoning_and_content(
                 self.request,
-                [*prefix, *encode(payload), eos],
+                [*prefix, *sampled, eos],
                 {"type": "stop", "matched": eos},
             )
             for mode, result in results.items():

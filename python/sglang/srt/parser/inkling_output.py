@@ -132,6 +132,8 @@ class InklingOutputParser:
             self._in_unframed_text = False
             if token_id != self._end_message_id:
                 self._parse(self._end_message_id, delta)
+            if token_id in self._content_kind_ids:
+                return
         elif self._at_message_boundary and not is_special:
             # Constrained decoding (e.g. response_format) samples a bare payload
             # where a message header belongs; parse it as model text.
