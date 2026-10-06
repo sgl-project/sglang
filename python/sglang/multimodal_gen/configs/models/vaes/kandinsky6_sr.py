@@ -1,25 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 SR causal video KVAE configuration.
+"""SR causal KVAE config supporting nested and flat checkpoint layouts.
 
-Two ``vae/config.json`` layouts have been observed from official Diffusers
-``Kandinsky6SRPipeline`` repos: an older one nesting the KVAE architecture under
-``encoder_config`` / ``decoder_config`` dicts (the config stores the *string* ``"None"`` for
-their unused channel fields)::
-
-    {"vae_type": "video-kvae", "encoder_config": {...}, "decoder_config": {...},
-     "scaling_factor": 0.9103, "spatial_factor": 16, "temporal_factor": 4}
-
-and the current one (confirmed against ``kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-
-Diffusers`` by an actual strict ``load_state_dict`` on GPU hardware) with those same knobs
-flattened to the top level instead -- ``decoder_ch`` / ``decoder_ch_mult`` are the only
-decoder-specific overrides, everything else (``num_res_blocks``, ``z_channels``, the
-temporal-compression / norm / padding knobs) is shared between encoder and decoder.
-``update_model_arch`` copies whichever layout the checkpoint has; ``__post_init__`` synthesizes
-``encoder_config`` / ``decoder_config`` from the flat fields when the nested ones weren't
-populated, so ``Kandinsky6SRVAE.__init__`` (``runtime/models/vaes/kandinsky6_sr_vae.py``) only
-ever has to handle the nested shape. Unknown *top-level* keys beyond the ones declared here are
-rejected because ``update_model_arch`` would otherwise store them silently in ``extra_attrs``.
-"""
+Normalize flat fields into encoder_config/decoder_config; reject unknown fields."""
 
 from dataclasses import dataclass, field
 from typing import Any

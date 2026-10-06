@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Glue between the request / bundle configuration and the pure SR helpers.
+"""SR request state and sampler resolution.
 
-Holds the ``batch.extra`` keys the SR stages hand to each other (CPU tensors and plain
-data only: ``Req`` is deep-copied for warmup and pickled between processes) and builds
-the immutable specs of :mod:`.sampling` from a DiT and its arch config.
-"""
+batch.extra contains only CPU tensors and serializable data, never model objects."""
 
 from typing import Any
 
@@ -63,12 +60,7 @@ def uses_latent_path(latent_upscaler: Any, tiling_scale: int) -> bool:
 
 
 def build_dit_spec(dit: Any) -> DitSpec:
-    """Post-override behaviour of the loaded DiT.
-
-    ``out_dim`` (the per-grid channel width) is not part of this spec any more: the scheduler
-    object now owns the DX-grid reshape (``PiflowScheduler._to_grid`` infers it from its own
-    ``n_grid`` and the state's channel count), so the denoising stage never needs it directly.
-    """
+    """Resolved DiT input and conditioning layout."""
     return DitSpec(
         instruct_type=dit.instruct_type,
         visual_cond=bool(dit.visual_cond),
@@ -123,12 +115,7 @@ def _describe_scheduler(scheduler: Any) -> str:
 def _check_sampler_fits_head(
     *, arch: Kandinsky6SRArchConfig, piflow: PiflowParams | None, scheduler: Any
 ) -> None:
-    """Fail fast when the resolved sampler cannot run on the DiT head of the bundle.
-
-    A DX / pi-Flow head must never run the flow-Euler loop and a single-grid head must
-    never run pi-Flow; without this check both die (or misbehave) inside the first DiT
-    call, after the tiles have been encoded.
-    """
+    """Reject incompatible scheduler and DiT head widths before encoding tiles."""
     head, grid = arch.head_width, arch.base_out_visual_dim
     if piflow is None:
         if head != grid:
@@ -166,16 +153,9 @@ def build_sampling_spec(
     tile_min_overlap: float,
     scheduler: Any = None,
 ) -> SamplingSpec:
-    """Sampling spec of one request from the checkpoint's SR parameters and the knobs.
+    """Resolve sampling from the bundle scheduler, falling back to legacy DiT fields.
 
-    The ``scheduler`` component of an official repo picks the sampler: a
-    ``PiflowScheduler`` with ``nfe`` is pi-Flow (``nfe`` DiT calls per tile, ``num_steps``
-    ignored), anything else is flow-Euler (``num_steps`` DiT calls -- this ``num_steps`` is
-    already the DiT-call count, the repo-wide convention, not the Diffusers-pipeline
-    timestep-grid-point count). A DiT config that carries its own ``piflow_*`` fields
-    (legacy / test configs) is the pi-Flow fallback. A sampler that does not fit the DiT
-    head raises ``ValueError`` before any tile is processed.
-    """
+    num_steps counts DiT calls, not Diffusers timestep grid points."""
     piflow = piflow_params_from_scheduler(scheduler)
     if piflow is None and arch.is_piflow:
         piflow = PiflowParams(
@@ -205,18 +185,7 @@ def build_sampling_spec(
 
 
 def effective_scheduler(spec: SamplingSpec, scheduler: Any) -> Any:
-    """The scheduler object that actually drives this request's denoising steps.
-
-    Prefers the loaded ``scheduler`` component (an official repo always ships one -- it is a
-    required module of ``Kandinsky6SRPipeline``). A legacy flat DiT config that carries its own
-    ``piflow_*`` / ``n_grid`` fields needs no ``scheduler/`` component at all (``spec.piflow``
-    is then built from those arch fields, see :func:`build_sampling_spec`); for that case (and
-    the degenerate one where a component was loaded but is not actually usable as the resolved
-    sampler) this synthesizes a matching scheduler from ``spec`` instead of leaving the
-    denoising stage with nothing to call ``.set_timesteps`` / ``.step`` on. ``spec`` has
-    already been validated against the DiT head width by :func:`build_sampling_spec`, so the
-    synthesized scheduler is guaranteed to fit.
-    """
+    """Use the loaded scheduler when compatible; synthesize one for legacy configs."""
     if spec.piflow is not None:
         if isinstance(scheduler, PiflowScheduler):
             return scheduler
@@ -234,18 +203,9 @@ def effective_scheduler(spec: SamplingSpec, scheduler: Any) -> Any:
 
 
 def check_denoising_request(spec: SamplingSpec, num_inference_steps: int) -> None:
-    """Reject or warn about ``num_inference_steps`` before the first DiT call.
+    """Validate the requested DiT-call count before denoising.
 
-    Ports FastVideo commit d8d0e79f ("Kandinsky6 SR: reject mismatched transformer/scheduler
-    pairs, document step count"): the transformer/scheduler head-width mismatch itself is
-    already caught earlier, inside :func:`build_sampling_spec` (``_check_sampler_fits_head``,
-    called for every request); this adds the two checks that are specifically about the
-    requested step *count*, which that function does not see.
-
-    ``num_inference_steps`` counts DiT calls per tile, the convention used everywhere else in
-    this repo; the upstream Diffusers pipeline counts timestep grid points instead (its default
-    5 is 4 calls here).
-    """
+    Diffusers counts timestep grid points instead: its default 5 is 4 calls here."""
     if num_inference_steps < 1:
         raise ValueError(
             f"Kandinsky6 SR: num_inference_steps must be >= 1, got {num_inference_steps}"

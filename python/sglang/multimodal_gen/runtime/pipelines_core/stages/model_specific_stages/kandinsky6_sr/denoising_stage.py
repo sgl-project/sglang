@@ -1,21 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Denoising stage of Kandinsky 6 video SR.
+"""Text-free SR tile denoising with shared residency, compile and cache-DiT hooks.
 
-Subclasses the shared :class:`~...pipelines_core.stages.denoising.DenoisingStage` instead of
-bypassing it with a free-standing loop (the gap the SGLang PR review flagged, the same one
-called out for the K6 TI2VA stage): this gets the constructor's attention-backend inference,
-torch.compile-during-offload plumbing, and ``_maybe_enable_cache_dit_and_torch_compile`` for
-free, the same hooks every other denoising stage in this repo reuses. ``forward`` is still
-overridden wholesale, because the shared per-step loop (``_prepare_denoising_loop`` /
-``_run_denoising_step``) assumes one global ``batch.latents`` tensor stepped once per timestep
-under CFG; SR instead denoises a list of independent tile chunks, each run through the bundle's
-own scheduler (``run_spec.effective_scheduler`` -- ``PiflowScheduler`` or
-``FlowMatchEulerDiscreteScheduler``) with a fresh ``set_timesteps`` per chunk, text-free and
-without CFG. The breakable-CUDA-graph hooks (``_maybe_get_bcg_runner`` / ``_bcg_run``) are *not*
-reused here: their padding logic (``_bcg_pad_prompt_kwargs``) exists to make a captured graph's
-shape independent of prompt length, which has no meaning for this text-free DiT, so wiring them
-up would add a no-op indirection rather than genuine behaviour.
-"""
+Each chunk resets its scheduler; the generic single-latent CFG loop and
+prompt-padding BCG path do not apply."""
 
 from __future__ import annotations
 
@@ -67,10 +54,7 @@ class Kandinsky6SRDenoisingStage(DenoisingStage):
         return True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """SR's ``forward`` reads ``batch.extra`` tile-chunk state, not the base class's
-        global ``timesteps``/``prompt_embeds``/``generator`` fields (this DiT is text-free and
-        steps each tile chunk through its own fresh scheduler instead of one CFG loop over
-        ``batch.latents``), so the inherited validator is replaced rather than satisfied."""
+        """Validate tile-chunk state instead of the shared text/CFG loop inputs."""
         result = VerificationResult()
         result.add_check(
             "extra[SR_SAMPLING_SPEC_KEY]",

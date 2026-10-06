@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from kandinsky6_sr_tiny_components import super_resolve
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
     Kandinsky6SRDitConfig,
@@ -68,7 +69,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     plan_tiles,
     stitch_tiles,
-    super_resolve,
 )
 
 REFERENCE_ENV = "KANDINSKY_SR_REFERENCE_SRC"

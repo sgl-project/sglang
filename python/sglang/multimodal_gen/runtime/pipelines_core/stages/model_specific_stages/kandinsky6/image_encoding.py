@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 optional IT2VA conditioning-image stage.
+"""Optional image conditioning, adapted from FastVideo's Kandinsky6ImageEncodingStage.
 
-A no-op for a pure T2VA call. When ``batch.condition_image`` is supplied
-(populated from ``batch.image_path`` by the generic ``InputValidationStage``),
-VAE-encodes it through the shared video VAE and appends it as one extra
-"clean" reference frame at the end of the video latent sequence -- the
-diffusers reference's default ``tail_cond_first_frame`` scheme -- tagged via
-a token-type id so the transformer's ``visual_token_type_embeddings`` can
-distinguish it from generated frames. ``Kandinsky6DenoisingStage`` re-pins
-this frame every step and strips it back out after the loop.
-
-Ported from FastVideo's ``Kandinsky6ImageEncodingStage``
-(fastvideo/pipelines/stages/kandinsky6.py), adapted to sglang-diffusion's
-``Req``/``ComponentUse``/precision-helper conventions.
-"""
+Append a clean reference latent frame and mark its token type. Denoising re-pins
+that frame every step and removes it before decoding."""
 
 from __future__ import annotations
 
@@ -52,10 +41,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
 
 logger = init_logger(__name__)
 
-# batch.extra keys used to pass tail-cond state between the Kandinsky6
-# stages -- Req's free-form "extra" dict is the documented mechanism for
-# state that specific pipeline implementations need but that isn't a
-# first-class Req field (see Req.extra's docstring).
+# model-specific reference-frame state shared through Req.extra
 TAIL_COND_ACTIVE_EXTRA_KEY = "kandinsky6_tail_cond_active"
 VISUAL_TOKEN_TYPE_IDS_EXTRA_KEY = "kandinsky6_visual_token_type_ids"
 
@@ -83,19 +69,9 @@ class Kandinsky6ImageEncodingStage(PipelineStage):
     def _cover_resize_dims(
         src_h: int, src_w: int, height: int, width: int
     ) -> tuple[int, int]:
-        """Resize target for a subsequent centre crop to (height, width),
-        matching the diffusers reference's ``encode_i2va_first_frame``:
-        ``scale = min(src_h/height, src_w/width)`` so the resized image
-        covers the target box on both axes (never smaller than it), and the
-        excess is centre-cropped afterward -- unlike stretching the whole
-        source image to fit, which distorts its aspect ratio.
-        """
+        """Resize to cover (height, width), preserving aspect before the centre crop."""
         scale = min(src_h / height, src_w / width)
-        # `int(src / scale)` matches the diffusers reference formula, but on the constraining axis
-        # (the one that produced `scale`) it can land a hair below the target -- e.g. 831 for 832 --
-        # from float error in the scale round-trip, which would give a negative centre-crop offset.
-        # Clamp each axis to its target as a floor; this is a no-op whenever `int()` already reaches
-        # the target, so it doesn't change the (non-constraining-axis) diffusers-parity values.
+        # clamp float round-trip undershoot on the constraining axis before centre crop
         new_h = max(height, int(src_h / scale))
         new_w = max(width, int(src_w / scale))
         return new_h, new_w
@@ -203,17 +179,7 @@ class Kandinsky6ImageEncodingStage(PipelineStage):
 
         latents = batch.latents
         if batch.image_latent.shape[0] != latents.shape[0]:
-            # Exactly one conditioning image is encoded per request,
-            # regardless of `num_outputs_per_prompt` -- `latents` was already
-            # expanded to the full per-sample batch by
-            # Kandinsky6LatentPreparationStage (`batch.batch_size`), so
-            # broadcast the single reference frame to match via the same
-            # per-output request-expansion mechanism other once-per-prompt
-            # conditioning uses (``PromptToSampleBatchExpander``, e.g.
-            # ``WanI2VCommonConfig`` / ``QwenImagePipelineConfig``'s
-            # ``expand_conditioning_to_sample_batch``). This also keeps every
-            # later per-step read of ``batch.image_latent`` (the tail-cond
-            # re-pin in ``Kandinsky6DenoisingStage``) correctly batched.
+            # encode one reference image, then expand it to the request's output batch
             expander = PromptToSampleBatchExpander(
                 prompt_batch_size=batch.image_latent.shape[0],
                 sample_batch_size=latents.shape[0],
@@ -225,11 +191,7 @@ class Kandinsky6ImageEncodingStage(PipelineStage):
 
         ref_frame = image_latent
         if latents.shape[-1] > num_channels:
-            # visual_cond channel layout: [real, cond, mask]. The
-            # tail_cond_first_frame scheme leaves the cond block at zero and
-            # only writes the real channel block (done above) and mask=1 --
-            # unlike other I2V schemes that duplicate the image latent into
-            # the cond block. Don't carry that convention over here.
+            # [real, cond, mask]: write the reference only into real; cond stays zero
             cond_block = torch.zeros_like(image_latent)
             mask_block = torch.ones_like(image_latent[..., :1])
             ref_frame = torch.cat([image_latent, cond_block, mask_block], dim=-1)

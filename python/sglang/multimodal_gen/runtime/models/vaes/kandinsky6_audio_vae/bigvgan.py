@@ -224,18 +224,7 @@ class AMPBlock2(nn.Module):
 
 
 class BigVGANV2(nn.Module):
-    """BigVGAN-v2 generator compatible with NVIDIA checkpoint keys.
-
-    ``config`` is the raw ``vocoder_config`` dict read off a checkpoint's
-    ``audio_vae/config.json`` (forwarded unmodified by
-    ``Kandinsky6AudioVAEArchConfig.vocoder_config``). Expected keys:
-    ``resblock`` ("1"|"2"), ``num_mels``, ``upsample_rates``,
-    ``upsample_kernel_sizes``, ``upsample_initial_channel``,
-    ``resblock_kernel_sizes``, ``resblock_dilation_sizes``, ``activation``
-    ("snake"|"snakebeta"), ``snake_logscale``, ``use_tanh_at_final``,
-    ``use_bias_at_final``, ``weight_norm_removed``, ``use_cuda_kernel``
-    (must be falsy -- this class supports only the portable PyTorch path).
-    """
+    """BigVGAN-v2 using checkpoint vocoder_config and the portable PyTorch path."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()

@@ -1,27 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 SR latent upscaler (LU): a bank of convolutional upsamplers of scaled KVAE latents.
+"""Kandinsky 6 SR x2/x4 upsampler bank for scaled [B, C, T, H, W] KVAE latents.
 
-Each bank entry is a cascade of two 2x stages over ``[B, C, T, h, w]`` latents::
-
-    x4: input_proj -> pre_blocks -> upsample_1 -> mid_blocks -> upsample_2 -> post_blocks -> output_proj
-    x2: mid_input_proj -> x2_branch (adapter -> finisher -> mid_blocks -> second stage)
-
-Every norm is an RMSNorm FiLM-modulated by the input latent itself (``zq``, nearest-resized to
-the feature grid), the 3x3x3 convs pad time by repeating the edge frame, and the 2x upsample is
-``Conv1x1(up + Conv(1,3,3)(up))`` with ``up`` the nearest-neighbour 2x resize.  The bank holds one
-entry per served scale under ``_models.<index>`` in the order declared by ``scales``.
-
-Module registration order equals the checkpoint's parameter order, so ``state_dict()`` lists keys
-in file order.
-
-This single file replaces the vendored ``kandinsky6_sr_lu`` subpackage (pydantic-style
-flat/multi_scale config, natten/shifted-window motion-attention training leftovers never present
-in the released checkpoint -- 12 files, ~3.2k lines): it mirrors FastVideo's consolidated
-``fastvideo/models/upsamplers/kandinsky6_sr.py`` (commit 950a5edb, "bitwise identical to the
-previous port on the real weights").
-
-The registered module names match the current Diffusers checkpoint layout directly.
-"""
+Norms are modulated by the source latent; temporal conv padding repeats edge frames.
+_models entries follow checkpoint scale order and retain checkpoint module names."""
 
 from __future__ import annotations
 
@@ -44,11 +25,7 @@ logger = init_logger(__name__)
 
 
 class ReplicateTimeConv3d(nn.Conv3d):
-    """``Conv3d`` with 'same' padding that repeats the edge frame along T and zero-pads H and W.
-
-    ``nn.Conv3d`` has a single padding mode for all axes, so T is padded explicitly before the
-    convolution.
-    """
+    """Conv3d with explicit edge-repeated temporal padding and zero spatial padding."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int) -> None:
         pad = kernel_size // 2
@@ -281,12 +258,7 @@ class Kandinsky6SRLatentUpscaler(nn.Module):
 
 
 class Kandinsky6SRLatentUpscalerBank(nn.Module, LayerwiseOffloadableModuleMixin):
-    """The x2 / x4 latent-upscaler bank of a Kandinsky 6 SR bundle (``latent_upscaler/``).
-
-    ``upscale(z, scale=...)`` upsamples an already scaled (``latent * scaling_factor``) KVAE latent
-    ``[B, C, T, h, w]`` by ``scale`` in H and W with the entry serving that scale.
-
-    """
+    """Select the checkpoint bank entry to upscale scaled KVAE latents in H/W."""
 
     layerwise_offload_dit_group_enabled = False
 

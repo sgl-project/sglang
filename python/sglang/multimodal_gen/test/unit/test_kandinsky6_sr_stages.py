@@ -14,6 +14,7 @@ from kandinsky6_sr_tiny_components import (
     make_request,
     make_stage,
     random_video,
+    super_resolve,
 )
 
 from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
@@ -66,7 +67,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     TilePlan,
-    super_resolve,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
     RESOLUTIONS,

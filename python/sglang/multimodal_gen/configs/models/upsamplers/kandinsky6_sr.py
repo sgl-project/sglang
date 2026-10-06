@@ -1,19 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config of one Kandinsky 6 SR latent-upscaler bank entry (``latent_upscaler/config.json``).
+"""Configuration of an entry in the SR latent-upscaler bank.
 
-The component config is ``{"models": [{"target_scale": "2x"|"4x", "model": {...}}, ...],
-"scaling_factor": f}``.  Each ``model`` mapping describes one cascaded 2x+2x upsampler.  Only
-the architecture of the released checkpoints is implemented (mirrors FastVideo's
-``fastvideo/configs/models/upsamplers/kandinsky6_sr.py``), so every key that would select a
-different architecture must carry its released value; a value that is not supported raises a
-``ValueError`` naming the key instead of silently building something else.
-
-Unlike FastVideo's ``Kandinsky6SRLatentUpscalerConfig``, there is no bank-level config class
-here: ``Kandinsky6SRLatentUpscalerBank`` (``runtime/models/upsampler/kandinsky6_sr_latent_upscaler.py``)
-takes the bundle's raw ``models`` list and ``scaling_factor`` directly, matching
-``LatentUpscalerLoader``'s existing call contract -- only the per-entry validation lives here,
-as a ``msgspec.Struct`` (this repo's house rule bans new ``@dataclass``).
-"""
+Only released architectures are implemented; reject unsupported settings."""
 
 from __future__ import annotations
 
@@ -93,13 +81,7 @@ def _parse_target_scale(where: str, value: Any) -> int:
 
 
 class Kandinsky6SRLatentUpscalerEntryConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """One bank entry: a cascaded 2x+2x upsampler serving ``target_scale``.
-
-    ``stage_channels`` are the widths at the 1x, 2x and 4x latent grids.  With
-    ``enable_x2_entry`` the entry also has a private x2 path (its own input stem,
-    ``x2_adapter_blocks`` residual blocks at 1x, and private copies of the mid stage and second
-    stage) that upsamples by 2 instead of 4.
-    """
+    """Cascaded 2x+2x upsampler, optionally with a private x2 entry path."""
 
     target_scale: int
     in_channels: int

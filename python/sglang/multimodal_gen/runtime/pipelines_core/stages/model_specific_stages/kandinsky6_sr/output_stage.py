@@ -3,6 +3,9 @@
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.kandinsky6_sr_resolution import (
+    resolve_target_hw,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
@@ -21,7 +24,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_utils import (
     resize_to_target,
-    resolve_target_hw,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 

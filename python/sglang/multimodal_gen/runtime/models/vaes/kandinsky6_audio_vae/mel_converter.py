@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from FastVideo's fastvideo/models/audio/kandinsky6_audio_vae.py.
-"""Waveform -> log-mel-spectrogram STFT frontend.
+"""Checkpoint-compatible waveform-to-log-mel frontend.
 
-Present in real Kandinsky6 audio_vae checkpoints (nested at
-``Kandinsky6AudioVAE.mel_converter``) but NOT exercised by pure T2VA/IT2VA
-generation, which only ever decodes audio latents into a waveform and
-never re-encodes real audio. Ported for state-dict completeness / loader
-compatibility (so ``load_state_dict`` has a correctly-shaped buffer to load
-real weights into) -- this has not been, and cannot yet be, verified
-end-to-end against the current (decode-only) inference path.
-
-Matches the diffusers reference's ``MelConverter``/``get_mel_converter("44k")``
-STFT+mel-filterbank implementation.
-"""
+Included for state-dict completeness; generation only decodes audio latents,
+so waveform encoding has not been validated end-to-end."""
 
 from __future__ import annotations
 
@@ -52,11 +43,7 @@ class MelConverter(nn.Module):
                 )
             ).float()
         except Exception:
-            # librosa is an optional dependency here, not a core one, and
-            # this buffer is only ever populated by the checkpoint's own
-            # loaded weights for the (currently unused, decode-only) encode
-            # path -- a zero filterbank still gives the loader a
-            # correctly-shaped buffer to load real weights into.
+            # generation does not use this buffer; the checkpoint supplies its real values
             mel_basis = torch.zeros(num_mels, n_fft // 2 + 1)
         self.register_buffer("mel_basis", mel_basis, persistent=True)
 

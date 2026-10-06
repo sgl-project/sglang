@@ -33,17 +33,9 @@ WARMUP_CLIP_HW = (256, 384)
 
 
 class Kandinsky6SRInputStage(PipelineStage):
-    """Streams the source video into a ``[T, 3, H, W]`` uint8 clip.
+    """Decode [T, 3, H, W] uint8 video, align fps/frames/size and retain source audio.
 
-    Follows the reference CLI: fps resampling toward 24 fps, the first 121 frames floored
-    to ``1 + 8k``, an optional x1.125 pre-upscale for the 2.25 scale, then edge-replicate
-    padding to the VAE spatial factor for every scale (``tiling.pad_to_spatial_factor``) so
-    whole-video KVAE encoding never runs on a misaligned frame.  Fills ``batch.fps`` (an
-    int), ``num_frames``, ``height`` and ``width`` (the *requested* SR result size, before
-    any delivery resize -- i.e. with the alignment padding already excluded), and puts the
-    source audio (mono float, trimmed to the processed duration) into ``batch.audio``.  No
-    prompt is required.
-    """
+    Record requested dimensions before VAE padding so output can remove it."""
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

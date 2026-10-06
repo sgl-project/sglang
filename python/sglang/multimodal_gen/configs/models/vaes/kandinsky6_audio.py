@@ -1,25 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 audio VAE + vocoder configuration.
-
-Mirrors the official checkpoints' ``audio_vae/config.json``
-(``kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`` and
-``kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers``, which differ only in
-``scaling_factor``: 0.5302 and 0.417)::
-
-    {
-      "_class_name": "MMAudioVAE", "mode": "44k", "sample_rate": 44100,
-      "downsample_factor": 1024, "scaling_factor": 0.5302,
-      "vocoder_config": {...BigVGAN-v2 hyperparams...}
-    }
-
-The runtime ``Kandinsky6AudioVAE`` module (``runtime/models/vaes``, resolved
-from the ``MMAudioVAE`` class name) bundles two independently-trained
-components in one checkpoint: an MMAudioVAE (mel<->latent codec) and a BigVGANV2
-vocoder (mel->waveform). This config is a thin passthrough for both:
-``vocoder_config`` is forwarded to the runtime ``BigVGANV2(...)`` constructor
-unmodified, ``mode`` selects the nested MMAudioVAE variant and
-``scaling_factor`` denormalizes the audio latents before decoding.
-"""
+"""Checkpoint configuration for the bundled MMAudio codec and BigVGAN vocoder."""
 
 from dataclasses import dataclass, field
 from typing import Any

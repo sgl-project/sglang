@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 TI2VA: text (optionally plus a conditioning image) to
-synchronized video + audio.
+"""Joint video/audio generation with optional image conditioning.
 
-There is deliberately no separate T2VA/IT2VA pipeline class -- one stage
-chain handles both: ``Kandinsky6ImageEncodingStage`` is a no-op when the
-request carries no conditioning image and injects it as an extra reference
-frame when one is supplied, mirroring how the diffusers reference's
-``Kandinsky6I2VAPipeline`` is itself just ``Kandinsky6T2VAPipeline`` plus an
-optional image branch on the same call path, not a materially different
-pipeline.
-
-This model jointly denoises two coupled modalities with a non-standard
-denoise loop, so -- like MOVA (this codebase's closest precedent for a
-dual-modality video+audio diffusion pipeline) and unlike a standard
-single-tensor pipeline -- it owns a model-specific stage chain
-(``runtime/pipelines_core/stages/model_specific_stages/kandinsky6/``) rather
-than using the framework's composite ``add_standard_*`` stage builders.
-"""
+One stage chain handles both T2VA and IT2VA; the image stage is a no-op for T2VA."""
 
 from __future__ import annotations
 
@@ -69,10 +54,7 @@ class Kandinsky6TI2VAPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def validate_disagg_role(self, role: RoleType) -> None:
-        # Simplest v1: the coupled video+audio denoising loop and the
-        # tail-cond re-pinning state aren't (yet) split across disaggregated
-        # roles. Matches MiniMaxH3Pipeline's precedent for a dual-modality
-        # pipeline that hasn't been made disagg-aware.
+        # coupled denoising and reference-frame state are not yet disaggregation-aware
         if role != RoleType.MONOLITHIC:
             raise ValueError(
                 "Kandinsky6TI2VAPipeline only supports monolithic deployment; "

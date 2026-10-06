@@ -1,21 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 video super-resolution (VSR) DiT architecture config.
+"""SR checkpoint architecture and sampling metadata.
 
-Field names mirror the ``transformer/config.json`` of the official Diffusers
-``Kandinsky6SRTransformer3DModel`` (for example ``kandinskylab/Kandinsky-6.0-VSR-5s-Diffusers``):
-every keyword of the constructor sits at the top level, next to ``attribute_overrides``
-(post-load behaviour overrides) and the nested ``sr_params`` (SR sampling parameters,
-expanded into the ``sr_*`` fields below).  ``out_visual_dim`` is the *total* head width:
-a flow-matching checkpoint stores the latent width there, a DX / pi-Flow (distilled)
-checkpoint stores ``base_dim * n_grid`` and keeps ``n_grid`` and the other pi-Flow values
-in ``scheduler/scheduler_config.json`` (``PiflowScheduler``).
-
-Unknown keys are rejected: ``ModelConfig.update_model_arch`` would otherwise park
-them silently in ``arch_config.extra_attrs``.  Configurations that this port does
-not implement (text-conditioned DiT, video adapter, LQ modulation) raise
-``NotImplementedError`` naming the flag instead of building a model that would
-load only partially.
-"""
+Official out_visual_dim is the total DX head width; n_grid lives in the scheduler.
+Unsupported architecture options and unknown fields are rejected."""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -140,12 +127,7 @@ class Kandinsky6SRArchConfig(DiTArchConfig):
 
     @property
     def base_out_visual_dim(self) -> int:
-        """Channels of one sampled latent grid.
-
-        An official checkpoint stores the TOTAL head width in ``out_visual_dim``
-        (``n_grid`` comes from the scheduler config), so the sampled width is the input
-        dim; with a legacy ``n_grid > 1`` the base dim is ``out_visual_dim``.
-        """
+        """Channels per latent grid; legacy n_grid configs store the base output width."""
         return self.out_visual_dim if self.n_grid > 1 else self.in_visual_dim
 
     @property

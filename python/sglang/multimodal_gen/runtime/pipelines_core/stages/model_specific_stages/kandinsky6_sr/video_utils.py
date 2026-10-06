@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from sr_core (parity-tested against the k6_video reference); adapted from
 # the Kandinsky 6 SR inference reference (k6_video, Apache-2.0).
-"""Pure-tensor frame-count / fps / output-size helpers for Kandinsky 6 video SR.
-
-Ported from ``pipeline/video_io.py`` (frame alignment and fps resampling) and
-``pipeline/output_resize.py`` (delivery-resolution resolution and resize). No
-file or video-decoder I/O lives here; ``loguru`` is replaced by stdlib ``logging``.
-
-The resolution-scale constant and the delivery-resize resolver (``SUPPORTED_RESOLUTION_SCALES``,
-``resolve_target_hw`` and what they depend on) live in
-``configs.sample.kandinsky6_sr_resolution`` instead of here: ``configs/sample/kandinsky6_sr.py``
-needs them too, and importing anything under this runtime stage package from a ``configs/sample``
-module closes an import cycle through ``registry`` -- see that module's docstring. They are
-re-exported here so this module stays the one place the rest of the stage package imports them
-from.
-"""
+"""Frame selection and bounded-memory output resize for Kandinsky 6 SR."""
 
 from __future__ import annotations
 
@@ -25,11 +12,6 @@ from torch.nn import functional as f  # noqa: N812
 
 from sglang.multimodal_gen.configs.sample.kandinsky6_sr_resolution import (
     ASPECT_MISMATCH_TOLERANCE,
-    SUPPORTED_RESOLUTION_SCALES,
-    TARGET_RESOLUTIONS,
-    TargetResizeMode,
-    fit_within,
-    resolve_target_hw,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,48 +29,10 @@ RESAMPLE_FPS_TOLERANCE: float = 1.5
 RESIZE_FRAME_CHUNK: int = 8
 
 
-# --------------------------------------------------------------------------- #
-# Frame alignment / fps resampling (pipeline/video_io.py)
-# --------------------------------------------------------------------------- #
-
-
-def align_to_vae_stride(t: int) -> int:
-    """Round ``t`` to the nearest valid pixel-frame count ``1 + 8·k`` (ties up).
-
-    SR data uses ``1 + 8·k`` frames so the temporal VAE stride round-trips
-    cleanly. Rounding to nearest (not truncation) keeps a requested duration
-    close to the target.
-
-    Args:
-        t: Raw frame count.
-
-    Returns:
-        Nearest valid frame count ``>= 1``.
-    """
-    if t <= 1:
-        return 1
-    k_floor = (t - 1) // 8
-    t_floor = 1 + 8 * k_floor
-    t_ceil = 1 + 8 * (k_floor + 1)
-    return t_ceil if (t - t_floor) >= (t_ceil - t) else t_floor
-
-
 def select_frame_indices(
     total_frames: int, src_fps: float, target_fps: float
 ) -> list[int]:
-    """Fixed-stride frame indices that downsample ``src_fps`` to ``target_fps``.
-
-    With ``step = src_fps / target_fps >= 1``, ``round(i * step)`` is strictly
-    non-decreasing, so the selection never duplicates a source frame.
-
-    Args:
-        total_frames: Number of frames in the source.
-        src_fps: Source frame rate (must be ``>= target_fps``).
-        target_fps: Desired frame rate.
-
-    Returns:
-        Sorted list of integer source-frame indices.
-    """
+    """Select rounded frame indices to downsample src_fps to target_fps."""
     step = src_fps / target_fps
     indices = [round(i * step) for i in range(int(total_frames / step))]
     return [i for i in indices if i < total_frames]
@@ -99,26 +43,9 @@ def resample_to_target_fps(
     src_fps: float,
     target_fps: int = TARGET_FPS,
 ) -> tuple[torch.Tensor, int]:
-    """Resample a decoded video toward ``target_fps`` (downsample / no-op / keep).
+    """Downsample high-fps inputs; retain near-target and lower-fps inputs.
 
-    Three tiers:
-
-    - ``|src_fps - target_fps| < RESAMPLE_FPS_TOLERANCE``: pass through unchanged.
-    - ``src_fps > target_fps``: fixed-stride downsample via
-      :func:`select_frame_indices`; the result is at ``target_fps``.
-    - ``src_fps < target_fps``: kept at the native rate with a warning (no
-      motion-compensated upsample); the clip stays mildly out of distribution.
-
-    Args:
-        video: ``[T, C, H, W]`` decoded source video.
-        src_fps: Source frame rate.
-        target_fps: Training frame rate to resample toward.
-
-    Returns:
-        ``(resampled_video, effective_fps)`` where ``effective_fps`` is the rate
-        the returned frames play at (``target_fps`` when downsampled, otherwise
-        ``round(src_fps)``) and is the correct rate to save the SR result at.
-    """
+    Return [T, C, H, W] video and its effective playback rate."""
     if abs(src_fps - target_fps) < RESAMPLE_FPS_TOLERANCE:
         return video, round(src_fps)
     if src_fps > target_fps:
@@ -145,18 +72,7 @@ def resample_to_target_fps(
 def clip_to_aligned_frames(
     video: torch.Tensor, max_num_frames: int = MAX_NUM_FRAMES
 ) -> torch.Tensor:
-    """Take the first ``max_num_frames`` and floor-align to ``1 + 8k`` frames.
-
-    Args:
-        video: ``[T, C, H, W]`` video.
-        max_num_frames: Hard cap applied before alignment (``<= 0`` disables it).
-
-    Returns:
-        ``[T', C, H, W]`` with ``T' == 1 + 8k`` and ``T' <= max_num_frames``.
-
-    Raises:
-        ValueError: If the video has no frames.
-    """
+    """Cap the frame count, then floor-align to 1+8k; reject empty video."""
     if max_num_frames > 0:
         video = video[:max_num_frames]
     aligned = 1 + 8 * ((video.shape[0] - 1) // 8) if video.shape[0] > 0 else 0
@@ -166,31 +82,8 @@ def clip_to_aligned_frames(
     return video[:aligned]
 
 
-# --------------------------------------------------------------------------- #
-# Output sizing (pipeline/output_resize.py)
-# --------------------------------------------------------------------------- #
-# ``fit_within`` and ``resolve_target_hw`` live in configs.sample.kandinsky6_sr_resolution
-# (imported above and re-exported via this module's __all__); only the actual tensor resize
-# stays here.
-
-
 def resize_to_target(video: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
-    """Antialiased-downscale the SR result to exactly ``target_hw``. No cropping.
-
-    Walks the clip in :data:`RESIZE_FRAME_CHUNK`-frame chunks to bound memory.
-
-    Args:
-        video: ``[C, T, H, W]`` uint8 SR result.
-        target_hw: Exact output ``(H, W)``.
-
-    Returns:
-        ``[C, T, target_h, target_w]`` uint8.
-
-    Raises:
-        ValueError: If the target exceeds the SR result on either axis —
-            that means the tier does not belong to this route, and silently
-            upscaling would hide the mistake.
-    """
+    """Downscale [C, T, H, W] uint8 video in bounded-memory chunks, without cropping."""
     _c, _t, height, width = video.shape
     target_h, target_w = target_hw
     if (height, width) == (target_h, target_w):
@@ -241,22 +134,3 @@ def resize_to_target(video: torch.Tensor, target_hw: tuple[int, int]) -> torch.T
         height / target_h,
     )
     return out
-
-
-__all__ = [
-    "ASPECT_MISMATCH_TOLERANCE",
-    "MAX_NUM_FRAMES",
-    "RESAMPLE_FPS_TOLERANCE",
-    "RESIZE_FRAME_CHUNK",
-    "SUPPORTED_RESOLUTION_SCALES",
-    "TARGET_FPS",
-    "TARGET_RESOLUTIONS",
-    "TargetResizeMode",
-    "align_to_vae_stride",
-    "clip_to_aligned_frames",
-    "fit_within",
-    "resample_to_target_fps",
-    "resize_to_target",
-    "resolve_target_hw",
-    "select_frame_indices",
-]

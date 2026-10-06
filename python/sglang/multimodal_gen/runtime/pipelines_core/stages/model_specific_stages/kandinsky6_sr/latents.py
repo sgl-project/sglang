@@ -1,21 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from sr_core (parity-tested against the k6_video reference); adapted from
 # the Kandinsky 6 SR inference reference (k6_video, Apache-2.0).
-"""Pure latent-construction functions for Kandinsky 6 video SR (no model object).
+"""SR latent construction with reference RNG ordering.
 
-Ported from ``core/algo/train_utils.py`` (``degrade_lq_latent``) and ``core/algo/utils.py``
-(``_build_initial_latent``). The timestep-schedule half of this module (the inline pi-Flow
-segment schedule of ``piflow_generate`` and the warped Euler ``linspace`` of ``generate``) was
-dropped: the denoising stage now drives the bundle's own diffusers scheduler
-(``FlowMatchEulerDiscreteScheduler.set_timesteps`` / ``PiflowScheduler.set_timesteps``) instead
-of re-deriving that schedule here -- see ``sampling.denoise_with_scheduler``.
-
-RNG semantics are the reference's: ``torch.Generator(device=device).manual_seed(seed)``
-seeds the initial noise, so results are bit-identical for the same
-``device``/``seed``/dtype. Note (faithful to the reference) that the
-channel-conditioning noise (``lq_channel_noise_scale``) is drawn from torch's
-*global* RNG, not from the seeded generator.
-"""
+Initial noise uses a per-request generator; conditioning noise uses the global RNG."""
 
 from __future__ import annotations
 
@@ -33,20 +21,7 @@ def degrade_lq_latent(
     noise_type: LqNoiseType = "linear",
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Mix random Gaussian noise into an LQ latent.
-
-    Args:
-        lq_latent: LQ latent tensor of arbitrary shape.
-        noise_scale: Noise fraction ``s`` in ``(0, 1)``. When ``<= 0``, the tensor
-            is returned unchanged (the very same object).
-        noise_type: ``"linear"`` for ``(1-s)*lq + s*eps`` or ``"ddpm"`` for
-            ``sqrt(1-s²)*lq + s*eps`` (variance-preserving).
-        generator: Optional RNG generator (on ``lq_latent``'s device) for
-            deterministic noise sampling; ``None`` uses torch's global RNG.
-
-    Returns:
-        Degraded LQ latent with the same shape and dtype as the input.
-    """
+    """Mix linear or variance-preserving (ddpm) noise; nonpositive scales are a no-op."""
     if noise_scale <= 0:
         return lq_latent
     eps = torch.randn(
@@ -84,44 +59,10 @@ def build_initial_latent(  # noqa: PLR0913
     lq_channel_noise_scale: float,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Build the initial latent tensor for the SR denoising loop.
+    """Build [starting | conditioning | mask] for the selected instruction mode.
 
-    Constructs ``[starting | cond | mask]`` depending on ``instruct_type``:
-
-    - ``"noise"``: degraded LQ as starting point; with ``visual_cond`` also a zero
-      LQ cond + zero mask, otherwise the bare degraded LQ latent.
-    - ``"channel"``: random Gaussian noise as starting point, LQ cond + ones mask.
-    - ``"hybrid"``: degraded LQ as starting point, LQ cond + ones mask.
-    - ``"hybrid_anchor"``: anchor-free only — degraded LQ as starting point, a
-      zeroed HR anchor (noised by ``lq_channel_noise_scale``) + a zeroed anchor
-      mask, as the tiled path runs it.
-
-    Args:
-        instruct_type: One of ``"noise"``, ``"channel"``, ``"hybrid"``, ``"hybrid_anchor"``.
-        visual_cond: ``dit.visual_cond`` — whether the DiT input layer has conditioning
-            channels (only consulted for ``"noise"``).
-        in_visual_dim: ``dit.in_visual_dim`` — latent channel count (only used by ``"channel"``).
-        lq_latent: Scaled LQ latent ``[batch_size*duration, H, W, C]``.
-        batch_size: Batch size (``bs``).
-        duration: Number of temporal frames per sample.
-        height: Latent height.
-        width: Latent width.
-        device: Target device (also the device of the noise generator).
-        seed: RNG seed for the starting-noise generator.
-        lq_noise_scale: Noise fraction mixed into the LQ starting point.
-        lq_noise_type: ``"linear"`` or ``"ddpm"`` noising formula.
-        lq_channel_noise_scale: Noise fraction mixed into the channel-cat
-            conditioning (LQ for ``channel``/``hybrid``, anchor for ``hybrid_anchor``).
-        dtype: Floating dtype to cast ``lq_latent`` to (the DiT's parameter dtype in
-            the reference); ``None`` keeps ``lq_latent``'s dtype.
-
-    Returns:
-        Initial latent tensor ready for the denoising loop, ``[batch_size*duration, H, W, 2C+1]``
-        (``[.., C]`` for ``"noise"`` without ``visual_cond``).
-
-    Raises:
-        ValueError: If ``instruct_type`` is not supported.
-    """
+    Inputs and output use [B*T, H, W, C]; the output has 2C+1 channels except
+    unconditioned noise mode. Cast LQ to the DiT dtype before drawing noise."""
     lq_latent = lq_latent.to(device)
     lq_latent = _cast_floating(lq_latent, dtype)
 

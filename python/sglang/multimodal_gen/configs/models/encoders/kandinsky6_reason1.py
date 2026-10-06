@@ -1,23 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config for Reason1, Kandinsky6's Qwen2.5-VL-based "prompt engineer" text
-encoder.
+"""Reason1 text encoder, reusing the Qwen2.5-VL runtime without its vision tower.
 
-Reused runtime class: this is a config-only port. Kandinsky6 only ever calls
-this encoder with plain text (never images -- the optional conditioning
-image goes through the video VAE, not through a vision tower), so the
-existing ``sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl
-.Qwen2_5_VLForConditionalGeneration`` runtime class is reused unmodified:
-its ``Qwen2_5_VLModel(config, enable_image_understanding=...)`` only builds
-the vision tower when ``enable_image_understanding=True``, which a
-``Kandinsky6TI2VAPipelineConfig`` never sets, so the vision tower is never
-allocated or loaded for this encoder.
-
-Field defaults below mirror Qwen2.5-VL-7B-Instruct's language-model trunk
-(matching ``Kandinsky6ArchConfig.in_text_dim == 3584``, the DiT's expected
-text-embedding width) as a self-contained fallback; a real checkpoint's own
-``text_encoder/config.json`` overlays these via ``update_model_arch`` once
-one is published.
-"""
+Defaults describe the 3584-wide language trunk; checkpoint config overrides them."""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -67,10 +51,7 @@ class Reason1ArchConfig(TextEncoderArchConfig):
     output_hidden_states: bool = True
     hidden_state_skip_layer: int = 0
 
-    # KANDINSKY6_PROMPT_TEMPLATE (configs/pipeline_configs/kandinsky6.py) is
-    # ~129 tokens; text_len bounds the *user* portion appended to it. The
-    # per-request tokenizer max_length (129 + 512) is set via
-    # Kandinsky6TI2VAPipelineConfig.text_encoder_extra_args, not here.
+    # text_len caps user tokens; tokenizer length also includes the 129-token template
     text_len: int = 512
 
     bos_token_id: int = 151643

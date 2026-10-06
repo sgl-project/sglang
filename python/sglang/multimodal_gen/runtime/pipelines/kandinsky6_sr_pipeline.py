@@ -1,46 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 video super-resolution (VSR): source video -> upscaled video (+ audio).
+"""Kandinsky 6 video SR: prepare, encode/upscale, denoise, decode and blend.
 
-Stage chain (all monolithic)::
-
-    input (stream-decode, fps / frame budget, pre-upscale, spatial-factor alignment pad,
-           source audio)
-      -> encode (LU path: whole-video KVAE encode)
-      -> latent_prep (LU or tile encode + upscale -> initial noisy latent chunks)
-      -> denoising (the bundle's own scheduler steps every chunk)
-      -> decode (KVAE decode every chunk into uint8 tiles)
-      -> output (Hann stitch, crop back to the requested size, optional resize, fp16 [0, 1]
-                 video + source audio)
-
-Four model phases (encode / upscale-or-encode / denoise / decode), one stage per phase, so the
-component-residency manager moves each component on and off the GPU once per request instead of
-once per tile; the denoising stage additionally subclasses the shared
-``pipelines_core.stages.denoising.DenoisingStage`` instead of a free-standing loop, to reuse its
-cache-dit / torch.compile hooks (see ``denoising_stage.py``).
-
-The model is an official Diffusers ``Kandinsky6SRPipeline`` repo, loaded directly like
-the K6 TI2VA repos::
-
-    model_index.json              _class_name = Kandinsky6SRPipeline
-    transformer/                  Kandinsky6SRTransformer3DModel (text-free SR DiT, ``sr_params``)
-    vae/                          Kandinsky6SRVAE (causal video KVAE)
-    scheduler/                    FlowMatchEulerDiscreteScheduler or PiflowScheduler
-    latent_upscaler/  (optional)  Kandinsky6SRLatentUpscalerBank (x2 / x4 entries)
-
-The ``scheduler`` component selects the sampler, and now actually drives the step loop (via
-``scheduler.set_timesteps`` / ``scheduler.step``) instead of a hand-written Euler / pi-Flow
-loop re-deriving the same schedule.  There are two official repos:
-
-* ``kandinskylab/Kandinsky-6.0-VSR-5s-Diffusers``: ``FlowMatchEulerDiscreteScheduler``,
-  flow-Euler with ``num_inference_steps`` DiT calls per tile;
-* ``kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers``: ``PiflowScheduler``
-  with ``nfe`` 2, pi-Flow with ``nfe`` DiT calls per tile (``num_inference_steps`` is ignored,
-  with a warning if it was explicitly set to something other than ``nfe``).
-
-``num_inference_steps`` counts DiT calls per tile here, the convention used everywhere else in
-this repo; the upstream Diffusers pipeline counts timestep grid points instead (its default 5
-is 4 calls here).
-"""
+Work is grouped by component to avoid weight transfers per tile. The bundle's
+scheduler drives denoising through the shared DenoisingStage lifecycle.
+num_inference_steps counts DiT calls; pi-Flow uses its checkpoint-defined nfe."""
 
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     Kandinsky6SRPipelineConfig,

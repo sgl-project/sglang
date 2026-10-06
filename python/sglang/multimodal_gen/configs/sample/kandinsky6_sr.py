@@ -17,13 +17,7 @@ SR_RESIZE_MODES = ("fit", "exact")
 
 @dataclass
 class Kandinsky6SRSamplingParams(SamplingParams):
-    """Knobs of the tiled SR run.
-
-    The input video comes from ``video_path``; ``height`` / ``width`` / ``num_frames`` /
-    ``fps`` are outputs of the SR input stage (they follow the source video), and the
-    prompt is ignored (the SR DiT is text-free).  ``seed`` seeds the LQ noising of the
-    tiles exactly like the reference (chunk ``k`` uses ``seed + first tile index``).
-    """
+    """SR request options; dimensions and fps follow video_path, prompt is ignored."""
 
     # No prompt-driven generation: keep the guidance defaults inert.
     negative_prompt: str = ""
@@ -49,10 +43,7 @@ class Kandinsky6SRSamplingParams(SamplingParams):
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
-        # num_inference_steps is not listed here: it is already a core field of the base
-        # video request schema (every model gets it), unlike the sr_* knobs below, which the
-        # base schema does not declare and which therefore only survive as pydantic
-        # model_extra on a multipart / JSON request.
+        # num_inference_steps is already in the base schema; only sr_* needs model_extra
         return frozenset(
             {
                 "sr_resolution_scale",

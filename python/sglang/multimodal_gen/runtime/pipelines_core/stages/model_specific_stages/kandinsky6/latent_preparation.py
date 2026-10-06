@@ -1,16 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 joint video+audio noise-latent preparation.
+"""Joint noise preparation, adapted from FastVideo's Kandinsky6LatentPreparationStage.
 
-Draws BOTH video and audio noise from the same generator (video first, then
-audio -- no seed offset needed, since each draw is an independent sample from
-the same RNG stream). Runs for both T2VA and IT2VA calls; the optional
-conditioning image (if any) is applied afterward by
-``Kandinsky6ImageEncodingStage``, which appends an extra reference frame
-rather than overwriting one drawn here.
-
-Ported from FastVideo's ``Kandinsky6LatentPreparationStage``
-(fastvideo/pipelines/stages/kandinsky6.py).
-"""
+Draw video then audio from the same generator. Image conditioning is appended later."""
 
 from __future__ import annotations
 
@@ -39,12 +30,7 @@ def audio_latent_duration(
     audio_sample_rate: int,
     audio_downsample_factor: int,
 ) -> int:
-    """Audio latent length matching the diffusers Kandinsky6 T2VA reference:
-    ``ceil(pixel_frames / fps * audio_sample_rate / audio_downsample_factor)``,
-    where ``pixel_frames = (video_latent_frames - 1) * 4 + 1`` is the causal
-    video VAE's temporal-compression convention (matches
-    ``HunyuanVAEConfig.temporal_compression_ratio == 4``).
-    """
+    """Audio latent length from causal video duration at the request's fps."""
     pixel_frames = (video_latent_frames - 1) * 4 + 1
     return int(
         math.ceil(pixel_frames / fps * audio_sample_rate / audio_downsample_factor)
@@ -115,16 +101,7 @@ class Kandinsky6LatentPreparationStage(PipelineStage):
             video = torch.cat([video, cond, mask], dim=-1)
 
         num_audio_channels = arch.in_audio_dim
-        # Audio duration must track the REQUESTED fps (`batch.fps`), not the
-        # pipeline's default `sample_fps`: the diffusers reference's
-        # `frame_rate` call argument (default 24.0, genuinely arbitrary --
-        # see `pipeline_kandinsky6_ti2va.py`'s `audio_length` computation)
-        # and FastVideo's own `Kandinsky6LatentPreparationStage` both derive
-        # audio length from the request's own fps, not a hardcoded 24.
-        # Using the pipeline default here regardless of the request would
-        # silently desync the generated audio from the video actually saved
-        # at `batch.fps` (e.g. a 121-frame, 30fps request would produce
-        # ~4s of video but ~5s of audio).
+        # align audio duration with request fps, not the pipeline default
         num_audio_frames = audio_latent_duration(
             num_latent_frames,
             fps=float(batch.fps),

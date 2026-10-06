@@ -1,35 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native sglang-diffusion port of the Kandinsky 6 video super-resolution DiT.
+"""Text-free Kandinsky 6 SR DiT, reusing the joint model's TP/SP building blocks.
 
-Reference: ``kandinsky_sr.core.components.model.dit.DiffusionTransformer3D`` (text-free
-mode) and ``dx_dit.DXDiTWrapper`` (``n_grid`` velocity grids per token).  The building
-blocks (time / visual embeddings, RoPE3D, modulation, dense attention, feed-forward) are
-the ones of the K6 T2VA DiT (``kandinsky6.py``); this module only adds what the
-super-resolution model differs in:
-
-* no text tower and no cross-attention: the decoder block has a 6-parameter modulation
-  (self-attention + FFN) and the pooled-text contribution to the time embedding is a
-  learned constant ``pooled_bias``;
-* ``instruct_type`` conditioning: the input layer is ``2 * in + 1`` channels wide for a
-  ``visual_cond`` or ``channel`` / ``hybrid`` / ``hybrid_anchor`` checkpoint;
-* a DX head (distilled pi-Flow checkpoints): ``out_layer`` emits ``head_width``
-  channels per token, all ``n_grid`` velocity grids of it (a flow-matching head is one
-  grid);
-* post-load ``attribute_overrides`` (``instruct_type``, ``visual_cond``,
-  ``attention_params``) that change inference behaviour but not the architecture.
-
-Layout is batched ``[B, T, H, W, C]`` (the reference packs samples along time with
-``cu_seqlens``).  Attention is always dense (never block-sparse); a checkpoint whose
-``attention_params`` ask for NABLA sparse attention is run dense with a warning.
-
-Numerics follow the reference under ``torch.autocast(bfloat16)``: parameters may be bf16,
-the residual stream and all norm / modulation arithmetic are fp32, and matmul inputs are
-cast to the parameter dtype.
-
-TP shards the shared K6 attention/FFN projections. SP shards the visual tokens and
-RoPE together before the decoder blocks, masks tail padding, and gathers before
-the output head. The VAE, latent upscaler, and tile scheduler remain replicated.
-"""
+Latents are [B, T, H, W, C]. Residuals, norms and modulation remain fp32;
+linear inputs use the parameter dtype. A pi-Flow DX head emits n_grid velocities
+per latent channel. VAE, upscaler and tile scheduling remain replicated."""
 
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -96,12 +70,7 @@ def _modulate(
 
 
 class Kandinsky6SRRoPE3D(Kandinsky6RoPE3D):
-    """``Kandinsky6RoPE3D`` whose fp32 angle tables survive ``module.to(dtype=bf16)``.
-
-    The component residency manager casts a whole module to its target dtype when it
-    moves it to the GPU.  The RoPE tables (buffers) hold rotation angles up to position
-    128; rounding them to bf16 would silently degrade the position encoding.
-    """
+    """Keep fp32 RoPE angle tables across residency-manager dtype casts."""
 
     def _apply(self, fn, recurse=True):
         device = fn(torch.zeros(1)).device
@@ -112,11 +81,7 @@ class Kandinsky6SRRoPE3D(Kandinsky6RoPE3D):
 
 
 class Kandinsky6SRDecoderBlock(nn.Module):
-    """Text-free decoder block: modulated self-attention + modulated feed-forward.
-
-    The residual stream ``visual_embed`` is kept in fp32 (like the reference, where the
-    gated residual add promotes it); ``compute_dtype`` is the dtype fed to the linears.
-    """
+    """Modulated self-attention and FFN with fp32 residuals and parameter-dtype linears."""
 
     def __init__(
         self,
@@ -402,19 +367,10 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         scale_factor: tuple[float, float, float] = (1.0, 1.0, 1.0),
         motion_score: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict the velocity (flow-matching head) or the DX velocity grids.
+        """Predict [B, T, H, W, head_width] velocities from channel-last latents.
 
-        Args:
-            hidden_states: ``[B, T, H, W, C]`` latent (channel-last, ``C`` = input width).
-            timestep: ``[B]`` model times, already multiplied by 1000.
-            visual_rope_pos: ``(arange(T), arange(H // ph), arange(W // pw))``.
-            scale_factor: RoPE frequency scaling per (t, h, w) axis.
-            motion_score: optional ``[1]`` / ``[B]`` score, used iff ``use_motion_score``.
-
-        Returns:
-            ``[B, T, H, W, head_width]``; for a DX head, grid ``g`` of channel ``c``
-            sits at index ``g * base_out_visual_dim + c`` (the sampler reshapes it).
-        """
+        timesteps are scaled by 1000. DX channels are ordered grid-major;
+        the scheduler reshapes them into n_grid velocity predictions."""
         self._check_latent_shape(hidden_states)
         compute_dtype = self.visual_embeddings.in_layer.weight.dtype
         time_embed = self.time_embeddings(timestep)

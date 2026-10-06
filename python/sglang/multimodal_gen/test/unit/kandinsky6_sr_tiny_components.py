@@ -2,7 +2,9 @@
 """Tiny random Kandinsky 6 SR components and requests for the stage-level tests."""
 
 import copy
+from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
@@ -31,6 +33,24 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     SR_REQUESTED_HW_KEY,
     SR_TILING_SCALE_KEY,
     SR_VIDEO_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
+    DitSpec,
+    SamplingSpec,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
+    LatentUpscaleFn,
+    decode_chunks,
+    denoise_chunks,
+    encode_video_to_lr_latent,
+    plan_tiles,
+    prepare_lu_tile_latents,
+    prepare_pixel_tile_latents,
+    stitch_tiles,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
+    RESOLUTIONS,
+    VAE_SPATIAL_FACTOR,
 )
 
 # Flat (legacy) transformer config with a pi-Flow DX head: 3 grids of 4 channels.
@@ -171,3 +191,69 @@ def random_video(frames, height, width, seed=0):
     generator = torch.Generator().manual_seed(seed)
     shape = (frames, 3, height, width)
     return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+
+
+@torch.no_grad()
+def super_resolve(
+    video: torch.Tensor,
+    *,
+    vae: torch.nn.Module,
+    scaling_factor: float,
+    dit: Callable[..., torch.Tensor],
+    dit_spec: DitSpec,
+    spec: SamplingSpec,
+    scheduler: Any,
+    device: torch.device | str,
+    upscale_fn: LatentUpscaleFn | None = None,
+    lu_dtype: torch.dtype | None = None,
+    spatial_factor: int = VAE_SPATIAL_FACTOR,
+    resolutions: Mapping[int, Sequence[tuple[int, int]]] = RESOLUTIONS,
+) -> torch.Tensor:
+    """Tiled SR of a ``[T, C, H, W]`` uint8 video -> uint8 ``[3, T, H*s, W*s]``.
+
+    ``upscale_fn`` selects the LU path; without it the pixel path runs. ``scheduler`` is the
+    already-resolved effective scheduler (``run_spec.effective_scheduler``) -- a real loaded
+    component, or one synthesized from ``spec.piflow`` / ``spec.scheduler_scale`` when none fits.
+    """
+    device = torch.device(device)
+    common = dict(
+        visual_size=spec.visual_size,
+        tiling_scale=spec.tiling_scale,
+        tile_min_overlap=spec.tile_min_overlap,
+        spatial_factor=spatial_factor,
+        resolutions=resolutions,
+    )
+    if upscale_fn is not None:
+        lr_latent = encode_video_to_lr_latent(video, vae, device=device).cpu()
+        frame_hw = (
+            lr_latent.shape[-2] * spatial_factor,
+            lr_latent.shape[-1] * spatial_factor,
+        )
+        plan = plan_tiles(frame_hw=frame_hw, **common)
+        chunks = prepare_lu_tile_latents(
+            lr_latent,
+            plan,
+            upscale_fn=upscale_fn,
+            lu_dtype=lu_dtype,
+            scaling_factor=scaling_factor,
+            dit_spec=dit_spec,
+            spec=spec,
+            device=device,
+            spatial_factor=spatial_factor,
+        )
+    else:
+        plan = plan_tiles(frame_hw=tuple(video.shape[-2:]), **common)
+        chunks = prepare_pixel_tile_latents(
+            video,
+            plan,
+            vae=vae,
+            scaling_factor=scaling_factor,
+            dit_spec=dit_spec,
+            spec=spec,
+            device=device,
+        )
+    denoised = denoise_chunks(
+        chunks, dit, scheduler, dit_spec=dit_spec, spec=spec, device=device
+    )
+    tiles = decode_chunks(denoised, vae, scaling_factor=scaling_factor, device=device)
+    return stitch_tiles(tiles, plan)

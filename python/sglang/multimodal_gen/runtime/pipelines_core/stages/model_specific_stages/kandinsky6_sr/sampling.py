@@ -1,20 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Framework-independent denoising loop of Kandinsky 6 video SR.
-
-A bundle's own diffusers scheduler (``FlowMatchEulerDiscreteScheduler`` for a flow-matching
-checkpoint, ``PiflowScheduler`` for a distilled pi-Flow one) drives the step grid and the state
-update: :func:`denoise_with_scheduler` calls ``scheduler.set_timesteps`` once and
-``scheduler.step`` once per DiT call, instead of a hand-written Euler / pi-Flow loop re-deriving
-that same math. The pi-Flow DX-grid reshape and its policy rollout, in particular, now live
-entirely inside ``PiflowScheduler._policy_step`` (``runtime/models/schedulers/kandinsky6_piflow.py``,
-not owned by this package) -- this module no longer needs ``DXPolicy`` / ``policy_rollout_fm`` at
-all.
-
-:func:`make_dit_fn` still binds the per-tile-chunk-constant DiT inputs (RoPE positions, RoPE
-scale, the optional motion score) into a plain ``dit_fn(x, model_time, step) -> velocity``
-callable, so the denoising loop knows nothing about the DiT class, the forward context or
-offloading.
-"""
+"""Scheduler-driven denoising for Kandinsky 6 SR tile chunks."""
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -30,13 +15,7 @@ StepContext = Callable[[int], AbstractContextManager]
 
 
 class PiflowParams(msgspec.Struct, frozen=True, kw_only=True):
-    """Sampler values of a pi-Flow bundle.
-
-    They come from the ``PiflowScheduler`` config of an official repo (or, for legacy flat
-    configs, from the ``piflow_*`` keys of the DiT config) and are enough to synthesize a
-    matching ``PiflowScheduler`` object when the loaded ``scheduler`` component is not one
-    (``run_spec.effective_scheduler``).
-    """
+    """pi-Flow parameters from the scheduler or legacy flat DiT config."""
 
     nfe: int
     num_policy_substeps: int
@@ -140,13 +119,7 @@ def make_dit_fn(
     use_motion_score: bool,
     step_context: StepContext | None = None,
 ) -> DitFn:
-    """Bind the constant DiT inputs (RoPE positions, RoPE scale, motion score).
-
-    Args:
-        latent_frames_hw: ``(T, H, W)`` of the latent tile that the loop feeds.
-        step_context: optional ``step -> context manager`` wrapped around every call
-            (the stage uses it for the attention forward context).
-    """
+    """Bind per-chunk RoPE/motion inputs and an optional per-step context."""
     frames, height, width = latent_frames_hw
     context = step_context or (lambda step: nullcontext())
 
@@ -183,21 +156,10 @@ def denoise_with_scheduler(
     is_piflow: bool,
     on_step: StepCallback | None = None,
 ) -> torch.Tensor:
-    """Run ``scheduler.timesteps`` DiT calls on a chunk; returns ``x[..., :channels]``.
+    """Denoise one chunk after set_timesteps; keep conditioning channels fixed.
 
-    ``scheduler.set_timesteps`` must already have been called (the stage resolves that once per
-    request, since it depends on the bundle and the requested step count, not on any one
-    chunk). Each step: slice the current state out of ``x`` (the first ``channels`` channels;
-    the rest -- the anchor / mask conditioning -- is fixed and re-concatenated every step), run
-    the DiT, and hand the prediction to ``scheduler.step``.
-
-    ``FlowMatchEulerDiscreteScheduler.step`` casts its result to the *prediction's* dtype; under
-    bf16 autocast that would quietly drop the running state out of fp32 after the first step.
-    ``PiflowScheduler.step`` instead casts to the incoming *sample*'s dtype, so once the state is
-    fp32 it stays fp32 on its own. Casting the prediction to fp32 before calling
-    ``scheduler.step`` keeps both schedulers' state fp32 across every step, matching the
-    reference (model_output may be bf16; the update itself promotes to fp32).
-    """
+    Promote predictions to fp32 so flow-Euler does not downcast its running
+    state to the bf16 prediction dtype. pi-Flow already preserves the state dtype."""
     state = x[..., :channels].float()
     cond = x[..., channels:]
     for step, t in enumerate(scheduler.timesteps):

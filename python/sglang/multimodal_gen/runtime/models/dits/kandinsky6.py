@@ -1,47 +1,11 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""Native sglang-diffusion implementation of the Kandinsky6 T2VA/IT2VA transformer.
+"""Kandinsky 6 transformer with channel-last video and [B, A, D] audio latents.
 
-Ported from FastVideo's ``fastvideo/models/dits/kandinsky6.py``, which mirrors
-``kandinsky5.py``'s structure and extends it with a second, parallel "audio"
-tower plus a fused video<->audio decoder block
-(``Kandinsky6FusedTransformerDecoderBlock``), following the reference
-``diffusers.models.transformers.transformer_kandinsky6`` module.
-
-Video latents are represented as ``[B, T, H, W, C]`` (channel-last) tensors and
-audio latents as ``[B, A, D]`` tensors -- ordinary batched tensors, not the
-packed ragged sequence with ``cu_seqlens`` boundaries the diffusers reference
-uses. RoPE position tensors therefore carry an explicit/broadcastable batch
-dimension instead of being derived from ``cu_seqlens``.
-
-Attention: the dense/SDPA path (``attention_engine != "nabla"``) is the only
-verified path -- no published Kandinsky6 checkpoint has been observed using
-NABLA block-sparse attention, and this codebase has no NABLA attention
-backend (no ``AttentionBackendEnum.NABLA_ATTN`` member, no
-``torch.nn.attention.flex_attention``-based block-mask kernel). Rather than
-guess-port FastVideo's ``nablaT_v2``/``flex_attention`` fallback logic with
-nothing to verify it against, ``attention_engine == "nabla"`` raises
-``NotImplementedError`` at model construction time. The ``use_nabla``
-construction-time flag and ``sparse_params`` forward-time plumbing are still
-threaded through every layer so a real NABLA backend can be dropped in later
-without an architectural rewrite.
-
-TP/SP: ``Kandinsky6Attention``'s Q/K/V and output projections are native
-TP-sharded (``ColumnParallelLinear``/``RowParallelLinear``, matching
-``wanvideo.py``'s/``krea2.py``'s pattern), and attention runs through
-``USPAttention`` for Ulysses/ring sequence parallelism, instead of a
-replicated ``ReplicatedLinear`` + single-GPU ``LocalAttention``. The
-feed-forward was already TP-sharded. ``Kandinsky6Attention`` is reused for
-five different roles (video self-attn, audio self-attn, two text
-cross-attns, two video<->audio cross-attns with asymmetric ``kv_dim``); see
-its docstring for how TP and SP are wired per role. TP preserves the model's
-head layout for every role (each rank shards whole attention heads, a
-per-head QK-norm, and an all-reduced output projection -- no role splits a
-single head's channels across ranks). SP shards the video stream while
-keeping the shorter audio and text streams replicated. Audio-to-video
-cross-attention gathers the projected video K/V and removes tail padding;
-video-to-audio and text cross-attention already have complete local K/V.
+TP shards whole heads. SP shards video tokens; text and audio stay replicated.
+Audio-to-video cross-attention gathers projected video K/V and removes padding.
+NABLA attention is not supported.
 """
 
 import math
@@ -90,14 +54,9 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 
-FRACTAL_PIXEL_SIZE = 8
 _ARCH_CONFIG_DEFAULTS = Kandinsky6VideoAudioConfig().arch_config
 
-# The plain (non-multimodal) T2V/I2V-parity path uses ``text_transformer_blocks``;
-# the real multimodal (T2VA/IT2VA) path builds one independent 4-layer text
-# tower per modality, named ``video_text_transformer_blocks`` /
-# ``audio_text_transformer_blocks``. ``visual_transformer_blocks`` (x60) is
-# shared by both paths. All four need individual-block FSDP/compile sharding.
+# block containers for FSDP and compilation across video-only and joint models
 _KANDINSKY6_BLOCK_CONTAINERS = (
     "text_transformer_blocks",
     "video_text_transformer_blocks",
@@ -118,105 +77,6 @@ def _build_rotary_freqs(dim: int, max_period: float) -> torch.Tensor:
     )
 
 
-def local_patching(
-    x: torch.Tensor,
-    shape: tuple[int, int, int, int],
-    group_size: tuple[int, int, int],
-    dim: int = 0,
-) -> torch.Tensor:
-    """Regroups a ``[..., T, H, W, ...]``-shaped tensor into local ``group_size``
-    blocks along ``dim``. Only exercised by the non-multimodal / NABLA
-    fractal-ordering path (see ``fractal_flatten``); ported for completeness.
-    """
-    _batch_size, duration, height, width = shape
-    g1, g2, g3 = group_size
-    x = x.reshape(
-        *x.shape[:dim],
-        duration // g1,
-        g1,
-        height // g2,
-        g2,
-        width // g3,
-        g3,
-        *x.shape[dim + 3 :],
-    )
-    x = x.permute(
-        *range(len(x.shape[:dim])),
-        dim,
-        dim + 2,
-        dim + 4,
-        dim + 1,
-        dim + 3,
-        dim + 5,
-        *range(dim + 6, len(x.shape)),
-    )
-    x = x.flatten(dim, dim + 2).flatten(dim + 1, dim + 3)
-    return x
-
-
-def local_merge(
-    x: torch.Tensor,
-    shape: tuple[int, int, int, int],
-    group_size: tuple[int, int, int],
-    dim: int = 0,
-) -> torch.Tensor:
-    """Inverse of ``local_patching``."""
-    _batch_size, duration, height, width = shape
-    g1, g2, g3 = group_size
-    x = x.reshape(
-        *x.shape[:dim],
-        duration // g1,
-        height // g2,
-        width // g3,
-        g1,
-        g2,
-        g3,
-        *x.shape[dim + 2 :],
-    )
-    x = x.permute(
-        *range(len(x.shape[:dim])),
-        dim,
-        dim + 3,
-        dim + 1,
-        dim + 4,
-        dim + 2,
-        dim + 5,
-        *range(dim + 6, len(x.shape)),
-    )
-    x = x.flatten(dim, dim + 1).flatten(dim + 1, dim + 2).flatten(dim + 2, dim + 3)
-    return x
-
-
-def fractal_flatten(
-    x: torch.Tensor,
-    rope: torch.Tensor,
-    shape: tuple[int, int, int, int],
-    block_mask: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if block_mask:
-        pixel_size = FRACTAL_PIXEL_SIZE
-        x = local_patching(x, shape, (1, pixel_size, pixel_size), dim=1)
-        rope = local_patching(rope, shape, (1, pixel_size, pixel_size), dim=1)
-        x = x.flatten(1, 2)
-        rope = rope.flatten(1, 2)
-    else:
-        x = x.flatten(1, 3)
-        rope = rope.flatten(1, 3)
-    return x, rope
-
-
-def fractal_unflatten(
-    x: torch.Tensor, shape: tuple[int, int, int, int], block_mask: bool = False
-) -> torch.Tensor:
-    if block_mask:
-        pixel_size = FRACTAL_PIXEL_SIZE
-        x = x.reshape(x.shape[0], -1, pixel_size**2, *x.shape[2:])
-        x = local_merge(x, shape, (1, pixel_size, pixel_size), dim=1)
-    else:
-        x = x.reshape(*shape, *x.shape[2:])
-    return x
-
-
 class Kandinsky6TimeEmbeddings(nn.Module):
     """Sinusoidal timestep embedding -> Linear -> SiLU -> Linear."""
 
@@ -231,9 +91,7 @@ class Kandinsky6TimeEmbeddings(nn.Module):
         assert model_dim % 2 == 0
         self.model_dim = model_dim
         self.max_period = max_period
-        # Plain attribute, not a registered buffer -- materialized on meta
-        # device at construction and re-derived in post_load_weights() if
-        # weights were loaded under a meta-device init context.
+        # plain fp32 frequencies are rebuilt by post_load_weights after meta initialization
         self.freqs = _build_rotary_freqs(self.model_dim // 2, self.max_period)
         self.in_layer = ReplicatedLinear(
             model_dim, time_dim, bias=True, prefix=add_prefix("in_layer", prefix)
@@ -244,16 +102,7 @@ class Kandinsky6TimeEmbeddings(nn.Module):
         )
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
-        # `self.freqs` is always fp32 (a plain attribute, not a registered buffer --
-        # see __init__), so this sinusoidal embedding is always fp32, but `in_layer`'s
-        # weight is whatever dtype the checkpoint loaded it as (bf16 under the default
-        # loading config). `torch.autocast(device_type="cuda", dtype=torch.float32)`
-        # does not bridge that gap -- it doesn't cast an already-materialized bf16
-        # weight to fp32, and it's a no-op entirely on CPU/MPS (`device_type="cuda"`) --
-        # so the first Linear call raised "mat1 and mat2 must have the same dtype".
-        # Cast the embedding to the Linear's own weight dtype explicitly instead,
-        # matching the diffusers reference's
-        # `embed.to(get_parameter_dtype(self.timestep_embedder))`.
+        # compute sinusoidal features in fp32, then cast to the loaded linear dtype
         args = torch.outer(time, self.freqs.to(device=time.device))
         time_embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         time_embed = time_embed.to(self.in_layer.weight.dtype)
@@ -408,9 +257,7 @@ class Kandinsky6Modulation(nn.Module):
         self.out_layer.bias.data.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Same bf16-weight-vs-fp32-input gap as Kandinsky6TimeEmbeddings.forward (see
-        # its comment): cast explicitly to out_layer's own weight dtype instead of
-        # relying on torch.autocast(dtype=torch.float32) to bridge it.
+        # cast explicitly: fp32 autocast does not convert loaded bf16 weights
         x = x.to(self.out_layer.weight.dtype)
         x = self.activation(x)
         x, _ = self.out_layer(x)
@@ -451,38 +298,10 @@ class Kandinsky6QKNorm(nn.RMSNorm):
 
 
 class Kandinsky6Attention(nn.Module):
-    """Self- or cross-attention. ``kv_dim`` lets K/V come from a
-    differently-sized stream (the video<->audio cross-modal attentions).
+    """TP-sharded attention with head-local QK norm and optional asymmetric K/V.
 
-    TP: ``to_query``/``to_key``/``to_value`` are column-parallel (sharded
-    across attention heads, ``gather_output=False``) and ``out_layer`` is
-    row-parallel (``input_is_parallel=True``, all-reduces back to the full
-    width) -- the native parallel-projection pattern ``wanvideo.py``'s
-    ``WanSelfAttention`` and ``krea2.py`` use. ``query_norm``/``key_norm``
-    stay replicated per-head RMSNorm instances: they normalize
-    *within* one head's ``head_dim`` slice (see ``forward``'s per-head
-    reshape before the norm call), and TP shards whole heads across ranks
-    (never splits a single head's channels), so this per-head norm is exactly
-    equivalent to the single-GPU computation on every rank with no
-    cross-rank reduction needed -- unlike models whose QK-norm runs over the
-    full (pre-head-split) channel width, which need a dedicated tensor-
-    parallel norm helper.
-
-    SP: attention runs through ``USPAttention`` instead of a plain
-    ``LocalAttention``, giving Ulysses/ring sequence parallelism for the
-    roles that can use it. ``is_cross_attention``/``skip_sequence_parallel``
-    select the right SP behaviour per role (see each call site's comment);
-    ``skip_sequence_parallel`` defaults to ``is_cross_attention`` (the
-    ``wanvideo.py`` convention: a true self-attention role participates in
-    the Ulysses all-to-all, a cross-attention role's replicated K/V does
-    not), and can be set independently for a role that is architecturally
-    self-attention but never sequence-sharded (the text towers).
-
-    ``use_nabla`` is accepted for API/shape parity with FastVideo's port but
-    always raises ``NotImplementedError`` at construction: sglang-diffusion
-    has no ``AttentionBackendEnum.NABLA_ATTN`` backend, and no published
-    Kandinsky6 checkpoint has been verified against NABLA sparse attention.
-    """
+    Video self-attention uses Ulysses/ring. Text/audio self-attention stays
+    replicated; cross-attention defaults to local K/V unless explicitly gathered."""
 
     def __init__(
         self,
@@ -491,19 +310,11 @@ class Kandinsky6Attention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None,
         prefix: str = "",
         kv_dim: int | None = None,
-        use_nabla: bool = False,
         quant_config: QuantizationConfig | None = None,
         is_cross_attention: bool = False,
         skip_sequence_parallel: bool | None = None,
     ):
         super().__init__()
-        if use_nabla:
-            raise NotImplementedError(
-                "Kandinsky6Attention: use_nabla=True (NABLA block-sparse attention) is not "
-                "implemented in sglang-diffusion -- there is no AttentionBackendEnum.NABLA_ATTN "
-                "backend, and the only verified Kandinsky6 checkpoint uses dense (SDPA) "
-                "attention. Construct with use_nabla=False (attention_engine != 'nabla')."
-            )
         assert num_channels % head_dim == 0
         self.num_heads = num_channels // head_dim
         kv_dim = kv_dim or num_channels
@@ -562,22 +373,12 @@ class Kandinsky6Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
-        sparse_params: dict[str, Any] | None = None,
         rotary_emb: torch.Tensor | None = None,
         rotary_emb_kv: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
         context_seq_len: int | None = None,
         skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        if sparse_params is not None:
-            # This module is only ever constructed with use_nabla=False (see
-            # __init__), so a real forward pass should never reach here --
-            # the top-level model already refuses attention_engine="nabla"
-            # at construction time. Kept as a defensive backstop.
-            raise NotImplementedError(
-                "Kandinsky6Attention: received sparse_params but NABLA sparse attention is not "
-                "implemented in this port."
-            )
         query, _ = self.to_query(hidden_states)
 
         kv_source = (
@@ -586,10 +387,7 @@ class Kandinsky6Attention(nn.Module):
         key, _ = self.to_key(kv_source)
         value, _ = self.to_value(kv_source)
 
-        # Column-parallel to_query/to_key/to_value already shard the channel
-        # width down to `local_num_heads * head_dim` on this rank (see
-        # __init__), so the per-rank reshape below splits local heads, not
-        # the model's full head count.
+        # reshape rank-local whole heads after the TP projections
         shape, kv_shape = query.shape[:-1], key.shape[:-1]
         query = query.reshape(*shape, self.local_num_heads, -1)
         key = key.reshape(*kv_shape, self.local_num_heads, -1)
@@ -625,9 +423,7 @@ class Kandinsky6Attention(nn.Module):
                 skip_sequence_parallel_override=skip_sequence_parallel,
             )
         except AssertionError as exc:
-            # USPAttention requires a pipeline forward context. Standalone
-            # parity tests call the model directly, so fall back to SDPA
-            # (single-rank only: this bypass does not implement SP).
+            # standalone single-rank parity uses SDPA without a pipeline forward context
             if "Forward context is not set" not in str(exc):
                 raise
 
@@ -659,18 +455,9 @@ class Kandinsky6Attention(nn.Module):
 
 
 class _Kandinsky6MLP(nn.Module):
-    """TP-sharded 2-layer MLP with ``fc_in``/``fc_out`` naming, matching
-    ``runtime.layers.mlp.MLP``'s module layout -- but (unlike that class)
-    actually honoring ``bias=False``.
+    """Bias-free TP MLP with checkpoint-mapped fc_in/fc_out names.
 
-    ``runtime.layers.mlp.MLP`` hardcodes ``bias=True`` on both of its
-    internal ``ColumnParallelLinear``/``RowParallelLinear`` layers regardless
-    of the ``bias`` constructor argument it accepts, so it cannot be reused
-    verbatim here: the Kandinsky6 feed-forward projections have no bias. This
-    class keeps the native ``fc_in``/``fc_out`` submodule names; the architecture
-    config maps the current Diffusers ``net.0.proj``/``net.2`` checkpoint names
-    onto them while retaining the same TP sharding.
-    """
+    The shared MLP currently hardcodes bias=True, so it cannot be used here."""
 
     def __init__(
         self,
@@ -725,15 +512,7 @@ class Kandinsky6FeedForward(nn.Module):
 def _norm_scale_shift(
     norm: LayerNormScaleShift, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    """float32 LayerNorm + AdaLN scale/shift, cast back to ``x``'s dtype.
-
-    ``LayerNormScaleShift`` (unlike FastVideo's) has no
-    ``convert_modulation_dtype`` kwarg -- it simply runs its internal norm in
-    float32 and returns in the dtype of whatever tensor it's called with.
-    Flooring ``x`` to float32 before the call and casting back after
-    reproduces FastVideo's "compute the whole norm+affine in float32"
-    behavior exactly.
-    """
+    """Compute LayerNorm and AdaLN affine in fp32, then restore the input dtype."""
     return norm(x.float(), shift=shift, scale=scale).type_as(x)
 
 
@@ -806,11 +585,7 @@ class Kandinsky6OutLayerAudio(nn.Module):
         x = (
             self.norm(audio_embed.float()) * (scale.float() + 1.0) + shift.float()
         ).type_as(audio_embed)
-        # Reference diffusers implementation normalizes again after the
-        # scale/shift affine, before the output projection. Replicated
-        # verbatim (not "simplified" away) for numeric parity with the
-        # upstream checkpoint conversion -- see FastVideo's identical
-        # comment in fastvideo/models/dits/kandinsky6.py.
+        # the reference applies a second norm after modulation; preserve its arithmetic
         x = self.norm(x.float()).type_as(audio_embed)
         out, _ = self.out_layer(x)
         return out
@@ -841,11 +616,7 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("self_attention", prefix),
             quant_config=quant_config,
-            # Architecturally self-attention (over this tower's own text
-            # tokens), but the text tower's sequence is never sequence-
-            # sharded by this port (only the long visual stream is) -- every
-            # SP rank holds the whole, identical text sequence, so this must
-            # skip the Ulysses all-to-all like a cross-attention would.
+            # text is replicated across SP ranks, so skip Ulysses even for self-attention
             skip_sequence_parallel=True,
         )
 
@@ -879,15 +650,9 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
 
 
 class Kandinsky6TransformerDecoderBlock(nn.Module):
-    """Self-attention + text cross-attention + feed-forward block.
+    """Self-attention, text cross-attention and FFN.
 
-    Used standalone for plain (non-multimodal) T2V/I2V-parity checkpoints,
-    and as the ``videoT``/``audioT`` sub-block inside
-    ``Kandinsky6FusedTransformerDecoderBlock`` for T2VA/IT2VA (whose
-    ``forward`` re-drives this block's individual sub-layers manually rather
-    than calling this class's own ``forward``, to splice a video<->audio
-    cross-attention step in between).
-    """
+    The joint decoder invokes these sublayers separately to insert cross-modal attention."""
 
     def __init__(
         self,
@@ -897,7 +662,6 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
         head_dim: int,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
-        use_nabla: bool = False,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -911,7 +675,6 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             head_dim,
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("self_attention", prefix),
-            use_nabla=use_nabla,
             quant_config=quant_config,
             # Video self-attention over the (long) visual token sequence --
             # the one role this port's sequence parallelism actually shards.
@@ -926,9 +689,7 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("cross_attention", prefix),
             quant_config=quant_config,
-            # Video queries attend to replicated text K/V -- skips the
-            # all-to-all (skip_sequence_parallel defaults to
-            # is_cross_attention=True).
+            # video queries attend to replicated text K/V
             is_cross_attention=True,
         )
 
@@ -948,7 +709,6 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
         text_embed: torch.Tensor,
         time_embed: torch.Tensor,
         rope: torch.Tensor | None,
-        sparse_params: dict[str, Any] | None,
         attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
         self_attn_params, cross_attn_params, ff_params = torch.chunk(
@@ -962,7 +722,6 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
         visual_out = self.self_attention(
             visual_out,
             rotary_emb=rope,
-            sparse_params=sparse_params,
             attn_mask_meta=attn_mask_meta,
         )
         visual_embed = (
@@ -1003,11 +762,7 @@ def _apply_scale_shift(
 
 
 class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
-    """Joint video+audio decoder block: per-modality self/text-cross
-    attention plus a dedicated bidirectional video<->audio cross-attention,
-    all independently AdaLN-modulated. Ported from
-    ``diffusers.models.transformers.transformer_kandinsky6.Kandinsky6FusedTransformerDecoderBlock``.
-    """
+    """Joint video/audio decoder with independently modulated bidirectional attention."""
 
     def __init__(
         self,
@@ -1021,7 +776,6 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
         head_dim_a: int,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
-        use_nabla: bool = False,
         ca_rope: bool = False,
         cross_gates: bool = False,
         fix_modulation: bool = False,
@@ -1035,7 +789,6 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim,
             supported_attention_backends,
             prefix=add_prefix("videoT", prefix),
-            use_nabla=use_nabla,
             quant_config=quant_config,
         )
         self.audioT = Kandinsky6TransformerDecoderBlock(
@@ -1045,7 +798,6 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim_a,
             supported_attention_backends,
             prefix=add_prefix("audioT", prefix),
-            use_nabla=False,
             quant_config=quant_config,
         )
         self.va_cross_attention = Kandinsky6Attention(
@@ -1093,7 +845,6 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
         time_embed: tuple[torch.Tensor, torch.Tensor],
         vis_rope: torch.Tensor | None,
         aud_rope: torch.Tensor | None,
-        sparse_params: dict[str, Any] | None,
         va_gate_scale: float = 1.0,
         av_gate_scale: float = 1.0,
         video_seq_len: int | None = None,
@@ -1110,7 +861,6 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             self.videoT.self_attention(
                 _norm_scale_shift(self.videoT.self_attention_norm, vis, shift, scale),
                 rotary_emb=vis_rope,
-                sparse_params=sparse_params,
                 attn_mask_meta=video_attn_meta,
             ),
             gate,
@@ -1221,12 +971,7 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = _ARCH_CONFIG_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_CONFIG_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_CONFIG_DEFAULTS.lora_param_names_mapping
-    # Restricted to the two backends verified as safe general-purpose dense
-    # attention for this model (matches BaseDiT's plain-SDPA-capable
-    # subset); the wider default set on BaseDiT also includes several sparse
-    # backends (video-sparse, STA, MoBA, ...) that Kandinsky6's attention
-    # sub-layers never pass sparsity metadata to, so leaving those in the
-    # candidate set risks a silently-wrong backend selection.
+    # dense backends only: these attention roles do not supply sparsity metadata
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
@@ -1259,9 +1004,7 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise ValueError("Kandinsky6 ring size must be positive.")
         if ulysses_size == 1 and ring_size == 1:
             return
-        # Ring Attention (see USPAttention) rotates whole K/V shards between
-        # ranks rather than splitting heads, so only Ulysses constrains head
-        # divisibility -- matches MiniMaxH3DiTModel's identical reasoning.
+        # only Ulysses splits heads; ring rotates complete K/V shards
         local_heads = num_heads // tp_size
         if local_heads % ulysses_size:
             raise ValueError(
@@ -1287,7 +1030,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 "checkpoint uses attention_engine='sdpa'; set attention_engine to 'auto' or "
                 "'sdpa' to use the dense attention path."
             )
-        use_nabla = False  # unreachable as True -- see guard above.
 
         head_dim = sum(arch.axes_dims)
         head_dim_a = sum(arch.axes_dims_a)
@@ -1372,7 +1114,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                         prefix=add_prefix(
                             f"visual_transformer_blocks.{i}", self.prefix
                         ),
-                        use_nabla=use_nabla,
                         quant_config=quant_config,
                     )
                     for i in range(arch.num_visual_blocks)
@@ -1458,7 +1199,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                         prefix=add_prefix(
                             f"visual_transformer_blocks.{i}", self.prefix
                         ),
-                        use_nabla=use_nabla,
                         ca_rope=arch.ca_rope,
                         cross_gates=arch.cross_gates,
                         fix_modulation=arch.fix_modulation,
@@ -1479,21 +1219,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ) + ["visual_transformer_blocks"]
         self.__post_init__()
 
-    def _time_embed(
-        self, prefix: str | None, time: torch.Tensor, pooled: torch.Tensor
-    ) -> torch.Tensor:
-        pooled_embeddings = (
-            self.pooled_text_embeddings
-            if prefix is None
-            else getattr(self, f"{prefix}_pooled_text_embeddings")
-        )
-        time_embeddings = (
-            self.time_embeddings
-            if prefix is None
-            else getattr(self, f"{prefix}_time_embeddings")
-        )
-        return time_embeddings(time) + pooled_embeddings(pooled)
-
     def _encode_text(
         self,
         prefix: str | None,
@@ -1502,26 +1227,13 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         time: torch.Tensor,
         text_rope_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        text_embeddings = (
-            self.text_embeddings
-            if prefix is None
-            else getattr(self, f"{prefix}_text_embeddings")
-        )
-        rope_embeddings = (
-            self.text_rope_embeddings
-            if prefix is None
-            else getattr(self, f"{prefix}_text_rope_embeddings")
-        )
-        blocks = (
-            self.text_transformer_blocks
-            if prefix is None
-            else getattr(self, f"{prefix}_text_transformer_blocks")
-        )
-        te = text_embeddings(text_embed)
-        tm = self._time_embed(prefix, time, pooled)
-        # Video and audio each own a text RoPE table sized to their own
-        # head_dim (they can differ), so the position indices are looked up
-        # per-tower rather than sharing one precomputed rope tensor.
+        prefix = f"{prefix}_" if prefix else ""
+        te = self.get_submodule(f"{prefix}text_embeddings")(text_embed)
+        tm = self.get_submodule(f"{prefix}time_embeddings")(time)
+        tm = tm + self.get_submodule(f"{prefix}pooled_text_embeddings")(pooled)
+        rope_embeddings = self.get_submodule(f"{prefix}text_rope_embeddings")
+        blocks = self.get_submodule(f"{prefix}text_transformer_blocks")
+        # each text tower has its own head dimension and RoPE table
         text_rope = rope_embeddings(text_rope_pos).unsqueeze(dim=0)
         for block in blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1570,129 +1282,54 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 "visual_token_type_ids requires visual_token_type_num_embeddings > 0."
             )
 
-        x_video = hidden_states
-        x_audio = hidden_states_audio
-        both = self.is_multimodal and x_video is not None and x_audio is not None
-
-        if not both:
-            # The only real case reaching here is a plain (is_multimodal=False)
-            # T2V/I2V-parity checkpoint denoising video through
-            # Kandinsky6TransformerDecoderBlock directly. A *multimodal*
-            # partial call (audio-only, or video-only) is not implemented:
-            # unlike the diffusers reference, whose fused block accepts
-            # vis=None/aud=None with every stage guarded accordingly, this
-            # port's Kandinsky6FusedTransformerDecoderBlock.forward assumes
-            # both streams are always present and takes a different call
-            # signature than the plain decoder block. The TI2VA pipeline
-            # always denoises both modalities together, so that guarded
-            # partial-modality path was intentionally not ported.
-            if self.is_multimodal:
-                raise NotImplementedError(
-                    "Kandinsky6Transformer3DModel: partial-modality forward (exactly one of "
-                    "hidden_states/hidden_states_audio set) is not implemented for a multimodal "
-                    "(is_multimodal=True) checkpoint. Provide both hidden_states and "
-                    "hidden_states_audio."
-                )
-            te, tm = self._encode_text(
-                None, encoder_hidden_states, pooled_projections, timestep, text_rope_pos
+        if sparse_params is not None:
+            raise NotImplementedError(
+                "Kandinsky6 does not support NABLA sparse attention."
             )
-            visual_embed = self.visual_embeddings(x_video)
-            if (
-                self.visual_token_type_embeddings is not None
-                and visual_token_type_ids is not None
-            ):
-                type_embed = self.visual_token_type_embeddings(visual_token_type_ids)
-                visual_embed = visual_embed + type_embed[:, :, None, None, :]
-            visual_shape = visual_embed.shape[:-1]
-            visual_rope = self.visual_rope_embeddings(
-                visual_shape, visual_rope_pos, scale_factor
-            )
-            to_fractal = (
-                sparse_params["to_fractal"] if sparse_params is not None else False
-            )
-            visual_embed, visual_rope = fractal_flatten(
-                visual_embed, visual_rope, visual_shape, block_mask=to_fractal
-            )
-            visual_embed, shard = shard_seq(visual_embed)
-            visual_rope = shard_like(visual_rope, shard, pad_mode="repeat_last")
-            attn_meta = tail_attn_meta(
-                shard, visual_embed.shape[0], visual_embed.device
+        both = self.is_multimodal
+        if both and (hidden_states is None or hidden_states_audio is None):
+            raise NotImplementedError(
+                "Multimodal Kandinsky6 checkpoints require both video and audio latents."
             )
 
-            for block in self.visual_transformer_blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    visual_embed = torch.utils.checkpoint.checkpoint(
-                        block,
-                        visual_embed,
-                        te,
-                        tm,
-                        visual_rope,
-                        sparse_params,
-                        attn_mask_meta=attn_meta,
-                        use_reentrant=False,
-                    )
-                else:
-                    visual_embed = block(
-                        visual_embed, te, tm, visual_rope, sparse_params, attn_meta
-                    )
-
-            visual_embed = fractal_unflatten(
-                gather_seq(visual_embed, shard.orig_len),
-                visual_shape,
-                block_mask=to_fractal,
-            )
-            result: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = self.out_layer(
-                visual_embed, tm
-            )
-        else:
-            audio_timestep = audio_timestep if audio_timestep is not None else timestep
-            audio_rope_pos = (
-                audio_rope_pos
-                if audio_rope_pos is not None
-                else torch.arange(x_audio.shape[1], device=x_audio.device)
-            )
-
-            video_te, video_tm = self._encode_text(
-                "video",
-                encoder_hidden_states,
-                pooled_projections,
-                timestep,
-                text_rope_pos,
-            )
+        video_te, video_tm = self._encode_text(
+            "video" if both else None,
+            encoder_hidden_states,
+            pooled_projections,
+            timestep,
+            text_rope_pos,
+        )
+        if both:
             audio_te, audio_tm = self._encode_text(
                 "audio",
                 encoder_hidden_states,
                 pooled_projections,
-                audio_timestep,
+                audio_timestep if audio_timestep is not None else timestep,
                 text_rope_pos,
             )
+            if audio_rope_pos is None:
+                audio_rope_pos = torch.arange(
+                    hidden_states_audio.shape[1], device=hidden_states_audio.device
+                )
 
-            visual_embed = self.visual_embeddings(x_video)
-            if (
-                self.visual_token_type_embeddings is not None
-                and visual_token_type_ids is not None
-            ):
-                type_embed = self.visual_token_type_embeddings(visual_token_type_ids)
-                visual_embed = visual_embed + type_embed[:, :, None, None, :]
-            visual_shape = visual_embed.shape[:-1]
-            visual_rope = self.visual_rope_embeddings(
-                visual_shape, visual_rope_pos, scale_factor
-            )
-            # Multimodal fused blocks always run the plain (non-fractal) token
-            # order -- NABLA sparse attention only applies to the video
-            # self-attention sub-layer (never built in this port), so no
-            # fractal reordering happens at this level.
-            visual_embed = visual_embed.flatten(1, 3)
-            visual_rope = visual_rope.flatten(1, 3)
-            visual_embed, shard = shard_seq(visual_embed)
-            visual_rope = shard_like(visual_rope, shard, pad_mode="repeat_last")
-            attn_meta = tail_attn_meta(
-                shard, visual_embed.shape[0], visual_embed.device
-            )
+        visual_embed = self.visual_embeddings(hidden_states)
+        if (
+            self.visual_token_type_embeddings is not None
+            and visual_token_type_ids is not None
+        ):
+            type_embed = self.visual_token_type_embeddings(visual_token_type_ids)
+            visual_embed = visual_embed + type_embed[:, :, None, None, :]
+        visual_shape = visual_embed.shape[:-1]
+        visual_rope = self.visual_rope_embeddings(
+            visual_shape, visual_rope_pos, scale_factor
+        ).flatten(1, 3)
+        visual_embed, shard = shard_seq(visual_embed.flatten(1, 3))
+        visual_rope = shard_like(visual_rope, shard, pad_mode="repeat_last")
+        attn_meta = tail_attn_meta(shard, visual_embed.shape[0], visual_embed.device)
 
-            audio_embed = self.audio_embeddings(x_audio)
+        if both:
+            audio_embed = self.audio_embeddings(hidden_states_audio)
             audio_rope = self.audio_rope_embeddings(audio_rope_pos).unsqueeze(dim=0)
-
             for block in self.visual_transformer_blocks:
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
                     visual_embed, audio_embed = torch.utils.checkpoint.checkpoint(
@@ -1704,7 +1341,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                         (video_tm, audio_tm),
                         visual_rope,
                         audio_rope,
-                        sparse_params,
                         va_gate_scale,
                         av_gate_scale,
                         video_seq_len=shard.orig_len,
@@ -1720,34 +1356,44 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                         (video_tm, audio_tm),
                         visual_rope,
                         audio_rope,
-                        sparse_params,
                         va_gate_scale,
                         av_gate_scale,
                         video_seq_len=shard.orig_len,
                         video_attn_meta=attn_meta,
                     )
+        else:
+            for block in self.visual_transformer_blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    visual_embed = torch.utils.checkpoint.checkpoint(
+                        block,
+                        visual_embed,
+                        video_te,
+                        video_tm,
+                        visual_rope,
+                        attn_mask_meta=attn_meta,
+                        use_reentrant=False,
+                    )
+                else:
+                    visual_embed = block(
+                        visual_embed, video_te, video_tm, visual_rope, attn_meta
+                    )
 
-            visual_embed = fractal_unflatten(
-                gather_seq(visual_embed, shard.orig_len), visual_shape, block_mask=False
-            )
-            video_out = self.out_layer(visual_embed, video_tm)
-            audio_out = self.audio_out_layer(audio_embed, audio_tm)
-            result = (video_out, audio_out)
+        visual_embed = gather_seq(visual_embed, shard.orig_len).reshape(
+            *visual_shape, -1
+        )
+        video_out = self.out_layer(visual_embed, video_tm)
+        result = (
+            (video_out, self.audio_out_layer(audio_embed, audio_tm))
+            if both
+            else video_out
+        )
 
         if return_dict:
             return Kandinsky6TransformerOutput(sample=result)
         return result
 
     def post_load_weights(self) -> None:
-        """Re-derive RoPE/time-embedding frequency buffers left on the meta
-        device by a meta-device-init-then-materialize loading flow.
-
-        These are plain (non-persistent-buffer or plain-attribute) tensors
-        computed from static config, not real checkpoint weights, so the
-        loader never populates them -- they must be rebuilt here after the
-        rest of the model's real parameters have landed on their target
-        device.
-        """
+        """Materialize non-checkpoint RoPE/time frequencies left on meta after loading."""
         device = next(self.parameters()).device
 
         for i, (axes_dim, ax_max_pos) in enumerate(
@@ -1766,35 +1412,19 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 pos = torch.arange(ax_max_pos, dtype=freq.dtype, device=device)
                 self.visual_rope_embeddings._buffers[name] = torch.outer(pos, freq)
 
-        rope1d_modules: list[Kandinsky6RoPE1D] = []
-        if self.is_multimodal:
-            rope1d_modules.extend(
-                [
-                    self.video_text_rope_embeddings,
-                    self.audio_text_rope_embeddings,
-                    self.audio_rope_embeddings,
-                ]
-            )
-            time_embeds = [self.video_time_embeddings, self.audio_time_embeddings]
-        else:
-            rope1d_modules.append(self.text_rope_embeddings)
-            time_embeds = [self.time_embeddings]
-
-        for rope1d in rope1d_modules:
-            if isinstance(rope1d.args, torch.Tensor) and rope1d.args.is_meta:
+        for module in self.modules():
+            if isinstance(module, Kandinsky6RoPE1D) and module.args.is_meta:
                 freq = (
-                    _build_rotary_freqs(rope1d.dim // 2, rope1d.max_period).to(
+                    _build_rotary_freqs(module.dim // 2, module.max_period).to(
                         device=device
                     )
-                    * rope1d.freqs_scaling
+                    * module.freqs_scaling
                 )
-                pos = torch.arange(rope1d.max_pos, dtype=freq.dtype, device=device)
-                rope1d._buffers["args"] = torch.outer(pos, freq)
-
-        for time_embed in time_embeds:
-            if isinstance(time_embed.freqs, torch.Tensor) and time_embed.freqs.is_meta:
-                time_embed.freqs = _build_rotary_freqs(
-                    time_embed.model_dim // 2, time_embed.max_period
+                pos = torch.arange(module.max_pos, dtype=freq.dtype, device=device)
+                module._buffers["args"] = torch.outer(pos, freq)
+            elif isinstance(module, Kandinsky6TimeEmbeddings) and module.freqs.is_meta:
+                module.freqs = _build_rotary_freqs(
+                    module.model_dim // 2, module.max_period
                 ).to(device=device)
 
 

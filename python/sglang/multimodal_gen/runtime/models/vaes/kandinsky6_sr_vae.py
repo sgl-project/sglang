@@ -1,30 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 SR causal video VAE (KVAE): spatial x16, temporal x4 (causal, ``1 + 4k`` frames).
+"""Causal Kandinsky 6 SR KVAE: spatial x16 and temporal x4.
 
-Consolidated from the former ``kandinsky6_sr_kvae/`` subpackage (``cached_enc_dec.py``,
-``cached_layers.py``, ``cached_model.py``, ``regularizers.py``, ``utils.py``) into this one
-file, mirroring FastVideo's post-refactor ``fastvideo/models/vaes/kandinsky6_sr.py`` (which
-replaced the equivalent vendored subpackage there): training-only code paths (KL sampling,
-``get_kl_loss``, ``get_last_layer``), the unused ``group_norm`` / non-``fix_pxs`` /
-non-``zeros``-padding / ``downsample_version=1`` variants, and the generic untyped
-``make_empty_cache`` dict-skeleton builder are all dropped -- this module only ever needs to
-run the one architecture the released checkpoints actually use (see ``_arch_kwargs`` below).
-
-Clips are encoded / decoded in temporal segments (16 pixel frames, the first one 17; 4 latent
-frames, the first one 5). Every causal conv carries its last input frames to the next segment,
-so memory is bounded by one segment whatever the clip length, and the segmentation is part of
-the numerics: it fixes which frames the first-frame special cases see.
-
-Conventions: ``normalize_data`` maps ``[0, 255]`` pixels to ``x / 128 - 1``; ``encode`` returns
-``(latent, split_list)`` where ``latent`` is the raw (unscaled) posterior mean and
-``split_list`` the pixel-frame segment sizes (unused by any caller in this repo, kept for
-parity with the Diffusers / FastVideo ports); ``decode`` returns an object whose ``.sample`` is
-in the normalized pixel range. State-dict keys are the checkpoint's own ``encoder.*`` /
-``decoder.*`` keys (``self.encoder`` / ``self.decoder`` are direct attributes of this wrapper,
-same as FastVideo's port), so the loader (``VAELoader``, strict for this pipeline's ``vae`` --
-see ``native_only_components`` in ``Kandinsky6SRPipelineConfig``) loads strictly, with no key
-remapping.
-"""
+Encode/decode segments preserve causal-convolution caches; segmentation affects
+numerics. Pixels normalize as x/128-1, encode returns an unscaled posterior mean,
+and decode returns normalized pixels. encoder.* and decoder.* match the checkpoint."""
 
 from __future__ import annotations
 
@@ -274,12 +253,7 @@ class _ResnetBlock3D(nn.Module):
 def _chunked_interpolate_nearest(
     x: torch.Tensor, size: tuple[int, int, int], channels: int = 32
 ) -> torch.Tensor:
-    """``F.interpolate(x, size, mode="nearest")`` in ``channels``-wide chunks along dim 1, to
-    bound peak memory at large SR-decode tile sizes and avoid the ``F.interpolate`` int32-index
-    overflow above ~2**31 elements (matches the Diffusers reference's chunked ``zq``
-    interpolation; the old vendored ``CachedPXSUpsample.spatial_upsample_NEW`` did not apply
-    this chunking to its own (non-``zq``) interpolate call, which is the exact overflow bug
-    found and fixed in the FastVideo port -- see that port's commit history)."""
+    """Nearest interpolation in channel chunks, bounding memory and int32 indexing."""
     if x.shape[1] <= channels:
         return F.interpolate(x, size=size, mode="nearest")
     return torch.cat(

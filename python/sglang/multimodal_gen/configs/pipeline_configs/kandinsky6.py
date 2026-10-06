@@ -1,15 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 TI2VA (text[+image] -> video+audio) pipeline configuration.
-
-One pipeline serves text-to-video+audio generation with an optional
-conditioning image: pure text when none is supplied at generation time,
-image+text (called "I2VA" in the diffusers reference) when one is -- mirroring
-how the reference's ``Kandinsky6I2VAPipeline`` is itself just a thin subclass
-of ``Kandinsky6T2VAPipeline`` sharing the same call path. This matches
-``ModelTaskType.TI2V`` semantics (accepts an image, does not require one)
-better than an ``I2V`` task type, which would force every request to supply
-one.
-"""
+"""Kandinsky 6 text-to-video/audio pipeline with optional image conditioning."""
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -43,12 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
-# Same Qwen2.5-VL "prompt engineer" system template and 129-token crop as
-# Kandinsky5's own pipeline config (this codebase has no Kandinsky5 port to
-# import it from, so it is kept as an independent, self-contained literal).
-# Byte-identical, including its two misspelled words: the real checkpoints
-# were trained with this exact system prompt, so correcting them would
-# silently change the text conditioning the model saw during training.
+# checkpoint-trained template: preserve its exact bytes, including misspellings
 KANDINSKY6_PROMPT_TEMPLATE = "\n".join(
     [
         "<|im_start|>system\nYou are a promt engineer. Describe the video in detail.",  # codespell:ignore promt
@@ -61,10 +46,7 @@ KANDINSKY6_PROMPT_TEMPLATE = "\n".join(
         "<|im_start|>user\n{}<|im_end|>",
     ]
 )
-# Tokenized length of everything in KANDINSKY6_PROMPT_TEMPLATE before the
-# user's own prompt text (i.e. the fixed system-prompt + start-of-user-turn
-# boilerplate). kandinsky6_qwen_postprocess_text crops exactly this many
-# tokens off the front of Reason1's per-example hidden states.
+# Reason1 template prefix length before user tokens
 KANDINSKY6_PROMPT_TEMPLATE_ENCODE_START_IDX = 129
 
 
@@ -79,18 +61,7 @@ def kandinsky6_qwen_postprocess_text(
     text_inputs,
     return_attention_mask: bool = False,
 ):
-    """Crop the KANDINSKY6_PROMPT_TEMPLATE system-prompt prefix off Reason1.
-
-    Ports the diffusers reference's fixed-offset
-    ``hidden_states[-1][:, KANDINSKY6_PROMPT_TEMPLATE_ENCODE_START_IDX:]``
-    slice onto sglang's mask-based crop idiom (``qwen_image_postprocess_text``
-    in ``configs/pipeline_configs/qwen_image.py``): it first strips padding
-    per example via the tokenizer's attention mask (so the crop offset lands
-    on the real token stream regardless of batch padding), then drops the
-    template prefix, then re-pads the variable-length results and returns an
-    embedding-aligned mask -- avoiding the fixed-offset version's failure
-    mode of slicing into right-padding for a batch of unequal-length prompts.
-    """
+    """Strip padding and the Reason1 template prefix, then repad embeddings and mask."""
     return qwen_image_postprocess_text(
         outputs,
         text_inputs,
@@ -118,18 +89,10 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
         "audio_vae",
     )
 
-    # Kandinsky6ImageEncodingStage owns all conditioning-image preprocessing
-    # (VAE-encode + tail-cond-frame append) itself. Without this, the generic
-    # InputValidationStage's ModelTaskType.TI2V branch (hard-coded for
-    # Wan2.2-5B TI2V) would run instead and crash on Kandinsky6's Hunyuan-
-    # lineage VAE (no `scale_factor_spatial` attribute) before that stage
-    # ever executes -- matching the MiniMaxH3/SanaWM/LTX-2 precedent.
+    # image conditioning is handled by Kandinsky6ImageEncodingStage, not Wan TI2V preprocessing
     skip_input_image_preprocess: bool = True
 
-    # Model configuration. Kandinsky6 uses a single joint video+audio DiT
-    # (unlike MOVA's separate video/audio towers), so there is no second
-    # `audio_dit_config` field here -- `hidden_states_audio` is just another
-    # argument on the one `dit_config.arch_config`-described transformer.
+    # a single joint DiT consumes video and audio latents
     dit_config: Kandinsky6VideoAudioConfig = field(
         default_factory=Kandinsky6VideoAudioConfig
     )
@@ -138,32 +101,20 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
         default_factory=lambda: CFGPolicy(parallel_uses_serial_arithmetic=True)
     )
 
-    # Video VAE: Kandinsky6 reuses the Hunyuan-lineage VAE unmodified
-    # (temporal_compression_ratio=4, matching the audio<->video alignment
-    # constants below), same as its Kandinsky5 predecessor.
-    # Keep tiled decoding on multiple GPUs: whole-clip spatial sharding would
-    # materialize the Hunyuan VAE's quadratic temporal attention mask.
+    # keep tiled decode: whole-clip sharding materializes a quadratic temporal mask
     vae_config: HunyuanVAEConfig = field(
         default_factory=lambda: HunyuanVAEConfig(parallel_decode_mode="tiled")
     )
     vae_precision: str = "bf16"
     vae_tiling: bool = True
 
-    # Audio VAE: Kandinsky6AudioVAE bundles the mel-VAE decoder *and* the
-    # BigVGAN-v2 vocoder in one checkpoint component (confirmed against a
-    # real checkpoint's audio_vae/*.safetensors) -- unlike e.g. LTX-2's
-    # separately loaded audio_vae/vocoder pair, there is no separate
-    # "vocoder" pipeline module here.
+    # audio_vae includes both the mel codec and vocoder
     audio_vae_config: Kandinsky6AudioVAEConfig = field(
         default_factory=Kandinsky6AudioVAEConfig
     )
     audio_vae_precision: str = "bf16"
 
-    # Text encoding stage: Reason1 (Qwen2.5-VL-based "prompt engineer",
-    # token-level hidden_states[-1]) + CLIP (pooled embedding). Two
-    # independent plain-text-only encoder towers -- the simple case the
-    # generic TextEncodingStage already handles (same shape as Flux's
-    # CLIP+T5 pair), so no custom text-encoding stage is needed.
+    # Reason1 provides token embeddings; CLIP provides pooled text conditioning
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Reason1Config(), CLIPTextConfig())
     )
@@ -179,9 +130,7 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
             kandinsky6_clip_postprocess_text,
         )
     )
-    # Reason1 uses dynamic padding up to its own 641-token cap (129-token
-    # template + 512-token user-prompt budget); CLIP uses OpenAI CLIP's
-    # standard fixed 77-token context.
+    # Reason1: 129 template + 512 user tokens; CLIP: fixed 77-token context
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
@@ -202,13 +151,7 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
     # for Pro-sft, PiflowScheduler for Pro-distill: scheduler_config.json "shift").
     flow_shift: float | None = 5.0
 
-    # Audio<->video latent-length alignment. Kandinsky6LatentPreparationStage
-    # derives the audio latent frame count from these, matching the diffusers
-    # reference's Kandinsky6TI2VAPipeline exactly: audio_latent_frames =
-    # ceil(((T_lat-1)*4+1) / sample_fps * audio_sample_rate /
-    # audio_downsample_factor), where (T_lat-1)*4+1 is the causal video VAE's
-    # pixel-frame count for T_lat latent frames (temporal_compression_ratio ==
-    # 4, matching HunyuanVAEConfig above).
+    # audio frames = ceil(pixel_frames / fps * sample_rate / downsample_factor)
     sample_fps: float = 24.0
     audio_sample_rate: int = 44100
     audio_downsample_factor: int = 1024
@@ -230,35 +173,16 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
                 f"tokenizer arg dicts, but got {len(self.text_encoder_extra_args)}."
             )
 
-        # The merged pipeline can receive an optional conditioning image on
-        # any given call, so the video VAE encoder must always be available
-        # (unlike Kandinsky5, which only flips this on for its dedicated I2V
-        # config) -- Kandinsky6ImageEncodingStage VAE-encodes the
-        # conditioning image through this same shared video VAE.
+        # keep the video VAE encoder available for optional image conditioning
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
     def supports_disaggregation(self) -> bool:
-        # The joint video+audio denoising loop advances both modalities from
-        # a single transformer forward per timestep (video via
-        # scheduler.step, audio via a manual Euler update using that same
-        # step's sigma delta) -- matching MiniMaxH3's simplest-v1 choice of
-        # disabling disaggregated deployment rather than splitting that
-        # coupled loop across separate encode/denoise/decode roles.
+        # joint denoising currently runs monolithically
         return False
 
     def get_text_encoder_pooler_output(self, outputs, encoder_index):
-        # Only the CLIP encoder (index 1) has a pooler_output. Reason1's
-        # forward (Qwen2_5_VLForConditionalGeneration) returns transformers'
-        # native Qwen2_5_VLCausalLMOutputWithPast, which has no
-        # `pooler_output` field at all (unlike sglang's own BaseEncoderOutput
-        # wrapper, which always carries one, defaulting to None) -- so
-        # `outputs.pooler_output` raises AttributeError for encoder_index 0.
-        # This hook is called once per encoder (text_encoding.py), so an
-        # unconditional return (Flux's CLIP+T5 precedent, where *both*
-        # encoders return BaseEncoderOutput) is not safe here. Kandinsky6's
-        # actual architectural twin is Hunyuan (LLM encoder at index 0 +
-        # CLIP at index 1), which guards the same way.
+        # only CLIP (index 1) returns pooler_output; Reason1 returns causal-LM output
         if encoder_index == 1:
             return outputs.pooler_output
         return None
@@ -270,21 +194,8 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
         return batch.negative_prompt_embeds[0]
 
     def tokenize_prompt(self, prompt, tokenizer, tok_kwargs) -> dict:
-        # The Reason1 "tokenizer" component is the full Qwen2_5_VLProcessor
-        # (a multimodal processor, not a plain text tokenizer) -- its
-        # __call__ signature is (images=None, text=None, videos=None,
-        # audio=None, **kwargs), so calling it positionally
-        # (tokenizer(prompt, **tok_kwargs), the base PipelineConfig default)
-        # feeds our prompt string into the `images` slot instead of `text`,
-        # which then fails trying to interpret the prompt as an image
-        # path/URL/base64 blob. Kandinsky6's own conditioning image (when
-        # supplied) never goes through this processor at all -- it is
-        # VAE-encoded directly into the video latents by
-        # Kandinsky6ImageEncodingStage -- so `images` must always stay
-        # unset here regardless of whether a conditioning image was passed
-        # at the pipeline level. Passing `text=` explicitly is also valid
-        # for the CLIP tokenizer (encoder_index 1), so this one override
-        # is correct for both text encoders.
+        # Reason1 uses a multimodal processor: positional input would bind to images,
+        # not text. The conditioning image is handled separately by the VAE.
         return tokenizer(text=prompt, **tok_kwargs)
 
 

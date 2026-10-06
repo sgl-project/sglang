@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pure resolution-scale helpers of Kandinsky 6 video super-resolution.
+"""SR resolution validation shared by sampling parameters and output stages.
 
-Deliberately kept outside the runtime stage package
-(``runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr``): this module is
-imported by ``configs/sample/kandinsky6_sr.py`` for request validation, and that sampling
-config is itself imported while ``registry`` builds its model table, before
-``runtime.pipelines_core.__init__`` (which in turn needs ``registry.get_model_info``) has
-finished importing. Importing anything under ``runtime.pipelines_core`` from here would
-close that cycle (``registry -> this sampling config -> pipelines_core.__init__ ->
-registry.get_model_info``) and break registry-first imports for every model, not just this
-one -- see the SGLang PR review comment on ``configs/sample/kandinsky6_sr.py``.
-
-Has no sglang runtime-package dependency: only the stdlib. The runtime stage package's own
-``video_utils.py`` imports the same names from here instead of redefining them, so the SR
-output stage and the sampling-params validator agree on one definition.
-"""
+Keep this module independent of runtime to avoid the registry import cycle."""
 
 from __future__ import annotations
 
@@ -44,12 +31,7 @@ ASPECT_MISMATCH_TOLERANCE = 0.02
 def fit_within(
     sr_hw: tuple[int, int], bucket_hw: tuple[int, int]
 ) -> tuple[int, int] | None:
-    """Isotropic-fit target: shrink ``sr_hw`` to fit inside ``bucket_hw``.
-
-    One scale factor for both axes, so the aspect is preserved exactly: the binding side
-    lands on the bucket, the other comes out at (or under) it, snapped to even for the video
-    codec. A result already inside the bucket is left alone -- fitting never upscales.
-    """
+    """Fit within the bucket without upscaling; preserve aspect and codec-even sizes."""
     scale = min(bucket_hw[0] / sr_hw[0], bucket_hw[1] / sr_hw[1])
     if scale >= 1.0:
         logger.warning(
@@ -74,31 +56,10 @@ def resolve_target_hw(
     mode: TargetResizeMode = "fit",
     validate_only: bool = False,
 ) -> tuple[int, int] | None:
-    """Resolve a target-resolution spec into the final ``(H, W)``.
+    """Resolve a tier or WxH bucket to (H, W), or None for no resize.
 
-    A tier name (``hd`` / ``fullhd`` / ``2k``) resolves against the SR result's aspect ratio,
-    picking the closest entry of that tier -- the same closest-aspect rule the tiling uses to
-    choose a base resolution. An explicit ``WxH`` is taken as the bucket verbatim.
-
-    ``mode`` then decides how the bucket is honoured: ``"fit"`` (the default) preserves the
-    aspect exactly -- an isotropic downscale into the bucket, so an off-tier source is never
-    squeezed; ``"exact"`` returns the bucket itself, trading a small anisotropy for exact
-    delivery dimensions. ``validate_only`` parses the spec (for request validation) without
-    computing a real downscale.
-
-    Args:
-        spec: Tier name, ``"WxH"``, or ``None`` / ``"none"`` to keep the raw SR result.
-        sr_hw: The SR result's ``(H, W)``, used to pick a tier entry.
-        mode: ``"fit"`` (aspect-preserving) or ``"exact"``.
-        validate_only: Parse and reject a bad spec without resolving a downscale.
-
-    Returns:
-        The target ``(H, W)``, or ``None`` when no resizing is requested (or, in ``fit``
-        mode, needed).
-
-    Raises:
-        ValueError: On an unknown tier name or a malformed ``WxH``.
-    """
+    fit preserves aspect; exact returns the bucket dimensions. validate_only
+    checks syntax without needing an actual SR result."""
     if mode not in ("fit", "exact"):
         raise ValueError(
             f"sr_target_resize_mode must be 'fit' or 'exact', got {mode!r}"

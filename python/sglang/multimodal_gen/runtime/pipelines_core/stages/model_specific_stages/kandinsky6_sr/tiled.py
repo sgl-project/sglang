@@ -1,26 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Framework-independent tile orchestration of Kandinsky 6 video SR.
+"""Tile preparation, denoising and blending for Kandinsky 6 SR.
 
-The whole tiled algorithm as plain functions over tensors and duck-typed components, so
-it can run (and be compared to the reference) on CPU without a pipeline:
-
-1. :func:`plan_tiles` - tile geometry for a frame size and scale;
-2. *prepare* - per chunk of ``tiles_batch_size`` tiles, the initial noisy latent
-   ``[B, T', H', W', C]``: the latent-upscaler (LU) path (:func:`prepare_lu_tile_latents`,
-   the whole video encoded once by :func:`encode_video_to_lr_latent`) or the pixel path
-   (:func:`prepare_pixel_tile_latents`, every tile bilinearly enlarged and encoded);
-3. *denoise* - :func:`denoise_chunks` runs the bundle's own scheduler (pi-Flow or flow-Euler);
-4. *decode* - :func:`decode_chunks` turns latents into uint8 tiles;
-5. :func:`stitch_tiles` - Hann-window blending back into one video.
-
-The stages run these phases one component at a time (LU or VAE, then DiT, then VAE) so
-that CPU offloading moves every component once per request instead of once per tile;
-:func:`super_resolve` chains them for tests.  Chunk ``k`` is seeded with
-``seed + first_tile_index_of_chunk`` exactly like the reference.
-
-Components: ``vae`` needs ``encode(x) -> (latent, _)``, ``decode(z).sample``,
-``normalize_data`` / ``denormalize_data`` and parameters; the LU is a callable
-``[1, C, T, h, w] -> [1, C, T, H, W]`` on the *scaled* latent.
+Stages group work by component to avoid swapping weights per tile.
+Each chunk uses seed + its first tile index, matching the reference.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -49,10 +31,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     RESOLUTIONS,
     VAE_SPATIAL_FACTOR,
     TileGrid,
+    closest_base_resolution,
+    compute_tile_grid_even,
     extract_all_tiles,
     latent_tile_grid_from_pixel_grid,
     stitch_tiles_hanning,
-    tile_geometry,
     upsample_tiles_to_base,
 )
 
@@ -81,16 +64,15 @@ def plan_tiles(
 ) -> TilePlan:
     """Even tile grid for a frame; the frame must hold at least one full tile."""
     height, width = frame_hw
-    base_hw, tile_hw, grid = tile_geometry(
-        height,
-        width,
-        visual_size,
-        tiling_scale,
-        0.25,
-        spatial_factor,
-        "even",
-        tile_min_overlap,
-        resolutions,
+    base_hw = closest_base_resolution(height, width, visual_size, resolutions)
+    if any(size % tiling_scale for size in base_hw):
+        raise ValueError(
+            f"resolution_scale={tiling_scale} does not divide the base resolution "
+            f"{base_hw[0]}x{base_hw[1]} exactly"
+        )
+    tile_hw = (base_hw[0] // tiling_scale, base_hw[1] // tiling_scale)
+    grid = compute_tile_grid_even(
+        height, width, tile_hw, tile_min_overlap, spatial_factor
     )
     if height < tile_hw[0] or width < tile_hw[1]:
         raise ValueError(
@@ -268,14 +250,7 @@ def prepare_pixel_tile_latents(
 
 
 def reset_scheduler_for_chunk(scheduler: Any) -> None:
-    """Rewind a scheduler already configured by ``set_timesteps`` back to its first step.
-
-    The same scheduler object denoises every chunk of a request in turn (``set_timesteps`` is
-    only called once -- it depends on the bundle and the requested step count, not on any one
-    chunk), so its step counter must be rewound between chunks or the second chunk would
-    silently continue from where the first left off. Mirrors the shared ``DenoisingStage``'s
-    own ``_reset_scheduler_loop_state`` / ``set_begin_index(0)`` pair.
-    """
+    """Reset step and begin indices so each tile chunk starts at the same timestep."""
     scheduler._step_index = None
     scheduler.set_begin_index(0)
 
@@ -291,12 +266,7 @@ def denoise_chunk(
     step_context: StepContext | None = None,
     on_step: StepCallback | None = None,
 ) -> torch.Tensor:
-    """Run the sampler on one chunk ``[B, T', H', W', C]`` -> ``[B, T', H', W', C]``.
-
-    ``scheduler`` must already have had ``set_timesteps`` called on it (once per request, by
-    the caller); this only rewinds its step counter so repeated calls (one per chunk) each
-    start from the first timestep.
-    """
+    """Denoise one [B, T, H, W, C] chunk, resetting the configured scheduler."""
     is_piflow = spec.piflow is not None
     check_sampler_options(
         piflow=spec.piflow,
@@ -344,14 +314,7 @@ def denoise_chunks(
     step_context: StepContext | None = None,
     on_step: StepCallback | None = None,
 ) -> list[torch.Tensor]:
-    """Denoise every chunk on ``device`` with the same scheduler; results come back on the CPU.
-
-    A pi-Flow scheduler's step grid depends only on the bundle (``nfe``), so it is built once,
-    before the first chunk, and every chunk just rewinds it (:func:`reset_scheduler_for_chunk`).
-    A flow-Euler scheduler's grid also depends on ``start_timestep`` (capped for some
-    ``instruct_type``s), which :func:`denoise_chunk` re-derives per chunk from ``spec`` -- cheap
-    to recompute and avoids a redundant "is this piflow" branch here.
-    """
+    """Denoise chunks sequentially on device and return CPU latents."""
     if spec.piflow is not None:
         scheduler.set_timesteps(spec.piflow.nfe, device=device)
     return [
@@ -430,11 +393,7 @@ def decode_chunks(
 
 @torch.no_grad()
 def stitch_tiles(tiles: Sequence[torch.Tensor], plan: TilePlan) -> torch.Tensor:
-    """Hann-blend uint8 tiles ``[3, T, Hb, Wb]`` into one uint8 ``[3, T, H*s, W*s]``.
-
-    Frames are independent, so the blend runs in frame chunks (bounded memory) with the
-    same per-pixel arithmetic as one call over the whole clip.
-    """
+    """Hann-blend [C, T, H, W] tiles in frame chunks to bound memory."""
     height, width = plan.frame_hw
     scale = plan.tiling_scale
     channels, frames = tiles[0].shape[:2]
@@ -452,69 +411,3 @@ def stitch_tiles(tiles: Sequence[torch.Tensor], plan: TilePlan) -> torch.Tensor:
         )
         out[:, start:stop] = blended.clamp(0, 255).to(torch.uint8)
     return out
-
-
-@torch.no_grad()
-def super_resolve(
-    video: torch.Tensor,
-    *,
-    vae: torch.nn.Module,
-    scaling_factor: float,
-    dit: Callable[..., torch.Tensor],
-    dit_spec: DitSpec,
-    spec: SamplingSpec,
-    scheduler: Any,
-    device: torch.device | str,
-    upscale_fn: LatentUpscaleFn | None = None,
-    lu_dtype: torch.dtype | None = None,
-    spatial_factor: int = VAE_SPATIAL_FACTOR,
-    resolutions: Mapping[int, Sequence[tuple[int, int]]] = RESOLUTIONS,
-) -> torch.Tensor:
-    """Tiled SR of a ``[T, C, H, W]`` uint8 video -> uint8 ``[3, T, H*s, W*s]``.
-
-    ``upscale_fn`` selects the LU path; without it the pixel path runs. ``scheduler`` is the
-    already-resolved effective scheduler (``run_spec.effective_scheduler``) -- a real loaded
-    component, or one synthesized from ``spec.piflow`` / ``spec.scheduler_scale`` when none fits.
-    """
-    device = torch.device(device)
-    common = dict(
-        visual_size=spec.visual_size,
-        tiling_scale=spec.tiling_scale,
-        tile_min_overlap=spec.tile_min_overlap,
-        spatial_factor=spatial_factor,
-        resolutions=resolutions,
-    )
-    if upscale_fn is not None:
-        lr_latent = encode_video_to_lr_latent(video, vae, device=device).cpu()
-        frame_hw = (
-            lr_latent.shape[-2] * spatial_factor,
-            lr_latent.shape[-1] * spatial_factor,
-        )
-        plan = plan_tiles(frame_hw=frame_hw, **common)
-        chunks = prepare_lu_tile_latents(
-            lr_latent,
-            plan,
-            upscale_fn=upscale_fn,
-            lu_dtype=lu_dtype,
-            scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
-            device=device,
-            spatial_factor=spatial_factor,
-        )
-    else:
-        plan = plan_tiles(frame_hw=tuple(video.shape[-2:]), **common)
-        chunks = prepare_pixel_tile_latents(
-            video,
-            plan,
-            vae=vae,
-            scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
-            device=device,
-        )
-    denoised = denoise_chunks(
-        chunks, dit, scheduler, dit_spec=dit_spec, spec=spec, device=device
-    )
-    tiles = decode_chunks(denoised, vae, scaling_factor=scaling_factor, device=device)
-    return stitch_tiles(tiles, plan)

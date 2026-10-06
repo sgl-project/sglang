@@ -23,11 +23,7 @@ from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
 class Kandinsky6SREncodeStage(PipelineStage):
-    """Encodes the whole clip to the raw LR latent (only when the LU path runs).
-
-    The pixel path encodes per tile later, so this stage is then a no-op and never
-    touches (or loads) the VAE.
-    """
+    """Encode the whole clip only for the LU path; pixel mode encodes tiles later."""
 
     def __init__(self, vae, latent_upscaler=None) -> None:
         super().__init__()

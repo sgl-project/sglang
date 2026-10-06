@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky 6 video super-resolution (VSR) pipeline configuration.
+"""Video-to-video SR without text/audio models; source audio is preserved.
 
-The SR pipeline is video -> video: no text encoder and no audio model.  Its ``scheduler``
-component selects the sampler (``PiflowScheduler`` with ``nfe``: pi-Flow; otherwise
-flow-Euler).  ``ModelTaskType.TI2V`` is used (like Cosmos3's video-to-video) because the
-task enum has no video-to-video member; the input video travels in
-``SamplingParams.video_path`` and every SR-specific stage owns its own input handling, so
-the generic image pre-processing is skipped.
-"""
+TI2V supplies the API task type, but model-specific stages handle video_path."""
 
 import re
 from dataclasses import dataclass, field

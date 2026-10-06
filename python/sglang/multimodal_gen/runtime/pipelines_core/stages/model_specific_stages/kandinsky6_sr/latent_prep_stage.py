@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Latent-preparation stage of Kandinsky 6 video SR: tiles -> initial noisy latent chunks.
+"""Prepare noisy tile chunks through the latent upscaler or pixel/VAE fallback.
 
-LU path: the latent-upscaler bank upscales every (already whole-video-KVAE-encoded) tile;
-pixel path (a bank with no entry for the requested scale): every tile is bilinearly enlarged
-to the trained base resolution and VAE-encoded directly. Both end in the same
-``build_initial_latent`` call per chunk of ``sr_tiles_batch_size`` tiles.
-
-Also resolves and validates this request's :class:`~.sampling.SamplingSpec` -- the
-transformer/scheduler head-width check (``run_spec.build_sampling_spec`` /
-``_check_sampler_fits_head``) and the step-count checks (``run_spec.check_denoising_request``,
-porting FastVideo commit d8d0e79f) run here, before any tile is upscaled or encoded, so a
-mismatched bundle fails before the expensive work rather than inside the first DiT call.
-"""
+Validate sampler/head compatibility and step count before processing tiles."""
 
 from functools import partial
 

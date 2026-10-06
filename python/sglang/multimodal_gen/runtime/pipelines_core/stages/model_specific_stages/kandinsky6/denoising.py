@@ -1,60 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6 joint video+audio flow-match Euler denoising loop.
+"""Joint video/audio denoising using the shared stage lifecycle, BCG and CFG.
 
-This model jointly denoises two coupled modalities through ONE transformer
-call per branch (``transformer(hidden_states=video, hidden_states_audio=audio,
-...)`` returns ``(video_velocity, audio_velocity)``), so it cannot use the
-framework's generic single-tensor ``_denoise()`` loop (whose
-``DenoisingContext`` carries exactly one ``latents`` tensor and calls
-``scheduler.step()`` against it alone).
+Flow-Euler advances the video scheduler once per step; audio uses the same
+sigma delta without advancing that scheduler again. pi-Flow uses independent
+video/audio schedulers and retains fp32 state between bf16 DiT calls.
 
-Following this codebase's "Native-stage subclass" pattern
-(docs/docs/sglang-diffusion/support_new_models.mdx, "Choose a Pipeline
-Shape") -- the same shape ``MiniMaxH3DenoisingStage``
-(``model_specific_stages/minimax_h3/stages/denoising.py``) uses for its own
-joint video+audio dual-modality loop -- this subclasses the shared
-``DenoisingStage`` purely to inherit its lifecycle hooks (component
-residency, cache-DiT mounting, torch.compile/BCG, offload-for-compile-
-warmup, progress-bar, profiling) rather than bypassing them with a from-
-scratch ``PipelineStage``. ``forward`` still replaces the parent's
-``_denoise()`` with a custom loop -- the joint video+audio state handling
-below is what is genuinely model-specific -- but every transformer call goes
-through the parent's BCG/cache-dit-aware ``_call_transformer`` helper, and
-CFG (when enabled) is dispatched through the shared ``CFGPolicy`` /
-``run_cfg_parallel`` / ``run_two_branch_cfg_parallel`` helpers
-(``runtime/distributed/cfg_policy.py``, ``cfg_parallel_utils.py``) the same
-way the parent's own ``_predict_noise_with_cfg`` does, so ``--enable-cfg-
-parallel`` dispatches Kandinsky6's two branches across GPUs instead of
-running both sequentially on every rank. ``CFGPolicy.combine``/
-``run_cfg_parallel`` already support a branch prediction being a tuple of
-tensors (not just one), which is what lets a 2-output joint model like this
-reuse them unmodified.
-
-Video is advanced through the shared flow-match scheduler's ``step()``
-(which owns the internal step index -- called exactly ONCE per iteration,
-against video only). Audio is advanced with a manual Euler update using the
-SAME per-step sigma delta the scheduler just consumed (``scheduler.sigmas[i
-+ 1] - scheduler.sigmas[i]``), so the scheduler's internal step index is
-never double-advanced -- unless the checkpoint is a PiFlow (distilled) one,
-in which case a second, independent ``PiflowScheduler`` instance advances
-audio instead (CFG is also unconditionally off for PiFlow).
-
-PiFlow's video state is tracked in fp32 across steps, separately from the
-bf16 ``video`` buffer used for the DiT call: ``PiflowScheduler.step``
-explicitly returns fp32 to preserve precision across steps (matching the
-diffusers reference's ``pipeline_kandinsky6_ti2va.py`` ``denoise_loop``,
-which rebinds its video state to that fp32 result every step rather than
-writing it back into a lower-precision buffer), so this loop keeps a
-separate ``video_state`` fp32 tensor and casts only the DiT input to bf16,
-mirroring how the audio (manual-Euler) path already keeps its own full-
-precision accumulator. Flow-match (non-PiFlow) does not need this -- the
-diffusers reference downcasts that state to the parameter dtype every step
-too -- so the non-PiFlow path keeps writing ``scheduler.step()``'s result
-directly into the bf16 ``video`` buffer, same as before.
-
-Ported from FastVideo's ``Kandinsky6DenoisingStage``
-(fastvideo/pipelines/stages/kandinsky6.py).
-"""
+Adapted from FastVideo's Kandinsky6DenoisingStage."""
 
 from __future__ import annotations
 
@@ -130,14 +81,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         return torch.arange(seq_len, device=device)
 
     def _call_transformer(self, transformer, **call_kwargs) -> Any:
-        """Route one DiT forward through the BCG runner when it applies.
-
-        Mirrors the parent ``DenoisingStage._predict_noise``'s BCG dispatch
-        (``_maybe_get_bcg_runner`` / ``_bcg_run``) so Kandinsky6 benefits
-        from breakable-CUDA-graph replay the same way single-tensor models
-        do; a no-op (plain ``transformer(**call_kwargs)``) whenever BCG is
-        disabled, which is the default.
-        """
+        """Dispatch through BCG when enabled, otherwise call the transformer directly."""
         runner = self._maybe_get_bcg_runner(transformer)
         if runner is not None:
             return self._bcg_run(runner, call_kwargs, transformer)
@@ -152,20 +96,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         pooled: torch.Tensor,
         text_rope_pos: torch.Tensor,
     ) -> CFGPolicy:
-        """Build the (one- or two-branch) CFG policy for this request.
-
-        Reuses ``server_args.pipeline_config.cfg_policy`` (the same object
-        the generic ``DenoisingStage`` builds branches from) rather than
-        constructing a bare ``CFGPolicy``, so a future model-specific
-        ``combine()`` override is still honored. Branches are built here
-        (not via ``CFGPolicy.build()``) because Kandinsky6's per-branch
-        kwargs (``text_rope_pos`` alongside the embeddings) don't match the
-        generic ``image_kwargs``/``pos_cond_kwargs``/``neg_cond_kwargs``
-        shape, and because CFG here additionally requires negative prompt
-        embeddings to actually be present (PiFlow forces
-        ``do_classifier_free_guidance`` off upstream, but this stays
-        defensive the same way the pre-refactor loop was).
-        """
+        """Reuse the pipeline CFG policy with joint-modality conditioning kwargs."""
         branches = [
             CFGBranch(
                 "conditional",
@@ -227,13 +158,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         sparse_params: dict[str, Any] | None,
         visual_token_type_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the CFG branch(es) for one step and combine into (video_vel, audio_vel).
-
-        Dispatch mirrors the parent ``DenoisingStage._predict_noise_with_cfg``
-        exactly: ``run_two_branch_cfg_parallel`` for the common 2-branch /
-        2-rank case, ``run_cfg_parallel`` otherwise, or a plain sequential
-        loop when CFG-parallel is disabled.
-        """
+        """Run sequential or distributed CFG branches and combine video/audio velocity."""
 
         def predict_fn(branch: CFGBranch) -> tuple[torch.Tensor, torch.Tensor]:
             branch.configure_batch(batch)
