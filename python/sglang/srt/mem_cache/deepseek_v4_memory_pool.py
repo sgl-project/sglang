@@ -2050,21 +2050,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
-            # One launch: norm + RoPE + e4m3 cast (scale 1.0) + scatter into the
-            # uniform pool rows; negative swa_loc rows are skipped in-kernel.
-            pool = self.swa_kv_pool
-            fused_k_norm_rope_flashmla(
-                kv=kv,
-                kv_weight=kv_weight,
-                eps=eps,
-                freqs_cis=freqs_cis,
-                positions=positions,
-                out_loc=swa_loc,
-                kvcache=pool.kv_buffer[self._swa_local_layer_id(layer_id)].view(
-                    torch.uint8
-                ),
-                page_size=pool.page_size,
-                uniform_fp8_store=True,
+            fused_k_norm_rope_uniform_fp8(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions,
+                swa_loc,
+                self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
         fused_k_norm_rope_flashmla(

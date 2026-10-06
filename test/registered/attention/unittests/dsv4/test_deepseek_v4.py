@@ -868,7 +868,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 64,
             ),
             mock.patch(
-                "flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4",
+                "sglang.srt.layers.attention.deepseek_v4_trtllm_backend.trtllm_batch_decode_sparse_mla_dsv4",
                 side_effect=fake_attention,
             ),
         ):
@@ -1030,23 +1030,44 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         copy_unless_aliased(tail, torch.full((4, 4), 3, **self.kw))
         self.assertTrue(torch.all(parent[:, 2:] == 3) and torch.all(parent[:, :2] == 0))
 
-    def _core(self, *, raw_indices: bool = False):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            SWA_WINDOW,
-            DSV4AttnMetadata,
-        )
+    def _core(
+        self,
+        *,
+        raw_indices: bool = False,
+        present_ratios=(4,),
+        swa_width: int = 128,
+        seq_lens=None,
+    ):
+        from dataclasses import fields
+
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
         n = 64  # tile-aligned, so no per-step pad parents are involved
         core = object.__new__(DSV4AttnMetadata)
+        for f in fields(DSV4AttnMetadata):  # unset fields default to None
+            if not hasattr(core, f.name):
+                setattr(core, f.name, None)
         core.cuda_int32_kwargs = self.kw
         core.trtllm_table_pool = self.pool
-        core.present_ratios = (4,)
-        core.index_topk = 1024
-        core.seq_lens_casual = torch.full((n,), 500, **self.kw)
-        core.swa_page_indices = torch.zeros(n, SWA_WINDOW, **self.kw)
-        core.c4_sparse_topk_lengths = torch.full((n,), 125, **self.kw)
+        core.present_ratios = present_ratios
+        core.low_ratios = tuple(r for r in (1, 2) if r in present_ratios)
+        core.index_topk = 1024 if 4 in present_ratios else 512
+        core.seq_lens_casual = (
+            torch.full((n,), 500, **self.kw) if seq_lens is None else seq_lens
+        )
+        core.swa_page_indices = torch.zeros(n, swa_width, **self.kw)
+        core.swa_topk_lengths = torch.arange(n, **self.kw) + 100
+        core.c4_sparse_topk_lengths = (
+            torch.full((n,), 125, **self.kw) if 4 in present_ratios else None
+        )
+        for r in core.low_ratios:
+            setattr(core, f"c{r}_sparse_topk_lengths", torch.full((n,), 300, **self.kw))
+            setattr(
+                core, f"c{r}_sparse_page_indices", torch.full((n, 512), 7, **self.kw)
+            )
         core.c128_page_indices = None
-        core.trtllm_topk_writes_table = True
+        # Mirrors the backend gate: low-ratio layers rewrite the shared lens per layer.
+        core.trtllm_topk_writes_table = not core.low_ratios
         core.c4_sparse_raw_indices = torch.empty(1, **self.kw) if raw_indices else None
         core.c4_sparse_page_indices = (
             torch.full((n, 1024), -1, **self.kw) if raw_indices else None
@@ -1070,30 +1091,70 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         )
 
     def test_copy_metadata_skips_pool_backed_tables(self):
-        from sglang.srt.layers.attention.dsv4.metadata import copy_metadata
+        pooled = (
+            "trtllm_swa_lens",
+            "trtllm_c4_indices",
+            "trtllm_c4_lens",
+            "c4_sparse_page_indices",
+        )
+        dst, src = self._core(), self._core()  # same pool parents
+        kept = {name: getattr(dst, name) for name in pooled}
+        parents = [
+            (b.data_ptr(), b.data_ptr() + b.numel() * b.element_size())
+            for b in self.pool._bufs.values()
+        ]
+        copied_into = []
+        real_copy = torch.Tensor.copy_
 
-        @dataclass
-        class Tables:
-            c4_indices: torch.Tensor
-            c4_lens: torch.Tensor
-            c4_sparse_page_indices: torch.Tensor
+        def spy(tensor, other, *args, **kwargs):
+            copied_into.append(tensor.data_ptr())
+            return real_copy(tensor, other, *args, **kwargs)
 
-        def tables(core):
-            return Tables(
-                core.trtllm_c4_indices, core.trtllm_c4_lens, core.c4_sparse_page_indices
+        with mock.patch.object(torch.Tensor, "copy_", spy):
+            dst.copy_(src)
+        # Captured table objects survive replay copies: no rebind, no self-copy.
+        for name, tensor in kept.items():
+            self.assertIs(getattr(dst, name), tensor, name)
+        self.assertTrue(copied_into)  # the non-pool fields were copied
+        for ptr in copied_into:
+            self.assertFalse(any(lo <= ptr < hi for lo, hi in parents), ptr)
+
+    def test_low_ratio_layers_share_the_indexed_table(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        seq_lens = torch.full((64,), 500, **self.kw)
+        seq_lens[0] = 1  # empty ratio-2 history
+        core = self._core(present_ratios=(0, 1, 2), seq_lens=seq_lens)
+        self.assertEqual(tuple(core.trtllm_c4_indices.shape), (64, SWA_WINDOW + 512))
+        self.assertIsNone(core.c4_sparse_page_indices)  # no in-place top-k writer
+        # trtllm needs the true zero length for an empty compressed history.
+        self.assertEqual(core.c2_sparse_topk_lengths[:2].tolist(), [0, 250])
+        self.assertEqual(core.c1_sparse_topk_lengths[0].item(), 1)
+        if self.dev != "cuda":
+            return  # pack_sparse_tail is a Triton kernel
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            _refresh_indexed_tail,
+        )
+
+        for ratio in (1, 2):
+            getattr(core, f"c{ratio}_sparse_page_indices").fill_(ratio)
+            _refresh_indexed_tail(
+                core,
+                ratio,
+                core.sparse_page_indices(ratio),
+                core.trtllm_c4_indices,
+                core.trtllm_c4_lens,
+                64,
             )
+            self.assertTrue(torch.all(core.trtllm_c4_indices[:, SWA_WINDOW:] == ratio))
+            expected = core.sparse_topk_lengths(ratio) + SWA_WINDOW
+            self.assertTrue(torch.equal(core.trtllm_c4_lens, expected))
 
-        dst, src = tables(self._core()), tables(self._core())  # same pool parents
-        ptrs = (dst.c4_indices.data_ptr(), dst.c4_sparse_page_indices.data_ptr())
-        copy_metadata(
-            src=src,
-            dst=dst,
-            check_eq_fields=[],
-            copy_fields=["c4_indices", "c4_lens", "c4_sparse_page_indices"],
-        )
-        self.assertEqual(
-            (dst.c4_indices.data_ptr(), dst.c4_sparse_page_indices.data_ptr()), ptrs
-        )
+    def test_dspark_wide_swa_lens_cover_the_draft_block(self):
+        core = self._core(present_ratios=(0,), swa_width=192)
+        self.assertEqual(core.trtllm_swa_lens[:2].tolist(), [128, 128])
+        self.assertEqual(core.trtllm_swa_lens[40].item(), 140)  # window + block
+        self.assertIsNone(core.trtllm_c4_indices)
 
     def test_width_changes_reuse_the_parent_and_growth_is_capture_guarded(self):
         a = self.pool.view("f", 10, fill=-1, width=16)  # parent: 64 (tile) x 16
