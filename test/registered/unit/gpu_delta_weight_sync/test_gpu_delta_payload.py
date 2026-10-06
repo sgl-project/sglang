@@ -56,7 +56,7 @@ class TestOuterZstd(unittest.TestCase):
     def test_manifest_codec_and_frame_geometry_admission(self):
         admitted = dict(protocol_version=4, codec="snappy-zstd", frame_bytes=1 << 20)
         for codec in ("snappy-zstd", "lz4-zstd"):
-            for size in (1 << 16, 1 << 20, 4 << 20):
+            for size in (1 << 16, 1 << 19, 1 << 20, 4 << 20):
                 validate_codec(admitted | {"codec": codec, "frame_bytes": size})
                 record = entry(bytes(50))
                 record["nbytes"] = size + 16
