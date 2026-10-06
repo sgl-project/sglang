@@ -5,7 +5,7 @@
 //! prototype, the listener mounts the canonical `runtime.v1` adapter on the
 //! transport-neutral [`crate::frontend::FrontendHandle`] contract.
 
-use sglang_grpc_types::sglang::runtime::v1::sglang_service_server::SglangServiceServer;
+use sglang_api_types::runtime::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use super::GrpcService;

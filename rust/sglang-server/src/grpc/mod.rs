@@ -13,8 +13,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures::Stream;
-use sglang_grpc_types::sglang::runtime::v1 as proto;
-use sglang_grpc_types::sglang::runtime::v1::sglang_service_server::SglangService;
+use sglang_api_types::runtime::v1 as proto;
+use sglang_api_types::runtime::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use crate::frontend::FrontendHandle;

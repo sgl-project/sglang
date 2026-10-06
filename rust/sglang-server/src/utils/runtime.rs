@@ -375,8 +375,8 @@ mod tests {
     use super::*;
     use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
     use crate::message::response::{BatchHeader, frame_decode_batch_cols};
-    use sglang_grpc_types::sglang::runtime::v1 as proto;
-    use sglang_grpc_types::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
+    use sglang_api_types::runtime::v1 as proto;
+    use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 
     fn free_loopback_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
         // Hold both probes at once so the OS cannot return the same ephemeral

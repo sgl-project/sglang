@@ -3,7 +3,7 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -245,56 +245,6 @@ pub struct SamplingParams {
     pub(crate) explicit_fields: BTreeSet<String>,
 }
 
-/// The `/generate` body's `sampling_params`: one object (broadcast to every
-/// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
-///
-/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
-/// the input and, on failure, reports only "data did not match any variant" —
-/// losing the field-level message ("unknown field `temperature`, expected one of
-/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
-/// single `deserialize_any` dispatch keeps the inner error verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SamplingParamsInput {
-    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
-    /// every `GenerateBody` that big regardless of which form arrived.
-    One(Box<SamplingParams>),
-    Many(Vec<SamplingParams>),
-}
-
-impl<'de> Deserialize<'de> for SamplingParamsInput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InputVisitor;
-
-        impl<'de> Visitor<'de> for InputVisitor {
-            type Value = SamplingParamsInput;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sampling_params object, or a list of them (one per prompt)")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                let value = serde_json::Value::deserialize(MapAccessDeserializer::new(map))?;
-                sampling_params_from_value(value)
-                    .map(|p| SamplingParamsInput::One(Box::new(p)))
-                    .map_err(serde::de::Error::custom)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                let values =
-                    Vec::<serde_json::Value>::deserialize(SeqAccessDeserializer::new(seq))?;
-                values
-                    .into_iter()
-                    .map(sampling_params_from_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SamplingParamsInput::Many)
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_any(InputVisitor)
-    }
-}
-
 fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
     let explicit_fields = value
         .as_object()
@@ -305,23 +255,6 @@ fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams
     let mut params: SamplingParams = serde_json::from_value(value).map_err(|e| e.to_string())?;
     params.explicit_fields = explicit_fields;
     Ok(params)
-}
-
-impl SamplingParamsInput {
-    /// Merge launch-time preferred params beneath request params. A request key
-    /// wins even when it explicitly carries the type's default or null.
-    pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
-        match self {
-            Self::One(params) => params.apply_preferred(preferred),
-            Self::Many(params) => params
-                .iter_mut()
-                .try_for_each(|params| params.apply_preferred(preferred)),
-        }
-    }
-
-    pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
-        sampling_params_from_value(preferred.clone()).map(|params| Self::One(Box::new(params)))
-    }
 }
 
 impl Default for SamplingParams {
@@ -363,6 +296,7 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
+            explicit_fields: BTreeSet::new(),
         }
     }
 }
