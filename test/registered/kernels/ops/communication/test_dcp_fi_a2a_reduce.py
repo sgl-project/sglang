@@ -1,6 +1,6 @@
 """DCP fi_a2a: FlashInfer's fused all-to-all + LSE reduce must equal the
-all-gather + Triton merge it replaces, including chunked, graph-replayed and
-fully-masked rows, next to custom all-reduce v2 on the same symmetric memory.
+all-gather + Triton merge it replaces, including chunked, strided, graph-replayed
+and fully-masked inputs, next to custom all-reduce v2 on the same symmetric memory.
 
 Run with ``python test_dcp_fi_a2a_reduce.py --num-gpu 2,4,8``. Skips unless the
 host can run the fused reduce (Blackwell, FlashInfer with the op).
@@ -130,6 +130,32 @@ def test_rows_empty_on_every_rank_are_zero(dcp):
     got = _fused(group, out, lse, is_lse_base_on_e=False)
     assert torch.equal(got[:, 0], torch.zeros_like(got[:, 0]))
     torch.testing.assert_close(got[:, 1:], expected[:, 1:], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "layout", ["strided_head_dim", "misaligned_rows", "lse_with_unit_dim"]
+)
+def test_layouts_the_kernel_cannot_read_are_adapted(dcp, layout):
+    """The kernel reads unit-stride rows that start on 8-byte boundaries, and
+    FlashMLA returns its LSE as [B, H, 1]; such inputs are copied or reshaped,
+    not rejected."""
+    group, _ = dcp
+    out, lse = _partials(
+        group, batch=3, heads=LOCAL_HEADS, dtype=torch.bfloat16, seed=71
+    )
+    expected = _reference(group, out, lse, is_lse_base_on_e=True)
+    if layout == "strided_head_dim":
+        wide = out.new_zeros(*out.shape[:-1], 2 * HEAD_DIM)
+        wide[..., ::2] = out
+        out = wide[..., ::2]
+    elif layout == "misaligned_rows":
+        flat = out.new_empty(out.numel() + 1)
+        flat[1:] = out.flatten()
+        out = flat[1:].view(out.shape)  # 2 bytes past an 8-byte boundary
+    else:
+        lse = lse.unsqueeze(-1)
+    got = _fused(group, out, lse, is_lse_base_on_e=True)
+    torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
 
 
 def test_graph_replay_and_eager_calls_interleave(dcp):

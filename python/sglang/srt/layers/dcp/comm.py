@@ -473,20 +473,29 @@ def init_fi_a2a_workspace(
     )
 
 
-def _fi_a2a_peer_partials(
+def _fi_a2a_peer_views(
     cp_attn_out: torch.Tensor, cp_attn_lse: torch.Tensor, cp_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """[B, H, D] partials and [B, H] LSE as the fused reduce's [B, H/cp, cp, D]
-    and [B, H/cp, cp]; head h goes to peer h // (H/cp)."""
-    batch, heads, head_dim = cp_attn_out.shape
+    """View [B, H, D] partials and their [B, H] LSE as the fused reduce's
+    [B, H/cp, cp, D] and [B, H/cp, cp]; head h goes to peer h // (H/cp)."""
+    batch, heads, _ = cp_attn_out.shape
     local_heads = heads // cp_size
-    partial_o = cp_attn_out.new_empty(batch, local_heads, cp_size, head_dim)
-    partial_lse = cp_attn_lse.new_empty(batch, local_heads, cp_size)
-    dcp_pack_a2a_send(
-        cp_attn_out,
-        cp_attn_lse,
-        partial_o.permute(2, 0, 1, 3),
-        partial_lse.permute(2, 0, 1),
+    itemsize = cp_attn_out.element_size()
+    # The kernel reads every row in 8-byte words along a unit-stride last dim.
+    if cp_attn_out.stride(-1) != 1 or any(
+        n % 8
+        for n in (
+            cp_attn_out.data_ptr(),
+            cp_attn_out.stride(0) * itemsize,
+            cp_attn_out.stride(1) * itemsize,
+        )
+    ):
+        cp_attn_out = cp_attn_out.clone(memory_format=torch.contiguous_format)
+    partial_o = cp_attn_out.unflatten(1, (cp_size, local_heads)).transpose(1, 2)
+    partial_lse = (
+        cp_attn_lse.reshape(batch, heads)
+        .unflatten(1, (cp_size, local_heads))
+        .transpose(1, 2)
     )
     return partial_o, partial_lse
 
@@ -521,7 +530,7 @@ def fi_a2a_lse_reduce(
     # The kernel rejects an empty batch; every DCP rank sees the same batch.
     if batch == 0:
         return cp_attn_out.new_empty(0, local_heads, head_dim)
-    partial_o, partial_lse = _fi_a2a_peer_partials(
+    partial_o, partial_lse = _fi_a2a_peer_views(
         cp_attn_out=cp_attn_out, cp_attn_lse=cp_attn_lse, cp_size=cp_size
     )
     if torch.cuda.current_stream().cuda_stream == state.capture_stream:
