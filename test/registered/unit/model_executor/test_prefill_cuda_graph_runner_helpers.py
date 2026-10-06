@@ -4,13 +4,14 @@ import unittest
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_pp_proxy_dspark_hidden_size,
 )
@@ -55,6 +56,77 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_qwen_hc_restore_round_trip(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._qwen_bcg_hc_sidechannel = True
+        hidden = torch.ones((8, 4))
+        runner.layer_model = SimpleNamespace(last_hc_hidden_states=hidden)
+        captured = runner._pack_qwen_bcg_hc_output(hidden)
+        runner.layer_model.last_hc_hidden_states = None
+        self.assertIs(runner._restore_qwen_bcg_hc_output(captured), hidden)
+        self.assertIs(runner.layer_model.last_hc_hidden_states, hidden)
+
+    def test_ple_prefetch_buffer_does_not_grow_under_breakable_replay(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            enable_breakable_cuda_graph,
+        )
+        from sglang.srt.models import qwen4_exp
+
+        ple = qwen4_exp.Qwen4ExpPLELayer.__new__(qwen4_exp.Qwen4ExpPLELayer)
+        ple._graph_prefetch_buffers, ple._eager_prefetch_buffer = {}, None
+        ple._allocate_prefetch_buffer = lambda n, ids: torch.empty((n, 2))
+        ids = torch.zeros(1, dtype=torch.int64)
+        with patch.object(qwen4_exp, "get_is_capture_mode", return_value=True):
+            with enable_breakable_cuda_graph():
+                for n in (1000, 1001, 1234):
+                    self.assertEqual(ple._get_prefetch_buffer(n, ids).shape[0], n)
+            self.assertEqual(ple._graph_prefetch_buffers, {})
+            self.assertEqual(ple._get_prefetch_buffer(16, ids).shape[0], 16)
+            self.assertEqual(list(ple._graph_prefetch_buffers), [16])
+
+    def test_ple_replay_uses_live_request_layout(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            breakable_cuda_graph as bcg,
+        )
+        from sglang.srt.models import qwen4_exp
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            tbo_parent_token_range=None,
+            spec_algorithm=None,
+            spec_info=None,
+            out_cache_loc=None,
+            _original_forward_mode=None,
+            global_num_token_non_padded_cpu=None,
+        )
+        context = SimpleNamespace(forward_batch=batch)
+        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        pool = Mock(get_mamba_indices=lambda indices: indices)
+        cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
+        with (
+            patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+            patch.object(bcg, "_current_capture_var") as active,
+            patch.object(
+                qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+            ),
+        ):
+            active.get.return_value = capture
+            for lengths, expected in cases:
+                context.forward_batch = batch = SimpleNamespace(**vars(batch))
+                batch.extend_seq_lens = torch.tensor(lengths)
+                batch.extend_seq_lens_cpu = lengths
+                batch.req_pool_indices = torch.arange(1, len(lengths) + 1)
+                if lengths == [8]:
+                    holder = qwen4_exp._breakable_prepare_ple_batch(
+                        input_ids=torch.arange(8),
+                        ngram_size=None,
+                        ngram_eos_token_id=None,
+                    )
+                else:
+                    for replay in capture.cuda_graph._break_fns:
+                        replay()
+                self.assertEqual(holder.batch.req_indices.tolist(), expected)
+
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:
             def get_pp_proxy_dspark_hidden_size(self):
@@ -250,6 +322,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 with self.subTest(first_rank=first_rank, positional=positional):
                     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
                     runner._is_full_backend = False
+                    runner._qwen_bcg_hc_sidechannel = False
+                    runner._qwen_bcg_mtp_draft = False
                     runner._input_embeds_arg_idx = 3
                     backing = torch.zeros(4, 8)
                     supplied = torch.full((4, 8), 7.0) if first_rank else None
@@ -354,7 +428,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertEqual(finalized["hidden_states"].shape, (3, 8))
 
     def test_bcg_eager_tail_uses_live_multimodal_embeddings(self):
-        live_embeds = object()
+        for live_embeds in (object(), None):
+            self._check_bcg_eager_tail(live_embeds=live_embeds)
+
+    def _check_bcg_eager_tail(self, live_embeds):
         live_batch = SimpleNamespace(mm_input_embeds=live_embeds)
         static_batch = SimpleNamespace(
             input_ids=None,
@@ -364,6 +441,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = None
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)
@@ -378,12 +457,48 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         output = runner._execute_body_capture(
             live_batch,
             static_batch,
-            static_num_tokens=1,
+            static_num_tokens=1 if live_embeds is not None else 8,
             raw_num_tokens=1,
             shape_key=object(),
         )
 
         self.assertIs(output, live_embeds)
+
+    def test_bcg_mtp_draft_replay_fills_hc_width_input_embeds_slot(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = True
+        runner._input_embeds_arg_idx = 3
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
+        slot = torch.empty((8, 2 * 4))
+        runner._fill_input_embeds_slot = Mock(
+            side_effect=lambda args, *_: slot[:1].copy_(args[3])
+        )
+        runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: "replayed")
+        runner.layer_model = SimpleNamespace(forward=None)
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True),
+            model=SimpleNamespace(
+                # The draft hands its hc stream to the body in the inputs_embeds slot.
+                forward=lambda ids, positions, batch, **_kwargs: (
+                    runner.layer_model.forward(
+                        ids, positions, batch, torch.zeros((1, 8))
+                    )
+                )
+            ),
+        )
+        runner._prefill_forward_context = lambda *_args, **_kwargs: nullcontext()
+        batch = SimpleNamespace(input_ids=None, positions=None, mm_input_embeds=None)
+
+        output = runner._execute_body_capture(
+            batch, batch, static_num_tokens=8, raw_num_tokens=1, shape_key=object()
+        )
+        self.assertEqual(output, "replayed")
+        runner._fill_input_embeds_slot.assert_called_once()
+        self.assertEqual(
+            runner._fill_input_embeds_slot.call_args.args[0][3].shape[1], slot.shape[1]
+        )
 
 
 if __name__ == "__main__":

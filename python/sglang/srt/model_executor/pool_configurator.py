@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
+    get_dsa_index_kpool,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -45,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -139,6 +141,30 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def check_dsv4_unified_fp8_pd_supported(
+    *, unified_fp8: bool, disaggregation_mode: str, pp_size: int, enable_hisparse: bool
+) -> None:
+    """PP and HiSparse still index kv_data as one region per layer; fp8 PD adds rope groups."""
+    if not unified_fp8 or disaggregation_mode == "null":
+        return
+    if pp_size > 1:
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            f"with pp_size={pp_size}: the PP re-slicing of the per-stage KV "
+            "regions has no coverage for the extra rope regions. Run PD with "
+            "pp_size=1 or unset the fp8 switch."
+        )
+    if enable_hisparse:
+        # HiSparse appends its device tail to kv_data and locates it as
+        # dst_kv_ptrs[c4_layer_num:] (mooncake/conn.py, decode.py), i.e. the
+        # slice that fp8 fills with the C4 rope regions.
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            "with --enable-hisparse: the host/device split locates its device "
+            "regions by layer count, which the fp8 rope regions shift."
+        )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -191,6 +217,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -232,6 +259,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
+                    if _is_npu and dcp_size > 1:
+                        target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -248,6 +277,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
+                    # The draft pool is replicated and consumes the widened
+                    # allocator-global slot space on NPU DCP.
+                    if _is_npu and dcp_size > 1:
+                        draft_kv_size *= dcp_size
+                        draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
@@ -336,10 +370,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                cell_size += self._compute_dsa_indexer_cell_size(
+                indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )
+                if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
+                    indexer_cell_size *= dcp_size
+                cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -455,6 +492,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         if num_layers == 0:
@@ -467,6 +505,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
+            compressed_dtype=resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
         )
 
     def _compute_dsa_indexer_cell_size(
@@ -477,8 +516,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        indexer_size_per_token = ceil_div(
+            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+            get_dsa_index_kpool(kvc.model_config.hf_config),
         )
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
@@ -604,9 +644,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                index_elements = (
+                index_elements = ceil_div(
                     index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+                    get_dsa_index_kpool(model_config.hf_config),
                 )
                 self._full_per_token += index_elements * torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
@@ -809,7 +850,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -> int:
+def compute_swa_request_cap(
+    *,
+    page_size: int,
+    window: int,
+    attn_dp_size: int,
+    max_running_requests: int | None = None,
+) -> int:
     """Worst-case SWA slots the scheduler holds live at max_running_requests."""
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -833,7 +880,9 @@ def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -
         decode_alloc = 2 * get_alloc_len_per_decode()
     per_request = trailing_tokens + decode_alloc
 
-    num_reqs = get_schedule().max_running_requests // attn_dp_size
+    if max_running_requests is None:
+        max_running_requests = get_schedule().max_running_requests
+    num_reqs = max_running_requests // attn_dp_size
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs
@@ -1062,15 +1111,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "env switch to get a bf16 unified pool."
             )
 
-        # get_contiguous_buf_infos prices a row as buf[0].nbytes, which under fp8
-        # covers the nope pool only; fail at startup rather than at the first transfer.
-        # TODO(danli103): drop this once the transfer ships the rope pool.
-        if self._unified_fp8 and self.disaggregation_mode != "null":
-            raise ValueError(
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
-                f"(disaggregation_mode={self.disaggregation_mode!r}). Unset the fp8 "
-                "switch or run without disaggregation."
-            )
+        check_dsv4_unified_fp8_pd_supported(
+            unified_fp8=self._unified_fp8,
+            disaggregation_mode=self.disaggregation_mode,
+            pp_size=kvc.pp_size,
+            enable_hisparse=get_memory().enable_hisparse,
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.

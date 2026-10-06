@@ -964,55 +964,6 @@ class TestStepOutCacheLoc(unittest.TestCase):
         self.assertIsInstance(result, torch.Tensor)
 
 
-class TestCommonTemplate(unittest.TestCase):
-    def _make_backend(self, speculative_num_steps):
-        backend = object.__new__(DeepseekV4AscendMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
-        return backend
-
-    def test_calls_call_fn_for_each_step(self):
-        backend = self._make_backend(speculative_num_steps=4)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        # range(speculative_num_steps - 1) = range(3) -> i=0,1,2
-        self.assertEqual(call_fn.call_count, 3)
-        for i, call in enumerate(call_fn.call_args_list):
-            self.assertEqual(call.args[0], i)
-            self.assertIs(call.args[1], forward_batch)
-
-    def test_single_step_no_calls(self):
-        backend = self._make_backend(speculative_num_steps=1)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
-
-    def test_two_steps_one_call(self):
-        backend = self._make_backend(speculative_num_steps=2)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
-        self.assertEqual(call_fn.call_args_list[0].args[0], 0)
-
-    def test_asserts_spec_info_not_none(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=None)
-        call_fn = MagicMock()
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
-
-    def test_call_fn_exception_propagates(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock(side_effect=RuntimeError("boom"))
-        with self.assertRaises(RuntimeError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
-
-
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):
     @staticmethod
     def _backend(*, loc, graph_mode=False):
