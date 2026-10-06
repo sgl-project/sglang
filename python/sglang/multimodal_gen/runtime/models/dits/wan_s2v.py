@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -73,20 +74,25 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
+def rope_cos_sin(freqs):
+    """Complex rotation table [b, s, 1, d/2] -> fp32 (cos, sin), each [b, s, d/2]."""
+    freqs = freqs[:, :, 0]
+    return freqs.real.float().contiguous(), freqs.imag.float().contiguous()
+
+
 @torch.amp.autocast("cuda", enabled=False)
 def rope_apply(x, grid_sizes, freqs):
-    n = x.size(2)
-    output = []
-    for i, _ in enumerate(x):
-        seq_len = x.size(1)
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-        )
-        freqs_i = freqs[i, :seq_len]
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-        output.append(x_i)
-    return torch.stack(output).to(dtype=x.dtype)
+    # freqs = (cos, sin) from rope_cos_sin. One rotation is shared by every head, and
+    # the interleaved (GPT-J) pairing is view_as_complex's, as in wanvideo.py.
+    cos, sin = freqs
+    if cos.shape[0] == 1:
+        return _apply_rotary_emb(x, cos[0], sin[0], is_neox_style=False)
+    return torch.cat(
+        [
+            _apply_rotary_emb(x[i : i + 1], cos[i], sin[i], is_neox_style=False)
+            for i in range(x.size(0))
+        ]
+    )
 
 
 @torch.amp.autocast("cuda", enabled=False)
@@ -698,12 +704,13 @@ class FramePackMotioner(nn.Module):
                 ]
             ]
             motion_rope_emb = rope_precompute(
+                # one head: the rotation does not depend on it
                 motion_lat.detach().view(
                     1,
                     motion_lat.shape[1],
                     self.num_heads,
                     self.inner_dim // self.num_heads,
-                ),
+                )[:, :, :1],
                 grid_sizes + grid_sizes_2x + grid_sizes_4x,
                 self.freqs,
                 start=None,
@@ -1168,8 +1175,9 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             mask_input[i][:, self.original_seq_len :] = 1
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
+        # one head: the rotation does not depend on it
         self.pre_compute_freqs = rope_precompute(
-            x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None
+            x.detach().view(b, s, n, d)[:, :, :1], grid_sizes, self.freqs, start=None
         )
         x = [u.unsqueeze(0) for u in x]
         self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
@@ -1290,7 +1298,7 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
+            freqs=rope_cos_sin(self.pre_compute_freqs),
             context=context,
             context_lens=None,
             num_replicated_suffix=condition_suffix_len if sequence_shard_enabled else 0,
