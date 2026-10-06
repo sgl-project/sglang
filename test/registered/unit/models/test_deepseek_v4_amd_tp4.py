@@ -54,6 +54,7 @@ def group():
 
 class _Projection:
     reduce_results = True
+    use_decode_attn_tp = False
 
     def __init__(self, group):
         self.group = group
@@ -74,14 +75,15 @@ class _Attention:
     def maybe_use_decode_attn_tp(self, forward_batch):
         return nullcontext()
 
-    def __call__(self, *, x, **kwargs):
+    def __call__(self, *, x, defer_all_reduce=False, **kwargs):
         from sglang.srt.models.deepseek_v4 import MQALayer
 
-        return MQALayer._project_wo_b(self, x * (self.rank + 1))
+        return MQALayer._project_wo_b(self, x * (self.rank + 1), defer_all_reduce)
 
 
 def _layer(group):
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
+    from sglang.srt.models import deepseek_v4_mhc as mhc
 
     torch.manual_seed(39186)
     norm_weight = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
@@ -89,6 +91,15 @@ def _layer(group):
         config=SimpleNamespace(model_type="deepseek_v41"),
         dsa_enable_prefill_cp=False,
         hc_pre_from_prev_sublayer=False,
+        hc_cfg=mhc.HcConfig(
+            mult=4,
+            sinkhorn_iters=20,
+            eps=1e-6,
+            rms_eps=1e-6,
+            hidden=5120,
+            pre_from_prev=True,
+            cp_prefill=False,
+        ),
         self_attn=_Attention(group),
         mlp=SimpleNamespace(tp_size=1),
         hc_mult=4,
@@ -216,13 +227,13 @@ def _moe_stub(rank, *, dual, shared_tp1):
     torch.nn.Module.__init__(moe)
     vars(moe).update(
         tp_size=4,
+        reduce_results=True,
         is_deepseek_v4=True,
         _shared_expert_tp1=shared_tp1,
         layer_id=0,
         is_nextn=False,
         is_hash=False,
         _fuse_shared_experts_inside_sbo=False,
-        _fuse_finalize_all_reduce=False,
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
         experts=experts,
@@ -234,7 +245,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         _forward_shared_experts=lambda x, *a, **kw: x * 0.5,
         forward=lambda x, *a, **kw: (
             moe.forward_normal_dual_stream if dual else moe.forward_normal
-        )(x),
+        )(x, return_moe_output=kw.get("return_moe_output", False)),
     )
     return moe
 
@@ -283,6 +294,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             "sglang.srt.models.deepseek_v2.post_experts_all_reduce",
             side_effect=group.all_reduce,
         ) as original_reduce,
+        patch("sglang.srt.layers.moe.post_experts_all_reduce", original_reduce),
         patch(
             "sglang.srt.layers.moe.get_moe_a2a_backend", return_value=MoeA2ABackend.NONE
         ),
@@ -317,22 +329,24 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
 
 @pytest.mark.parametrize("flag", ["mlp_reduce_scatter"])
 @pytest.mark.parametrize("dual", [False, True], ids=["normal", "dual-stream"])
-def test_moe_skipped_reduction_keeps_post(group, dual, flag):
+def test_moe_skipped_reduction_declines_fusion(group, dual, flag):
     """A reduce-scattered MoE output must not reach the fused all-reduce + mHC
-    post: the pending post stays pending and no collective runs."""
-    from sglang.srt.layers.moe.mhc_post_fusion import (
-        MhcPostFusion,
-        use_mhc_post_fusion,
+    post: moe_mhc_fusion declines, so the MoE is never asked to defer, and its
+    own path runs no collective either."""
+    from sglang.srt.layers.moe import MoeA2ABackend
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+        moe_mhc_fusion,
     )
 
     moe = _moe_stub(0, dual=dual, shared_tp1=False)
+    layer = SimpleNamespace(mlp=moe)
     x = torch.ones(1, 5120, device="cuda", dtype=torch.bfloat16)
     residual = torch.randn(1, 4, 5120, device="cuda", dtype=torch.bfloat16)
-    post = torch.rand(1, 4, device="cuda")
-    state = MhcPostFusion(residual, post, torch.rand(1, 4, 4, device="cuda"), None)
     with (
         get_forward().scoped(**{flag: True}, flashinfer_trtllm_bypass=False),
-        use_mhc_post_fusion(state),
+        patch(f"{_FUSED_MHC}._can_fuse_mhc", lambda *_: True),
+        patch(f"{_FUSED_MHC}._make_mhc_fusion") as make_fusion,
+        patch(f"{_FUSED_MHC}.get_moe_a2a_backend", return_value=MoeA2ABackend.NONE),
         patch(
             "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce"
         ) as reduction,
@@ -344,8 +358,9 @@ def test_moe_skipped_reduction_keeps_post(group, dual, flag):
             return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
         ),
     ):
+        assert moe_mhc_fusion(layer, residual, None, None) is None
         actual = moe(x)
-    assert state.output is None
+    make_fusion.assert_not_called()
     reduction.assert_not_called()
     moe_reduction.assert_not_called()
     torch.testing.assert_close(actual, x * 1.5, atol=0, rtol=0)
