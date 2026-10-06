@@ -1177,7 +1177,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
-                    aiter_swiglu_oai_limit,
                 )
 
                 quant_info = AiterMoeQuantInfo(
