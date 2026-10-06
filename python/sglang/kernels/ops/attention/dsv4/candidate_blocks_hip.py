@@ -10,10 +10,31 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
+from sglang.kernels.ops.attention.dsv4 import plan_topk_v2, topk_transform_paged_v2
 
-# the k the AOT fast_topk op (topk_hip.hip) is instantiated for; any other k takes torch.topk
-_AOT_FAST_TOPK_K = 2048
+# the k the block top-k kernel path is taken for; any other k takes torch.topk
+_BLOCK_TOPK_K = 2048
+
+
+def topk_transform_paged_hip(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: Optional[torch.Tensor],
+    page_indices: torch.Tensor,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor],
+) -> None:
+    """topk_transform_paged (rows unordered) on the top-k v2 kernel."""
+    assert scores.stride(0) % 4 == 0, "top-k v2 needs 16-byte aligned score rows"
+    topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_indices,
+        page_size,
+        plan_topk_v2(seq_lens),
+        raw_indices,
+    )
 
 
 def topk_transform_paged_sorted(
@@ -117,7 +138,12 @@ def candidate_block_scores(
     assert block_size & (block_size - 1) == 0, f"{block_size = } must be a power of 2"
     rows, width = logits.shape
     num_blocks = triton.cdiv(width, block_size)
-    scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=logits.device)
+    # rows padded to 16 bytes: the top-k v2 kernel only takes 16-byte aligned rows
+    scores = torch.empty(
+        (rows, triton.cdiv(num_blocks, 4) * 4),
+        dtype=torch.float32,
+        device=logits.device,
+    )[:, :num_blocks]
     grid = (rows, triton.cdiv(num_blocks, _LEVEL_ONE_BLOCKS_PER_PROGRAM))
     _candidate_block_scores_kernel[grid](
         logits,
@@ -280,9 +306,9 @@ def select_candidate_blocks_hip(
     rows, width = logits.shape
     device = logits.device
     num_blocks = triton.cdiv(width, block_size)
-    use_aot = topk_blocks == _AOT_FAST_TOPK_K
+    use_kernel = topk_blocks == _BLOCK_TOPK_K
     scores = candidate_block_scores(
-        logits, seq_lens, block_size=block_size, fill_tail=not use_aot
+        logits, seq_lens, block_size=block_size, fill_tail=not use_kernel
     )
     block_lens = torch.empty(rows, dtype=torch.int32, device=device)
     compact_lens = torch.empty(rows, dtype=torch.int32, device=device)
@@ -295,10 +321,10 @@ def select_candidate_blocks_hip(
         BLOCK_SIZE=block_size,
         BLOCK=1024,
     )
-    if use_aot:
+    if use_kernel:
         # exact top-k over the first ceil(len / block_size) block scores of each row, -1 padded
         ids = torch.empty((rows, topk_blocks), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.fast_topk(scores, ids, block_lens, None)
+        topk_transform_paged_hip(scores, block_lens, None, ids, 1, None)
     else:
         picked = scores.topk(min(topk_blocks, num_blocks), dim=-1)
         ids = picked.indices.to(torch.int32).masked_fill(
@@ -372,7 +398,7 @@ def topk_within_candidate_blocks_hip(
     )
     assert compact.shape[1] <= candidates.compact_page_size
     compact_pos = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
-    topk_transform_paged(
+    topk_transform_paged_hip(
         compact,
         candidates.compact_lens,
         candidates.compact_page_table,
