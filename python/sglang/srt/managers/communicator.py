@@ -35,26 +35,37 @@ class FanOutCommunicator(Generic[T]):
         self._result_values: Optional[List[T]] = None
         self._result_fan_out: Optional[int] = None
         self._queueing_lock = asyncio.Lock()
+        self._queueing_call_cancelled = False
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
         # callers are still waiting, so requests are strictly serialized in
-        # arrival order. It also releases on exception/cancellation, so a
-        # failed caller never blocks the callers queued behind it.
-        async with self._queueing_lock:
+        # arrival order. Cancellation while queued must not dispatch a request.
+        await self._queueing_lock.acquire()
+        self._result_event = asyncio.Event()
+        self._result_values = []
+        self._result_fan_out = self._fan_out
+        try:
             if obj is not None:
                 self._send(obj)
-
-            self._result_event = asyncio.Event()
-            self._result_values = []
-            self._result_fan_out = self._fan_out
             await self._result_event.wait()
-            result_values = self._result_values
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
-            return result_values
+            return self._result_values
+        except asyncio.CancelledError:
+            # Replies have no request ID. Keep the slot until all replies to
+            # the dispatched request arrive, or they could satisfy the next call.
+            self._queueing_call_cancelled = not self._result_event.is_set()
+            raise
+        finally:
+            if not self._queueing_call_cancelled:
+                self._finish_queueing_call()
+
+    def _finish_queueing_call(self):
+        self._result_event = self._result_values = None
+        self._result_fan_out = None
+        self._queueing_call_cancelled = False
+        self._queueing_lock.release()
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -101,6 +112,8 @@ class FanOutCommunicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._result_fan_out:
             self._result_event.set()
+            if self._queueing_call_cancelled:
+                self._finish_queueing_call()
 
     @staticmethod
     def merge_results(results):
