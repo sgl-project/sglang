@@ -612,9 +612,12 @@ class DSV4AttnMetadata:
             # the kernel's reads to that, so only the tile-pad rows need
             # re-inerting.
             table = pool.view(
-                "d_c128", num_tokens, fill=-1, rows_written_by_caller=True
+                "d_c128",
+                num_tokens,
+                fill=-1,
+                width=SWA_WINDOW + w128,
+                rows_written_by_caller=True,
             )
-            assert table.shape[1] >= SWA_WINDOW + w128, f"{table.shape=} {w128=}"
             table[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             table[:, SWA_WINDOW : SWA_WINDOW + w128].copy_(self.c128_page_indices)
             self.trtllm_c128_indices = table
@@ -674,9 +677,12 @@ class DSV4AttnMetadata:
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
             table = pool.view(
-                "p_c128", num_tokens, fill=-1, rows_written_by_caller=True
+                "p_c128",
+                num_tokens,
+                fill=-1,
+                width=SWA_WINDOW + w128,
+                rows_written_by_caller=True,
             )
-            assert table.shape[1] >= SWA_WINDOW + w128, f"{table.shape=} {w128=}"
             table[:, :SWA_WINDOW].copy_(self.trtllm_prefill_swa_indices)
             table[:, SWA_WINDOW : SWA_WINDOW + w128].copy_(
                 self.c128_page_indices[:num_tokens]

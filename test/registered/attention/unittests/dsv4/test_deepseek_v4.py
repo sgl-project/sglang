@@ -14,6 +14,7 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 
 import importlib.util
 import unittest
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1014,12 +1015,12 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertEqual(small.stride(0), 4)
         # Rows past `rows` up to the 64-row tile are re-inerted; [:rows] is left
         # to the caller when it promises to write them.
-        self.assertTrue(torch.all(self.pool._bufs["t"][10:64] == -1))
+        self.assertTrue(torch.all(big[10:64] == -1))
         self.assertTrue(torch.all(small == 7))
         src = torch.arange(5, **self.kw)
-        self.assertEqual(
-            self.pool.view("l", 5, fill=128, src=src).tolist(), [0, 1, 2, 3, 4]
-        )
+        lens = self.pool.view("l", 5, fill=128, src=src)
+        self.assertEqual(lens.tolist(), [0, 1, 2, 3, 4])
+        self.assertTrue(torch.all(self.pool._bufs["l"][5:] == 128))
 
     def test_copy_unless_aliased(self):
         from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
@@ -1031,7 +1032,7 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         copy_unless_aliased(tail, torch.full((4, 4), 3, **self.kw))
         self.assertTrue(torch.all(parent[:, 2:] == 3) and torch.all(parent[:, :2] == 0))
 
-    def test_topk_writes_table_aliases_c4_indices_into_the_tail(self):
+    def _core(self, *, raw_indices: bool = False):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             SWA_WINDOW,
             DSV4AttnMetadata,
@@ -1048,20 +1049,82 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         core.c4_sparse_topk_lengths = torch.full((n,), 125, **self.kw)
         core.c128_page_indices = None
         core.trtllm_topk_writes_table = True
-
-        core.c4_sparse_raw_indices = None
-        core.c4_sparse_page_indices = None
+        core.c4_sparse_raw_indices = torch.empty(1, **self.kw) if raw_indices else None
+        core.c4_sparse_page_indices = (
+            torch.full((n, 1024), -1, **self.kw) if raw_indices else None
+        )
         core.init_trtllm_sparse_buffers()
+        return core
+
+    def test_topk_writes_table_aliases_c4_indices_into_the_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        core = self._core()
         tail = core.trtllm_c4_indices[:, SWA_WINDOW:]
         self.assertEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
         self.assertEqual(core.c4_sparse_page_indices.stride(), tail.stride())
-        self.assertEqual(core.trtllm_c4_lens.tolist(), [125 + SWA_WINDOW] * n)
-
+        self.assertEqual(core.trtllm_c4_lens.tolist(), [125 + SWA_WINDOW] * 64)
         # A raw-indices side channel routes the indexer to the v1 kernel: no alias.
-        core.c4_sparse_raw_indices = torch.empty(1, **self.kw)
-        core.c4_sparse_page_indices = torch.full((n, tail.shape[1]), -1, **self.kw)
-        core.init_trtllm_sparse_buffers()
-        self.assertNotEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
+        other = self._core(raw_indices=True)
+        self.assertNotEqual(
+            other.c4_sparse_page_indices.data_ptr(),
+            other.trtllm_c4_indices[:, SWA_WINDOW:].data_ptr(),
+        )
+
+    def test_copy_metadata_skips_pool_backed_tables(self):
+        from sglang.srt.layers.attention.dsv4.metadata import copy_metadata
+
+        @dataclass
+        class Tables:
+            c4_indices: torch.Tensor
+            c4_lens: torch.Tensor
+            c4_sparse_page_indices: torch.Tensor
+
+        def tables(core):
+            return Tables(
+                core.trtllm_c4_indices, core.trtllm_c4_lens, core.c4_sparse_page_indices
+            )
+
+        dst, src = tables(self._core()), tables(self._core())  # same pool parents
+        ptrs = (dst.c4_indices.data_ptr(), dst.c4_sparse_page_indices.data_ptr())
+        copy_metadata(
+            src=src,
+            dst=dst,
+            check_eq_fields=[],
+            copy_fields=["c4_indices", "c4_lens", "c4_sparse_page_indices"],
+        )
+        self.assertEqual(
+            (dst.c4_indices.data_ptr(), dst.c4_sparse_page_indices.data_ptr()), ptrs
+        )
+
+    def test_width_changes_reuse_the_parent_and_growth_is_capture_guarded(self):
+        a = self.pool.view("f", 10, fill=-1, width=16)  # parent: 64 (tile) x 16
+        a.fill_(3)
+        b = self.pool.view("f", 30, fill=-1, width=8)  # 64 x 8 fits: no realloc
+        self.assertEqual(b.data_ptr(), a.data_ptr())
+        self.assertEqual(b.shape, (30, 8))
+        self.assertTrue(torch.all(self.pool._bufs["f"][30 * 8 : 64 * 8] == -1))
+        with mock.patch("torch.cuda.is_current_stream_capturing", return_value=True):
+            self.pool.view("f", 64, fill=-1, width=16)  # within capacity: fine
+            with self.assertRaisesRegex(AssertionError, "capture"):
+                self.pool.view("f", 65, fill=-1, width=16)
+
+    def test_copy_metadata_keeps_unified_kv_metadata_object(self):
+        from sglang.srt.layers.attention.dsv4.metadata import (
+            UnifiedKvMetadata,
+            copy_metadata,
+        )
+
+        @dataclass
+        class Holder:
+            unified: UnifiedKvMetadata
+
+        dst = Holder(UnifiedKvMetadata(swa_loc=torch.zeros(4, **self.kw)))
+        src = Holder(UnifiedKvMetadata(swa_loc=torch.ones(4, **self.kw)))
+        keep = dst.unified
+        copy_metadata(src=src, dst=dst, check_eq_fields=[], copy_fields=["unified"])
+        self.assertIs(dst.unified, keep)  # refreshed in place, not swapped
+        self.assertEqual(dst.unified.swa_loc.tolist(), [1, 1, 1, 1])
 
     def test_uniform_qmeta_floors_padded_requests_at_q_len(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata

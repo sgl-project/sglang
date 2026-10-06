@@ -137,47 +137,32 @@ def _check_trtllm_query_rows(num_rows: int) -> None:
 
 
 class TrtllmSparseTablePool:
-    """One persistent, inert-filled parent per table role; ``view`` hands out
-    ``[:rows]`` slices rewritten in place each step, so kernel-visible
-    addresses never depend on allocator state (CUDA-graph safe)."""
+    """One persistent int32 parent per table role, handed out as a ``[:rows]``
+    view (2-D when ``width`` is given) whose 64-row tile pad is re-inerted each
+    step, so kernel-visible addresses never depend on allocator state. Capacity
+    grows only outside CUDA-graph capture."""
 
     def __init__(self, int32_kwargs: dict):
         self._kwargs = int32_kwargs
         self._bufs: dict = {}
-        self._fills: dict = {}
 
     @staticmethod
     def _pad_rows(rows: int) -> int:
-        # Retain the historical 64-row guard conservatively. Current cubins
-        # pass memcheck with exact-row allocations, so this rounding is not a
-        # proven kernel requirement and can be removed after full graph tests.
         return ceil_align(rows, 64)
 
-    def preallocate(self, role: str, rows: int, fill: int, width: int = 0) -> None:
-        self._ensure(role, self._pad_rows(rows), fill, width)
-
-    def _ensure(self, role: str, rows_pad: int, fill: int, width: int) -> torch.Tensor:
+    def _parent(self, role: str, numel: int, fill: int) -> torch.Tensor:
         buf = self._bufs.get(role)
-        if buf is not None:
-            # width == 0 with an existing 2-D buffer means "use the
-            # preallocated width" (the caller writes a column subrange).
-            if width:
-                assert buf.dim() == 2 and buf.shape[1] == width, (
-                    f"table role {role!r} width changed: {buf.shape} vs {width=}"
-                )
-            assert self._fills[role] == fill, f"table role {role!r} fill changed"
-        if buf is None or buf.shape[0] < rows_pad:
+        if buf is None or buf.numel() < numel:
             assert not torch.cuda.is_current_stream_capturing(), (
                 f"trtllm table pool role {role!r} would (re)allocate during "
                 "CUDA graph capture; preallocate it with enough rows first."
             )
-            if buf is not None and buf.dim() == 2:
-                width = buf.shape[1]
-            shape = (rows_pad,) if not width else (rows_pad, width)
-            buf = torch.full(shape, fill, **self._kwargs)
+            buf = torch.full((numel,), fill, **self._kwargs)
             self._bufs[role] = buf
-        self._fills[role] = fill
-        return self._bufs[role]
+        return buf
+
+    def preallocate(self, role: str, rows: int, fill: int, width: int = 0) -> None:
+        self._parent(role, self._pad_rows(rows) * max(width, 1), fill)
 
     def view(
         self,
@@ -189,15 +174,14 @@ class TrtllmSparseTablePool:
         *,
         rows_written_by_caller: bool = False,
     ) -> torch.Tensor:
-        """A ``[:rows]`` view of the role's parent with the 64-row-aligned tail
-        re-inerted (rows [rows, rows_pad) may hold a previous, larger step's
-        entries). Rows [:rows] are filled from ``src`` when given, left to the
-        caller when ``rows_written_by_caller`` (it must write every column the
-        kernel can read), and re-inerted otherwise.
-        """
+        """Rows [:rows] come from ``src``, from the caller (who then writes every
+        column the kernel can read), or are re-inerted; rows [rows, rows_pad)
+        are always re-inerted."""
         rows_pad = self._pad_rows(rows)
-        buf = self._ensure(role, rows_pad, fill, width)
-        padded = buf[:rows_pad]
+        numel = rows_pad * max(width, 1)
+        padded = self._parent(role, numel, fill)[:numel]
+        if width:
+            padded = padded.view(rows_pad, width)
         if src is not None:
             padded[rows:].fill_(fill)
             padded[:rows].copy_(src)
@@ -290,9 +274,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 "d_c128", max_decode_rows, fill=-1, width=SWA_WINDOW + w128
             )
             pool.preallocate("d_c128_lens", max_decode_rows, fill=SWA_WINDOW)
-            pool.preallocate(
-                "p_c128", max_prefill_rows, fill=-1, width=SWA_WINDOW + w128
-            )
             pool.preallocate("p_c128_lens", max_prefill_rows, fill=SWA_WINDOW)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
