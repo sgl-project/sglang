@@ -187,8 +187,8 @@ DeepGEMM-family plans and the dense/sparse MQA plans pin the physical SM count
 | `prepare_fp8_batched_gemm` | `fp8_batched_gemm:prepare_fp8_batched_gemm` | 10.0-10.3 | prepare once; pins 148/152 SMs |
 | `prepare_fp8_fp4_gemm` | `fp8_fp4_gemm:prepare_fp8_fp4_gemm` | 10.0-10.3 | prepare once; runtime shapes (`gran_k_a` 32/128) |
 | `prepare_fp8_gemm_1d1d` | `experimental.deepgemm_fp8_gemm:prepare_fp8_gemm_1d1d` | 10.0-10.3 | prepare once; any M/N, K % 128; JIT-built at first use |
-| `prepare_group_gemm_fp8_nt_groupwise_contiguous` | `gemm.cake_grouped_fp8_gemm:prepare_group_gemm_fp8_nt_groupwise_contiguous` | 10.0 | prepare once; first launch NOT capturable |
-| `prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | `gemm.cake_grouped_fp8_fused_silu_quant:prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | 10.0 | prepare once; first launch NOT capturable |
+| `prepare_group_gemm_fp8_nt_groupwise_contiguous` | `gemm.cake_grouped_fp8_gemm:prepare_group_gemm_fp8_nt_groupwise_contiguous` | 10.0-10.3 | prepare once; `launch(a=, a_scale=, m_indices=, out=)` rebinds per call; N % 128; packed UE8M0 scales |
+| `prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | `gemm.cake_grouped_fp8_fused_silu_quant:prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | 10.0-10.3 | prepare once; still binds its operands at prepare (per-call form not merged upstream) |
 | `prepare_grouped_gemm_fwd` | `experimental.cake_moe_grouped_gemm.cake_backend:prepare_grouped_gemm_fwd` | 10.0-10.7 | prepare once; adapter pins {10.0,10.3,10.7} |
 | `prepare_kimi_k3_fp8_projection` | `gemm.kimi_k3_fp8_projection:prepare_kimi_k3_fp8_projection` | 10.0-10.3 | prepare once, launch many |
 | `prepare_kimi_k3_fp8_projection_weights` | `gemm.kimi_k3_fp8_projection:prepare_kimi_k3_fp8_projection_weights` | 10.0-10.3 | offline weight prep |
