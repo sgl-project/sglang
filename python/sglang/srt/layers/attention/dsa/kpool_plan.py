@@ -585,14 +585,21 @@ def init_pooled_paged_mqa_metadata(
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return metadata
 
-    pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
     pooled_page_table = build_pooled_page_table_64(
         metadata.real_page_table, kpool
     ).contiguous()
+    if forward_mode.is_target_verify():
+        return dataclasses.replace(
+            metadata,
+            pooled_index_kpool=kpool,
+            pooled_real_page_table=pooled_page_table,
+        )
+
+    pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
     schedule = (
         _compute_pool_schedule_metadata(
             pool_seqlens,
@@ -623,8 +630,12 @@ def update_pooled_paged_mqa_metadata(
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
+        return
+
+    if forward_mode.is_target_verify():
+        metadata.pooled_real_page_table.copy_(metadata.real_page_table[:, ::kpool])
         return
 
     if (
