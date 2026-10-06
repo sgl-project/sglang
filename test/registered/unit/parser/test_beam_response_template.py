@@ -453,28 +453,73 @@ class TestBeamResponseTemplate(CustomTestCase):
         bare = _continuation_call("set_mode", _parameter("mode", "\nab"))
         bare = bare.replace("\n\nab\n", "\nab")
         self.assertFalse(_is_grammar_accept_string(grammar, bare))
-        # No framing holds these choices, so the tool takes any arguments.
         for choice in ("a\n</rfl:parameter>b", "a<|end|><|start|>assistantb"):
             with self.subTest(choice=choice):
                 tool = _tool("set_mode", {"mode": {"type": "string", "enum": [choice]}})
                 tool.function.strict = True
                 parser = FunctionCallParser(tools=[tool], tool_call_parser="beam")
 
-                kind, tag = parser.get_structure_constraint("required")
-                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+                kind, _ = parser.get_structure_constraint("required")
 
-                self.assertEqual(kind, "structural_tag")
-                self.assertTrue(
-                    _is_grammar_accept_string(
-                        grammar, _continuation_call("set_mode", _parameter("mode", "x"))
-                    )
-                )
+                self.assertEqual(kind, "json_schema")
         named = _tool("set_mode", {"a<|end|><|start|>assistantb": {"type": "string"}})
         named.function.strict = True
         with self.assertRaisesRegex(ValueError, "parameter name"):
             FunctionCallParser(
                 tools=[named], tool_call_parser="beam"
             ).get_structure_constraint("required")
+
+    def test_string_formats_and_patterns_are_held_in_raw_text(self):
+        """Like XGrammar, a strict string keeps its format or pattern, unless a
+        match could end the value early."""
+        contact = _tool(
+            "set_contact",
+            {
+                "email": {"type": "string", "format": "email"},
+                "code": {"type": "string", "pattern": "^[A-Z]{3}$"},
+                "n": {"type": "integer"},
+            },
+        )
+        contact.function.parameters["required"] = ["email", "code", "n"]
+        contact.function.strict = True
+        parser = FunctionCallParser(
+            tools=[contact], tool_call_parser="beam", prefix=PREFIX
+        )
+        kind, tag = parser.get_structure_constraint("required")
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+        def call(email: str, code: str, *rest: str) -> str:
+            body = _parameter("email", email) + _parameter("code", code)
+            return _continuation_call("set_contact", body + "".join(rest))
+
+        text = call("a.b@x.co", "ABC", _parameter("n", "1"))
+        _, parsed = parser.parse_non_stream(text)
+        self.assertEqual(kind, "structural_tag")
+        self.assertTrue(_is_grammar_accept_string(grammar, text))
+        self.assertEqual(
+            json.loads(parsed[0].parameters),
+            {"email": "a.b@x.co", "code": "ABC", "n": 1},
+        )
+        for rejected in (
+            call("ab", "ABC", _parameter("n", "1")),
+            call("a.b@x.co", "ABCD", _parameter("n", "1")),
+            call("a.b@x.co", "ABC"),
+        ):
+            with self.subTest(rejected=rejected):
+                self.assertFalse(_is_grammar_accept_string(grammar, rejected))
+        # Line breaks could end the value; XGrammar holds length bounds only in JSON.
+        for schema in (
+            {"type": "string", "pattern": "^a.b$"},
+            {"type": "string", "minLength": 3},
+        ):
+            with self.subTest(schema=schema):
+                tool = _tool("set_code", {"code": schema})
+                tool.function.strict = True
+                parser = FunctionCallParser(tools=[tool], tool_call_parser="beam")
+
+                kind, _ = parser.get_structure_constraint("required")
+
+                self.assertEqual(kind, "json_schema")
 
     def test_strict_tools_constrain_automatic_tool_choice(self):
         count = _tool("set_count", {"count": {"type": "integer"}})

@@ -1208,39 +1208,25 @@ class TestResponseTemplateAdapters(CustomTestCase):
             "json_schema",
         )
 
-    def test_strict_tools_the_template_cannot_hold_take_any_arguments(self):
-        """The grammar and the parser must agree on such a tool: a parser that
-        took its integer as JSON would read past the closer of an unfinished
-        value."""
-        tool = _tool()
-        tool.function.strict = True
-        tool.function.parameters["if"] = {"required": ["days"]}
-        call = "<call:get_weather><arg:days>[1, 2</arg><|call|>"
-        for choice in (
-            "auto",
-            "required",
-            ToolChoice(function={"name": "get_weather"}),
-        ):
-            with self.subTest(choice=choice):
+        # A strict tool the native format cannot hold to its schema keeps forced
+        # calls on the JSON array, and the parser must then expect it too.
+        untyped = _tool()
+        untyped.function.parameters["properties"]["days"] = {
+            "$ref": "https://example.com/days.json"
+        }
+        for strict, native in ((False, True), (True, False)):
+            with self.subTest(strict=strict):
+                untyped.function.strict = strict
                 parser = FunctionCallParser(
-                    tools=[tool],
+                    tools=[untyped],
                     tool_call_parser="response_template",
                     tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
                 )
-                kind, tag = parser.get_structure_constraint(choice)
-                self.assertEqual(kind, "structural_tag")
-                grammar = Grammar.from_structural_tag(tag.model_dump_json())
-                self.assertTrue(_is_grammar_accept_string(grammar, call))
-                self.assertTrue(parser.detector.supports_structural_tag())
-
-        detector = ResponseTemplateToolDetector(
-            response_template=XML_TOOL_TEMPLATE, tools=[tool], constrained=True
-        )
-        result = detector.detect_and_parse(call, [tool])
-        self.assertEqual(
-            [(item.name, json.loads(item.parameters)) for item in result.calls],
-            [("get_weather", {"days": "[1, 2"})],
-        )
+                self.assertEqual(
+                    parser.get_structure_constraint("required")[0],
+                    "structural_tag" if native else "json_schema",
+                )
+                self.assertIs(parser.detector.supports_structural_tag(), native)
 
 
 if __name__ == "__main__":

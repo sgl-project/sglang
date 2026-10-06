@@ -321,7 +321,8 @@ class TestToolCallStructuralTag(CustomTestCase):
     def test_schemas_text_values_cannot_hold_are_not_derived(self):
         """Untyped arguments, or text a strict schema cannot hold, must not get a native
         grammar for a strict tool."""
-        pattern = {"type": "string", "pattern": "^[a-z]+$"}
+        # A match could write the start of the value's end.
+        pattern = {"type": "string", "pattern": "^[a-z<]+$"}
         remote = {"$ref": "https://example.com/level.json"}
         cases = [
             ({"enum": [1, 2]}, True, True),
