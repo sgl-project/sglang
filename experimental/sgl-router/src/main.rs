@@ -10,10 +10,7 @@ use sgl_router::{
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
+    policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
     server::{
@@ -22,7 +19,7 @@ use sgl_router::{
         shutdown::drain_for_termination,
     },
     state::{
-        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex},
+        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
@@ -375,6 +372,10 @@ fn build_app_context(
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
+        engine_state.tree().pending().enable(ttl);
+    }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
