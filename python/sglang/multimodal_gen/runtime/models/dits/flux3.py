@@ -53,6 +53,7 @@ from sglang.kernels.ops.diffusion import (
     fused_inplace_qknorm_rope,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
+    fused_packed_swiglu_fp8_rowwise,
     is_plain_layer_norm,
     residual_gate_add,
 )
@@ -294,7 +295,7 @@ class Flux3Fp8RowwiseLinear(nn.Module):
     parallel linears so the module can replace either kind.
     """
 
-    # _scaled_mm needs M padded to a multiple of 16.
+    # Preserve the checkpoint inference path's row padding convention.
     ROW_ALIGNMENT = 16
 
     def __init__(
@@ -346,6 +347,35 @@ class Flux3Fp8RowwiseLinear(nn.Module):
                 activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     activation, activation_scale
                 )
+        return self._forward_quantized(activation, activation_scale, leading)
+
+    def forward_swiglu(self, packed: torch.Tensor):
+        """Fuse packed BF16 SwiGLU with this layer's activation quantization."""
+        if not (
+            packed.is_cuda
+            and torch.version.hip is None
+            and packed.dtype == torch.bfloat16
+            and packed.ndim == 3
+            and packed.shape[-1] == 2 * self.in_features
+            and 0 < self.in_features <= 16384
+            and packed.stride(-1) == 1
+            and packed.stride(1) >= packed.shape[-1]
+            and (
+                packed.shape[0] <= 1
+                or packed.stride(0) == packed.shape[1] * packed.stride(1)
+            )
+            and self.weight.dtype == torch.float8_e4m3fn
+            and torch.cuda.get_device_capability(packed.device) >= (8, 9)
+            and not torch.compiler.is_compiling()
+        ):
+            return self(_swiglu(packed))
+        activation, activation_scale = fused_packed_swiglu_fp8_rowwise(
+            packed, self.ROW_ALIGNMENT
+        )
+        return self._forward_quantized(activation, activation_scale, packed.shape[:-1])
+
+    def _forward_quantized(self, activation, activation_scale, leading):
+        rows = math.prod(leading)
         out = torch._scaled_mm(
             activation,
             self.weight.T,
@@ -549,7 +579,11 @@ class Flux3Block(nn.Module):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             attended = self.attn(q, k, v, attn_mask_meta=sp.attn_mask_meta)
         attended = attended.reshape(batch, length, self.local_hidden)
-        out = self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if isinstance(self.mlp_out, Flux3Fp8RowwiseLinear):
+            mlp_out = self.mlp_out.forward_swiglu(mlp)[0]
+        else:
+            mlp_out = self.mlp_out(_swiglu(mlp))[0]
+        out = self.attn_out(attended)[0] + mlp_out
         if self.tp_size > 1:
             # One reduce of the summed partials, not one per branch (the order
             # the FLUX 3 reference TP uses).

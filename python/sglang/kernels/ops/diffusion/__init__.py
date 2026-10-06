@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.fused_packed_swiglu_fp8_rowwise",
+        KernelBackend.TRITON,
+        "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
+        frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+        "Packed BF16 SwiGLU with both BF16 rounding boundaries, rowwise E4M3 quantization and padding.",
+    ),
+    (
         "diffusion.fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.fp8_rowwise_triton:fp8_rowwise",
@@ -562,6 +569,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
