@@ -4,6 +4,39 @@ from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
+class GatedResidual2Seg(CustomOp):
+    """x + y * gate, with gate [b, 2, dim] switching rows at a token index: row 0 for
+    tokens [0, seg_idx), row 1 after."""
+
+    def __init__(self, prefix: str = ""):
+        super().__init__()
+
+    def forward_native(
+        self, x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor, seg_idx: int
+    ) -> torch.Tensor:
+        y = torch.cat(
+            [
+                y[:, :seg_idx].float() * gate[:, :1],
+                y[:, seg_idx:].float() * gate[:, 1:],
+            ],
+            dim=1,
+        )
+        return x + y.to(dtype=x.dtype)
+
+    def forward_cuda(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(
+        self, x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor, seg_idx: int
+    ) -> torch.Tensor:
+        # bf16 addcmul into one preallocated output: no fp32 products and no cat copy.
+        out = torch.empty_like(x)
+        gate = gate.to(x.dtype)
+        torch.addcmul(x[:, :seg_idx], y[:, :seg_idx], gate[:, :1], out=out[:, :seg_idx])
+        torch.addcmul(x[:, seg_idx:], y[:, seg_idx:], gate[:, 1:], out=out[:, seg_idx:])
+        return out
+
+
 class MulAdd(CustomOp):
     """
     Fuse elementwise mul and add
