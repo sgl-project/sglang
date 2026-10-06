@@ -158,7 +158,9 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Select workers for `request` and forward it to them.
+    /// Select workers for `request` and forward it to them. An attempt that
+    /// fails before any response reaches the client is retried on workers it
+    /// has not tried, up to `--retry-max-attempts`.
     async fn dispatch(
         &self,
         ctx: &AppContext,
@@ -166,9 +168,39 @@ impl<'a> ModelRouting<'a> {
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
-        let workers = self.select_workers(ctx, &request, &headers, &[]).await?;
-        let duration = RequestDurationGuard::new(ctx, &request.model, start);
-        forward_request(ctx, &mut request, workers, headers, start, &duration).await
+        let mut excluded = Vec::new();
+        let mut failed = None;
+        let mut duration = None;
+        for _ in 0..ctx.config.proxy.max_attempts.get() {
+            // A retry never starts past the request's stale deadline.
+            if failed.is_some()
+                && start.elapsed() >= ctx.router_inflight_load.stale_request_timeout()
+            {
+                break;
+            }
+            let workers = match self
+                .select_workers(ctx, &request, &headers, &excluded)
+                .await
+            {
+                Ok(workers) => workers,
+                // Every eligible worker already failed this request: report the last failure.
+                Err(error) => return failed.ok_or(error),
+            };
+            if failed.is_some() {
+                ctx.metrics.record_retry(&request.model.0);
+            }
+            let duration = duration
+                .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let attempt =
+                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
+                    .await?;
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
+            }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
+        }
+        Ok(failed.expect("at least one attempt"))
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,

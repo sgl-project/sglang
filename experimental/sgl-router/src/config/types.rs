@@ -15,13 +15,15 @@ pub struct Config {
     pub router_inflight_load: InflightLoadConfig,
 }
 
-/// Outbound request timeout settings.
+/// Outbound request timeout and retry settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
     /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
     /// Maximum silence between streamed upstream chunks before the stream fails.
     pub stream_idle_timeout_secs: u64,
+    /// Dispatch attempts per request, including the first; 1 disables retries.
+    pub max_attempts: NonZeroU32,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -33,6 +35,7 @@ impl Default for ProxyConfig {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
+            max_attempts: NonZeroU32::MIN,
         }
     }
 }
