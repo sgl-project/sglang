@@ -9,6 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     post_process_sample,
     save_outputs,
+    warm_image_writer,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     WarmupMemoryRecord,
@@ -67,6 +69,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    DiffusionMetrics,
+    init_metrics,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -74,9 +80,16 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+    initialize_current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+    concat_rollout_trajectory_data,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.realtime.video import (
@@ -106,6 +119,24 @@ from sglang.srt.utils.network import NetworkAddress
 logger = init_logger(__name__)
 
 
+def _device_has_allocator_cache() -> bool:
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    )
+
+
+def _device_module():
+    return torch.get_device_module(current_platform.device_type)
+
+
+def _device_initialized() -> bool:
+    if not _device_has_allocator_cache():
+        return False
+    return _device_module().is_initialized()
+
+
 @dataclass
 class _ExpandedOutputParts:
     tensor_outputs: list[torch.Tensor] = field(default_factory=list)
@@ -116,6 +147,9 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
+    rollout_trajectory_data: list[RolloutTrajectoryData | None] = field(
+        default_factory=list
+    )
 
 
 def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
@@ -196,6 +230,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     A worker that executes the model on a single GPU.
     """
 
+    metrics: DiffusionMetrics | None = None
+
     def __init__(
         self,
         local_rank: int,
@@ -212,6 +248,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
+        self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
@@ -239,9 +276,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
+        self._async_output_save = (
+            server_args.async_output_save
+            and self.is_output_rank
+            and current_platform.is_cuda()
+        )
+        self._deferred_finalize: Callable[[], None] | None = None
+        self._deferred_save_stream = None
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        self._update_lora_metrics()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -256,8 +301,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         released = self._realtime_sessions.release(session_id)
         if released:
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if _device_initialized():
+                _device_module().empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
@@ -417,6 +462,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 ),
             )
 
+        if (
+            self.is_output_rank
+            and self.server_args.pipeline_config.task_type.is_image_gen()
+        ):
+            warm_image_writer()
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
@@ -470,7 +521,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
 
     def execute_forward(
-        self, batch: List[Req], return_req: bool = False
+        self, batch: List[Req], return_req: bool = False, defer_finalize: bool = False
     ) -> OutputBatch | Req:
         """
         Execute a forward pass.
@@ -479,6 +530,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             batch: List of requests to process.
             return_req: If True, return the raw Req instead of OutputBatch.
                 Used by disaggregated pipelines to access intermediate tensors.
+            defer_finalize: If True and the request is eligible, skip output
+                materialization and stash it as a closure for the caller to
+                retrieve via take_deferred_finalize() and run off the event loop.
         """
         assert self.pipeline is not None
         # request boundary: the IPC watchdog flag is a device read, illegal
@@ -505,6 +559,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 req, output_batch
             ),
             error_context=f"request {req.request_id}",
+            defer_finalize=defer_finalize,
         )
 
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
@@ -582,6 +637,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         error_context: str,
         execution_start_time: float | None = None,
         propagate_forward_errors: bool = False,
+        defer_finalize: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
@@ -589,6 +645,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        # A closure left behind by an aborted dispatch must not pair with this
+        # request's output.
+        self._deferred_finalize = None
         # Prewarm reqs (is_warmup=False) run a different offload layout and
         # must not contaminate the calibration records. Pipelines that cannot
         # apply a residency plan also skip the temporary per-layer hooks.
@@ -691,48 +750,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            req_label = req.request_id[:8] if req.request_id else "unnamed"
-            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-                self._materialize_output_transport(output_batch, req, save_output_paths)
-            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-
-            collect_perf = (
-                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
-            )
-            if collect_perf and not req.is_warmup:
-                self._record_replica_peak_memory(output_metrics)
-
-            if (
-                self.is_output_rank
-                and not req.suppress_logs
-                and not current_platform.is_cpu()
-                and logger.isEnabledFor(logging.DEBUG)
-            ):
-                self.do_mem_analysis(output_batch)
-
-            if (
-                not current_platform.is_cpu()
-                and output_batch.output is None
-                and not req.return_raw_frames
-            ):
-                with maybe_record_function("EMPTY_CACHE"):
-                    torch.get_device_module().empty_cache()
-
-            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
-
-            # dump per-request perf report to the server-mode file path.
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
+            if defer_finalize and self._can_defer_finalize(req):
+                done_event = torch.get_device_module().Event()
+                done_event.record()
+                self._deferred_finalize = partial(
+                    self._finalize_deferred,
+                    output_batch=output_batch,
+                    req=req,
+                    save_output_paths=save_output_paths,
+                    output_metrics=output_metrics,
+                    done_event=done_event,
+                )
+            else:
+                self._finalize_output_batch(
+                    output_batch=output_batch,
+                    req=req,
+                    save_output_paths=save_output_paths,
+                    output_metrics=output_metrics,
+                    deferred=False,
                 )
         except Exception as e:
             if propagate_forward_errors and forward_failed:
@@ -776,6 +811,99 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
+
+    def _finalize_output_batch(
+        self,
+        *,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+        output_metrics: list[Any],
+        deferred: bool,
+    ) -> None:
+        req_label = req.request_id[:8] if req.request_id else "unnamed"
+        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+            self._materialize_output_transport(output_batch, req, save_output_paths)
+        self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+
+        collect_perf = (
+            req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        )
+        if collect_perf and not req.is_warmup:
+            self._record_replica_peak_memory(output_metrics)
+
+        if (
+            self.is_output_rank
+            and not req.suppress_logs
+            and not current_platform.is_cpu()
+            and logger.isEnabledFor(logging.DEBUG)
+        ):
+            self.do_mem_analysis(output_batch)
+
+        # Deferred finalize keeps the allocator cache: releasing it while the
+        # next request is mid-forward causes cudaFree/cudaMalloc churn.
+        if (
+            not deferred
+            and not current_platform.is_cpu()
+            and output_batch.output is None
+            and not req.return_raw_frames
+        ):
+            with maybe_record_function("EMPTY_CACHE"):
+                torch.get_device_module().empty_cache()
+
+        if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
+            if not req.is_warmup:
+                PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+
+        self._dump_perf_report(req, output_batch)
+
+    def _can_defer_finalize(self, req: Req) -> bool:
+        # Perf-instrumented requests stay synchronous: their finalize runs a
+        # replica-wide all_reduce that must not fire from a second thread.
+        return (
+            self._async_output_save
+            and not req.is_warmup
+            and not req.return_raw_frames
+            and bool(req.save_output and req.return_file_paths_only)
+            and req.perf_dump_path is None
+            and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        )
+
+    def _finalize_deferred(
+        self,
+        *,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+        output_metrics: list[Any],
+        done_event: Any,
+    ) -> None:
+        """Runs on the scheduler's finalize thread, never on the event loop."""
+        # A dedicated stream, ordered after the producing forward via done_event,
+        # keeps the D2H copies and uint8 conversions off the next request's
+        # compute stream.
+        device_module = torch.get_device_module()
+        # CUDA's current device is thread-local; executor threads do not inherit
+        # the worker's device selection.
+        with device_module.device(self.local_rank):
+            if self._deferred_save_stream is None:
+                self._deferred_save_stream = device_module.Stream()
+            stream = self._deferred_save_stream
+            stream.wait_event(done_event)
+            with device_module.stream(stream):
+                self._finalize_output_batch(
+                    output_batch=output_batch,
+                    req=req,
+                    save_output_paths=save_output_paths,
+                    output_metrics=output_metrics,
+                    deferred=True,
+                )
+            stream.synchronize()
+
+    def take_deferred_finalize(self) -> Callable[[], None] | None:
+        deferred = self._deferred_finalize
+        self._deferred_finalize = None
+        return deferred
 
     def _record_server_warmup_memory(
         self,
@@ -916,9 +1044,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and torch.cuda.is_initialized()
+            and _device_initialized()
         ):
-            torch.cuda.synchronize()
+            _device_module().synchronize()
         start_time = time.perf_counter()
         output_batch.output = [
             self._materialize_frame_output(output, output_batch, req)
@@ -927,9 +1055,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics is not None:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and torch.cuda.is_initialized()
+                and _device_initialized()
             ):
-                torch.cuda.synchronize()
+                _device_module().synchronize()
             output_batch.metrics.record_stage(
                 "GPUWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
@@ -1068,6 +1196,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if self.is_output_rank:
             output_batch.peak_memory_mb = snapshot.peak_reserved_mb
 
+    def _dump_perf_report(self, req: Req, output_batch: OutputBatch) -> None:
+        """Write the per-request perf report to the server-mode file path."""
+        # one writer per replica, or ranks sharing the path clobber each other
+        if (
+            req.perf_dump_path is None
+            or req.is_warmup
+            or output_batch.metrics is None
+            or not self.is_output_rank
+        ):
+            return
+        PerformanceLogger.dump_benchmark_report(
+            file_path=req.perf_dump_path,
+            metrics=output_batch.metrics,
+            meta={"model": self.server_args.model_path},
+            tag="server_perf_dump",
+        )
+
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
         if not current_platform.is_cuda():
@@ -1082,9 +1227,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._runtime_peak_allocated_mb,
             ],
             dtype=torch.float64,
-            device=current_platform.get_device(self.local_rank),
         )
-        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        replica = get_replica_group()
+        if replica.world_size > 1:
+            # Host counters over gloo: the device group's first collective
+            # sets up NCCL connections, which cost the first dumped request
+            # 0.15 s of latency.
+            torch.distributed.all_reduce(
+                peaks, op=torch.distributed.ReduceOp.MAX, group=replica.cpu_group
+            )
         if not self.is_output_rank:
             return
 
@@ -1162,6 +1313,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=req.output_compression,
+            x264_preset=req.x264_preset,
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
             frame_interpolation_scale=req.frame_interpolation_scale,
@@ -1194,6 +1346,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
+            x264_preset=first_req.x264_preset,
             enable_frame_interpolation=first_req.enable_frame_interpolation,
             frame_interpolation_exp=first_req.frame_interpolation_exp,
             frame_interpolation_scale=first_req.frame_interpolation_scale,
@@ -1214,6 +1367,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             "data_type",
             "fps",
             "output_compression",
+            "x264_preset",
             "enable_frame_interpolation",
             "frame_interpolation_exp",
             "frame_interpolation_scale",
@@ -1306,11 +1460,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             and output_batch.trajectory_timesteps is not None
         ):
             merged.trajectory_timesteps = output_batch.trajectory_timesteps
-        if (
-            merged.rollout_trajectory_data is None
-            and output_batch.rollout_trajectory_data is not None
-        ):
-            merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
 
     @staticmethod
     def _collect_expanded_parts(
@@ -1330,6 +1479,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             parts.trajectory_latents.append(output_batch.trajectory_latents)
         if isinstance(output_batch.noise_pred, torch.Tensor):
             parts.noise_preds.append(output_batch.noise_pred)
+        parts.rollout_trajectory_data.append(output_batch.rollout_trajectory_data)
         if output_batch.trajectory_decoded:
             GPUWorker._collect_trajectory_decoded(
                 parts, output_batch.trajectory_decoded
@@ -1379,6 +1529,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.cat(decoded_step, dim=0)
                 for decoded_step in parts.trajectory_decoded_parts
             ]
+        if any(data is not None for data in parts.rollout_trajectory_data):
+            merged.rollout_trajectory_data = concat_rollout_trajectory_data(
+                parts.rollout_trajectory_data
+            )
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -1440,14 +1594,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(
-            lora_nickname,
-            lora_path,
-            target,
-            strength,
-            merge_mode=merge_mode,
-            lora_alpha=lora_alpha,
-        )
+        try:
+            self.pipeline.set_lora(
+                lora_nickname,
+                lora_path,
+                target,
+                strength,
+                merge_mode=merge_mode,
+                lora_alpha=lora_alpha,
+            )
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1462,7 +1619,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.merge_lora_weights(target, strength)
+        try:
+            self.pipeline.merge_lora_weights(target, strength)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1474,8 +1634,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.unmerge_lora_weights(target)
+        try:
+            self.pipeline.unmerge_lora_weights(target)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
+
+    def _update_lora_metrics(self) -> None:
+        if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
+            self.metrics.update_lora(self.pipeline.get_lora_status())
 
     def list_loras(self) -> OutputBatch:
         """
@@ -1524,11 +1691,7 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    # torch.OutOfMemoryError exists only in some PyTorch builds
-    types = [torch.cuda.OutOfMemoryError]
-    if hasattr(torch, "OutOfMemoryError"):
-        types.append(torch.OutOfMemoryError)
-    return tuple(types)
+    return (torch.OutOfMemoryError,)
 
 
 def run_scheduler_process(
@@ -1538,9 +1701,14 @@ def run_scheduler_process(
     pipe_writer: mp.connection.Connection,
 ) -> None:
     """Run a rank's scheduler and report readiness to the launching process."""
+    # Idempotent safeguard for direct callers; process bootstraps already
+    # initialized the platform before this module was imported.
+    initialize_current_platform()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():
@@ -1575,8 +1743,8 @@ def run_scheduler_process(
         if "scheduler" in locals():
             del scheduler
         gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if _device_initialized():
+            _device_module().empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

@@ -49,6 +49,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +103,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 
@@ -115,6 +117,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    expected_load_ms: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
     # Peak of the warmup calibration probe (the default workload's full shape
@@ -146,6 +149,7 @@ class ScenarioConfig:
             expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
             expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            expected_load_ms=optional_float("expected_load_ms"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
             warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
@@ -171,6 +175,15 @@ class BaselineConfig:
         """Load baseline configuration from JSON file."""
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
+
+        # runner pools with the same gpu can have different host-side latency
+        runner_name = os.environ.get("RUNNER_NAME", "")
+        for prefix, overrides in data.get("runner_overrides", {}).items():
+            if runner_name.startswith(prefix):
+                for name, metrics in overrides.items():
+                    data["scenarios"][name].update(metrics)
+                print(f"--- Performance Runner Baseline: {prefix} ---")
+                break
 
         # Get tolerance profile, defaulting to 'pr_test'
         profile_name = "pr_test"
@@ -320,9 +333,11 @@ class DiffusionTestCase:
     run_perf_check: bool = True
     # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    perf_warmup_requests: int = 0
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
+    expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
@@ -332,12 +347,19 @@ class DiffusionTestCase:
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
             raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        if self.perf_warmup_requests < 0:
+            raise ValueError(f"{self.id}: perf_warmup_requests must be non-negative")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
             )
+        if (
+            self.perf_warmup_requests
+            and self.sampling_params.realtime_num_chunks is not None
+        ):
+            raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
@@ -431,6 +453,28 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
 )
 
 
+# DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
+# the package recipe (4 steps, CFG on video). Noise comes from the seed.
+FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="put the marker in the cup",
+    extras={
+        "action_horizon": 32,
+        "action_dim": 8,
+        "state_dim": 8,
+        "image_height": 360,
+        "image_width": 640,
+        "camera_order": ("wrist", "left", "right"),
+        "num_inference_steps": 4,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        # Same path is bit-exact across runs and GPUs. Kernel swaps move actions
+        # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
+        "action_max_abs_diff_threshold": 0.2,
+        "action_mean_abs_diff_threshold": 0.05,
+    },
+)
+
+
 def sample_step_indices(
     step_map: dict[int, float], fractions: Sequence[float]
 ) -> list[int]:
@@ -467,6 +511,8 @@ class PerformanceSummary:
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+    denoising_stages: set[str] = field(default_factory=set)
+    load_time_ms: float | None = None
 
     @staticmethod
     def from_req_perf_record(
@@ -488,10 +534,13 @@ class PerformanceSummary:
 
         # convert from list to dict
         stage_metrics = {}
+        denoising_stages = set()
         for item in record.stages:
             if isinstance(item, dict) and "name" in item:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
+                if item.get("is_denoising", item["name"] == "DenoisingStage"):
+                    denoising_stages.add(item["name"])
 
         load_peak_vram_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
@@ -527,6 +576,7 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            denoising_stages=denoising_stages,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
             warmup_peak_vram_mb=warmup_peak_vram_mb,

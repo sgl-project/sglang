@@ -121,7 +121,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Di
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if you run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference.
 - `--vae-cpu-offload`: Use CPU offload for VAE.
@@ -381,3 +381,9 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

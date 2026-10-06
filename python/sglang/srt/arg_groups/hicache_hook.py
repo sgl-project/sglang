@@ -23,6 +23,11 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_linker_mla_dedup and (
+        not cfg.enable_unified_cache_external_linker
+        or cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
+        raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
@@ -49,11 +54,25 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        # The shared host pool must match KV transfer's per-layer buffers.
+        declare_resolution(
+            server_args, "handle_hicache", hicache_mem_layout="layer_first"
+        )
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    if (
+        cfg.disaggregation_decode_host_receive_threshold > 0
+        and cfg.hicache_mem_layout != "layer_first"
+    ):
+        raise ValueError(
+            f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "
+            "cannot share the layer_first decode host pool used by KV transfer"
+        )
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
@@ -69,16 +88,23 @@ def handle_hicache_ratio_default(server_args: Any):
 
     A decode server keeps the ratio unset here: kv_cache_builder resolves
     it against the retraction-backup backend (1.0 for host_pool, else 2.0).
+
+    An explicit --hicache-ratio or --hicache-size is honored as given, so it
+    resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    fraction = cfg.hicache_host_memory_fraction
+    if fraction is not None and not 0 < fraction <= 1:
+        raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")
+    fields = {}
     if cfg.hicache_ratio is None and cfg.disaggregation_mode != "decode":
-        declare_resolution(
-            server_args,
-            "_handle_hicache_ratio_default",
-            hicache_ratio=(
-                1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
-            ),
+        fields["hicache_ratio"] = (
+            1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
         )
+    if cfg.hicache_ratio is not None or cfg.hicache_size > 0:
+        fields["hicache_host_memory_fraction"] = None
+    if fields:
+        declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):

@@ -13,10 +13,92 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     UnifiedKvMetadata,
     _match_num_queries,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+SWA_WINDOW = 128
+PAGE_SIZE = 256
+NUM_REQ_SLOTS = 6
+MAX_CONTEXT = 512
+# Block slots (out_cache_loc) live past every req_to_token slot.
+OUT_LOC_BASE = NUM_REQ_SLOTS * MAX_CONTEXT + 1
+NUM_FULL_SLOTS = OUT_LOC_BASE + 4096
+_HIP_RADIX = "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix"
+
+
+def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
+    backend = object.__new__(DeepseekV4HipRadixBackend)
+    backend.device = device
+    backend.cuda_int32_kwargs = {"device": device, "dtype": torch.int32}
+    backend.swa_page_size = SWA_WINDOW
+    backend.page_size = PAGE_SIZE
+    g = torch.Generator().manual_seed(0)
+    # Distinct full slots per (request slot, position); slot 0 stays the dummy.
+    req_to_token = (
+        torch.randperm(NUM_REQ_SLOTS * MAX_CONTEXT, generator=g).view(
+            NUM_REQ_SLOTS, MAX_CONTEXT
+        )
+        + 1
+    )
+    backend.req_to_token = req_to_token.to(device=device, dtype=torch.int32)
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = MAX_CONTEXT
+    backend.max_context_len = MAX_CONTEXT
+    # full -> swa: injective and not the identity, so a wrong source shows.
+    full_to_swa = (torch.arange(NUM_FULL_SLOTS) * 3 + 7).to(
+        device=device, dtype=torch.int64
+    )
+    backend.token_to_kv_pool = SimpleNamespace(
+        full_to_swa_index_mapping=full_to_swa,
+        translate_loc_from_full_to_swa=lambda idx: full_to_swa[idx.to(torch.int64)],
+        unified_swa_pages=0,
+        request_window=None,
+    )
+    backend.index_topk = 512
+    backend.present_ratios = tuple(sorted(low_ratios))
+    backend.low_ratios = tuple(low_ratios)
+    backend.has_c4 = False
+    backend.has_c128 = False
+    backend.candidate_masks = None
+    backend.low_ratio_identity_skip = False
+    backend.low_ratio_candidate_span = None
+    backend.enable_deepseek_v4_fp4_indexer = False
+    backend.topk = 1
+    backend.mtp_enabled = True
+    backend.speculative_num_steps = 0
+    backend.speculative_step_id = 0
+    backend.speculative_num_draft_tokens = block_size + 1
+    backend.is_dspark = True
+    backend.needs_cpu_seq_lens = False
+    backend._fp4_graph_row_limit = None
+    backend.is_draft_worker = is_dspark_draft
+    # compressed-KV metadata is built only on the target worker
+    backend.need_compress = not is_dspark_draft
+    backend.is_dspark_draft = is_dspark_draft
+    backend.is_dsv41 = True
+    # The draft verifies gamma rows, the target gamma + 1 (bonus included).
+    backend.target_verify_num_draft_tokens = (
+        block_size if is_dspark_draft else block_size + 1
+    )
+    backend.forward_metadata = None
+    return backend
+
+
+def _expected_block_row(backend, *, req_slot, prefix, out_loc_block, width):
+    """Reference window row: the last min(prefix, SWA_WINDOW) committed tokens,
+    then the block's slots, -1 padded; all through the full -> swa map."""
+    full_to_swa = backend.token_to_kv_pool.full_to_swa_index_mapping
+    ctx = min(prefix, SWA_WINDOW)
+    row = torch.full((width,), -1, dtype=torch.int32, device=full_to_swa.device)
+    if ctx:
+        ctx_full = backend.req_to_token[req_slot, prefix - ctx : prefix].to(torch.int64)
+        row[:ctx] = full_to_swa[ctx_full].to(torch.int32)
+    row[ctx : ctx + out_loc_block.numel()] = full_to_swa[out_loc_block].to(torch.int32)
+    return row, ctx
 
 
 @unittest.skipUnless(is_hip(), "DeepSeek V4 HIP radix backend requires ROCm")
@@ -44,7 +126,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             positions_casual=torch.tensor([base + 5], dtype=torch.int32),
             swa_page_indices=torch.tensor([[base + 6, base + 7]], dtype=torch.int32),
             swa_topk_lengths=torch.tensor([base + 8], dtype=torch.int32),
-            c4_sparse_topk=512,
+            index_topk=512,
             swa_out_cache_loc=torch.tensor([base + 9], dtype=torch.int32),
             unified=UnifiedKvMetadata(),
         )
@@ -75,6 +157,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_unified_prefill_metadata_pads_to_capture_bucket(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.token_to_kv_pool = SimpleNamespace(unified_swa_window=128)
         core = self._make_core_metadata(0)
         core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
@@ -111,6 +196,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
@@ -157,8 +245,177 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             backend._attach_unified_kv_prefill_meta.call_args.kwargs["exact_num_tokens"]
         )
 
+    def test_cp_prefill_attaches_before_reindex(self):
+        for need_compress in (False, True):
+            with self.subTest(need_compress=need_compress):
+                self._check_cp_prefill_order(need_compress)
+
+    def _check_cp_prefill_order(self, need_compress):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
+        backend.has_c4 = False
+        backend.has_c128 = False
+        backend._init_low_ratio_indexer_metadata = mock.Mock(return_value={})
+        core = self._make_core_metadata(0)
+        events = []
+        core.apply_cp_reindex = mock.Mock(
+            side_effect=lambda **_: events.append("reindex")
+        )
+        core.init_flashmla_related = mock.Mock(
+            side_effect=lambda: events.append("flashmla")
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+        backend._attach_unified_kv_prefill_meta = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: events.append("attach")
+        )
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2, 2])
+        )
+
+        with (
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "ExpandPrefillCausally.execute",
+                return_value=SimpleNamespace(
+                    seq_lens_casual=torch.ones(4, dtype=torch.int32),
+                    req_pool_indices_repeated=torch.tensor(
+                        [7, 9, 9, 9], dtype=torch.int32
+                    ),
+                ),
+            ) as expand_prefill,
+            mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
+        ):
+            backend.init_forward_metadata_prefill(
+                max_seq_len=4096,
+                req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
+                seq_lens=torch.tensor([1, 3], dtype=torch.int32),
+                seq_lens_cpu=[1, 3],
+                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+                num_tokens=3,
+                extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+                extend_seq_lens_cpu=[1, 2],
+                need_compress=need_compress,
+                forward_batch=forward_batch,
+            )
+
+        self.assertEqual(expand_prefill.call_args.kwargs["padded_num_tokens"], 4)
+        self.assertEqual(
+            backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
+        )
+        core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
+        # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
+        self.assertEqual(
+            events, ["attach", "reindex"] + (["flashmla"] if need_compress else [])
+        )
+
+    def test_cp_reindex_skips_absent_compression_fields(self):
+        core = self._make_core_metadata(0)
+        core.seq_lens_casual = torch.tensor([1, 2, 3, 1], dtype=torch.int32)
+        core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
+        core.swa_page_indices = torch.arange(8, dtype=torch.int32).view(4, 2)
+        core.swa_topk_lengths = torch.tensor([1, 2, 3, 1], dtype=torch.int32)
+        core.page_table = torch.arange(8, dtype=torch.int32).view(4, 2)
+        core.raw_out_loc = torch.arange(3, dtype=torch.int64)
+        core.swa_out_cache_loc = torch.arange(3, dtype=torch.int64)
+        for field_name in ("c4_out_loc", "c128_out_loc", "c1_out_loc", "c2_out_loc"):
+            setattr(core, field_name, None)
+        for field_name in core._CP_REINDEX_OPTIONAL_FIELDS:
+            setattr(core, field_name, None)
+
+        # HIP reuses the CUDA reindex, which reads get_parallel there.
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
+        ):
+            core.apply_cp_reindex(num_tokens=3)
+
+        self.assertIn("c128_topk_lengths_raw", core._CP_REINDEX_OPTIONAL_FIELDS)
+        self.assertEqual(core.positions_casual.tolist(), [1, 0])
+        for field_name in core._CP_REINDEX_FIELDS:
+            self.assertEqual(getattr(core, field_name).shape[0], 2)
+        for field_name in core._CP_REINDEX_OPTIONAL_FIELDS:
+            self.assertIsNone(getattr(core, field_name))
+        # Cache-write locations stay global.
+        self.assertEqual(core.raw_out_loc.tolist(), [0, 1, 2])
+        self.assertEqual(core.swa_out_cache_loc.tolist(), [0, 1, 2])
+
+    def test_cp_unified_uses_inert_query_padding_and_logical_ring_rows(self):
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.token_to_kv_pool = SimpleNamespace(
+            unified_swa_window=128,
+            unified_swa_ring_size=128,
+            unified_swa_pages=8,
+            get_unified_kv=lambda _layer_id: torch.zeros(32, 4),
+        )
+        backend.softmax_scale = 0.5
+        core = SimpleNamespace(
+            unified=SimpleNamespace(
+                pf_state_slot=torch.tensor([7, 7, 7, 7], dtype=torch.int32),
+                pf_chunk_start=torch.tensor([5, 5, 5, 0], dtype=torch.int64),
+                pf_cu_q=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
+                pf_final_pos=torch.tensor([7, 7, 7, 128], dtype=torch.int64),
+            ),
+            c128_page_indices=None,
+            c4_sparse_page_indices=None,
+            # Rank 1 owns global position 6 plus one physical padding row.
+            positions_casual=torch.tensor([6, 0], dtype=torch.int32),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_decode_or_idle=lambda: False,
+            ),
+            positions=torch.tensor([5, 6, 7], dtype=torch.int64),
+        )
+        kv = torch.arange(12, dtype=torch.float32).view(3, 4)
+        output = torch.zeros(2, 1, 4)
+
+        with (
+            mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
+            mock.patch(
+                f"{_HIP_RADIX}.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
+            ),
+            mock.patch.object(
+                runtime,
+                "build_prefill_indices",
+                return_value=(
+                    torch.empty(0, dtype=torch.int32),
+                    torch.tensor([0, 0, 0], dtype=torch.int32),
+                    torch.empty(0, dtype=torch.int32),
+                    torch.tensor([0, 0, 0], dtype=torch.int32),
+                ),
+            ) as build_indices,
+            mock.patch.object(runtime, "prefill", return_value=output),
+            mock.patch.object(runtime, "store_swa_into_unified") as store,
+        ):
+            result = backend._forward_unified_kv(
+                q=torch.zeros(2, 1, 4),
+                kv=kv,
+                layer=SimpleNamespace(layer_id=0, v_head_dim=4),
+                forward_batch=forward_batch,
+                compress_ratio=0,
+                attn_sink=torch.zeros(1),
+                core_attn_metadata=core,
+                save_kv_cache=True,
+            )
+
+        self.assertIs(result, output)
+        self.assertEqual(build_indices.call_args.kwargs["positions"].tolist(), [6, 0])
+        self.assertEqual(build_indices.call_args.kwargs["chunk_start"].tolist(), [5, 0])
+        self.assertEqual(build_indices.call_args.kwargs["cu_q"].tolist(), [0, 0])
+        self.assertEqual(store.call_args.kwargs["kv"].shape[0], 3)
+        self.assertEqual(store.call_args.kwargs["state_slot"].tolist(), [7, 7, 7])
+        self.assertEqual(store.call_args.kwargs["positions"].tolist(), [5, 6, 7])
+        self.assertEqual(store.call_args.kwargs["final_pos"].tolist(), [7, 7, 7])
+
     def test_prefill_bcg_uses_bucket_sized_gpu_compressor_plans(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
@@ -222,6 +479,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
     def test_capture_builds_graph_compatible_metadata_and_workspace(self):
         capture_metadata = DSV4Metadata(object(), indexer_metadata=None)
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend._build_forward_metadata = mock.Mock(return_value=capture_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
@@ -348,6 +608,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         capture_metadata.refresh_for_breakable_cuda_graph_replay_ = mock.Mock()
 
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend._build_forward_metadata = mock.Mock(return_value=replay_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
@@ -413,6 +676,270 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.attn_backends[
             -1
         ].prepare_forward_metadata_for_breakable_cuda_graph_replay.assert_not_called()
+
+
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestDsparkDraftBlockWindowHip(CustomTestCase):
+    def setUp(self):
+        self.device = torch.device("cuda")
+
+    def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
+        """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
+        a replay must refresh it in place for new lengths and slots, whether or not the
+        replay batch carries a CPU mirror of the lengths (the draft-window bucket must
+        not read seq_lens_cpu)."""
+        for cpu_mirror in (True, False):
+            with self.subTest(cpu_mirror=cpu_mirror):
+                self._check_block_window_replay(cpu_mirror=cpu_mirror)
+
+    def test_dsv4_draft_keeps_the_causal_verify_indices(self):
+        """Only V4.1's DSpark draft takes the block window; DSv4's (V4-Pro) keeps main's."""
+        backend = _make_backend(block_size=3, device=self.device)
+        self.assertTrue(backend._uses_dspark_draft_window())
+        backend.is_dsv41 = False
+        self.assertFalse(backend._uses_dspark_draft_window())
+
+    def _check_block_window_replay(self, *, cpu_mirror):
+        block = 3
+        bs = 2
+        backend = _make_backend(block_size=block, device=self.device)
+        backend.init_cuda_graph_state(max_bs=bs, max_num_tokens=bs * block)
+
+        def make_batch(prefix_list, out_base, cpu_extended):
+            prefix = torch.tensor(prefix_list, dtype=torch.int32, device=self.device)
+            out_loc = (
+                torch.arange(bs * block, device=self.device, dtype=torch.int64)
+                + out_base
+            )
+            seq_lens_cpu = torch.tensor(prefix_list, dtype=torch.int64)
+            if cpu_extended:
+                # The worker hands the draft a seq_lens_cpu already + block.
+                seq_lens_cpu = seq_lens_cpu + block
+            return SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                req_pool_indices=torch.tensor(
+                    [4, 1], dtype=torch.int32, device=self.device
+                ),
+                seq_lens=prefix,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=int(seq_lens_cpu.sum()),
+                positions=torch.zeros(
+                    bs * block, dtype=torch.int64, device=self.device
+                ),
+                out_cache_loc=out_loc,
+                spec_info=SimpleNamespace(draft_token_num=block),
+            )
+
+        capture_batch = make_batch([1, 1], OUT_LOC_BASE, cpu_extended=False)
+        backend.init_forward_metadata_out_graph(capture_batch, in_capture=True)
+        captured = backend.forward_metadata
+        core = captured.core_attn_metadata
+        width = core.swa_page_indices.shape[1]
+
+        replay_batch = make_batch([150, 7], OUT_LOC_BASE + 100, cpu_extended=True)
+        if not cpu_mirror:
+            replay_batch.seq_lens_cpu = None
+            replay_batch.seq_lens_sum = None
+        backend.init_forward_metadata_out_graph(replay_batch)
+        self.assertIs(backend.forward_metadata, captured)
+        for b, p in enumerate([150, 7]):
+            row, ctx = _expected_block_row(
+                backend,
+                req_slot=int(replay_batch.req_pool_indices[b]),
+                prefix=p,
+                out_loc_block=replay_batch.out_cache_loc[b * block : (b + 1) * block],
+                width=width,
+            )
+            for j in range(block):
+                r = b * block + j
+                self.assertTrue(torch.equal(core.swa_page_indices[r], row), (b, j))
+                self.assertEqual(int(core.swa_topk_lengths[r]), ctx + block)
+                # Derived from the device prefix, not the pre-extended CPU copy.
+                self.assertEqual(int(core.positions_casual[r]), p + j)
+
+
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestAiterSparseLengthFoldPerStep(CustomTestCase):
+    """The length-fold cache must not outlive the forward: a TARGET_VERIFY bucket keeps
+    one core object across steps, so the warmup's lists would be replayed."""
+
+    def test_graph_bucket_refold_follows_the_new_lengths(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            _fold_lengths_for_aiter_sparse,
+        )
+
+        device = torch.device("cuda")
+        block, bs = 3, 2
+        backend = _make_backend(block_size=block, device=device)
+        backend.init_cuda_graph_state(max_bs=bs, max_num_tokens=bs * block)
+
+        def make_batch(prefix_list, out_base):
+            prefix = torch.tensor(prefix_list, dtype=torch.int32, device=device)
+            seq_lens_cpu = torch.tensor(prefix_list, dtype=torch.int64)
+            return SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                req_pool_indices=torch.tensor([4, 1], dtype=torch.int32, device=device),
+                seq_lens=prefix,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=int(seq_lens_cpu.sum()),
+                positions=torch.zeros(bs * block, dtype=torch.int64, device=device),
+                out_cache_loc=torch.arange(bs * block, device=device, dtype=torch.int64)
+                + out_base,
+                spec_info=SimpleNamespace(draft_token_num=block),
+            )
+
+        def fold(core):
+            masked, _ = _fold_lengths_for_aiter_sparse(
+                core,
+                0,
+                core.swa_page_indices.unsqueeze(1),
+                core.swa_topk_lengths,
+                None,
+                None,
+            )
+            return masked.squeeze(1)
+
+        # Warmup-like forward at the capture lengths (prefix 1: 1 + block valid).
+        backend.init_forward_metadata_out_graph(
+            make_batch([1, 1], OUT_LOC_BASE), in_capture=True
+        )
+        core = backend.forward_metadata.core_attn_metadata
+        warm = fold(core).clone()
+        self.assertTrue(
+            torch.equal(
+                (warm >= 0).sum(1), torch.full((bs * block,), 1 + block, device=device)
+            )
+        )
+
+        # Next step: replay copies longer contexts into the same bucket object.
+        replay = make_batch([150, 7], OUT_LOC_BASE + 100)
+        backend.init_forward_metadata_out_graph(replay)
+        self.assertIs(backend.forward_metadata.core_attn_metadata, core)
+        backend.init_forward_metadata_in_graph(replay)
+        got = fold(core)
+        expect_valid = torch.tensor(
+            [SWA_WINDOW + block] * block + [7 + block] * block, device=device
+        )
+        self.assertTrue(torch.equal((got >= 0).sum(1), expect_valid))
+        self.assertTrue(
+            torch.equal(
+                got,
+                core.swa_page_indices.clone().masked_fill(
+                    torch.arange(got.shape[1], device=device)[None, :]
+                    >= core.swa_topk_lengths[:, None],
+                    -1,
+                ),
+            )
+        )
+        self.assertFalse(torch.equal(got, warm))
+
+
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestLowRatioTargetVerifyHip(CustomTestCase):
+    def setUp(self):
+        self.device = torch.device("cuda")
+        import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as module
+
+        self.module = module
+
+    def test_target_verify_device_lengths_match_cpu_and_replay(self):
+        backend = _make_backend(block_size=4, device=self.device, is_dspark_draft=False)
+        backend.has_c128 = True
+        backend.token_to_kv_pool.swa_page_size = SWA_WINDOW
+        backend.token_to_kv_pool._unified_kv = False
+        backend.token_to_kv_pool.get_ring_size = lambda **kwargs: 128
+        prefix = torch.tensor([125, 255], dtype=torch.int32, device=self.device)
+        slots = torch.tensor([1, 4], dtype=torch.int32, device=self.device)
+        count = 2 * backend.target_verify_num_draft_tokens
+        out_loc = torch.arange(count, device=self.device) + OUT_LOC_BASE
+
+        def build(cpu_lengths):
+            return backend.init_forward_metadata_target_verify_old(
+                max_seq_len=MAX_CONTEXT - backend.target_verify_num_draft_tokens,
+                req_pool_indices=slots,
+                seq_lens=prefix,
+                seq_lens_cpu=cpu_lengths,
+                out_cache_loc=out_loc,
+                use_prefill_cuda_graph=True,
+            )
+
+        # Build the full compressor plan on device, not just the raw wrapper.
+        build(None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = build(None)
+        for lengths, request_slots in (([125, 255], [1, 4]), ([254, 381], [4, 2])):
+            prefix.copy_(torch.tensor(lengths, device=self.device))
+            slots.copy_(torch.tensor(request_slots, device=self.device))
+            out_loc.add_(count)
+            graph.replay()
+            reference = build(lengths)
+            for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(captured.core_metadata, name),
+                        getattr(reference.core_metadata, name),
+                    ),
+                    name,
+                )
+            for name in ("plan_c", "plan_w"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(captured.c128_compress_metadata, name),
+                        getattr(reference.c128_compress_metadata, name),
+                    ),
+                    name,
+                )
+
+
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestEncoderReplayRequestWindowHip(CustomTestCase):
+    """Encoder SWA bounded replay floors each request's window at its first row,
+    the floor the CUDA backend passes to window_layout."""
+
+    class _Stop(Exception):
+        pass
+
+    def _floor_passed(self, *, encoder_replay, swa_replay_start=None):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=SimpleNamespace(capacity=256)
+        )
+        backend.encoder_replay = encoder_replay
+        seen = {}
+
+        def fake_window_layout(req, pos, **kwargs):
+            seen.update(kwargs)
+            raise self._Stop
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.window_layout",
+            side_effect=fake_window_layout,
+        ):
+            with self.assertRaises(self._Stop):
+                backend.make_core_attn_metadata(
+                    req_to_token=None,
+                    req_pool_indices_repeated=torch.tensor([3, 3, 3, 5, 5]),
+                    seq_lens_casual=torch.tensor([10, 11, 12, 20, 21]),
+                    max_seq_len=32,
+                    out_loc=None,
+                    swa_replay_start=swa_replay_start,
+                )
+        self.assertNotIn("replay", seen)
+        return seen["floor"]
+
+    def test_replay_floors_each_request_at_its_first_row(self):
+        floor = self._floor_passed(encoder_replay=True)
+        self.assertEqual(floor.tolist(), [9, 9, 9, 19, 19])
+
+    def test_without_replay_the_caller_floor_passes_through(self):
+        start = torch.tensor([4, 4, 4, 7, 7])
+        self.assertIs(self._floor_passed(encoder_replay=False), None)
+        self.assertIs(
+            self._floor_passed(encoder_replay=False, swa_replay_start=start), start
+        )
 
 
 if __name__ == "__main__":

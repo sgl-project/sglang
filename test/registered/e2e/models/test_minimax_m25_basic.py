@@ -56,7 +56,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             num_questions=200,
             parallel=200,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

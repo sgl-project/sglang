@@ -69,6 +69,7 @@ class TestModelInfoSerialization(CustomTestCase):
             "load_format": _CustomModelLoader,
             "reasoning_parser": None,
             "tool_call_parser": None,
+            "disaggregation_mode": "null",
         }
         tokenizer_manager = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -97,6 +98,7 @@ class TestModelInfoSerialization(CustomTestCase):
             reset_context()
 
         self.assertEqual(payload["load_format"], f"{__name__}._CustomModelLoader")
+        self.assertEqual(payload["disaggregation_mode"], "null")
         json.dumps(payload)
 
 
@@ -521,6 +523,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
+        self.assertEqual(info["frontend"], "python")
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the
